@@ -292,8 +292,9 @@ impl ToggleKind {
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)]
 pub enum Message {
-    /// MahBot finished async startup (or failed). On success, [`BOOT_LOG_STORE`] is set.
-    Boot(Result<(), String>),
+    /// MahBot finished async startup (or failed), carrying the log store it
+    /// opened — the logs page is built from it.
+    Boot(Result<LogStore, String>),
     Navigation(Page),
     /// A toast's expiry timer fired — dismiss the toast by its stable id.
     /// Dismissing an already-expired/unknown id is a safe no-op.
@@ -310,7 +311,7 @@ pub enum Message {
     /// writes that same column).
     UsersCdcChanged,
     /// The admin's DB-stored active workspace read back after a users-table
-    /// change — the desktop and the chat are one and the same choice, so a
+    /// change — the desktop and Telegram are one and the same choice, so a
     /// switch made on the phone applies here without a restart. `generation` is
     /// the `active_workspace_gen` guard value captured at dispatch, so a read a
     /// newer pick or read superseded cannot apply.
@@ -601,9 +602,6 @@ pub(crate) fn parse_key_press(
 
 // ── Dashboard state ──────────────────────────────────────────────
 
-/// Log store created during boot; read when handling [`Message::Boot`].
-pub static BOOT_LOG_STORE: OnceLock<LogStore> = OnceLock::new();
-
 pub struct Dashboard {
     ready: bool,
     boot_error: Option<String>,
@@ -751,13 +749,9 @@ impl Dashboard {
         }
     }
 
-    fn finish_boot(&mut self, result: Result<(), String>) -> Task<Message> {
+    fn finish_boot(&mut self, result: Result<LogStore, String>) -> Task<Message> {
         match result {
-            Ok(()) => {
-                let log_store = BOOT_LOG_STORE
-                    .get()
-                    .cloned()
-                    .expect("BOOT_LOG_STORE set before Boot(Ok)");
+            Ok(log_store) => {
                 self.ready = true;
                 self.boot_error = None;
                 let refresh_logs = self.logs_state.refresh(&log_store);
@@ -767,6 +761,11 @@ impl Dashboard {
                     load_workspace_options(self.workspaces_reload_gen),
                     std::convert::identity,
                 );
+
+                // The app's own conversation opens with the screen — once,
+                // because the app started, together with the persisted composer
+                // draft. It is never loaded by a workspace selection.
+                let open_chat = self.home_state.open().map(Message::Home);
 
                 // The Home chat now runs the Phase-1 scripted onboarding
                 // scenario while no LLM provider is configured (and fires the
@@ -782,6 +781,7 @@ impl Dashboard {
                     refresh_logs.map(Message::Logs),
                     refresh_board.map(Message::Board),
                     boot_workspaces,
+                    open_chat,
                 ])
             }
             Err(e) => {
@@ -968,11 +968,7 @@ impl Dashboard {
         // The boot read always yields a name — a shared workspace or the
         // admin's `personal:admin` fallback.
         self.selected_workspace_name = Some(restored_name.to_owned());
-        let propagate = self.propagate_workspace_selection(restored_name);
-        // The composer's draft comes back with the chat itself, not with a
-        // picker change.
-        let restore_draft = Task::done(home::HomeMessage::RestoreDraft).map(Message::Home);
-        Task::batch([propagate, restore_draft])
+        self.propagate_workspace_selection(restored_name)
     }
 
     /// Navigate to a page, refreshing page-specific state as needed.
@@ -1660,7 +1656,7 @@ impl Dashboard {
                 // "Personal": the map can lag the stored choice (a workspace
                 // registered and selected in one go is missing from a read that
                 // started before its insert), and resolving here would leave the
-                // desktop on the personal space while the chat and the DB keep
+                // desktop on the personal space while Telegram and the DB keep
                 // the project active. The DB owns the choice and its read-back
                 // applies it (see `active_workspace_gen`), so only the
                 // now-unresolved surfaces are re-pushed.
@@ -1718,8 +1714,7 @@ impl Dashboard {
             } => {
                 // Stale reads are dropped (see `active_workspace_gen`); an
                 // unchanged value is a no-op rather than a re-run of the
-                // propagate — the Home transcript reload and the pushes to the
-                // workspace-scoped surfaces.
+                // propagate's pushes.
                 if generation != self.active_workspace_gen
                     || self.selected_workspace_name.as_deref() == Some(name.as_str())
                 {
@@ -2004,17 +1999,12 @@ impl Dashboard {
     /// it lists every workspace's tickets, so a switch must leave it — its
     /// search included — exactly as it is.
     fn propagate_workspace_selection(&mut self, name: &str) -> Task<Message> {
-        // Notify the Home page so it can reload chat history: the selection as
-        // stored, with no substitution. A selection the loaded map has not
-        // caught up with yet — a project activated from the chat while a reload
-        // read was in flight — is still the account's active choice, and Home's
-        // transcript read key must key on the same choice the picker and the DB
-        // carry. Same rule as
-        // `sync_workspace_surfaces`: an unresolved selection is never shown the
-        // personal workspace.
+        // Notify the Home page of the selection as stored, with no
+        // substitution, so the composer's send carries the same choice the
+        // picker and the DB carry. The conversation Home shows is the admin's
+        // own and is not touched by it.
         let home_task: Task<Message> =
-            Task::done(home::HomeMessage::WorkspaceChanged(Some(name.to_string())))
-                .map(Message::Home);
+            Task::done(home::HomeMessage::WorkspaceChanged(name.to_string())).map(Message::Home);
 
         let surfaces = self.sync_workspace_surfaces();
         Task::batch([home_task, surfaces])
@@ -2926,7 +2916,7 @@ fn workspaces_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
 /// Subscription that emits [`Message::UsersCdcChanged`] when a users-table row
 /// changes or the stream lags. Both map to the same message: the full users
 /// re-list and the DB read-back of the active workspace (the same single choice
-/// the chat's switcher writes) that follow are each their own recovery.
+/// Telegram's `/workspace` writes) that follow are each their own recovery.
 ///
 /// The stream opens with one synthetic BASELINE event, like
 /// [`workspaces_cdc_subscription`]: a switch written between the boot selection
@@ -3833,7 +3823,7 @@ async fn read_active_workspace() -> Option<String> {
 /// Build the footer workspace picker options from the shared workspace map:
 /// values sorted by name, labeled by each workspace's display name. A personal
 /// workspace is never an option — a lingering `personal:{user}` row is filtered
-/// out, so this picker and the chat's switcher offer the same set.
+/// out, so this picker and Telegram's `/workspace` offer the same set.
 #[must_use]
 fn shared_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
     let mut values: Vec<&Workspace> = map
@@ -3983,6 +3973,23 @@ mod tests {
         dash
     }
 
+    /// The conversation's first load is dispatched by the app opening — it hangs
+    /// off the screen opening, never off a workspace selection (the other routes
+    /// are a session reset and a stream-lag re-sync).
+    #[tokio::test]
+    async fn the_app_opening_loads_the_conversation() {
+        let (log_store, _logs_dir) = crate::open_test_store!(LogStore, "logs");
+
+        let mut dash = ready_dashboard();
+        let generation = dash.home_state.history_generation();
+        let _ = dash.update(Message::Boot(Ok(log_store)));
+        assert_eq!(
+            dash.home_state.history_generation(),
+            generation.wrapping_add(1),
+            "opening the app must issue the conversation's load"
+        );
+    }
+
     /// A `WorkspacesReloaded` for generation 0 — the generation a dashboard that
     /// has not reloaded yet carries (the reload guard drops anything older).
     fn reloaded(map: HashMap<String, Workspace>) -> Message {
@@ -4050,7 +4057,7 @@ mod tests {
         ]);
         dash.selected_workspace_name = Some("ws1".to_string());
 
-        // A switch made elsewhere — the chat — is adopted as soon as it is read
+        // A switch made elsewhere — Telegram — is adopted as soon as it is read
         // back.
         let _ = dash.update(Message::ActiveWorkspaceSynced {
             generation: 0,
@@ -4073,8 +4080,7 @@ mod tests {
         );
 
         // A failed read changes nothing, and an unchanged value is a no-op
-        // rather than a re-run of the propagate — the Home transcript reload
-        // and the pushes to the workspace-scoped surfaces.
+        // rather than a re-run of the propagate's pushes.
         let _ = dash.update(Message::ActiveWorkspaceSynced {
             generation: 1,
             name: None,
@@ -4433,7 +4439,7 @@ mod tests {
 
     /// A personal workspace is never a picker option — a lingering
     /// `personal:{user}` row in the map is filtered out — so the footer picker
-    /// and the chat's switcher offer the same set.
+    /// and Telegram's `/workspace` offer the same set.
     #[test]
     fn shared_workspace_options_never_offer_a_personal_workspace() {
         let map = HashMap::from([

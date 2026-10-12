@@ -73,10 +73,10 @@ pub struct LogStore {
 /// second connection to the same database, causing WAL coordination
 /// conflicts between the two connections.
 ///
-/// In addition to this global, [`crate::gui::BOOT_LOG_STORE`] holds another clone of
-/// the same `LogStore`, and [`init_tracing()`] returns a third `Arc<LogStore>`
-/// to its caller. All three point to the same underlying connection (which
-/// is cheaply cloneable since `Connection` wraps an `Arc` internally).
+/// In addition to this global, [`init_tracing()`] returns an `Arc<LogStore>` to
+/// its caller, and that store travels on with the boot result to the dashboard —
+/// so the logs page and the global share one connection (which is cheaply
+/// cloneable since `Connection` wraps an `Arc` internally).
 pub static LOG_STORE: OnceCell<LogStore> = OnceCell::const_new();
 
 /// One greppable shell call's grep-engine decision, persisted to the dedicated

@@ -1207,7 +1207,7 @@ async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<Stri
 
 /// Resolve the account's admin-aware selected workspace name — THE single
 /// admin-aware resolution primitive, shared by message routing and the GUI
-/// (boot restore, reverse-sync, merge partner).
+/// (boot restore, reverse-sync).
 ///
 /// Workspace membership is admin-only: the admin gets their stored selection
 /// (a legacy stored personal value normalizes to the canonical

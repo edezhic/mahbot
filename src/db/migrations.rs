@@ -1032,11 +1032,10 @@ fn add_chat_history_broadcast_id(conn: &Connection) -> BoxFuture<'_, anyhow::Res
 }
 
 /// Upfill the `chat_history.broadcast_id` column for databases created before
-/// delta `33`: a shared id tagging all per-user copies of one broadcast
-/// dispatch so the workspace stream can dedup agent rows exactly. Fresh
-/// installs get the column from entry `24`'s `CREATE TABLE`, so the probe makes
-/// this a no-op there. Guarded by [`add_column_if_missing`], so this body is
-/// idempotent (non-transactional like every Rust body, re-runnable until
+/// delta `33`: an id tagging the delivery dispatch that wrote an agent row.
+/// Fresh installs get the column from entry `24`'s `CREATE TABLE`, so the probe
+/// makes this a no-op there. Guarded by [`add_column_if_missing`], so this body
+/// is idempotent (non-transactional like every Rust body, re-runnable until
 /// recorded).
 async fn run_add_chat_history_broadcast_id(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "chat_history", "broadcast_id", "TEXT").await

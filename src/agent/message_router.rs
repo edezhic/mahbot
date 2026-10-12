@@ -1389,12 +1389,11 @@ async fn deliver_response_over_channels(
 /// non-empty by the consumer loop before calling this function.
 ///
 /// Broadcast+persist is performed exactly once per response, tagged with the
-/// originating channel and a fresh `broadcast_id` (so the workspace stream
-/// dedupes the agent-direction row exactly); transport delivery is delegated to
-/// [`deliver_response_over_channels`], which iterates all registered channels
-/// and every binding, using each binding's own reply_target. A user registered
-/// on multiple channels sees the reply on all of them, regardless of the
-/// channel the request came in on.
+/// originating channel and a fresh `broadcast_id` on the row; transport delivery
+/// is delegated to [`deliver_response_over_channels`], which iterates all
+/// registered channels and every binding, using each binding's own reply_target.
+/// A user registered on multiple channels sees the reply on all of them,
+/// regardless of the channel the request came in on.
 ///
 /// `job.reply_target` is not used to scope transport delivery for registered
 /// users — each binding supplies its own reply_target on its own channel.
@@ -1405,9 +1404,8 @@ async fn deliver_single_user_response(
     role: &Role,
     file_roots: &[std::path::PathBuf],
 ) {
-    // Broadcast + persist (tagged with the originating channel). A fresh
-    // broadcast_id makes every NEW agent-direction row exactly dedupable;
-    // legacy NULL rows keep the (agent_role, content) fallback.
+    // Broadcast + persist (tagged with the originating channel and a fresh
+    // dispatch tag on the row).
     let channel = job.channel.as_str();
     broadcast_and_persist_agent_response(
         &user.name,
@@ -1458,9 +1456,8 @@ pub async fn deliver_unregistered_user_response(
     let user_name =
         crate::session::normalize_user_name(&job.user_name, "deliver_unregistered_user_response");
 
-    // Broadcast + persist (works with just strings, no UserRecord needed). A
-    // fresh broadcast_id makes the new agent row exactly dedupable; legacy
-    // NULL rows keep the (agent_role, content) fallback.
+    // Broadcast + persist (works with just strings, no UserRecord needed),
+    // tagged with the originating channel and a fresh dispatch tag on the row.
     broadcast_and_persist_agent_response(
         user_name,
         ch,

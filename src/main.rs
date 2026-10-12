@@ -26,7 +26,8 @@ use mahbot::agent::message_router;
 use mahbot::channels::broadcast_and_persist_incoming_message;
 use mahbot::channels::telegram::{ControlInput, control_input, user_command_entries};
 use mahbot::config::CONFIG;
-use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
+use mahbot::gui::{Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
+use mahbot::logs::LogStore;
 use mahbot::session::clear_session;
 use mahbot::util::UnwrapPoison;
 use mahbot::{BotCommand, Channel, ChannelMessage, Role, Workspace};
@@ -66,12 +67,15 @@ const LOG_RETENTION_HOURS: i64 = 8;
 /// a boot error instead of hanging on "Starting…" forever. A panic is recorded
 /// as a start-up failure like any other; the `Ok(Err(_))` arm is not recorded
 /// again, since the failing step already recorded it.
-async fn bootstrap_mahbot_safe(start_paused: bool) -> Result<(), String> {
+///
+/// The log store the boot opened travels with the result — the dashboard's logs
+/// page is built from it, so it is handed over rather than parked in a global.
+async fn bootstrap_mahbot_safe(start_paused: bool) -> Result<LogStore, String> {
     match AssertUnwindSafe(bootstrap_mahbot(start_paused))
         .catch_unwind()
         .await
     {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(store)) => Ok(store),
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(payload) => {
             let message = mahbot::util::panic_message(&*payload);
@@ -90,7 +94,7 @@ async fn bootstrap_mahbot_safe(start_paused: bool) -> Result<(), String> {
 ///
 /// `start_paused` is the `mahbot paused` startup mode: every registered
 /// workspace is put on pause before the poll loop that claims work starts.
-async fn bootstrap_mahbot(start_paused: bool) -> Result<()> {
+async fn bootstrap_mahbot(start_paused: bool) -> Result<LogStore> {
     mahbot::config::load_or_init()
         .await
         .map_err(|e| mahbot::boot::record_startup_failure("config::load_or_init", e))?;
@@ -134,15 +138,6 @@ async fn bootstrap_mahbot(start_paused: bool) -> Result<()> {
         }
     }
 
-    BOOT_LOG_STORE
-        .set(log_store.as_ref().clone())
-        .map_err(|_| {
-            mahbot::boot::record_startup_failure(
-                "BOOT_LOG_STORE::set",
-                anyhow::anyhow!("BOOT_LOG_STORE already set"),
-            )
-        })?;
-
     // `mahbot paused`: put every registered workspace on pause here. The stores
     // are up and the poll loop that claims work is not spawned yet, so its first
     // round already finds them paused and nothing gets claimed. This is the
@@ -178,7 +173,7 @@ async fn bootstrap_mahbot(start_paused: bool) -> Result<()> {
         .await;
     });
 
-    Ok(())
+    Ok(log_store.as_ref().clone())
 }
 
 /// Global `JoinSet` tracking all background task handles for clean shutdown.

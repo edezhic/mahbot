@@ -1,14 +1,16 @@
 //! Home page — native GUI chat interface for the app's own admin identity.
 //!
-//! The page acts as the seeded admin, selects a workspace via the footer
-//! workspace picker, and chats with MahBot agents in real time with full
-//! markdown rendering and typing indicators.
+//! The page is the app's own single conversation with the Assistant, living in
+//! the admin's personal workspace. The footer workspace picker selects the
+//! workspace the work that follows runs in — never the conversation, which is
+//! one chat in real time with full markdown rendering and typing indicators.
 
 use crate::ChatDirection;
 use crate::Role;
 use crate::channels::ReplyReference;
 use crate::channels::chat_history::ChatHistoryEntry;
 use crate::channels::reply::{agent_author_label, normalize_reply_text};
+use chrono::{DateTime, Utc};
 use futures_util::SinkExt;
 use iced::widget::rule;
 #[cfg(target_os = "macos")]
@@ -47,13 +49,17 @@ const CHAT_COMPOSER_ID: Id = Id::new("home_chat_composer");
 /// A displayed chat message in the scroll view.
 #[derive(Debug, Clone)]
 struct DisplayMessage {
-    /// Database row ID (Some for history-loaded, None for live arrivals).
+    /// Row id in storage (`Some` for entries read from chat_history) or `None`
+    /// for what is only on screen — a live arrival, or the message the user is
+    /// sending. Only the `Some` entries are the stored history a load replaces.
     pub id: Option<i64>,
     pub message_id: String,
     pub content: String,
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
-    /// Timestamp (from chat_history) used for the relative-time label.
+    /// Timestamp for the relative-time label and for load reconciliation: the
+    /// stored row's own, or — for a message that is only on screen — the instant
+    /// of the event that produced it.
     pub timestamp: Option<String>,
     /// Reference to the message this message replies to, rendered as a quote
     /// header. `None` for messages with no reply target.
@@ -129,7 +135,7 @@ impl From<ChatHistoryEntry> for DisplayMessage {
 /// Broadcast a transient GUI chat event, wrapping
 /// [`crate::channels::broadcast_transient_event`] with the constants shared by
 /// every GUI call site: the `"gui"` channel, no reply reference, and a fresh
-/// timestamp. Callers pass the user and the workspace of the visible chat.
+/// timestamp. Callers pass the user and the conversation's own workspace.
 fn broadcast_gui_transient(
     user: &str,
     workspace: &str,
@@ -334,25 +340,25 @@ fn recording_popup(
 
 #[derive(Debug, Clone)]
 pub enum HomeMessage {
-    /// Workspace changed (from the footer workspace picker — propagated via Dashboard).
-    WorkspaceChanged(Option<String>),
+    /// The selected workspace changed (footer picker, Settings, or the
+    /// read-back of the stored selection). Recorded only: the conversation does
+    /// not depend on it.
+    WorkspaceChanged(String),
     /// Text editor content changed.
     InputChanged(super::editor_widget::EditorAction),
     /// Send button pressed or Enter key in editor.
     SendMessage,
-    /// Chat history loaded from the store (entries, has_more), carrying the
-    /// transcript's primary workspace as the read key: a successful read for a
-    /// transcript the page has since left must not replace the current one (nor
-    /// clear the failure of the one it left behind).
+    /// Chat history loaded from the store. `generation` is the load counter the
+    /// read was issued under: a result whose generation is no longer current
+    /// belongs to a superseded load and is dropped.
     HistoryLoaded {
         entries: Vec<ChatHistoryEntry>,
         has_more: bool,
-        key: String,
+        generation: u64,
     },
-    /// History load failed. Carries the key (primary workspace) the read was
-    /// issued under, so a failure for a transcript the page has since left is
-    /// dropped.
-    HistoryLoadError { key: String, error: String },
+    /// History load failed. Carries the generation the read was issued under, so
+    /// a failure from a superseded load is dropped.
+    HistoryLoadError { generation: u64, error: String },
     /// Live chat event from CHAT_BROADCAST subscription.
     ChatEvent(crate::ChatEvent),
     /// Stream lagged — resync needed.
@@ -367,9 +373,6 @@ pub enum HomeMessage {
     OlderHistoryLoadError(String, u64),
     /// Markdown link was clicked.
     LinkClicked(String),
-    /// Refreshed DB-selected project workspace (re-read on workspace change so
-    /// the Personal-picker merge partner never goes stale).
-    ProjectWorkspaceRefreshed(Option<String>),
     /// Reset session button pressed — reset session and display.
     ClearChat,
     /// Copy a chat message's raw markdown content to the clipboard.
@@ -395,9 +398,6 @@ pub enum HomeMessage {
     /// stale and dropped, so per-keystroke and out-of-order writes are
     /// impossible.
     DraftSaveSettled { generation: u64 },
-    /// Bring the persisted draft back into the composer; dispatched once when
-    /// the chat starts.
-    RestoreDraft,
     /// Chat history cleared successfully — divider inserted.
     ChatCleared,
     /// Chat history clear failed.
@@ -430,16 +430,14 @@ pub enum HomeMessage {
 }
 
 pub struct HomeState {
-    /// Currently selected workspace name (synced from the footer workspace
-    /// picker). `Some("personal:admin")` = the admin's "Personal" workspace;
-    /// `Some("ws")` = a shared workspace. Resolved to `personal:admin`
-    /// before querying chat_history or sessions.
+    /// The footer workspace picker's selection, recorded for the send path (the
+    /// workspace the work that follows runs in). The conversation does not
+    /// depend on it.
     selected_workspace: Option<String>,
-    /// The admin's DB-stored project workspace (None when unset or
-    /// personal). The merge partner for the Personal-picker chat view: at
-    /// the Personal picker the chat shows this workspace alongside the
-    /// admin's personal workspace.
-    user_project_workspace: Option<String>,
+    /// Load counter for the conversation read: advanced by every load. A result
+    /// (success or failure) carrying a superseded generation is dropped, so a
+    /// slow load can never overwrite a newer one.
+    history_gen: u64,
     /// Displayed chat messages.
     messages: Vec<DisplayMessage>,
     /// Deduplication set of seen message IDs.
@@ -452,8 +450,6 @@ pub struct HomeState {
     typing: bool,
     /// Typing animation dot cycle state: 0=".", 1="..", 2="...".
     typing_tick_state: u8,
-    /// Whether the initial history load has happened for the current workspace.
-    history_loaded: bool,
     /// Whether the Phase-1 scripted onboarding scenario is active (shown while
     /// `provider_configured() == false`).
     onboarding_script_active: bool,
@@ -482,10 +478,9 @@ pub struct HomeState {
     drafts: Arc<crate::channels::chat_draft::DraftStore>,
     /// Debounce state for the asynchronous draft persistence.
     draft_save: super::common::DebounceState,
-    /// Persistent failure of the last chat-history read for the current
-    /// context. Rendered in place of the empty-chat hint so a failed read is
-    /// never mistaken for a legitimately empty history; cleared on the next
-    /// successful load.
+    /// Persistent failure of the last conversation read. Rendered in place of
+    /// the empty-chat hint so a failed read is never mistaken for a legitimately
+    /// empty history; cleared on the next successful load.
     history_error: Option<String>,
     /// Persistent failure of the last "load older messages" read. Rendered
     /// above the transcript so a failed read is never mistaken for "nothing
@@ -493,28 +488,13 @@ pub struct HomeState {
     older_history_error: Option<String>,
 }
 
-/// The chat view for the admin: two workspaces — the picker-resolved
-/// one plus a merge partner. Symmetric visibility: the picker only selects
-/// the recipient, it never filters the view (personal Assistant
-/// messages show at any picker, and the admin's project chat shows at the
-/// Personal picker).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VisibleChat {
-    /// The picker-resolved workspace: the selected workspace, or
-    /// `personal:admin` at the Personal picker.
-    primary: String,
-    /// The merge partner: `personal:admin` at a project picker, or the
-    /// admin's DB-selected project workspace at the Personal picker. `None`
-    /// only when the primary is the personal workspace and the admin has no
-    /// project workspace (deduplicated).
-    merge: Option<String>,
-}
-
-impl VisibleChat {
-    /// Whether `workspace` is part of this visible chat.
-    fn contains(&self, workspace: &str) -> bool {
-        self.primary == workspace || self.merge.as_deref() == Some(workspace)
-    }
+/// The instant a stored timestamp names, or `None` when it is absent or not a
+/// timestamp the clock produced. Compared as instants rather than as text: the
+/// strings `db::now()` writes vary in their fractional digits and carry an
+/// offset, so their text order is the clock's order only by accident of the
+/// format.
+fn instant(timestamp: Option<&str>) -> Option<DateTime<Utc>> {
+    timestamp.and_then(|ts| crate::db::parse_utc_timestamp(ts).ok())
 }
 
 impl HomeState {
@@ -522,7 +502,7 @@ impl HomeState {
     pub fn new() -> Self {
         Self {
             selected_workspace: None,
-            user_project_workspace: None,
+            history_gen: 0,
             messages: Vec::new(),
             seen_ids: HashSet::new(),
             editor_content: super::editor_widget::EditorBuffer::with_text(
@@ -532,7 +512,6 @@ impl HomeState {
             sending: false,
             typing: false,
             typing_tick_state: 0,
-            history_loaded: false,
             onboarding_script_active: false,
             sending_gen: 0,
             auto_scroll_enabled: true,
@@ -549,84 +528,47 @@ impl HomeState {
         }
     }
 
-    /// Resolve the workspace name for chat history and session queries.
-    /// A `personal:{user}` name is used as-is; no selection yet → the admin's
-    /// personal workspace. Non-personal names are the workspace name as-is.
-    fn resolve_workspace_name(&self) -> String {
-        match &self.selected_workspace {
-            Some(w) => w.clone(),
-            None => crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-        }
-    }
-
-    /// Whether `workspace` is the admin's personal workspace
-    /// (`personal:admin`) — the Assistant chat shown at any picker.
+    /// Whether `workspace` is the admin's own personal workspace (`personal:admin`)
+    /// — the only workspace the conversation lives in, and therefore the test for
+    /// whether a live event belongs to it.
     fn is_admin_personal_workspace(workspace: &str) -> bool {
         crate::users::personal_user_name(workspace).is_some_and(crate::users::is_admin_name)
     }
 
-    /// The visible chat set for the admin (see [`VisibleChat`]).
-    fn visible_workspaces(&self) -> VisibleChat {
-        let personal = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
-        let sel = self.resolve_workspace_name();
-        if Self::is_admin_personal_workspace(&sel) {
-            VisibleChat {
-                primary: personal,
-                merge: self.user_project_workspace.clone(),
-            }
-        } else {
-            VisibleChat {
-                primary: sel,
-                merge: Some(personal),
-            }
-        }
+    /// The workspace the conversation belongs to: the admin's own personal
+    /// space. The Assistant is pinned to it, so everything this chat receives —
+    /// the admin's own text, agent replies, the notice written when a turn fails
+    /// — is tagged with it, and nothing else is.
+    fn conversation_workspace() -> String {
+        crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME)
     }
 
-    /// The key a chat-history read is issued under: the transcript's primary
-    /// workspace. A result whose key no longer matches the current selection
-    /// belongs to a transcript the page has left.
-    fn history_read_key(&self) -> String {
-        self.visible_workspaces().primary
+    /// Open the app's own conversation: bring the persisted composer draft back
+    /// and load the conversation. This is the app-opening load route — the load
+    /// hangs off the screen opening, never off a selection arriving.
+    pub fn open(&mut self) -> Task<HomeMessage> {
+        self.restore_draft();
+        self.refresh_history()
     }
 
-    /// Whether a message or typing event in `workspace` belongs to the
-    /// admin's visible chat (see [`VisibleChat::contains`]).
-    fn workspace_visible(&self, workspace: &str) -> bool {
-        self.visible_workspaces().contains(workspace)
+    /// The load counter: a load was issued exactly when it advanced. Read by the
+    /// boot test, which proves the app opening is a load route.
+    #[cfg(test)]
+    pub(crate) fn history_generation(&self) -> u64 {
+        self.history_gen
     }
 
-    /// Whether the picker selects the admin's personal workspace —
-    /// projected from [`Self::visible_workspaces`] (its `primary` is the
-    /// personal workspace only at the Personal picker), so the merge-partner
-    /// decision keeps a single shape across the refresh paths.
-    fn at_personal_picker(&self) -> bool {
-        Self::is_admin_personal_workspace(&self.visible_workspaces().primary)
-    }
-
-    /// The admin's DB-selected project workspace (None when unset or
-    /// personal). The Personal-picker merge partner — re-read on workspace
-    /// changes so it never goes stale (Users-page edits flow through
-    /// [`WorkspaceChanged`]).
-    async fn project_workspace_for() -> Option<String> {
-        crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME)
-            .await
-            .filter(|ws| !crate::users::is_personal_workspace(ws))
-    }
-
-    /// Refresh chat history from the store for the admin's visible
-    /// workspaces (the selected workspace plus the admin's personal workspace).
-    fn refresh_history(&self) -> Task<HomeMessage> {
-        let chat = self.visible_workspaces();
-        let key = chat.primary.clone();
+    /// Load the conversation — the admin's own single chat, in their personal
+    /// workspace, independent of the selected workspace.
+    fn refresh_history(&mut self) -> Task<HomeMessage> {
+        self.history_gen = self.history_gen.wrapping_add(1);
+        let generation = self.history_gen;
+        let workspace = Self::conversation_workspace();
         Task::perform(
             async move {
                 let store = crate::channels::chat_history::store();
                 store
-                    .load_for_user_workspaces(
-                        crate::users::ADMIN_USER_NAME,
-                        &chat.primary,
-                        chat.merge.as_deref(),
-                    )
+                    .load_recent(crate::users::ADMIN_USER_NAME, &workspace)
                     .await
                     .map_err(|e| e.to_string())
             },
@@ -634,43 +576,94 @@ impl HomeState {
                 Ok((entries, has_more)) => HomeMessage::HistoryLoaded {
                     entries,
                     has_more,
-                    key,
+                    generation,
                 },
-                Err(e) => HomeMessage::HistoryLoadError { error: e, key },
+                Err(e) => HomeMessage::HistoryLoadError {
+                    generation,
+                    error: e,
+                },
             },
         )
     }
 
-    /// Push a new chat message to the display. Returns the message's ID for dedup tracking.
-    fn push_message(&mut self, entry: ChatHistoryEntry) -> String {
-        let msg_id = entry.message_id.clone();
-        self.messages.push(entry.into());
-        msg_id
-    }
-
-    /// Reset pagination and auto-scroll state. Called at all cleanup sites
-    /// (workspace change, clear, stream lag).
+    /// Reset the paging window only: the oldest-loaded cursor, has-more, the
+    /// in-flight flag, its failure, and its generation. Called when the stored
+    /// window is (re)built and on a deliberate clear. Auto-scroll is
+    /// deliberately not part of it: resetting the window must never move the
+    /// view.
     fn reset_pagination_state(&mut self) {
         self.oldest_loaded_id = None;
         self.has_more = false;
         self.loading_older = false;
         self.older_history_error = None;
-        self.auto_scroll_enabled = true;
         self.pagination_gen = self.pagination_gen.wrapping_add(1);
     }
 
-    /// Reset session display state: messages, dedup set, history flag,
-    /// pagination; the composer is left alone.
-    fn reset_chat_state(&mut self) {
-        self.messages.clear();
-        self.seen_ids.clear();
-        self.history_loaded = false;
-        self.onboarding_script_active = false;
-        // The transcript this failure described is gone; the read that follows
-        // reports its own outcome.
-        self.history_error = None;
+    /// Replace the stored history with `entries` — the page of the conversation
+    /// just read. What is on screen but not stored (the message being sent, the
+    /// scripted introduction) is kept, and nothing is ever shown twice; no task
+    /// is issued (the caller batches the snap and the onboarding check).
+    fn replace_stored_history(&mut self, entries: Vec<ChatHistoryEntry>, has_more: bool) {
+        // The window is rebuilt from this page, so pagination starts over and an
+        // in-flight "load older" read of the old window is dropped.
         self.reset_pagination_state();
+        self.has_more = has_more;
+        let mut kept: Vec<DisplayMessage> = std::mem::take(&mut self.messages)
+            .into_iter()
+            .filter(|m| m.id.is_none())
+            .collect();
+        let stored: Vec<DisplayMessage> = entries.into_iter().map(DisplayMessage::from).collect();
+        // Anything the page carries in its own right goes in favour of the
+        // stored copy: a live arrival and a pending send already confirmed both
+        // show under the pipeline's id.
+        let stored_ids: HashSet<&str> = stored.iter().map(|m| m.message_id.as_str()).collect();
+        // A pending send still shows under its local id, and a lag can drop
+        // exactly its confirmation — leaving the bubble while the page brings the
+        // row back under the pipeline's id. Matching the two is a heuristic: the
+        // row of that send is a page row with the user's own text, written from
+        // here, so not older than the bubble it confirms, while an older row with
+        // the same text is the user having sent that text before. A bubble the
+        // heuristic does not match — its row never written, or stored under a text
+        // enrichment rewrote — goes when its confirmation arrives, which drops it
+        // if the page already carries the row.
+        kept.retain(|msg| {
+            if stored_ids.contains(msg.message_id.as_str()) {
+                return false;
+            }
+            // Only a pending send is reconciled, and only against a bubble that
+            // carries the send's own instant — with nothing to compare, the
+            // bubble stays.
+            if !msg.is_optimistic {
+                return true;
+            }
+            let Some(sent_at) = instant(msg.timestamp.as_deref()) else {
+                return true;
+            };
+            !stored.iter().any(|s| {
+                s.direction == ChatDirection::User
+                    && s.content == msg.content
+                    && instant(s.timestamp.as_deref()).is_some_and(|at| at >= sent_at)
+            })
+        });
+        // What is kept goes back where it belongs: both a scripted transient and
+        // a pending send carry the instant of the event that produced them, and
+        // go before the first stored message that is newer.
+        let mut merged = stored;
+        for msg in kept {
+            let at = instant(msg.timestamp.as_deref()).and_then(|ts| {
+                merged
+                    .iter()
+                    .position(|m| instant(m.timestamp.as_deref()).is_some_and(|t| t > ts))
+            });
+            merged.insert(at.unwrap_or(merged.len()), msg);
+        }
+        self.oldest_loaded_id = merged.iter().find_map(|m| m.id);
+        self.messages = merged;
+        self.seen_ids.clear();
+        self.seen_ids
+            .extend(self.messages.iter().map(|m| m.message_id.clone()));
     }
+
     /// Snapshot the current composer state (text + pending reply) into the
     /// draft store and schedule a debounced persist after `delay_ms`.
     ///
@@ -721,9 +714,7 @@ impl HomeState {
             if self.onboarding_script_active {
                 return Task::none();
             }
-            let workspace = self.visible_workspaces().primary;
-            // Only arm the scenario once a workspace is confirmed visible, so an
-            // empty picker can't strand `onboarding_script_active` with no script.
+            let workspace = Self::conversation_workspace();
             self.onboarding_script_active = true;
             for (i, msg) in crate::onboarding::intro_messages().into_iter().enumerate() {
                 broadcast_gui_transient(
@@ -756,7 +747,9 @@ impl HomeState {
     /// If `optimistic_id` matches a locally-inserted optimistic message
     /// (`is_optimistic && message_id == optimistic_id`), swaps in the real
     /// [`DisplayMessage`], marks the canonical ID as seen, clears `sending`,
-    /// and returns `Some(snap_task)` so the caller can early-return.
+    /// and returns `Some(snap_task)` so the caller can early-return. When the
+    /// stored copy is already on screen (a load brought its row in under the
+    /// canonical ID) the bubble is the same message and is dropped instead.
     /// Returns `None` when no replacement was performed.
     #[expect(clippy::too_many_arguments)]
     fn replace_optimistic(
@@ -775,6 +768,13 @@ impl HomeState {
                 .iter()
                 .position(|m| m.is_optimistic && m.message_id == *opt_id)
             {
+                // The canonical copy is already shown, so the bubble is the same
+                // message a second time — it goes, the stored copy stays.
+                if self.seen_ids.contains(message_id) {
+                    self.messages.remove(pos);
+                    self.sending = false;
+                    return Some(self.maybe_snap());
+                }
                 // Fall back to the optimistic bubble's own reference when the
                 // confirmed event carries none (robustness for agent/derived
                 // confirmations that drop the reference).
@@ -834,12 +834,10 @@ impl HomeState {
     ///   only (re-enables the send button). Does **not** clear `typing`
     ///   — the typing indicator persists until an agent response arrives.
     ///
-    /// Does nothing when `workspace` is not visible for the admin
-    /// (see [`Self::workspace_visible`]) — this prevents an agent response
-    /// from an unrelated workspace from clearing the typing/sending
-    /// indicators for the visible chat.
+    /// Does nothing when `workspace` is not the conversation's own: live work on
+    /// project tickets must not clear the conversation's typing/sending state.
     fn update_sending_state(&mut self, direction: ChatDirection, user_name: &str, workspace: &str) {
-        if !self.workspace_visible(workspace) {
+        if !Self::is_admin_personal_workspace(workspace) {
             return;
         }
         if !crate::users::is_admin_name(user_name) {
@@ -852,11 +850,12 @@ impl HomeState {
         }
     }
 
-    /// Append a chat message if it belongs to the admin's visible
-    /// chat (selected workspace or the admin's personal workspace).
+    /// Append a chat message if it belongs to the conversation: the admin's own
+    /// chat in their personal workspace. Nothing else is ever shown here, so
+    /// what is shown live can never disagree with what a later load reads.
     ///
-    /// Does nothing when `user_name` is not the admin, or when
-    /// `workspace` is not visible (see [`Self::workspace_visible`]).
+    /// Does nothing when `user_name` is not the admin, or when `workspace` is
+    /// not the conversation's own (see [`Self::is_admin_personal_workspace`]).
     /// Takes ownership of the message fields so the caller avoids extra
     /// clones on the common (append) path.
     ///
@@ -878,7 +877,7 @@ impl HomeState {
         if !crate::users::is_admin_name(user_name) {
             return;
         }
-        if !self.workspace_visible(workspace) {
+        if !Self::is_admin_personal_workspace(workspace) {
             return;
         }
 
@@ -1088,7 +1087,7 @@ impl HomeState {
             }
 
             // Prepend "Load older messages" button when applicable.
-            if self.has_more && self.history_loaded {
+            if self.has_more {
                 let load_text = if self.loading_older {
                     "Loading older messages\u{2026}"
                 } else {
@@ -1238,35 +1237,11 @@ impl HomeState {
     pub fn update(&mut self, msg: HomeMessage) -> Task<HomeMessage> {
         match msg {
             HomeMessage::WorkspaceChanged(ws_name) => {
-                self.selected_workspace.clone_from(&ws_name);
-                // A picker change loads a different transcript; the composer is
-                // intentionally untouched — its draft text and pending reply
-                // belong to the chat, not the workspace.
-                self.reset_chat_state();
-                // At the Personal picker the view merges the admin's DB-selected
-                // project workspace — re-read it so Users-page edits (which
-                // flow through WorkspaceChanged) are reflected, then load in
-                // one shot. At a project picker the merge partner is the
-                // selected workspace itself, so a direct refresh suffices.
-                if self.at_personal_picker() {
-                    Task::perform(
-                        Self::project_workspace_for(),
-                        HomeMessage::ProjectWorkspaceRefreshed,
-                    )
-                } else {
-                    self.refresh_history()
-                }
-            }
-            HomeMessage::ProjectWorkspaceRefreshed(project) => {
-                let at_personal_picker = self.at_personal_picker();
-                self.user_project_workspace = project;
-                // Re-load only while the merge partner is part of the view; a
-                // later project-picker switch already refreshed.
-                if at_personal_picker {
-                    self.refresh_history()
-                } else {
-                    Task::none()
-                }
+                // Recorded for the send path only: the selection decides the
+                // workspace the work that follows runs in, and the conversation
+                // is not its to touch.
+                self.selected_workspace = Some(ws_name);
+                Task::none()
             }
             HomeMessage::InputChanged(action) => {
                 let changes_text = action.changes_text();
@@ -1285,34 +1260,22 @@ impl HomeState {
             HomeMessage::HistoryLoaded {
                 entries,
                 has_more,
-                key,
+                generation,
             } => {
-                // A read issued for a transcript the page has since left must not
-                // replace the current one — nor clear the failure of the one it
-                // left behind.
-                if self.history_read_key() != key {
+                // A superseded load belongs to a window the page has left.
+                if generation != self.history_gen {
                     return Task::none();
                 }
                 self.history_error = None;
-                // A fresh transcript has not attempted to page further back, so
-                // a previous transcript's failed "load older" no longer applies.
-                self.older_history_error = None;
-                // Track oldest loaded ID and whether more exist for pagination.
-                self.oldest_loaded_id = entries.first().map(|e| e.id);
-                self.has_more = has_more;
-                for entry in entries {
-                    let msg_id = self.push_message(entry);
-                    self.seen_ids.insert(msg_id);
-                }
-                self.history_loaded = true;
+                self.replace_stored_history(entries, has_more);
                 let onboarding = self.maybe_start_onboarding();
                 Task::batch([self.maybe_snap(), onboarding])
             }
-            HomeMessage::HistoryLoadError { key, error } => {
-                // A read issued for a workspace the page has since left must
-                // not paint its failure over the current transcript.
+            HomeMessage::HistoryLoadError { generation, error } => {
                 tracing::warn!(error = %error, "Home: failed to load chat history");
-                if self.history_read_key() == key {
+                // A failure from a superseded load belongs to a window the page
+                // has left: it must not paint itself over the current one.
+                if generation == self.history_gen {
                     self.history_error = Some(error);
                 }
                 Task::none()
@@ -1329,6 +1292,15 @@ impl HomeState {
                 // `ChatCleared` callback issues reports its own outcome.
                 self.history_error = None;
                 self.reset_pagination_state();
+                // A load in flight describes the transcript this clear just
+                // dropped: superseding it keeps it from landing in front of the
+                // reload.
+                self.history_gen = self.history_gen.wrapping_add(1);
+                // A deliberate clear empties the screen (including a message
+                // being sent) and re-arms the no-provider script, so the reset
+                // conversation is shown from its own beginning at the bottom.
+                self.onboarding_script_active = false;
+                self.auto_scroll_enabled = true;
                 // Capture synchronously (not from the ChatCleared callback): the
                 // reply is dropped but the draft text is kept.
                 let draft = self.capture_draft(DRAFT_SETTLE_MS);
@@ -1384,9 +1356,9 @@ impl HomeState {
                 Task::batch([draft, clear_task])
             }
             HomeMessage::ChatCleared => {
-                // Belt and suspenders: ClearChat cleared the message list and
-                // this callback re-loads history (not via reset_chat_state), so
-                // drop any pending reply explicitly.
+                // Belt and suspenders: ClearChat already cleared the message
+                // list and this callback reloads the conversation, so drop any
+                // pending reply explicitly.
                 self.pending_reply = None;
                 let toast = Task::done(HomeMessage::Toast(ToastMessage::SuccessMsg(
                     "Session cleared".to_string(),
@@ -1427,10 +1399,6 @@ impl HomeState {
                 }
                 Task::none()
             }
-            HomeMessage::RestoreDraft => {
-                self.restore_draft();
-                Task::none()
-            }
             HomeMessage::ChatClearError(e) => {
                 Task::done(HomeMessage::Toast(ToastMessage::Error(e)))
             }
@@ -1461,13 +1429,16 @@ impl HomeState {
                         return task;
                     }
 
-                    // 2. Deduplicate against already-seen IDs.
+                    // 2. Clear sending/typing state based on direction, sender, and workspace.
+                    //    Before the dedup: a confirmation whose row a load already
+                    //    brought in is dropped below, and it must still free the
+                    //    composer rather than leave the send guard holding it.
+                    self.update_sending_state(direction, &user_name, &workspace);
+
+                    // 3. Deduplicate against already-seen IDs.
                     if self.try_dedup(&message_id) {
                         return Task::none();
                     }
-
-                    // 3. Clear sending/typing state based on direction, sender, and workspace.
-                    self.update_sending_state(direction, &user_name, &workspace);
 
                     // 4. Append the message (filtered by acting user + workspace).
                     self.append_message(
@@ -1489,8 +1460,9 @@ impl HomeState {
                     workspace,
                 } => {
                     // Apply user + workspace filter — only show typing indicator
-                    // for the admin in a visible workspace.
-                    if crate::users::is_admin_name(&user_name) && self.workspace_visible(&workspace)
+                    // for the admin in the conversation's own workspace.
+                    if crate::users::is_admin_name(&user_name)
+                        && Self::is_admin_personal_workspace(&workspace)
                     {
                         self.typing = is_typing;
                         if is_typing {
@@ -1501,12 +1473,10 @@ impl HomeState {
                 }
             },
             HomeMessage::StreamLagged => {
-                // Resync: reload history. Also clear sending as a safety
-                // net — if the agent response was dropped due to the lag,
-                // this prevents the send button from staying stuck.
+                // Resync through the one load path. Clearing `sending` is the
+                // safety net for an agent response the lag swallowed —
+                // otherwise the send button stays stuck.
                 self.sending = false;
-                self.seen_ids.clear();
-                self.reset_pagination_state();
                 self.refresh_history()
             }
             HomeMessage::ScrollChanged(viewport) => {
@@ -1532,7 +1502,7 @@ impl HomeState {
                 }
                 self.loading_older = true;
                 let sender = crate::users::ADMIN_USER_NAME.to_string();
-                let chat = self.visible_workspaces();
+                let workspace = Self::conversation_workspace();
                 let Some(before_id) = self.oldest_loaded_id else {
                     self.loading_older = false;
                     return Task::none();
@@ -1542,12 +1512,7 @@ impl HomeState {
                     async move {
                         let store = crate::channels::chat_history::store();
                         store
-                            .load_older_for_user_workspaces(
-                                &sender,
-                                &chat.primary,
-                                chat.merge.as_deref(),
-                                before_id,
-                            )
+                            .load_older(&sender, &workspace, before_id)
                             .await
                             .map_err(|e| e.to_string())
                     },
@@ -1560,27 +1525,30 @@ impl HomeState {
                 )
             }
             HomeMessage::OlderHistoryLoaded(display_entries, has_more, generation) => {
-                // Stale-result guard: `pagination_gen` advances only through
-                // `reset_pagination_state` (which clears `loading_older`), so a
-                // dropped result cannot strand the action — and clearing the flag
-                // here could take it away from a newer load already in flight.
+                // Stale-result guard: only `reset_pagination_state` advances
+                // `pagination_gen`, and it clears `loading_older` with it — so a
+                // dropped result cannot strand the action, and this arm must not
+                // clear a flag a newer load may already own.
                 if generation != self.pagination_gen {
                     return Task::none();
                 }
-                // Prepend entries to the beginning of messages.
-                let mut prepended: Vec<DisplayMessage> = display_entries
-                    .into_iter()
-                    .map(DisplayMessage::from)
-                    .collect();
-                self.older_history_error = None;
-                // Track seen_ids for the prepended messages.
-                for msg in &prepended {
-                    self.seen_ids.insert(msg.message_id.clone());
+                // An older page can overlap what the transcript already holds; a
+                // message is never shown twice.
+                let mut prepended: Vec<DisplayMessage> = Vec::new();
+                for entry in display_entries {
+                    let msg = DisplayMessage::from(entry);
+                    if self.seen_ids.insert(msg.message_id.clone()) {
+                        prepended.push(msg);
+                    }
                 }
+                let oldest = prepended
+                    .first()
+                    .and_then(|m| m.id)
+                    .or(self.oldest_loaded_id);
+                self.older_history_error = None;
                 prepended.append(&mut self.messages);
                 self.messages = prepended;
-                // Update oldest_loaded_id and has_more.
-                self.oldest_loaded_id = self.messages.first().and_then(|m| m.id);
+                self.oldest_loaded_id = oldest;
                 self.has_more = has_more;
                 self.loading_older = false;
                 // Snap to end if auto-scroll enabled.
@@ -1588,8 +1556,8 @@ impl HomeState {
             }
             HomeMessage::OlderHistoryLoadError(msg, generation) => {
                 // Stale-result guard, mirroring `OlderHistoryLoaded`: a failed
-                // read for a transcript the page has left must not pin its
-                // failure on the current one (nor touch its in-flight flag).
+                // read of a superseded window must not pin its failure on the
+                // current one (nor touch its in-flight flag).
                 if generation != self.pagination_gen {
                     return Task::none();
                 }
@@ -1714,13 +1682,16 @@ impl HomeState {
             } else {
                 self.pending_reply.clone()
             };
+            // Carries the instant it was sent: the load reconciles it against
+            // the stored copy of the same send (see `replace_stored_history`).
+            // A user bubble renders no time label, so this is not displayed.
             self.messages.push(display_message(
                 None,
                 opt_id.clone(),
                 content.clone(),
                 ChatDirection::User,
                 None,
-                None,
+                Some(crate::db::now()),
                 reply,
                 true,
             ));
@@ -1804,7 +1775,7 @@ impl HomeState {
         optimistic_id: Option<String>,
     ) -> Task<HomeMessage> {
         let user = crate::users::ADMIN_USER_NAME;
-        let workspace = self.visible_workspaces().primary;
+        let workspace = Self::conversation_workspace();
         let send_task = Task::perform(
             async move {
                 let parsed = crate::onboarding::parse_provider_input(&content);
@@ -1912,8 +1883,22 @@ mod tests {
         // Hermetic draft store bound to a throwaway temp dir so tests never
         // touch the real draft file.
         state.drafts = hermetic_draft_store();
+        // The selection is recorded for the send path only: the conversation
+        // does not depend on it.
         state.selected_workspace = Some(workspace.to_string());
         state
+    }
+
+    fn stored_entry(id: i64, message_id: &str, content: &str) -> ChatHistoryEntry {
+        ChatHistoryEntry {
+            id,
+            message_id: message_id.to_string(),
+            content: content.to_string(),
+            direction: ChatDirection::User,
+            agent_role: None,
+            timestamp: None,
+            reply_reference: None,
+        }
     }
 
     /// A draft store backed by a unique throwaway file under one shared test
@@ -1938,9 +1923,9 @@ mod tests {
 
         // The workspace swap does not touch the composer: the text stays, and
         // the draft is still the same single draft.
-        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
+        let _ = state.update(HomeMessage::WorkspaceChanged("ws2".to_string()));
         assert_eq!(state.editor_content.text(), "h");
-        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws1".to_string())));
+        let _ = state.update(HomeMessage::WorkspaceChanged("ws1".to_string()));
         assert_eq!(state.editor_content.text(), "h");
         assert_eq!(state.drafts.get().text, "h");
     }
@@ -1951,118 +1936,118 @@ mod tests {
         let reply = reply_reference_for(ChatDirection::Agent, Some("assistant"), "hi there");
         state.drafts.set("typed".to_string(), Some(reply.clone()));
 
-        // Boot pushes the workspace selection and the draft restore in one
-        // batch (order not guaranteed): either order must leave the composer
-        // holding the stored draft.
-        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
-        let _ = state.update(HomeMessage::RestoreDraft);
+        // The app's opening brings the stored draft back; the boot selection
+        // push lands after it and leaves the composer as it is.
+        let _ = state.open();
+        let _ = state.update(HomeMessage::WorkspaceChanged("ws2".to_string()));
         assert_eq!(state.editor_content.text(), "typed");
         assert_eq!(state.pending_reply, Some(reply));
+        assert_eq!(state.history_gen, 1, "the opening issues exactly one load");
 
         // ...and a later picker change leaves it alone.
-        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws1".to_string())));
+        let _ = state.update(HomeMessage::WorkspaceChanged("ws1".to_string()));
         assert_eq!(state.editor_content.text(), "typed");
         assert!(state.pending_reply.is_some());
-
-        // The other batch order: restore first, then the selection push.
-        let mut state = make_home_state("ws1");
-        state.drafts.set("typed".to_string(), None);
-        let _ = state.update(HomeMessage::RestoreDraft);
-        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
-        assert_eq!(state.editor_content.text(), "typed");
     }
 
     #[test]
     fn failed_reads_stay_set_until_a_successful_load() {
         let mut state = HomeState::new();
+        let generation = state.history_gen;
 
-        // A failed history read is retained; a successful load clears it.
-        let key = state.history_read_key();
+        // A failed read of the current load is retained.
         let _ = state.update(HomeMessage::HistoryLoadError {
-            key: key.clone(),
+            generation,
             error: "db down".to_string(),
         });
         assert_eq!(state.history_error.as_deref(), Some("db down"));
 
-        // A failure whose key no longer matches the current selection belongs to
-        // a transcript the page has left: it must not overwrite the current one.
-        let stale_key = "personal:bob".to_string();
+        // A failure from a superseded load is dropped.
         let _ = state.update(HomeMessage::HistoryLoadError {
-            key: stale_key.clone(),
+            generation: generation.wrapping_sub(1),
             error: "stale".to_string(),
         });
         assert_eq!(state.history_error.as_deref(), Some("db down"));
 
-        // Neither may a successful read of that left transcript: applying it
-        // would replace the current transcript and clear the failure it shows.
+        // A superseded successful load must not replace the window nor clear
+        // the current failure.
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: Vec::new(),
             has_more: false,
-            key: stale_key,
+            generation: generation.wrapping_sub(1),
         });
         assert_eq!(
             state.history_error.as_deref(),
             Some("db down"),
-            "a stale successful read must not clear the current failure"
+            "a superseded successful load must not clear the current failure"
+        );
+        assert!(
+            state.messages.is_empty(),
+            "a superseded load must not replace the window"
         );
 
+        // A successful load of the current generation clears it.
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: Vec::new(),
             has_more: false,
-            key: key.clone(),
+            generation,
         });
         assert!(state.history_error.is_none());
 
-        // A transcript replacement drops the failure with the transcript it
-        // described; the read that follows reports its own outcome.
+        // A clear drops the failure with the transcript it described.
         let _ = state.update(HomeMessage::HistoryLoadError {
-            key: key.clone(),
+            generation,
             error: "db down".to_string(),
         });
-        state.reset_chat_state();
-        assert!(state.history_error.is_none());
-
-        // Same for a cleared chat, which reloads through its own callback.
-        let _ = state.update(HomeMessage::HistoryLoadError {
-            key,
-            error: "db down".to_string(),
-        });
+        assert!(state.history_error.is_some());
+        // ...and supersedes a load still in flight, so nothing lands behind it.
+        let in_flight = state.history_gen;
         let _ = state.update(HomeMessage::ClearChat);
         assert!(state.history_error.is_none());
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: vec![stored_entry(1, "old-1", "old")],
+            has_more: false,
+            generation: in_flight,
+        });
+        assert!(
+            state.messages.is_empty(),
+            "a pre-clear load must not land behind the clear"
+        );
 
-        // Same for the older-messages read: the failure survives until a load
-        // succeeds.
-        let generation = state.pagination_gen;
+        // The older-messages read keeps its own failure until a load of the
+        // same window succeeds.
+        let pagination = state.pagination_gen;
         let _ = state.update(HomeMessage::OlderHistoryLoadError(
             "db down".to_string(),
-            generation,
+            pagination,
         ));
         assert_eq!(state.older_history_error.as_deref(), Some("db down"));
         let _ = state.update(HomeMessage::OlderHistoryLoaded(
             Vec::new(),
             false,
-            generation,
+            pagination,
         ));
         assert!(state.older_history_error.is_none());
 
-        // A paging failure from a transcript the page has left is dropped, like
-        // its successful counterpart.
+        // A paging failure from a superseded window is dropped, like its
+        // successful counterpart.
         let _ = state.update(HomeMessage::OlderHistoryLoadError(
             "stale".to_string(),
-            generation.wrapping_sub(1),
+            pagination.wrapping_sub(1),
         ));
         assert!(state.older_history_error.is_none());
 
-        // A fresh transcript drops a stale older-messages failure: it belongs
-        // to the transcript that was replaced.
+        // ...and a fresh conversation load drops a stale paging failure with
+        // the window it described.
         let _ = state.update(HomeMessage::OlderHistoryLoadError(
             "db down".to_string(),
             state.pagination_gen,
         ));
+        assert_eq!(state.older_history_error.as_deref(), Some("db down"));
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: Vec::new(),
             has_more: false,
-            key: state.history_read_key(),
+            generation: state.history_gen,
         });
         assert!(state.older_history_error.is_none());
     }
@@ -2085,6 +2070,24 @@ mod tests {
             md_items: Vec::new(),
             is_optimistic,
         }
+    }
+
+    /// The admin's own message as the live stream delivers it: the confirmation
+    /// of a composer send (`optimistic_id`) or a plain echo.
+    fn own_message(message_id: &str, optimistic_id: Option<&str>) -> HomeMessage {
+        HomeMessage::ChatEvent(crate::ChatEvent::Message {
+            message_id: message_id.to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            content: "hello".to_string(),
+            direction: ChatDirection::User,
+            timestamp: crate::db::now(),
+            channel: "gui".to_string(),
+            agent_role: None,
+            workspace: HomeState::conversation_workspace(),
+            optimistic_id: optimistic_id.map(std::string::ToString::to_string),
+            transient: false,
+            reply_reference: None,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -2172,6 +2175,34 @@ mod tests {
         assert!(task.is_none(), "expected None when optimistic_id is None");
     }
 
+    #[test]
+    fn test_replace_optimistic_drops_a_bubble_the_page_already_carries() {
+        let mut state = make_home_state("ws1");
+        let mut row = make_msg("pipeline-9", "hello", ChatDirection::User, None, false);
+        row.id = Some(9);
+        state.messages.push(row);
+        state
+            .messages
+            .push(make_msg("opt-1", "hello", ChatDirection::User, None, true));
+        state.seen_ids.insert("pipeline-9".to_string());
+        state.sending = true;
+
+        let task = state.replace_optimistic(
+            Some("opt-1"),
+            "pipeline-9",
+            "hello",
+            ChatDirection::User,
+            None,
+            None,
+            None,
+        );
+
+        assert!(task.is_some(), "the removal still snaps to the end");
+        assert_eq!(state.messages.len(), 1, "one message, not two");
+        assert_eq!(state.messages[0].message_id, "pipeline-9");
+        assert!(!state.sending, "sending should be cleared");
+    }
+
     // ------------------------------------------------------------------
     // try_dedup
     // ------------------------------------------------------------------
@@ -2230,29 +2261,37 @@ mod tests {
 
     #[test]
     fn test_update_sending_state() {
+        let personal = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
         let cases = [
             (
-                "agent match",
+                "agent in the conversation",
                 ChatDirection::Agent,
                 crate::users::ADMIN_USER_NAME,
-                "ws1",
+                personal.as_str(),
                 false,
                 false,
             ),
             (
-                "user match",
+                "user echo in the conversation",
                 ChatDirection::User,
                 crate::users::ADMIN_USER_NAME,
-                "ws1",
+                personal.as_str(),
                 false,
                 true,
             ),
-            ("wrong user", ChatDirection::Agent, "bob", "ws1", true, true),
             (
-                "wrong workspace",
+                "another user",
+                ChatDirection::Agent,
+                "bob",
+                personal.as_str(),
+                true,
+                true,
+            ),
+            (
+                "a project workspace",
                 ChatDirection::Agent,
                 crate::users::ADMIN_USER_NAME,
-                "ws2",
+                "ws1",
                 true,
                 true,
             ),
@@ -2278,7 +2317,7 @@ mod tests {
 
         state.append_message(
             crate::users::ADMIN_USER_NAME,
-            "ws1",
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
             "msg-1".to_string(),
             "Hello!".to_string(),
             ChatDirection::User,
@@ -2332,7 +2371,7 @@ mod tests {
         assert_eq!(
             state.messages.len(),
             0,
-            "ws2 message should be filtered out"
+            "a project workspace's message is not the conversation's and must never be appended"
         );
     }
 
@@ -2342,7 +2381,7 @@ mod tests {
 
         state.append_message(
             crate::users::ADMIN_USER_NAME,
-            "ws1",
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
             "msg-agent".to_string(),
             "Agent answer".to_string(),
             ChatDirection::Agent,
@@ -2357,252 +2396,348 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // personal-workspace visibility (Assistant at any picker)
+    // one conversation, scoped to the admin's personal workspace
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_visible_chat_symmetric_at_any_picker() {
-        let admin = crate::users::ADMIN_USER_NAME;
-        let personal_name = crate::users::personal_workspace_name(admin);
-
-        // Project picker: project + personal visible; unrelated stays hidden.
-        let project = make_home_state("ws1");
-        assert_eq!(
-            project.visible_workspaces(),
-            VisibleChat {
-                primary: "ws1".to_string(),
-                merge: Some(personal_name.clone()),
-            }
-        );
-        assert!(project.workspace_visible("ws1"));
-        assert!(
-            project.workspace_visible(&personal_name),
-            "personal Assistant messages must be visible at any picker"
-        );
-        assert!(!project.workspace_visible("ws2"));
-        assert!(
-            !project.workspace_visible("personal:bob"),
-            "another user's personal workspace is not visible"
-        );
-
-        // Personal picker: personal + the admin's DB project workspace visible
-        // (symmetric — the picker selects the recipient, not the view).
-        let mut personal = make_home_state(&personal_name);
-        personal.user_project_workspace = Some("ws1".to_string());
-        assert_eq!(
-            personal.resolve_workspace_name(),
-            personal_name,
-            "a personal picker selection resolves to the personal workspace"
-        );
-        assert_eq!(
-            personal.visible_workspaces(),
-            VisibleChat {
-                primary: personal_name.clone(),
-                merge: Some("ws1".to_string()),
-            },
-            "personal picker merges the admin's project workspace"
-        );
-        assert!(personal.workspace_visible(&personal_name));
-        assert!(
-            personal.workspace_visible("ws1"),
-            "project messages must be visible at the personal picker"
-        );
-        assert!(
-            !personal.workspace_visible("ws2"),
-            "a non-selected project workspace stays hidden at the personal picker"
-        );
-
-        // No DB project workspace → personal-only view.
-        let personal_only = make_home_state(&personal_name);
-        assert_eq!(
-            personal_only.visible_workspaces(),
-            VisibleChat {
-                primary: personal_name,
-                merge: None,
-            },
-            "personal picker without a project workspace shows only the personal chat"
-        );
-        assert!(!personal_only.workspace_visible("ws1"));
-    }
-
-    #[test]
-    fn test_workspace_changed_at_personal_picker_resets_and_defers() {
-        // Switching to the Personal picker resets the chat and re-reads the
-        // admin's DB project workspace (completion via ProjectWorkspaceRefreshed
-        // is covered by test_project_workspace_refreshed_updates_merge_partner).
+    fn a_selection_change_leaves_the_conversation_alone() {
         let mut state = make_home_state("ws1");
-        state.user_project_workspace = Some("ws1".to_string());
         state
             .messages
-            .push(make_msg("m1", "hi", ChatDirection::User, None, false));
+            .push(make_msg("m1", "one", ChatDirection::User, None, false));
+        state.messages.push(make_msg(
+            "m2",
+            "two",
+            ChatDirection::Agent,
+            Some("assistant"),
+            false,
+        ));
+        state.seen_ids = state
+            .messages
+            .iter()
+            .map(|m| m.message_id.clone())
+            .collect();
+        state.sending = true;
+        state.typing = true;
+        state.auto_scroll_enabled = false; // the user has scrolled up
+        state.has_more = true;
+        state.oldest_loaded_id = Some(7);
+        let generation = state.history_gen;
 
-        let _task = state.update(HomeMessage::WorkspaceChanged(Some(
-            "personal:admin".to_string(),
-        )));
-        assert_eq!(state.selected_workspace.as_deref(), Some("personal:admin"));
+        // A selection change is recorded and nothing else — in any order, back
+        // and forth.
+        for picker in ["ws2", "ws1", "personal:admin"] {
+            let task = state.update(HomeMessage::WorkspaceChanged(picker.to_string()));
+            assert_eq!(task.units(), 0, "a selection change must issue no read");
+            assert_eq!(state.selected_workspace.as_deref(), Some(picker));
+            assert_eq!(generation, state.history_gen, "no load was issued");
+            let ids_and_contents: Vec<(&str, &str)> = state
+                .messages
+                .iter()
+                .map(|m| (m.message_id.as_str(), m.content.as_str()))
+                .collect();
+            assert_eq!(ids_and_contents, [("m1", "one"), ("m2", "two")]);
+            assert!(
+                state.sending && state.typing,
+                "live-work state is not the selection's to reset"
+            );
+            assert!(
+                !state.auto_scroll_enabled,
+                "a scrolled-up view must not be snapped back"
+            );
+            assert!(
+                state.has_more && state.oldest_loaded_id == Some(7),
+                "paging continues where it was"
+            );
+        }
+    }
+
+    #[test]
+    fn live_work_follows_the_conversation_not_the_selection() {
+        let personal = HomeState::conversation_workspace();
+        let message = |workspace: &str, id: &str| {
+            HomeMessage::ChatEvent(crate::ChatEvent::Message {
+                message_id: id.to_string(),
+                user_name: crate::users::ADMIN_USER_NAME.to_string(),
+                content: format!("from {workspace}"),
+                direction: ChatDirection::Agent,
+                timestamp: crate::db::now(),
+                channel: "gui".to_string(),
+                agent_role: Some("assistant".to_string()),
+                workspace: workspace.to_string(),
+                optimistic_id: None,
+                transient: false,
+                reply_reference: None,
+            })
+        };
+        let typing = |workspace: &str| {
+            HomeMessage::ChatEvent(crate::ChatEvent::Typing {
+                user_name: crate::users::ADMIN_USER_NAME.to_string(),
+                is_typing: true,
+                workspace: workspace.to_string(),
+            })
+        };
+
+        // The project the picker selects is where the work that follows runs —
+        // not where the conversation's live traffic lands.
+        let mut state = make_home_state("ws1");
+        state.sending = true;
+        let _ = state.update(message("ws1", "project-1"));
+        let _ = state.update(typing("ws1"));
         assert!(
             state.messages.is_empty(),
-            "chat state resets on workspace change"
+            "a project's message is never the conversation's"
         );
-        assert_eq!(
-            state.resolve_workspace_name(),
-            "personal:admin",
-            "personal picker selection resolves to the personal workspace"
+        assert!(
+            !state.typing && state.sending,
+            "a project's live work is not the conversation's cue either"
         );
 
-        // A project-picker change refreshes history directly and keeps the
-        // merge partner untouched (it only matters at the Personal picker).
-        let mut state = make_home_state("ws1");
-        state.user_project_workspace = Some("ws1".to_string());
-        let _task = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
-        assert_eq!(state.selected_workspace.as_deref(), Some("ws2"));
-        assert_eq!(state.user_project_workspace.as_deref(), Some("ws1"));
+        let _ = state.update(message(&personal, "own-1"));
+        let _ = state.update(typing(&personal));
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].message_id, "own-1");
+        assert!(state.typing, "the conversation's own typing cue is shown");
+        assert!(!state.sending, "its own live traffic clears the send");
     }
 
     #[test]
-    fn test_project_workspace_refreshed_updates_merge_partner() {
-        // At the Personal picker the refreshed DB project workspace drives
-        // the view (the wiring that keeps the merge partner fresh after a
-        // Users-page workspace edit).
-        let mut state = make_home_state("personal:admin");
-        state.user_project_workspace = Some("ws1".to_string());
-
-        let _ = state.update(HomeMessage::ProjectWorkspaceRefreshed(Some(
-            "ws2".to_string(),
-        )));
-        assert_eq!(state.user_project_workspace.as_deref(), Some("ws2"));
-        assert!(state.workspace_visible("ws2"));
-        assert!(!state.workspace_visible("ws1"));
-        assert_eq!(
-            state.visible_workspaces(),
-            VisibleChat {
-                primary: "personal:admin".to_string(),
-                merge: Some("ws2".to_string()),
-            }
-        );
-
-        // At a project picker the refreshed value is stored but the view is
-        // the selected workspace (no reload needed there).
-        let mut state = make_home_state("ws1");
-        state.user_project_workspace = Some("ws1".to_string());
-        let _ = state.update(HomeMessage::ProjectWorkspaceRefreshed(Some(
-            "ws2".to_string(),
-        )));
-        assert_eq!(state.user_project_workspace.as_deref(), Some("ws2"));
-        assert_eq!(
-            state.visible_workspaces(),
-            VisibleChat {
-                primary: "ws1".to_string(),
-                merge: Some("personal:admin".to_string()),
-            }
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
-    async fn test_project_workspace_for_reads_db_normalized() {
-        crate::util::test::init_test_stores().await;
-        let store = crate::users::USER_STORE
-            .get()
-            .expect("users store initialized");
-
-        // The guard restores the shared seeded admin row even when an assertion
-        // below panics.
-        crate::users::test_util::with_admin_workspace_restored(async {
-            // NULL → None.
-            store
-                .set_selected_workspace(crate::users::ADMIN_USER_NAME, None)
-                .await
-                .expect("update admin selected_workspace");
-            assert_eq!(HomeState::project_workspace_for().await, None);
-
-            // Personal DB workspace → None.
-            store
-                .set_selected_workspace(
-                    crate::users::ADMIN_USER_NAME,
-                    Some("personal:home_project_workspace_for"),
-                )
-                .await
-                .expect("update admin selected_workspace");
-            assert_eq!(HomeState::project_workspace_for().await, None);
-
-            // Shared DB workspace → Some(ws).
-            crate::util::test::create_test_workspace(
-                "/tmp/home_project_workspace_for_ws",
-                "ws_home_project_workspace_for",
-            )
-            .await;
-            store
-                .set_selected_workspace(
-                    crate::users::ADMIN_USER_NAME,
-                    Some("ws_home_project_workspace_for"),
-                )
-                .await
-                .expect("update admin selected_workspace");
-            assert_eq!(
-                HomeState::project_workspace_for().await.as_deref(),
-                Some("ws_home_project_workspace_for")
-            );
-        })
-        .await;
-    }
-
-    #[test]
-    fn test_call_site_wiring_symmetric_at_any_picker() {
-        // (picker, message workspace, agent role, content) — both directions:
-        // at the project picker personal Assistant messages append and
-        // clear sending/typing; at the personal picker Assistant messages
-        // still append into the admin's DB project workspace (the merge partner).
-        let cases = [
-            ("ws1", "personal:admin", "assistant", "Assistant reply"),
-            (
-                "personal:admin",
-                "ws1",
-                "assistant",
-                "Assistant reply in project",
-            ),
-        ];
-        for (picker, msg_ws, role, content) in cases {
-            let mut state = make_home_state(picker);
-            state.user_project_workspace = Some("ws1".to_string());
-            state.append_message(
-                crate::users::ADMIN_USER_NAME,
-                msg_ws,
-                "msg".to_string(),
-                content.to_string(),
-                ChatDirection::Agent,
-                Some(role.to_string()),
-                None,
-                None,
-            );
-            assert_eq!(state.messages.len(), 1);
-            assert_eq!(state.messages[0].content, content);
-            state.sending = true;
-            state.typing = true;
-            state.update_sending_state(ChatDirection::Agent, crate::users::ADMIN_USER_NAME, msg_ws);
-            assert!(!state.sending);
-            assert!(!state.typing);
-        }
-
-        // A project workspace that is not the admin's own stays hidden at the
-        // personal picker.
-        let mut state = make_home_state("personal:admin");
-        state.user_project_workspace = Some("ws1".to_string());
-        state.append_message(
-            crate::users::ADMIN_USER_NAME,
-            "ws2",
-            "msg-other".to_string(),
-            "other".to_string(),
+    fn a_reload_replaces_the_stored_history_and_keeps_what_is_not_stored() {
+        let mut state = HomeState::new();
+        let mut old = make_msg("old-1", "old", ChatDirection::User, None, false);
+        old.id = Some(1);
+        state.messages.push(make_msg(
+            "live-1",
+            "live",
             ChatDirection::Agent,
+            Some("assistant"),
+            false,
+        ));
+        state.messages.push(old);
+        state.messages.push(make_msg(
+            "opt-1",
+            "optimistic",
+            ChatDirection::User,
             None,
-            None,
-            None,
-        );
+            true,
+        ));
+        state.seen_ids = state
+            .messages
+            .iter()
+            .map(|m| m.message_id.clone())
+            .collect();
+
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: vec![
+                stored_entry(1, "old-1", "old"),
+                stored_entry(2, "new-2", "new"),
+            ],
+            has_more: false,
+            generation: state.history_gen,
+        });
+
+        // The stored page in chronological order, then what was kept, in its
+        // previous order.
+        let ids_and_contents: Vec<(&str, &str)> = state
+            .messages
+            .iter()
+            .map(|m| (m.message_id.as_str(), m.content.as_str()))
+            .collect();
         assert_eq!(
-            state.messages.len(),
-            0,
-            "messages from an unrelated workspace must not append at the personal picker"
+            ids_and_contents,
+            [
+                ("old-1", "old"),
+                ("new-2", "new"),
+                ("live-1", "live"),
+                ("opt-1", "optimistic"),
+            ]
         );
+        assert_eq!(state.messages[0].id, Some(1));
+        assert_eq!(state.messages[1].id, Some(2));
+        assert!(state.messages[2].id.is_none());
+        assert!(state.messages[3].id.is_none() && state.messages[3].is_optimistic);
+        let unique: HashSet<&str> = state
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        assert_eq!(unique.len(), state.messages.len(), "no duplicated ids");
+        assert_eq!(state.oldest_loaded_id, Some(1));
+    }
+
+    #[test]
+    fn a_reload_puts_a_kept_transient_message_back_among_the_stored_ones() {
+        let mut state = HomeState::new();
+        // The scripted onboarding exchange is transient — never stored — and
+        // carries the timestamp of the event that produced it.
+        let mut transient = make_msg(
+            "intro-1",
+            "intro",
+            ChatDirection::Agent,
+            Some("assistant"),
+            false,
+        );
+        transient.timestamp = Some("2026-01-01T10:00:00.000000000+00:00".to_string());
+        state.messages.push(transient);
+
+        let mut reply = stored_entry(5, "reply", "the reply");
+        reply.timestamp = Some("2026-01-01T10:00:05.000000000+00:00".to_string());
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: vec![reply],
+            has_more: false,
+            generation: state.history_gen,
+        });
+
+        let ids: Vec<&str> = state
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["intro-1", "reply"],
+            "a kept message stays in front of the stored one it preceded"
+        );
+        assert_eq!(state.oldest_loaded_id, Some(5));
+    }
+
+    #[test]
+    fn a_lost_confirmation_does_not_double_a_pending_send() {
+        let sent = "2026-01-01T10:00:00.000000000+00:00";
+        let mut confirmed = stored_entry(9, "pipeline-9", "hello");
+        confirmed.timestamp = Some("2026-01-01T10:00:01.000000000+00:00".to_string());
+
+        let mut state = HomeState::new();
+        let mut bubble = make_msg("opt-1", "hello", ChatDirection::User, None, true);
+        bubble.timestamp = Some(sent.to_string());
+        state.messages.push(bubble);
+        state.messages.push(make_msg(
+            "live-1",
+            "later",
+            ChatDirection::Agent,
+            Some("assistant"),
+            false,
+        ));
+
+        // The resync page brings the pending send back under the pipeline's own
+        // id — its confirmation was dropped with the lag.
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: vec![confirmed],
+            has_more: false,
+            generation: state.history_gen,
+        });
+        let ids: Vec<&str> = state
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["pipeline-9", "live-1"],
+            "the pending send appears once, as the stored row"
+        );
+
+        // A row of the same text written before the send is a message of its
+        // own, so the pending send is not swallowed by it.
+        let mut state = HomeState::new();
+        let mut bubble = make_msg("opt-2", "hello", ChatDirection::User, None, true);
+        bubble.timestamp = Some(sent.to_string());
+        state.messages.push(bubble);
+        let mut older_row = stored_entry(1, "old-1", "hello");
+        older_row.timestamp = Some("2026-01-01T09:00:00.000000000+00:00".to_string());
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: vec![older_row],
+            has_more: false,
+            generation: state.history_gen,
+        });
+        let ids: Vec<&str> = state
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["old-1", "opt-2"],
+            "an older row of the same text is not the pending send's copy"
+        );
+    }
+
+    #[test]
+    fn a_deduplicated_confirmation_still_frees_the_composer() {
+        // The row is already on screen and the bubble is gone, so the
+        // confirmation only repeats what is shown: it adds nothing and still
+        // releases the send guard.
+        let mut state = HomeState::new();
+        state.sending = true;
+        let mut row = make_msg("pipeline-9", "hello", ChatDirection::User, None, false);
+        row.id = Some(9);
+        state.messages.push(row);
+        state.seen_ids.insert("pipeline-9".to_string());
+
+        let _ = state.update(own_message("pipeline-9", None));
+        assert_eq!(state.messages.len(), 1);
+        assert!(
+            !state.sending,
+            "a deduplicated confirmation must not block the composer"
+        );
+    }
+
+    #[test]
+    fn a_reload_never_doubles_history() {
+        let mut state = HomeState::new();
+        state.messages.push(make_msg(
+            "in-flight",
+            "text",
+            ChatDirection::Agent,
+            Some("assistant"),
+            false,
+        ));
+        state.seen_ids.insert("in-flight".to_string());
+
+        // A live arrival whose copy the loaded page also carries appears
+        // exactly once — the stored copy, not the live one.
+        let _ = state.update(HomeMessage::HistoryLoaded {
+            entries: vec![stored_entry(5, "in-flight", "text")],
+            has_more: false,
+            generation: state.history_gen,
+        });
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].id, Some(5));
+    }
+
+    #[test]
+    fn test_older_history_prepends_and_drops_duplicates() {
+        let mut state = HomeState::new();
+        let mut ten = make_msg("m10", "ten", ChatDirection::User, None, false);
+        ten.id = Some(10);
+        state.messages.push(ten);
+        state.seen_ids.insert("m10".to_string());
+        state.loading_older = true;
+
+        let generation = state.pagination_gen;
+        let _ = state.update(HomeMessage::OlderHistoryLoaded(
+            vec![
+                stored_entry(9, "m9", "nine"),
+                stored_entry(10, "m10", "ten"),
+            ],
+            true,
+            generation,
+        ));
+
+        let ids_and_contents: Vec<(&str, &str)> = state
+            .messages
+            .iter()
+            .map(|m| (m.message_id.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            ids_and_contents,
+            [("m9", "nine"), ("m10", "ten")],
+            "the duplicate m10 was dropped, not re-added"
+        );
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.oldest_loaded_id, Some(9));
+        assert!(state.has_more);
+        assert!(!state.loading_older);
     }
 
     // ------------------------------------------------------------------
