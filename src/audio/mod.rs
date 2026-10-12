@@ -7,7 +7,10 @@
 //! `lib.rs`): the speech engine it is built on has no other platform support,
 //! and nothing here has a fallback. Linux and Windows builds do not contain any
 //! of this, and the surfaces that used to reach into it either disappear or
-//! answer honestly instead (a voice message is refused at intake there).
+//! answer honestly instead (a voice message is refused at intake there, and the
+//! `mahbot audio` command line is listed in their help and refuses both of its
+//! operations, naming the platform — see [`crate::audio_cli`], which compiles
+//! everywhere and is the frontend onto what lives here).
 //!
 //! Wake word detection runs entirely on the shared Qwen3-ASR encoder
 //! ([`wake_word`]) — no separate embedding model, no trainable head, no

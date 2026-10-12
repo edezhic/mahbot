@@ -322,11 +322,9 @@ async fn download_retry_loop() {
 
         if let Err(e) = &model_result {
             warn!(error = %e, retry_after_secs = delay.as_secs(), "Failed to download embedding model, retrying");
-            let _ = std::fs::remove_file(model_dest.with_extension("tmp"));
         }
         if let Err(e) = &tokenizer_result {
             warn!(error = %e, retry_after_secs = delay.as_secs(), "Failed to download tokenizer, retrying");
-            let _ = std::fs::remove_file(tokenizer_dest.with_extension("tmp"));
         }
 
         if model_ok && tokenizer_ok {

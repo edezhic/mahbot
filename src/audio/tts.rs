@@ -73,7 +73,14 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const DEFAULT_TOTAL_STEPS: usize = 8;
 const SPEED_FACTOR: f32 = 1.05;
 const MAX_CHUNK_LENGTH: usize = 300;
-const TTS_CHUNK_SILENCE_SECS: f32 = 0.3;
+/// The seed every reading the product speaks is rendered with: fixed, so the
+/// same text and voice always give the same waveform — the file the command
+/// line writes and the app's own read-aloud are then the same audio.
+const PLAYBACK_SEED: u64 = 42;
+/// The pause between two spoken parts, in milliseconds: the read-aloud path
+/// waits it out between parts, and a reading rendered to a file carries the
+/// same pause written into its audio.
+const TTS_CHUNK_SILENCE_MS: u64 = 300;
 // Timeout per-chunk receive: guards against hung synthesis (ONNX deadlock).
 const SYNTHESIS_CHUNK_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -113,7 +120,7 @@ const VECTOR_EST_ONNX_NAME: &str = "vector_estimator.onnx";
 const VOCODER_ONNX_NAME: &str = "vocoder.onnx";
 const TTS_JSON_NAME: &str = "tts.json";
 const UNICODE_INDEXER_NAME: &str = "unicode_indexer.json";
-const DEFAULT_VOICE_NAME: &str = "M1.json";
+pub(crate) const DEFAULT_VOICE_NAME: &str = "M1.json";
 
 /// The six `onnx/` model+config files as `(filename, expected sha256)`.
 /// Single source of truth for the download, cache-check, and test sites below.
@@ -128,9 +135,18 @@ const ONNX_TTS_FILES: &[(&str, &str)] = &[
 
 /// All 10 available voice styles from HuggingFace.
 /// F1-F5 are female voices, M1-M5 are male voices.
-const ALL_VOICE_STYLE_NAMES: &[&str] = &[
+pub(crate) const ALL_VOICE_STYLE_NAMES: &[&str] = &[
     "F1.json", "F2.json", "F3.json", "F4.json", "F5.json", "M1.json", "M2.json", "M3.json",
     "M4.json", "M5.json",
+];
+
+/// The speech model's own language tags: the 31 languages upstream publishes
+/// plus `na`, its language-agnostic fallback. A language the product spells is
+/// always one of these — the read-aloud setting's own value is put in the tag
+/// as it stands, and the command line's `--language` is read against this list.
+pub(crate) const TTS_LANGUAGES: &[&str] = &[
+    "en", "ko", "ja", "ar", "bg", "cs", "da", "de", "el", "es", "et", "fi", "fr", "hi", "hr", "hu",
+    "id", "it", "lt", "lv", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "tr", "uk", "vi", "na",
 ];
 
 // ── State machine ─────────────────────────────────────────────────────
@@ -694,15 +710,20 @@ pub fn synthesize(
     }
 }
 
+/// The ONNX model files in `dir`, in the order the set is fetched: the six files
+/// every reading needs, whatever voice it is spoken with.
+fn onnx_paths(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    ONNX_TTS_FILES
+        .iter()
+        .map(|(name, _)| dir.join(ONNX_DIR).join(name))
+}
+
 /// Essential TTS model file paths for a given model directory, used to
 /// verify that the model is fully cached on disk. Shared between
 /// [`try_load_cached`] and the test module helpers so the file set stays
 /// in sync.
 fn essential_tts_paths(dir: &Path) -> Vec<PathBuf> {
-    let mut paths: Vec<_> = ONNX_TTS_FILES
-        .iter()
-        .map(|(name, _)| dir.join(ONNX_DIR).join(name))
-        .collect();
+    let mut paths: Vec<_> = onnx_paths(dir).collect();
     // Also check that at least the default voice style exists
     paths.push(dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME));
     paths
@@ -797,6 +818,23 @@ fn load_voice_style(dir: &Path, voice_name: &str) -> Result<(Tensor, Tensor)> {
     Ok((style_dp, style_ttl))
 }
 
+/// A voice style, loaded: the pair of tensors a reading is spoken with.
+///
+/// [`ensure_ready_once`] loads it — that load is how it knows a request can be
+/// served from the cache — and hands it to [`render_speech_wav`], so one reading
+/// parses the style file once instead of proving it and then loading it again.
+pub(crate) struct Voice {
+    dp: Tensor,
+    ttl: Tensor,
+}
+
+impl Voice {
+    fn load(dir: &Path, voice_style: &str) -> Result<Self> {
+        let (dp, ttl) = load_voice_style(dir, voice_style)?;
+        Ok(Self { dp, ttl })
+    }
+}
+
 /// Flatten the first batch slice of a 3D `[batch, rows, cols]` style tensor
 /// and wrap it into a candle `Tensor` with the batch dimension restored.
 fn style_tensor(data: &[Vec<Vec<f32>>], label: &str, device: &Device) -> Result<Tensor> {
@@ -857,6 +895,72 @@ fn load_engine(dir: &Path) -> Result<TtsEngine> {
     })
 }
 
+/// Prepare the speech engine for one rendering: the model set, loaded from the
+/// cache when it is complete and fetched EXACTLY once when it is not. The voice
+/// that was loaded comes back with it, for the render to speak with.
+///
+/// No download retry loop: the daemon retries for as long as it is up, while a
+/// command line has one answer to give. `voice_style` names the voice style file
+/// the rendering will use — one file out of the set the product ships, fetched
+/// with the rest when it is missing. `announce_fetch` runs once, when the FIRST
+/// fetch that actually starts begins, with the model directory it goes into; a
+/// set already on disk needs nothing from the network, so it is not called.
+///
+/// A set is complete for this call when the ONNX files are on disk AND that ONE
+/// style file loads — [`try_load_cached`] asks for the default style instead,
+/// because the app reads aloud in one voice only, and a caller who asked for
+/// another voice must not pay for the whole set again on every run.
+///
+/// This prepares the engine for ONE operation and expects nothing to be up yet:
+/// [`init_global`] is called under the guard that asks whether the global is
+/// already there, because it refuses a second initialisation.
+pub(crate) async fn ensure_ready_once(
+    voice_style: &str,
+    announce_fetch: impl FnOnce(&Path),
+) -> Result<Voice> {
+    let dir = models_subdir(MODEL_DIR_NAME).context("Cannot resolve the speech model directory")?;
+
+    // The download events and the cancel channel have to exist before the
+    // engine can be parked in them.
+    if GLOBAL_TTS.get().is_none() {
+        init_global().context("Cannot initialize the speech engine")?;
+    }
+
+    // The notice is bound to the first fetch that actually starts: the set is
+    // verified file by file, and a set already on disk fetches nothing and says
+    // nothing.
+    let mut announce_fetch = Some(announce_fetch);
+    let mut fetch_starting = || {
+        if let Some(say) = announce_fetch.take() {
+            say(&dir);
+        }
+    };
+    // A set on disk is loaded from disk and verified against nothing: what the
+    // reading needs is the ONNX files and the ONE voice asked for, so a set
+    // fetched for another voice serves this one too, a caller repeating his own
+    // command repeats no work, and a style file that is there but unusable is
+    // not taken for a set either.
+    if onnx_paths(&dir).all(|path| path.exists())
+        && let Ok(voice) = Voice::load(&dir, voice_style)
+    {
+        match load_engine(&dir) {
+            Ok(engine) => {
+                set_engine_ready(engine);
+                return Ok(voice);
+            }
+            // Present is not the same as usable — a file left truncated by an
+            // interrupted fetch is not a set — so this falls through to the
+            // verified fetch below, which replaces what does not verify.
+            Err(e) => warn!("The cached speech models did not load, verifying them: {e}"),
+        }
+    }
+
+    ensure_models_downloaded(&dir, &[voice_style], &mut fetch_starting).await?;
+    let engine = load_engine(&dir).context("Cannot load the speech models")?;
+    set_engine_ready(engine);
+    Voice::load(&dir, voice_style)
+}
+
 // ── Download retry loop ──────────────────────────────────────────────
 
 /// Emit a download event through the global broadcast channel.
@@ -872,7 +976,7 @@ async fn download_retry_loop() {
         MODEL_DIR_NAME,
         "TTS",
         MODEL_DOWNLOAD_TIMEOUT,
-        async |dir| ensure_models_downloaded(dir).await,
+        async |dir| ensure_models_downloaded(dir, ALL_VOICE_STYLE_NAMES, &mut || {}).await,
         |dir| {
             let e = load_engine(dir)?;
             set_engine_ready(e);
@@ -897,10 +1001,10 @@ struct TtsFile {
     sha256: &'static str,
 }
 
-async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(dir.join(ONNX_DIR)).await?;
-    tokio::fs::create_dir_all(dir.join(VOICE_STYLES_DIR)).await?;
-
+/// The files the speech model set is made of: the ONNX models and config, plus
+/// the voice styles named in `styles`. The daemon's own acquisition asks for all
+/// of them; a caller that needs one voice asks for that one.
+fn model_files(dir: &Path, styles: &[&str]) -> Vec<TtsFile> {
     let base = format!("{HF_BASE}/{MODEL_REPO}/resolve/{MODEL_REVISION}");
 
     let mut files: Vec<TtsFile> = ONNX_TTS_FILES
@@ -912,25 +1016,43 @@ async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
         })
         .collect();
 
-    // Add all 10 voice style files. Only M1.json has a verified SHA256;
-    // the rest have empty hashes (minimum-size check only) until they
-    // are verified against downloads.
-    for style_name in ALL_VOICE_STYLE_NAMES {
-        let sha = if *style_name == DEFAULT_VOICE_NAME {
+    files.extend(
+        styles
+            .iter()
+            .map(|style_name| voice_style_file(dir, style_name)),
+    );
+    files
+}
+
+/// One voice style file out of the set the product ships.
+fn voice_style_file(dir: &Path, name: &str) -> TtsFile {
+    TtsFile {
+        url: format!("{HF_BASE}/{MODEL_REPO}/resolve/{MODEL_REVISION}/{VOICE_STYLES_DIR}/{name}"),
+        path: dir.join(VOICE_STYLES_DIR).join(name),
+        // Only M1.json has a verified SHA256; the rest have empty hashes
+        // (minimum-size check only) until they are verified against downloads.
+        sha256: if name == DEFAULT_VOICE_NAME {
             VOICE_STYLE_SHA256
         } else {
-            "" // No verified hash yet — minimum-size check only
-        };
-        files.push(TtsFile {
-            url: format!("{base}/{VOICE_STYLES_DIR}/{style_name}"),
-            path: dir.join(VOICE_STYLES_DIR).join(style_name),
-            sha256: sha,
-        });
+            ""
+        },
     }
+}
+
+/// Fetch the model set, calling `fetch_starting` before the first file that
+/// actually has to be fetched — a file already on disk is verified and skipped,
+/// so a set that needs nothing from the network does not call it.
+async fn ensure_models_downloaded(
+    dir: &Path,
+    styles: &[&str],
+    fetch_starting: &mut impl FnMut(),
+) -> Result<()> {
+    tokio::fs::create_dir_all(dir.join(ONNX_DIR)).await?;
+    tokio::fs::create_dir_all(dir.join(VOICE_STYLES_DIR)).await?;
 
     // Sequential downloads so per-file progress is meaningful
-    for f in &files {
-        if let Err(e) = ensure_file(f).await {
+    for f in &model_files(dir, styles) {
+        if let Err(e) = ensure_file(f, fetch_starting).await {
             let file_name = f
                 .path
                 .file_name()
@@ -947,8 +1069,10 @@ async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Ensure a single file exists and is uncorrupted, or download it.
-async fn ensure_file(f: &TtsFile) -> Result<()> {
+/// Ensure a single file exists and is uncorrupted, or download it. `fetch_starting`
+/// is called once, just before the download that actually streams, so a caller
+/// can bind a notice to a fetch that really begins.
+async fn ensure_file(f: &TtsFile, fetch_starting: &mut impl FnMut()) -> Result<()> {
     let file_name = f
         .path
         .file_name()
@@ -970,6 +1094,7 @@ async fn ensure_file(f: &TtsFile) -> Result<()> {
             // First call (pre-stream) carries total_bytes → FileStarted.
             if !started {
                 started = true;
+                fetch_starting();
                 emit_download_event(TtsDownloadEvent::FileStarted {
                     name: file_name.clone(),
                     total_bytes: total_size,
@@ -1352,30 +1477,25 @@ fn synthesize_internal(
 /// Synthesize with chunking for long texts, streaming each chunk through
 /// a bounded channel as it becomes available.
 ///
-/// Language tags are applied per-chunk (model requires `<en>...</en>` wrapping).
-/// Each chunk's PCM samples are sent via the provided sender. The function
-/// returns `Ok(())` when all chunks have been sent, or an error on cancellation
+/// The reading is split into parts ([`reading_parts`]) and each part is spoken
+/// under the language tag `lang` (the model requires `<en>...</en>` wrapping).
+/// Each part's PCM samples are sent via the provided sender. The function
+/// returns `Ok(())` when all parts have been sent, or an error on cancellation
 /// or if the receiver was dropped.
 ///
 /// # Error propagation (intentional asymmetry)
 ///
-/// There are two code paths with different error-handling strategies:
-///
-/// **Short-text path** (`text.len() <= MAX_CHUNK_LENGTH`):
-/// Propagates synthesis errors via `?` because there is only one chunk — a
-/// failure means no audio at all, so an error is the correct response.
-///
-/// **Long-text path** (multiple chunks):
-/// Logs individual chunk failures via `warn!` and continues to the next chunk.
-/// This is intentional: a single problematic sentence should not abort the
-/// entire response. The user hears partial audio (all succeeding chunks)
-/// rather than silence from an aborted synthesis. Only fatal errors
-/// (cancellation, receiver drop) are propagated.
+/// A part that fails to render is skipped with a `warn!` — one bad sentence
+/// should not abort the whole response, so the user hears the rest — except
+/// when it is the only part: there is then no audio at all, and the error is
+/// returned instead. Cancellation and a dropped receiver are always fatal.
+#[expect(clippy::too_many_arguments)]
 fn synthesize_chunked_streaming(
     engine: &TtsEngine,
     text: &str,
     style_dp: &Tensor,
     style_ttl: &Tensor,
+    lang: &str,
     cancel: Option<&AtomicBool>,
     tx: &mpsc::Sender<Vec<f32>>,
     seed: u64,
@@ -1385,41 +1505,61 @@ fn synthesize_chunked_streaming(
         anyhow::bail!("Synthesis cancelled");
     }
 
-    if text.len() <= MAX_CHUNK_LENGTH {
-        let samples = synthesize_internal(engine, &wrap_lang_tag(text), style_dp, style_ttl, seed)?;
-        tx.blocking_send(samples)
-            .map_err(|_| anyhow!("Synthesis cancelled (receiver dropped)"))?;
-        return Ok(());
-    }
-
-    for chunk in split_at_sentence_boundaries(text, MAX_CHUNK_LENGTH) {
+    let parts = reading_parts(text);
+    let single = parts.len() == 1;
+    for part in parts {
         // Check cancellation between chunks
         if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
             anyhow::bail!("Synthesis cancelled");
         }
-        match synthesize_internal(engine, &wrap_lang_tag(&chunk), style_dp, style_ttl, seed) {
+        match synthesize_part(engine, &part, style_dp, style_ttl, lang, seed) {
             Ok(samples) => {
                 if tx.blocking_send(samples).is_err() {
                     anyhow::bail!("Synthesis cancelled (receiver dropped)");
                 }
             }
-            Err(e) => {
-                warn!("TTS: chunk synthesis failed, skipping chunk: {e}");
-            }
+            Err(e) if !single => warn!("TTS: chunk synthesis failed, skipping chunk: {e}"),
+            Err(e) => return Err(e),
         }
     }
     Ok(())
 }
 
+/// The parts of one reading, in the order the product speaks them: one part when
+/// the text fits [`MAX_CHUNK_LENGTH`], else the sentence-boundary split
+/// ([`split_at_sentence_boundaries`]).
+fn reading_parts(text: &str) -> Vec<String> {
+    if text.len() <= MAX_CHUNK_LENGTH {
+        vec![text.to_string()]
+    } else {
+        split_at_sentence_boundaries(text, MAX_CHUNK_LENGTH)
+    }
+}
+
+/// Render one part of a reading under the language tag it is spoken in.
+fn synthesize_part(
+    engine: &TtsEngine,
+    part: &str,
+    style_dp: &Tensor,
+    style_ttl: &Tensor,
+    lang: &str,
+    seed: u64,
+) -> Result<Vec<f32>> {
+    synthesize_internal(
+        engine,
+        &wrap_lang_tag(part, lang),
+        style_dp,
+        style_ttl,
+        seed,
+    )
+}
+
 /// Wrap text in a language tag for the Supertonic 3 model.
 ///
-/// Reads the language tag from `CONFIG.tts_language()` (defaults to `"na"` —
-/// the model's language-agnostic fallback). Users can set `tts_language` in
-/// config to any supported code: en, ko, ja, ar, bg, cs, da, de, el, es, et,
-/// fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr,
-/// uk, vi, na.
-fn wrap_lang_tag(text: &str) -> String {
-    let lang = CONFIG.tts_language();
+/// The language is the caller's — the read-aloud setting's value (defaults to
+/// `"na"`, the model's language-agnostic fallback) or the command line's
+/// `--language` — and is one of [`TTS_LANGUAGES`].
+fn wrap_lang_tag(text: &str, lang: &str) -> String {
     format!("<{lang}>{text}</{lang}>")
 }
 
@@ -1506,6 +1646,49 @@ pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+// ── Speech file rendering ────────────────────────────────────────────
+
+/// Render `text` to the spoken file's bytes: the product's own reading path —
+/// the same preparation, the same split at sentence boundaries, the same
+/// per-part rendering under the same language tag, and the same pause between
+/// the parts, written into the audio rather than waited out — assembled into one
+/// uncompressed WAV at the engine's own sample rate.
+///
+/// The voice comes from [`ensure_ready_once`], loaded for this reading already.
+/// Unlike the read-aloud path, a part that fails to render fails the whole
+/// reading: a file delivered with a part missing would be a lie about what the
+/// text says.
+pub(crate) async fn render_speech_wav(text: &str, voice: Voice, lang: &str) -> Result<Vec<u8>> {
+    let processed = preprocess_text(text);
+
+    let engine = get_engine_clone().context("the speech engine is not loaded")?;
+    let sample_rate = engine.sample_rate;
+
+    let lang = lang.to_string();
+    tokio::task::spawn_blocking(move || {
+        let Voice {
+            dp: style_dp,
+            ttl: style_ttl,
+        } = voice;
+        // The pause the read-aloud path waits out between parts, in samples: the
+        // same duration, written into the audio instead.
+        let gap = usize::try_from(u64::from(sample_rate) * TTS_CHUNK_SILENCE_MS / 1000)
+            .unwrap_or_default();
+        let mut pcm: Vec<f32> = Vec::new();
+        for part in reading_parts(&processed) {
+            let samples =
+                synthesize_part(&engine, &part, &style_dp, &style_ttl, &lang, PLAYBACK_SEED)?;
+            if !pcm.is_empty() {
+                pcm.resize(pcm.len() + gap, 0.0);
+            }
+            pcm.extend_from_slice(&samples);
+        }
+        render_wav(&pcm, sample_rate)
+    })
+    .await
+    .context("the speech synthesis task panicked")?
+}
+
 // ── Async speak ──────────────────────────────────────────────────────
 
 #[expect(clippy::too_many_lines)]
@@ -1520,6 +1703,10 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
 
     // Process text (lightweight, no blocking I/O)
     let processed = preprocess_text(&text);
+
+    // The read-aloud language, read once: the synthesis itself runs on a
+    // blocking thread that must not touch the config.
+    let lang = CONFIG.tts_language();
 
     // Clone the engine Arc outside the blocking task so the RwLock is
     // not held across CPU-bound synthesis (which can take seconds).
@@ -1568,9 +1755,10 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
             &processed,
             &style_dp,
             &style_ttl,
+            &lang,
             cancel_flag.as_deref(),
             &tx,
-            42, // default seed for playback
+            PLAYBACK_SEED,
         )
     });
 
@@ -1629,7 +1817,7 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
                 break;
             }
             // Natural pause between speech chunks
-            tokio::time::sleep(Duration::from_secs_f32(TTS_CHUNK_SILENCE_SECS)).await;
+            tokio::time::sleep(Duration::from_millis(TTS_CHUNK_SILENCE_MS)).await;
         }
 
         // Render WAV bytes for this chunk (in-memory, no file I/O).
@@ -2074,33 +2262,16 @@ mod tests {
         }
     }
 
-    /// Panic-safe guard that restores the TTS language config on drop.
-    struct TtsLangGuard {
-        saved: String,
-    }
-
-    impl Drop for TtsLangGuard {
-        fn drop(&mut self) {
-            let _ = CONFIG.set_string_field("tts_language", &self.saved);
-        }
-    }
-
     #[test]
     fn test_wrap_lang_tag() {
-        let _guard = TtsLangGuard {
-            saved: CONFIG.tts_language(),
-        };
+        assert_eq!(
+            wrap_lang_tag("Hello world", "en"),
+            "<en>Hello world</en>",
+            "text wrapped in language tag"
+        );
 
-        // Force language to "en" for deterministic test
-        let _ = CONFIG.set_string_field("tts_language", "en");
-        let r = wrap_lang_tag("Hello world");
-        assert_eq!(r, "<en>Hello world</en>", "text wrapped in language tag");
-
-        // Test with language-agnostic tag
-        let _ = CONFIG.set_string_field("tts_language", "na");
-        let r2 = wrap_lang_tag("Test");
-        assert_eq!(r2, "<na>Test</na>");
-        // _guard restores original language on drop (including on panic)
+        // Language-agnostic tag
+        assert_eq!(wrap_lang_tag("Test", "na"), "<na>Test</na>");
     }
 
     // ── Tier 2: encode_text with synthetic indexer ────────────────────
@@ -2829,6 +3000,25 @@ mod tests {
             let _ = std::fs::remove_file(&wav_path);
             panic!("ASR transcription failed: {e}");
         });
+
+        // ── The engine's own bound ────────────────────────────────────
+        //
+        // A millisecond stands in for the engine's ten minutes — the same
+        // timeout racing the same inference, so the same failure — because
+        // reaching the real bound would need hours of audio. The failure must be
+        // the recogniser's own type, never a partial transcript, which is what
+        // `mahbot audio` turns into its long-recording error.
+        let err = crate::audio::local_transcriber::transcribe_file_async(
+            &wav_path,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a 1 ms bound must time the inference out");
+        assert!(
+            err.downcast_ref::<crate::audio::local_transcriber::InferenceTimedOut>()
+                .is_some(),
+            "the timeout must be InferenceTimedOut, got: {err}"
+        );
 
         // ── Clean up temp file ────────────────────────────────────────
         let _ = std::fs::remove_file(&wav_path);

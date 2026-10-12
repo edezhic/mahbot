@@ -46,13 +46,14 @@
 //! * **WAV** — decoded via `qwen_asr::audio::parse_wav_buffer()` (qwen-asr's
 //!   built-in parser, which handles resampling from any sample rate).
 //!
-//! # Call site
+//! # Call sites
 //!
-//! The [`transcribe_file_async`] function is called from
-//! [`crate::channels::enrichment::transcribe_audio_marker`].  When the local
-//! model is unavailable or disabled in config, the caller annotates the
-//! message with just the audio-transcription icon combo — there is no API
-//! fallback.
+//! [`transcribe_file_async`] has three callers: the voice pipeline
+//! ([`crate::audio::voice`], a whole recording), the enrichment path
+//! ([`crate::channels::enrichment::transcribe_audio_marker`], an attached audio
+//! file) and `mahbot audio transcribe`.  When the local model is unavailable or
+//! disabled in config, the enrichment caller annotates the message with just the
+//! audio-transcription icon combo — there is no API fallback.
 
 use crate::audio::models_subdir;
 use crate::util::UnwrapPoison;
@@ -115,8 +116,26 @@ const MERGES_SHA256: &str = "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74
 /// several minutes.  This timeout prevents a hung inference from
 /// permanently occupying a tokio blocking thread.
 ///
-/// Shared by the voice pipeline and the audio-enrichment path.
+/// Shared by the voice pipeline, the audio-enrichment path, and
+/// `mahbot audio transcribe` — which answers this bound in its own words.
 pub(crate) const INFERENCE_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// The recogniser's own bound on one inference ([`INFERENCE_TIMEOUT`]) was
+/// reached: the recording is longer than the engine will take.
+///
+/// A type rather than a message, so `mahbot audio` can answer this failure in its
+/// own words — a recording longer than the engine takes, and never a transcript
+/// with a part of it missing — without matching on the engine's wording.
+#[derive(Debug)]
+pub(crate) struct InferenceTimedOut;
+
+impl std::fmt::Display for InferenceTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Qwen3-ASR inference timed out")
+    }
+}
+
+impl std::error::Error for InferenceTimedOut {}
 
 /// Download timeout for the 1.88 GB model file (30 minutes).
 /// The smaller files (vocab.json, merges.txt) complete far sooner under this
@@ -246,9 +265,9 @@ impl QwenLocalTranscriber {
 /// # Timeout
 ///
 /// `inference_timeout` controls the maximum wall-clock time for the ONNX
-/// inference step (audio decoding is excluded from the timeout).  Both
-/// callers — the voice pipeline (recordings up to 10 minutes) and the
-/// enrichment path for attached audio — pass [`INFERENCE_TIMEOUT`].
+/// inference step (audio decoding is excluded from the timeout).  Every caller
+/// — the voice pipeline (recordings up to 10 minutes), the enrichment path for
+/// attached audio, and `mahbot audio transcribe` — passes [`INFERENCE_TIMEOUT`].
 ///
 /// A shutdown guard races against the inference so that a stalled model
 /// cannot block pipeline exit.
@@ -297,7 +316,7 @@ pub async fn transcribe_file_async(path: &Path, inference_timeout: Duration) -> 
             .await
             .context("Inference task panicked")?
         }) => {
-            result.context("Qwen3-ASR inference timed out")?
+            result.map_err(|_| anyhow::Error::new(InferenceTimedOut))?
         }
         () = shutdown_token.cancelled() => {
             anyhow::bail!("Shutdown during audio transcription");
@@ -308,6 +327,32 @@ pub async fn transcribe_file_async(path: &Path, inference_timeout: Duration) -> 
 }
 
 // ── Audio decoding ────────────────────────────────────────────────────
+
+/// The audio names the recogniser takes — the formats are WAV, OGG/Opus and MP3
+/// (see the module docs) — and how each one is decoded.
+///
+/// This is the ONE table of that rule: [`decode_audio_to_mono_f32`] dispatches
+/// through it, [`takes_audio`] accepts a file by it, and a caller's refusal lists
+/// it, so a format can never be taken by one of them and refused by another. A
+/// file under a name outside the table is decoded when its bytes begin with OGG's
+/// magic — [`takes_audio`] is the rule a caller asks.
+pub(crate) const AUDIO_FORMATS: &[(&str, AudioFormat)] = &[
+    ("wav", AudioFormat::Wav),
+    ("ogg", AudioFormat::Opus),
+    ("oga", AudioFormat::Opus),
+    ("mp3", AudioFormat::Mp3),
+];
+
+/// The decoding one name in [`AUDIO_FORMATS`] stands for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AudioFormat {
+    /// qwen-asr's own parser for WAV.
+    Wav,
+    /// Pure-Rust OGG demuxing and Opus decoding.
+    Opus,
+    /// The `minimp3` decoder.
+    Mp3,
+}
 
 /// Decode any supported audio file to 16 kHz mono f32 samples.
 ///
@@ -323,13 +368,19 @@ pub(crate) fn decode_audio_to_mono_f32(path: &Path) -> Result<Vec<f32>> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    // What the file's name says it is: one of the names in [`AUDIO_FORMATS`], or
+    // none of them.
+    let format = AUDIO_FORMATS
+        .iter()
+        .find(|(name, _)| *name == ext)
+        .map(|(_, format)| *format);
 
     // Read the file into memory for decoding.
     let data = std::fs::read(path)
         .with_context(|| format!("Failed to read audio file: {}", path.display()))?;
 
     // Fast path for WAV files — use qwen-asr's native parser.
-    if ext == "wav" {
+    if format == Some(AudioFormat::Wav) {
         // Attempt once; success returns immediately, failure falls through
         // to the generic decoder match below (which will fail with a clear
         // error rather than calling parse_wav_buffer a second time).
@@ -343,19 +394,19 @@ pub(crate) fn decode_audio_to_mono_f32(path: &Path) -> Result<Vec<f32>> {
         anyhow::bail!("Audio file too small: {}", path.display());
     }
 
-    let (samples, sample_rate) = match ext.as_str() {
-        "ogg" | "oga" => decode_opus_from_ogg(&data, path)?,
-        "mp3" => decode_mp3(&data, path)?,
-        "wav" => {
+    let (samples, sample_rate) = match format {
+        Some(AudioFormat::Opus) => decode_opus_from_ogg(&data, path)?,
+        Some(AudioFormat::Mp3) => decode_mp3(&data, path)?,
+        Some(AudioFormat::Wav) => {
             // Fast-path above already failed — don't retry the same call.
             anyhow::bail!(
                 "Failed to decode WAV file (format error): {}",
                 path.display()
             );
         }
-        // For unknown formats, try OGG/Opus (common Telegram format).
-        _ => {
-            // Check for OGG magic bytes.
+        // For a name no format is named with, try OGG/Opus: its magic bytes are
+        // the only thing that can make such a file audio.
+        None => {
             if data.len() >= 4 && &data[0..4] == b"OggS" {
                 decode_opus_from_ogg(&data, path)?
             } else {
@@ -374,6 +425,31 @@ pub(crate) fn decode_audio_to_mono_f32(path: &Path) -> Result<Vec<f32>> {
             qwen_asr::audio::resample(&samples, sample_rate, qwen_asr::config::SAMPLE_RATE);
         Ok(resampled)
     }
+}
+
+/// Whether the recogniser takes this file — its own rule, and only it: one of the
+/// names [`AUDIO_FORMATS`] holds, or, under a name the decoder does not know,
+/// content that begins with Ogg's magic (which is how a Telegram voice note is
+/// taken). A name [`decode_audio_to_mono_f32`] knows is settled by the NAME, as
+/// that decoder settles it. `Err` is a file that cannot be opened at all, which a
+/// caller answers as its own misuse rather than as a failure of the work. A caller
+/// asks this before it fetches anything, so a typo never costs a model download.
+pub(crate) fn takes_audio(path: &Path) -> std::io::Result<bool> {
+    // Opening is also the readability check, and asking the rule costs one open.
+    let mut file = std::fs::File::open(path)?;
+    let named = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            AUDIO_FORMATS
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(extension))
+        });
+    if named {
+        return Ok(true);
+    }
+    let mut magic = [0u8; 4];
+    Ok(std::io::Read::read_exact(&mut file, &mut magic).is_ok_and(|()| magic == *b"OggS"))
 }
 
 /// Decode an OGG/Opus file into mono f32 samples at the file's sample rate.
@@ -615,6 +691,62 @@ fn download_client() -> Result<reqwest::Client> {
         .context("Failed to create HTTP client for model download")
 }
 
+/// Fetch the whole model set once: every file, verified as it streams, with a
+/// file already on disk re-verified and re-downloaded only when it does not
+/// match. No retry and no backoff — the caller decides what a failure means.
+/// `fetch_starting` is called before the first file actually fetched, so a
+/// caller can bind a notice to a fetch that really begins.
+async fn download_once(
+    client: &reqwest::Client,
+    dir: &Path,
+    files: &[ModelFile],
+    fetch_starting: &mut impl FnMut(),
+) -> Result<()> {
+    for file in files {
+        let dest = dir.join(file.filename);
+        if dest.exists() {
+            // Verify existing file on a blocking thread (SHA256 reads
+            // the full 1.88 GB model file).
+            let dest_clone = dest.clone();
+            let expected = file.expected_sha256.to_string();
+            let checksum_ok = tokio::task::spawn_blocking(move || {
+                crate::audio::util::verify_sha256(&dest_clone, &expected).is_ok()
+            })
+            .await
+            .unwrap_or_else(|join_err| {
+                warn!("Local transcriber: SHA256 verification task panicked: {join_err}");
+                false
+            }); // JoinError → log and treat as checksum mismatch, will re-download
+
+            if checksum_ok {
+                continue;
+            }
+            warn!(
+                "Local transcriber: {} SHA256 mismatch, re-downloading",
+                file.filename
+            );
+            // Remove the corrupted file so the download starts fresh.
+            tokio::fs::remove_file(&dest).await.ok();
+        }
+
+        info!("Local transcriber: downloading {}", file.filename);
+        fetch_starting();
+
+        // download_file already verifies SHA256 during streaming and removes
+        // the file on mismatch, so no re-verification is needed on success.
+        if let Err(e) = download_file(client, file, &dest).await {
+            warn!(
+                "Local transcriber: failed to download {}: {e}",
+                file.filename
+            );
+            tokio::fs::remove_file(&dest).await.ok();
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
 /// Background download loop with retry.
 ///
 /// Downloads all model files sequentially. On failure, sleeps with exponential
@@ -654,58 +786,12 @@ async fn download_retry_loop() {
 
     loop {
         attempt += 1;
-        let mut all_ok = true;
+        info!("Local transcriber: model download attempt {attempt}/{MAX_DOWNLOAD_RETRIES}");
 
-        for file in &files {
-            let dest = dir.join(file.filename);
-            if dest.exists() {
-                // Verify existing file on a blocking thread (SHA256 reads
-                // the full 1.88 GB model file).
-                let dest_clone = dest.clone();
-                let expected = file.expected_sha256.to_string();
-                let checksum_ok = tokio::task::spawn_blocking(move || {
-                    crate::audio::util::verify_sha256(&dest_clone, &expected).is_ok()
-                })
-                .await
-                .unwrap_or_else(|join_err| {
-                    warn!("Local transcriber: SHA256 verification task panicked: {join_err}");
-                    false
-                }); // JoinError → log and treat as checksum mismatch, will re-download
-
-                if checksum_ok {
-                    continue;
-                }
-                warn!(
-                    "Local transcriber: {} SHA256 mismatch, re-downloading",
-                    file.filename
-                );
-                // Remove the corrupted file so the download starts fresh.
-                tokio::fs::remove_file(&dest).await.ok();
-            }
-
-            info!(
-                "Local transcriber: downloading {} — attempt {attempt}/{MAX_DOWNLOAD_RETRIES}",
-                file.filename,
-            );
-
-            match download_file(&client, file, &dest).await {
-                Ok(()) => {
-                    // download_file already verifies SHA256 during streaming
-                    // and removes the file on mismatch, so no re-verification needed.
-                }
-                Err(e) => {
-                    warn!(
-                        "Local transcriber: failed to download {}: {e}",
-                        file.filename
-                    );
-                    tokio::fs::remove_file(&dest).await.ok();
-                    all_ok = false;
-                    break;
-                }
-            }
-        }
-
-        if all_ok {
+        if download_once(&client, &dir, &files, &mut || {})
+            .await
+            .is_ok()
+        {
             // All files downloaded and verified. Load the model on a blocking
             // thread (reads model weights from disk).
             info!("Local transcriber: all model files downloaded, loading...");
@@ -761,6 +847,61 @@ async fn load_from_cache(dir: PathBuf) -> Option<QwenLocalTranscriber> {
         .flatten()
 }
 
+/// Prepare the recogniser for one operation: the model set, loaded from the
+/// cache when it is complete and fetched EXACTLY once when it is not.
+///
+/// No background task and no retry loop: the product's own daemon retries for
+/// as long as it is up and never has to answer a caller, while a command line
+/// has one answer to give — a failure is reported, never waited on.
+/// `announce_fetch` runs once, before the FIRST file that actually has to be
+/// fetched, with the model directory it goes into; a set already on disk fetches
+/// nothing and says nothing.
+///
+/// The caller prepares the recogniser for ONE operation, so nothing here is
+/// already up when this is called — the daemon never calls this function.
+/// Readiness comes from the model directory alone: the set is loaded from it when
+/// it is already complete, and fetched into it when it is not.
+pub(crate) async fn ensure_ready_once(announce_fetch: impl FnOnce(&Path)) -> Result<()> {
+    let dir = models_subdir(MODEL_DIR_NAME)
+        .context("cannot resolve the model directory (the storage root is not set)")?;
+
+    if cache_present(&dir)
+        && let Some(tc) = load_from_cache(dir.clone()).await
+    {
+        set_transcriber_ready(tc);
+        return Ok(());
+    }
+
+    // The notice is bound to the first file that is actually fetched: the set is
+    // verified file by file, and a set already on disk fetches nothing and says
+    // nothing.
+    let mut announce_fetch = Some(announce_fetch);
+    let mut fetch_starting = || {
+        if let Some(say) = announce_fetch.take() {
+            say(&dir);
+        }
+    };
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .context("Failed to create the model directory")?;
+    let client = download_client()?;
+    download_once(&client, &dir, &model_files(), &mut fetch_starting)
+        .await
+        .context("Failed to fetch the recognition model")?;
+    let tc = load_from_cache(dir)
+        .await
+        .context("the recognition model could not be loaded")?;
+    set_transcriber_ready(tc);
+    Ok(())
+}
+
+/// Whether every file the recogniser needs is present in `dir`.
+fn cache_present(dir: &Path) -> bool {
+    dir.join(MODEL_FILENAME).exists()
+        && dir.join(VOCAB_FILENAME).exists()
+        && dir.join(MERGES_FILENAME).exists()
+}
+
 /// Shared cache-check + load logic used by both the awaited entry
 /// ([`try_init_from_cache`]) and the background boot init
 /// ([`init_background`]). The caller is responsible for the STATE atomic
@@ -774,11 +915,7 @@ async fn load_from_cache(dir: PathBuf) -> Option<QwenLocalTranscriber> {
 /// (Tradeoff: the mmap-based load can succeed on partial corruption —
 /// accepted; see module docs.)
 async fn try_init_inner(dir: PathBuf) -> bool {
-    let model_path = dir.join(MODEL_FILENAME);
-    let vocab_path = dir.join(VOCAB_FILENAME);
-    let merges_path = dir.join(MERGES_FILENAME);
-
-    if model_path.exists() && vocab_path.exists() && merges_path.exists() {
+    if cache_present(&dir) {
         if let Some(tc) = load_from_cache(dir).await {
             info!("Local transcriber: loaded from cache");
             set_transcriber_ready(tc);
@@ -809,11 +946,7 @@ async fn try_init_inner(dir: PathBuf) -> bool {
 /// transition STATE to a terminal state ([`set_transcriber_ready`] /
 /// `Failed`).
 async fn init_background(dir: PathBuf) {
-    let model_path = dir.join(MODEL_FILENAME);
-    let vocab_path = dir.join(VOCAB_FILENAME);
-    let merges_path = dir.join(MERGES_FILENAME);
-
-    if model_path.exists() && vocab_path.exists() && merges_path.exists() {
+    if cache_present(&dir) {
         if let Some(tc) = load_from_cache(dir).await {
             info!("Local Qwen3-ASR transcriber loaded from cache");
             set_transcriber_ready(tc);

@@ -12,8 +12,11 @@
 //! execution entry point in [`instance`], and the frontend's own command line:
 //! the family/operation/flag registry that ties every sub-command to one tool
 //! action, the argv parsing under it, the help, and the [`Exit`] classes a
-//! script reads.
+//! script reads. The flag grammar itself is [`grammar`], which `mahbot audio`
+//! reads too — the browser-automation command and the OpenRouter benchmark read
+//! their own flags and word their own refusals.
 
+pub(crate) mod grammar;
 pub(crate) mod instance;
 
 use std::fmt::Write as _;
@@ -26,8 +29,8 @@ use crate::util::lock::InstanceLockState;
 /// command-line families among them.
 ///
 /// It lives beside the family registry rather than in the binary so that the
-/// check that each family is listed runs in the library's own test lane
-/// (`every_family_is_listed_in_the_top_level_usage`) — a family reachable only
+/// check that every entry point is listed runs in the library's own test lane
+/// (`every_entry_point_is_listed_in_the_top_level_usage`) — one reachable only
 /// by someone who already knew its word would not be an entry point.
 pub const TOP_LEVEL_USAGE: &str = "\
 mahbot — autonomous agentic engineering system with a GUI dashboard daemon
@@ -36,6 +39,9 @@ Usage:
   mahbot                 Launch the GUI dashboard daemon
   mahbot paused          Launch the daemon with every registered workspace
                          paused (no ticket is claimed or advanced)
+  mahbot audio <operation> [flags]
+                         Speech on the command line (macOS): a recording into
+                         text, text into a spoken WAV file
   mahbot chrome <args>   Browser automation CLI over the shared chrome core
   mahbot debug           Read-only SQL query tool against the live stores
   mahbot bench-openrouter <args>
@@ -161,19 +167,31 @@ pub(crate) async fn wait_for_service() -> ServiceGate {
 // ── The exit classes ──────────────────────────────────────────────
 
 /// The exit-code classes a command line here separates — the same numbering the
-/// browser-automation command uses: success, a failed operation, the
-/// environment, and this command's own misuse.
+/// browser-automation command and `mahbot audio` use: success, a failed
+/// operation, the environment, and the command's own misuse.
 ///
 /// What separates [`Usage`](Exit::Usage) from [`Failed`](Exit::Failed) is who
-/// judges. Misuse covers ONLY what this command can tell from its own argv: a
+/// judges. Misuse covers what a frontend can settle without the target at all: a
 /// word no family or operation has, a flag the operation does not take, a flag
-/// with no value after it, a token that is not a flag at all, an argument that
-/// is not valid text. Everything the PRODUCT judges is a failed operation
-/// instead: a value the tool does not accept, an argument the tool finds
-/// missing, a refusal the tool returns, an operation it carried out only in
-/// part. The frontend holds no copy of the tools' own rules (see the module
-/// doc), so it must never guess at one and call it misuse — a wrong class would
-/// make a script skip a real refusal or keep retrying a malformed invocation.
+/// with no value after it, a token that is not a flag at all, an argument that is
+/// not valid text — and, for a frontend that opens the files itself, what the
+/// filesystem says about the paths it was handed: an input that is missing, is not
+/// a regular file, or cannot be read; a destination directory that is not there; a
+/// destination that is already taken. Everything the TARGET of the command judges
+/// is a failed operation instead: a value the tool does not accept, an argument
+/// the tool finds missing, a refusal the tool returns, an operation it carried out
+/// only in part.
+///
+/// A frontend that only CARRIES the operation to a running product — this one,
+/// over IPC — holds no copy of the target's own rules (see the module doc), so
+/// it must never guess at one and call it misuse: a wrong class would make a
+/// script skip a real refusal or keep retrying a malformed invocation. A frontend
+/// that RUNS the target in its own process — `mahbot audio` — may judge the
+/// closed vocabulary that target publishes — voice and language names, the audio
+/// formats it takes, the one container it writes, text that says nothing — as the
+/// caller's own misuse, because there the rule is data the frontend reads rather
+/// than a guess. What the classes mean for a given family is said by that
+/// family's own help.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Exit {
     /// The operation was carried out.
@@ -182,10 +200,12 @@ pub(crate) enum Exit {
     /// outcome could not be confirmed after the call went out (it may have been
     /// carried out, which is never the environment's class).
     Failed = 1,
-    /// Nothing ran: the product is not up, its channel was not reachable, or it
+    /// Nothing ran: the environment — the instance, the engine, its models —
     /// could not take the operation on. The environment, not the operation.
     Environment = 2,
-    /// This command's own invocation was malformed.
+    /// The caller's own mistake: an invocation that cannot mean what it asks, and
+    /// — for a frontend that opens the files itself — the paths it was handed, as
+    /// the filesystem itself judges them (see the class's own doc for the line).
     Usage = 3,
 }
 
@@ -638,24 +658,19 @@ fn flag_spelling(arg: &str) -> String {
 
 /// Parse one operation's flag tail — the tokens after the operation word.
 ///
-/// The grammar is deliberately tiny: every token is `--<flag>` (a `Present`
-/// flag), `--<flag> <value>`, or `--<flag>=<value>`. A `<value>` is the very
-/// next token, taken VERBATIM — so a secret can never be mistaken for a flag,
-/// and a value may itself look like one (`--content -h`), which is also why a
-/// `-h`/`--help` asks for help only where a FLAG could stand and never where a
-/// VALUE does. A `List` flag accumulates one array entry per occurrence, an
-/// empty value emptying it (see [`FlagKind::List`]).
-///
-/// Everything a reason says is a flag's NAME and never a flag's VALUE: a secret
-/// the caller handed over must not travel back out in an error text, so a flag
-/// is refused by its `--spelling` alone (`--full=<value>` names the flag, never
-/// the value), and a token that is no flag at all is not echoed either — a
-/// secret mistyped as a positional is still a secret. A mistake this frontend
-/// can judge by itself — a token that is not a flag, a flag this operation does
-/// not take, a missing value, a flag given twice — is returned as its reason,
-/// for [`Exit::Usage`]. A flag the operation DOES take with a value the tool
-/// will not accept is not a mistake this command can judge, so it is sent on:
-/// the product refuses it, and that is a failed operation.
+/// The grammar itself lives in [`grammar`]; what is this frontend's own is the
+/// handling under it. A `List` flag accumulates one array entry per occurrence,
+/// an empty value emptying it (see [`FlagKind::List`]). Everything a reason says
+/// is a flag's NAME and never a flag's VALUE: a secret the caller handed over
+/// must not travel back out in an error text, so a flag is refused by its
+/// `--spelling` alone (`--full=<value>` names the flag, never the value), and a
+/// token that is no flag at all is not echoed either — a secret mistyped as a
+/// positional is still a secret. A mistake this frontend can judge by itself — a
+/// token that is not a flag, a flag this operation does not take, a missing
+/// value, a flag given twice — is returned as its reason, for [`Exit::Usage`]. A
+/// flag the operation DOES take with a value the tool will not accept is not a
+/// mistake this command can judge, so it is sent on: the product refuses it, and
+/// that is a failed operation.
 fn parse_flags(operation: &Operation, tokens: &[String]) -> Result<Tail, String> {
     let mut args = serde_json::Map::new();
     args.insert(
@@ -676,31 +691,18 @@ fn parse_flags(operation: &Operation, tokens: &[String]) -> Result<Tail, String>
 
     let mut rest = tokens.iter();
     while let Some(token) = rest.next() {
-        // Help is asked for where a FLAG could stand: where a VALUE stands, the
-        // very next token IS that value, a leading dash and all.
-        if is_help(token) {
-            return Ok(Tail::Help);
-        }
-        let Some(spelled) = token.strip_prefix("--") else {
-            // The token is NOT echoed: a value the caller forgot to give a flag
-            // to may be a secret, and this reason is not the place for it.
-            return Err("unexpected argument where a '--flag' was expected".to_string());
-        };
-        let (name, inline) = match spelled.split_once('=') {
-            Some((name, value)) => (name, Some(value)),
-            None => (spelled, None),
+        let (name, inline) = match grammar::read_token(token)? {
+            grammar::Token::Help => return Ok(Tail::Help),
+            grammar::Token::Flag { name, inline } => (name, inline),
         };
         let Some(index) = spellings.iter().position(|spelling| spelling == name) else {
-            return Err(format!(
-                "unknown flag '--{name}' for '{}'",
-                operation.word()
-            ));
+            return Err(grammar::unknown_flag(name, &operation.word()));
         };
         let flag = &operation.flags[index];
 
         if !matches!(flag.kind, FlagKind::List) {
             if given.contains(&flag.arg) {
-                return Err(format!("flag '--{name}' was given more than once"));
+                return Err(grammar::repeated_flag(name));
             }
             given.push(flag.arg);
         }
@@ -715,9 +717,10 @@ fn parse_flags(operation: &Operation, tokens: &[String]) -> Result<Tail, String>
             FlagKind::Value | FlagKind::List => {
                 let value = match inline {
                     Some(value) => value.to_string(),
-                    None => rest.next().cloned().ok_or_else(|| {
-                        format!("flag '--{name}' needs a value: '--{name} <value>'")
-                    })?,
+                    None => rest
+                        .next()
+                        .cloned()
+                        .ok_or_else(|| grammar::flag_value_missing(name))?,
                 };
                 if flag.secret {
                     secrets.push(value.clone());
@@ -872,11 +875,6 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
 
 // ── The run ───────────────────────────────────────────────────────
 
-/// Whether a token asks for help (`-h`/`--help`).
-fn is_help(token: &str) -> bool {
-    token == "-h" || token == "--help"
-}
-
 /// Run one family's command line, returning the process exit code.
 ///
 /// The product's own answer goes to STDOUT exactly as the product worded it
@@ -889,7 +887,7 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
     let Some(operation_word) = args.first().map(String::as_str) else {
         return misuse(family, "no operation was given");
     };
-    if is_help(operation_word) {
+    if grammar::is_help(operation_word) {
         crate::util::print_stdout(&family_help(family));
         return Exit::Ok.code();
     }
@@ -1113,13 +1111,22 @@ mod tests {
     use crate::chrome::contract::OutKind;
     use crate::db::ipc::CallReply;
 
-    /// Every family is discoverable from `mahbot -h`: one left out of the
-    /// top-level usage would be reachable only by someone who already knew its
-    /// word. Here — beside the registry — so the library's own test lane holds
-    /// the tie, not just the whole-workspace run.
+    /// Every entry point is discoverable from `mahbot -h`: the families from the
+    /// registry, and the command lines that belong to none of them — `paused`,
+    /// the speech command, the browser CLI, the debugger and the benchmark. One
+    /// left out of the top-level usage would be reachable only by someone who
+    /// already knew its word; `mahbot audio` above all, which has to be
+    /// discoverable on a platform where it can only refuse.
+    ///
+    /// The bare launch is not in the list: it has no word after `mahbot`, so the
+    /// shape this loop looks for cannot match it.
+    ///
+    /// Here — beside the registry — so the library's own test lane holds the tie,
+    /// not just the whole-workspace run.
     #[test]
-    fn every_family_is_listed_in_the_top_level_usage() {
-        for word in family_words() {
+    fn every_entry_point_is_listed_in_the_top_level_usage() {
+        for word in family_words().chain(["paused", "audio", "chrome", "debug", "bench-openrouter"])
+        {
             let entry = format!("  mahbot {word} ");
             assert!(
                 TOP_LEVEL_USAGE.lines().any(|line| line.starts_with(&entry)),

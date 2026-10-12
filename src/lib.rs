@@ -21,9 +21,15 @@ pub mod app_icon;
 /// read-aloud TTS, cues). macOS-only: the speech engine it is built on has no
 /// other platform support, and nothing here has a fallback. Linux and Windows
 /// builds have no audio feature, no audio dependency and no audio control at
-/// all — an inbound voice message is refused at intake there.
+/// all — an inbound voice message is refused at intake there, as are the
+/// command line's own audio operations ([`audio_cli`]).
 #[cfg(target_os = "macos")]
 pub mod audio;
+/// The product's own speech engine on the command line (`mahbot audio`): a
+/// recording into text, and text into a spoken file. Standalone — it needs no
+/// running product and touches no store — and compiled everywhere, because the
+/// command exists (and refuses, naming the platform) where the engine does not.
+pub(crate) mod audio_cli;
 pub mod bench_openrouter;
 pub mod boot;
 pub mod channels;
@@ -91,6 +97,11 @@ pub mod workspace;
 /// instance lock; the shell tool's transparent grep interception rewrites
 /// served invocations to this subcommand of the current binary).
 pub use tools::shell::grep_engine::run_engine as run_grep_engine;
+
+/// `mahbot audio` subcommand entry (dispatched from `main()` before the instance
+/// lock — the speech engine's file-into-text and text-into-file operations,
+/// neither of which needs the running product).
+pub use audio_cli::run as run_audio_cli;
 
 /// `mahbot chrome` subcommand entry (dispatched from `main()` before the
 /// instance lock — browser automation that runs alongside the daemon).

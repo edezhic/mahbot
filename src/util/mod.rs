@@ -582,11 +582,12 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// full disk). The subcommand CLIs that always run with wired stdio (the `debug`
 /// verb's own usage and argument errors, chrome, the benchmark) still print through
 /// the macros: a failed write there can only reach a caller that stopped reading.
-/// `mahbot config …` and `mahbot workspace …` print the product's answer and their
-/// own diagnostics through these two writers too: their exit code, not the delivered
-/// text, reports whether the operation was carried out, so a reader that closed the
-/// pipe (a script piping the answer into `head`) or a terminated one must not turn a
-/// carried-out operation into a crash — a failed write is discarded, never panicked on.
+/// `mahbot config …`, `mahbot workspace …` and `mahbot audio …` print the
+/// product's answer and their own diagnostics through these two writers too:
+/// their exit code, not the delivered text, reports whether the operation was
+/// carried out, so a reader that closed the pipe (a script piping the answer into
+/// `head`) or a terminated one must not turn a carried-out operation into a
+/// crash — a failed write is discarded, never panicked on.
 ///
 /// A windowed launch may also have been given no standard streams at all (its parent
 /// passed none): the library discards a write to an absent handle itself

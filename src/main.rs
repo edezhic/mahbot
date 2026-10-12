@@ -737,6 +737,21 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // `mahbot audio` subcommand: the product's own speech engine on the command
+    // line — a recording into text, text into a spoken file. Dispatched before
+    // lock acquisition + temp-root init like the other CLIs: it touches only the
+    // speech models under the storage root (never a store, never the settings),
+    // so it works while the product is stopped and runs alongside it without
+    // disturbing it.
+    if std::env::args().nth(1).as_deref() == Some("audio") {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let args = std::env::args().skip(2).collect::<Vec<_>>();
+        let code = rt.block_on(mahbot::run_audio_cli(&args));
+        std::process::exit(code);
+    }
+
     // `mahbot chrome` subcommand: browser automation CLI over the
     // shared chrome core. Dispatched before lock acquisition + temp-root init
     // so it can run alongside the instance (it uses its own session namespace);
@@ -806,8 +821,8 @@ fn main() -> Result<()> {
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
     // platform's temp variables to it — BEFORE any temp use (config, logs,
     // stores, shell children). The debug, __grep-engine, __env-dump,
-    // bench-openrouter, chrome, config/workspace and help/version dispatches
-    // above must NOT create the root (they exit before this point).
+    // bench-openrouter, audio, chrome, config/workspace and help/version
+    // dispatches above must NOT create the root (they exit before this point).
     mahbot::temp::init_temp_root().map_err(|e| {
         mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e)
     })?;

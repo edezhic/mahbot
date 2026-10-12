@@ -5,7 +5,7 @@
 //! and reused — it maintains an internal connection pool, caches DNS
 //! resolutions, and reuses TLS sessions.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -328,6 +328,126 @@ impl std::fmt::Display for ChecksumMismatch {
 
 impl std::error::Error for ChecksumMismatch {}
 
+/// A temp path beside `dest` that no other writer can be using.
+///
+/// Two fetchers of the same file — the running product's own daemon and a
+/// `mahbot audio` process, say — must never share a temp path: each verifies
+/// only the bytes it streamed itself, so interleaved writes into one file would
+/// install a file whose bytes nobody verified. The process id and a per-process
+/// sequence make the name unique, and the rename that follows publishes a whole
+/// file, so the last fetcher to finish wins with a complete one. A process
+/// killed mid-download leaves its part file behind; the name is never read back
+/// by anything, so a leftover is inert until the next fetch of the same file
+/// clears it ([`sweep_abandoned_parts`]).
+fn temp_sibling(dest: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(format!(
+        ".part-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    PathBuf::from(tmp)
+}
+
+/// Remove the part files a killed fetcher left beside `dest`.
+///
+/// A process killed before its guard could run leaves its temp behind, and the
+/// model directories are the one place nothing else sweeps — so the next fetch of
+/// the same file clears what the fetchers that are gone left there. Only a part
+/// file whose own process is no longer there is taken: a fetch running in another
+/// process (the daemon's, say) holds its own and is never touched. The names are
+/// [`temp_sibling`]'s, so the process id is read straight out of one.
+///
+/// [`download_verified`] runs this on a blocking thread: it walks a directory and
+/// probes pids, and every download in the process pays for it.
+#[cfg(unix)]
+fn sweep_abandoned_parts(dest: &Path) {
+    let (Some(dir), Some(prefix)) = (
+        dest.parent(),
+        dest.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(prefix))
+            .and_then(|rest| rest.strip_prefix(".part-"))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _seq)| pid.parse::<i32>().ok());
+        if let Some(pid) = pid
+            && pid != std::process::id().cast_signed()
+            && !process_exists(pid)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether a process with this id is still there.
+///
+/// A process this one may not signal is a process that is there, so only a pid
+/// the system reports no such process for counts as gone.
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 sends nothing — it asks the system whether the process
+    // exists, and touches no memory.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Nothing is swept where the process table cannot be asked about: a leftover
+/// stays, inert — see [`temp_sibling`].
+#[cfg(not(unix))]
+fn sweep_abandoned_parts(_dest: &Path) {}
+
+/// A temp file a download owns until it is renamed into place: dropped without
+/// [`disarm`](Self::disarm), it removes whatever is at its path.
+///
+/// Every failure a download can meet therefore leaves nothing behind, which
+/// matters most for the downloaders that retry — an orphan per attempt would
+/// otherwise accumulate beside the models. (A process killed outright runs no
+/// destructor; [`sweep_abandoned_parts`] is what takes that leftover, at the
+/// next fetch of the same file.)
+struct TempDownload {
+    path: PathBuf,
+    /// The rename published the file: there is nothing left to remove.
+    disarmed: bool,
+}
+
+impl TempDownload {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            disarmed: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for TempDownload {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Stream a file download with on-the-fly SHA256 verification and atomic
 /// tmp+rename — the single canonical path for model downloads.
 ///
@@ -338,9 +458,12 @@ impl std::error::Error for ChecksumMismatch {}
 ///   ("started"), then per chunk; callers throttle as needed. `total` is 0
 ///   when the server omits Content-Length.
 ///
-/// On failure the temp file is removed; on success it is atomically renamed
-/// into place. (The bench-only sync downloader in `voice_pipeline_e2e_test.rs`
-/// stays separate.)
+/// On every failure path the temp file is removed (a failed rename included);
+/// on success it is atomically renamed into place. A temp file a killed process
+/// left behind is taken by the next fetch of the same file. (The bench-only sync
+/// downloader in `voice_pipeline_e2e_test.rs` stays separate.) The temp name is
+/// unique per fetcher, so a concurrent download of the same file can never
+/// interleave writes into this one.
 pub(crate) async fn download_verified(
     client: &reqwest::Client,
     url: &str,
@@ -373,8 +496,14 @@ pub(crate) async fn download_verified(
     // "Started" signal before the first byte is streamed.
     progress(0, total_size);
 
-    let tmp = dest.with_extension("tmp");
-    let mut file = tokio::fs::File::create(&tmp)
+    // What killed fetchers left beside this file is dead weight: take it before
+    // this fetch adds its own. Off the runtime thread — it is a directory walk and
+    // a process probe, and every download in the process pays it.
+    let sweep_dest = dest.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || sweep_abandoned_parts(&sweep_dest)).await;
+
+    let mut temp = TempDownload::new(temp_sibling(dest));
+    let mut file = tokio::fs::File::create(temp.path())
         .await
         .context("Failed to create temp file")?;
 
@@ -403,14 +532,12 @@ pub(crate) async fn download_verified(
             if let Some(expected) = content_length
                 && downloaded != expected
             {
-                let _ = tokio::fs::remove_file(&tmp).await;
                 anyhow::bail!(
                     "Download size mismatch: expected {expected} bytes, got {downloaded} bytes"
                 );
             }
         }
         DownloadSizeCheck::Min(min) if downloaded < min => {
-            let _ = tokio::fs::remove_file(&tmp).await;
             anyhow::bail!("Downloaded file too small: {downloaded} bytes");
         }
         DownloadSizeCheck::Min(_) | DownloadSizeCheck::None => {}
@@ -419,7 +546,6 @@ pub(crate) async fn download_verified(
     if let Some(h) = hasher {
         let actual_hash = format!("{:x}", h.finalize());
         if actual_hash != expected_sha256 {
-            let _ = tokio::fs::remove_file(&tmp).await;
             return Err(anyhow::Error::new(ChecksumMismatch).context(format!(
                 "SHA256 mismatch for {}: expected {expected_sha256}, got {actual_hash}",
                 dest.display()
@@ -427,9 +553,10 @@ pub(crate) async fn download_verified(
         }
     }
 
-    tokio::fs::rename(&tmp, dest)
+    tokio::fs::rename(temp.path(), dest)
         .await
         .with_context(|| format!("Failed to rename temp file to {}", dest.display()))?;
+    temp.disarm();
     Ok(())
 }
 

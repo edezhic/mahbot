@@ -5011,7 +5011,7 @@ mod tests {
     }
 
     #[test]
-    fn mahbot_chrome_envelope_line_bypasses_the_line_cap() {
+    fn mahbot_surface_lines_bypass_the_line_cap() {
         // The chrome CLI emits ONE line of JSON; its profile must not apply
         // GEN_FALLBACK's 500-byte line cap, which would truncate the envelope
         // mid-JSON and drop the page content.
@@ -5035,6 +5035,24 @@ mod tests {
         assert!(
             result.contains(&envelope),
             "envelope line must survive intact"
+        );
+
+        // `mahbot audio transcribe` prints the transcript as ONE line, so the
+        // same cap would cut it off after the first 500 bytes — the harm the
+        // chrome case above exists to prevent.
+        let transcript = "x".repeat(600);
+        let result = process_shell_output(
+            "mahbot audio transcribe --input voice.wav",
+            &transcript,
+            "",
+            0,
+            Duration::from_secs_f64(1.0),
+        );
+        assert_contains_not_contains(
+            "mahbot audio transcript",
+            &result,
+            &[&transcript],
+            &["more chars on this line"],
         );
 
         // The one profile now covers the `config`/`workspace` families too,

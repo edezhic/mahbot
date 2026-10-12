@@ -173,7 +173,7 @@ pub(crate) fn shell_temp_vars() -> Vec<(String, String)> {
 /// Must run at the very start of startup, BEFORE config and any temp use, and
 /// AFTER every dispatch that must not create the root — the read-only `debug`
 /// CLI and the hidden subcommands (`__grep-engine`, `__env-dump`), the
-/// standalone mode CLIs (`bench-openrouter`, `chrome`), and `-h`/`-V`.
+/// standalone mode CLIs (`bench-openrouter`, `chrome`, `audio`), and `-h`/`-V`.
 /// Cross-platform: `/tmp/mahbot` on unix, `<user temp>\mahbot` on Windows.
 ///
 /// Failure modes (fail loudly, never paper over):

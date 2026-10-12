@@ -917,6 +917,11 @@ const PRODUCT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
 /// stops sessions in the LIVE daemon by name, while the chrome tool a role
 /// holds works in a per-run namespace of its own — so the tool, not this shell
 /// route, is what such a role uses (the read-only banner lists the refusal).
+///
+/// `mahbot audio …` is refused with them too: `speak` writes a file at a path
+/// the caller names and `transcribe` fetches the recognition model it needs —
+/// neither is a read-only form of the product's own binary, and this mode
+/// allows none of the whole family.
 fn check_product_segment(segment: &str, second: Option<&str>) -> Result<(), String> {
     if second.is_some_and(|word| PRODUCT_READ_ONLY_SUBCOMMANDS.contains(&word)) {
         return Ok(());
@@ -6769,6 +6774,9 @@ mod tests {
             ("mahbot config add-user --name bob", false),
             ("mahbot workspace pause", false),
             ("mahbot bench-openrouter", false),
+            // The speech command is refused with the rest: `speak` writes a file at
+            // a path the caller names, and the whole family stays out of this mode.
+            ("mahbot audio speak --text hi --output /tmp/x.wav", false),
             ("mahbot DEBUG", false),     // a daemon launch, not `debug`
             ("mahbot foo debug", false), // the verb's own next word is the one read
             ("mahbot -V", true),
