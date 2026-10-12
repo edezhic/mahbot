@@ -280,11 +280,11 @@ fn session_image_marker_count(history: &[ChatMessage]) -> usize {
 
 /// Derive an [`ImagePayload`] from a successful tool's raw output when the tool
 /// did not supply its own payload but returned a real on-disk `[IMAGE:path]`
-/// marker, so a tool-produced image (e.g. image_gen) reaches the agent's own
-/// context automatically. Fails open (`None`) when the marker path is not
-/// absolute or cannot be compressed into a bounded JPEG data-URI (e.g. an SVG,
-/// which the compressor cannot rasterize) — the user still receives the file via
-/// the marker in the raw output.
+/// marker, so a marker-delivered image still reaches the agent's own context.
+/// Fails open (`None`) when the marker path is not absolute or cannot be
+/// compressed into a bounded JPEG data-URI (e.g. an SVG, which the compressor
+/// cannot rasterize) — the user still receives the file via the marker in the raw
+/// output.
 ///
 /// This deliberately does NOT route through the shared classifier: as a
 /// *producer* it must emit a bounded compressed payload, so the async
@@ -352,14 +352,14 @@ async fn tool_result_content(
         None => crate::util::truncate_tool_output(&outcome.output),
     };
 
-    // The outcome's own payloads (read tool) take precedence; otherwise derive
-    // an injected image from a real on-disk `[IMAGE:path]` marker in a
-    // successful tool output (image_gen) so a tool-produced image reaches the
-    // agent's own context. Only a text that is a claim about its images can be
-    // the source of such a claim — in content (a converted document's extracted
-    // text) a marker is text, so nothing is derived from it. Derivation fails
-    // open: a non-rasterizable path (e.g. SVG) yields no payload while the
-    // marker stays in the raw output.
+    // The outcome's own payloads (read tool, image_gen) take precedence;
+    // otherwise derive an injected image from a real on-disk `[IMAGE:path]`
+    // marker in a successful tool output that supplied no payload of its own, so
+    // a marker-delivered image reaches the agent's own context. Only a text that
+    // is a claim about its images can be the source of such a claim — in content
+    // (a converted document's extracted text) a marker is text, so nothing is
+    // derived from it. Derivation fails open: a non-rasterizable path (e.g. SVG)
+    // yields no payload while the marker stays in the raw output.
     let mut payloads: Vec<ImagePayload> = outcome.image_payloads;
     if payloads.is_empty() && !outcome.text_is_content && outcome.success {
         payloads.extend(derive_image_payload_from_marker(&outcome.output).await);
@@ -1738,7 +1738,7 @@ impl Agent {
                             let (outcome, error_reason) = Self::failure_outcome(
                                 &tool_name,
                                 &tool_arguments,
-                                &format!("Error executing {tool_name}: {e}"),
+                                &crate::tools::tool_failure_reason(&tool_name, &e.to_string()),
                             );
                             tracing::debug!(
                                 tool = %tool_name,
@@ -5444,6 +5444,7 @@ mod tests {
                     height: 1,
                     format: "PNG".into(),
                     recovery_note: None,
+                    note: None,
                     source: crate::tools::ImagePayloadSource::Read,
                 }],
                 text_is_content: false,
@@ -5460,6 +5461,7 @@ mod tests {
                     height: 1,
                     format: "PNG".into(),
                     recovery_note: None,
+                    note: None,
                     source: crate::tools::ImagePayloadSource::Read,
                 }],
                 text_is_content: false,
@@ -5583,6 +5585,7 @@ mod tests {
                     height: 1,
                     format: "PNG".into(),
                     recovery_note: None,
+                    note: None,
                     source: crate::tools::ImagePayloadSource::Read,
                 }],
                 text_is_content: false,
@@ -5599,6 +5602,7 @@ mod tests {
                     height: 1,
                     format: "PNG".into(),
                     recovery_note: None,
+                    note: None,
                     source: crate::tools::ImagePayloadSource::Read,
                 }],
                 text_is_content: false,
@@ -5679,6 +5683,7 @@ mod tests {
             height: 1,
             format: "JPEG".into(),
             recovery_note: None,
+            note: None,
             source: crate::tools::ImagePayloadSource::Read,
         };
         let outcomes = vec![
@@ -5813,6 +5818,7 @@ mod tests {
                 height: 1000,
                 format: "JPEG".into(),
                 recovery_note: None,
+                note: None,
                 source: crate::tools::ImagePayloadSource::Generated,
             }],
             text_is_content: true,
@@ -5861,8 +5867,11 @@ mod tests {
         std::fs::write(&png_path, crate::util::test::noisy_png(4, 4)).expect("write png");
         let abs = std::fs::canonicalize(&png_path).expect("canonicalize");
 
+        // A media tool that supplies no payload of its own: the derived-image path
+        // exists for such output — image_gen, chrome and computer all ship their own
+        // payloads and never reach it.
         let tool = Box::new(MediaTestTool {
-            name: "image_gen",
+            name: "media_probe",
             marker: "[IMAGE:",
         }) as Box<dyn Tool>;
         let mut agent = make_agent(vec![tool]);
@@ -5870,7 +5879,7 @@ mod tests {
         let marker = format!("[IMAGE:{}]", abs.display());
         let tool_calls = vec![ToolCall {
             id: "callgen".into(),
-            name: "image_gen".into(),
+            name: "media_probe".into(),
             arguments: serde_json::json!({}),
         }];
         // `MediaTestTool` does not override the hook, so this round takes the

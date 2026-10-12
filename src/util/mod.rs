@@ -237,6 +237,20 @@ pub(crate) fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
     }
 }
 
+/// [`truncate_bytes`] with the cut marked by an ellipsis that counts against
+/// `max_bytes` — so a caller composing byte-bounded output can trust the bound — and
+/// nothing left of a text with no room for the marker.
+#[must_use]
+pub(crate) fn cut_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    match max_bytes.checked_sub('…'.len_utf8()) {
+        Some(room) => format!("{}…", truncate_bytes(text, room)),
+        None => String::new(),
+    }
+}
+
 /// Convert a string reference to `None` if empty, otherwise `Some(s.to_string())`.
 ///
 /// Useful when building query structs where empty filters mean "no filter".

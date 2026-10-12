@@ -14,12 +14,24 @@ use std::time::{Duration, Instant};
 /// Supports text-to-image and image-to-image generation. Accepts multiple
 /// reference images on input. Returns the path to the generated file so the
 /// agent can embed it as `[IMAGE:path]` in its reply.
+///
+/// One attempt walks the image models the account's picker offers: its own model
+/// first, exactly as it was always tried, then each other model once, in picker
+/// order, until one serves the request. A request a fallback covered is a success
+/// for the user; when another model produced the picture, the tool's result names
+/// it and says what happened with the account's own model.
 pub struct ImageGenTool;
+
+impl ImageGenTool {
+    /// The tool's own name — what [`Tool::name`] reports and what the failure
+    /// envelope is measured with.
+    const NAME: &'static str = "image_gen";
+}
 
 #[async_trait]
 impl Tool for ImageGenTool {
     fn name(&self) -> &'static str {
-        "image_gen"
+        Self::NAME
     }
 
     fn media_marker(&self) -> Option<&'static str> {
@@ -44,7 +56,7 @@ impl Tool for ImageGenTool {
                 },
                 "size": {
                     "type": "string",
-                    "description": "Image size — a tier (e.g. 1K, 2K) or explicit pixels (e.g. 1024x1024); only a value the selected model supports is accepted"
+                    "description": "Image size — a tier (e.g. 1K, 2K) or explicit pixels (e.g. 1024x1024); a model that cannot express the value is not sent the request"
                 }
             }),
             &["prompt"],
@@ -52,54 +64,89 @@ impl Tool for ImageGenTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        let prompt = super::get_str(&args, "prompt")?;
-        let user_name = crate::agent::tool_user_name();
-        let model = crate::users::resolve_image_gen_model(&user_name).await;
-        let aspect_ratio_arg = super::get_opt_str(&args, "aspect_ratio");
-        let size_arg = super::get_opt_str(&args, "size");
-        let images: Vec<String> = super::get_str_array(&args, "images")?;
+        let generated = self.generate(ws, &args, &HttpSender).await?;
+        Ok(self.result_text(&generated))
+    }
 
-        // Confine every reference before any other filesystem or provider
-        // access: a refused path is never stat'ed or read, and the catalog
-        // lookup below cannot precede the refusal.
+    /// The generated picture travels with the tool's own result: the walk decided
+    /// which model produced it, and the note naming that model has to reach the
+    /// assistant — which receives the image's annotation IN PLACE of the tool's own
+    /// text once the picture is attached, so the note rides on the payload.
+    async fn execute_with_payloads(
+        &self,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<super::ToolOutput> {
+        let generated = self.generate(ws, &args, &HttpSender).await?;
+        Ok(self.output(&generated).await)
+    }
+}
+
+/// A finished generation: the picture on disk and the note that must reach the
+/// assistant with it (`None` when the account's own model produced it, so there is
+/// nothing to disclose).
+struct Generated {
+    path: PathBuf,
+    note: Option<String>,
+}
+
+impl Generated {
+    /// The payload that carries the picture into the conversation as a native
+    /// image, the note riding on its annotation. `None` when the saved file cannot
+    /// be re-encoded into one (fail-open, e.g. an SVG): the marker then stays in the
+    /// tool result's own text, and the note with it.
+    async fn payload(&self) -> Option<super::ImagePayload> {
+        let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&self.path)
+            .await
+            .ok()?;
+        let mut payload = super::ImagePayload::from_compressed_meta(
+            &self.path,
+            meta,
+            None,
+            super::ImagePayloadSource::Generated,
+        );
+        payload.note.clone_from(&self.note);
+        Some(payload)
+    }
+}
+
+impl ImageGenTool {
+    /// Generate one picture: the account's own image model first, then every other
+    /// image model its picker offers, until one serves the request.
+    async fn generate(
+        &self,
+        ws: &Workspace,
+        args: &serde_json::Value,
+        sender: &dyn ImageSender,
+    ) -> anyhow::Result<Generated> {
+        let prompt = super::get_str(args, "prompt")?;
+        let user_name = crate::agent::tool_user_name();
+        let own_model = crate::users::resolve_image_gen_model(&user_name).await;
+        let aspect_ratio_arg = super::get_opt_str(args, "aspect_ratio");
+        let size_arg = super::get_opt_str(args, "size");
+        let images: Vec<String> = super::get_str_array(args, "images")?;
+
+        // Confine every reference before any other filesystem or provider access:
+        // a refused path is never stat'ed or read, and the plan below cannot
+        // precede the refusal.
         let mut reference_paths = Vec::with_capacity(images.len());
         for img_path in &images {
             reference_paths
                 .push(super::resolve_local_media_path(img_path, ws, "reference image").await?);
         }
 
-        // Capability and parameter decisions come from the catalog. A membership
-        // miss forces one catalog refresh before the verdict; a catalog outage
-        // degrades to minimal user-provided parameters (fail-open), while a model
-        // confirmed absent from a freshly fetched catalog rejects generation.
-        let info = resolve_image_model(crate::config::DEFAULT_PROVIDER_ENDPOINT, &model).await?;
-        let info = info.as_ref();
+        // What the walk will do, decided before any reference is loaded.
+        let plan = plan_walk(
+            &own_model,
+            reference_paths.len(),
+            size_arg,
+            &crate::config::CONFIG.image_gen_models_raw(),
+        )
+        .await?;
 
-        // Pre-flight reference-count validation BEFORE loading any files: a
-        // too-many-refs error must not first read every reference into memory.
-        // The catalog declares the per-model cap, clamped to the provider's
-        // documented ceiling; with no catalog that ceiling is the cap.
-        if let Some(info) = info
-            && !reference_paths.is_empty()
-        {
-            validate_reference_count(&model, info, reference_paths.len())?;
-        } else if reference_paths.len() > super::MAX_REFERENCE_IMAGES_PER_REQUEST {
-            anyhow::bail!(
-                "Image generation supports at most {} reference image(s), got {}. \
-                 Retry with fewer images.",
-                super::MAX_REFERENCE_IMAGES_PER_REQUEST,
-                reference_paths.len(),
-            );
-        }
-
-        // The size the selected model accepts is a catalog fact, so it is
-        // resolved and refused BEFORE any file is read — the request must not
-        // reach the provider with a value that model cannot express.
-        let size = resolve_size(&model, size_arg, info)?;
-
-        // Combined-size pre-flight before loading any file: the per-image
-        // ceilings don't bound the total, and a pathological multi-reference
-        // request must be refused without reading everything into memory first.
+        // Combined-size pre-flight before loading any file: the per-image ceilings
+        // don't bound the total, and a pathological multi-reference request must be
+        // refused without reading everything into memory first.
         if !reference_paths.is_empty() {
             crate::util::check_reference_total_input(&reference_paths).await?;
         }
@@ -112,56 +159,60 @@ impl Tool for ImageGenTool {
             );
         }
 
-        // Fail-open sends only an explicitly user-provided aspect ratio.
-        let resolved_aspect_ratio = match info {
-            Some(_) => Some(resolve_aspect_ratio(aspect_ratio_arg, &reference_paths)),
-            None => aspect_ratio_arg.map(String::from),
-        };
-
-        let mut body = build_request_body(
-            &model,
-            prompt,
-            resolved_aspect_ratio.as_deref(),
-            size,
-            &references,
-            info,
-        );
-
-        // Aggregate body budget: per-image caps don't bound multi-reference
-        // totals, so compress references further until the serialized request
-        // fits the ~2 MB client-side body budget (not a documented OpenRouter
-        // number).
-        super::fit_request_body_budget(&mut body, &mut references, super::MAX_REQUEST_BODY_BYTES)?;
+        let resolved_aspect_ratio =
+            request_aspect_ratio(aspect_ratio_arg, &reference_paths, plan.catalog_reached);
 
         // Image generation always targets OpenRouter — a custom
         // chat endpoint never serves image models.
         let api_base = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
         let images_url = format!("{api_base}/images");
+        // A key the product does not hold is a failure of preparing the request,
+        // not a refusal any model could fix, so nothing is walked.
         let auth = bearer_auth_header().ok_or_else(|| {
             anyhow::anyhow!("Image generation: provider API key is not configured")
         })?;
 
-        // Bounded retry loop over the dedicated 10-minute client; the loop is
-        // also raced against global shutdown so a long generation cannot
+        let mut walk = ImageWalk {
+            request: RequestMaterial {
+                prompt,
+                aspect_ratio: resolved_aspect_ratio,
+                size_arg,
+                references: &mut references,
+            },
+            own_model: &own_model,
+            url: &images_url,
+            auth: &auth,
+            sender,
+            trail: Vec::new(),
+            stopped: None,
+        };
+
+        // The walk is raced against global shutdown so a long generation cannot
         // block process teardown.
         let shutdown = crate::shutdown::shutdown_token();
-        let result = tokio::select! {
+        let walked = tokio::select! {
             () = shutdown.cancelled() => {
-                anyhow::bail!("Shutting down — image generation aborted");
+                anyhow::bail!("{SHUTDOWN_ABORTED}");
             }
-            result = generate_image_with_retries(&images_url, &body, &auth) => result,
+            walked = walk.run(plan.own_step, plan.candidates) => walked?,
         };
 
-        let response_body = match result {
-            Ok(body) => body,
-            Err(message) => anyhow::bail!("{message}"),
+        let Walked::Served {
+            model: served_by,
+            response,
+        } = walked
+        else {
+            // Nothing served the request: the failure names what was tried and what
+            // each model answered.
+            anyhow::bail!("{}", walk.failure_message());
         };
 
-        let (b64_json, media_type) = match extract_response_image(&response_body) {
+        let (b64_json, media_type) = match extract_response_image(&response) {
             Ok(x) => x,
             Err(err) => {
                 // A 2xx body carrying a provider error (or no image data)
-                // means the attempt completed and was billed — never retried.
+                // means the attempt completed and was billed — never walked to
+                // another model, never retried.
                 anyhow::bail!("Image generation response error: {err}");
             }
         };
@@ -170,7 +221,7 @@ impl Tool for ImageGenTool {
             Ok(bytes) => bytes,
             Err(e) => {
                 // Provider returned malformed base64 — a response-processing
-                // failure.
+                // failure, and a billed one: never walked to another model.
                 anyhow::bail!("Failed to decode base64 image data from response: {e}");
             }
         };
@@ -183,7 +234,590 @@ impl Tool for ImageGenTool {
         )
         .await?;
 
-        Ok(self.format_media_result(&output_path))
+        // The record the walk leaves behind: which model produced the picture, so a
+        // fallback stays diagnosable afterwards.
+        tracing::info!(
+            model = %served_by,
+            own_model = %own_model,
+            "Image generation produced a picture"
+        );
+
+        Ok(Generated {
+            path: output_path,
+            note: walk.fallback_note(&served_by),
+        })
+    }
+
+    /// One generated picture as the tool's own result: the marker text, and the picture
+    /// as a payload whose annotation the assistant reads in place of that text.
+    async fn output(&self, generated: &Generated) -> super::ToolOutput {
+        super::ToolOutput {
+            text: self.result_text(generated),
+            image_payloads: generated.payload().await.into_iter().collect(),
+            text_is_content: false,
+        }
+    }
+
+    /// The tool result text: the delivery marker, then the note naming the model
+    /// that produced the picture when it was not the account's own.
+    fn result_text(&self, generated: &Generated) -> String {
+        let marker = self.format_media_result(&generated.path);
+        match &generated.note {
+            Some(note) => format!("{marker}\n{note}"),
+            None => marker,
+        }
+    }
+}
+
+// ── The walk: the account's own model, then the picker's other models ────
+
+/// The request every model's body is built from: the prompt, the aspect ratio the
+/// request resolved to, and the references it carries — already confined, loaded
+/// and compressed.
+struct RequestMaterial<'a> {
+    prompt: &'a str,
+    /// The aspect ratio the request resolved to — the user's own argument on a
+    /// fail-open attempt (no catalog), and the value the request resolved to
+    /// otherwise. Sent only to a model whose own declarations carry the parameter.
+    aspect_ratio: Option<String>,
+    size_arg: Option<&'a str>,
+    references: &'a mut [crate::util::ReferenceImage],
+}
+
+/// One model's step in the walk.
+enum Step {
+    /// Attempt it: the catalog declarations that shape its body — `None` only for
+    /// the account's own fail-open attempt (the catalog was unreachable, so only
+    /// what the user provided is sent) — and the size those declarations accept.
+    Attempt {
+        info: Option<ImageModelInfo>,
+        size: Option<(&'static str, String)>,
+    },
+    /// Never sent to, with the reason.
+    Skip(String),
+}
+
+/// What one visited model came to.
+enum Visited {
+    /// Nothing was sent to it, with the reason.
+    Skipped(String),
+    /// Sent, and this is what came back. A failure that may have been produced and
+    /// charged is not this entry's business: it stops the walk, and the walk's stop
+    /// reason says so.
+    Attempted(Vec<AttemptFailure>),
+}
+
+/// What the walk came to.
+enum Walked {
+    /// The provider served `response`, produced by `model`.
+    Served {
+        model: String,
+        response: serde_json::Value,
+    },
+    /// Nothing served the request — what every visited model answered is in the
+    /// walk's trail.
+    Unserved,
+}
+
+/// What the walk will do, decided before any reference is loaded: the account's own
+/// model's step, the other models its picker offers, and whether the catalog was
+/// reached (with no catalog no model's declarations are known, so the request keeps
+/// its fail-open shape).
+struct WalkPlan {
+    own_step: Step,
+    candidates: Vec<String>,
+    catalog_reached: bool,
+}
+
+/// Decide the walk before any reference is loaded. `Err` refuses the request before
+/// anything is sent — the provider's own reference ceiling, or the account's own
+/// model refusing with nothing else configured to walk to.
+async fn plan_walk(
+    own_model: &str,
+    reference_count: usize,
+    size_arg: Option<&str>,
+    picker: &[String],
+) -> anyhow::Result<WalkPlan> {
+    // The provider's own ceiling on how many references a request may carry at all
+    // is a property of the REQUEST, not of any model: nothing can take such a
+    // request, so it is refused before the catalog — or any model — is consulted.
+    // This is also the wording the user gets when the request is over both that
+    // ceiling and the account's own model's lower cap: the provider's limit is the one
+    // no model can move, so it is the one worth naming.
+    if reference_count > super::MAX_REFERENCE_IMAGES_PER_REQUEST {
+        anyhow::bail!(
+            "Image generation supports at most {} reference image(s), got {}. \
+             Retry with fewer images.",
+            super::MAX_REFERENCE_IMAGES_PER_REQUEST,
+            reference_count,
+        );
+    }
+
+    // Capability comes from the catalog: a membership miss forces one refresh before
+    // the verdict, a catalog outage degrades to minimal user-provided parameters
+    // (fail-open), and a model confirmed absent from a freshly fetched catalog is
+    // the walk's first reason instead of the end of the attempt.
+    let capability = resolve_image_model(crate::config::DEFAULT_PROVIDER_ENDPOINT, own_model).await;
+    // Without a reachable catalog no model's capability can be established, so
+    // nothing is walked and the attempt keeps its fail-open behaviour.
+    let catalog_reached = !matches!(capability, Ok(None));
+    let own_step = own_step(own_model, capability, reference_count, size_arg);
+
+    // The other models the account could have picked, in picker order — the list
+    // exactly as configured (`image_gen_models_raw`, never the accessor that fills
+    // in a default): a default the picker never showed was never offered to the
+    // account, so it is not a candidate.
+    let candidates = if catalog_reached {
+        fallback_candidates(own_model, picker)
+    } else {
+        Vec::new()
+    };
+
+    // With nothing else to walk to, a refusal before anything is sent ends the
+    // attempt exactly as it always did — before the request's material is touched,
+    // so which of two faults is reported stays as it was.
+    if candidates.is_empty()
+        && let Step::Skip(reason) = &own_step
+    {
+        anyhow::bail!("{reason}");
+    }
+    Ok(WalkPlan {
+        own_step,
+        candidates,
+        catalog_reached,
+    })
+}
+
+/// The other image models the account could have picked: the picker list, in picker
+/// order, with every entry of the model already tried — a repeated one included —
+/// and repeats of any other entry left out, so each model is visited once. Only
+/// models the picker offered are ever used: a default that fills in when nothing has
+/// been chosen is not one of them.
+fn fallback_candidates(own_model: &str, picker_list: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::from([own_model]);
+    picker_list
+        .iter()
+        .filter(|model| seen.insert(model.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The account's own model's step, decided exactly as that model was validated
+/// before the walk existed: its capability verdict, then the reference cap and the
+/// size its declarations accept. A refusal becomes the walk's first reason instead
+/// of the end of the attempt.
+fn own_step(
+    model: &str,
+    capability: anyhow::Result<Option<ImageModelInfo>>,
+    references: usize,
+    size_arg: Option<&str>,
+) -> Step {
+    let info = match capability {
+        Ok(info) => info,
+        Err(e) => return Step::Skip(e.to_string()),
+    };
+    match info {
+        // Catalog unreachable: fail-open, exactly as it always was — no capability is
+        // known, so nothing is checked and the requested size is dropped before
+        // [`resolve_size`] is ever consulted.
+        None => {
+            if let Some(size) = size_arg {
+                tracing::debug!(size, "Image generation: size dropped — catalog unavailable");
+            }
+            Step::Attempt {
+                info: None,
+                size: None,
+            }
+        }
+        Some(info) => match eligibility(model, &info, references, size_arg, RefusalVoice::OwnModel)
+        {
+            Err(reason) => Step::Skip(reason),
+            Ok(size) => Step::Attempt {
+                info: Some(info),
+                size,
+            },
+        },
+    }
+}
+
+/// Whom a pre-send refusal speaks to. The account's own model's attempt refuses the
+/// user, who can put another model in that pick — today's `usage:`/`hint:` text. The
+/// walk's line about a model it merely passed over states the fact alone: the account
+/// never picked that model, so neither the header nor the advice applies to it.
+#[derive(Clone, Copy)]
+enum RefusalVoice {
+    OwnModel,
+    Candidate,
+}
+
+/// The reference cap and the size checks one model's own declarations decide: `Ok`
+/// with the size they accept (if any) when it can serve the request, `Err` with the
+/// reason when it cannot — worded for `voice`. Only reached for a model whose
+/// declarations are known — with no catalog the check is skipped entirely (see
+/// [`own_step`]).
+fn eligibility(
+    model: &str,
+    info: &ImageModelInfo,
+    references: usize,
+    size_arg: Option<&str>,
+    voice: RefusalVoice,
+) -> Result<Option<(&'static str, String)>, String> {
+    if references > 0 {
+        validate_reference_count(model, info, references, voice)?;
+    }
+    resolve_size(model, size_arg, info, voice).map_err(|e| e.to_string())
+}
+
+/// The aspect ratio the request carries to every model: the value the request
+/// resolved to when the catalog was reached (auto-detected from the references
+/// unless the user named one), and the user's own argument alone on a fail-open
+/// attempt — auto-detection exists to pick a value a catalog-declared parameter can
+/// carry, which a catalog-less attempt has none of.
+fn request_aspect_ratio(
+    aspect_ratio_arg: Option<&str>,
+    reference_paths: &[PathBuf],
+    catalog_reached: bool,
+) -> Option<String> {
+    if catalog_reached {
+        Some(resolve_aspect_ratio(aspect_ratio_arg, reference_paths))
+    } else {
+        aspect_ratio_arg.map(String::from)
+    }
+}
+
+/// The room everything around the walk failure text takes before the model receives it:
+/// the wrapper `Agent::execute_tool` raises a fault with, and the failure envelope
+/// [`crate::tools::tool_failure_envelope_bytes`] accounts for — derived from those
+/// pieces rather than restated, so neither wrapper can drift from this budget.
+const WALK_ENVELOPE_BYTES: usize =
+    crate::tools::tool_failure_envelope_bytes(ImageGenTool::NAME.len());
+
+/// The walk failure text's own budget: what a tool result is truncated to, less
+/// everything wrapped around that text.
+const WALK_MESSAGE_BYTES: usize = crate::util::TOOL_OUTPUT_BUDGET_BYTES - WALK_ENVELOPE_BYTES;
+
+/// The most room one visited model's line takes — and the most the fallback note gives
+/// what it says about the account's own model.
+const WALK_ENTRY_MAX_BYTES: usize = 300;
+
+/// The room one visited model's line has: the failure's budget less the header and the
+/// stop line, shared out over the lines and capped — counted in bytes, so a multi-byte
+/// name or answer cannot eat a neighbour's room, and shared out before the names are
+/// written, so a picker whose names alone outgrow the budget cannot push the message past
+/// it either.
+fn walk_line_bytes(models: usize, fixed: usize) -> usize {
+    WALK_ENTRY_MAX_BYTES.min(WALK_MESSAGE_BYTES.saturating_sub(fixed) / models.max(1))
+}
+
+/// The prefix the failure text gives the reason a walk stopped before exhausting its
+/// list, shared by both failure formatters.
+const WALK_STOPPED_PREFIX: &str = "The walk stopped there: ";
+
+/// A generation cut short by process shutdown, on both the outer race and a sender
+/// that reports the abort mid-walk.
+const SHUTDOWN_ABORTED: &str = "Shutting down — image generation aborted";
+
+/// A candidate whose capability cannot be judged because the catalog could not be
+/// reached.
+const CATALOG_UNREACHABLE: &str =
+    "the image-models catalog could not be reached, so the model's capability is unknown";
+
+/// A candidate the catalog does not offer for image output — absent from it, or listed
+/// as text-only. The walk says so in its own words: the resolver's message speaks to
+/// the account's pick, which a model the walk passed over is not.
+const NOT_AN_IMAGE_MODEL: &str = "the image-models catalog does not offer it for image output";
+
+/// The walk over the account's own image model and the other models its picker
+/// offers: the own model first, then each other model once, in picker order, until
+/// one serves the request. Every visited model's answer is kept, so a failure can
+/// name what each of them answered or why it was never sent to.
+struct ImageWalk<'a> {
+    request: RequestMaterial<'a>,
+    own_model: &'a str,
+    url: &'a str,
+    auth: &'a str,
+    /// The POST the walk makes — its only outward step, and the seam a test drives
+    /// with scripted answers instead of a live provider.
+    sender: &'a dyn ImageSender,
+    /// What every visited model came to, in visit order.
+    trail: Vec<(String, Visited)>,
+    /// Why the walk stopped before exhausting the candidates, when it did.
+    stopped: Option<String>,
+}
+
+impl ImageWalk<'_> {
+    /// Run the walk: `own_step` for the account's own model, then `candidates` — the
+    /// other models the account's picker offers, in picker order, with the tried
+    /// model and repeats of any entry already left out.
+    async fn run(&mut self, own_step: Step, candidates: Vec<String>) -> anyhow::Result<Walked> {
+        let own_model = self.own_model;
+        if let Some(walked) = self
+            .visit(own_model, own_step, !candidates.is_empty())
+            .await?
+        {
+            return Ok(walked);
+        }
+
+        for (index, model) in candidates.iter().enumerate() {
+            // A visit that left its outcome unknown — or found the request itself
+            // unsendable — set the reason: nothing after it may be tried.
+            if self.stopped.is_some() {
+                break;
+            }
+            let more_models = index + 1 < candidates.len();
+            let Some(step) = self.candidate_step(model).await else {
+                // The catalog's loss is stated on this model's own line; the stop
+                // line says only that the walk ended here.
+                self.trail.push((
+                    model.clone(),
+                    Visited::Skipped(CATALOG_UNREACHABLE.to_string()),
+                ));
+                if more_models {
+                    self.stopped = Some("the remaining models were not checked".to_string());
+                }
+                break;
+            };
+            if let Some(walked) = self.visit(model, step, more_models).await? {
+                return Ok(walked);
+            }
+        }
+        Ok(Walked::Unserved)
+    }
+
+    /// Prepare one candidate: its catalog declarations checked against the request,
+    /// so the step to visit it with is known before anything is sent to it.
+    ///
+    /// `None` when the catalog itself could not be reached — this model's capability
+    /// is unknown, and so is every later candidate's.
+    async fn candidate_step(&mut self, model: &str) -> Option<Step> {
+        let info = match resolve_image_model(crate::config::DEFAULT_PROVIDER_ENDPOINT, model).await
+        {
+            Ok(Some(info)) => info,
+            // Reached the catalog and it does not list the model, or lists it as
+            // text-only: that model's own limitation, and the walk goes on.
+            Err(_) => return Some(Step::Skip(NOT_AN_IMAGE_MODEL.to_string())),
+            Ok(None) => return None,
+        };
+        match eligibility(
+            model,
+            &info,
+            self.request.references.len(),
+            self.request.size_arg,
+            RefusalVoice::Candidate,
+        ) {
+            Ok(size) => Some(Step::Attempt {
+                info: Some(info),
+                size,
+            }),
+            Err(reason) => Some(Step::Skip(reason)),
+        }
+    }
+
+    /// Visit one model: skip it when it can never be sent the request, otherwise
+    /// attempt it and read what came back.
+    ///
+    /// `more_models` is whether any model is left after this one, so a visit whose
+    /// outcome ends the walk says why it stopped only when something was actually
+    /// left untried — with the list exhausted there is nothing to explain.
+    async fn visit(
+        &mut self,
+        model: &str,
+        step: Step,
+        more_models: bool,
+    ) -> anyhow::Result<Option<Walked>> {
+        let (info, size) = match step {
+            Step::Skip(reason) => {
+                tracing::debug!(model, %reason, "Image generation: model cannot serve the request");
+                self.trail
+                    .push((model.to_string(), Visited::Skipped(reason)));
+                return Ok(None);
+            }
+            Step::Attempt { info, size } => (info, size),
+        };
+        // A body the client-side budget cannot fit is the REQUEST's own limit: no
+        // declaration of any other model changes it. On the account's own model
+        // nothing has been sent yet, so the attempt is refused as it always was;
+        // mid-walk the walk stops there, naming the model the request could no longer
+        // be built for.
+        let body = match self.body(model, info.as_ref(), size) {
+            Ok(body) => body,
+            Err(e) if model == self.own_model => return Err(e),
+            Err(e) => {
+                let reason = e.to_string();
+                tracing::warn!(
+                    model,
+                    %reason,
+                    "Image generation: request body too large — no other model is tried"
+                );
+                self.stopped = Some(format!("`{model}` was not sent to: {reason}"));
+                return Ok(None);
+            }
+        };
+        match generate_image_with_retries(self.url, &body, self.auth, self.sender).await {
+            Ok(response) => Ok(Some(Walked::Served {
+                model: model.to_string(),
+                response,
+            })),
+            Err(AttemptOutcome::WalkOn(failures)) => {
+                tracing::info!(
+                    model,
+                    reason = %describe_failure(&failures, self.has_references()),
+                    "Image generation: model did not serve the request"
+                );
+                self.trail
+                    .push((model.to_string(), Visited::Attempted(failures)));
+                Ok(None)
+            }
+            Err(AttemptOutcome::Unknown(failures)) => {
+                let reason = describe_failure(&failures, self.has_references());
+                tracing::warn!(
+                    model,
+                    %reason,
+                    "Image generation: outcome unknown — no other model is tried"
+                );
+                if more_models {
+                    self.stopped = Some(format!(
+                        "`{model}` may have completed and been billed — its outcome is unknown, \
+                         so no other model was tried"
+                    ));
+                }
+                self.trail
+                    .push((model.to_string(), Visited::Attempted(failures)));
+                Ok(None)
+            }
+            Err(AttemptOutcome::Aborted) => {
+                anyhow::bail!("{SHUTDOWN_ABORTED}");
+            }
+        }
+    }
+
+    /// Build one model's attempt request from its own declarations and fit it to the
+    /// aggregate body budget. `info` is `None` only for the account's own model's
+    /// fail-open attempt (the catalog was unreachable): it sends only what the user
+    /// provided itself, with no requested size — which is exactly what
+    /// [`RequestMaterial::aspect_ratio`] holds for it.
+    fn body(
+        &mut self,
+        model: &str,
+        info: Option<&ImageModelInfo>,
+        size: Option<(&'static str, String)>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut body = build_request_body(
+            model,
+            self.request.prompt,
+            self.request.aspect_ratio.as_deref(),
+            size,
+            self.request.references,
+            info,
+        );
+        // Aggregate body budget: per-image caps don't bound multi-reference
+        // totals, so compress references further until the serialized request fits
+        // the ~2 MB client-side body budget (not a documented OpenRouter number).
+        // The references belong to the REQUEST, not to one model, so the first fit
+        // releases their retained bytes.
+        super::fit_request_body_budget(
+            &mut body,
+            self.request.references,
+            super::MAX_REQUEST_BODY_BYTES,
+        )?;
+        Ok(body)
+    }
+
+    /// Whether the request carries reference images — the refusal hint about the
+    /// provider possibly accepting fewer of them may only appear when it does.
+    fn has_references(&self) -> bool {
+        !self.request.references.is_empty()
+    }
+
+    /// The failure text: with nothing else configured to walk to, exactly what a lone
+    /// attempt reported before the walk existed; otherwise what every visited model
+    /// answered, what was skipped and why, and why the walk stopped where it did.
+    fn failure_message(&self) -> String {
+        let [(_, visited)] = &self.trail[..] else {
+            return self.walk_failure();
+        };
+        let message = match visited {
+            Visited::Skipped(reason) => reason.clone(),
+            Visited::Attempted(failures) => build_terminal_message(failures, self.has_references()),
+        };
+        // The walk stopped at its first model: with nothing visited after it, the
+        // lone attempt's message stands, and the reason nothing else was tried
+        // follows it.
+        match &self.stopped {
+            Some(stopped) => format!("{message}\n{WALK_STOPPED_PREFIX}{stopped}"),
+            None => message,
+        }
+    }
+
+    /// The failure that names every model the walk visited, inside the room the model
+    /// receives for it: what one line cannot hold is cut like anything else.
+    fn walk_failure(&self) -> String {
+        let header = "Image generation failed: no configured image model served the request.";
+        let stop = match &self.stopped {
+            Some(stopped) => format!("\n{WALK_STOPPED_PREFIX}{stopped}"),
+            None => String::new(),
+        };
+        let line_bytes = walk_line_bytes(self.trail.len(), header.len() + stop.len());
+
+        let mut out = String::from(header);
+        for (model, visited) in &self.trail {
+            out.push_str(&crate::util::cut_bytes(
+                &self.line(model, visited),
+                line_bytes,
+            ));
+        }
+        out.push_str(&stop);
+        out
+    }
+
+    /// One visited model's line: its own opening — the name, and the label marking the
+    /// account's own pick — with what it answered or why it was never sent to.
+    fn line(&self, model: &str, visited: &Visited) -> String {
+        let own = if model == self.own_model {
+            " (the account's image model)"
+        } else {
+            ""
+        };
+        let described = match visited {
+            Visited::Skipped(reason) => format!("not sent to — {reason}"),
+            Visited::Attempted(failures) => describe_failure(failures, self.has_references()),
+        };
+        format!("\n- `{model}`{own}: {described}")
+    }
+
+    /// The note the assistant receives with a picture another model produced: which
+    /// model made it, and what happened with the account's own model (the walk's
+    /// first entry). `None` when the account's own model produced it — there is
+    /// nothing to disclose.
+    fn fallback_note(&self, served_by: &str) -> Option<String> {
+        if served_by == self.own_model {
+            return None;
+        }
+        let (_, own_visited) = self.trail.first()?;
+        let own_fate = match own_visited {
+            Visited::Skipped(reason) => format!("was never sent to: {reason}"),
+            Visited::Attempted(failures) => format!(
+                "did not serve the request: {}",
+                describe_failure(failures, self.has_references())
+            ),
+        };
+        // The note carries the provider's own answer, and the annotation it rides on is
+        // not scrubbed anywhere downstream — unlike the failure path and the tool text
+        // this note also feeds.
+        let fate = crate::util::cut_bytes(
+            &crate::util::scrub_credentials(&own_fate),
+            WALK_ENTRY_MAX_BYTES,
+        );
+        // A cut fate, or one the provider already punctuated, takes no second stop.
+        let full_stop = if fate.ends_with(['.', '…']) {
+            ""
+        } else {
+            "."
+        };
+        Some(format!(
+            "`{served_by}` produced this picture — the account's image model `{}` {fate}{full_stop}",
+            self.own_model,
+        ))
     }
 }
 
@@ -265,36 +899,108 @@ impl AttemptFailure {
             _ => None,
         }
     }
+
+    /// Whether another configured model may be offered the request after this
+    /// failure: the cause is on the side of the chosen model or the provider
+    /// serving it — the model cannot make pictures, is gone, is unavailable or
+    /// overloaded, will not accept the request or the key, has no quota left — or
+    /// the request never reached the provider at all. Every HTTP refusal qualifies
+    /// whatever it says, since the product does not judge a refusal from its
+    /// wording; a transport failure qualifies along the same line the product
+    /// already treats such an attempt as safely repeatable (inside the
+    /// quick-failure window, i.e. nothing can have been generated). A failure whose
+    /// outcome is unknown — a wait that ran out, an answer that could not be read —
+    /// never does.
+    fn walkable(&self) -> bool {
+        match self {
+            Self::Http { .. } => true,
+            Self::Transport { elapsed_ms }
+            | Self::Timeout {
+                elapsed_ms,
+                connect: true,
+            } => *elapsed_ms < IMAGE_GEN_QUICK_FAILURE_MS,
+            Self::Timeout { connect: false, .. } | Self::BodyRead | Self::Parse { .. } => false,
+        }
+    }
 }
 
-/// POST the image-generation request with bounded retries.
+/// How one model's attempt ended without a picture.
+enum AttemptOutcome {
+    /// Walk on: another configured model may still serve the request.
+    WalkOn(Vec<AttemptFailure>),
+    /// The outcome is unknown — the request may have been produced and charged, so
+    /// nothing may re-issue it.
+    Unknown(Vec<AttemptFailure>),
+    /// Global shutdown raced the attempt.
+    Aborted,
+}
+
+impl AttemptOutcome {
+    /// Classify one model's terminal failure trail (its last failure decides).
+    fn of(failures: Vec<AttemptFailure>) -> Self {
+        if failures.last().is_some_and(AttemptFailure::walkable) {
+            Self::WalkOn(failures)
+        } else {
+            Self::Unknown(failures)
+        }
+    }
+}
+
+/// One model's POST — the walk's only outward step, and the seam through which a
+/// test drives the walk with the answers the product receives instead of reaching a
+/// provider.
+#[async_trait]
+trait ImageSender: Send + Sync {
+    async fn post(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        auth: &str,
+    ) -> Result<serde_json::Value, AttemptFailure>;
+}
+
+/// The production sender: OpenRouter's dedicated Image API over the 10-minute
+/// client.
+struct HttpSender;
+
+#[async_trait]
+impl ImageSender for HttpSender {
+    async fn post(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        auth: &str,
+    ) -> Result<serde_json::Value, AttemptFailure> {
+        attempt_image_generation(url, body, auth).await
+    }
+}
+
+/// POST one model's request with bounded retries.
 ///
 /// Retry policy: auto-retry ONLY prompt failures — transport errors and HTTP
 /// 429/502/503/524/529 — with backoff (Retry-After when present, else 5 s)
-/// and at most one retry. Every retryable arm is additionally gated by
-/// `IMAGE_GEN_QUICK_FAILURE_MS`: a failure outside the quick-failure window
-/// means a long generation was in flight — possibly billed, never re-submitted.
-/// Never retry: full-timeout hangs, any 4xx (402 =
-/// insufficient credits), body-read failures after a 2xx (may have been
-/// billed), or 200-with-error bodies (completed and billed).
+/// and at most one retry per model, the same single retry the attempt always had.
+/// Every retryable arm is additionally gated by `IMAGE_GEN_QUICK_FAILURE_MS`: a
+/// failure outside the quick-failure window means a long generation was in flight —
+/// possibly billed, never re-submitted. Never retry: full-timeout hangs, a 4xx
+/// outside the retryable statuses (402 = insufficient credits), body-read
+/// failures after a 2xx (may have been billed), or 200-with-error bodies
+/// (completed and billed).
 async fn generate_image_with_retries(
     url: &str,
     body: &serde_json::Value,
     auth: &str,
-) -> Result<serde_json::Value, String> {
-    // The refusal hint about the reference count may only appear when the
-    // request actually carried input images — the body carries the array
-    // exactly then.
-    let has_references = body.get(super::INPUT_REFERENCES_KEY).is_some();
+    sender: &dyn ImageSender,
+) -> Result<serde_json::Value, AttemptOutcome> {
     let mut failures: Vec<AttemptFailure> = Vec::new();
     for attempt in 1..=IMAGE_GEN_MAX_ATTEMPTS {
-        match attempt_image_generation(url, body, auth).await {
+        match sender.post(url, body, auth).await {
             Ok(body) => return Ok(body),
             Err(failure) => {
                 let retryable = failure.retryable();
                 failures.push(failure);
                 if !retryable || attempt == IMAGE_GEN_MAX_ATTEMPTS {
-                    return Err(build_terminal_message(&failures, has_references));
+                    return Err(AttemptOutcome::of(failures));
                 }
                 let sleep_ms = failures
                     .last()
@@ -303,7 +1009,7 @@ async fn generate_image_with_retries(
                         ms.clamp(IMAGE_GEN_BACKOFF_MS, RETRY_AFTER_MAX_MS)
                     });
                 if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(sleep_ms)).await {
-                    return Err("Shutting down — image generation aborted".to_string());
+                    return Err(AttemptOutcome::Aborted);
                 }
             }
         }
@@ -381,7 +1087,38 @@ async fn attempt_image_generation(
 /// a refusal can carry the reference-count hint only where it could apply.
 fn build_terminal_message(failures: &[AttemptFailure], has_references: bool) -> String {
     let last = failures.last().expect("at least one failure");
-    let cause = match last {
+    let cause = failure_cause(last, has_references);
+    let attempts = failures.len();
+    let prefix = if attempts > 1 {
+        format!("Image generation failed after {attempts} attempt(s): ")
+    } else if matches!(last, AttemptFailure::Parse { .. }) {
+        // A single-attempt parse failure keeps its fully-formed message
+        // without an extra "Image generation failed: " prefix.
+        String::new()
+    } else {
+        "Image generation failed: ".to_string()
+    };
+    format!("{prefix}{cause}")
+}
+
+/// One model's answer as the walk's failure names it: the cause of its terminal
+/// attempt, with the attempt count when its own single retry ran.
+fn describe_failure(failures: &[AttemptFailure], has_references: bool) -> String {
+    let cause = failure_cause(
+        failures.last().expect("at least one failure"),
+        has_references,
+    );
+    if failures.len() > 1 {
+        format!("{cause} ({} attempts)", failures.len())
+    } else {
+        cause
+    }
+}
+
+/// The cause of one attempt failure — the provider's own explanation where it gave
+/// one, never an invented one.
+fn failure_cause(last: &AttemptFailure, has_references: bool) -> String {
+    match last {
         // Parse failures already carry a fully-formed message (error context
         // plus a raw-body preview) — used verbatim.
         AttemptFailure::Parse { message } => message.clone(),
@@ -428,18 +1165,7 @@ fn build_terminal_message(failures: &[AttemptFailure], has_references: bool) -> 
              have completed and been billed server-side; verify before retrying"
                 .to_string()
         }
-    };
-    let attempts = failures.len();
-    let prefix = if attempts > 1 {
-        format!("Image generation failed after {attempts} attempt(s): ")
-    } else if matches!(last, AttemptFailure::Parse { .. }) {
-        // A single-attempt parse failure keeps its fully-formed message
-        // without an extra "Image generation failed: " prefix.
-        String::new()
-    } else {
-        "Image generation failed: ".to_string()
-    };
-    format!("{prefix}{cause}")
+    }
 }
 
 /// Map an HTTP status to the typed provider error description, including the
@@ -489,14 +1215,14 @@ fn describe_http_failure(status: u16, body: &str, has_references: bool) -> Strin
 /// available) the model's declared capabilities. `info` is `Some` exactly
 /// when the catalog is available and the model passed the capability check;
 /// `None` means the catalog is unavailable (fail-open) — only explicitly
-/// user-provided parameters that need no capability check are sent, and a
-/// requested size is dropped (see [`resolve_size`], which then returns `None`).
+/// user-provided parameters that need no capability check are sent, and the
+/// requested size was already dropped before this point (see [`own_step`]).
 ///
 /// `size` is the pre-validated [`resolve_size`] result: the request-body key
 /// to send it under, and the value.
 ///
-/// Reference-count validation happens in `execute`'s pre-flight guard before
-/// any file is loaded; this builder trusts the caller's count.
+/// Reference-count validation is the caller's ([`eligibility`], through
+/// [`validate_reference_count`]); this builder trusts the caller's count.
 fn build_request_body(
     model: &str,
     prompt: &str,
@@ -528,9 +1254,9 @@ fn build_request_body(
             body[super::INPUT_REFERENCES_KEY] = super::reference_json(references);
         }
     } else {
-        // Fail-open: send only what the user explicitly provided. The size is
-        // deliberately dropped by `resolve_size` (it returns `None`) — with no
-        // catalog data, guessing the model's size parameter is not an option.
+        // Fail-open: send only what the user explicitly provided. A requested
+        // size never gets here — with no catalog data, guessing the model's size
+        // parameter is not an option (see [`own_step`], which drops it).
         if let Some(ratio) = aspect_ratio {
             body["aspect_ratio"] = json!(ratio);
         }
@@ -548,34 +1274,48 @@ fn build_request_body(
 }
 
 /// Validate the reference count against the catalog's `input_references`
-/// range, clamped to the provider's documented ceiling. Runs in execute's
-/// pre-flight guard, before any file is loaded.
+/// range, clamped to the provider's documented ceiling. Runs in [`eligibility`]
+/// before any model's body is built — for the account's own model before any
+/// reference file is loaded, for a candidate after they are — and is worded for
+/// `voice`, exactly as [`unsupported_size`] is.
 fn validate_reference_count(
     model: &str,
     info: &ImageModelInfo,
     count: usize,
-) -> anyhow::Result<()> {
-    match info
+    voice: RefusalVoice,
+) -> Result<(), String> {
+    let Some(max) = info
         .range_max("input_references")
         .map(super::effective_reference_max)
-    {
-        #[expect(clippy::cast_possible_wrap)]
-        Some(max) if count as i64 > max => anyhow::bail!(
-            "Model `{model}` supports at most {max} reference image(s), \
-             got {count}. Retry with fewer images.",
-        ),
-        Some(_) => {}
-        None => anyhow::bail!(
-            "Model `{model}` does not support reference images. \
-             Retry without the `images` parameter."
-        ),
+    else {
+        // The model declares no reference input at all.
+        return Err(match voice {
+            RefusalVoice::OwnModel => format!(
+                "Model `{model}` does not support reference images. \
+                 Retry without the `images` parameter."
+            ),
+            RefusalVoice::Candidate => "does not support reference images".to_string(),
+        });
+    };
+    #[expect(clippy::cast_possible_wrap)]
+    if count as i64 <= max {
+        return Ok(());
     }
-    Ok(())
+    Err(match voice {
+        RefusalVoice::OwnModel => format!(
+            "Model `{model}` supports at most {max} reference image(s), got {count}. \
+             Retry with fewer images.",
+        ),
+        RefusalVoice::Candidate => {
+            format!("supports at most {max} reference image(s), got {count}")
+        }
+    })
 }
 
-/// Resolve the requested `size` against the selected model's declared
-/// capabilities, returning the request-body key and the normalised value the
-/// request must carry.
+/// Resolve the requested `size` against the model's declared capabilities,
+/// returning the request-body key and the normalised value the request must
+/// carry. Called for every model the walk builds a body for — the account's own
+/// and each candidate alike.
 ///
 /// The model — not MahBot — decides which sizes exist, so a value it cannot
 /// express is refused with the values it does support (or an explicit "no
@@ -583,21 +1323,15 @@ fn validate_reference_count(
 /// provider as an opaque error. A tier (`2K`) is case-insensitive and goes
 /// through `resolution` when the model declares it, through `size` otherwise
 /// (OpenRouter's `size` takes a tier or explicit pixels); pixels
-/// (`1024x1024`) always go through `size`. With no catalog data nothing is
-/// known about the model, so the value is dropped exactly as before.
+/// (`1024x1024`) always go through `size`. A request from a model whose
+/// declarations are unknown never reaches this (see [`eligibility`]).
 fn resolve_size(
     model: &str,
     size: Option<&str>,
-    info: Option<&ImageModelInfo>,
+    info: &ImageModelInfo,
+    voice: RefusalVoice,
 ) -> anyhow::Result<Option<(&'static str, String)>> {
     let Some(size) = size.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-
-    let Some(info) = info else {
-        tracing::debug!(
-            "size `{size}` dropped — catalog unavailable, so no model capability is known"
-        );
         return Ok(None);
     };
 
@@ -610,41 +1344,52 @@ fn resolve_size(
     };
 
     if !info.declares(key) {
-        return Err(unsupported_size(model, size, info));
+        return Err(unsupported_size(model, size, info, voice));
     }
     // A declared enum is the model's own list of what it takes; another
     // constraint shape declares the parameter without enumerating values.
     if let Some(values) = info.enum_values(key)
         && !values.iter().any(|v| v.eq_ignore_ascii_case(&value))
     {
-        return Err(unsupported_size(model, size, info));
+        return Err(unsupported_size(model, size, info, voice));
     }
 
     Ok(Some((key, value)))
 }
 
-/// The refusal for a size the selected model cannot express: the values it
-/// accepts, or — when the model declares no size parameter at all — a
-/// statement that it has no adjustable size (an empty value list would be
-/// meaningless).
-fn unsupported_size(model: &str, size: &str, info: &ImageModelInfo) -> anyhow::Error {
+/// The refusal for a size the model cannot express: the values it accepts, or —
+/// when the model declares no size parameter at all — a statement that it has no
+/// adjustable size (an empty value list would be meaningless), in the voice of
+/// `voice`.
+fn unsupported_size(
+    model: &str,
+    size: &str,
+    info: &ImageModelInfo,
+    voice: RefusalVoice,
+) -> anyhow::Error {
     let supported: Vec<&str> = ["resolution", "size"]
         .iter()
         .filter_map(|param| info.enum_values(param))
         .flatten()
         .map(String::as_str)
         .collect();
-    if supported.is_empty() {
-        anyhow::anyhow!(
+    // A candidate's line names the model already, so the fact alone is what it adds.
+    match (voice, supported.is_empty()) {
+        (RefusalVoice::OwnModel, true) => anyhow::anyhow!(
             "usage: model `{model}` has no adjustable image size — \
              hint: omit the `size` argument"
-        )
-    } else {
-        anyhow::anyhow!(
+        ),
+        (RefusalVoice::OwnModel, false) => anyhow::anyhow!(
             "usage: model `{model}` does not support size `{size}` — \
              hint: pass a size it supports: {}",
             supported.join(", ")
-        )
+        ),
+        (RefusalVoice::Candidate, true) => anyhow::anyhow!("has no adjustable image size"),
+        (RefusalVoice::Candidate, false) => anyhow::anyhow!(
+            "does not support size `{size}` — \
+             it accepts: {}",
+            supported.join(", ")
+        ),
     }
 }
 
@@ -814,6 +1559,10 @@ fn extension_for_media_type(media_type: Option<&str>) -> &'static str {
 mod tests {
     use super::*;
     use crate::tools::media_catalog::image::{ImageCatalog, parse_catalog};
+    use crate::util::UnwrapPoison;
+    use RefusalVoice::OwnModel;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
 
     /// Fixture catalog covering a hybrid image model (resolution + reference
     /// caps), a recraft-like model (aspect ratio only, declares "auto"), a
@@ -863,20 +1612,44 @@ mod tests {
         .expect("valid fixture")
     }
 
+    /// One tiny 1×1 reference PNG on disk and the `ReferenceImage`s loaded from it —
+    /// what a walk's request carries, with the path the aspect ratio is resolved
+    /// from.
+    struct Refs {
+        _dir: tempfile::TempDir,
+        paths: Vec<PathBuf>,
+        loaded: Vec<crate::util::ReferenceImage>,
+    }
+
+    impl Refs {
+        /// No reference at all.
+        fn none() -> Self {
+            Self {
+                _dir: tempfile::TempDir::new().unwrap(),
+                paths: Vec::new(),
+                loaded: Vec::new(),
+            }
+        }
+    }
+
     /// Build `n` real validated reference images from one tiny PNG file.
-    async fn refs(n: usize) -> Vec<crate::util::ReferenceImage> {
+    async fn refs(n: usize) -> Refs {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("ref.png");
         std::fs::write(&path, crate::util::test::noisy_png(1, 1)).unwrap();
-        let mut out = Vec::with_capacity(n);
+        let mut loaded = Vec::with_capacity(n);
         for _ in 0..n {
-            out.push(
+            loaded.push(
                 crate::util::load_reference_image(&path, super::super::MAX_REFERENCE_IMAGE_BYTES)
                     .await
                     .unwrap(),
             );
         }
-        out
+        Refs {
+            _dir: dir,
+            paths: vec![path; n],
+            loaded,
+        }
     }
 
     #[tokio::test]
@@ -885,8 +1658,14 @@ mod tests {
         let qwen = catalog.find("qwen/qwen-image-3-pro");
 
         // size "2k" → resolution "2K" (catalog case); 9:16; two references.
-        let refs = refs(2).await;
-        let size = resolve_size("qwen/qwen-image-3-pro", Some("2k"), qwen).unwrap();
+        let refs = refs(2).await.loaded;
+        let size = resolve_size(
+            "qwen/qwen-image-3-pro",
+            Some("2k"),
+            qwen.expect("fixture"),
+            OwnModel,
+        )
+        .unwrap();
         assert_eq!(size, Some(("resolution", "2K".to_string())));
         let body = build_request_body(
             "qwen/qwen-image-3-pro",
@@ -920,7 +1699,13 @@ mod tests {
         let acme = catalog.find("acme/pixels");
 
         // recraft declares no size parameter at all → refused, not dropped.
-        let err = resolve_size("recraft/recraft-v4.1", Some("2K"), recraft).unwrap_err();
+        let err = resolve_size(
+            "recraft/recraft-v4.1",
+            Some("2K"),
+            recraft.expect("fixture"),
+            OwnModel,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("has no adjustable image size"),
             "unexpected error: {err}"
@@ -928,7 +1713,13 @@ mod tests {
 
         // qwen declares resolution ["1K", "2K"] → an unsupported tier names
         // the values the model does support.
-        let err = resolve_size("qwen/qwen-image-3-pro", Some("512"), qwen).unwrap_err();
+        let err = resolve_size(
+            "qwen/qwen-image-3-pro",
+            Some("512"),
+            qwen.expect("fixture"),
+            OwnModel,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("1K, 2K"),
             "unexpected error: {err}"
@@ -936,7 +1727,13 @@ mod tests {
 
         // '1024X1024' (uppercase separator) is pixels; qwen declares no `size`
         // → refused with its resolution values, never sent as a bogus resolution.
-        let err = resolve_size("qwen/qwen-image-3-pro", Some("1024X1024"), qwen).unwrap_err();
+        let err = resolve_size(
+            "qwen/qwen-image-3-pro",
+            Some("1024X1024"),
+            qwen.expect("fixture"),
+            OwnModel,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("1K, 2K"),
             "unexpected error: {err}"
@@ -944,18 +1741,36 @@ mod tests {
 
         // A tier is case-insensitive: "1k" matches the declared "1K".
         assert_eq!(
-            resolve_size("qwen/qwen-image-3-pro", Some("1k"), qwen).unwrap(),
+            resolve_size(
+                "qwen/qwen-image-3-pro",
+                Some("1k"),
+                qwen.expect("fixture"),
+                OwnModel
+            )
+            .unwrap(),
             Some(("resolution", "1K".to_string()))
         );
 
         // Explicit-pixel model: a supported pixel value is sent verbatim under
         // `size`; an unsupported one is refused with the supported list.
-        let size = resolve_size("acme/pixels", Some("1024x1024"), acme).unwrap();
+        let size = resolve_size(
+            "acme/pixels",
+            Some("1024x1024"),
+            acme.expect("fixture"),
+            OwnModel,
+        )
+        .unwrap();
         assert_eq!(size, Some(("size", "1024x1024".to_string())));
         let body = build_request_body("acme/pixels", "p", None, size, &[], acme);
         assert_eq!(body["size"], "1024x1024");
 
-        let err = resolve_size("acme/pixels", Some("512x512"), acme).unwrap_err();
+        let err = resolve_size(
+            "acme/pixels",
+            Some("512x512"),
+            acme.expect("fixture"),
+            OwnModel,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("1024x1024, 2048x2048"),
             "unexpected error: {err}"
@@ -978,33 +1793,41 @@ mod tests {
 
         // Reference overflow → error (count validated pre-flight, not
         // truncated by the body builder).
-        let err = validate_reference_count("qwen/qwen-image-3-pro", qwen.unwrap(), 5).unwrap_err();
-        assert!(err.to_string().contains("at most 4 reference image(s)"));
+        let err = validate_reference_count("qwen/qwen-image-3-pro", qwen.unwrap(), 5, OwnModel)
+            .unwrap_err();
+        assert!(err.contains("at most 4 reference image(s)"));
 
         // Model without input_references → error when images provided.
         let text_only = catalog.find("text-only/model").unwrap();
-        let err = validate_reference_count("text-only/model", text_only, 1).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("does not support reference images")
-        );
+        let err = validate_reference_count("text-only/model", text_only, 1, OwnModel).unwrap_err();
+        assert!(err.contains("does not support reference images"));
+
+        // A candidate the walk passed over gets the fact alone: no model name the line
+        // already carries, no advice about the account's own pick.
+        let err = validate_reference_count(
+            "qwen/qwen-image-3-pro",
+            qwen.unwrap(),
+            5,
+            RefusalVoice::Candidate,
+        )
+        .unwrap_err();
+        assert_eq!(err, "supports at most 4 reference image(s), got 5");
 
         // A catalog declaring more than the provider accepts is clamped to the
         // documented ceiling: 16 passes, 17 is refused with that same maximum.
         let huge = catalog.find("huge/refs").unwrap();
-        validate_reference_count("huge/refs", huge, 16).expect("16 references accepted");
-        let err = validate_reference_count("huge/refs", huge, 17).unwrap_err();
-        assert!(err.to_string().contains("at most 16 reference image(s)"));
+        validate_reference_count("huge/refs", huge, 16, OwnModel).expect("16 references accepted");
+        let err = validate_reference_count("huge/refs", huge, 17, OwnModel).unwrap_err();
+        assert!(err.contains("at most 16 reference image(s)"));
     }
 
     #[tokio::test]
     async fn test_build_request_body_fail_open_minimal() {
-        // info = None (catalog unavailable): only user-provided params are sent,
-        // and the size is dropped — no model capability is known.
-        let refs = refs(1).await;
-        let size = resolve_size("any/model", Some("2k"), None).unwrap();
-        assert!(size.is_none());
-        let body = build_request_body("any/model", "p", Some("16:9"), size, &refs, None);
+        // info = None (catalog unavailable): only user-provided params are sent.
+        // A requested size never reaches the body — with no catalog data, no
+        // model capability is known (`own_step` drops it before the walk).
+        let refs = refs(1).await.loaded;
+        let body = build_request_body("any/model", "p", Some("16:9"), None, &refs, None);
         assert_eq!(body["model"], "any/model");
         assert_eq!(body["prompt"], "p");
         assert_eq!(body["aspect_ratio"], "16:9");
@@ -1427,5 +2250,1269 @@ mod tests {
         );
         assert!(msg.contains("failed after 2 attempt(s)"));
         assert!(msg.contains("parse error"));
+    }
+
+    // ── ImageWalk fallback tests ─────────────────────────────────────────
+
+    /// Scripted answers per model: the walk is driven by exactly the answers the
+    /// product would receive, never by a provider.
+    struct Scripted {
+        answers: Mutex<HashMap<String, VecDeque<Result<serde_json::Value, AttemptFailure>>>>,
+        sent: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    #[async_trait]
+    impl ImageSender for Scripted {
+        async fn post(
+            &self,
+            url: &str,
+            body: &serde_json::Value,
+            _auth: &str,
+        ) -> Result<serde_json::Value, AttemptFailure> {
+            let model = body["model"]
+                .as_str()
+                .expect("every request body names its model")
+                .to_string();
+            self.sent
+                .lock()
+                .unwrap_poison()
+                .push((model.clone(), body.clone()));
+            let mut answers = self.answers.lock().unwrap_poison();
+            let queue = answers
+                .get_mut(&model)
+                .unwrap_or_else(|| panic!("unscripted image POST to `{model}` ({url})"));
+            queue
+                .pop_front()
+                .unwrap_or_else(|| panic!("scripted answers for `{model}` exhausted ({url})"))
+        }
+    }
+
+    impl Scripted {
+        fn new() -> Self {
+            Self {
+                answers: Mutex::new(HashMap::new()),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn answer(&self, model: &str, answer: Result<serde_json::Value, AttemptFailure>) {
+            self.answers
+                .lock()
+                .unwrap_poison()
+                .entry(model.to_string())
+                .or_default()
+                .push_back(answer);
+        }
+
+        /// The models POSTed to, in POST order.
+        fn models_sent(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap_poison()
+                .iter()
+                .map(|(model, _)| model.clone())
+                .collect()
+        }
+
+        /// The body of the last POST made to `model`.
+        fn body_for(&self, model: &str) -> serde_json::Value {
+            self.sent
+                .lock()
+                .unwrap_poison()
+                .iter()
+                .rev()
+                .find(|(sent_to, _)| sent_to.as_str() == model)
+                .map_or_else(
+                    || panic!("no POST was made to `{model}`"),
+                    |(_, body)| body.clone(),
+                )
+        }
+    }
+
+    /// An HTTP refusal that came back in 1 s.
+    fn http(status: u16, body: &str) -> AttemptFailure {
+        AttemptFailure::Http {
+            status,
+            body: body.to_string(),
+            retry_after_ms: None,
+            elapsed_ms: 1_000,
+        }
+    }
+
+    /// A 2xx body carrying one base64 picture.
+    fn served(b64: &str) -> serde_json::Value {
+        json!({"data": [{"b64_json": b64}]})
+    }
+
+    /// A picker list from bare model names.
+    fn picker(models: &[&str]) -> Vec<String> {
+        models.iter().map(|model| (*model).to_string()).collect()
+    }
+
+    fn seed_fixture() {
+        crate::tools::media_catalog::image::seed_cache(Some(Arc::new(fixture_catalog())));
+    }
+
+    /// Seed the process-global catalog with the fixture, arming the
+    /// membership-miss refresh cooldown on the way.
+    ///
+    /// Resolving a model the snapshot does not list forces one catalog refresh;
+    /// with no provider key configured in tests that refresh fails and records a
+    /// negative cache entry — wiping the snapshot. Priming the cooldown once (its
+    /// side effect undone by the re-seed right after) makes every later
+    /// membership miss re-check the seeded snapshot, as a reachable catalog does
+    /// in production.
+    async fn seed_fixture_catalog() {
+        seed_fixture();
+        let _ = resolve_image_model(crate::config::DEFAULT_PROVIDER_ENDPOINT, "probe/absent").await;
+        seed_fixture();
+    }
+
+    /// Restore the shared catalog fixture at the end of a test that seeds a negative
+    /// cache into it, however that test ends: a poisoned global cache would fail every
+    /// later test sharing the `active_models` key.
+    struct CatalogFixture;
+
+    impl Drop for CatalogFixture {
+        fn drop(&mut self) {
+            seed_fixture();
+        }
+    }
+
+    /// Restore the global config at the end of a test that changes it, however that test
+    /// ends: a panic between the change and the restore would otherwise leave every later
+    /// test in this binary running on it.
+    struct ConfigFixture(Option<crate::config::ConfigData>);
+
+    impl Drop for ConfigFixture {
+        fn drop(&mut self) {
+            if let Some(config) = self.0.take() {
+                crate::config::CONFIG.swap(config);
+            }
+        }
+    }
+
+    /// The plan `generate` builds for these fixtures: the real [`plan_walk`] over the
+    /// fixture catalog and the given picker.
+    async fn plan_for(
+        own: &str,
+        refs: &Refs,
+        size_arg: Option<&str>,
+        candidates: &[&str],
+    ) -> WalkPlan {
+        plan_walk(own, refs.loaded.len(), size_arg, &picker(candidates))
+            .await
+            .expect("the plan walks")
+    }
+
+    /// Run the walk `generate` would run for these fixtures: the real plan, then the
+    /// walk itself over scripted answers.
+    async fn planned_report(
+        own: &str,
+        size_arg: Option<&str>,
+        candidates: &[&str],
+        refs: Refs,
+        scripted: &Scripted,
+    ) -> WalkReport {
+        let plan = plan_for(own, &refs, size_arg, candidates).await;
+        walk_report(own, plan, size_arg, refs, scripted).await
+    }
+
+    /// One walk driven by scripted answers: what it came to, the failure text it
+    /// would report, the note it would attach, and the models it POSTed to.
+    struct WalkReport {
+        /// The serving model, when one served.
+        walked_is_served: Option<String>,
+        /// The failure text, when none did.
+        failure: Option<String>,
+        /// The note for the serving model.
+        note: Option<String>,
+        sent: Vec<String>,
+    }
+
+    /// Run one walk from an explicit plan — for the states [`plan_walk`] never returns
+    /// (a catalog that goes unreachable mid-walk, and the walk-only skip the plan
+    /// refuses outright).
+    async fn walk_report(
+        own: &str,
+        plan: WalkPlan,
+        size_arg: Option<&str>,
+        refs: Refs,
+        scripted: &Scripted,
+    ) -> WalkReport {
+        let WalkPlan {
+            own_step,
+            candidates,
+            catalog_reached,
+        } = plan;
+        let Refs {
+            _dir,
+            paths,
+            loaded,
+        } = refs;
+        let mut references = loaded;
+        // What `generate` resolves for these fixtures — no fixture carries an aspect
+        // ratio argument of its own, so it is the detection over the same references.
+        let aspect_ratio = request_aspect_ratio(None, &paths, catalog_reached);
+        let mut walk = ImageWalk {
+            request: RequestMaterial {
+                prompt: "a cat",
+                aspect_ratio,
+                size_arg,
+                references: &mut references,
+            },
+            own_model: own,
+            url: "https://example.invalid/images",
+            auth: "Bearer test",
+            sender: scripted,
+            trail: Vec::new(),
+            stopped: None,
+        };
+        let walked = walk
+            .run(own_step, candidates)
+            .await
+            .expect("the walk completes");
+        let (walked_is_served, failure, note) = match walked {
+            Walked::Served { model, .. } => {
+                let note = walk.fallback_note(&model);
+                (Some(model), None, note)
+            }
+            Walked::Unserved => (None, Some(walk.failure_message()), None),
+        };
+        WalkReport {
+            walked_is_served,
+            failure,
+            note,
+            sent: scripted.models_sent(),
+        }
+    }
+
+    /// A model the account's picker offers may produce the picture, and the result
+    /// the assistant receives with it names that model and what happened with the
+    /// account's own.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn walk_falls_back_to_another_picker_model_and_notes_it() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let fallback = "recraft/recraft-v4.1";
+        let scripted = Scripted::new();
+        scripted.answer(
+            own,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+        scripted.answer(fallback, Ok(served("aGVsbG8=")));
+
+        let report = planned_report(own, None, &[fallback], Refs::none(), &scripted).await;
+
+        assert_eq!(report.walked_is_served.as_deref(), Some(fallback));
+        // The own model's 400 is its own refusal: one POST to it — never retried
+        // — and then one to the model that served.
+        assert_eq!(report.sent, [own, fallback]);
+        assert_eq!(scripted.body_for(fallback)["model"], fallback);
+
+        let note = report.note.expect("a fallback carries the note");
+        assert!(
+            note.contains(fallback),
+            "the note names the model that served: {note}"
+        );
+        assert!(
+            note.contains(own),
+            "the note names the account's own model: {note}"
+        );
+        assert!(
+            note.contains("did not serve the request"),
+            "the note says what the own model did: {note}"
+        );
+        assert!(
+            note.contains("unsupported"),
+            "the note carries the provider's message: {note}"
+        );
+        // The note rides with the picture — the result (and so the payload
+        // annotation the assistant reads) carries it beside the image.
+        let generated = Generated {
+            path: std::path::PathBuf::from("x.png"),
+            note: Some(note),
+        };
+        assert!(
+            ImageGenTool
+                .result_text(&generated)
+                .contains("did not serve the request")
+        );
+    }
+
+    /// The note carries the provider's own words, and the payload annotation it rides on
+    /// is scrubbed nowhere downstream — so the note scrubs them where it is built.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn the_fallback_note_scrubs_the_providers_own_words() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let fallback = "recraft/recraft-v4.1";
+        let scripted = Scripted::new();
+        scripted.answer(
+            own,
+            Err(http(
+                400,
+                r#"{"error":{"message":"rejected: api_key: sk-live-0123456789"}}"#,
+            )),
+        );
+        scripted.answer(fallback, Ok(served("aGVsbG8=")));
+
+        let report = planned_report(own, None, &[fallback], Refs::none(), &scripted).await;
+
+        let note = report.note.expect("a fallback carries the note");
+        assert!(
+            !note.contains("sk-live-0123456789"),
+            "a credential in the provider's answer is redacted: {note}"
+        );
+        assert!(note.contains("*[REDACTED]"), "{note}");
+    }
+
+    /// A refusal of the account's own model before anything was sent — here a size
+    /// its declarations cannot express — starts the walk instead of ending the
+    /// attempt.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn walk_starts_when_the_own_model_is_refused_before_sending() {
+        seed_fixture_catalog().await;
+        let own = "recraft/recraft-v4.1";
+        let fallback = "acme/pixels";
+        // A size `acme/pixels` declares; `recraft` has no adjustable size at all.
+        let size_arg = Some("2048x2048");
+        let scripted = Scripted::new();
+        scripted.answer(fallback, Ok(served("aGVsbG8=")));
+
+        let refs = Refs::none();
+        let plan = plan_for(own, &refs, size_arg, &[fallback]).await;
+        assert!(
+            matches!(plan.own_step, Step::Skip(_)),
+            "the own model must be refused before sending"
+        );
+
+        let report = walk_report(own, plan, size_arg, refs, &scripted).await;
+
+        assert_eq!(report.walked_is_served.as_deref(), Some(fallback));
+        assert_eq!(
+            report.sent,
+            [fallback],
+            "the refused own model is never POSTed to"
+        );
+        assert_eq!(scripted.body_for(fallback)["size"], "2048x2048");
+
+        let note = report.note.expect("a fallback carries the note");
+        assert!(
+            note.contains("was never sent to"),
+            "the note says the own model was never sent to: {note}"
+        );
+        assert!(
+            note.contains("no adjustable image size"),
+            "the note carries the refusal: {note}"
+        );
+        assert!(
+            note.contains("hint:"),
+            "the note carries the refusal's size hint: {note}"
+        );
+    }
+
+    /// A candidate that cannot serve the request is never POSTed to, and the failure
+    /// names every visited model with the reason it was skipped.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn walk_skips_candidates_that_cannot_serve_the_request() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let absent = "gone/model";
+        let text_only = "text-only/model";
+        let capped = "recraft/recraft-v4.1";
+        let scripted = Scripted::new();
+        scripted.answer(
+            own,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+
+        // Two references: `recraft` declares at most one.
+        let report = planned_report(
+            own,
+            None,
+            &[absent, text_only, capped],
+            refs(2).await,
+            &scripted,
+        )
+        .await;
+
+        assert_eq!(report.walked_is_served, None);
+        assert_eq!(report.sent, [own], "no candidate may be POSTed to");
+
+        let failure = report.failure.expect("nothing served");
+        assert!(
+            failure.starts_with(
+                "Image generation failed: no configured image model served the request."
+            ),
+            "{failure}"
+        );
+        for (model, reason) in [
+            (absent, NOT_AN_IMAGE_MODEL),
+            (text_only, NOT_AN_IMAGE_MODEL),
+            (capped, "supports at most 1 reference image(s), got 2"),
+        ] {
+            let line = failure
+                .lines()
+                .find(|line| line.contains(model))
+                .unwrap_or_else(|| panic!("`{model}` is missing from: {failure}"));
+            assert!(
+                line.contains(reason),
+                "`{model}` says why it was skipped: {line}"
+            );
+        }
+        // A candidate the walk passed over is not the account's pick to change, so
+        // its line carries no remediation for changing it — and no repetition of the
+        // model name the line itself already opens with.
+        assert!(
+            failure.contains(
+                "`recraft/recraft-v4.1`: not sent to — \
+                 supports at most 1 reference image(s), got 2"
+            ),
+            "a candidate's refusal is the fact alone: {failure}"
+        );
+        assert!(
+            !failure.contains("Set an image-capable model"),
+            "a candidate's reason drops the account's remediation: {failure}"
+        );
+        // The failure reaches the assistant whole, through the truncation a tool
+        // result goes through.
+        assert_eq!(crate::util::truncate_tool_output(&failure), failure);
+    }
+
+    /// A candidate whose declarations cannot express the requested size is skipped with
+    /// the declaration fact, in the walk's own voice: the `usage:`/`hint:` framing of
+    /// the account's own model's refusal speaks to the user's pick, and a model the
+    /// walk passed over never was it.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn a_size_refused_candidate_keeps_the_walks_own_voice() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let scripted = Scripted::new();
+        scripted.answer(
+            own,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+
+        // qwen expresses the 1K tier; recraft declares no size parameter at all, and
+        // acme declares only explicit pixel values.
+        let report = planned_report(
+            own,
+            Some("1K"),
+            &["recraft/recraft-v4.1", "acme/pixels"],
+            Refs::none(),
+            &scripted,
+        )
+        .await;
+
+        assert_eq!(report.walked_is_served, None);
+        assert_eq!(report.sent, [own], "no candidate may be POSTed to");
+        let failure = report.failure.expect("nothing served");
+        assert!(
+            failure.contains("`recraft/recraft-v4.1`: not sent to — has no adjustable image size"),
+            "{failure}"
+        );
+        assert!(
+            failure.contains("`acme/pixels`: not sent to — does not support size `1K`"),
+            "{failure}"
+        );
+        assert!(
+            failure.contains("it accepts: 1024x1024, 2048x2048"),
+            "the fact names what the model does take: {failure}"
+        );
+        assert!(
+            !failure.contains("usage:") && !failure.contains("hint:"),
+            "the account's own refusal framing has no place in a candidate's line: {failure}"
+        );
+    }
+
+    /// Every model the picker offers is offered the request once, in picker order,
+    /// the account's own model first.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn walk_visits_each_model_once_in_picker_order() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let other = "recraft/recraft-v4.1";
+        let scripted = Scripted::new();
+        // One scripted answer each: a second POST to either model panics.
+        scripted.answer(own, Err(http(402, r#"{"error":{"message":"no credits"}}"#)));
+        scripted.answer(
+            other,
+            Err(http(402, r#"{"error":{"message":"no credits"}}"#)),
+        );
+
+        // The raw picker list, de-duplicated through the real plan exactly as
+        // `generate` hands it to the walk.
+        let report = planned_report(
+            own,
+            None,
+            &[own, other, own, other, other],
+            Refs::none(),
+            &scripted,
+        )
+        .await;
+
+        assert_eq!(report.walked_is_served, None);
+        assert_eq!(
+            report.sent,
+            [own, other],
+            "one POST per distinct model, in picker order, the own model first"
+        );
+    }
+
+    /// A failure whose outcome is unknown — a wait that ran out, an answer that could
+    /// not be read — is never retried and never handed to another model, since the
+    /// request may have been produced and billed.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn walk_never_reissues_an_unknown_outcome() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let fallback = "recraft/recraft-v4.1";
+
+        for (failure, cause) in [
+            (
+                AttemptFailure::Timeout {
+                    elapsed_ms: 600_000,
+                    connect: false,
+                },
+                "timed out after 600 s",
+            ),
+            (AttemptFailure::BodyRead, "body could not be read"),
+        ] {
+            let scripted = Scripted::new();
+            scripted.answer(own, Err(failure));
+            // Would have served — the walk must never reach it.
+            scripted.answer(fallback, Ok(served("aGVsbG8=")));
+
+            let report = planned_report(own, None, &[fallback], Refs::none(), &scripted).await;
+
+            assert_eq!(report.walked_is_served, None);
+            assert_eq!(report.sent, [own], "one POST: no retry, no walk");
+
+            let failure = report.failure.expect("nothing served");
+            assert!(
+                failure.starts_with("Image generation failed:"),
+                "the single-model formatter reports it: {failure}"
+            );
+            assert!(failure.contains(cause), "{failure}");
+            assert!(
+                failure.contains(own),
+                "the model that ran out is named: {failure}"
+            );
+            assert!(
+                failure.contains("outcome is unknown"),
+                "the stop reason is stated: {failure}"
+            );
+            assert!(failure.contains("The walk stopped there:"), "{failure}");
+        }
+    }
+
+    /// The reason the walk stopped is reported only when a model was left untried —
+    /// with the list exhausted, and with nothing configured to fall back to, the
+    /// lone attempt's own failure stands unembellished.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn walk_stop_reason_appears_only_when_a_model_was_left_untried() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let fallback = "recraft/recraft-v4.1";
+        let timed_out = || AttemptFailure::Timeout {
+            elapsed_ms: 600_000,
+            connect: false,
+        };
+
+        // The account's own model left its outcome unknown with nothing else
+        // configured: today's failure exactly, with no line about a walk that has
+        // no models in it.
+        let scripted = Scripted::new();
+        scripted.answer(own, Err(timed_out()));
+        let report = planned_report(own, None, &[], Refs::none(), &scripted).await;
+        let failure = report.failure.expect("nothing served");
+        assert_eq!(
+            failure,
+            build_terminal_message(std::slice::from_ref(&timed_out()), false),
+            "with nothing to walk to the failure is exactly as before the walk"
+        );
+
+        // The same outcome with one model left untried says why it was left.
+        let scripted = Scripted::new();
+        scripted.answer(own, Err(timed_out()));
+        let report = planned_report(own, None, &[fallback], Refs::none(), &scripted).await;
+        let failure = report.failure.expect("nothing served");
+        assert!(failure.contains("The walk stopped there:"), "{failure}");
+        assert!(!failure.contains(fallback), "{failure}");
+
+        // A candidate the walk reached last leaves nothing untried either.
+        let scripted = Scripted::new();
+        scripted.answer(own, Err(http(400, r#"{"error":{"message":"nope"}}"#)));
+        scripted.answer(fallback, Err(timed_out()));
+        let report = planned_report(own, None, &[fallback], Refs::none(), &scripted).await;
+        let failure = report.failure.expect("nothing served");
+        assert!(
+            failure.contains(fallback),
+            "the last model is named: {failure}"
+        );
+        assert!(
+            !failure.contains("The walk stopped there:"),
+            "nothing was left untried, so there is nothing to explain: {failure}"
+        );
+    }
+
+    /// With nothing else configured to walk to, the failure is byte for byte what a
+    /// lone attempt reported before the walk existed.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn single_model_failure_is_exactly_as_before_the_walk() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+
+        // A single refused attempt.
+        let refusal = r#"{"error":{"message":"unsupported"}}"#;
+        let scripted = Scripted::new();
+        scripted.answer(own, Err(http(400, refusal)));
+        let report = planned_report(own, None, &[], Refs::none(), &scripted).await;
+        assert_eq!(
+            report.failure.as_deref(),
+            Some(build_terminal_message(&[http(400, refusal)], false).as_str())
+        );
+        assert_eq!(report.sent, [own]);
+
+        // The in-attempt retry: the same model, refused twice.
+        let overload = r#"{"error":{"message":"down"}}"#;
+        let scripted = Scripted::new();
+        scripted.answer(own, Err(http(503, overload)));
+        scripted.answer(own, Err(http(503, overload)));
+        let report = planned_report(own, None, &[], Refs::none(), &scripted).await;
+        assert_eq!(
+            report.failure.as_deref(),
+            Some(
+                build_terminal_message(&[http(503, overload), http(503, overload)], false).as_str()
+            )
+        );
+        assert_eq!(report.sent, [own, own], "the retry belongs to the attempt");
+
+        // A step refused before sending: the refusal itself is the failure. This is
+        // the walk-only state `plan_walk` refuses outright (nothing to walk to), so
+        // the plan is built by hand.
+        let reason = resolve_size(
+            "recraft/recraft-v4.1",
+            Some("2K"),
+            fixture_catalog()
+                .find("recraft/recraft-v4.1")
+                .expect("fixture"),
+            OwnModel,
+        )
+        .expect_err("a size recraft cannot express")
+        .to_string();
+        let scripted = Scripted::new();
+        let report = walk_report(
+            own,
+            WalkPlan {
+                own_step: Step::Skip(reason.clone()),
+                candidates: Vec::new(),
+                catalog_reached: true,
+            },
+            None,
+            Refs::none(),
+            &scripted,
+        )
+        .await;
+        assert_eq!(report.failure.as_deref(), Some(reason.as_str()));
+        assert!(report.sent.is_empty());
+    }
+
+    /// A walk whose every visited model the provider refused with `message` — the
+    /// failure-text tests' fixture: no references, and its sender drives nothing (the
+    /// walk is never run).
+    fn refused_walk<'a>(
+        sender: &'a Scripted,
+        models: usize,
+        message: &str,
+        stopped: Option<String>,
+    ) -> ImageWalk<'a> {
+        let refusal = format!(r#"{{"error":{{"message":"{message}"}}}}"#);
+        ImageWalk {
+            request: RequestMaterial {
+                prompt: "a cat",
+                aspect_ratio: None,
+                size_arg: None,
+                references: &mut [],
+            },
+            own_model: "vendor/model-0",
+            url: "https://example.invalid/images",
+            auth: "Bearer test",
+            sender,
+            trail: (0..models)
+                .map(|index| {
+                    (
+                        format!("vendor/model-{index}"),
+                        Visited::Attempted(vec![http(400, &refusal)]),
+                    )
+                })
+                .collect(),
+            stopped,
+        }
+    }
+
+    /// What the model actually receives for a failure: the wrapper the caller raises
+    /// the fault text with, then the failure envelope — with a long multi-byte request
+    /// preview in it — as `Agent::execute_tool`'s error arm composes them.
+    fn delivered(failure: &str) -> String {
+        crate::tools::format_tool_failure_feedback(
+            "image_gen",
+            &json!({ "prompt": "生成".repeat(600) }),
+            &crate::tools::tool_failure_reason("image_gen", failure),
+        )
+    }
+
+    /// A failure that names several models with long multi-byte answers stays inside
+    /// the budget a tool result is truncated to: every model keeps its line, and an
+    /// answer is cut to the room its own line has.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn long_multi_byte_answers_do_not_crowd_out_other_models() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let candidates = ["recraft/recraft-v4.1", "acme/pixels", "huge/refs"];
+        let refusal = format!(
+            r#"{{"error":{{"message":"{}"}}}}"#,
+            "запрос отклонён провайдером. ".repeat(200)
+        );
+        let scripted = Scripted::new();
+        scripted.answer(own, Err(http(400, &refusal)));
+        for model in candidates {
+            scripted.answer(model, Err(http(400, &refusal)));
+        }
+
+        let report = planned_report(own, None, &candidates, Refs::none(), &scripted).await;
+        let failure = report.failure.expect("nothing served");
+        for model in std::iter::once(own).chain(candidates) {
+            assert!(
+                failure.contains(model),
+                "`{model}` keeps its line: {failure}"
+            );
+        }
+        assert!(failure.contains('…'), "a cut answer is marked: {failure}");
+
+        let envelope = delivered(&failure);
+        assert_eq!(
+            crate::util::truncate_tool_output(&envelope),
+            envelope,
+            "the whole result the model receives survives the truncation a tool result goes through"
+        );
+        for model in std::iter::once(own).chain(candidates) {
+            assert!(
+                envelope.contains(model),
+                "`{model}` keeps its line: {envelope}"
+            );
+        }
+    }
+
+    /// The composed result the model receives stays inside the budget a tool result is
+    /// truncated to even for a long picker: every model keeps its line, and each answer
+    /// is cut to the room its own line has.
+    #[tokio::test]
+    async fn the_walk_failure_fits_the_tool_output_budget_it_is_delivered_in() {
+        let sender = Scripted::new();
+        let walk = refused_walk(
+            &sender,
+            20,
+            &"запрос отклонён провайдером. ".repeat(200),
+            Some("`vendor/model-18` was not sent to: request body too large".to_string()),
+        );
+
+        let failure = walk.failure_message();
+        assert!(
+            failure.len() <= WALK_MESSAGE_BYTES,
+            "{} bytes over the failure's own budget",
+            failure.len()
+        );
+        let envelope = delivered(&failure);
+        assert_eq!(
+            crate::util::truncate_tool_output(&envelope),
+            envelope,
+            "the composed result is not truncated: {} bytes",
+            envelope.len()
+        );
+        for index in 0..20 {
+            assert!(
+                envelope.contains(&format!("vendor/model-{index}")),
+                "every model keeps its line: {envelope}"
+            );
+        }
+        assert!(envelope.contains('…'), "a cut answer is marked: {envelope}");
+    }
+
+    /// A picker whose model names alone outgrow the message cannot push it past the
+    /// room it is delivered in: what one line cannot hold is cut like anything else.
+    #[tokio::test]
+    async fn a_picker_too_long_to_name_stays_inside_the_message_room() {
+        let sender = Scripted::new();
+        let walk = refused_walk(&sender, 200, "no", None);
+
+        let failure = walk.failure_message();
+        assert!(
+            failure.len() <= WALK_MESSAGE_BYTES,
+            "{} bytes over the failure's own budget",
+            failure.len()
+        );
+        let envelope = delivered(&failure);
+        assert_eq!(
+            crate::util::truncate_tool_output(&envelope),
+            envelope,
+            "the composed result is not truncated: {} bytes",
+            envelope.len()
+        );
+    }
+
+    /// The candidate list is the picker list without the tried model and without
+    /// repeats, in picker order.
+    #[test]
+    fn fallback_candidates_take_the_picker_list_without_the_tried_model() {
+        assert_eq!(
+            fallback_candidates("m", &picker(&["m", "a", "m", "b", "a"])),
+            picker(&["a", "b"])
+        );
+        assert!(fallback_candidates("m", &[]).is_empty());
+        assert!(fallback_candidates("m", &picker(&["m"])).is_empty());
+        // Order follows the picker, not the alphabet.
+        assert_eq!(
+            fallback_candidates("m", &picker(&["b", "a", "b"])),
+            picker(&["b", "a"])
+        );
+    }
+
+    /// Only a cause on the chosen model's or the provider's side is walked on — every
+    /// HTTP refusal, and a transport or connect failure that never reached the
+    /// provider. Unknown outcomes never are.
+    #[test]
+    fn walkable_failures_are_the_model_or_provider_side_ones() {
+        // Every HTTP refusal qualifies, whatever its status and however long the
+        // attempt took: the product never judges a refusal from its wording.
+        for status in [400, 401, 402, 404, 429, 500, 503] {
+            for elapsed_ms in [1_000, 90_000] {
+                let failure = AttemptFailure::Http {
+                    status,
+                    body: String::new(),
+                    retry_after_ms: None,
+                    elapsed_ms,
+                };
+                assert!(failure.walkable(), "HTTP {status} after {elapsed_ms} ms");
+            }
+        }
+        // A transport failure is safely repeatable only inside the quick-failure
+        // window, where nothing can have been generated.
+        assert!(AttemptFailure::Transport { elapsed_ms: 1_000 }.walkable());
+        assert!(!AttemptFailure::Transport { elapsed_ms: 90_000 }.walkable());
+        // A connect timeout never reached the provider; a request timeout may
+        // have completed server-side.
+        assert!(
+            AttemptFailure::Timeout {
+                elapsed_ms: 10_000,
+                connect: true,
+            }
+            .walkable()
+        );
+        assert!(
+            !AttemptFailure::Timeout {
+                elapsed_ms: 1_000,
+                connect: false,
+            }
+            .walkable()
+        );
+        assert!(
+            !AttemptFailure::Timeout {
+                elapsed_ms: 600_000,
+                connect: false,
+            }
+            .walkable()
+        );
+        // A 2xx whose body was lost is billable-ambiguous, and a parse failure is
+        // not a model/provider-side cause.
+        assert!(!AttemptFailure::BodyRead.walkable());
+        assert!(
+            !AttemptFailure::Parse {
+                message: "bad".into()
+            }
+            .walkable()
+        );
+    }
+
+    /// Each model is sent a body built from its own catalog declarations — the size
+    /// under the key it declares, an aspect ratio only where it declares one, and a
+    /// reference-carrying request never turned into a plain generation nor handed to
+    /// a model that declares fewer.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn candidate_body_is_built_from_its_own_declarations() {
+        seed_fixture_catalog().await;
+
+        // A request carrying one reference and no size: the auto-detected aspect
+        // ratio goes only to a model that declares the parameter (qwen does,
+        // `huge/refs` does not), and the same reference reaches both.
+        let own = "qwen/qwen-image-3-pro";
+        let candidate = "huge/refs";
+        let scripted = Scripted::new();
+        scripted.answer(
+            own,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+        scripted.answer(
+            candidate,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+        let report = planned_report(own, None, &[candidate], refs(1).await, &scripted).await;
+
+        assert_eq!(report.walked_is_served, None);
+        assert_eq!(report.sent, [own, candidate]);
+        let own_body = scripted.body_for(own);
+        // The 1×1 fixture reference auto-detects as 1:1, which qwen declares.
+        assert_eq!(own_body["aspect_ratio"], "1:1");
+        let body = scripted.body_for(candidate);
+        assert!(
+            body.get("aspect_ratio").is_none(),
+            "huge/refs declares no `aspect_ratio`: {body}"
+        );
+        assert!(
+            body.get("resolution").is_none(),
+            "huge/refs declares no `resolution`: {body}"
+        );
+        assert!(
+            body.get("size").is_none(),
+            "huge/refs declares no `size`: {body}"
+        );
+        assert_eq!(body["input_references"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["input_references"], own_body["input_references"],
+            "the request keeps carrying the same references"
+        );
+
+        // No references: a candidate that declares no aspect ratio gets none.
+        let own = "qwen/qwen-image-3-pro";
+        let candidate = "acme/pixels";
+        let size_arg = Some("1024x1024");
+        let scripted = Scripted::new();
+        scripted.answer(
+            candidate,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+        let report = planned_report(own, size_arg, &[candidate], Refs::none(), &scripted).await;
+
+        assert_eq!(report.sent, [candidate]);
+        let body = scripted.body_for(candidate);
+        assert!(
+            body.get("aspect_ratio").is_none(),
+            "acme/pixels declares no aspect_ratio: {body}"
+        );
+        assert_eq!(body["size"], "1024x1024");
+    }
+
+    /// An unreachable catalog leaves every remaining model's capability unknown, so
+    /// the walk skips them and says so instead of POSTing blindly.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn walk_stops_when_the_catalog_cannot_be_reached() {
+        let own = "qwen/qwen-image-3-pro";
+        let candidate = "recraft/recraft-v4.1";
+        let after = "acme/pixels";
+        let _restore = CatalogFixture;
+        crate::tools::media_catalog::image::seed_cache(None);
+
+        let scripted = Scripted::new();
+        scripted.answer(
+            own,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+        // The catalog is unreachable, so the own model's capability is unknown
+        // too: the attempt keeps its fail-open behaviour. A plan the walk could
+        // never have built: the catalog went unreachable after `plan_walk`.
+        let report = walk_report(
+            own,
+            WalkPlan {
+                own_step: Step::Attempt {
+                    info: None,
+                    size: None,
+                },
+                candidates: picker(&[candidate, after]),
+                catalog_reached: false,
+            },
+            None,
+            Refs::none(),
+            &scripted,
+        )
+        .await;
+
+        assert_eq!(report.walked_is_served, None);
+        assert_eq!(report.sent, [own], "no candidate may be POSTed to blindly");
+
+        let failure = report.failure.expect("nothing served");
+        assert!(failure.contains(candidate), "{failure}");
+        assert!(
+            failure.contains("catalog could not be reached"),
+            "{failure}"
+        );
+        assert!(
+            failure.contains("remaining models were not checked"),
+            "the walk says why it stopped there: {failure}"
+        );
+        assert!(
+            !failure.contains(after),
+            "a model the walk never reached is not reported on: {failure}"
+        );
+        assert_eq!(crate::util::truncate_tool_output(&failure), failure);
+    }
+
+    /// The provider's own reference ceiling is refused before the catalog — or any
+    /// model — is consulted, so the plan fails with no catalog seeded.
+    #[tokio::test]
+    async fn plan_refuses_a_request_over_the_providers_reference_ceiling() {
+        let refused = plan_walk(
+            "qwen/qwen-image-3-pro",
+            super::super::MAX_REFERENCE_IMAGES_PER_REQUEST + 1,
+            None,
+            &picker(&["recraft/recraft-v4.1"]),
+        )
+        .await;
+        let Err(err) = refused else {
+            panic!("a request over the provider's ceiling must be refused");
+        };
+        assert!(
+            err.to_string()
+                .contains("at most 16 reference image(s), got 17"),
+            "{err}"
+        );
+    }
+
+    /// The walk exists only when the picker offers another model: with an empty
+    /// picker the own model's pre-send refusal is the plan's own error, and an
+    /// unreachable catalog walks nothing at all.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn plan_walks_only_when_the_picker_offers_another_model() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        // qwen declares the 1K/2K tiers only, so explicit pixels are refused before
+        // anything is sent.
+        let size_arg = Some("1024x1024");
+        let picker_list = picker(&["acme/pixels"]);
+
+        let refused = plan_walk(own, 0, size_arg, &[]).await;
+        let Err(err) = refused else {
+            panic!("with nothing to walk to the refusal must be the plan's error");
+        };
+        assert!(err.to_string().contains("does not support size"), "{err}");
+
+        let plan = plan_walk(own, 0, size_arg, &picker_list)
+            .await
+            .expect("a picker model to walk to");
+        assert!(matches!(plan.own_step, Step::Skip(_)));
+        assert_eq!(plan.candidates, picker_list);
+        assert!(plan.catalog_reached);
+
+        // The catalog unreachable: nothing is walked, and the attempt keeps its
+        // fail-open shape.
+        let _restore = CatalogFixture;
+        crate::tools::media_catalog::image::seed_cache(None);
+        let plan = plan_walk(own, 0, size_arg, &picker_list)
+            .await
+            .expect("an unreachable catalog is fail-open");
+        assert!(plan.candidates.is_empty());
+        assert!(!plan.catalog_reached);
+        assert!(matches!(
+            plan.own_step,
+            Step::Attempt {
+                info: None,
+                size: None
+            }
+        ));
+    }
+
+    /// A picture the account's own model produced carries no note — there is nothing
+    /// to disclose.
+    #[tokio::test]
+    #[serial_test::serial(active_models)]
+    async fn note_is_absent_when_the_accounts_own_model_served() {
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let scripted = Scripted::new();
+        scripted.answer(own, Ok(served("aGVsbG8=")));
+
+        let report = planned_report(own, None, &[], Refs::none(), &scripted).await;
+
+        assert_eq!(report.walked_is_served.as_deref(), Some(own));
+        assert_eq!(report.sent, [own]);
+        assert_eq!(report.note, None);
+    }
+
+    /// Each refusal that used to end the attempt — the model gone from the catalog, a
+    /// reference count or a size its own declarations cannot take — becomes the
+    /// reason the walk starts, while an unreachable catalog keeps the attempt
+    /// fail-open.
+    #[test]
+    fn own_step_turns_each_pre_send_refusal_into_a_walk_reason() {
+        let model = "qwen/qwen-image-3-pro";
+        let info = fixture_catalog().find(model).cloned().expect("fixture");
+        let recraft = fixture_catalog()
+            .find("recraft/recraft-v4.1")
+            .cloned()
+            .expect("fixture");
+
+        assert!(
+            matches!(
+                own_step(model, Err(anyhow::anyhow!("not in the catalog")), 0, None),
+                Step::Skip(reason) if reason.contains("not in the catalog")
+            ),
+            "a model the catalog confirms absent is refused before sending"
+        );
+        assert!(
+            matches!(
+                own_step("recraft/recraft-v4.1", Ok(Some(recraft)), 2, None),
+                Step::Skip(reason) if reason.contains("at most 1 reference image")
+            ),
+            "its own declared reference cap is a pre-send refusal"
+        );
+        assert!(
+            matches!(
+                own_step(model, Ok(Some(info)), 0, Some("1024x1024")),
+                Step::Skip(reason) if reason.contains("does not support size")
+            ),
+            "a size its declarations cannot express is a pre-send refusal"
+        );
+        assert!(
+            matches!(
+                own_step(model, Ok(None), 0, Some("1K")),
+                Step::Attempt {
+                    info: None,
+                    size: None
+                }
+            ),
+            "an unreachable catalog stays fail-open: nothing is checked, no size sent"
+        );
+    }
+
+    /// The note reaches the assistant with the picture itself — as part of the image
+    /// annotation that stands in place of the tool result's own text.
+    #[tokio::test]
+    async fn generated_payload_carries_the_note_into_the_annotation() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("picture.png");
+        std::fs::write(&path, crate::util::test::noisy_png(1, 1)).expect("fixture picture");
+        let note = "`recraft/recraft-v4.1` produced this picture".to_string();
+
+        let annotation = Generated {
+            path: path.clone(),
+            note: Some(note.clone()),
+        }
+        .payload()
+        .await
+        .expect("a raster picture is attached")
+        .attached_annotation();
+        assert!(
+            annotation.contains(&note),
+            "the annotation the assistant reads carries the note: {annotation}"
+        );
+
+        let plain = Generated { path, note: None }
+            .payload()
+            .await
+            .expect("a raster picture is attached")
+            .attached_annotation();
+        assert!(
+            !plain.contains("produced this picture"),
+            "a picture with nothing to disclose carries no note: {plain}"
+        );
+    }
+
+    /// The whole path, not only its parts: the account's own model is refused, another
+    /// model the picker offers serves the picture, and the note arrives in the image
+    /// annotation that stands in place of the tool's own result — while the account
+    /// keeps its own model choice.
+    ///
+    /// `generate` is the real path both trait entry points run (they hardwire the
+    /// production sender, so a scripted one can only enter here); the payload is then
+    /// assembled exactly as `execute_with_payloads` assembles it, so what the assistant
+    /// reads in place of the tool's own text is what this asserts on.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn fallback_reaches_the_assistant_through_the_real_generate_path() {
+        crate::util::test::init_test_stores().await;
+        seed_fixture_catalog().await;
+
+        let own = "qwen/qwen-image-3-pro";
+        let fallback = "recraft/recraft-v4.1";
+        let user = "image_gen_fallback_user";
+        crate::users::store()
+            .set_image_gen_model(user, own)
+            .await
+            .expect("the account's own model is set");
+
+        // The picker list and a provider key, as the settings page would leave them:
+        // restored however this test ends, so a panic here cannot leave the rest of the
+        // binary running on this config.
+        let _config = ConfigFixture(Some(crate::config::CONFIG.snapshot()));
+        let _ = crate::config::CONFIG.set_string_field("provider_key", "test-key");
+        let _ = crate::config::CONFIG.set_string_field("image_gen_models", fallback);
+
+        let scripted = Scripted::new();
+        scripted.answer(
+            own,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+        scripted.answer(
+            fallback,
+            Ok(served(&STANDARD.encode(crate::util::test::noisy_png(4, 4)))),
+        );
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let ws =
+            crate::workspace::test_ws_named(&dir.path().to_string_lossy(), "image-gen-fallback");
+        let output = crate::agent::CURRENT_TOOL_USER_NAME
+            .scope(user.to_string(), async {
+                let generated = ImageGenTool
+                    .generate(&ws, &json!({ "prompt": "a cat" }), &scripted)
+                    .await?;
+                anyhow::Ok(ImageGenTool.output(&generated).await)
+            })
+            .await;
+        let output = output.expect("a fallback-covered request is a success");
+        assert_eq!(
+            scripted.models_sent(),
+            [own, fallback],
+            "the account's own model first, then the model that served"
+        );
+        assert!(
+            output.text.contains("[IMAGE:"),
+            "the marker still reaches the caller: {}",
+            output.text
+        );
+        assert!(
+            !output.text_is_content,
+            "the picture is offered as a payload, not as text"
+        );
+        let annotation = output
+            .image_payloads
+            .first()
+            .expect("the picture is attached")
+            .attached_annotation();
+        assert!(
+            annotation.contains(fallback),
+            "the assistant is told which model produced the picture: {annotation}"
+        );
+        assert!(
+            annotation.contains(own) && annotation.contains("did not serve the request"),
+            "and what happened with the account's own model: {annotation}"
+        );
+        assert_eq!(
+            crate::users::resolve_image_gen_model(user).await,
+            own,
+            "the account keeps its own stored model choice"
+        );
     }
 }

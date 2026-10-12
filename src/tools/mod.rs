@@ -391,6 +391,38 @@ pub(crate) fn scrub_tool_output(
 /// produces (a successful result never starts with it).
 pub(crate) const TOOL_FAILURE_MARKER: &str = "Tool call failed.";
 
+/// Byte cap for the argument preview in [`format_tool_failure_feedback`]: a byte
+/// bound, so a multi-byte argument cannot take the whole budget the reason beside
+/// it is measured against.
+const TOOL_FAILURE_ARGS_PREVIEW_BYTES: usize = 1_000;
+
+/// What the caller wraps a tool's own fault text with before it reaches
+/// [`format_tool_failure_feedback`] — see [`tool_failure_reason`].
+const TOOL_FAILURE_REASON_PREFIX: &str = "Error executing ";
+
+/// The reason a tool's fault is reported with: the fault text in the wrapper
+/// [`Agent::execute_tool`](crate::agent::Agent) raises it with, so a tool bounding the
+/// text it composes and the wrapper that carries it agree on one shape.
+#[must_use]
+pub(crate) fn tool_failure_reason(tool_name: &str, fault: &str) -> String {
+    format!("{TOOL_FAILURE_REASON_PREFIX}{tool_name}: {fault}")
+}
+
+/// The room a fault may NOT take inside the result the model receives: the wrapper
+/// above plus everything [`format_tool_failure_feedback`] spends on the text itself —
+/// the marker, the labels, a tool name of `tool_name_len` bytes and the capped argument
+/// preview. A tool composing a fault text subtracts this from the budget a tool result
+/// is truncated to rather than re-stating the shape of either wrapper.
+pub(crate) const fn tool_failure_envelope_bytes(tool_name_len: usize) -> usize {
+    TOOL_FAILURE_REASON_PREFIX.len()
+        + tool_name_len
+        + ": ".len()
+        + TOOL_FAILURE_MARKER.len()
+        + "\ntool: \narguments: \nreason:\n".len()
+        + tool_name_len
+        + TOOL_FAILURE_ARGS_PREVIEW_BYTES
+}
+
 #[must_use]
 pub(crate) fn format_tool_failure_feedback(
     tool_name: &str,
@@ -401,7 +433,9 @@ pub(crate) fn format_tool_failure_feedback(
     // ([`failure_outcome`](crate::agent::Agent::failure_outcome)) and passed
     // through as-is to avoid double-scrubbing. The `tool_args` are scrubbed
     // here since they're formatted for display.
-    let args_preview = scrub_credentials(&crate::util::truncate(&tool_args.to_string(), 1000));
+    // Scrubbed before the cap: redaction can lengthen the text.
+    let args = scrub_credentials(&tool_args.to_string());
+    let args_preview = crate::util::cut_bytes(&args, TOOL_FAILURE_ARGS_PREVIEW_BYTES);
     format!(
         "{TOOL_FAILURE_MARKER}\n\
          tool: {tool_name}\n\
@@ -1282,10 +1316,11 @@ impl ImagePayloadSource {
 }
 
 /// Per-call image payload produced by a tool that reads an on-disk raster image
-/// (the Read tool), or a tool-produced/derived image (e.g. image_gen) the agent
-/// loop derives from a real on-disk `[IMAGE:path]` marker. The agent loop injects
-/// `[IMAGE:{data_uri}]` as a synthetic persisted User-role message after the
-/// round's tool results.
+/// (the Read tool), by a tool that generated or captured one (image_gen, chrome,
+/// computer), or derived by the agent loop from a real on-disk `[IMAGE:path]`
+/// marker in a successful tool output that supplied no payload of its own. The
+/// agent loop injects `[IMAGE:{data_uri}]` as a synthetic persisted User-role
+/// message after the round's tool results.
 ///
 /// `width`/`height` are the post-EXIF/post-resize dimensions of the *encoded*
 /// JPEG the data-URI carries, and `format` is the uppercase source-format label
@@ -1310,6 +1345,10 @@ pub(crate) struct ImagePayload {
     /// preserved in the tool-result annotation so the model keeps the typo
     /// context (mirrors the `[Recovered path: ...]` note shown for text reads).
     pub recovery_note: Option<String>,
+    /// An extra line the annotation carries, for a tool-specific fact that must
+    /// reach the assistant with the image itself (image_gen names the model that
+    /// produced the picture when a fallback served it).
+    pub note: Option<String>,
     /// Tool that produced the image, selecting the annotation opener
     /// ("Read image file", "Generated image file", "Chrome screenshot").
     pub source: ImagePayloadSource,
@@ -1332,29 +1371,34 @@ impl ImagePayload {
     /// new synthetic user message).
     #[must_use]
     pub(crate) fn attached_annotation(&self) -> String {
-        let base = format!(
-            "{} {} ({}x{}, {}). Image content attached to the conversation as a native image.",
-            self.source.opener(),
-            self.path,
-            self.width,
-            self.height,
-            self.format
-        );
-        with_recovery_note(self.recovery_note.as_deref(), base)
+        self.annotation("Image content attached to the conversation as a native image.")
     }
 
     /// Tool-result annotation for a DEDUPED repeat read (image already attached;
     /// the read returns a reference rather than re-adding it).
     #[must_use]
     pub(crate) fn already_attached_annotation(&self) -> String {
+        self.annotation("Image content is already attached to the conversation as a native image.")
+    }
+
+    /// Render the annotation shared by the fresh/already-attached variants:
+    /// `{opener} {path} ({w}x{h}, {format}). {sentence}`, then the tool's own
+    /// `note` on a new line, then the read's recovery note as a prefix.
+    #[must_use]
+    fn annotation(&self, sentence: &str) -> String {
         let base = format!(
-            "{} {} ({}x{}, {}). Image content is already attached to the conversation as a native image.",
+            "{} {} ({}x{}, {}). {}",
             self.source.opener(),
             self.path,
             self.width,
             self.height,
-            self.format
+            self.format,
+            sentence
         );
+        let base = match self.note.as_deref() {
+            Some(note) => format!("{base}\n{note}"),
+            None => base,
+        };
         with_recovery_note(self.recovery_note.as_deref(), base)
     }
 
@@ -1366,6 +1410,10 @@ impl ImagePayload {
     /// fallible decode separately
     /// (`crate::util::local_image_to_compressed_data_uri_with_meta(...).await.ok()?`)
     /// and passes the decoded meta in to build the payload.
+    ///
+    /// The annotation `note` (a tool-specific fact carried with the image, e.g.
+    /// image_gen naming the model that produced a fallback picture) is left
+    /// `None` for the caller to set.
     #[must_use]
     pub(crate) fn from_compressed_meta(
         path: &std::path::Path,
@@ -1380,6 +1428,7 @@ impl ImagePayload {
             height: meta.height,
             format: meta.format,
             recovery_note,
+            note: None,
             source,
         }
     }
@@ -1817,6 +1866,49 @@ mod tests {
         assert_eq!(parsed.name, "test");
     }
 
+    #[test]
+    fn failure_feedback_bounds_the_argument_preview_it_shows() {
+        let tool = "image_gen";
+        let fault = "Image generation failed: no configured image model served the request.";
+        // A multi-byte argument far longer than the preview's own cap: the preview is
+        // cut, marked as cut, and the whole result stays inside the budget it is
+        // delivered in — which is what a tool composing a fault text counts on.
+        let args = serde_json::json!({ "prompt": "生成".repeat(600) });
+        let args_str = args.to_string();
+        assert!(args_str.len() > TOOL_FAILURE_ARGS_PREVIEW_BYTES);
+        // The fault reaches the formatter in the caller's wrapper, as it does in
+        // production.
+        let reason = tool_failure_reason(tool, fault);
+        let feedback = format_tool_failure_feedback(tool, &args, &reason);
+        let preview = feedback
+            .lines()
+            .find_map(|line| line.strip_prefix("arguments: "))
+            .expect("the preview is shown");
+        assert!(
+            preview.ends_with('…'),
+            "a cut preview says so: {}",
+            preview.len()
+        );
+        assert!(
+            preview.len() <= TOOL_FAILURE_ARGS_PREVIEW_BYTES,
+            "{preview}"
+        );
+        assert!(
+            args_str.starts_with(preview.trim_end_matches('…')),
+            "the preview is the head of the arguments"
+        );
+        // The reserve covers the wrapper and the envelope alike, and leaves the fault
+        // text a byte or two of slack at most (a char-boundary cut never fills its cap
+        // exactly).
+        assert!(
+            feedback.len() <= tool_failure_envelope_bytes(tool.len()) + fault.len(),
+            "{} bytes for a fault text of {}",
+            feedback.len(),
+            fault.len()
+        );
+        assert_eq!(crate::util::truncate_tool_output(&feedback), feedback);
+    }
+
     // ── ImagePayload source verb ──────────────────────────────────
 
     #[test]
@@ -1828,6 +1920,7 @@ mod tests {
             height: 4,
             format: "PNG".into(),
             recovery_note: None,
+            note: None,
             source: ImagePayloadSource::Generated,
         };
         let fresh = payload.attached_annotation();
@@ -1839,12 +1932,33 @@ mod tests {
             !fresh.starts_with("Read image file"),
             "must not be Read: {fresh}"
         );
+        assert!(
+            !fresh.contains('\n'),
+            "note-free annotation must stay one sentence: {fresh}"
+        );
         let dup = payload.already_attached_annotation();
         assert!(
             dup.starts_with("Generated image file /gen/img.png"),
             "dup: {dup}"
         );
         assert!(dup.contains("already attached"), "dup: {dup}");
+
+        // A tool-specific note rides on its own line after the attachment
+        // sentence; without one the annotation is exactly the sentence above.
+        let mut noted = payload.clone();
+        noted.note = Some("Served by fallback model fallback-1".into());
+        let fresh_noted = noted.attached_annotation();
+        assert!(
+            fresh_noted.starts_with(&fresh)
+                && fresh_noted.ends_with("\nServed by fallback model fallback-1"),
+            "note must be appended as a new line: {fresh_noted}"
+        );
+        assert!(
+            noted
+                .already_attached_annotation()
+                .ends_with("\nServed by fallback model fallback-1"),
+            "note also rides on the already-attached annotation"
+        );
     }
 
     // ── find_tool aliases ──────────────────────────────────────────

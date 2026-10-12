@@ -192,14 +192,19 @@ pub mod image {
         CATALOG.seed(&endpoint, catalog);
     }
 
+    /// The remediation the account's own-model paths append to a capability verdict:
+    /// it speaks to the account's pick. A walk candidate's skip line leaves it out —
+    /// the model the account chose is not the one the walk passed over.
+    const IMAGE_MODEL_REMEDIATION: &str =
+        " Set an image-capable model in Settings → Image Generation and retry.";
+
     /// Reject a catalog-listed model that explicitly declares text-only output.
     /// (Shape drift — missing/empty modalities — is tolerated as capable.)
     fn reject_text_only(model: &str, info: &ImageModelInfo) -> anyhow::Result<()> {
         if info.image_output == ImageOutput::TextOnly {
             anyhow::bail!(
                 "Model `{model}` cannot generate images: the OpenRouter image-models catalog \
-                 does not list image output for it. Set an image-capable model in \
-                 Settings → Image Generation and retry."
+                 does not list image output for it.{IMAGE_MODEL_REMEDIATION}"
             );
         }
         Ok(())
@@ -251,8 +256,7 @@ pub mod image {
             Some(info) => reject_text_only(model, info).map(|()| Some(info.clone())),
             None => anyhow::bail!(
                 "Model `{model}` cannot generate images: it is not in the OpenRouter \
-                 image-models catalog. Set an image-capable model in Settings → \
-                 Image Generation and retry."
+                 image-models catalog.{IMAGE_MODEL_REMEDIATION}"
             ),
         }
     }

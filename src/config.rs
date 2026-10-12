@@ -32,6 +32,8 @@
 //!   (e.g. `DEFAULT_PROVIDER_ENDPOINT`).
 //! * `list_or(default = …)` — returns `Vec<String>`, parses a
 //!   newline-separated list, falling back to a hardcoded default when unset.
+//!   A `, raw` suffix additionally generates `<field>_raw`, which returns the
+//!   list exactly as configured with no default injected.
 //!
 //! At reload time [`reload_from_db`] loads key–value pairs from the `config_kv`
 //! table (via [`crate::config_db::ConfigStore::get_all_kv`]) and applies them
@@ -331,13 +333,14 @@ pub struct ConfigData {
 //
 // ══ Per-field accessor patterns ═════════════════════════════════════
 //
-// Each field is annotated with one of three patterns:
+// Each field is annotated with one of these patterns:
 //
 // * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
 // * `or(DEFAULT)` — returns `String`, falls back to the given default constant.
 // * `list_or(default = <const>)` — returns `Vec<String>`, parses a
-//   newline-separated list, falls back to a single-element list of the
-//   default constant when unset/empty.
+//   newline-separated list and falls back to a single-element list of the
+//   default constant when unset/empty.  A `, raw` suffix also emits
+//   `<field>_raw`, which returns the configured list with no default injected.
 //
 // Generated accessors live on `impl ConfigReload`, created by `string_config_fields!`.
 
@@ -346,7 +349,10 @@ pub struct ConfigData {
 /// — all from a single annotated list of `Option<String>` field names.
 ///
 /// Each field is declared as `$field [$annotation]` where `$annotation` is one of
-/// `non_empty`, `or($default)`, or `list_or(default = $default)`.
+/// `non_empty`, `or($default)`, `list_or(default = $default)`, or
+/// `list_or(default = $default, raw)` — the last also emitting a raw
+/// `<field>_raw` accessor that returns the configured list with no default
+/// injected.
 ///
 /// All generated items are guaranteed to stay synchronised because they expand
 /// from the same source.
@@ -523,7 +529,20 @@ macro_rules! string_config_fields {
     // hardcoded `$default` constant. Used for the model picker lists, whose
     // active selection is now per-user (not a global config field) — the only
     // fallback is the default model.
+    //
+    // `, raw` additionally emits `<field>_raw` — the stored list with no default
+    // injected, for a caller that must tell "nothing was chosen" apart from "the
+    // default was chosen". Only a field whose caller needs that difference asks
+    // for it.
     (@accessor $field:ident list_or(default = $default:expr)) => {
+        string_config_fields!(@list_accessor $field, $default);
+    };
+    (@accessor $field:ident list_or(default = $default:expr, raw)) => {
+        string_config_fields!(@list_accessor $field, $default);
+        string_config_fields!(@raw_accessor $field);
+    };
+
+    (@list_accessor $field:ident, $default:expr) => {
         #[doc = concat!(
             "Returns the list of available `", stringify!($field), "`.",
             "\n\nIf unset or the parsed newline-separated list is empty,",
@@ -535,6 +554,19 @@ macro_rules! string_config_fields {
             resolve_list_or(guard.$field.as_deref(), $default)
         }
     };
+
+    (@raw_accessor $field:ident) => {
+        ::paste::paste! {
+            #[doc = concat!(
+                "Returns the `", stringify!($field), "` list exactly as configured",
+                " (empty when unset), with no default injected."
+            )]
+            #[must_use]
+            pub fn [<$field _raw>](&self) -> Vec<String> {
+                parse_newline_list(self.read().$field.as_deref().unwrap_or_default())
+            }
+        }
+    };
 }
 
 string_config_fields! {
@@ -543,7 +575,7 @@ string_config_fields! {
     provider_endpoint_key [non_empty],
     manager_model [or(DEFAULT_MANAGER_MODEL)],
     worker_model [or(DEFAULT_WORKER_MODEL)],
-    image_gen_models [list_or(default = DEFAULT_IMAGE_GEN_MODEL)],
+    image_gen_models [list_or(default = DEFAULT_IMAGE_GEN_MODEL, raw)],
     video_models [list_or(default = DEFAULT_VIDEO_MODEL)],
     firecrawl_key [non_empty],
     exa_key [non_empty],
@@ -1658,6 +1690,12 @@ mod tests {
             vec![DEFAULT_IMAGE_GEN_MODEL.to_string()],
             "unset image_gen_models falls back to default"
         );
+        // The raw accessor injects no default — an unset picker is empty, so a
+        // caller cannot mistake the setter's fallback for a chosen model.
+        assert!(
+            reload.image_gen_models_raw().is_empty(),
+            "unset image_gen_models_raw must be empty"
+        );
 
         // When list is set, returns parsed entries
         let mut list_config = ConfigData::STRUCT_FIELDS_DEFAULT;
@@ -1666,6 +1704,11 @@ mod tests {
         assert_eq!(
             reload.image_gen_models(),
             vec!["model-a", "model-b", "model-c"]
+        );
+        assert_eq!(
+            reload.image_gen_models_raw(),
+            vec!["model-a", "model-b", "model-c"],
+            "raw accessor returns exactly the configured entries, in order"
         );
     }
 

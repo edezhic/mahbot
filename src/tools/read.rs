@@ -2025,6 +2025,7 @@ mod tests {
             height: 4,
             format: "PNG".into(),
             recovery_note: Some("[Recovered path: requested 'x.png', using 'y.png']".into()),
+            note: None,
             source: crate::tools::ImagePayloadSource::Read,
         };
         let fresh = payload.attached_annotation();
