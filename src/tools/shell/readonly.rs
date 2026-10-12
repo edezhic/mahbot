@@ -7564,9 +7564,9 @@ mod tests {
             // $PWD after tracked cd resolves to the tracked CWD.
             ("cd /tmp && touch $PWD/out", true),
             ("cd /tmp && touch $PWD/../../etc/passwd", false),
-            // A nonexistent relative target must not be tracked: `$PWD` would
-            // then resolve one level deeper than the real CWD.
-            ("cd /tmp ; cd src ; touch $PWD/../etc/passwd", false),
+            // A nonexistent relative target must not be tracked: `$PWD` would then
+            // resolve deeper than the real CWD (named so no stray dir occupies it).
+            ("cd /tmp ; cd no_dir_1059 ; touch $PWD/../etc/passwd", false),
             (
                 "mkdir -p /tmp/src && cd /tmp && cd src && touch $PWD/out",
                 true,

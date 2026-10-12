@@ -45,21 +45,36 @@ pub(crate) fn tool_user_name() -> String {
         .unwrap_or_default()
 }
 
+/// The calling agent's SESSION id on its own — the identity a session-scoped
+/// action needs when the user is not part of it. A workspace-scoped Manager
+/// session is driven by pipeline ticket notifications, whose turns carry an
+/// empty user name, so [`tool_identity`] refuses those turns while this one
+/// answers them.
+pub(crate) fn tool_agent_id() -> anyhow::Result<String> {
+    current_agent_id()
+        .context("No agent identity available — the tool must run in an agent session.")
+}
+
 /// Identity of the agent currently executing a tool call: `(agent_id, user_name)`.
 /// Errors when the call runs outside a user session — there is no addressable
-/// identity to associate side effects with.
+/// identity to associate side effects with. The session id it returns is the one
+/// [`tool_agent_id`] returns, from the same read.
 pub(crate) fn tool_identity() -> anyhow::Result<(String, String)> {
     let user_name = tool_user_name();
-    let agent_id = CURRENT_TOOL_AGENT_ID
+    let agent_id = current_agent_id()
+        .filter(|_| !user_name.is_empty())
+        .context("No agent identity available — the tool must run in a user session.")?;
+    Ok((agent_id, user_name))
+}
+
+/// The calling agent's session id as the task-local carries it, `None` outside an
+/// agent run and for the empty id a turn can carry — the one read above.
+fn current_agent_id() -> Option<String> {
+    CURRENT_TOOL_AGENT_ID
         .try_with(Option::clone)
         .ok()
         .flatten()
-        .unwrap_or_default();
-    anyhow::ensure!(
-        !agent_id.is_empty() && !user_name.is_empty(),
-        "No agent identity available — the tool must run in a user session."
-    );
-    Ok((agent_id, user_name))
+        .filter(|agent_id| !agent_id.is_empty())
 }
 
 /// The calling agent's identity for a row written STRAIGHT to the log store:
@@ -591,14 +606,20 @@ impl Agent {
             }
             _ => None,
         });
-        // Registration-time manual-cancel check: a sub-agent of a research
-        // run whose cancel signal already fired (the user cancelled the run
-        // from the Running Agents page) must never run a round — even when it
-        // registers AFTER the registry's cancel sweep (the late-register
-        // race). The token is pre-cancelled, so the agent's llm_loop bails at
-        // its first tool-round-top check and the round yields no response.
-        if let Some(crate::agent::registry::ParentKey::Research(run_id)) = &parent_key
-            && crate::research_cancel::is_cancelled(run_id)
+        // Registration-time manual-cancel check: a sub-agent of a research run
+        // or of an analyze round whose cancel signal already fired (the user
+        // cancelled the run from the Running Agents page, or the caller
+        // cancelled its round) must never run a round — even when it registers
+        // AFTER the registry's cancel sweep (the late-register race: an analyze
+        // round's verification analysts are dispatched after the analysts it
+        // started with). The token is pre-cancelled, so the agent's llm_loop
+        // bails at its first tool-round-top check and the round yields no
+        // response.
+        if let Some(
+            crate::agent::registry::ParentKey::Research(run_id)
+            | crate::agent::registry::ParentKey::AnalyzeRound(run_id),
+        ) = &parent_key
+            && crate::round_cancel::is_cancelled(run_id)
         {
             cancel_token.cancel();
         }
@@ -941,6 +962,14 @@ impl Agent {
         // check fires. The round is cut before any LLM work; boot resume
         // continues the session.
         Self::bail_on_shutdown()?;
+        // Pre-maybe_summarize cancel check, same rule: an agent stopped before
+        // its first model call (an analyze round's analyst whose round its
+        // caller cancelled) must not spend a summarization call on itself. The
+        // bail matches the llm_loop's own cancellation check, which would have
+        // fired one step later — after that call.
+        if self.cancel_token.is_cancelled() {
+            anyhow::bail!("Agent cancelled");
+        }
 
         // A resumed stage-agent round starting with an empty message would
         // otherwise never surface board comments (the session-start ticket block

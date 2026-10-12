@@ -12,6 +12,7 @@
 
 pub mod agent;
 pub mod alarms;
+pub(crate) mod analyze_cancel;
 /// The product's own icon: the artwork, and the surfaces outside the window it
 /// appears on (the file's own resource on Windows, the running application's Dock
 /// tile on macOS, the launcher entry on Linux, the dashboard's own renderings).
@@ -67,6 +68,7 @@ pub(crate) mod reader_output;
 pub(crate) mod research_cancel;
 pub mod research_cleanup;
 pub(crate) mod retry;
+pub(crate) mod round_cancel;
 pub(crate) mod runtime_events;
 pub mod search_engine;
 pub mod self_update;

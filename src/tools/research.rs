@@ -505,7 +505,7 @@ async fn dispatch_durable_research(
     // and its terminalization tail. A manual cancel from the Running Agents
     // page fires it; the orchestrator's boundary gates observe it and stop
     // permanently (ResearchExit::Cancelled).
-    let _cancel_guard = crate::research_cancel::register(job_id);
+    let _cancel_guard = crate::round_cancel::register(job_id, None);
     // A round dispatched by a custom role owns a custom branch address — its
     // jobs row and result envelope must say `Role::Custom` plus the launch, not
     // the tool's construction role.
@@ -627,7 +627,7 @@ async fn terminalize_research(
     // anything. The cancelled-run handoff dispatches the cleanup agent with
     // the already-final dump — no racing folder deletion, the dump stays
     // alive for the cleanup agent.
-    if crate::research_cancel::is_cancelled(job_id) {
+    if crate::round_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research terminalization suppressed by manual cancel");
         hand_off_cancelled_or_warn(job_id, ws, question).await;
         return None;
@@ -666,7 +666,7 @@ async fn terminalize_research(
     // fired mid-tx — never route the report or dispatch the cleanup. The
     // cancelled-run handoff suppresses the pending envelope and dispatches the
     // cleanup agent.
-    if crate::research_cancel::is_cancelled(job_id) {
+    if crate::round_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research completion suppressed by manual cancel — not routed");
         hand_off_cancelled_or_warn(job_id, ws, question).await;
         return None;
@@ -707,7 +707,7 @@ async fn hand_off_cancelled_or_warn(job_id: &str, ws: &Workspace, question: &str
 pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
     // Register the run's cancel signal for this invocation — the boot-resume
     // path can be cancelled exactly like a fresh dispatch.
-    let _cancel_guard = crate::research_cancel::register(job_id);
+    let _cancel_guard = crate::round_cancel::register(job_id, None);
     let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
         &crate::session::store().conn,
         job_id,
@@ -2125,7 +2125,7 @@ async fn run_coder_round(
         set_coder_marker(state, round_key, "skipped — shutdown/drain");
         return;
     }
-    if crate::research_cancel::is_cancelled(job_id) {
+    if crate::round_cancel::is_cancelled(job_id) {
         set_coder_marker(state, round_key, "skipped — run cancelled");
         return;
     }
@@ -2249,7 +2249,7 @@ async fn gap_rounds(
     // stop without extracting gaps, dispatching the coder, or spawning
     // another gap round. The caller (run_deep_research) observes the fired
     // signal and exits Cancelled regardless of this outcome's value.
-    if crate::research_cancel::is_cancelled(job_id) {
+    if crate::round_cancel::is_cancelled(job_id) {
         return GapRoundsOutcome::default();
     }
     let initial_list = match state.gap_list.take() {
@@ -2272,7 +2272,7 @@ async fn gap_rounds(
     let mut round_index = state.round_index;
     loop {
         if crate::shutdown::aborting()
-            || crate::research_cancel::is_cancelled(job_id)
+            || crate::round_cancel::is_cancelled(job_id)
             || budget.is_exhausted()
             // Round-wide deadline expired: further rounds would be spawned
             // and instantly aborted — stop instead of burning budget on
@@ -3225,7 +3225,7 @@ async fn run_deep_research(
 
     // Manual-cancel gate BEFORE round 0: a cancel that landed between the
     // dispatch registration and the first boundary must stop immediately.
-    if crate::research_cancel::is_cancelled(job_id) {
+    if crate::round_cancel::is_cancelled(job_id) {
         return ResearchExit::Cancelled;
     }
 
@@ -3266,7 +3266,7 @@ async fn run_deep_research(
                 state.save(job_id).await;
                 return ResearchExit::Aborted;
             }
-            Err(_) if crate::research_cancel::is_cancelled(job_id) => {
+            Err(_) if crate::round_cancel::is_cancelled(job_id) => {
                 return ResearchExit::Cancelled;
             }
             Err(e) => {
@@ -3289,7 +3289,7 @@ async fn run_deep_research(
         return ResearchExit::Aborted;
     }
 
-    if crate::research_cancel::is_cancelled(job_id) {
+    if crate::round_cancel::is_cancelled(job_id) {
         return ResearchExit::Cancelled;
     }
 
@@ -3390,7 +3390,7 @@ async fn run_deep_research(
             state.save(job_id).await;
             return ResearchExit::Aborted;
         }
-        if crate::research_cancel::is_cancelled(job_id) {
+        if crate::round_cancel::is_cancelled(job_id) {
             // Manual cancel: permanent stop — the cancelled-run handoff owns
             // the cleanup dispatch; nothing further is checkpointed or
             // delivered.
@@ -3414,7 +3414,7 @@ async fn run_deep_research(
         return ResearchExit::Aborted;
     }
 
-    if crate::research_cancel::is_cancelled(job_id) {
+    if crate::round_cancel::is_cancelled(job_id) {
         return ResearchExit::Cancelled;
     }
 
@@ -3444,7 +3444,7 @@ async fn run_deep_research(
         Err(_) if crate::shutdown::aborting() => {
             return ResearchExit::Aborted;
         }
-        Err(_) if crate::research_cancel::is_cancelled(job_id) => {
+        Err(_) if crate::round_cancel::is_cancelled(job_id) => {
             return ResearchExit::Cancelled;
         }
         Err(e) => {
@@ -3461,7 +3461,7 @@ async fn run_deep_research(
     // synthesized report as-is (partial is acceptable).
     let verification = if crate::shutdown::aborting() {
         Vec::new()
-    } else if crate::research_cancel::is_cancelled(job_id) {
+    } else if crate::round_cancel::is_cancelled(job_id) {
         return ResearchExit::Cancelled;
     } else if !state.verification.is_empty() {
         std::mem::take(&mut state.verification)
@@ -3776,8 +3776,8 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws("/tmp/test_ws_research_cancel_boundary");
         let job_id = "research_job_cancel_boundary_1";
-        let _guard = crate::research_cancel::register(job_id);
-        crate::research_cancel::cancel(job_id);
+        let _guard = crate::round_cancel::register(job_id, None);
+        crate::round_cancel::cancel(job_id);
         let exit = run_deep_research(&ws, "question?", job_id, true).await;
         assert!(
             matches!(exit, ResearchExit::Cancelled),

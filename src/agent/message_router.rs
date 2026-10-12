@@ -78,7 +78,7 @@ pub enum MessageKind {
     /// Only enqueued for the Manager role.
     TicketNotify,
     /// Result from an async AnalyzeTool sub-agent, injected back into the caller's
-    /// agent session.
+    /// agent session. A round its caller cancels produces none.
     AnalyzeToolResult,
     /// Result from an async single-run coder dispatch (`send` `coder`), injected
     /// back into the caller's agent session. Also the kind a coder branch's

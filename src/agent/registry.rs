@@ -389,9 +389,11 @@ impl AgentRegistry {
     }
 
     /// Cancel every agent belonging to a direct parent invocation (ticket /
-    /// analyze round / research run) as a group. Used by the research
-    /// manual-cancel path to stop the whole run (analysts, verifier, coder,
-    /// and the cleanup agent — they share the run's [`ParentKey::Research`]).
+    /// analyze round / research run) as a group. Used by the manual-cancel paths
+    /// — the GUI's research stop (analysts, verifier, coder and the cleanup
+    /// agent share the run's [`ParentKey::Research`]) and the analyze tool's
+    /// cancel action (the round's analysts and verification analysts share its
+    /// [`ParentKey::AnalyzeRound`]).
     ///
     /// Follows the lock-ordering invariant documented on
     /// [`cancel_matching`](AgentRegistry::cancel_matching): the predicate runs
@@ -553,10 +555,9 @@ impl NonAgentCallRegistry {
 
     /// Remove every in-flight call belonging to a direct parent invocation
     /// (ticket / analyze round / research run). Purely observational — the
-    /// RAII guards' drops become no-ops. Used by the research manual-cancel
-    /// path so the run's group disappears from Running Agents immediately
-    /// instead of lingering until the orchestrator task returns (which can be
-    /// minutes mid-LLM-call).
+    /// RAII guards' drops become no-ops. Used by the manual-cancel paths so the
+    /// group disappears from Running Agents immediately instead of lingering
+    /// until its task returns (which can be minutes mid-LLM-call).
     pub fn remove_by_parent_key(&self, parent: &ParentKey) {
         let parent = parent.clone();
         let mut map = self.inner.lock().unwrap_poison();

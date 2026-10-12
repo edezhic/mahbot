@@ -1,11 +1,12 @@
 //! AnalyzeTool — dispatches a batch of parallel analysts to research a question,
 //! at one of two depths.
 //!
-//! Analyst-only: every call dispatches analysts (read-only research), never
-//! mutation-capable agents. `quick` runs the single round of parallel analysts;
-//! `deep` runs the multi-round deep investigation ([`super::research`]) to one
-//! consolidated, source-cited report. A holder that has both declares the
-//! `depth` choice; a holder with one fixed depth does not.
+//! Dispatch-only: every dispatch call raises analysts (read-only research),
+//! never mutation-capable agents. The cancel action dispatches nothing (it
+//! deletes the named round's own rows — see below). `quick` runs the single
+//! round of parallel analysts; `deep` runs the multi-round deep investigation
+//! ([`super::research`]) to one consolidated, source-cited report. A holder that
+//! has both declares the `depth` choice; a holder with one fixed depth does not.
 //!
 //! Holders: the Engineer, Manager and Maintainer run `quick` (sync for the
 //! Engineer/Maintainer, async for the Manager); a guest Assistant runs `quick`
@@ -21,7 +22,10 @@
 //! judgment with code-computed agreement brackets. Disputed groups (those with
 //! a genuine contradiction) get an optional annotation-only verification round
 //! of fresh analysts, appended as a `## Verification` section. Fail-open is
-//! preserved throughout: findings are never silently lost.
+//! preserved throughout: findings are never silently lost — with one deliberate
+//! exception, a round the caller cancels: its analysts stop, its partial
+//! findings are never turned into a result, and its result is never delivered
+//! (see [`crate::analyze_cancel`]).
 
 use crate::agent::{run_agent, run_default_agent};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
@@ -95,6 +99,16 @@ impl AnalyzeDepth {
     }
 }
 
+/// The cancel action's argument spellings — the interface's second axis,
+/// declared only where an asynchronous quick round can be dispatched
+/// ([`AnalyzeTool::cancels`]).
+pub(crate) const ACTION_ARG: &str = "action";
+/// The round the cancel action addresses — the id the dispatch acknowledgement
+/// carried.
+pub(crate) const JOB_ID_ARG: &str = "job_id";
+/// The `action` value that selects the cancel action.
+const ACTION_CANCEL: &str = "cancel";
+
 pub struct AnalyzeTool {
     /// Controls how the sub-agents are dispatched.
     /// - [`DispatchMode::Sync`] — blocks the caller until the sub-agents complete.
@@ -159,6 +173,16 @@ impl AnalyzeTool {
             accepts_place,
         }
     }
+
+    /// Whether this holder is offered the cancel action. Only a holder that can
+    /// dispatch an asynchronous `quick` round can — the Manager, the Assistant
+    /// and a custom role granted `quick`. A sync holder (Engineer, Maintainer)
+    /// and a `deep`-only holder dispatch work this action deliberately does not
+    /// stop, so it is not offered to them.
+    #[must_use]
+    fn cancels(&self) -> bool {
+        self.dispatch_mode.is_async() && self.kinds.contains(&AnalyzeDepth::Quick)
+    }
 }
 
 #[async_trait]
@@ -169,8 +193,9 @@ impl Tool for AnalyzeTool {
 
     /// Compose the description from shared fragments: the base text, the quick
     /// note when `quick` is held, the depth note for what this holder can call,
-    /// the optional-`place` note, and the async note. The deep note always
-    /// carries the long-running warning and the scope-confirmation requirement.
+    /// the optional-`place` note, the async note, and — only where the cancel
+    /// action is offered — the cancel note. The deep note always carries the
+    /// long-running warning and the scope-confirmation requirement.
     fn description(&self) -> String {
         let mut parts = vec![load_prompt("tool/analyze.md")];
         if self.kinds.contains(&AnalyzeDepth::Quick) {
@@ -190,6 +215,9 @@ impl Tool for AnalyzeTool {
         if self.dispatch_mode.is_async() {
             parts.push(load_prompt("tool/analyze_async.md"));
         }
+        if self.cancels() {
+            parts.push(load_prompt("tool/analyze_cancel.md"));
+        }
         parts.join("\n\n")
     }
 
@@ -200,7 +228,7 @@ impl Tool for AnalyzeTool {
                 "description": "The question for the analysts"
             }
         });
-        let mut required = vec!["message"];
+        let mut dispatch = vec!["message"];
         if self.kinds.len() > 1 {
             let choices: Vec<&str> = self.kinds.iter().map(|depth| depth.as_str()).collect();
             properties[AnalyzeDepth::ARG] = json!({
@@ -208,7 +236,7 @@ impl Tool for AnalyzeTool {
                 "enum": choices,
                 "description": "How deep to go; the matching note says what each value does."
             });
-            required.push(AnalyzeDepth::ARG);
+            dispatch.push(AnalyzeDepth::ARG);
         }
         if self.accepts_place {
             // The interface declares the per-choice requirement — `deep` never
@@ -223,14 +251,40 @@ impl Tool for AnalyzeTool {
                 "description": description
             });
         }
-        super::tool_params_schema(&properties, &required)
+        if !self.cancels() {
+            return super::tool_params_schema(&properties, &dispatch);
+        }
+        // The cancel action is a second axis, not a second tool: it is declared
+        // beside the dispatch arguments and validated on the call. A cancel call
+        // carries no dispatch argument, so the requirement is a disjunction —
+        // `message` (+ `depth`) to dispatch, `action` + `job_id` to cancel —
+        // which the flat `required` envelope cannot express (built like
+        // `web_search`'s two-branch schema).
+        properties[ACTION_ARG] = json!({
+            "type": "string",
+            "enum": [ACTION_CANCEL],
+            "description": "Set to `cancel` to stop one of the rounds you dispatched, named by `job_id`, instead of dispatching a new one."
+        });
+        properties[JOB_ID_ARG] = json!({
+            "type": "string",
+            "description": "The round to cancel — the id from its dispatch acknowledgement."
+        });
+        let mut schema = super::tool_params_schema(&properties, &[]);
+        schema["oneOf"] = json!([
+            { "required": dispatch },
+            { "required": [ACTION_ARG, JOB_ID_ARG] },
+        ]);
+        schema
     }
 
-    /// Sub-agents dispatched by AnalyzeTool are always Analysts, who have no
-    /// mutation tools (no edit, and at most the read-only shell, which reports
-    /// [`Self::side_effects`] = false — see `Role::tools()` for when even that
-    /// is withheld). This classification is coupled to `Role::tools()`; if
-    /// Analyst ever gains side-effecting tools, this must be reconsidered.
+    /// A dispatch itself spends nothing the workspace can observe — the analysts
+    /// are read-only (see `Role::tools()` for when even the read-only shell is
+    /// withheld), and this classification is coupled to it: if Analyst ever gains
+    /// side-effecting tools, this must be reconsidered. A cancel call does delete
+    /// the round's rows, but it can only name a round whose acknowledgement an
+    /// EARLIER tool round returned, so it never acts on a round dispatched beside
+    /// it — staying read-only keeps several dispatches of one tool round running
+    /// in parallel.
     fn side_effects(&self) -> bool {
         false
     }
@@ -245,6 +299,32 @@ impl Tool for AnalyzeTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
+        // The cancel action is read before anything else: it takes neither the
+        // message, nor the depth, nor the place, so a cancel is never refused
+        // for a dispatch argument it does not carry.
+        if self.cancels() {
+            match super::get_opt_str_strict(&args, ACTION_ARG)? {
+                None => {}
+                Some(action) if action == ACTION_CANCEL => {
+                    let job_id = super::get_str(&args, JOB_ID_ARG)?.trim();
+                    anyhow::ensure!(
+                        !job_id.is_empty(),
+                        "usage: `{JOB_ID_ARG}` must name the round to cancel"
+                    );
+                    // Ownership is the calling SESSION: the round's own delivery
+                    // address is compared against it, and the user is not part of
+                    // it — a workspace-scoped Manager session is driven by
+                    // pipeline ticket notifications, whose turns carry no user at
+                    // all (`tool_identity` would refuse exactly those turns).
+                    let caller = crate::agent::tool_agent_id()?;
+                    let outcome = crate::analyze_cancel::cancel_round(job_id, &caller).await?;
+                    return Ok(crate::analyze_cancel::answer(&outcome, job_id));
+                }
+                Some(action) => {
+                    return Err(super::refuse_choice(ACTION_ARG, action, &[ACTION_CANCEL]));
+                }
+            }
+        }
         let message = super::get_dispatch_message(&args)?;
         let depth = super::chosen_kind(
             &args,
@@ -276,8 +356,8 @@ impl Tool for AnalyzeTool {
                         job_id.clone(),
                     );
                     return Ok(format!(
-                        "Analysis dispatched (job {job_id}). The consolidated answer will follow \
-                         as an <analyze-tool-result> message."
+                        "Analysis dispatched (job {job_id}). The consolidated answer follows \
+                         as an <analyze-tool-result> message unless you cancel the round first."
                     ));
                 }
                 // Sync path — blocks the caller until the analysts complete.
@@ -322,6 +402,11 @@ pub(crate) async fn run_analyze_with_job(
     } = args;
     let resume = spawn.is_none();
     let deadline = std::time::Instant::now() + round_timeout();
+    // The signal may have fired before the round started: the caller was already
+    // answered and the round's rows swept, so stop before writing anything.
+    if crate::round_cancel::is_cancelled(job_id) {
+        return Ok(crate::tools::SyncCoreOutcome::Cancelled);
+    }
 
     let (slots, pre_done) = match &spawn {
         // Resume: reuse the stored roster (agent ids + final tasks) — never
@@ -383,6 +468,13 @@ pub(crate) async fn run_analyze_with_job(
                 spawn.custom_launch,
             )
             .await?;
+            // The cancel can have landed while the roster was built, or between
+            // that and this INSERT's commit. The gate inside `spawn_job`'s tx
+            // refuses the row in that case, so this only turns the stop into the
+            // round's outcome — a cancelled round is never resumed either way.
+            if crate::round_cancel::is_cancelled(job_id) {
+                return Ok(crate::tools::SyncCoreOutcome::Cancelled);
+            }
             (slots, Vec::new())
         }
     };
@@ -395,6 +487,14 @@ pub(crate) async fn run_analyze_with_job(
     // Round key = the durable job_id — stable across resume so a resumed
     // round's analysts and consolidation call group under the same key.
     let fresh_runs = run_analyze_slots(ws, &fresh_slots, deadline, resume, job_id, message).await;
+
+    // The cancel landed while the analysts ran: they were cancelled as a group,
+    // so their runs already carry the stopped outcome — the partial findings are
+    // never turned into a result, with no checkpoint write, extraction or
+    // consolidation.
+    if crate::round_cancel::is_cancelled(job_id) {
+        return Ok(crate::tools::SyncCoreOutcome::Cancelled);
+    }
 
     // Assemble runs in slot order.
     let mut runs: Vec<AnalyzeRun> = Vec::with_capacity(slots.len());
@@ -468,8 +568,15 @@ pub(crate) async fn run_analyze_with_job(
         return Ok(crate::tools::SyncCoreOutcome::DrainCut);
     }
 
-    let result = consolidate_analyst_runs(ws, message, runs, deadline, job_id).await;
-    Ok(crate::tools::SyncCoreOutcome::Terminal(result))
+    // The consolidation owns the round's last model calls, so a cancel landing
+    // anywhere inside it stops the round instead of yielding a result.
+    Ok(
+        match consolidate_analyst_runs(ws, message, runs, deadline, job_id).await {
+            Ok(Some(text)) => crate::tools::SyncCoreOutcome::Terminal(Ok(text)),
+            Ok(None) => crate::tools::SyncCoreOutcome::Cancelled,
+            Err(e) => crate::tools::SyncCoreOutcome::Terminal(Err(e)),
+        },
+    )
 }
 
 /// Run the given analyst slots concurrently (deadline-bounded).
@@ -824,14 +931,22 @@ fn analyst_slot(
 /// ≥2 valid → extract findings and run the shared grouping pass (≥2 with
 /// parseable claims group; a single parseable source skips grouping). Failed
 /// members and completed members without a usable response count as no-response,
-/// with their reasons surfaced in the error.
+/// with their reasons surfaced in the error. `Ok(None)` is a round that was
+/// cancelled before this phase's first model call: no text was produced and the
+/// caller receives nothing.
 async fn consolidate_analyst_runs(
     ws: &Workspace,
     analyze: &str,
     runs: Vec<AnalyzeRun>,
     deadline: std::time::Instant,
     round_key: &str,
-) -> Result<String> {
+) -> Result<Option<String>> {
+    // The cancel may have landed while the analysts ran: nothing new is started
+    // for a cancelled round, so the extraction model calls never happen and the
+    // partial findings are never turned into a result.
+    if crate::round_cancel::is_cancelled(round_key) {
+        return Ok(None);
+    }
     // Drain-watch coverage for this phase: extraction runs while the analyst
     // Agents are still registered (their registry entries keep the drain-watch
     // from firing); the grouping pass runs with zero live agents and is
@@ -866,9 +981,11 @@ async fn consolidate_analyst_runs(
                 "all parallel analysts failed to produce a response{suffix}"
             )))
         }
-        1 => Ok(single_raw_response(&runs).expect("exactly one valid response")),
+        1 => Ok(Some(
+            single_raw_response(&runs).expect("exactly one valid response"),
+        )),
         _ => {
-            let outcomes = extract_findings(runs, deadline).await;
+            let outcomes = extract_findings(runs, deadline, round_key).await;
             consolidate_findings(ws, analyze, outcomes, round_key, deadline).await
         }
     }
@@ -886,16 +1003,19 @@ fn single_raw_response(runs: &[AnalyzeRun]) -> Option<String> {
 /// KV-cache rationale). Fail-open: parse failures keep the raw response and
 /// are never silently dropped. The extraction wait shares the round-wide
 /// `deadline` — a stuck extraction is reported as no-response, not awaited
-/// forever.
+/// forever — and `round_key` is the round whose cancel signal abandons each
+/// extraction instead of asking again.
 async fn extract_findings(
     runs: Vec<AnalyzeRun>,
     deadline: std::time::Instant,
+    round_key: &str,
 ) -> Vec<AnalystOutcome> {
     let extraction_prompt = load_prompt("extraction/findings.md");
     let handles: Vec<_> = runs
         .into_iter()
         .map(|run| {
             let extraction_prompt = extraction_prompt.clone();
+            let round_key = round_key.to_string();
             tokio::spawn(async move {
                 let (agent, response) = match run {
                     AnalyzeRun::Completed { agent, response } => (agent, response),
@@ -912,10 +1032,24 @@ async fn extract_findings(
                         "no-response: analyst produced no response".to_string(),
                     );
                 }
-                match agent
-                    .extract_verdict::<AnalystFindings>(&extraction_prompt, None, None)
-                    .await
-                {
+                // Nothing new starts for a round the caller has cancelled: the
+                // extraction loop re-asks on a parse failure, so the whole call
+                // chain is abandoned at the signal instead of asking again. The
+                // caller has already been told the round was stopped, and the
+                // outcome here is discarded by the phase gate either way. The
+                // signal is polled first (`biased`), so it wins over an
+                // extraction that is ready to return.
+                let extracted = tokio::select! {
+                    biased;
+                    () = crate::round_cancel::cancelled(&round_key) => {
+                        return AnalystOutcome::NoResponse(
+                            "cancelled: findings extraction task was cancelled".to_string(),
+                        );
+                    }
+                    result = agent
+                        .extract_verdict::<AnalystFindings>(&extraction_prompt, None, None) => result,
+                };
+                match extracted {
                     Ok(findings) => AnalystOutcome::Findings { raw, findings },
                     Err(e) => AnalystOutcome::ParseFailed {
                         raw,
@@ -987,13 +1121,22 @@ fn render_unconsolidated_fallback(
 /// Partial success (≥1 frozen group) is delivered as-is; only an exhaustion
 /// with zero groups ever frozen keeps the fail-open flat claim list plus raw
 /// analyst dumps with an explicit marker — never a fabricated consensus.
+/// `Ok(None)` is a round cancelled before this phase's first model call or one
+/// that was cancelled while it ran: no model call is started and the caller
+/// receives nothing.
 async fn consolidate_findings(
     ws: &Workspace,
     analyze: &str,
     outcomes: Vec<AnalystOutcome>,
     round_key: &str,
     deadline: std::time::Instant,
-) -> Result<String> {
+) -> Result<Option<String>> {
+    // A round cancelled while its analysts ran produces no text at all — not
+    // even the fail-open claim list below, which would render a partial result
+    // for a round whose caller was already answered that it was stopped.
+    if crate::round_cancel::is_cancelled(round_key) {
+        return Ok(None);
+    }
     let items_by_agent = claims_per_agent(&outcomes);
     let n_valid = items_by_agent.iter().filter(|l| !l.is_empty()).count();
     if n_valid == 0 {
@@ -1010,9 +1153,9 @@ async fn consolidate_findings(
         } else {
             "unconsolidated — no extractable claims from any analyst"
         };
-        return Ok(format!(
+        return Ok(Some(format!(
             "## Analyst Reports\n\n({marker})\n\n{failures}\n\n{raw_dump}"
-        ));
+        )));
     }
     if n_valid == 1 {
         // Only one analyst produced parseable claims — a grouping pass over a
@@ -1020,11 +1163,11 @@ async fn consolidate_findings(
         // so skip the provider call and deliver the flat claim list + raw
         // dumps with an explicit marker.
         tracing::info!("Single-analyst consolidation — skipping grouping pass");
-        return Ok(render_unconsolidated_fallback(
+        return Ok(Some(render_unconsolidated_fallback(
             "only one analyst produced parseable claims — grouping skipped",
             &items_by_agent,
             &outcomes,
-        ));
+        )));
     }
     // User material: global flat ids across ALL agents (each claim exactly one
     // id, in (agent, claim) order) — the schema's `id` field matches.
@@ -1057,28 +1200,36 @@ async fn consolidate_findings(
     // agents have dropped, the consensus core's guard is not yet registered):
     // never start a new LLM call once the drain begins — deliver the fail-open
     // raw claim list instead (the same deliverable as a Fallback, without the
-    // doomed call). The extraction itself is covered by the live analyst
-    // cards; this check closes the sync-only residual window.
+    // doomed call). The extraction itself is covered by the live analyst cards.
     if crate::shutdown::aborting() {
         tracing::warn!(
             "Analyst consolidation skipped — shutdown/drain in progress; delivering raw claim list"
         );
-        return Ok(render_unconsolidated_fallback(
+        return Ok(Some(render_unconsolidated_fallback(
             "unconsolidated — shutdown during consolidation",
             &items_by_agent,
             &outcomes,
-        ));
+        )));
     }
-    match crate::consensus::run_grouping_repair(
-        ws,
-        "consolidate",
-        request,
-        &items_by_agent,
-        parent,
-        Some(analyze.to_string()),
-    )
-    .await
-    {
+    // The same stop at the phase's own model calls: a cancel that lands after
+    // the entry gate abandons the pass instead of letting it start another
+    // repair round (or write its fail-open fallback and Warn for a round the
+    // caller was already told was stopped). The signal is polled first and
+    // without the random branch choice (`biased`), so a fired signal always wins
+    // over a pass that is ready to continue.
+    let outcome = tokio::select! {
+        biased;
+        () = crate::round_cancel::cancelled(round_key) => return Ok(None),
+        outcome = crate::consensus::run_grouping_repair(
+            ws,
+            "consolidate",
+            request,
+            &items_by_agent,
+            parent,
+            Some(analyze.to_string()),
+        ) => outcome,
+    };
+    match outcome {
         crate::consensus::RepairOutcome::Repaired { output, references } => {
             // Annotation-only verification of disputed groups: fresh analysts
             // re-check the contested findings, appended after the grouped
@@ -1087,22 +1238,22 @@ async fn consolidate_findings(
                 ws, analyze, &output, &table, &outcomes, round_key, deadline,
             )
             .await;
-            Ok(render_analyze_groups(
+            Ok(Some(render_analyze_groups(
                 &output,
                 &references,
                 &table,
                 n_valid,
                 &outcomes,
                 &verification,
-            ))
+            )))
         }
         crate::consensus::RepairOutcome::Fallback => {
             tracing::warn!("Analyst consolidation failed — delivering raw claim list");
-            Ok(render_unconsolidated_fallback(
+            Ok(Some(render_unconsolidated_fallback(
                 "unconsolidated — consolidation failed",
                 &items_by_agent,
                 &outcomes,
-            ))
+            )))
         }
     }
 }
@@ -1580,6 +1731,17 @@ async fn verify_disputed_groups(
     round_key: &str,
     deadline: std::time::Instant,
 ) -> String {
+    // A cancelled round starts nothing new AND raises no complaint about itself:
+    // this gate is the phase's first statement, so neither skip warning below can
+    // fire for a round whose result is discarded. Logged at info, like the
+    // consolidation phase's gate.
+    if crate::round_cancel::is_cancelled(round_key) {
+        tracing::info!(
+            round = %round_key,
+            "Analyze verification skipped — the round was cancelled"
+        );
+        return String::new();
+    }
     let disputed: Vec<&crate::consensus::GroupingGroup> =
         output.groups.iter().filter(|g| g.contradiction).collect();
     if disputed.is_empty() {
@@ -1861,8 +2023,8 @@ mod tests {
         .await;
         assert!(result.is_ok(), "1 response should succeed");
         assert_eq!(
-            result.unwrap(),
-            "only answer",
+            result.unwrap().as_deref(),
+            Some("only answer"),
             "Should return the single response directly without consolidation"
         );
     }
@@ -1889,8 +2051,8 @@ mod tests {
             "1 valid after filtering empty should succeed"
         );
         assert_eq!(
-            result.unwrap(),
-            "valid",
+            result.unwrap().as_deref(),
+            Some("valid"),
             "Should return the only non-empty response"
         );
     }
@@ -2074,6 +2236,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_mins(60),
         )
         .await
+        .map(|text| text.expect("a live round delivers its consolidated text"))
     }
 
     /// Two analysts agreeing on one claim (2/3, no contradictions).
@@ -2214,7 +2377,9 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_mins(60),
         )
         .await;
-        let text = result.expect("single parseable source succeeds");
+        let text = result
+            .expect("single parseable source succeeds")
+            .expect("a live round delivers its text");
         assert!(
             text.contains("only one analyst produced parseable claims — grouping skipped"),
             "skip marker must be present: {text}"
@@ -2298,7 +2463,9 @@ mod tests {
             "test_round",
         )
         .await;
-        let text = result.expect("extraction fail-open must deliver raw reports");
+        let text = result
+            .expect("extraction fail-open must deliver raw reports")
+            .expect("a live round delivers its text");
         assert!(
             text.contains("unconsolidated — findings extraction failed"),
             "{text}"
@@ -3059,6 +3226,1383 @@ mod tests {
             "the round runs in the caller's own workspace, not the named folder"
         );
         crate::research_cancel::cancel_research_run(&job_id).await;
+    }
+
+    // ── Analyze cancel action ─────────────────────────────────────────────
+
+    // The cancel tests' caller: a guest Assistant's async quick variant under
+    // its own user/workspace identity. The message router and the shared test
+    // store are process-global, so this identity is deliberately one no other
+    // test routes to — a restart's replay of the store cannot leak another
+    // test's message into this caller's receiver.
+    const CANCEL_TEST_USER: &str = "cancel_test_user";
+    const CANCEL_TEST_WS: &str = "cancel_test_ws";
+
+    // The sibling-round test's own identity: its delivered result stays in the
+    // shared store's `pending_jobs` for the rest of the process, so it must not
+    // be one the other cancel tests' replay assertions observe.
+    const CANCEL_SIBLING_USER: &str = "cancel_sibling_user";
+    const CANCEL_SIBLING_WS: &str = "cancel_sibling_ws";
+
+    /// The agent address of [`CANCEL_SIBLING_USER`]'s Assistant session.
+    fn cancel_sibling_caller_id() -> String {
+        crate::session::resolve_agent_id(
+            CANCEL_SIBLING_USER,
+            Role::Assistant.as_str(),
+            CANCEL_SIBLING_WS,
+        )
+    }
+
+    /// The agent address of [`CANCEL_TEST_USER`]'s Assistant session — the id
+    /// these tests register as a consumer and the one a round's `jobs` row
+    /// derives to.
+    fn cancel_test_caller_id() -> String {
+        crate::session::resolve_agent_id(CANCEL_TEST_USER, Role::Assistant.as_str(), CANCEL_TEST_WS)
+    }
+
+    /// Whether the store holds a row with this `id` in `table` — the cancel
+    /// tests' window into the durable state a round leaves behind.
+    async fn cancel_row_exists(table: &str, id: &str) -> bool {
+        !crate::session::store()
+            .conn
+            .query(
+                &format!("SELECT id FROM {table} WHERE id = ?1"),
+                crate::db::params![id.to_string()],
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    }
+
+    /// Run the cancel tests' tool the way the agent loop does — with the caller
+    /// identity the tool reads from its task-locals, including the calling agent
+    /// id the cancel action proves ownership with. The caller's workspace is the
+    /// one the round's address derives from, so the session that dispatched the
+    /// round is the one cancelling it.
+    async fn run_as_caller(
+        tool: &AnalyzeTool,
+        ws: &Workspace,
+        user: &str,
+        caller_id: &str,
+        args: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        crate::agent::CURRENT_TOOL_USER_NAME
+            .scope(user.to_string(), async {
+                crate::agent::CURRENT_TOOL_CHANNEL
+                    .scope("gui".to_string(), async {
+                        crate::agent::CURRENT_TOOL_AGENT_ID
+                            .scope(Some(caller_id.to_string()), async {
+                                tool.execute(ws, args).await
+                            })
+                            .await
+                    })
+                    .await
+            })
+            .await
+    }
+
+    /// [`run_as_caller`] for [`CANCEL_TEST_USER`]'s own session.
+    async fn run_as_cancel_test_caller(
+        tool: &AnalyzeTool,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        run_as_caller(tool, ws, CANCEL_TEST_USER, &cancel_test_caller_id(), args).await
+    }
+
+    /// Records the level of every event emitted on the thread it is installed
+    /// for, so a test can assert a path left no complaint behind.
+    #[derive(Clone, Default)]
+    struct LevelRecorder {
+        levels: std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>,
+    }
+
+    impl LevelRecorder {
+        fn levels(&self) -> Vec<tracing::Level> {
+            self.levels.lock().unwrap_poison().clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LevelRecorder {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.levels
+                .lock()
+                .unwrap_poison()
+                .push(*event.metadata().level());
+        }
+    }
+
+    /// A cancel stops a parked quick round: its `jobs` row and its queued result
+    /// go, the fired signal stays observable while the round unwinds, the
+    /// cancelled round delivers nothing to the caller, the analysts' own session
+    /// records survive, and a start does not re-arm the round.
+    ///
+    /// `current_thread` on purpose: the WARN/ERROR capture below is
+    /// thread-scoped, and a single-threaded runtime keeps the awaited cancel on
+    /// the thread the capture was installed for.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(provider, drain, recover_from_restart)]
+    async fn cancel_stops_a_running_round_and_delivers_nothing() {
+        crate::util::test::init_management_test_stores().await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let _provider_guard = install_fake_provider(Arc::new(GatedProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            open: gate_rx,
+        }));
+        let caller_id = cancel_test_caller_id();
+        let mut rx = crate::agent::message_router::register_agent(&caller_id);
+        let caller = crate::workspace::test_ws_named("/tmp/test_ws_analyze_cancel", CANCEL_TEST_WS);
+        let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
+
+        let ack = run_as_cancel_test_caller(&tool, &caller, json!({ "message": "what changed" }))
+            .await
+            .expect("dispatch acked");
+        let job_id = ack
+            .split("job ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("the ack names the job id")
+            .to_string();
+        assert!(ack.contains(&job_id), "{ack}");
+
+        // The round parks on the gated provider: the jobs row and its analyst
+        // roster are written while nothing has been delivered.
+        let (kind, _exec_dir) = round_row(&job_id).await;
+        assert_eq!(kind, "analyze", "a quick round is an analyze job");
+        let conn = &crate::session::store().conn;
+        let roster: Vec<String> = conn
+            .query(
+                "SELECT agent_id FROM agents WHERE job_id = ?1",
+                crate::db::params![job_id.clone()],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String>(0).unwrap())
+            .collect();
+        assert!(!roster.is_empty(), "the round has an analyst roster");
+
+        // A synthetic call card belonging to the round, exactly as the round's
+        // consolidation call registers one: the cancel must remove it so the
+        // cancelled round stops being shown as running work.
+        let _call_card = crate::agent::registry::NON_AGENT_CALLS.register(
+            "consolidate",
+            CANCEL_TEST_WS,
+            Some(crate::agent::registry::ParentKey::AnalyzeRound(
+                job_id.clone(),
+            )),
+            false,
+            None,
+        );
+
+        let recorder = LevelRecorder::default();
+        let answer = {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let _capture = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(recorder.clone()),
+            );
+            run_as_cancel_test_caller(
+                &tool,
+                &caller,
+                json!({ "action": "cancel", "job_id": job_id }),
+            )
+            .await
+            .expect("the cancel is answered")
+        };
+        assert!(answer.contains("Cancelled the analysis round"), "{answer}");
+        assert!(answer.contains(&job_id), "{answer}");
+        // The cancel leaves no complaint about itself behind: nothing it emits
+        // is a WARN or an ERROR (its own record is the INFO line plus the tool
+        // call in the caller's session). `tracing::Level` orders by VERBOSITY
+        // (ERROR < WARN < INFO < …), so "above WARN" means quieter than a
+        // warning. The test runs on a single-threaded runtime so the capture
+        // installed for this thread sees every event the awaited cancel emits.
+        // The capture must have seen the path's own INFO record — an empty
+        // capture could only make the assertion below pass vacuously.
+        assert!(
+            recorder.levels().contains(&tracing::Level::INFO),
+            "the capture must observe the cancel's own record: {:?}",
+            recorder.levels()
+        );
+        assert!(
+            recorder
+                .levels()
+                .iter()
+                .all(|level| *level > tracing::Level::WARN),
+            "the cancel must leave no complaint behind: {:?}",
+            recorder.levels()
+        );
+
+        // The stop is already durable while the round is still parked: the rows
+        // are gone and the fired signal is still observable on the live entry.
+        assert!(
+            !cancel_row_exists("jobs", &job_id).await,
+            "the cancelled round's jobs row must be gone"
+        );
+        assert!(
+            !cancel_row_exists("pending_jobs", &job_id).await,
+            "the cancelled round must leave no queued result"
+        );
+        assert!(
+            crate::round_cancel::is_cancelled(&job_id),
+            "the fired signal must be observable while the round unwinds"
+        );
+        assert!(
+            !crate::agent::registry::NON_AGENT_CALLS
+                .list()
+                .iter()
+                .any(|card| card.parent_key
+                    == Some(crate::agent::registry::ParentKey::AnalyzeRound(
+                        job_id.clone()
+                    ))),
+            "the cancelled round must stop being shown as running work"
+        );
+
+        // The round really is still running (its entry is registered until its
+        // invocation exits), so its stop is still in force and a second cancel
+        // of the same id is answered as stopped again.
+        let answer = run_as_cancel_test_caller(
+            &tool,
+            &caller,
+            json!({ "action": "cancel", "job_id": job_id }),
+        )
+        .await
+        .expect("the repeat cancel is answered");
+        assert!(answer.contains("Cancelled the analysis round"), "{answer}");
+
+        // Let the parked round unwind, then assert nothing it might still do
+        // resurrects its rows or reaches the caller.
+        gate_tx.send(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::round_cancel::is_registered(&job_id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancelled round never unwound after its gate opened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !cancel_row_exists("jobs", &job_id).await,
+            "the unwound round must not resurrect its jobs row"
+        );
+        assert!(
+            !cancel_row_exists("pending_jobs", &job_id).await,
+            "the unwound round must not deliver a result"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled round must deliver nothing to the caller"
+        );
+
+        // The analysts' own records are not the round's to remove.
+        for agent_id in &roster {
+            assert_eq!(
+                conn.query(
+                    "SELECT agent_id FROM session_metadata WHERE agent_id = ?1",
+                    crate::db::params![agent_id.clone()],
+                )
+                .await
+                .unwrap()
+                .len(),
+                1,
+                "the analyst {agent_id}'s session record must survive the cancel"
+            );
+        }
+
+        // A start replays pending_jobs and re-arms resumable jobs: this round is
+        // neither, and the replay delivers nothing for it.
+        let resumable = crate::jobs::recover_from_restart().await.unwrap();
+        assert!(
+            !resumable.iter().any(|job| matches!(
+                job,
+                crate::jobs::ResumableJob::Analyze { job_id: id, .. } if id == &job_id
+            )),
+            "a cancelled round must not be re-armed by a start"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the pending replay must deliver nothing for the cancelled round"
+        );
+    }
+
+    /// A cancel discards an analyze result already produced but not yet
+    /// delivered: its queued row goes, nothing reaches the caller, the discard
+    /// survives a start's replay, and a second cancel of the same id answers
+    /// exactly like an id that never existed.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain, recover_from_restart)]
+    async fn cancel_discards_a_produced_result_and_survives_a_restart() {
+        crate::util::test::init_management_test_stores().await;
+        let caller_id = cancel_test_caller_id();
+        let mut rx = crate::agent::message_router::register_agent(&caller_id);
+        let caller =
+            crate::workspace::test_ws_named("/tmp/test_ws_analyze_cancel_discard", CANCEL_TEST_WS);
+        let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
+        let job_id = "analyze_cancel_discard_job";
+
+        // A produced result with no round row left: the delivery is all that
+        // remains, and it waits in `pending_jobs`.
+        crate::jobs::complete_durable_job(
+            job_id,
+            format!("<analyze-tool-result>\n\nJob: {job_id}\n\nfindings"),
+            crate::agent::message_router::MessageKind::AnalyzeToolResult,
+            crate::Role::Assistant,
+            CANCEL_TEST_USER,
+            "gui",
+            &caller.name,
+            None,
+        )
+        .await;
+        assert!(
+            cancel_row_exists("pending_jobs", job_id).await,
+            "the produced result waits in pending_jobs"
+        );
+
+        let answer = run_as_cancel_test_caller(
+            &tool,
+            &caller,
+            json!({ "action": "cancel", "job_id": job_id }),
+        )
+        .await
+        .expect("the cancel is answered");
+        assert!(
+            answer.contains("had already produced its result"),
+            "{answer}"
+        );
+        assert!(answer.contains("discarded"), "{answer}");
+        assert!(answer.contains(job_id), "{answer}");
+        assert!(
+            !cancel_row_exists("pending_jobs", job_id).await,
+            "the discarded result's queued row is gone"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a discarded result must not be delivered"
+        );
+
+        // A start replays pending_jobs — the discarded row must not come back
+        // and the replay must deliver nothing for it.
+        crate::jobs::recover_from_restart().await.unwrap();
+        assert!(
+            !cancel_row_exists("pending_jobs", job_id).await,
+            "the discard must survive a restart's pending replay"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the pending replay of a discarded result delivers nothing"
+        );
+
+        // The row is gone for good: a second cancel answers like an id that
+        // never existed.
+        let answer = run_as_cancel_test_caller(
+            &tool,
+            &caller,
+            json!({ "action": "cancel", "job_id": job_id }),
+        )
+        .await
+        .expect("the second cancel is answered");
+        assert!(
+            answer.contains("No analysis round of this session to cancel"),
+            "{answer}"
+        );
+    }
+
+    /// A cancelled round leaves no resumable row: a dispatch that observes the
+    /// cancel at its entry returns before writing anything, delivers nothing, and
+    /// releases the synthetic place's engine it would have held. (The write that
+    /// WOULD have happened — a cancel landing inside the dispatch's own row
+    /// transaction — is the gate `jobs::spawn_job` covers, pinned beside it in
+    /// `spawn_job_refuses_a_cancelled_rounds_row`.)
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_cancelled_dispatch_leaves_no_resumable_row() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_analyze_cancel_dispatch");
+        let job_id = "analyze_cancel_dispatch_job";
+
+        // The synthetic `dir-…` delegation place: the cancelled dispatch must
+        // release the picker/watcher it created for it.
+        let place_dir = std::env::temp_dir().join("mahbot_analyze_cancel_place");
+        std::fs::create_dir_all(&place_dir).unwrap();
+        let place =
+            crate::workspace::test_ws_named(place_dir.to_str().unwrap(), "dir-cancel-place-test");
+        crate::search_engine::get_or_init_engine(&place.name, std::path::Path::new(&place.path))
+            .unwrap();
+        assert!(
+            crate::search_engine::get_engine_by_name(&place.name).is_some(),
+            "the place's search engine must be registered before the dispatch"
+        );
+
+        let _cancel_guard = crate::round_cancel::register(job_id, None);
+        crate::round_cancel::cancel(job_id);
+
+        let delivered = crate::tools::SyncDurableCore::Analyze
+            .dispatch_durable(
+                &ws,
+                Some(&place),
+                "task",
+                Role::Assistant,
+                "user",
+                "gui",
+                job_id,
+                None,
+            )
+            .await;
+        assert!(delivered.is_none(), "a cancelled round delivers nothing");
+        assert!(
+            !cancel_row_exists("jobs", job_id).await,
+            "the cancelled dispatch must write no row for a start to resume"
+        );
+        assert!(
+            crate::search_engine::get_engine_by_name(&place.name).is_none(),
+            "a cancelled round must not leave its picker/watcher held"
+        );
+    }
+
+    /// A cancel that lands between the boot scan which picked a round and the
+    /// resume's own cancel-signal registration still stops that round: the mark
+    /// the cancel left reaches the registration, so the resume runs nothing and
+    /// a caller answered as stopped is never delivered to.
+    #[tokio::test]
+    #[serial_test::serial(drain, recover_from_restart)] // the resume consults the drain flag
+    async fn a_cancel_before_a_resume_registers_still_stops_that_resume() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_analyze_cancel_before_resume");
+        let job_id = "analyze_cancel_before_resume_job";
+        let agent_id = format!("analyze_{}_rs_0_analyst", ws.name);
+        let conn = &crate::session::store().conn;
+        // A round a crashed dispatch left launched, with its stored outcome
+        // (reconstructed by its roster slot — no provider needed): without the
+        // cancel, this resume runs and delivers that outcome.
+        crate::jobs::spawn_job(
+            conn,
+            job_id,
+            "question?",
+            &ws.name,
+            "caller-user",
+            "telegram",
+            Role::Assistant,
+            &[crate::jobs::NewAgent {
+                agent_id: agent_id.clone(),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(0),
+                task: "question?".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Analyze,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::jobs::write_agent_outcome(
+            conn,
+            job_id,
+            &agent_id,
+            crate::jobs::RowStatus::Done,
+            Some("completed analyst response"),
+        )
+        .await
+        .unwrap();
+
+        // The cancel fires while nothing is registered for the round, and its
+        // row removal has not landed yet: the boot scan has already listed this
+        // row, so the resume below is the one that must observe the cancel.
+        assert!(!crate::round_cancel::is_registered(job_id));
+        crate::round_cancel::cancel(job_id);
+        resume_analyze_round(job_id, &ws, None).await;
+
+        // Asserted BEFORE the cancel action's own row removal below: an
+        // uncancelled resume of this stored round writes exactly this row.
+        let pending = conn
+            .query(
+                "SELECT id FROM pending_jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            0,
+            "a round cancelled before its resume must deliver nothing"
+        );
+
+        // The cancel action then removes the round's own rows, as it always
+        // does, so the next start cannot re-arm it.
+        crate::jobs::delete_round_rows(conn, job_id).await.unwrap();
+        assert!(
+            !cancel_row_exists("jobs", job_id).await,
+            "the cancelled round must not be re-armed for the next start"
+        );
+    }
+
+    /// Seed one launched analyze round row exactly as a dispatch writes it — the
+    /// address shapes the ownership cases below need.
+    async fn seed_round_row(
+        ws: &Workspace,
+        job_id: &str,
+        user: &str,
+        role: Role,
+        launch: Option<&crate::Launch>,
+    ) {
+        crate::jobs::spawn_job(
+            &crate::session::store().conn,
+            job_id,
+            "question?",
+            &ws.name,
+            user,
+            "gui",
+            role,
+            &[],
+            &crate::jobs::SpawnChild::Analyze,
+            None,
+            None,
+            launch,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Ownership is the calling SESSION, resolved through the crate's ONE
+    /// delivery-address derivation ([`crate::jobs::target_agent_id`]) — so the two
+    /// addresses that are NOT (user, role, workspace) are both covered: the
+    /// workspace's shared Manager session, cancelling in a pipeline-driven turn
+    /// that carries NO user at all, and a custom-role branch, whose address comes
+    /// from the launch its row carries.
+    #[tokio::test]
+    #[serial_test::serial(drain, recover_from_restart)]
+    async fn the_dispatchers_session_cancels_its_round_whatever_its_address_shape() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_analyze_cancel_addresses");
+
+        // A Manager round, cancelled by the workspace's manager session in a turn
+        // with no user (pipeline ticket notifications).
+        let manager_job = "analyze_cancel_manager_job";
+        seed_round_row(&ws, manager_job, "asking-user", Role::Manager, None).await;
+        let manager_tool = AnalyzeTool::new(DispatchMode::Async, Role::Manager);
+        let answer = run_as_caller(
+            &manager_tool,
+            &ws,
+            "",
+            &crate::session::manager_agent_id(&ws.name),
+            json!({ "action": "cancel", "job_id": manager_job }),
+        )
+        .await
+        .expect("the cancel is answered");
+        assert!(answer.contains("Cancelled the analysis round"), "{answer}");
+        assert!(
+            !cancel_row_exists("jobs", manager_job).await,
+            "the manager's own round is stopped"
+        );
+
+        // A custom-role branch's round, cancelled by that branch.
+        let branch_job = "analyze_cancel_custom_job";
+        let branch = "role_audit:1";
+        let launch = crate::Launch {
+            role: Role::Custom,
+            name: "audit".to_string(),
+            identifier: Some("1".to_string()),
+            prompt: String::new(),
+            tools: Vec::new(),
+            agent_id: branch.to_string(),
+            reply_to: None,
+        };
+        seed_round_row(&ws, branch_job, "branch-user", Role::Custom, Some(&launch)).await;
+        let answer = run_as_caller(
+            &AnalyzeTool::new(DispatchMode::Async, Role::Assistant),
+            &ws,
+            "branch-user",
+            branch,
+            json!({ "action": "cancel", "job_id": branch_job }),
+        )
+        .await
+        .expect("the cancel is answered");
+        assert!(answer.contains("Cancelled the analysis round"), "{answer}");
+        assert!(
+            !cancel_row_exists("jobs", branch_job).await,
+            "the branch's own round is stopped"
+        );
+    }
+
+    /// A placed round holds its synthetic `dir-…` search engine for the resume
+    /// that reuses it — a round cut by drain has already returned, so its own
+    /// exit released nothing. A cancel means there is no resume, so the cancel
+    /// action releases the engine from the directory its row records — even once
+    /// that directory itself is gone, since the engine is NAMED by it and the
+    /// round's rows are swept.
+    #[tokio::test]
+    #[serial_test::serial(drain, recover_from_restart)]
+    async fn a_cancel_releases_a_placed_rounds_search_engine() {
+        crate::util::test::init_management_test_stores().await;
+        let caller = crate::workspace::test_ws_named(
+            "/tmp/test_ws_analyze_cancel_place_release",
+            CANCEL_TEST_WS,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let place_path =
+            crate::util::strip_verbatim_prefix(&std::fs::canonicalize(dir.path()).unwrap())
+                .to_str()
+                .unwrap()
+                .to_string();
+        // The engine the round left behind, exactly as a drain-cut leaves it.
+        let place = crate::tools::delegation::workspace_at_dir(&place_path)
+            .await
+            .unwrap();
+        crate::search_engine::get_or_init_engine(&place.name, std::path::Path::new(&place.path))
+            .unwrap();
+        assert!(
+            crate::search_engine::get_engine_by_name(&place.name).is_some(),
+            "the placed round's engine must be registered before the cancel"
+        );
+        let job_id = "analyze_cancel_place_release_job";
+        crate::jobs::spawn_job(
+            &crate::session::store().conn,
+            job_id,
+            "analyze task",
+            CANCEL_TEST_WS,
+            CANCEL_TEST_USER,
+            "gui",
+            Role::Assistant,
+            &[],
+            &crate::jobs::SpawnChild::Analyze,
+            None,
+            Some(&place_path),
+            None,
+        )
+        .await
+        .unwrap();
+        // The directory is gone by the time the cancel lands — exactly the state
+        // a drain-cut round leaves: it has already returned, its rows are swept,
+        // and the engine's name is a derivation of the recorded path, not a
+        // lookup that needs the directory to exist.
+        dir.close().unwrap();
+        assert!(
+            !std::path::Path::new(&place_path).exists(),
+            "the fixture's directory must be gone before the cancel"
+        );
+
+        let answer = run_as_cancel_test_caller(
+            &AnalyzeTool::new(DispatchMode::Async, Role::Assistant),
+            &caller,
+            json!({ "action": "cancel", "job_id": job_id }),
+        )
+        .await
+        .expect("the cancel is answered");
+        assert!(answer.contains("Cancelled the analysis round"), "{answer}");
+        assert!(
+            crate::search_engine::get_engine_by_name(&place.name).is_none(),
+            "a cancelled round must not leave its picker/watcher held for a resume that cannot happen"
+        );
+        assert!(!cancel_row_exists("jobs", job_id).await);
+    }
+
+    /// A cancelled round starts no model call on its way out: both the findings
+    /// extraction and the grouping pass stop at the fired signal, so the round
+    /// reports its cancellation instead of a result — no extraction call and no
+    /// re-registered `consolidate` call card.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_cancelled_round_starts_no_consolidation_call() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_analyze_cancel_consolidate");
+        let round = "analyze_cancel_consolidate_round";
+        // Every scripted call fails: a call the cancelled round started anyway
+        // would surface as a fail-open deliverable instead of a cancellation.
+        let fake =
+            FakeProvider::new().err(crate::retry::FailureClass::Transport, "no call expected");
+        let provider: Arc<dyn crate::Provider> = Arc::new(fake);
+        let _provider_guard = install_fake_provider(provider);
+        // The round's cancel signal, fired before either phase: the entry stays
+        // alive for the duration of the test.
+        let _cancel_guard = crate::round_cancel::register(round, None);
+
+        // Extraction phase: the gate sits ahead of the analyst extraction calls.
+        let runs = vec![
+            test_analyst_run(&ws, Some("report one")),
+            test_analyst_run(&ws, Some("report two")),
+        ];
+        crate::round_cancel::cancel(round);
+        let result = consolidate_analyst_runs(
+            &ws,
+            "test question",
+            runs,
+            std::time::Instant::now() + Duration::from_mins(1),
+            round,
+        )
+        .await
+        .expect("a cancelled round is not a failure");
+        assert!(
+            result.is_none(),
+            "a cancelled round produces no text: {result:?}"
+        );
+
+        // Grouping pass: the gate sits ahead of the shared grouping call.
+        let result = consolidate_findings(
+            &ws,
+            "test question",
+            agreed_outcomes("report one", "report two"),
+            round,
+            std::time::Instant::now() + Duration::from_mins(1),
+        )
+        .await
+        .expect("a cancelled round is not a failure");
+        assert!(
+            result.is_none(),
+            "a cancelled round starts no grouping call: {result:?}"
+        );
+    }
+
+    /// A cancel landing AFTER a phase's entry gate stops that phase's own model
+    /// calls instead of letting the retry loop re-ask: both the findings
+    /// extraction and the consolidation pass are abandoned at the fired signal,
+    /// so no attempt starts after the caller was answered.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_cancelled_round_asks_no_further_model_call() {
+        // Parks the canceller deterministically at the phase's in-flight call
+        // instead of sleeping blindly: waits (bounded) until the provider has
+        // recorded `expected` calls.
+        async fn wait_for_calls(provider: &GatedProvider, expected: usize) {
+            let mut waited = 0;
+            while provider.calls.lock().unwrap_poison().len() < expected {
+                assert!(waited < 400, "the provider never recorded {expected} calls");
+                waited += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        /// The phase is already over: a retry loop that ignored the signal would
+        /// re-ask right away, so watching the count across a settle window
+        /// catches it wherever in the window it lands.
+        async fn assert_no_further_calls(provider: &GatedProvider, expected: usize) {
+            for _ in 0..20 {
+                assert_eq!(
+                    provider.calls.lock().unwrap_poison().len(),
+                    expected,
+                    "no further attempt may be asked after the cancel"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        crate::util::test::init_management_test_stores().await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Every call parks until the gate opens, then answers with a text that
+        // never parses: were the phase not abandoned at the cancel, the retry
+        // loop would re-ask within the test window.
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let provider = Arc::new(GatedProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            open: gate_rx,
+        });
+        let _provider_guard = install_fake_provider(provider.clone() as Arc<dyn crate::Provider>);
+        let ws = test_ws("/tmp/test_ws_analyze_cancel_no_further_call");
+        let round = "analyze_cancel_no_further_call";
+        let _cancel_guard = crate::round_cancel::register(round, None);
+
+        // Part 1 — findings extraction: the two extraction calls are in flight
+        // when the cancel lands, so neither may re-ask once the gate opens.
+        let runs = vec![
+            test_analyst_run(&ws, Some("report one")),
+            test_analyst_run(&ws, Some("report two")),
+        ];
+        let (result, ()) = tokio::join!(
+            consolidate_analyst_runs(
+                &ws,
+                "test question",
+                runs,
+                std::time::Instant::now() + Duration::from_mins(1),
+                round,
+            ),
+            async {
+                wait_for_calls(&provider, 2).await;
+                crate::round_cancel::cancel(round);
+                // Unblock the parked calls too: were the phase not abandoned at
+                // the signal, the retry loop would re-ask and the count below
+                // would grow.
+                gate_tx.send(true).unwrap();
+            },
+        );
+        assert!(
+            result
+                .expect("a cancelled round is not a failure")
+                .is_none(),
+            "a cancelled round produces no text"
+        );
+        assert_no_further_calls(&provider, 2).await;
+
+        // Part 2 — consolidation: the grouping call is in flight when the cancel
+        // lands, so no repair round may start. A fresh round key is registered —
+        // the already-fired signal would be caught by the entry gate before any
+        // call — and the gate is re-armed so that grouping call parks.
+        let round2 = "analyze_cancel_no_further_call_consolidate";
+        let _cancel_guard2 = crate::round_cancel::register(round2, None);
+        gate_tx.send(false).unwrap();
+        let (result, ()) = tokio::join!(
+            consolidate_findings(
+                &ws,
+                "test question",
+                agreed_outcomes("report one", "report two"),
+                round2,
+                std::time::Instant::now() + Duration::from_mins(1),
+            ),
+            async {
+                wait_for_calls(&provider, 3).await;
+                crate::round_cancel::cancel(round2);
+                // Same as Part 1: the phase must stop at the signal, not after
+                // the unblocked call returns.
+                gate_tx.send(true).unwrap();
+            },
+        );
+        assert!(
+            result
+                .expect("a cancelled round is not a failure")
+                .is_none(),
+            "a cancelled round starts no grouping call"
+        );
+        assert_no_further_calls(&provider, 3).await;
+    }
+
+    /// A cancelled round raises no warning about itself: the verification
+    /// phase's cancel gate is its first statement, so the elapsed-window WARN —
+    /// the very state the expired deadline below sets up — cannot fire for a
+    /// round whose result is discarded.
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(clippy::unchecked_time_subtraction)] // the expired deadline is this fixture's point
+    async fn a_cancelled_round_raises_no_verification_warning() {
+        let ws = test_ws("/tmp/test_ws_analyze_cancel_verify_warning");
+        let round_key = "analyze_cancel_verify_warning_job";
+        let _cancel_guard = crate::round_cancel::register(round_key, None);
+        crate::round_cancel::cancel(round_key);
+
+        let items = vec![
+            vec!["the cache is warm".to_string()],
+            vec!["the cache is cold".to_string()],
+        ];
+        let table = crate::consensus::ItemTable::new(&items);
+        let output = crate::consensus::GroupingOutput {
+            summary: "contested".to_string(),
+            groups: vec![crate::consensus::GroupingGroup {
+                heading: "cache state".to_string(),
+                contradiction: true,
+                members: Vec::new(),
+            }],
+            ungrouped: Vec::new(),
+        };
+        let recorder = LevelRecorder::default();
+        let section = {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let _capture = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(recorder.clone()),
+            );
+            verify_disputed_groups(
+                &ws,
+                "test question",
+                &output,
+                &table,
+                &[],
+                round_key,
+                std::time::Instant::now() - round_timeout(),
+            )
+            .await
+        };
+        assert!(
+            section.is_empty(),
+            "a cancelled round renders no verification: {section}"
+        );
+        // The capture saw this phase's own record (the gate's INFO), so the
+        // absence of a WARN below is not a vacuous pass.
+        assert!(
+            recorder.levels().contains(&tracing::Level::INFO),
+            "the capture must observe the gate's own record: {:?}",
+            recorder.levels()
+        );
+        assert!(
+            !recorder.levels().contains(&tracing::Level::WARN),
+            "a cancelled round must not warn about itself: {:?}",
+            recorder.levels()
+        );
+    }
+
+    /// Cancelling one round leaves the caller's other in-flight rounds alone: a
+    /// second round of the same session keeps its produced result, its signal is
+    /// never fired, and that result is still delivered by a start's replay.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain, recover_from_restart)]
+    async fn a_cancel_leaves_the_callers_other_rounds_delivering() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let caller_id = cancel_sibling_caller_id();
+        let mut rx = crate::agent::message_router::register_agent(&caller_id);
+        let caller = crate::workspace::test_ws_named(
+            "/tmp/test_ws_analyze_cancel_siblings",
+            CANCEL_SIBLING_WS,
+        );
+        let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
+
+        // The caller's other round, already produced and waiting.
+        let sibling = "analyze_cancel_sibling_job";
+        crate::jobs::complete_durable_job(
+            sibling,
+            format!("<analyze-tool-result>\n\nJob: {sibling}\n\nsibling findings"),
+            crate::agent::message_router::MessageKind::AnalyzeToolResult,
+            crate::Role::Assistant,
+            CANCEL_SIBLING_USER,
+            "gui",
+            &caller.name,
+            None,
+        )
+        .await;
+
+        // A live round of the same session, cancelled by the action.
+        crate::jobs::spawn_job(
+            conn,
+            "analyze_cancel_first_job",
+            "first question",
+            &caller.name,
+            CANCEL_SIBLING_USER,
+            "gui",
+            crate::Role::Assistant,
+            &[],
+            &crate::jobs::SpawnChild::Analyze,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let answer = run_as_caller(
+            &tool,
+            &caller,
+            CANCEL_SIBLING_USER,
+            &caller_id,
+            json!({ "action": "cancel", "job_id": "analyze_cancel_first_job" }),
+        )
+        .await
+        .expect("the cancel is answered");
+        assert!(answer.contains("Cancelled the analysis round"), "{answer}");
+
+        // The sibling round is untouched: its result still waits and its signal
+        // was never fired.
+        assert!(
+            !crate::round_cancel::is_cancelled(sibling),
+            "cancelling one round must not fire another round's signal"
+        );
+        assert!(
+            cancel_row_exists("pending_jobs", sibling).await,
+            "the sibling round's queued result must survive"
+        );
+
+        // …and it still reaches the caller on the start replay.
+        crate::jobs::recover_from_restart().await.unwrap();
+        let mut delivered = Vec::new();
+        while let Ok(job) = rx.try_recv() {
+            delivered.push(job.content);
+        }
+        assert!(
+            delivered.iter().any(|content| content.contains(sibling)),
+            "the sibling round's result is still delivered: {delivered:?}"
+        );
+        // The delivered row is not reclaimed by the replay: clear it so it
+        // cannot reach another test's assertions.
+        crate::jobs::delete_pending_job(conn, sibling)
+            .await
+            .unwrap();
+    }
+
+    /// The cancel action refuses everything that is not the caller's own live
+    /// quick round — an unknown id, a `deep` investigation the caller owns, a
+    /// deep investigation's queued report, a coder round's queued report, and
+    /// another session's analyze round — and leaves each completely alone: no
+    /// signal is fired and every refused row survives. The caller's own live
+    /// quick row is stopped and deleted, after which the same id answers as
+    /// nothing of the caller's.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain, recover_from_restart)]
+    async fn a_cancel_refuses_everything_that_is_not_the_callers_live_quick_round() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let caller_id = cancel_sibling_caller_id();
+        let _rx = crate::agent::message_router::register_agent(&caller_id);
+        let caller = crate::workspace::test_ws_named(
+            "/tmp/test_ws_analyze_cancel_refuse",
+            CANCEL_SIBLING_WS,
+        );
+        let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
+
+        // An id that names nothing is answered without touching anything.
+        let answer = run_as_caller(
+            &tool,
+            &caller,
+            CANCEL_SIBLING_USER,
+            &caller_id,
+            json!({ "action": "cancel", "job_id": "no_such_cancel_round" }),
+        )
+        .await
+        .expect("an unknown id is answered");
+        assert!(
+            answer.contains("No analysis round of this session to cancel"),
+            "{answer}"
+        );
+        assert!(
+            !crate::round_cancel::is_cancelled("no_such_cancel_round"),
+            "a refused cancel must not fire a signal"
+        );
+
+        // A `deep` investigation is a research-kind row — out of the action's
+        // scope even when the caller's own identity owns it.
+        crate::jobs::spawn_job(
+            conn,
+            "deep_cancel_round",
+            "deep question",
+            &caller.name,
+            CANCEL_SIBLING_USER,
+            "gui",
+            crate::Role::Assistant,
+            &[],
+            &crate::jobs::SpawnChild::Research,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let answer = run_as_caller(
+            &tool,
+            &caller,
+            CANCEL_SIBLING_USER,
+            &caller_id,
+            json!({ "action": "cancel", "job_id": "deep_cancel_round" }),
+        )
+        .await
+        .expect("a deep round is answered");
+        assert!(
+            answer.contains("No analysis round of this session to cancel"),
+            "{answer}"
+        );
+        assert!(
+            !crate::round_cancel::is_cancelled("deep_cancel_round"),
+            "a refused cancel must not fire a signal"
+        );
+        assert!(
+            cancel_row_exists("jobs", "deep_cancel_round").await,
+            "a refused deep round is left in place"
+        );
+
+        // Another session's analyze round is refused and untouched.
+        crate::jobs::spawn_job(
+            conn,
+            "someone_elses_analyze",
+            "their question",
+            "mahbot",
+            "someone-else",
+            "gui",
+            crate::Role::Engineer,
+            &[],
+            &crate::jobs::SpawnChild::Analyze,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let answer = run_as_caller(
+            &tool,
+            &caller,
+            CANCEL_SIBLING_USER,
+            &caller_id,
+            json!({ "action": "cancel", "job_id": "someone_elses_analyze" }),
+        )
+        .await
+        .expect("another session's round is answered");
+        assert!(
+            answer.contains("No analysis round of this session to cancel"),
+            "{answer}"
+        );
+        assert!(
+            !crate::round_cancel::is_cancelled("someone_elses_analyze"),
+            "a refused cancel must not fire a signal"
+        );
+        assert!(
+            cancel_row_exists("jobs", "someone_elses_analyze").await,
+            "another session's round is left in place"
+        );
+
+        // Reports queued for THIS caller: only the round's own kind
+        // distinguishes them from a quick round's result, and a deep
+        // investigation's report and a coder round's report are not this
+        // action's to destroy.
+        for (job_id, kind) in [
+            (
+                "cancel_refuses_deep_report",
+                crate::agent::message_router::MessageKind::ResearchResult,
+            ),
+            (
+                "cancel_refuses_coder_report",
+                crate::agent::message_router::MessageKind::ImplementResult,
+            ),
+        ] {
+            crate::jobs::complete_durable_job(
+                job_id,
+                format!("<report>\n\nJob: {job_id}\n\nreport"),
+                kind,
+                crate::Role::Assistant,
+                CANCEL_SIBLING_USER,
+                "gui",
+                &caller.name,
+                None,
+            )
+            .await;
+            let answer = run_as_caller(
+                &tool,
+                &caller,
+                CANCEL_SIBLING_USER,
+                &caller_id,
+                json!({ "action": "cancel", "job_id": job_id }),
+            )
+            .await
+            .expect("other queued work is answered");
+            assert!(
+                answer.contains("No analysis round of this session to cancel"),
+                "{answer}"
+            );
+            assert!(
+                !crate::round_cancel::is_cancelled(job_id),
+                "a refused cancel must not fire a signal"
+            );
+            assert!(
+                cancel_row_exists("pending_jobs", job_id).await,
+                "{kind:?} queued for the caller must survive"
+            );
+        }
+
+        // The caller's own live quick round: a live round holds its
+        // cancel-signal entry for the duration of its invocation, so register
+        // one the way a dispatch would. The first cancel stops it, fires its
+        // signal and deletes the row; once the invocation exits (the guard
+        // drops) the same id answers like one that never existed.
+        crate::jobs::spawn_job(
+            conn,
+            "mine_cancel_round",
+            "my question",
+            &caller.name,
+            CANCEL_SIBLING_USER,
+            "gui",
+            crate::Role::Assistant,
+            &[],
+            &crate::jobs::SpawnChild::Analyze,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mine_round = crate::round_cancel::register("mine_cancel_round", Some(&caller_id));
+        let answer = run_as_caller(
+            &tool,
+            &caller,
+            CANCEL_SIBLING_USER,
+            &caller_id,
+            json!({ "action": "cancel", "job_id": "mine_cancel_round" }),
+        )
+        .await
+        .expect("the caller's own round is answered");
+        assert!(answer.contains("Cancelled the analysis round"), "{answer}");
+        assert!(
+            !cancel_row_exists("jobs", "mine_cancel_round").await,
+            "the caller's own cancelled round is deleted"
+        );
+        assert!(
+            crate::round_cancel::is_cancelled("mine_cancel_round"),
+            "the caller's own live round has its signal fired"
+        );
+        drop(mine_round);
+
+        let answer = run_as_caller(
+            &tool,
+            &caller,
+            CANCEL_SIBLING_USER,
+            &caller_id,
+            json!({ "action": "cancel", "job_id": "mine_cancel_round" }),
+        )
+        .await
+        .expect("the second cancel is answered");
+        assert!(
+            answer.contains("No analysis round of this session to cancel"),
+            "{answer}"
+        );
+
+        // Leave nothing behind for a sibling test's `recover_from_restart`
+        // replay: every queued report and every launched row this test created
+        // goes.
+        for report in ["cancel_refuses_deep_report", "cancel_refuses_coder_report"] {
+            crate::jobs::delete_pending_job(conn, report).await.unwrap();
+        }
+        for launched in ["deep_cancel_round", "someone_elses_analyze"] {
+            crate::jobs::terminalize_job(conn, launched).await.unwrap();
+        }
+    }
+
+    /// Nothing new is started for a cancelled round: an analyst that registers
+    /// AFTER the round's cancel signal fired is pre-cancelled at registration.
+    /// The late-register race is reachable for an analyze round because its
+    /// verification analysts are dispatched after the analysts it started with.
+    #[tokio::test]
+    async fn a_late_registering_analyst_of_a_cancelled_round_is_pre_cancelled() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_analyze_cancel_late_register");
+        let job_id = "analyze_late_register_round";
+        let round = crate::round_cancel::register(job_id, None);
+        let analyst = |id: &str| {
+            crate::Agent::new(
+                id.to_string(),
+                Role::Analyst,
+                &ws,
+                None,
+                String::new(),
+                String::new(),
+                false,
+                Some(crate::agent::registry::ParentKey::AnalyzeRound(
+                    job_id.to_string(),
+                )),
+                Some("round question".to_string()),
+                None,
+            )
+        };
+
+        assert!(
+            !analyst("analyze_late_register_first").is_cancelled(),
+            "a round's analyst runs while its round is live"
+        );
+        crate::round_cancel::cancel(job_id);
+        assert!(
+            analyst("analyze_late_register_late").is_cancelled(),
+            "an analyst the cancelled round dispatches afterwards must be pre-cancelled"
+        );
+
+        // The entry belongs to the round's own invocation: once that invocation
+        // exits, a fresh round is not affected by the gone round's signal.
+        drop(round);
+        assert!(
+            !analyst("analyze_late_register_fresh").is_cancelled(),
+            "a fresh round's analyst is not pre-cancelled by a gone round's signal"
+        );
+    }
+
+    /// A dangling cancel frame is re-executed, never bound to an unrelated
+    /// analyze job: the core resolution refuses any `analyze` call carrying an
+    /// `action`, while the plain dispatch form still resolves to the quick
+    /// round.
+    #[test]
+    fn a_cancel_frame_is_never_resolved_to_a_dispatch() {
+        assert!(
+            crate::tools::SyncDurableCore::from_call(
+                "analyze",
+                &json!({ "action": "cancel", "job_id": "abc" }),
+            )
+            .is_none(),
+            "a dangling cancel frame must be re-executed, never resolved to a dispatch"
+        );
+        assert!(
+            matches!(
+                crate::tools::SyncDurableCore::from_call("analyze", &json!({ "message": "q" })),
+                Some(crate::tools::SyncDurableCore::Analyze)
+            ),
+            "a plain analyze call still resolves to its quick round"
+        );
+    }
+
+    /// The cancel action is offered exactly where a quick async round can be
+    /// dispatched: its `action`/`job_id` properties and the cancel note appear
+    /// on the admin Assistant, the async Manager and a quick-granted holder, and
+    /// nowhere else.
+    #[test]
+    fn the_cancel_action_is_offered_only_where_a_quick_round_can_be_dispatched() {
+        let note = load_prompt("tool/analyze_cancel.md");
+        for tool in [
+            AnalyzeTool::admin(Role::Assistant),
+            AnalyzeTool::new(DispatchMode::Async, Role::Manager),
+            AnalyzeTool::granted(&[AnalyzeDepth::Quick]),
+        ] {
+            let description = tool.description();
+            let schema = tool.parameters_schema();
+            assert!(
+                schema["properties"]
+                    .get(crate::tools::analyze::ACTION_ARG)
+                    .is_some(),
+                "a holder that can dispatch a quick round must offer the cancel action: \
+                 {description}"
+            );
+            assert!(
+                schema["properties"]
+                    .get(crate::tools::analyze::JOB_ID_ARG)
+                    .is_some(),
+                "a cancelling holder must declare the round to cancel: {description}"
+            );
+            assert!(
+                description.contains(&note),
+                "the cancel note must be declared where the action is: {description}"
+            );
+            // A cancel call carries no dispatch argument, so the requirement is
+            // per-branch: `message` (+ `depth`) to dispatch, `action` + `job_id`
+            // to cancel — never a flat `required` list that would demand both.
+            let branches = schema["oneOf"]
+                .as_array()
+                .expect("a cancelling holder's schema states the two call forms");
+            assert!(
+                branches[0]["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|field| field == "message")),
+                "the dispatch branch requires `message`: {schema}"
+            );
+            assert_eq!(
+                branches[1]["required"],
+                json!([
+                    crate::tools::analyze::ACTION_ARG,
+                    crate::tools::analyze::JOB_ID_ARG
+                ]),
+                "the cancel branch requires the action and the round to cancel: {schema}"
+            );
+            assert!(
+                schema.get("required").is_none(),
+                "a cancelling holder must not also state a flat required list: {schema}"
+            );
+        }
+        for tool in [
+            AnalyzeTool::new(DispatchMode::Sync, Role::Engineer),
+            AnalyzeTool::new(DispatchMode::Sync, Role::Maintainer),
+            AnalyzeTool::granted(&[AnalyzeDepth::Deep]),
+        ] {
+            let description = tool.description();
+            let schema = tool.parameters_schema();
+            assert!(
+                schema["properties"]
+                    .get(crate::tools::analyze::ACTION_ARG)
+                    .is_none(),
+                "a holder that cannot cancel must not declare the action: {description}"
+            );
+            assert!(
+                schema["properties"]
+                    .get(crate::tools::analyze::JOB_ID_ARG)
+                    .is_none(),
+                "a holder that cannot cancel must not declare a job id: {description}"
+            );
+            assert!(
+                !description.contains(&note),
+                "the cancel note must not be declared where the action is not: {description}"
+            );
+            assert!(
+                schema.get("oneOf").is_none() && schema["required"].is_array(),
+                "a holder that cannot cancel keeps the plain required list: {schema}"
+            );
+        }
     }
 
     /// The same class `send`'s sweep guards, for the depth choice: a holder is

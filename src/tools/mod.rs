@@ -534,10 +534,15 @@ pub(crate) struct SpawnRecord<'a> {
 /// `Terminal` wraps a produced result (Ok or Err — both terminalize with a
 /// durable envelope), `DrainCut` means the round was cut by drain/shutdown —
 /// the job stays status='launched' for resume (boot or live), nothing is
-/// routed or terminalized now.
+/// routed or terminalized now, `Cancelled` means the round observed its
+/// cancel signal and stopped.
 pub(crate) enum SyncCoreOutcome {
     Terminal(Result<String, anyhow::Error>),
     DrainCut,
+    /// The round observed its cancel signal and stopped: nothing is produced and
+    /// nothing is routed. Its durable rows are the cancel path's to remove (see
+    /// [`SyncDurableCore::dispatch_durable`]).
+    Cancelled,
 }
 
 /// The sync analyze/coder durable cores, normalized behind one interface so the
@@ -579,6 +584,15 @@ impl SyncDurableCore {
     /// rewritten, so a cut-mid-flight retired call is simply repeated.
     #[must_use]
     pub(crate) fn from_call(name: &str, args: &serde_json::Value) -> Option<Self> {
+        // A cancel call names an existing round instead of starting one: a
+        // dangling cancel frame is re-executed, never resolved to a dispatch.
+        if name == "analyze"
+            && args
+                .get(crate::tools::analyze::ACTION_ARG)
+                .is_some_and(|v| !v.is_null())
+        {
+            return None;
+        }
         // Each tool's sync form is its narrowest choice: the quick depth, the
         // coder addressee. An absent (or explicit null) choice is that narrowest
         // kind — how a call frame that predates the merge reconnects to its
@@ -629,6 +643,31 @@ impl SyncDurableCore {
                 "Failed to abandon the failed {label} dispatch's row",
             );
         }
+    }
+
+    /// The round's cancel-signal guard for the core the cancel action can stop
+    /// ([Analyze](Self::Analyze) only), `None` for the rest — see
+    /// [`crate::round_cancel`].
+    fn cancel_guard(
+        self,
+        job_id: &str,
+        caller: Option<&str>,
+    ) -> Option<crate::round_cancel::CancelGuard> {
+        match self {
+            Self::Analyze => Some(crate::round_cancel::register(job_id, caller)),
+            Self::Coder => None,
+        }
+    }
+
+    /// Whether the round's cancel signal has fired — the delivery path's last look
+    /// before the result is handed over, so a cancelled round's result is never
+    /// delivered.
+    fn stopped_by_cancel(self, job_id: &str) -> bool {
+        if !crate::round_cancel::is_cancelled(job_id) {
+            return false;
+        }
+        tracing::info!(job = %job_id, "{} round stopped by cancel — nothing delivered", self.label());
+        true
     }
 
     /// Shared sync dispatch: read the task-locals the way the two wrappers do
@@ -693,6 +732,13 @@ impl SyncDurableCore {
                 );
                 Err(anyhow::Error::new(crate::tools::CallSuspended))
             }
+            // Unreachable: only the async entry points register a cancel signal,
+            // and a sync dispatch's id is freshly generated — and whatever
+            // cancels a round removes that round's own rows, so there is nothing
+            // to clean up here.
+            SyncCoreOutcome::Cancelled => Err(crate::tools::internal_fault(
+                "a sync round observed a cancel signal it never registered",
+            )),
         }
     }
 
@@ -759,6 +805,10 @@ impl SyncDurableCore {
                 );
                 Ok(crate::jobs::SyncResumeOutcome::DrainCut)
             }
+            // A cancel landed while this resume ran: the round stopped and its
+            // rows are the cancel action's to remove — a quiet abort, exactly
+            // like an explicitly abandoned row.
+            Ok(SyncCoreOutcome::Cancelled) => Ok(crate::jobs::SyncResumeOutcome::Gone),
             Err(e) => Err(e),
         }
     }
@@ -808,10 +858,15 @@ impl SyncDurableCore {
     /// session pin, then terminalize into the
     /// durable envelope under the caller-generated `job_id` (the id is created
     /// in the tool's `execute()` BEFORE the spawn so the immediate ack and the
-    /// delivered envelope share one id). Returns `None` only when the round
-    /// was cut by drain/shutdown — the job stays status='launched' for boot
-    /// resume and NOTHING is routed now. On error the envelope still routes
-    /// (errors wrapped in the core's envelope tag) and the job is terminalized.
+    /// delivered envelope share one id). Returns `None` when the round was cut
+    /// by drain/shutdown — the job stays status='launched' for boot resume and
+    /// NOTHING is routed now — and also when the round observed a cancel: the
+    /// cancel action owns the round's rows (it sweeps them, and answers the caller
+    /// when it cannot), so nothing is completed, routed or removed here; the
+    /// round's own row write is gated in-tx against the cancel signal (see
+    /// `jobs::spawn_job`), so the two cannot both stand. On error the envelope
+    /// still routes (errors wrapped in the core's envelope tag) and the job is
+    /// terminalized.
     ///
     /// `delivery` is the caller's own workspace (the durable delivery key);
     /// `place`, when present, is the directory the round executes in — the
@@ -870,6 +925,24 @@ impl SyncDurableCore {
                 );
                 return None;
             }
+            Ok(SyncCoreOutcome::Cancelled) => {
+                // Cancelled: the cancel action already answered the caller and
+                // owns the round's rows — nothing is completed, routed or removed
+                // here, because there is nothing to remove: the row write itself is
+                // gated in-tx against the cancel signal (see `jobs::spawn_job`), and
+                // a sweep that failed was answered to the caller as a cancellation
+                // that did not happen. Unlike the drain-cut arm (which keeps the
+                // engine for the resume) the synthetic `dir-…` goes.
+                tracing::info!(
+                    job = %job_id,
+                    "{} round stopped by cancel — not completed, not routed",
+                    self.label(),
+                );
+                if let Some(place) = place {
+                    crate::tools::delegation::release_exec_engine(place);
+                }
+                return None;
+            }
             Ok(SyncCoreOutcome::Terminal(result)) => result,
             Err(e) => Err(e),
         };
@@ -907,7 +980,9 @@ impl SyncDurableCore {
     ///
     /// Aborts quietly on shutdown/drain: no routing, no terminalization — the
     /// job row stays for the next boot (checkpointed outcomes are reused, so
-    /// already-completed LLM work is never lost or duplicated).
+    /// already-completed LLM work is never lost or duplicated). A cancel landing
+    /// during the resume is the one stop that discards the round's own result
+    /// instead (the cancel action owns its rows).
     pub(crate) async fn resume_durable_round(
         self,
         job_id: &str,
@@ -915,6 +990,17 @@ impl SyncDurableCore {
         exec_dir: Option<&str>,
     ) {
         let label = self.label();
+        // A resume registers its cancel signal too: its rows exist, so
+        // ownership is the row's and no caller pin is needed.
+        let _cancel_guard = self.cancel_guard(job_id, None);
+        // A cancel can land between the boot scan that picked this round and the
+        // registration above — and it fires into nothing, because this round had
+        // not registered yet. Its mark reaches that registration
+        // ([`crate::round_cancel`]), so the signal is already fired here: return
+        // before running a round whose caller was answered as stopped.
+        if self.stopped_by_cancel(job_id) {
+            return;
+        }
         let resumed = match exec_dir {
             None => self.resume_sync_core(delivery, job_id, false).await,
             Some(dir) => match crate::tools::delegation::workspace_at_dir(dir).await {
@@ -936,8 +1022,9 @@ impl SyncDurableCore {
                 let custom = caller.custom_launch.as_deref().cloned();
                 (caller_role, caller, custom, result)
             }
-            // Drain-cut mid-resume / job row gone (explicitly abandoned): abort
-            // quietly — the core logs the reason; a gone job was already noted.
+            // Drain-cut mid-resume / job row gone (explicitly abandoned, or
+            // removed by a cancel racing this resume): abort quietly — the core
+            // logs the reason; a gone job was already noted.
             Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
                 return;
             }
@@ -969,6 +1056,11 @@ impl SyncDurableCore {
                     custom,
                 )
                 .await;
+                // Last look before the route, mirroring `spawn_dispatch`: a cancel landing
+                // during this resume discards its result.
+                if self.stopped_by_cancel(job_id) {
+                    return;
+                }
                 crate::agent::message_router::route(
                     &crate::jobs::envelope_target(&envelope),
                     envelope,
@@ -998,6 +1090,11 @@ impl SyncDurableCore {
             custom,
         )
         .await;
+        // A cancel landed while this resume ran: its result is never delivered —
+        // the last look before the route, mirroring `spawn_dispatch`.
+        if self.stopped_by_cancel(job_id) {
+            return;
+        }
         crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
     }
 
@@ -1020,11 +1117,12 @@ impl SyncDurableCore {
     /// 2. The dispatch builds the success envelope itself (with pending_job_id
     ///    set by the completion tx) — route it as-is so the persisted copy and
     ///    the routed copy can never drift.
-    /// 3. `Ok(None)` = drain-cut: the job stays status='launched' for boot
-    ///    resume — route NOTHING now (a spurious error envelope during the drain
-    ///    would discard the checkpointed outcome; the result envelope is
-    ///    delivered after boot resume). This silent return is deliberately
-    ///    BEFORE the aborting() guard.
+    /// 3. `Ok(None)` = drain-cut or cancel: route NOTHING now. For a drain-cut
+    ///    the job stays status='launched' for boot resume (a spurious error
+    ///    envelope during the drain would discard the checkpointed outcome; the
+    ///    result envelope is delivered after boot resume); for a cancel the
+    ///    round is gone for good. This silent return is deliberately BEFORE the
+    ///    aborting() guard.
     /// 4. `crate::shutdown::aborting()` guard: drain/shutdown fired between the
     ///    dispatch and the route — the pending row (if any) survives for boot
     ///    replay; skip routing rather than deliver into a consumer that has
@@ -1032,11 +1130,15 @@ impl SyncDurableCore {
     ///    suppresses the insert-failure policy's best-effort route — the
     ///    surviving launched job row is resumed at the next boot, so the result
     ///    is deferred, never lost.)
-    /// 5. `crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope)`.
+    /// 5. The round's cancel signal is registered BEFORE the spawn and consulted
+    ///    immediately before the route: a round the caller cancels is never
+    ///    delivered — the one case where a produced result is deliberately
+    ///    discarded.
+    /// 6. `crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope)`.
     ///
     /// Note: src/tools/research.rs deliberately does NOT share this scaffold —
-    /// its Ok(None) also covers manual cancel, it logs "ended without delivery",
-    /// and it omits the pre-route aborting() guard (at-least-once rationale).
+    /// it logs "ended without delivery" and omits the pre-route aborting() guard
+    /// (at-least-once rationale).
     ///
     /// `delivery` is the caller's own workspace (the durable delivery key);
     /// `place`, when present, is the directory the round executes in.
@@ -1055,10 +1157,19 @@ impl SyncDurableCore {
         // custom role, and the default construction role otherwise — that
         // derivation lives in `dispatch_durable`.
         let custom = crate::agent::tool_custom_launch();
+        // The dispatching session's agent id, read synchronously before the
+        // spawn (task-local contract) — the round's cancel-signal entry records
+        // it, so a cancel naming this id can prove ownership even in the window
+        // before the round's `jobs` row is written.
+        let caller = crate::agent::CURRENT_TOOL_AGENT_ID
+            .try_with(Clone::clone)
+            .unwrap_or(None);
+        let cancel_guard = self.cancel_guard(&job_id, caller.as_deref());
         let (delivery, task) = (delivery.clone(), task.to_string());
         let place = place.cloned();
         let ws_name = delivery.name.clone();
         tokio::spawn(async move {
+            let _cancel_guard = cancel_guard;
             let exec_dir = place.as_ref().map(|p| p.path.as_str());
             let round = std::panic::AssertUnwindSafe(async {
                 self.dispatch_durable(
@@ -1078,7 +1189,7 @@ impl SyncDurableCore {
             let envelope = match round {
                 Ok(Some(envelope)) => envelope,
                 Ok(None) => {
-                    // Drain-cut (see doc point 3): silently route nothing.
+                    // Drain-cut or cancel (see doc point 3): route nothing.
                     return;
                 }
                 Err(panic) => {
@@ -1105,13 +1216,16 @@ impl SyncDurableCore {
                         kind: self.message_kind(),
                         role,
                         reply_target: None,
-                        pending_job_id: Some(job_id),
+                        pending_job_id: Some(job_id.clone()),
                         originating_workspace: None,
                         custom_role: custom,
                         reply_to_custom: None,
                     }
                 }
             };
+            if self.stopped_by_cancel(&job_id) {
+                return;
+            }
             if crate::shutdown::aborting() {
                 return;
             }
@@ -1125,8 +1239,8 @@ impl SyncDurableCore {
 /// so the delivered result is correlatable with the immediate ack placeholder;
 /// when the round ran in a chosen directory (`exec_dir`), a `Directory:` line
 /// follows it in the same shape so the caller is never in doubt which directory
-/// the round really ran in. Failures carry an explicit marker — findings are
-/// never silently dropped. Shared with the deep analysis run.
+/// the round really ran in. Failures carry an explicit marker instead of an
+/// empty result. Shared with the deep analysis run.
 pub(crate) fn build_async_result_envelope(
     job_id: &str,
     result: &anyhow::Result<String>,

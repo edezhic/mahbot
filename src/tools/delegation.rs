@@ -228,12 +228,27 @@ fn data_dir(dir: &Path) -> Option<PathBuf> {
 /// Accepted trade-off: two rounds placed in the same directory share one
 /// `dir-…` name, so releasing while another such round is still running only
 /// costs that round a picker re-scan on its next search — never a wrong result.
+/// A round cut by drain keeps its engine for the resume that reuses it; a cancel
+/// of that round releases it, even after the directory itself is gone — see
+/// [`release_placed_engine`].
 pub(crate) fn release_exec_engine(exec: &Workspace) {
     if !exec.name.starts_with(DIR_WORKSPACE_PREFIX) || !crate::search_engine::registry_initialized()
     {
         return;
     }
     crate::search_engine::remove_engine(&exec.name);
+}
+
+/// Release the search engine a round placed in `dir` created, named by the
+/// directory alone: the synthetic name is a pure function of the canonical path,
+/// so this reaches the engine even when the directory is no longer there — which
+/// is exactly the state a cancel can leave (its rows are gone too, so the round's
+/// own exit never runs and nothing else will release it). A registered folder's
+/// engine is not touched: the derivation only ever names a `dir-…` workspace, and
+/// a name nothing handed an engine releases nothing.
+pub(crate) fn release_placed_engine(dir: &str) {
+    let canonical = crate::stored_workspace_path(Path::new(dir));
+    release_exec_engine(&dir_workspace(&canonical));
 }
 
 /// The name prefix of a directory-scoped synthetic workspace — impossible in a

@@ -1,5 +1,6 @@
-//! Per-run cancel signal registry for deep-research runs, plus the cancelled-run
-//! sweep (durable row removal, folder release, archive deletion).
+//! The deep-research cancel action and the cancelled-run sweep (durable row
+//! removal, folder release, archive deletion). The shared per-round cancel
+//! signal registry itself lives in [`crate::round_cancel`].
 //!
 //! A manual cancel from the Running Agents page is a DISTINCT, PERMANENT stop:
 //! unlike the shutdown/drain abort (the run stays alive and resumes at boot),
@@ -9,111 +10,9 @@
 //! dispatch, and folder release; the GUI/abandon action only fires the signal
 //! (plus sweeps rows itself only when no orchestrator is alive to observe it).
 
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
-use tokio_util::sync::CancellationToken;
-
 use crate::Workspace;
 use crate::agent::registry::ParentKey;
 use crate::research_cleanup::COMMAND_DUMP_FILE;
-use crate::util::UnwrapPoison;
-
-/// Per-run cancel signals. An entry exists from the moment a run's
-/// orchestrator starts (fresh dispatch or boot resume) until it exits (any
-/// exit — terminal, abort, cancel, panic — via the RAII guard). [`cancel`]
-/// FIRES the entry's token but deliberately leaves the entry in place so
-/// [`is_cancelled`] keeps returning true for the orchestrator's gates until
-/// the orchestrator actually stops and its guard removes the entry.
-static RESEARCH_CANCELS: LazyLock<ResearchCancelRegistry> =
-    LazyLock::new(ResearchCancelRegistry::default);
-
-#[derive(Default)]
-struct ResearchCancelRegistry {
-    inner: Mutex<HashMap<String, CancellationToken>>,
-}
-
-impl ResearchCancelRegistry {
-    fn register(&'static self, job_id: &str) -> ResearchCancelGuard {
-        let token = CancellationToken::new();
-        self.inner
-            .lock()
-            .unwrap_poison()
-            .insert(job_id.to_string(), token.clone());
-        ResearchCancelGuard {
-            job_id: job_id.to_string(),
-            registry: self,
-        }
-    }
-
-    /// Fire a run's cancel signal. No-op when the run is not registered
-    /// (already terminalized — the sweep handles the durable state alone).
-    /// The entry is NOT removed here: [`is_cancelled`] must keep reporting
-    /// true until the orchestrator exits, so mid-terminalize gates observe it.
-    fn cancel(&self, job_id: &str) {
-        let map = self.inner.lock().unwrap_poison();
-        if let Some(token) = map.get(job_id) {
-            token.cancel();
-        }
-    }
-
-    /// Whether the run's cancel signal has been fired. False for runs never
-    /// registered (terminalized) and for live runs whose token is unfired.
-    fn is_cancelled(&self, job_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap_poison()
-            .get(job_id)
-            .is_some_and(CancellationToken::is_cancelled)
-    }
-
-    /// Whether a live orchestrator invocation is registered for the run. A
-    /// registered entry means the orchestrator is alive and can observe the
-    /// fired signal at its next boundary — the cancelled-exit handoff owns the
-    /// durable sweep. An unregistered id means no orchestrator is alive, so the
-    /// cancel action sweeps directly.
-    fn is_registered(&self, job_id: &str) -> bool {
-        self.inner.lock().unwrap_poison().contains_key(job_id)
-    }
-
-    fn unregister(&self, job_id: &str) {
-        self.inner.lock().unwrap_poison().remove(job_id);
-    }
-}
-
-/// RAII guard: removes the run's cancel-signal entry when the orchestrator
-/// invocation exits — on every path, including panics (Drop runs during
-/// unwind). The fields are private; only [`register`] constructs it and the
-/// guard's drop is its only externally-visible behavior.
-pub(crate) struct ResearchCancelGuard {
-    job_id: String,
-    registry: &'static ResearchCancelRegistry,
-}
-
-impl Drop for ResearchCancelGuard {
-    fn drop(&mut self) {
-        self.registry.unregister(&self.job_id);
-    }
-}
-
-/// Register the run's cancel signal for the duration of one orchestrator
-/// invocation (fresh dispatch or boot resume). Callers hold the returned
-/// guard for the whole invocation.
-pub(crate) fn register(job_id: &str) -> ResearchCancelGuard {
-    RESEARCH_CANCELS.register(job_id)
-}
-
-/// Fire the run's cancel signal — the user cancelled the run from the
-/// Running Agents page. Must be called BEFORE any row deletion so the
-/// orchestrator observes it at its next boundary and stops.
-pub(crate) fn cancel(job_id: &str) {
-    RESEARCH_CANCELS.cancel(job_id);
-}
-
-/// Whether the run's cancel signal has been fired. Consulted by the
-/// orchestrator's boundary gates and the completion/cleanup gates.
-pub(crate) fn is_cancelled(job_id: &str) -> bool {
-    RESEARCH_CANCELS.is_cancelled(job_id)
-}
 
 /// The manual cancel action, run from the GUI on confirm and the workspace
 /// abandon path:
@@ -129,7 +28,7 @@ pub(crate) fn is_cancelled(job_id: &str) -> bool {
 ///    disappears from Running Agents immediately (the guards' drops become
 ///    no-ops).
 /// 4. If no orchestrator is alive to observe the signal
-///    ([`ResearchCancelRegistry::is_registered`]), sweep the durable rows
+///    ([`crate::round_cancel::is_registered`]), sweep the durable rows
 ///    directly ([`sweep_cancelled_run`] — the folder release is dump-guarded)
 ///    and log it; if an orchestrator IS alive, return and let its
 ///    cancelled-exit handoff own the rest (cleanup dispatch + folder release).
@@ -138,12 +37,12 @@ pub(crate) fn is_cancelled(job_id: &str) -> bool {
 /// orchestrator sweep) always makes progress, so there is nothing for the GUI
 /// to surface as a cancel failure.
 pub(crate) async fn cancel_research_run(job_id: &str) {
-    cancel(job_id);
+    crate::round_cancel::cancel(job_id);
     crate::agent::registry::AGENT_REGISTRY
         .cancel_by_parent_key(&ParentKey::Research(job_id.to_string()));
     crate::agent::registry::NON_AGENT_CALLS
         .remove_by_parent_key(&ParentKey::Research(job_id.to_string()));
-    if !RESEARCH_CANCELS.is_registered(job_id)
+    if !crate::round_cancel::is_registered(job_id)
         && let Err(e) = sweep_cancelled_run(job_id).await
     {
         tracing::warn!(job = %job_id, error = %e, "cancel sweep failed — durable rows left for boot resume");
@@ -153,12 +52,14 @@ pub(crate) async fn cancel_research_run(job_id: &str) {
 /// Remove a cancelled run's durable state terminally and idempotently — the
 /// no-orchestrator path (runs with NO cleanup intent, or a cancelled run whose
 /// orchestrator is already gone so no live cancelled-exit handoff can sweep).
-/// - pending_jobs row (a persisted report would be replayed at boot) and the
-///   jobs row in ONE tx. The jobs DELETE cascades research_jobs + the roster;
-///   it also removes the `research_cleanup` row when the run already
-///   terminalized (the cleanup row reuses id == run_id, and at most one of
-///   the research/cleanup job rows exists at any time — the research row is
-///   deleted by the completion boundary before the cleanup row is created).
+/// - the durable rows — the pending_jobs row (a persisted report would be
+///   replayed at boot) and the jobs row, in ONE tx
+///   ([`crate::jobs::delete_round_rows`]), which also owns the ordering rule.
+///   The jobs DELETE cascades research_jobs and the roster; it also removes the
+///   `research_cleanup` row when the run already terminalized (the cleanup row
+///   reuses id == run_id, and at most one of the research/cleanup job rows
+///   exists at any time — the research row is deleted by the completion
+///   boundary before the cleanup row is created).
 /// - the run folder ONLY when it has NO command dump: a folder holding a
 ///   `commands.dump` is the run's cleanup intent, which must survive for the
 ///   cleanup tail (or the periodic temp cleaner). See [`command_dump_exists`].
@@ -169,17 +70,9 @@ pub(crate) async fn cancel_research_run(job_id: &str) {
 /// logged, never fatal.
 pub(crate) async fn sweep_cancelled_run(job_id: &str) -> Result<(), String> {
     let conn = &crate::session::store().conn;
-    let tx = conn.begin_tx().await.map_err(|e| format!("{e:#}"))?;
-    tx.execute(
-        "DELETE FROM pending_jobs WHERE id = ?1",
-        crate::db::params![job_id],
-    )
-    .await
-    .map_err(|e| format!("{e:#}"))?;
-    tx.execute("DELETE FROM jobs WHERE id = ?1", crate::db::params![job_id])
+    crate::jobs::delete_round_rows(conn, job_id)
         .await
         .map_err(|e| format!("{e:#}"))?;
-    tx.commit().await.map_err(|e| format!("{e:#}"))?;
     if crate::research_cleanup::command_dump_exists(job_id).await {
         tracing::warn!(
             job = %job_id,
@@ -284,25 +177,6 @@ async fn delete_results_archive(job_id: &str) {
 mod tests {
     use super::*;
     use crate::util::test::JobRowBuilder;
-
-    #[tokio::test]
-    async fn cancel_fires_signal_and_guard_removes_entry_on_drop() {
-        // Unregistered run: cancel is a no-op, is_cancelled false.
-        cancel("nope");
-        assert!(!is_cancelled("nope"));
-        let guard = register("run_signal_1");
-        assert!(!is_cancelled("run_signal_1"));
-        cancel("run_signal_1");
-        assert!(is_cancelled("run_signal_1"), "fired signal stays visible");
-        // A second cancel is idempotent.
-        cancel("run_signal_1");
-        assert!(is_cancelled("run_signal_1"));
-        drop(guard);
-        assert!(
-            !is_cancelled("run_signal_1"),
-            "guard drop removes the entry"
-        );
-    }
 
     /// Mid-run cancel with NO command dump (no cleanup intent): jobs +
     /// research_jobs rows + pending row + folder + archive all removed;
@@ -730,8 +604,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let _guard = register(job_id);
-        cancel(job_id);
+        let _guard = crate::round_cancel::register(job_id, None);
+        crate::round_cancel::cancel(job_id);
         let envelope = crate::jobs::complete_durable_job(
             job_id,
             "report".to_string(),

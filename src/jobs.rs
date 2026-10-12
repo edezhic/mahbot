@@ -144,7 +144,8 @@ pub(crate) const DRAIN_CAP_SECS: u64 = 10 * 60;
 /// are purged (they are recoverable from `tickets.phase`). Non-phase launched
 /// jobs (researches, cleanups, sync/async envelope kinds) are never
 /// time-deleted — explicit abandon only. `pending_jobs` envelopes are never
-/// purged — at-least-once keeps unconfirmed rows alive.
+/// time-purged — at-least-once keeps unconfirmed rows alive (a cancel removing
+/// one by id is a deliberate, caller-requested discard, not a purge).
 pub const PURGE_CUTOFF_HOURS: i64 = 8;
 
 // ── Row model ───────────────────────────────────────────────────────────
@@ -394,7 +395,8 @@ fn child_ticket_id(child: &SpawnChild) -> Option<&str> {
 /// Spawn a job with its pre-generated agent roster in ONE transaction.
 /// MUST commit before the agent's first session write. The kind is derived
 /// from the child via [`SpawnChild::kind_str`] — closing the drift window of
-/// an inconsistent (kind, child) pair.
+/// an inconsistent (kind, child) pair. A row for a cancelled analyze round is
+/// never committed (see the gate below).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn spawn_job(
     conn: &Connection,
@@ -426,6 +428,26 @@ pub(crate) async fn spawn_job(
         custom_launch,
     )
     .await?;
+    // Manual-cancel gate INSIDE the tx (after the INSERT, before the commit),
+    // mirroring [`complete_job_with_envelope`] and scoped to the child a cancel
+    // action can name: the tx holds the single-writer lock, so a dispatch whose
+    // row write races the cancel either observes the already-fired signal here —
+    // the row is never committed — or commits first, and the cancel sweep's
+    // DELETE then serializes behind this tx and removes the row it finds. A
+    // cancellation and the analyze row this dispatch wrote can therefore never
+    // both stand, so a cancelled round leaves no row for a start to resume unless
+    // the sweep itself failed — and that case was answered to the caller as a
+    // cancellation that did not happen. Every other child keeps its dispatch
+    // unbounded by cancel signals — a research run's id, for one, is reused by the
+    // cleanup row its cancelled-run handoff still has to write.
+    if matches!(child, SpawnChild::Analyze) && crate::round_cancel::is_cancelled(id) {
+        // Rolled back HERE rather than left to the guard's drop: a cancellation
+        // that abandons its own write leaves no complaint about itself behind (the
+        // deferred cleanup logs a WARN) and no dangling transaction to retry.
+        tracing::info!(job = %id, "Job dispatch rolled back — round cancelled");
+        tx.rollback().await?;
+        return Ok(());
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -594,15 +616,18 @@ pub(crate) async fn complete_job_with_envelope(
     // Manual-cancel gate INSIDE the tx (after the INSERT, before the
     // commit): the tx holds the single-writer lock, so a cancel that
     // fired after the caller's pre-completion gate check is still
-    // observed here and rolls the tx back (the default DropBehavior) —
-    // the pending row is never committed and the job row survives for
-    // the cancel sweep. The sweep's own DELETE then serializes behind
-    // this tx (single-writer), so no cancelled run can leave a
-    // deliverable pending row. Only research runs ever register a cancel
-    // signal (analyze job ids are never registered) — no behavior change
-    // for other job kinds.
-    if crate::research_cancel::is_cancelled(job_id) {
+    // observed here and rolls the tx back — the pending row is never
+    // committed and the job row survives for the cancel sweep. The
+    // sweep's own DELETE then serializes behind this tx (single-writer),
+    // so no cancelled run can leave a deliverable pending row. Any round
+    // that registered a cancel signal is covered by the gate — job kinds
+    // that never register one (a coder round, for instance) keep their
+    // unbounded completion. Rolled back HERE rather than by the guard's
+    // drop, so a cancelled completion leaves no deferred-cleanup WARN
+    // behind either.
+    if crate::round_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Job completion rolled back — run manually cancelled");
+        tx.rollback().await?;
         return Ok(());
     }
     tx.commit().await?;
@@ -615,7 +640,10 @@ pub(crate) async fn complete_job_with_envelope(
 /// `pending_job_id` set when the row persisted, cleared on INSERT failure so
 /// the caller falls back to a best-effort route: the result still reaches the
 /// caller (never a silent drop — the envelope is the caller's only result
-/// path), the pending row is simply absent.
+/// path), the pending row is simply absent. A cancelled round's in-tx gate rolls
+/// the write back and still returns Ok, so the id stays set (the rollback itself
+/// failing is the one error); both call sites consult their cancel check before
+/// routing and never hand that envelope on.
 ///
 /// `custom`, when present, is the calling custom role's launch — written into
 /// the envelope so [`envelope_target`] resolves the custom branch instead of a
@@ -668,7 +696,72 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
     Ok(())
 }
 
-// ── Explicit abandon (the only deletion path for unfinished non-phase jobs) ──
+/// Whether a queued `pending_jobs` row still exists — the boot replay's re-check
+/// that the envelope it is about to deliver was not discarded since the list was
+/// read. A read failure answers `true`: in doubt, delivering is the safe side
+/// (the row is replayed again next boot if it was in fact gone).
+async fn pending_row_exists(conn: &Connection, id: &str) -> bool {
+    conn.query_optional(
+        "SELECT 1 FROM pending_jobs WHERE id = ?1",
+        params![id],
+        |_| Ok::<(), anyhow::Error>(()),
+    )
+    .await
+    .map_or(true, |found| found.is_some())
+}
+
+/// The envelope of the result queued for `id`, when one waits — the
+/// `pending_jobs` counterpart of the `jobs`-row readers, so no feature module
+/// hand-writes this table's shape. An unparsable envelope answers `None`: it
+/// addresses nothing a reader can honour.
+pub(crate) async fn pending_envelope(conn: &Connection, id: &str) -> Result<Option<AgentJob>> {
+    let raw = conn
+        .query_optional(
+            "SELECT envelope FROM pending_jobs WHERE id = ?1",
+            params![id],
+            |r| r.get::<String>(0),
+        )
+        .await
+        .context("read a queued result")?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&raw) {
+        Ok(job) => Ok(Some(job)),
+        Err(e) => {
+            tracing::debug!(
+                pending_job = %id,
+                error = %e,
+                "Queued envelope unreadable — nothing to honour",
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Remove a gone round's own durable state in ONE tx: its queued result row
+/// first (the boot replay would otherwise deliver it), then its `jobs` row (a
+/// surviving row would be resumed at the next start, and its deletion cascades
+/// the roster). Every statement is a no-op on missing rows, so this is
+/// idempotent; a failure rolls the whole thing back.
+pub(crate) async fn delete_round_rows(conn: &Connection, job_id: &str) -> Result<()> {
+    let tx = conn
+        .begin_tx()
+        .await
+        .context("begin the gone round's removal tx")?;
+    tx.execute("DELETE FROM pending_jobs WHERE id = ?1", params![job_id])
+        .await
+        .context("delete the gone round's queued result")?;
+    tx.execute("DELETE FROM jobs WHERE id = ?1", params![job_id])
+        .await
+        .context("delete the gone round's job row")?;
+    tx.commit()
+        .await
+        .context("commit the gone round's removal")?;
+    Ok(())
+}
+
+// ── Explicit abandon (deletion at the caller's request) ──
 //
 // Sync caller-owned jobs are never purged by time — only the caller's /clear or
 // the deletion of the owning workspace abandons them. This is that path.
@@ -1041,6 +1134,23 @@ async fn delete_job_tx(tx: &TxGuard<'_>, job_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The delivery address a round's result is routed to, from the round's own
+/// identity parts — the ONE derivation shared by [`envelope_target`] (a
+/// completed envelope) and the analyze cancel action's ownership check (a live
+/// `jobs` row), so what a cancel treats as the caller's can never drift from
+/// where the result would be delivered.
+pub(crate) fn target_agent_id(
+    custom: Option<&crate::Launch>,
+    user_name: &str,
+    role: &str,
+    workspace_name: &str,
+) -> String {
+    if let Some(custom) = custom {
+        return custom.agent_id.clone();
+    }
+    crate::session::resolve_agent_id(user_name, role, workspace_name)
+}
+
 /// Resolve the consumer-loop agent ID for an envelope (Manager role → the
 /// workspace Manager session; pinned Assistant in a personal workspace → that
 /// user's assistant session). `session::resolve_agent_id` already branches on
@@ -1052,10 +1162,12 @@ async fn delete_job_tx(tx: &TxGuard<'_>, job_id: &str) -> Result<()> {
 /// directly when present. Boot replay uses the STORED `target_agent_id` written
 /// from this same derivation, so both stay in agreement.
 pub(crate) fn envelope_target(job: &AgentJob) -> String {
-    if let Some(custom) = &job.custom_role {
-        return custom.agent_id.clone();
-    }
-    crate::session::resolve_agent_id(&job.user_name, job.role.as_str(), &job.workspace_name)
+    target_agent_id(
+        job.custom_role.as_ref(),
+        &job.user_name,
+        job.role.as_str(),
+        &job.workspace_name,
+    )
 }
 
 /// Caller identity + task of a job, read from the `jobs` row ALONE — child
@@ -1084,9 +1196,10 @@ pub(crate) enum ResumePreamble {
     /// Drain/shutdown active — quiet abort, the job row is untouched.
     DrainCut,
     /// The jobs row is absent — only possible via an explicit abandon (session
-    /// /clear or workspace deletion) racing this resume; no terminalization
-    /// happens (the row is already gone). The old terminalize-on-missing
-    /// compensation existed only because jobs could be purged.
+    /// /clear or workspace deletion) or a cancel whose own row deletion raced
+    /// this resume; no terminalization happens (the row is already gone). The
+    /// old terminalize-on-missing compensation existed only because jobs could
+    /// be purged.
     Gone,
     /// The job row could not be READ (transient DB error) — NOT an abandon.
     /// The row is untouched; the error is carried for infra-failure reporting.
@@ -1100,9 +1213,33 @@ pub(crate) enum SyncResumeOutcome {
     Terminal(Role, JobCaller, anyhow::Result<String>),
     /// Drain-cut mid-resume — outcomes checkpointed, the job stays launched.
     DrainCut,
-    /// The job row was explicitly abandoned between the ownership lookup and
-    /// the resume.
+    /// The job row was gone between the ownership lookup and the resume — an
+    /// explicit abandon, or a cancel that removed the row while this resume ran.
     Gone,
+}
+
+/// Parse a `jobs.custom_launch` value — the ONE policy for every reader of that
+/// column: NULL and a corrupted value both mean "no launch", the corruption
+/// warned and the row left to the reader's own refusal of that shape. A resume
+/// passes it on and is refused downstream, in the consumer loop's custom-role
+/// funnel; an ownership check derives the fabricated `…_{role}` address
+/// [`envelope_target`] derives for a missing launch, which no live custom/coder
+/// session carries (`Launch::agent_id` is always a `role_…`/`rolerun_…`/`coder_…`
+/// address), so it refuses the row too.
+pub(crate) fn parse_custom_launch(raw: Option<String>) -> Option<crate::Launch> {
+    match raw {
+        None => None,
+        Some(raw) => match serde_json::from_str(&raw) {
+            Ok(launch) => Some(launch),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "jobs.custom_launch is unreadable — treating as absent",
+                );
+                None
+            }
+        },
+    }
 }
 
 /// Load the task + caller identity of a job from the `jobs` row alone.
@@ -1111,39 +1248,66 @@ async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>
         "SELECT task, role, user_name, channel, custom_launch FROM jobs WHERE id = ?1",
         params![job_id],
         |r| {
-            // Fail-soft on an unreadable launch: it is treated as absent, so the
-            // caller decides. That is a shape a resume cannot honour — a
-            // launch-carrying row must resume as its branch — and the refusal
-            // lives downstream, in the consumer loop's custom-role funnel, which
-            // skips the job and reclaims its pending row. The resume itself
-            // proceeds: `envelope_target` derives a fabricated `…_custom`
-            // address for a `Role::Custom` caller whose launch is missing, and
-            // the consumer refuses that address exactly like the corrupted row
-            // it came from.
-            let custom_launch = match r.get::<Option<String>>(4)? {
-                None => None,
-                Some(raw) => match serde_json::from_str(&raw) {
-                    Ok(launch) => Some(Box::new(launch)),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "jobs.custom_launch is unreadable — treating as absent",
-                        );
-                        None
-                    }
-                },
-            };
             Ok::<_, anyhow::Error>(JobCaller {
                 task: r.get::<String>(0)?,
                 role: r.get::<String>(1)?,
                 user_name: r.get::<String>(2)?,
                 channel: r.get::<String>(3)?,
-                custom_launch,
+                custom_launch: parse_custom_launch(r.get::<Option<String>>(4)?).map(Box::new),
             })
         },
     )
     .await
     .context("load job caller")
+}
+
+/// A live analyze round of the caller's: the cancel action needs the row's
+/// ownership AND, while the row is still there, the execution directory a
+/// cancelled round's synthetic search engine is named after
+/// ([`crate::tools::delegation::release_placed_engine`]) — both from one read,
+/// because neither may be looked up after the rows are gone.
+pub(crate) struct CallerAnalyzeRound {
+    /// The round's `place`, when it was dispatched with one.
+    pub(crate) exec_dir: Option<String>,
+}
+
+/// The analyze round named by `job_id` when it is `caller`'s to stop: its `jobs`
+/// row must be an analyze round whose own delivery address ([`target_agent_id`])
+/// is the caller's session — the ONE derivation, so what a cancel treats as the
+/// caller's can never drift from where the result would be delivered. The
+/// `kind = 'analyze'` filter is load-bearing: it refuses the `deep` depth's
+/// `research` job and every coder round, however the id was named. An absent row
+/// answers `None`, and a row whose `custom_launch` cannot be read is read as
+/// launch-less ([`parse_custom_launch`]) — a fabricated address for the
+/// custom/coder roles that carry a launch, so another branch's round is never
+/// stopped either.
+pub(crate) async fn analyze_round_owned_by(
+    conn: &Connection,
+    job_id: &str,
+    caller: &str,
+) -> Result<Option<CallerAnalyzeRound>> {
+    let row = conn
+        .query_optional(
+            "SELECT role, user_name, workspace_name, custom_launch, exec_dir FROM jobs \
+             WHERE id = ?1 AND kind = 'analyze'",
+            params![job_id],
+            |r| {
+                Ok::<_, anyhow::Error>((
+                    target_agent_id(
+                        parse_custom_launch(r.get::<Option<String>>(3)?).as_ref(),
+                        &r.get::<String>(1)?,
+                        &r.get::<String>(0)?,
+                        &r.get::<String>(2)?,
+                    ),
+                    r.get::<Option<String>>(4)?,
+                ))
+            },
+        )
+        .await
+        .context("read the round's own row")?;
+    Ok(row.and_then(|(target, exec_dir)| {
+        (target == caller).then_some(CallerAnalyzeRound { exec_dir })
+    }))
 }
 
 /// Boot-resume preamble shared by the analyze/research resume paths. Order is
@@ -1191,10 +1355,10 @@ pub(crate) async fn resume_job_preamble_discrete(
             caller_role = caller_role.for_launch(caller.custom_launch.as_deref());
             ResumePreamble::Proceed(caller, caller_role)
         }
-        // The row is only ever absent because an explicit abandon raced this
-        // resume — report it as such.
+        // The row is gone: an explicit abandon, or a cancel, raced this resume —
+        // report it as such.
         Ok(None) => {
-            tracing::info!(job = %job_id, "{missing_site}: job row gone (explicitly abandoned) — skipping resume");
+            tracing::info!(job = %job_id, "{missing_site}: job row gone (abandoned or cancelled) — skipping resume");
             ResumePreamble::Gone
         }
         // A transient DB read error is NOT an abandon — warn, and surface it
@@ -1602,6 +1766,17 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
         {
             crate::research_cleanup::dispatch_cleanup_for_pending_envelope(&row.id, &job).await;
         }
+        if !pending_row_exists(conn, &row.id).await {
+            debug!(
+                pending_job = %row.id,
+                "Pending job discarded by a cancel — not replayed",
+            );
+            continue;
+        }
+        // The last look this path can take: a discarded round's queued row is its
+        // only trace (its invocation has long exited, so there is no signal to
+        // consult), and a removal committing between the read above and the route
+        // below is the one window this replay cannot close.
         // The dedup above is the authoritative "in session" check: a row whose
         // content is NOT in the session was never appended (interrupted between
         // route and the consumer's append) — route the FULL content. Replaying
@@ -2001,6 +2176,106 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dispatch whose id is already cancelled commits no row: the cancel gate
+    /// inside `spawn_job`'s transaction refuses it, roster included, so a round
+    /// the caller was answered as stopped has nothing for a later start to resume
+    /// — whatever becomes of the cancel's own sweep.
+    #[serial_test::serial(recover_from_restart)]
+    #[tokio::test]
+    async fn spawn_job_refuses_a_cancelled_rounds_row() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let job_id = "spawn_gate_cancelled_round";
+        let _cancel_guard = crate::round_cancel::register(job_id, None);
+        crate::round_cancel::cancel(job_id);
+
+        spawn_job(
+            conn,
+            job_id,
+            "task",
+            "spawn_gate_ws",
+            "caller",
+            "telegram",
+            crate::Role::Engineer,
+            &[NewAgent {
+                agent_id: "spawn_gate_agent".to_string(),
+                kind: AgentKind::Analyst,
+                idx: Some(0),
+                task: "task".to_string(),
+            }],
+            &SpawnChild::Analyze,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let row = conn
+            .query(
+                "SELECT 1 FROM jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            row.is_empty(),
+            "a cancelled round must not commit its jobs row"
+        );
+        let roster = conn
+            .query(
+                "SELECT 1 FROM agents WHERE job_id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            roster.is_empty(),
+            "the roster is written in the same transaction, so it goes with it"
+        );
+
+        // The gate is scoped to the analyze child: a research run's id is reused
+        // by the cleanup row its cancelled-run handoff still has to write, so
+        // that write is not refused by the run's fired signal.
+        let cleanup_id = "spawn_gate_cleanup_round";
+        let _cleanup_guard = crate::round_cancel::register(cleanup_id, None);
+        crate::round_cancel::cancel(cleanup_id);
+        spawn_job(
+            conn,
+            cleanup_id,
+            "cleanup task",
+            "spawn_gate_ws",
+            "",
+            "",
+            crate::Role::Sanitation,
+            &[],
+            &SpawnChild::ResearchCleanup,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let cleanup_row = conn
+            .query(
+                "SELECT 1 FROM jobs WHERE id = ?1",
+                crate::db::params![cleanup_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cleanup_row.len(),
+            1,
+            "a cancelled run's cleanup row is still written"
+        );
+        conn.execute(
+            "DELETE FROM jobs WHERE id IN (?1, ?2)",
+            crate::db::params![job_id, cleanup_id],
+        )
+        .await
+        .unwrap();
+    }
 
     /// Insert a minimal ticket row so a [`SpawnChild::Phase`] job's `ticket_id`
     /// FK resolves (the phase job row links to tickets).
