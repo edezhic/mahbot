@@ -10,7 +10,8 @@ use crate::config::{
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
 };
 use crate::custom_role::CustomRoleBehavior;
-use crate::users::{GrantChange, format_grants};
+use crate::tools::ToolAnswer;
+use crate::users::{AddUserOutcome, GrantChange, format_grants};
 use crate::{Tool, Workspace};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -158,19 +159,41 @@ impl Tool for MahbotConfigTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        let action = super::get_str(&args, "action")?;
-        match action {
-            "setup_telegram_bot" => self.exec_setup_telegram_bot(args).await,
-            "bind_telegram" => self.exec_bind_telegram(args).await,
-            "add_user" => self.exec_add_user(args).await,
-            "setup_web_search" => self.exec_setup_web_search(args).await,
-            "grant_tool" => self.exec_grant_tool(args).await,
-            "revoke_tool" => self.exec_revoke_tool(args).await,
-            "list_grants" => self.exec_list_grants(args).await,
-            "create_custom_role" => self.exec_create_custom_role(args).await,
-            "update_custom_role" => self.exec_update_custom_role(args).await,
-            "list_custom_roles" => self.exec_list_custom_roles().await,
-            "delete_custom_role" => self.exec_delete_custom_role(args).await,
+        Ok(self.answer(args).await?.text)
+    }
+
+    async fn execute_answer(
+        &self,
+        _ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<ToolAnswer> {
+        self.answer(args).await
+    }
+}
+
+impl MahbotConfigTool {
+    /// The one action dispatch both faces of the tool go through: `execute`
+    /// renders it to its text (so an agent's view is unchanged) and
+    /// [`Tool::execute_answer`] hands it over with the partiality flag a
+    /// command-line caller reads.
+    ///
+    /// `add_user` is the one action that can be carried out in part — the
+    /// account is created whatever happens, and that account's personal
+    /// workspace folder separately — so it builds its own answer; every other
+    /// action either happens in full or fails.
+    async fn answer(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
+        match super::get_str(&args, "action")? {
+            "add_user" => self.answer_add_user(args).await,
+            "setup_telegram_bot" => Ok(ToolAnswer::done(self.exec_setup_telegram_bot(args).await?)),
+            "bind_telegram" => Ok(ToolAnswer::done(self.exec_bind_telegram(args).await?)),
+            "setup_web_search" => Ok(ToolAnswer::done(self.exec_setup_web_search(args).await?)),
+            "grant_tool" => Ok(ToolAnswer::done(self.exec_grant_tool(args).await?)),
+            "revoke_tool" => Ok(ToolAnswer::done(self.exec_revoke_tool(args).await?)),
+            "list_grants" => Ok(ToolAnswer::done(self.exec_list_grants(args).await?)),
+            "create_custom_role" => Ok(ToolAnswer::done(self.exec_create_custom_role(args).await?)),
+            "update_custom_role" => Ok(ToolAnswer::done(self.exec_update_custom_role(args).await?)),
+            "list_custom_roles" => Ok(ToolAnswer::done(self.exec_list_custom_roles().await?)),
+            "delete_custom_role" => Ok(ToolAnswer::done(self.exec_delete_custom_role(args).await?)),
             other => Err(err(format!(
                 "unknown action '{other}' — expected one of: setup_telegram_bot, bind_telegram, \
                  add_user, setup_web_search, grant_tool, revoke_tool, list_grants, \
@@ -178,9 +201,7 @@ impl Tool for MahbotConfigTool {
             ))),
         }
     }
-}
 
-impl MahbotConfigTool {
     async fn exec_setup_telegram_bot(&self, args: serde_json::Value) -> anyhow::Result<String> {
         let token = super::get_str(&args, "token")?;
         crate::config::persist_settled_string_field(CONFIG_KEY_TELEGRAM_BOT_TOKEN, token).await?;
@@ -207,7 +228,12 @@ impl MahbotConfigTool {
         ))
     }
 
-    async fn exec_add_user(&self, args: serde_json::Value) -> anyhow::Result<String> {
+    /// Create guest account `name` and bind `telegram` to them, reporting the
+    /// two things the action does — the account, and that account's personal
+    /// workspace folder — truthfully: the folder can be refused while the
+    /// account is still created, and then the answer says what did not happen
+    /// and is partial rather than a whole success.
+    async fn answer_add_user(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
         let name = super::get_str(&args, "name")?;
         let value = get_binding_value(&args, "telegram")?;
 
@@ -237,19 +263,26 @@ impl MahbotConfigTool {
         // row holding no Telegram binding is a half-finished earlier run.
         let identifier = store.validate_telegram_bind(name, &value).await?;
 
-        store.add_user(name).await?;
+        let outcome = store.add_user(name).await?;
         store.attach_telegram_binding(name, &identifier).await?;
 
         let binding = crate::users::describe_telegram_binding(&identifier);
-        let guest_note = "They are a guest — they chat with the Assistant agent only.";
-        if exists {
-            Ok(format!(
-                "Bound {binding} to the existing user '{name}'. {guest_note}"
-            ))
+        let account = if exists {
+            format!("Bound {binding} to the existing user '{name}'.")
         } else {
-            Ok(format!(
-                "Created guest account '{name}' and bound {binding} to them. {guest_note}"
-            ))
+            format!("Created guest account '{name}' and bound {binding} to them.")
+        };
+        let answer =
+            format!("{account} They are a guest — they chat with the Assistant agent only.");
+        // The account half is always true — the row exists either way; the
+        // folder half is stated only when it did not happen, and then the answer
+        // is partial.
+        match outcome {
+            AddUserOutcome::Complete => Ok(ToolAnswer::done(answer)),
+            AddUserOutcome::WithoutPersonalWorkspace => Ok(ToolAnswer::partial(format!(
+                "{answer} {}",
+                crate::users::missing_personal_workspace_note(name)
+            ))),
         }
     }
 
@@ -674,5 +707,87 @@ mod tests {
             out.contains("tools: analyze:quick, send:coder,manager"),
             "the listing spells a bare entry's narrowest kind and keeps the stored kinds: {out}"
         );
+    }
+
+    /// A created account whose personal workspace folder is in place answers
+    /// exactly as it always has, and is not partial.
+    #[tokio::test]
+    async fn add_user_answers_a_whole_success_when_the_folder_is_created() {
+        crate::util::test::init_test_stores().await;
+        let tool = MahbotConfigTool;
+        let ws = test_ws("/tmp/test_ws");
+
+        let answer = tool
+            .execute_answer(
+                &ws,
+                json!({ "action": "add_user", "name": "WholeGuest", "telegram": "@whole_guest" }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !answer.partial,
+            "a folder in place is a whole success, got: {}",
+            answer.text
+        );
+        assert_eq!(
+            answer.text,
+            "Created guest account 'WholeGuest' and bound @whole_guest to them. They are a \
+             guest — they chat with the Assistant agent only."
+        );
+        assert!(
+            crate::users::personal_workspace_path("WholeGuest").is_dir(),
+            "the account's personal workspace folder is created with it"
+        );
+    }
+
+    /// A personal workspace folder that cannot be created is reported as the
+    /// part that did not happen: the account is still created and the answer
+    /// says so, and the answer is partial rather than a whole success.
+    #[tokio::test]
+    async fn add_user_answers_a_partial_result_when_the_folder_cannot_be_created() {
+        crate::util::test::init_test_stores().await;
+        let tool = MahbotConfigTool;
+        let ws = test_ws("/tmp/test_ws");
+        // A file where the folder must go makes `create_dir_all` fail
+        // deterministically on every platform.
+        let name = "FolderRefusedGuest";
+        let marker = crate::users::personal_workspace_path(name);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"a file, not a folder").unwrap();
+
+        let answer = tool
+            .execute_answer(
+                &ws,
+                json!({ "action": "add_user", "name": name, "telegram": "@folder_refused" }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            answer.partial,
+            "a folder that was not created is not a whole success, got: {}",
+            answer.text
+        );
+        assert!(
+            answer
+                .text
+                .contains("Created guest account 'FolderRefusedGuest'"),
+            "the account half must still be reported: {}",
+            answer.text
+        );
+        assert!(
+            answer
+                .text
+                .contains(&crate::users::missing_personal_workspace_note(name)),
+            "the folder half must be reported as not created: {}",
+            answer.text
+        );
+        assert!(
+            crate::users::store().user_exists(name).await.unwrap(),
+            "the account exists even though its folder does not"
+        );
+
+        std::fs::remove_file(&marker).unwrap();
     }
 }

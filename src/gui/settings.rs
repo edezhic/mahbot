@@ -334,7 +334,7 @@ pub enum SettingsMessage {
     /// Submit the add-user modal.
     SubmitAddUser,
     /// Result of user add.
-    AddUserResult(Result<(), String>),
+    AddUserResult(Result<crate::users::AddUserOutcome, String>),
     // ── Custom tools area (sub-messages) ────────────────────────
     /// Wrapped custom-tools area message.
     CustomToolsMsg(custom_tools::CustomToolsMessage),
@@ -1548,15 +1548,30 @@ impl SettingsState {
                         {
                             return Err(crate::users::name_taken_message(&sender));
                         }
-                        store.add_user(&sender).await.map_err(|e| e.to_string())?;
-                        Ok(())
+                        let outcome = store.add_user(&sender).await.map_err(|e| e.to_string())?;
+                        Ok(outcome)
                     },
                     SettingsMessage::AddUserResult,
                 )
             }
-            SettingsMessage::AddUserResult(Ok(())) => {
+            SettingsMessage::AddUserResult(Ok(outcome)) => {
+                // The account is added either way; a personal workspace folder
+                // that was not created must not read as a whole success, so it
+                // is told as a warning beside the refreshed list.
+                let name = self.add_user_sender.text();
                 self.close_add_user_modal();
-                self.users_state.refresh().map(SettingsMessage::UserMsg)
+                let refresh = self.users_state.refresh().map(SettingsMessage::UserMsg);
+                match outcome {
+                    crate::users::AddUserOutcome::Complete => refresh,
+                    crate::users::AddUserOutcome::WithoutPersonalWorkspace => Task::batch([
+                        refresh,
+                        Task::done(SettingsMessage::UserMsg(users::UsersMessage::Toast(
+                            super::ToastMessage::Warning(
+                                crate::users::missing_personal_workspace_note(&name),
+                            ),
+                        ))),
+                    ]),
+                }
             }
             SettingsMessage::AddUserResult(Err(e)) => {
                 self.add_user_adding = false;

@@ -206,6 +206,22 @@ crate::columns! {
     }
 }
 
+/// What creating an account actually produced.
+///
+/// The account row is always in place when [`UserStore::add_user`] returns
+/// `Ok`; the account's personal workspace folder is a second thing that call
+/// tries to create, and the name rule or the platform can refuse it. Callers
+/// report both halves, so a partly carried-out creation is never answered as a
+/// whole success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddUserOutcome {
+    /// The account and its personal workspace folder are both in place.
+    Complete,
+    /// The account is in place, but its personal workspace folder could not be
+    /// created — the failure is also reported out of band.
+    WithoutPersonalWorkspace,
+}
+
 impl UserStore {
     /// Auto-create the admin account if this is a fresh database.
     ///
@@ -228,10 +244,11 @@ impl UserStore {
     /// account must also pass the collision rule
     /// ([`UserStore::refuse_colliding_name`]) — the reserved admin name itself
     /// is exempt. Also creates the personal workspace directory under
-    /// `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on failure, but
-    /// reported). Idempotent — re-adding an existing account preserves its
-    /// stored preferences.
-    pub async fn add_user(&self, name: &str) -> Result<()> {
+    /// `~/.mahbot/userspaces/<name>/` with `git init`; a failure there is
+    /// reported out of band and named by the returned [`AddUserOutcome`], never
+    /// by an `Err` — the account exists whatever happened. Idempotent —
+    /// re-adding an existing account preserves its stored preferences.
+    pub async fn add_user(&self, name: &str) -> Result<AddUserOutcome> {
         // Only a name that becomes a new account's own folder has to satisfy
         // the folder rule: an account that is already stored keeps the name it
         // has — it is never re-judged — and its folder, when it does not exist
@@ -253,12 +270,14 @@ impl UserStore {
             )
             .await?;
         // A failure to put the folder there (the rule refusing the name, or the
-        // platform refusing the directory) is reported, never silently skipped
-        // — the account still exists either way.
+        // platform refusing the directory) is reported out of band, never
+        // silently skipped — the account still exists either way, and which of
+        // the two the caller got is what it is told.
         if let Err(e) = ensure_personal_workspace(name).await {
             self.report_personal_workspace_failure(name, &e).await;
+            return Ok(AddUserOutcome::WithoutPersonalWorkspace);
         }
-        Ok(())
+        Ok(AddUserOutcome::Complete)
     }
 
     /// Refuse a name about to become a NEW account when, with case and Unicode
@@ -832,6 +851,17 @@ fn owner_message(name: &str, error: &anyhow::Error) -> String {
     format!(
         "⚠️ The personal workspace folder for the account '{name}' could not be created, so nothing \
          that account stores in its workspace is kept: {cause}."
+    )
+}
+
+/// What a caller's answer says about an account whose personal workspace folder
+/// could not be created: the part that did not happen, and nothing more — no
+/// cause and no remedy, because another writer can create the folder later.
+#[must_use]
+pub(crate) fn missing_personal_workspace_note(name: &str) -> String {
+    format!(
+        "The personal workspace folder for '{name}' could not be created, so that account has \
+         nowhere to keep its workspace files."
     )
 }
 
@@ -1907,7 +1937,12 @@ mod tests {
             .await
             .unwrap();
 
-        store.add_user(legacy).await.unwrap();
+        let outcome = store.add_user(legacy).await.unwrap();
+        assert_eq!(
+            outcome,
+            AddUserOutcome::WithoutPersonalWorkspace,
+            "the folder the rule refuses must be reported as not created"
+        );
         assert!(
             !personal_workspace_path(legacy).exists(),
             "completing a stored account must not create the folder the rule refuses"
