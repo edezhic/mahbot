@@ -731,10 +731,13 @@ mod tests {
         chosen_names.sort_unstable();
         assert_eq!(chosen_names, vec!["read", "sleep"]);
         assert!(Role::custom_role_tools(&[]).is_empty());
+    }
 
-        // Kinds: a granted dispatch tool is built with exactly the kinds the
-        // entry names, and every kind the holder does not have is absent from
-        // its declared interface.
+    /// A granted dispatch tool is built with exactly the kinds its entry names,
+    /// declared and required: a kind the holder does not have is absent from its
+    /// interface, and a one-kind holder still states its choice.
+    #[test]
+    fn granted_dispatch_tools_offer_exactly_the_granted_kinds() {
         let granted = |entries: &[&str]| {
             let entries: Vec<String> = entries.iter().map(|s| (*s).to_string()).collect();
             Role::custom_role_tools(&entries)
@@ -782,21 +785,32 @@ mod tests {
         );
         let branch_only = granted(&["send:coder_branch"]);
         let send = props(&branch_only, "send");
+        assert_eq!(
+            send["addressee"]["enum"],
+            serde_json::json!(["coder_branch"]),
+            "a coder_branch-only holder declares the choice it holds: {send:?}"
+        );
         assert!(
-            send.get("addressee").is_none() && send.contains_key("branch"),
-            "a coder_branch-only holder declares no choice and requires its branch — the \
-             continuing kind does not imply the single run: {send:?}"
+            send.contains_key("branch"),
+            "a coder_branch holder requires its branch — the continuing kind does \
+             not imply the single run: {send:?}"
         );
         let manager = granted(&["send:manager"]);
         let send = props(&manager, "send");
+        assert_eq!(
+            send["addressee"]["enum"],
+            serde_json::json!(["manager"]),
+            "a manager-only holder declares the choice it holds: {send:?}"
+        );
         assert!(
-            send.get("addressee").is_none() && send.get("place").is_some(),
-            "a one-addressee manager-only send declares no choice but requires its project: {send:?}"
+            send.get("place").is_some(),
+            "a manager-only send requires its project: {send:?}"
         );
         let bare = granted(&["send"]);
-        assert!(
-            props(&bare, "send").get("addressee").is_none(),
-            "a bare entry is the narrowest kind — a one-kind holder declares no choice"
+        assert_eq!(
+            props(&bare, "send")["addressee"]["enum"],
+            serde_json::json!(["coder"]),
+            "a bare entry is the narrowest kind, declared and required like any other"
         );
     }
 
@@ -1191,9 +1205,9 @@ mod tests {
     #[test]
     fn manager_addressee_only_in_the_admin_assistants_send() {
         // Acceptance pin: the Manager and custom-role addressees belong to the
-        // admin's Assistant's `send` (and any custom role it grants them to). The
-        // Engineer's `send` addresses a coder only — it must not offer the
-        // `addressee` choice, `name` or the manager addressee.
+        // admin's Assistant's `send` (and any custom role it grants them to).
+        // The choice declaration names exactly the addressees the holder has, so
+        // manager+role being offered pins this surface.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for is_admin in [false, true] {
@@ -1209,8 +1223,15 @@ mod tests {
                     .cloned()
                     .unwrap_or_default();
                 let holder_is_admin_assistant = role == crate::Role::Assistant && is_admin;
-                let offers_manager_or_role =
-                    props.contains_key("addressee") && props.contains_key("name");
+                let kinds = props
+                    .get("addressee")
+                    .and_then(|choice| choice.get("enum"))
+                    .and_then(|kinds| kinds.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let offers_manager_or_role = ["manager", "role"]
+                    .iter()
+                    .all(|kind| kinds.iter().any(|entry| entry == kind));
                 assert_eq!(
                     offers_manager_or_role,
                     holder_is_admin_assistant,

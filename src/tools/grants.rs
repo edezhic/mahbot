@@ -334,6 +334,19 @@ mod tests {
         assert!(parse(&entries(&["read:quick"])).is_err());
     }
 
+    /// The GRANT vocabulary is [`Addressee::STRS`] — the tool's own set — and never
+    /// the wider one [`Addressee::parse`] reads: an entry reaches the tool's own
+    /// parser only after this module has validated it, so a role can never be
+    /// granted the owner's own assistant (an address of the command line alone).
+    #[test]
+    fn a_grant_can_never_name_the_command_lines_own_assistant() {
+        assert!(parse(&entries(&["send:assistant"])).is_err());
+        assert!(
+            parse(&entries(&["send:coder,assistant"])).is_err(),
+            "a known kind beside an unknown one does not make the entry valid"
+        );
+    }
+
     #[test]
     fn encode_roundtrips() {
         let parsed = parse(&entries(&["send:coder,role", "read", "analyze"])).unwrap();

@@ -97,6 +97,14 @@ pub(crate) fn tool_channel() -> String {
         .unwrap_or_default()
 }
 
+/// Synchronous read of [`CURRENT_TOOL_COMMAND_LINE`]: false outside the
+/// command line's own call. Same contract as [`tool_user_name`].
+pub(crate) fn tool_command_line() -> bool {
+    CURRENT_TOOL_COMMAND_LINE
+        .try_with(|flag| *flag)
+        .unwrap_or(false)
+}
+
 /// Synchronous read of [`CURRENT_TOOL_CUSTOM_LAUNCH`]. Same contract as
 /// [`tool_user_name`]: a tool that dispatches a durable round must read it
 /// before its `tokio::spawn` boundary so the round carries the caller's branch.
@@ -109,6 +117,14 @@ pub(crate) fn tool_custom_launch() -> Option<crate::Launch> {
 tokio::task_local! {
     pub(crate) static CURRENT_TOOL_USER_NAME: String;
     pub(crate) static CURRENT_TOOL_CHANNEL: String;
+    /// Whether THIS tool call is the command line's own — `mahbot send …` (see
+    /// [`crate::cli`]) running in the instance with no agent session behind it.
+    /// Set ONLY by [`crate::cli::instance`], around the one call it serves: the
+    /// command line is a distinct EXECUTOR, and it is never inferred from values
+    /// a call carries, because other executors carry the same ones — a message the
+    /// command line hands to an agent runs that agent's turn with the command
+    /// line's channel and its own session like any other turn.
+    pub(crate) static CURRENT_TOOL_COMMAND_LINE: bool;
     /// The calling agent's DIRECT PARENT INVOCATION grouping key (ticket /
     /// analyze round / research run) — set for the duration of tool execution so
     /// tools that spawn sub-agents (e.g. `send`) can propagate the caller's

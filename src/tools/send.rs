@@ -2,9 +2,14 @@
 //!
 //! The addressees are the coder (a single coder run), a coder branch (a
 //! continuable coder conversation), a project workspace's Manager, and an
-//! administrator-defined custom role. A holder with one addressee does not
-//! declare the choice argument; a holder with several does, and a value outside
-//! its set is refused.
+//! administrator-defined custom role. Every holder declares the `addressee`
+//! choice and every call states it — including a holder that can address only
+//! one agent — and a value outside its set is refused.
+//!
+//! The one caller with no agent session behind it is the command line
+//! (`mahbot send`): there the owner's own assistant is an address too — what an
+//! unnamed address means — and every handover is durable BEFORE that caller is
+//! answered, since it is gone the moment it returns.
 //!
 //! The Engineer's instance addresses a coder only and runs it synchronously —
 //! the coder's report returns inline. The admin Assistant and a custom role
@@ -72,10 +77,15 @@ struct Requirement {
     required: bool,
 }
 
-/// Exactly one addressee of a `send` call. The order of [`Self::ALL`] is the
-/// interface order — the narrowest kind is first.
+/// Exactly one addressee of a `send` call. [`Self::ALL`] is the dispatch tool's
+/// own set — the order is the interface order, the narrowest kind first; the
+/// command line's vocabulary leads with the owner's own assistant and lives in
+/// [`Self::COMMAND_LINE`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Addressee {
+    /// The owner's own assistant — the command line's default address, and one
+    /// an agent is never offered (it is not in [`Self::ALL`]).
+    Assistant,
     /// A single coder run: implement a scoped task, report back.
     Coder,
     /// A continuable coder conversation: continue (or create) a named branch.
@@ -86,12 +96,38 @@ pub enum Addressee {
     Role,
 }
 
+/// What the command line shows for its `--addressee` flag, word for word. It
+/// lives beside the vocabulary it describes rather than in the command line's own
+/// registry, so the two cannot drift apart unnoticed: the spellings and the
+/// REQUIRED argument of every address are checked against the table below by
+/// `the_address_help_is_the_vocabulary_it_describes`.
+pub(crate) const ADDRESSEE_FLAG_HELP: &str = "Who receives it: 'assistant' (your own \
+     assistant — the same as naming none), 'coder' (one scoped coder run in the folder \
+     `--place` names, your own workspace when it names none), 'coder_branch' (a \
+     continuable coder conversation, needs `--branch`), 'manager' (the Manager of the \
+     project `--place` names — what a script aiming at a project should use), or 'role' \
+     (a custom role, needs `--name`). An address takes only its own flags: a flag the \
+     address does not take is refused rather than ignored — `--branch` with 'coder', or \
+     `--place` with 'assistant', fails the call";
+
 impl Addressee {
     /// The argument naming the choice.
     pub const ARG: &'static str = "addressee";
 
-    /// Every addressee, in interface order (narrowest first).
+    /// Every addressee the dispatch tool itself offers, in interface order
+    /// (narrowest first). The vocabulary a GRANT is drawn from.
     pub const ALL: [Self; 4] = [Self::Coder, Self::CoderBranch, Self::Manager, Self::Role];
+
+    /// Every addressee the COMMAND LINE may name: the tool's own set plus the
+    /// owner's own assistant, which leads it. The holder decides which of them
+    /// it offers.
+    pub const COMMAND_LINE: [Self; 5] = [
+        Self::Assistant,
+        Self::Coder,
+        Self::CoderBranch,
+        Self::Manager,
+        Self::Role,
+    ];
 
     /// The wire spellings of [`Self::ALL`], in the same order.
     pub const STRS: &'static [&'static str] = &[
@@ -105,6 +141,7 @@ impl Addressee {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Assistant => "assistant",
             Self::Coder => "coder",
             Self::CoderBranch => "coder_branch",
             Self::Manager => "manager",
@@ -112,15 +149,21 @@ impl Addressee {
         }
     }
 
-    /// Parse a wire spelling.
+    /// Parse a wire spelling — the whole vocabulary the command line may name;
+    /// the holder decides which of them it offers. This is the address vocabulary
+    /// of a CALL (the command line's); the vocabulary a GRANT is drawn from is the
+    /// narrower [`Self::STRS`], and a stored grant entry is validated against that
+    /// before it ever reaches here (see [`crate::tools::grants`]), so a custom role
+    /// can never be granted the owner's own assistant.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| a.as_str() == value)
+        Self::COMMAND_LINE.into_iter().find(|a| a.as_str() == value)
     }
 
     /// What this addressee does, in the choice declaration's own words.
     const fn does(self) -> &'static str {
         match self {
+            Self::Assistant => "hands the message to your own assistant",
             Self::Coder => "runs one scoped implementation and reports back",
             Self::CoderBranch => "continues a named coder branch",
             Self::Manager => "messages a project's Manager",
@@ -134,6 +177,8 @@ impl Addressee {
         /// text stays one entry.
         const OUTSIDE_PROJECTS: &str = "any directory outside the registered projects";
         match self {
+            // The message is all it takes.
+            Self::Assistant => &[],
             Self::Coder => &[Requirement {
                 arg: Argument::Place,
                 note: OUTSIDE_PROJECTS,
@@ -194,6 +239,17 @@ impl Addressee {
     }
 }
 
+/// One note under its label(s) as the model reads it. The single place a `send`
+/// note gets its label.
+fn labelled(labels: &[&str], note: &str) -> String {
+    let names = labels
+        .iter()
+        .map(|label| format!("`{label}`"))
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{names}: {note}")
+}
+
 pub struct SendTool {
     /// Controls how a coder run is dispatched (see [`DispatchMode`]).
     dispatch_mode: DispatchMode,
@@ -201,7 +257,7 @@ pub struct SendTool {
     /// correct agent channel.
     pub caller_role: Role,
     /// The addressees this holder may use, in interface order. A single
-    /// addressee is never declared as a choice argument.
+    /// addressee is declared and required like any other.
     kinds: Vec<Addressee>,
     /// Whether the optional `place` argument is accepted. Every addressee takes
     /// a folder, so every async holder declares it; the Engineer's coder-only
@@ -257,10 +313,116 @@ impl SendTool {
         self.kinds.iter().map(|kind| kind.as_str()).collect()
     }
 
-    /// Whether this holder declares the choice argument: it has more than one
-    /// addressee to choose between. A one-value choice is never declared.
-    fn declares_choice(&self) -> bool {
-        self.kinds.len() > 1
+    /// Whether this call is the COMMAND LINE's — the owner acting through
+    /// `mahbot send`, with no agent session behind it (see [`crate::cli`]). The
+    /// command line marks its own call with
+    /// [`CURRENT_TOOL_COMMAND_LINE`](crate::agent::CURRENT_TOOL_COMMAND_LINE),
+    /// which only [`crate::cli::instance`] sets — nothing a call carries
+    /// identifies the executor, because a message the command line hands over
+    /// runs the addressee's own turn with the command line's channel in place,
+    /// and that turn is an agent's own call like any other. This is the one
+    /// surface where an unnamed address means the owner's own assistant and
+    /// where that assistant may be named; an agent's call must state an
+    /// address, so an agent session is never a command line.
+    fn command_line() -> bool {
+        crate::agent::tool_command_line()
+    }
+
+    /// The addressees THIS CALL may name: the holder's own inside an agent
+    /// session, the command line's own vocabulary outside one. A holder's set is
+    /// what its tool offers an agent; the command line takes the whole vocabulary,
+    /// which adds the owner's own assistant — the one address an agent's holder
+    /// never has. The CLI's own holder is the admin Assistant's `send`, whose set
+    /// is already the tool's, so no holder the instance serves a call with can
+    /// narrow this surface.
+    fn addressed(&self) -> Vec<Addressee> {
+        if Self::command_line() {
+            Addressee::COMMAND_LINE.to_vec()
+        } else {
+            self.kinds.clone()
+        }
+    }
+
+    /// The addressee the call must name: an absent (or explicit null) value is
+    /// refused in the choice's own words instead of taking the narrowest kind, so
+    /// no caller — not even a holder that can address only one agent — is ever
+    /// handed a silent pick. `chosen_kind`'s absent-means-narrowest stays the rule
+    /// where the choice is an optional NARROWING: `analyze`'s depth, and the
+    /// tolerant arm an in-flight call frame reconnects through.
+    fn required_addressee(args: &serde_json::Value, held: &[Addressee]) -> Result<Addressee> {
+        if matches!(
+            args.get(Addressee::ARG),
+            None | Some(serde_json::Value::Null)
+        ) {
+            return Err(anyhow::anyhow!(
+                "usage: `{}` is required — it must be one of {}",
+                Addressee::ARG,
+                held.iter()
+                    .map(|addressee| addressee.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        super::chosen_kind(
+            args,
+            Addressee::ARG,
+            held,
+            Addressee::as_str,
+            Addressee::parse,
+        )
+    }
+
+    /// The addressee this call names. An agent's call MUST name one (the
+    /// mandatory address); the command line's own rule is that an unnamed
+    /// address means the owner's assistant — naming it is the same as naming
+    /// none — and no other address is ever chosen silently.
+    fn addressee(&self, args: &serde_json::Value) -> Result<Addressee> {
+        // The command line's own rule first: its unnamed address means the owner's
+        // own assistant, and naming it is the same as naming none.
+        if Self::command_line()
+            && matches!(
+                args.get(Addressee::ARG),
+                None | Some(serde_json::Value::Null)
+            )
+        {
+            return Ok(Addressee::Assistant);
+        }
+        Self::required_addressee(args, &self.addressed())
+    }
+
+    /// Refuse an optional argument the chosen address does not take. An agent's
+    /// call is built from its holder's own interface, so an argument it cannot
+    /// use is inert by construction; a script names the address and the flags
+    /// apart, and a combination that cannot mean anything must be refused rather
+    /// than dispatched with the value dropped.
+    fn refuse_unused(args: &serde_json::Value, addressee: Addressee) -> Result<()> {
+        for arg in Argument::ALL {
+            let given = args.get(arg.as_str()).is_some_and(|value| !value.is_null());
+            let taken = addressee
+                .requirements()
+                .iter()
+                .any(|requirement| requirement.arg == arg);
+            if given && !taken {
+                return Err(anyhow::anyhow!(
+                    "usage: `{}` is not an argument of the `{}` address",
+                    arg.as_str(),
+                    addressee.as_str()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Who answers for the handovers this call makes: the command line's caller
+    /// is answered and gone the moment it returns, so its handovers are REFUSED
+    /// when they could not be made durable; an agent's own turn is durable
+    /// already, so its handovers are routed best-effort instead of dropped.
+    fn answered_for() -> crate::agent::message_router::AnsweredFor {
+        if Self::command_line() {
+            crate::agent::message_router::AnsweredFor::CommandLine
+        } else {
+            crate::agent::message_router::AnsweredFor::Agent
+        }
     }
 
     /// Whether this holder's interface declares `arg` — the one question the
@@ -299,23 +461,6 @@ impl SendTool {
         }
     }
 
-    /// One note under its label(s) as the model reads it: labelled only where
-    /// this holder declares the choice, the note alone where it does not — a
-    /// one-addressee holder must never read a value it cannot pass. The single
-    /// place a `send` note gets its label.
-    fn labelled(&self, labels: &[&str], note: &str) -> String {
-        if self.declares_choice() {
-            let names = labels
-                .iter()
-                .map(|label| format!("`{label}`"))
-                .collect::<Vec<_>>()
-                .join("/");
-            format!("{names}: {note}")
-        } else {
-            note.to_string()
-        }
-    }
-
     /// The description of one optional argument: its lead, what it holds for
     /// every addressee this holder has that takes it, and whether it can be left
     /// out. `None` when this holder does not declare the argument at all.
@@ -334,7 +479,6 @@ impl SendTool {
                     .map(|requirement| (addressee, requirement))
             })
             .collect();
-        let declared = self.declares_choice();
         // Addressees that share a note read as one entry under their joint label.
         let mut grouped: Vec<(Vec<&'static str>, &'static Requirement)> = Vec::new();
         for (addressee, requirement) in &takers {
@@ -348,7 +492,7 @@ impl SendTool {
         }
         let notes: Vec<String> = grouped
             .iter()
-            .map(|(labels, requirement)| self.labelled(labels, requirement.note))
+            .map(|(labels, requirement)| labelled(labels, requirement.note))
             .collect();
         let needed_by: Vec<String> = takers
             .iter()
@@ -356,12 +500,9 @@ impl SendTool {
             .map(|(addressee, _)| format!("`{}`", addressee.as_str()))
             .collect();
         // Whether the argument can be left out follows from the choices this
-        // holder has: with the choice declared, only the choices that cannot do
-        // without it are named; without it, its one addressee's own answer is
-        // unconditional.
+        // holder has: only the choices that cannot do without it are named.
         let tail = match needed_by.len() {
             0 => " Omit for the default.".to_string(),
-            _ if !declared => " Required.".to_string(),
             needed if needed < takers.len() => {
                 format!(
                     " Omit for the default; required for {}.",
@@ -381,13 +522,12 @@ impl Tool for SendTool {
     }
 
     /// Compose the description from shared fragments: the base text, the choice
-    /// note when a choice is declared, one note per held addressee, and the
-    /// async/sync note.
+    /// note, one note per held addressee, and the async/sync note.
     fn description(&self) -> String {
-        let mut parts = vec![load_prompt("tool/send.md")];
-        if self.declares_choice() {
-            parts.push(load_prompt("tool/send_addressee.md"));
-        }
+        let mut parts = vec![
+            load_prompt("tool/send.md"),
+            load_prompt("tool/send_addressee.md"),
+        ];
         for addressee in Addressee::ALL {
             if !self.kinds.contains(&addressee) {
                 continue;
@@ -401,7 +541,7 @@ impl Tool for SendTool {
                 }
                 other => load_prompt(&format!("tool/send_{}.md", other.as_str())),
             };
-            parts.push(self.labelled(&[addressee.as_str()], &note));
+            parts.push(labelled(&[addressee.as_str()], &note));
         }
         // Only an async holder returns before the work is done; the sync one's
         // own note already says its report returns in the call's result.
@@ -421,19 +561,17 @@ impl Tool for SendTool {
         let mut required = vec!["message"];
         // The choice names only the addressees this holder has: a holder is never
         // told about a choice it cannot make.
-        if self.declares_choice() {
-            let clauses: Vec<String> = self
-                .kinds
-                .iter()
-                .map(|addressee| format!("`{}` {}", addressee.as_str(), addressee.clause()))
-                .collect();
-            properties[Addressee::ARG] = json!({
-                "type": "string",
-                "enum": self.allowed(),
-                "description": format!("Who receives it. {}", clauses.join("; ")),
-            });
-            required.push(Addressee::ARG);
-        }
+        let clauses: Vec<String> = self
+            .kinds
+            .iter()
+            .map(|addressee| format!("`{}` {}", addressee.as_str(), addressee.clause()))
+            .collect();
+        properties[Addressee::ARG] = json!({
+            "type": "string",
+            "enum": self.allowed(),
+            "description": format!("Who receives it. {}", clauses.join("; ")),
+        });
+        required.push(Addressee::ARG);
         // Every optional argument the holder's addressees take, described from
         // the one per-addressee table — `place` included only where the holder
         // declares it: the Engineer's coder-only instance runs where the caller is.
@@ -445,8 +583,9 @@ impl Tool for SendTool {
                 });
             }
         }
-        // A one-addressee holder declares no choice, so whatever its addressee
-        // cannot do without becomes unconditional.
+        // A one-addressee holder declares the choice like any other, so the single
+        // addressee's own required arguments are stated as required because there
+        // is no other addressee to choose between.
         if let [only] = self.kinds.as_slice() {
             required.extend(
                 only.requirements()
@@ -458,17 +597,32 @@ impl Tool for SendTool {
         super::tool_params_schema(&properties, &required)
     }
 
+    #[expect(clippy::too_many_lines)]
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let message = super::get_dispatch_message(&args)?;
-        let addressee = super::chosen_kind(
-            &args,
-            Addressee::ARG,
-            &self.kinds,
-            Addressee::as_str,
-            Addressee::parse,
-        )?;
+        let addressee = self.addressee(&args)?;
+        // The command line's own strictness: its caller names the address and
+        // the flags apart, so a combination that cannot mean anything is refused
+        // here rather than dispatched with the value silently dropped (see
+        // [`Self::refuse_unused`]).
+        if Self::command_line() {
+            Self::refuse_unused(&args, addressee)?;
+        }
 
         match addressee {
+            Addressee::Assistant => {
+                // Only the command line reaches this arm: the owner's own
+                // assistant is not one of the addressees an agent's holder
+                // declares (see [`Addressee::ALL`]), so an agent that names it
+                // is refused before any dispatch.
+                crate::agent::message_router::deliver_command_line_message(message.to_string())
+                    .await?;
+                Ok(
+                    "Message handed to your assistant, which answers on the channels it \
+                    normally uses."
+                        .to_string(),
+                )
+            }
             Addressee::Coder => {
                 if !self.dispatch_mode.is_async() {
                     // The Engineer's sync coder run: the report returns inline.
@@ -480,19 +634,32 @@ impl Tool for SendTool {
                 // durable background round can honour the optional `place`.
                 let place = self.optional_place(&args).await?;
                 let job_id = crate::generate_id();
-                super::SyncDurableCore::Coder.spawn_dispatch(
-                    ws,
-                    place.as_ref(),
-                    message,
-                    self.caller_role,
-                    job_id,
-                );
+                if Self::command_line() {
+                    // Answered and gone the moment this returns: the round's
+                    // durable rows are written BEFORE the acknowledgement, and
+                    // the round then runs as a resume of its own rows.
+                    crate::tools::implement::hand_over_coder_round(
+                        ws,
+                        place.as_ref(),
+                        message,
+                        self.caller_role,
+                        &job_id,
+                    )
+                    .await?;
+                } else {
+                    super::SyncDurableCore::Coder.spawn_dispatch(
+                        ws,
+                        place.as_ref(),
+                        message,
+                        self.caller_role,
+                        job_id,
+                    );
+                }
                 let folder = place
                     .as_ref()
                     .map_or_else(|| ws.path.clone(), |p| p.path.clone());
                 Ok(format!(
-                    "Work handed to a coder in {}. Its report will arrive in this conversation as \
-                     a <coder-report> message.",
+                    "Work handed to a coder in {}; its report arrives as a <coder-report> message.",
                     folder.trim_end_matches(std::path::MAIN_SEPARATOR)
                 ))
             }
@@ -505,10 +672,28 @@ impl Tool for SendTool {
                 // Read the asker before the launch: the report returns to the
                 // conversation that asked.
                 let asker = crate::agent::tool_custom_launch();
-                crate::launch::coder_branch(ws, branch, message, place.as_ref(), asker).await
+                crate::launch::coder_branch(
+                    ws,
+                    branch,
+                    message,
+                    place.as_ref(),
+                    asker,
+                    Self::answered_for(),
+                )
+                .await
             }
             Addressee::Manager => {
-                let (_, user_name) = crate::agent::tool_identity()?;
+                // The calling session's user is who the message is attributed
+                // to. A project's Manager is reachable with no agent session
+                // behind the call — the command line acts as the machine's
+                // owner — so the user is all this arm needs (`tool_identity`
+                // also demands a session id, which the arm never uses).
+                let user_name = crate::agent::tool_user_name();
+                anyhow::ensure!(
+                    !user_name.is_empty(),
+                    "No user identity available — a message to a project's Manager must run in a \
+                     user session or on the command line."
+                );
                 // Read before any spawn: routes the Manager's answer back into
                 // this branch when the caller is a custom role.
                 let asker = crate::agent::tool_custom_launch();
@@ -537,8 +722,9 @@ impl Tool for SendTool {
                         launch,
                         workspace: ws.name.clone(),
                     }),
+                    Self::answered_for(),
                 )
-                .await;
+                .await?;
                 Ok(format!(
                     "Message delivered to the manager of workspace '{}'.",
                     project.name
@@ -555,6 +741,7 @@ impl Tool for SendTool {
                     message,
                     self.optional(&args, Argument::Branch)?,
                     self.optional(&args, Argument::Place)?,
+                    Self::answered_for(),
                 )
                 .await
             }
@@ -567,9 +754,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Run a dispatch tool the way the agent loop does — outside any spawn, with
+    /// Run a dispatch tool the way a turn does: `channel` is the transport the
+    /// message arrived over and `agent_id` the session driving the turn — `None`
+    /// for no session. A turn is an agent's call whatever carried it, so the
+    /// command line's own marker is NOT set here. Scoped outside any spawn, with
     /// the caller identity in the task-locals the tools read.
-    async fn dispatch(
+    async fn dispatch_over(
+        channel: &str,
+        agent_id: Option<&str>,
         tool: &dyn Tool,
         ws: &Workspace,
         args: serde_json::Value,
@@ -577,9 +769,61 @@ mod tests {
         crate::agent::CURRENT_TOOL_USER_NAME
             .scope("admin".to_string(), async {
                 crate::agent::CURRENT_TOOL_CHANNEL
-                    .scope("gui".to_string(), async {
-                        crate::agent::CURRENT_TOOL_AGENT_ID
-                            .scope(Some("agent_harness".to_string()), async {
+                    .scope(channel.to_string(), async {
+                        match agent_id {
+                            Some(agent_id) => {
+                                crate::agent::CURRENT_TOOL_AGENT_ID
+                                    .scope(Some(agent_id.to_string()), async {
+                                        tool.execute(ws, args).await
+                                    })
+                                    .await
+                            }
+                            None => tool.execute(ws, args).await,
+                        }
+                    })
+                    .await
+            })
+            .await
+    }
+
+    /// The transport an agent's own turn arrived over in these tests — the channel
+    /// the rounds such a turn dispatches carry.
+    const TURN_CHANNEL: &str = "gui";
+
+    /// A dispatch from an agent's own turn.
+    async fn dispatch(
+        tool: &dyn Tool,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        dispatch_over(TURN_CHANNEL, Some("agent_harness"), tool, ws, args).await
+    }
+
+    /// Run a dispatch tool the way the COMMAND LINE does: the marker only
+    /// [`crate::cli::instance`] sets, with the owner's own identity and the command
+    /// line's channel, and NO agent session behind it.
+    async fn dispatch_command_line(
+        tool: &dyn Tool,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        dispatch_command_line_as(crate::users::ADMIN_USER_NAME, tool, ws, args).await
+    }
+
+    /// The same call under the identity the caller carries — `""` for a command
+    /// line that names no owner at all.
+    async fn dispatch_command_line_as(
+        user: &str,
+        tool: &dyn Tool,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        crate::agent::CURRENT_TOOL_COMMAND_LINE
+            .scope(true, async {
+                crate::agent::CURRENT_TOOL_USER_NAME
+                    .scope(user.to_string(), async {
+                        crate::agent::CURRENT_TOOL_CHANNEL
+                            .scope(crate::cli::CHANNEL.to_string(), async {
                                 tool.execute(ws, args).await
                             })
                             .await
@@ -678,13 +922,17 @@ mod tests {
         .unwrap_or_else(|| panic!("no job row for {job_id} — the round was never created"))
     }
 
-    /// The ids of the durable rounds of `kind` that exist right now.
-    async fn job_ids_of_kind(kind: &str) -> Vec<String> {
+    /// The ids of the durable rounds of `kind` that exist right now, narrowed to
+    /// the rounds ONE PRODUCER's call wrote (`channel` is the caller's own — see
+    /// [`crate::jobs`]). The store is shared with parallel tests, so a test that
+    /// must know its own rows narrows by provenance instead of taking the whole
+    /// set.
+    async fn job_ids_of_kind(kind: &str, channel: &str) -> Vec<String> {
         crate::session::store()
             .conn
             .query(
-                "SELECT id FROM jobs WHERE kind = ?1",
-                crate::db::params![kind],
+                "SELECT id FROM jobs WHERE kind = ?1 AND channel = ?2",
+                crate::db::params![kind, channel],
             )
             .await
             .unwrap()
@@ -836,7 +1084,7 @@ mod tests {
         crate::research_cancel::cancel_research_run(&deep_job_id).await;
 
         // ── send coder (a single run) ─────────────────────────────────────
-        let coder_jobs_before = job_ids_of_kind("implement").await;
+        let coder_jobs_before = job_ids_of_kind("implement", TURN_CHANNEL).await;
         let ack = dispatch(
             &send,
             &caller,
@@ -848,10 +1096,11 @@ mod tests {
             !ack.contains("job "),
             "a coder dispatch names no job number: {ack}"
         );
-        // The round is proven by ITS OWN row — the new `implement` job — never by
-        // "some row of that kind exists" in the shared store.
+        // The round is proven by ITS OWN row — the new `implement` job carrying
+        // this turn's channel — never by "some row of that kind exists" in the
+        // shared store.
         let job_id = deadline_poll(|| async {
-            job_ids_of_kind("implement")
+            job_ids_of_kind("implement", TURN_CHANNEL)
                 .await
                 .into_iter()
                 .find(|id| !coder_jobs_before.contains(id))
@@ -1189,16 +1438,461 @@ mod tests {
         }
     }
 
+    /// A provider whose every call parks until the test opens the gate, so a
+    /// round's durable rows can be observed while the round cannot have finished.
+    struct GatedProvider {
+        open: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Provider for GatedProvider {
+        async fn chat_scoped(
+            &self,
+            _request: crate::ChatRequest,
+        ) -> Result<crate::ChatResponse, crate::providers::ScopedCallError> {
+            let mut open = self.open.clone();
+            while !*open.borrow_and_update() {
+                if open.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok(crate::ChatResponse {
+                text: Some("the work is done".to_string()),
+                ..crate::ChatResponse::default()
+            })
+        }
+
+        async fn warmup(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A provider that parks every call until the test opens the gate and then
+    /// panics: a round that dies in flight, at a moment the test chooses.
+    struct DyingProvider {
+        open: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Provider for DyingProvider {
+        async fn chat_scoped(
+            &self,
+            _request: crate::ChatRequest,
+        ) -> Result<crate::ChatResponse, crate::providers::ScopedCallError> {
+            let mut open = self.open.clone();
+            while !*open.borrow_and_update() {
+                if open.changed().await.is_err() {
+                    break;
+                }
+            }
+            panic!("the provider blew up")
+        }
+
+        async fn warmup(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The ids of the `implement` rounds a COMMAND-LINE call wrote: the rounds
+    /// whose `channel` is the one a command-line caller carries
+    /// ([`crate::cli::CHANNEL`]). An agent's own turn carries that same channel
+    /// when it was triggered by a command-line message, so this narrows to a
+    /// command-line CALL only while no such turn runs — which holds for every
+    /// test here, whose conversations spies consume.
+    async fn command_line_round_ids() -> Vec<String> {
+        job_ids_of_kind("implement", crate::cli::CHANNEL).await
+    }
+
+    /// How many deferred envelopes waiting for `agent_id` carry `content` — the
+    /// handover whose durability is being pinned, told apart from a parallel
+    /// test's row for the same conversation by the message itself.
+    async fn pending_for_content(agent_id: &str, content: &str) -> usize {
+        crate::session::store()
+            .conn
+            .query(
+                "SELECT envelope FROM pending_jobs WHERE target_agent_id = ?1",
+                crate::db::params![agent_id],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.get::<String>(0).unwrap().contains(content))
+            .count()
+    }
+
+    /// The messages the command-line handovers of
+    /// `the_command_lines_handovers_are_durable_before_the_acknowledgement` carry.
+    /// Each dispatch and the assertion on what that handover must have left
+    /// behind read the SAME definition, so the two cannot drift apart.
+    const UNNAMED_ASSISTANT_TEXT: &str = "hello";
+    const NAMED_ASSISTANT_TEXT: &str = "hello again";
+    const MANAGER_TEXT: &str = "from the command line";
+    const BRANCH_TEXT: &str = "carry on";
+    const ROLE_TEXT: &str = "take this";
+
+    /// The ids of the owner's own conversation rows holding any of `contents` —
+    /// what a command-line handover to the assistant persists through
+    /// [`crate::channels::broadcast_and_persist_incoming_message`].
+    async fn owner_message_ids(contents: &[&str]) -> Vec<String> {
+        let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let (entries, _) = crate::channels::chat_history::store()
+            .load_recent(crate::users::ADMIN_USER_NAME, &workspace)
+            .await
+            .expect("the owner's own conversation loads");
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.direction == crate::ChatDirection::User
+                    && contents.contains(&entry.content.as_str())
+            })
+            .map(|entry| entry.message_id.clone())
+            .collect()
+    }
+
+    /// The command line is answered and GONE the moment a call returns, so every
+    /// handover it makes must be durable BEFORE the acknowledgement — and the
+    /// address it names must describe where a restart picks the work up. Each
+    /// durability claim below is checked IMMEDIATELY after `execute` returns: no
+    /// `deadline_poll` is allowed for the pin, because its whole point is that
+    /// the durable record exists when (not some time after) the caller is
+    /// answered. Every provider call the `send` round makes parks until this test
+    /// opens the gate, so "immediately" cannot race the round's own progress.
+    #[tokio::test]
+    #[serial_test::serial(provider, channel_registry, drain)]
+    async fn the_command_lines_handovers_are_durable_before_the_acknowledgement() {
+        use std::sync::Arc;
+
+        crate::util::test::init_management_test_stores().await;
+        let _policy =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Every provider call the round makes parks until the gate opens below, so
+        // the round CANNOT have finished when the durability pin reads the store.
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let _provider =
+            crate::util::test::install_fake_provider(Arc::new(GatedProvider { open: gate_rx }));
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_path =
+            crate::util::strip_verbatim_prefix(&std::fs::canonicalize(project_dir.path()).unwrap())
+                .to_str()
+                .unwrap()
+                .to_string();
+        let project =
+            crate::util::test::create_test_workspace(&project_path, "ws_cli_durable").await;
+        let home = tempfile::tempdir().unwrap();
+        // The command line's own workspace: the admin's personal one, where a
+        // handover that names no folder runs.
+        let caller = crate::workspace::test_ws_named(
+            home.path().to_str().unwrap(),
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let folder =
+            crate::util::strip_verbatim_prefix(&std::fs::canonicalize(dir.path()).unwrap())
+                .to_str()
+                .unwrap()
+                .to_string();
+
+        crate::custom_role::create(
+            "cli_role",
+            "you do the work",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+
+        // Every conversation the command line's handovers reach is a registered
+        // spy consumer, so nothing is left unconsumed — and the coder round the
+        // resume path really runs reports back into the assistant's session.
+        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut assistant_spy = Spy::register(&assistant);
+        let manager_agent = crate::session::manager_agent_id(&project.name);
+        let mut manager_spy = Spy::register(&manager_agent);
+        let _branch_spy = Spy::register(&crate::session::coder_branch_agent_id("cli_branch"));
+        let role_agent = crate::session::custom_role_agent_id("cli_role", None);
+        let _role_spy = Spy::register(&role_agent);
+
+        // The deferred envelopes that already exist: cleanup removes only the
+        // rows this harness creates, because the shared global store is written
+        // by parallel tests too (see `src/session/mod.rs`).
+        let pending_before: std::collections::HashSet<String> =
+            crate::jobs::list_pending_jobs(&crate::session::store().conn)
+                .await
+                .expect("list pending")
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+        // The conversation rows the assistant handovers below persist, likewise
+        // snapshotted: the store is shared, so only the rows that appear with
+        // these texts are this harness's to reclaim.
+        let history_before: Vec<String> =
+            owner_message_ids(&[UNNAMED_ASSISTANT_TEXT, NAMED_ASSISTANT_TEXT]).await;
+
+        let send = SendTool::admin(Role::Assistant);
+
+        // ── the owner's own assistant, unnamed and named ──────────────────
+        // Each pin is scoped to the handover it is about — this conversation AND
+        // this message's own text — never to a count over the shared store, which
+        // a parallel test's row for the same conversation could satisfy. The count
+        // is read before and after rather than asserted to be exactly one: a
+        // leftover row from an earlier run is not this handover's business.
+        let before = pending_for_content(&assistant, UNNAMED_ASSISTANT_TEXT).await;
+        let ack =
+            dispatch_command_line(&send, &caller, json!({ "message": UNNAMED_ASSISTANT_TEXT }))
+                .await
+                .expect("an unnamed command-line address means the owner's assistant");
+        assert!(
+            ack.contains("assistant") && !ack.contains("<coder-report"),
+            "the acknowledgement names the assistant: {ack}"
+        );
+        assert!(
+            pending_for_content(&assistant, UNNAMED_ASSISTANT_TEXT).await > before,
+            "the unnamed handover is durable when its caller is answered"
+        );
+
+        let before = pending_for_content(&assistant, NAMED_ASSISTANT_TEXT).await;
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({ "message": NAMED_ASSISTANT_TEXT, "addressee": "assistant" }),
+        )
+        .await
+        .expect("naming the assistant is the same as naming none");
+        assert!(
+            ack.contains("assistant") && !ack.contains("<coder-report"),
+            "{ack}"
+        );
+        assert!(
+            pending_for_content(&assistant, NAMED_ASSISTANT_TEXT).await > before,
+            "the named handover is durable when its caller is answered"
+        );
+
+        // ── the coder: the round's own row exists before the ack ──────────
+        let coder_jobs_before = command_line_round_ids().await;
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({ "message": "go", "addressee": "coder", "place": &folder }),
+        )
+        .await
+        .expect("a command-line coder dispatch succeeds");
+        assert!(
+            ack.contains("<coder-report"),
+            "a coder dispatch names its report: {ack}"
+        );
+        let coder_jobs_after = command_line_round_ids().await;
+        assert!(
+            coder_jobs_after
+                .iter()
+                .any(|id| !coder_jobs_before.contains(id)),
+            "the round's own row must exist the moment the command line is answered \
+             (the durability pin, no poll): before={coder_jobs_before:?} after={coder_jobs_after:?}"
+        );
+        // The round really runs through the RESUME path: its report arrives in
+        // the assistant's conversation and names the folder it worked in, which
+        // proves the row asserted above is THIS round's. Opening the gate is what
+        // lets it run at all.
+        gate_tx
+            .send(true)
+            .expect("the gated provider holds the gate");
+        let report = assistant_spy.report("<coder-report").await;
+        assert!(
+            report.content.contains(&folder),
+            "the coder report names the folder the round ran in: {}",
+            report.content
+        );
+
+        // ── a project's Manager ───────────────────────────────────────────
+        let before = pending_for_content(&manager_agent, MANAGER_TEXT).await;
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({
+                "message": MANAGER_TEXT,
+                "addressee": "manager",
+                "place": &project.name,
+            }),
+        )
+        .await
+        .expect("the command line reaches a project's Manager");
+        assert!(
+            ack.contains(&project.name),
+            "the acknowledgement names the workspace: {ack}"
+        );
+        assert!(
+            pending_for_content(&manager_agent, MANAGER_TEXT).await > before,
+            "the Manager handover is durable when its caller is answered"
+        );
+        let delivered = manager_spy.report("<assistant-message").await;
+        assert!(
+            delivered.content.contains("<assistant-message"),
+            "{}",
+            delivered.content
+        );
+
+        // ── a coder branch ────────────────────────────────────────────────
+        let branch_agent = crate::session::coder_branch_agent_id("cli_branch");
+        let before = pending_for_content(&branch_agent, BRANCH_TEXT).await;
+        dispatch_command_line(
+            &send,
+            &caller,
+            json!({
+                "message": BRANCH_TEXT,
+                "addressee": "coder_branch",
+                "branch": "cli_branch",
+            }),
+        )
+        .await
+        .expect("the command line reaches a coder branch");
+        assert!(
+            pending_for_content(&branch_agent, BRANCH_TEXT).await > before,
+            "the coder branch launch is durable when its caller is answered"
+        );
+
+        // ── a custom role ─────────────────────────────────────────────────
+        let before = pending_for_content(&role_agent, ROLE_TEXT).await;
+        dispatch_command_line(
+            &send,
+            &caller,
+            json!({ "message": ROLE_TEXT, "addressee": "role", "name": "cli_role" }),
+        )
+        .await
+        .expect("the command line reaches a custom role");
+        assert!(
+            pending_for_content(&role_agent, ROLE_TEXT).await > before,
+            "the custom-role launch is durable when its caller is answered"
+        );
+
+        // Leave the shared global store as the harness found it: the deferred
+        // envelopes every handover above persisted are deleted, scoped by the
+        // snapshot taken before the first dispatch. The coder round's own job row
+        // needs no cleanup: the resume path terminalizes it as the report is
+        // delivered, which the assertion above already waited for.
+        for row in crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .expect("list pending")
+        {
+            if !pending_before.contains(&row.id) {
+                crate::jobs::delete_pending_job(&crate::session::store().conn, &row.id)
+                    .await
+                    .expect("delete the harness's own envelope");
+            }
+        }
+        // The two handovers to the assistant are the ones that reach a
+        // conversation, and each left its copy of the owner's own message behind.
+        // A leftover row is not inert: it is a message from the owner no turn was
+        // ever produced for. Asserted before it is reclaimed — a reclaim that finds
+        // nothing reclaims nothing.
+        let dirty: Vec<String> = owner_message_ids(&[UNNAMED_ASSISTANT_TEXT, NAMED_ASSISTANT_TEXT])
+            .await
+            .into_iter()
+            .filter(|id| !history_before.contains(id))
+            .collect();
+        assert_eq!(
+            dirty.len(),
+            2,
+            "each assistant handover persists the owner's own message"
+        );
+        for id in dirty {
+            crate::channels::chat_history::store()
+                .conn
+                .execute(
+                    "DELETE FROM chat_history WHERE message_id = ?1",
+                    crate::db::params![id],
+                )
+                .await
+                .expect("reclaim the conversation row");
+        }
+    }
+
+    /// A round that dies in flight reports its failure where its report would have
+    /// gone. The command line is answered and gone the moment a handover returns,
+    /// so a failure nobody is told about would leave work the caller was told had
+    /// been handed over with nothing to notice it by until the next start — and a
+    /// row left launched would have every boot retry a round that dies the same
+    /// way.
+    #[tokio::test]
+    #[serial_test::serial(provider, channel_registry, drain)]
+    async fn a_round_that_dies_in_flight_reports_its_failure() {
+        use std::sync::Arc;
+
+        crate::util::test::init_management_test_stores().await;
+        let _policy =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // The round parks at its first call until the gate opens below: the row the
+        // ack promises is therefore still there to be read, and is provably THIS
+        // round's.
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let _provider =
+            crate::util::test::install_fake_provider(Arc::new(DyingProvider { open: gate_rx }));
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+
+        let home = tempfile::tempdir().unwrap();
+        let caller = crate::workspace::test_ws_named(
+            home.path().to_str().unwrap(),
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        );
+        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut assistant_spy = Spy::register(&assistant);
+        let rounds_before = command_line_round_ids().await;
+
+        let ack = dispatch_command_line(
+            &SendTool::admin(Role::Assistant),
+            &caller,
+            json!({ "message": "go", "addressee": "coder" }),
+        )
+        .await
+        .expect("the handover itself succeeds — the round it starts is what dies");
+        assert!(ack.contains("<coder-report"), "{ack}");
+        let mine: Vec<String> = command_line_round_ids()
+            .await
+            .into_iter()
+            .filter(|id| !rounds_before.contains(id))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "the ack means the round's own row is down: {mine:?}"
+        );
+
+        gate_tx
+            .send(true)
+            .expect("the dying provider holds the gate");
+        let report = assistant_spy.report("<coder-report").await;
+        assert!(
+            report.content.contains("panicked"),
+            "the failure must reach the conversation the report would have: {}",
+            report.content
+        );
+
+        // Terminalized by that report, never left launched for the next boot to
+        // retry it.
+        let left = command_line_round_ids().await;
+        assert!(
+            !left.iter().any(|id| mine.contains(id)),
+            "the panicked round's row must not stay launched for the next boot: {left:?}"
+        );
+        // Reclaim the deferred envelope it delivered — by this round's own id,
+        // because the store is shared with parallel tests whose rows are none of
+        // this harness's business.
+        for id in &mine {
+            crate::jobs::delete_pending_job(&crate::session::store().conn, id)
+                .await
+                .expect("delete the harness's own envelope");
+        }
+    }
+
     /// The addressees a holder's text may name: the choice declaration names
-    /// every held addressee, an argument's text names exactly the held addressees
-    /// that take it, and a holder that declares no choice reads no label at all.
+    /// every held addressee, and an argument's text names exactly the held
+    /// addressees that take it.
     fn assert_labels_follow_the_choice(kinds: &[Addressee]) {
-        let declared = kinds.len() > 1;
         let tool = SendTool::granted(kinds);
         let description = tool.description();
         for kind in Addressee::ALL {
             let labelled = format!("`{}`", kind.as_str());
-            let named = declared && kinds.contains(&kind);
+            let named = kinds.contains(&kind);
             assert_eq!(
                 description.contains(&labelled),
                 named,
@@ -1208,11 +1902,10 @@ mod tests {
         let schema = tool.parameters_schema();
         for (name, property) in schema["properties"].as_object().unwrap() {
             let text = property["description"].as_str().unwrap_or_default();
-            let named: Vec<Addressee> = match (declared, name == Addressee::ARG) {
-                // No choice is declared, so no label is read at all.
-                (false, _) => Vec::new(),
-                (true, true) => kinds.to_vec(),
-                (true, false) => Argument::ALL
+            let named: Vec<Addressee> = if name == Addressee::ARG {
+                kinds.to_vec()
+            } else {
+                Argument::ALL
                     .iter()
                     .find(|arg| arg.as_str() == name)
                     .map(|arg| {
@@ -1222,7 +1915,7 @@ mod tests {
                             .copied()
                             .collect()
                     })
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
             };
             for kind in Addressee::ALL {
                 let labelled = format!("`{}`", kind.as_str());
@@ -1235,17 +1928,13 @@ mod tests {
         }
     }
 
-    /// The arguments a holder declares: one where a held addressee takes it (and
-    /// only then), with nothing required unconditionally while a choice is
-    /// declared — a requirement belongs to the choice that needs it.
+    /// The arguments a holder declares: `message` and the choice always, and one
+    /// more where a held addressee takes it (and only then) — a requirement
+    /// belongs to the choice that needs it.
     fn assert_arguments_follow_the_addressees(kinds: &[Addressee]) {
-        let declared = kinds.len() > 1;
         let schema = SendTool::granted(kinds).parameters_schema();
         let properties = schema["properties"].as_object().unwrap();
-        let mut expected: Vec<&str> = vec!["message"];
-        if declared {
-            expected.push(Addressee::ARG);
-        }
+        let mut expected: Vec<&str> = vec!["message", Addressee::ARG];
         for arg in Argument::ALL {
             let taken = kinds
                 .iter()
@@ -1271,28 +1960,23 @@ mod tests {
             .iter()
             .map(|value| value.as_str().unwrap())
             .collect();
-        if declared {
-            assert_eq!(required, ["message", Addressee::ARG], "{kinds:?}");
-            return;
+        let mut expected_required = vec!["message", Addressee::ARG];
+        // With one addressee there is no other choice to make, so its own
+        // required arguments stand.
+        if let [only] = kinds {
+            expected_required.extend(
+                only.requirements()
+                    .iter()
+                    .filter(|req| req.required)
+                    .map(|req| req.arg.as_str()),
+            );
         }
-        // Without a choice, what its one addressee cannot do without is
-        // unconditional.
-        let mut expected_required = vec!["message"];
-        expected_required.extend(
-            kinds[0]
-                .requirements()
-                .iter()
-                .filter(|req| req.required)
-                .map(|req| req.arg.as_str()),
-        );
         assert_eq!(required, expected_required, "{kinds:?}");
     }
 
     /// How an argument's text states whether it can be left out: named for the
-    /// choice that needs it, and never as the unconditional requirement of a
-    /// holder that has a choice to satisfy instead.
+    /// choice that needs it, never as an unconditional requirement.
     fn assert_requirements_are_named_per_choice(kinds: &[Addressee]) {
-        let declared = kinds.len() > 1;
         let schema = SendTool::granted(kinds).parameters_schema();
         let properties = schema["properties"].as_object().unwrap();
         for arg in Argument::ALL {
@@ -1311,22 +1995,14 @@ mod tests {
                 })
                 .copied()
                 .collect();
-            if declared {
-                assert!(
-                    !text.ends_with(" Required."),
-                    "{kinds:?}: `{}` is not unconditional: {text}",
-                    arg.as_str()
-                );
-                for kind in needed {
-                    let named = format!("required for `{}`", kind.as_str());
-                    assert!(text.to_lowercase().contains(&named), "{kinds:?}: {text}");
-                }
-            } else {
-                assert_eq!(
-                    text.ends_with(" Required."),
-                    !needed.is_empty(),
-                    "{kinds:?}: {text}"
-                );
+            assert!(
+                !text.ends_with(" Required."),
+                "{kinds:?}: `{}` is not unconditional: {text}",
+                arg.as_str()
+            );
+            for kind in needed {
+                let named = format!("required for `{}`", kind.as_str());
+                assert!(text.to_lowercase().contains(&named), "{kinds:?}: {text}");
             }
         }
     }
@@ -1386,12 +2062,20 @@ mod tests {
             .to_string();
         assert!(place.contains("`coder`/`coder_branch`:"), "{place}");
 
-        // The Engineer's own instance: a sync coder with no folder at all.
+        // The Engineer's own instance: a sync coder that declares the choice
+        // like any other holder, and no folder at all.
         let engineer = SendTool::engineer();
         assert!(engineer.description().contains("One coder sub-agent"));
+        assert!(
+            engineer
+                .description()
+                .contains(load_prompt("tool/send_addressee.md").as_str()),
+            "the addressee-required note is read by every holder: {}",
+            engineer.description()
+        );
         let schema = engineer.parameters_schema();
-        assert_eq!(schema["required"], json!(["message"]));
-        assert!(schema["properties"].get("addressee").is_none());
+        assert_eq!(schema["required"], json!(["message", "addressee"]));
+        assert_eq!(schema["properties"]["addressee"]["enum"], json!(["coder"]));
         assert!(schema["properties"].get("place").is_none());
     }
 
@@ -1415,7 +2099,7 @@ mod tests {
         let result = dispatch(
             &SendTool::engineer(),
             &ws,
-            json!({ "message": "do the thing" }),
+            json!({ "message": "do the thing", "addressee": "coder" }),
         )
         .await
         .expect("the engineer's sync coder dispatch succeeds");
@@ -1438,32 +2122,250 @@ mod tests {
         dispatch(
             &SendTool::engineer(),
             &ws,
-            json!({ "message": "again", "place": "/no/such/folder" }),
+            json!({ "message": "again", "addressee": "coder", "place": "/no/such/folder" }),
         )
         .await
         .expect("an undeclared argument is inert for the holder that does not declare it");
+
+        // The address is never assumed, not even for the one-addressee holder.
+        let err = dispatch(&SendTool::engineer(), &ws, json!({ "message": "again" }))
+            .await
+            .expect_err("a call that names no addressee is refused");
+        let err = err.to_string();
+        assert!(
+            err.contains("`addressee`") && err.to_lowercase().contains("required"),
+            "{err}"
+        );
+    }
+
+    /// The three spellings of the address vocabulary are one list written three
+    /// ways: the grant vocabulary ([`Addressee::STRS`]) is [`Addressee::ALL`]'s
+    /// spellings, the command line's ([`Addressee::COMMAND_LINE`]) is that list led
+    /// by the owner's own assistant, and `parse` reads exactly the command line's.
+    /// A drift between them would mis-scope a grant (the assistant is not
+    /// grantable) or leave an accepted address out of the declarations.
+    #[test]
+    fn the_address_vocabularies_are_one_list() {
+        let all: Vec<&str> = Addressee::ALL.iter().map(|a| a.as_str()).collect();
+        assert_eq!(all, Addressee::STRS.to_vec(), "the grant vocabulary");
+        let mut command_line: Vec<&str> = vec![Addressee::Assistant.as_str()];
+        command_line.extend(all.iter().copied());
+        assert_eq!(
+            command_line,
+            Addressee::COMMAND_LINE
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>(),
+            "the command line's vocabulary"
+        );
+        for addressee in Addressee::COMMAND_LINE {
+            assert_eq!(
+                Addressee::parse(addressee.as_str()),
+                Some(addressee),
+                "'{}' must parse back to itself",
+                addressee.as_str()
+            );
+        }
+        assert_eq!(Addressee::parse("bogus"), None);
+    }
+
+    /// The help the command line shows for `--addressee` is the vocabulary's own
+    /// words, and it must stay that way: it names every address the command line
+    /// takes AND every argument each address REQUIRES, so a new address — or a new
+    /// required argument on an existing one — cannot ship with the help silent
+    /// about it. (The command line's registry ties flags to the tool's ARGUMENTS,
+    /// never to the vocabulary those arguments accept.)
+    #[test]
+    fn the_address_help_is_the_vocabulary_it_describes() {
+        let help = ADDRESSEE_FLAG_HELP;
+        for addressee in Addressee::COMMAND_LINE {
+            let spelling = format!("'{}'", addressee.as_str());
+            assert!(
+                help.contains(&spelling),
+                "the help must name the {spelling} address: {help}"
+            );
+            for requirement in addressee
+                .requirements()
+                .iter()
+                .filter(|requirement| requirement.required)
+            {
+                let flag = format!("--{}", requirement.arg.as_str().replace('_', "-"));
+                assert!(
+                    help.contains(&flag),
+                    "the help must say the {spelling} address needs {flag}: {help}"
+                );
+            }
+        }
+    }
+
+    /// The command line's own strictness: a script names the address and the flags
+    /// apart, so an argument the named address does not take is refused rather
+    /// than dispatched with the value silently dropped. An agent's call is built
+    /// from its holder's own interface — where the combination cannot arise — and
+    /// an argument it cannot use stays inert there, as it always is.
+    #[tokio::test]
+    async fn a_command_line_flag_the_address_does_not_take_is_refused() {
+        let ws = crate::workspace::test_ws("/tmp/test_ws_send_unused");
+        let send = SendTool::admin(Role::Assistant);
+        for (addressee, flag) in [
+            ("assistant", "place"),
+            ("assistant", "branch"),
+            ("coder", "branch"),
+            ("coder", "name"),
+            ("manager", "name"),
+        ] {
+            let mut args = json!({ "message": "go", "addressee": addressee });
+            args[flag] = json!(if flag == "place" { "/tmp" } else { "x" });
+            let err = dispatch_command_line(&send, &ws, args)
+                .await
+                .expect_err("an argument the address does not take is refused")
+                .to_string();
+            assert!(
+                err.contains(flag) && err.contains(addressee),
+                "the refusal names the argument and the address: {err}"
+            );
+        }
     }
 
     /// A choice value the holder does not offer is refused, naming its own set —
-    /// never silently narrowed.
+    /// never silently narrowed. The calls run in an agent session: on the command
+    /// line the vocabulary is the command line's own (see [`Addressee::COMMAND_LINE`]).
     #[tokio::test]
     async fn unheld_addressee_values_are_refused() {
         let ws = crate::workspace::test_ws("/tmp/test_ws_send_refuse");
         let engineer = SendTool::engineer();
-        let err = engineer
-            .execute(&ws, json!({ "message": "do it", "addressee": "manager" }))
-            .await
-            .expect_err("the engineer addresses a coder only");
+        let err = dispatch(
+            &engineer,
+            &ws,
+            json!({ "message": "do it", "addressee": "manager" }),
+        )
+        .await
+        .expect_err("the engineer addresses a coder only");
         let err = err.to_string();
         assert!(err.contains("`addressee` must be one of coder"), "{err}");
 
         let admin = SendTool::admin(Role::Assistant);
-        let err = admin
-            .execute(&ws, json!({ "message": "do it", "addressee": "bogus" }))
-            .await
-            .expect_err("an unknown addressee is refused");
+        let err = dispatch(
+            &admin,
+            &ws,
+            json!({ "message": "do it", "addressee": "bogus" }),
+        )
+        .await
+        .expect_err("an unknown addressee is refused");
         let err = err.to_string();
         assert!(err.contains("coder, coder_branch, manager, role"), "{err}");
+
+        let err = dispatch(
+            &admin,
+            &ws,
+            json!({ "message": "do it", "addressee": "assistant" }),
+        )
+        .await
+        .expect_err("an agent session never names the owner's own assistant");
+        let err = err.to_string();
+        assert!(err.contains("coder, coder_branch, manager, role"), "{err}");
+    }
+
+    /// What decides is the marker the executor sets: a turn that ARRIVED over the
+    /// command line's channel — the assistant answering a `mahbot send`, whose
+    /// envelope carries the tag — is an agent's own call, so it must state its
+    /// address and can never name the owner's own assistant. The tag is a
+    /// transport, not a caller.
+    #[tokio::test]
+    async fn a_command_line_delivered_turn_is_still_an_agents_own() {
+        let ws = crate::workspace::test_ws("/tmp/test_ws_send_cli_turn");
+        let admin = SendTool::admin(Role::Assistant);
+        let err = dispatch_over(
+            crate::cli::CHANNEL,
+            Some("agent_harness"),
+            &admin,
+            &ws,
+            json!({ "message": "do it" }),
+        )
+        .await
+        .expect_err("an agent's turn states its address whatever channel it arrived over");
+        let err = err.to_string();
+        assert!(
+            err.contains("`addressee`") && err.to_lowercase().contains("required"),
+            "{err}"
+        );
+
+        let err = dispatch_over(
+            crate::cli::CHANNEL,
+            Some("agent_harness"),
+            &admin,
+            &ws,
+            json!({ "message": "do it", "addressee": "assistant" }),
+        )
+        .await
+        .expect_err("an agent's turn never names the owner's own assistant");
+        let err = err.to_string();
+        assert!(err.contains("coder, coder_branch, manager, role"), "{err}");
+    }
+
+    /// The address is never assumed: an agent's call that names no addressee is
+    /// refused by every holder, even one that can address only a single agent.
+    /// The refusal happens before any dispatch, so no store or provider is needed.
+    /// (The command line's own rule differs: there an unnamed address means the
+    /// owner's assistant.)
+    #[tokio::test]
+    async fn a_missing_addressee_is_refused_for_every_holder() {
+        let ws = crate::workspace::test_ws("/tmp/test_ws_send_required");
+        for holder in [
+            SendTool::admin(Role::Assistant),
+            SendTool::engineer(),
+            SendTool::granted(&[Addressee::Coder]),
+            SendTool::granted(&[Addressee::Manager]),
+        ] {
+            let err = dispatch(&holder, &ws, json!({ "message": "do it" }))
+                .await
+                .expect_err("a call that names no addressee is refused");
+            let err = err.to_string();
+            assert!(
+                err.contains("`addressee`") && err.to_lowercase().contains("required"),
+                "{err}"
+            );
+        }
+    }
+
+    /// The command line's handover carries the owner it acts for: a call that
+    /// names none is refused rather than attributed to nobody and addressed to a
+    /// `personal:` workspace that does not exist. (The command line itself always
+    /// scopes the owner, so this pins the contract, as the Manager arm's own check
+    /// does.)
+    #[tokio::test]
+    async fn a_command_line_handover_without_an_owner_is_refused() {
+        let ws = crate::workspace::test_ws("/tmp/test_ws_send_ownerless");
+        let err = dispatch_command_line_as(
+            "",
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({ "message": "no owner" }),
+        )
+        .await
+        .expect_err("a handover that names no owner is refused");
+        assert!(err.to_string().contains("No user identity"), "{err}");
+    }
+
+    /// The resume tolerance the required address depends on: an in-flight `send`
+    /// frame that predates the choice still reconnects to its unfinished sync
+    /// coder round instead of being refused or restarted. A frame naming another
+    /// addressee stays unresolvable and is re-executed, as today.
+    #[test]
+    fn an_absent_address_still_resumes_the_sync_coder() {
+        use crate::tools::SyncDurableCore;
+        assert!(matches!(
+            SyncDurableCore::from_call("send", &json!({ "message": "m" })),
+            Some(SyncDurableCore::Coder)
+        ));
+        assert!(matches!(
+            SyncDurableCore::from_call("send", &json!({ "message": "m", "addressee": "coder" })),
+            Some(SyncDurableCore::Coder)
+        ));
+        assert!(
+            SyncDurableCore::from_call("send", &json!({ "message": "m", "addressee": "manager" }))
+                .is_none()
+        );
     }
 
     /// Regression: the manager send stays fully internal — the

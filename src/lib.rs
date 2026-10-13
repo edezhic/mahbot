@@ -627,7 +627,7 @@ pub enum ChatEvent {
         direction: ChatDirection,
         /// ISO-8601 timestamp.
         timestamp: String,
-        /// The channel this message was delivered on (e.g. "gui", "telegram", "voice").
+        /// The channel this message was delivered on (e.g. "gui", "telegram", "voice", "cli").
         channel: String,
         /// The agent's role (e.g. "manager", "engineer"), if from an agent.
         agent_role: Option<String>,
@@ -907,7 +907,7 @@ pub struct Agent {
     /// Whether the triggering account is the admin — gates the Assistant's
     /// widened toolset and role prompt.
     pub(crate) is_admin: bool,
-    /// The channel origin (gui, telegram, voice) of the triggering message.
+    /// The channel origin (gui, telegram, voice, cli) of the triggering message.
     pub(crate) channel: String,
     /// DIRECT PARENT INVOCATION grouping key for the Running Agents view
     /// (ticket / analyze round / research run). `None` for workspace singletons.

@@ -1,1 +1,1 @@
-`addressee` picks who receives the message; the matching note below says what each value needs.
+`addressee` is required: it names who receives the message, and the matching note below says what each value needs.

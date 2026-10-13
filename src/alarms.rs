@@ -590,6 +590,7 @@ async fn fire_custom_role_alarm(alarm: &Alarm) -> Result<()> {
             &alarm.text,
             alarm.identifier.as_deref(),
             alarm.workspace.as_deref(),
+            crate::agent::message_router::AnsweredFor::Agent,
         )
         .await
         {

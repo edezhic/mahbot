@@ -229,10 +229,10 @@ pub(super) static GEN_FALLBACK: LazyLock<Profile> = LazyLock::new(|| {
 
 /// The product's own answer surfaces: `mahbot chrome` emits exactly ONE line of
 /// JSON (the OutEnvelope), `mahbot audio transcribe` emits ONE line of transcript
-/// and the `config`/`workspace` families answer in prose — a per-line cap would
-/// truncate the envelope mid-JSON into invalid JSON, or shred a transcript or a
-/// prose answer, and head/tail would cut either short. No cap of any kind for
-/// them; each answer is byte-bounded by the product's own limits. The family
+/// and the `config`/`workspace`/`send` families answer in prose — a per-line cap
+/// would truncate the envelope mid-JSON into invalid JSON, or shred a transcript
+/// or a prose answer, and head/tail would cut either short. No cap of any kind
+/// for them; each answer is byte-bounded by the product's own limits. The family
 /// words come from the CLI registry, so a family added there cannot silently lose
 /// this profile.
 fn product_surface_profile() -> Profile {

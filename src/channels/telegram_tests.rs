@@ -2667,6 +2667,10 @@ fn voice_msg(user_name: &str, content: &str) -> ChannelMessage {
     test_msg(user_name, content, "voice", "")
 }
 
+fn cli_msg(user_name: &str, content: &str) -> ChannelMessage {
+    test_msg(user_name, content, crate::cli::CHANNEL, "")
+}
+
 /// Shared happy-path mirror harness: sets up the mirror environment, binds
 /// `user_name` to `reply_target`, mirrors `msg`, and returns the single
 /// message sent to `reply_target` (panics unless exactly one was sent).
@@ -2751,7 +2755,8 @@ async fn mirror_skips_guard_cases() {
     assert_mirror_skips(
         MirrorSkipSetup::BoundTo("skip_telegram", "target_non_gui"),
         &telegram_msg("skip_telegram", "hello from telegram"),
-        "Telegram-originated messages should not send (voice is the only non-GUI source accepted)",
+        "Telegram-originated messages should not send (telegram is the only \
+         source that can originate a loop)",
     )
     .await;
     assert_mirror_skips(
@@ -2840,6 +2845,23 @@ async fn mirrors_voice_transcript_to_telegram() {
     assert!(mirrored.reply_markup.is_none());
 }
 
+#[tokio::test]
+async fn mirrors_command_line_message_to_telegram() {
+    // A message the command line sends is the owner's own, so it mirrors exactly
+    // like GUI text and a voice transcript: same recipient bindings, same
+    // blockquote format, and NOTHING in the mirrored text marks it as scripted.
+    let mirrored = mirror_single_to_binding(
+        "cli_user",
+        "unique_cli",
+        &cli_msg("cli_user", "Send this from a script"),
+    )
+    .await;
+    assert_eq!(
+        mirrored.content,
+        "<blockquote>\nSend this from a script\n</blockquote>"
+    );
+    assert!(mirrored.reply_markup.is_none());
+}
 #[tokio::test]
 async fn sends_to_multiple_telegram_bindings() {
     let (sent, _lock) = setup_mirror_test_env().await;

@@ -136,7 +136,7 @@ pub struct AgentJob {
     pub workspace_name: String,
     /// Sender identity — used for per-user response delivery.
     pub user_name: String,
-    /// Channel origin (gui, telegram, voice).
+    /// Channel origin (gui, telegram, voice, cli).
     pub channel: String,
     /// The semantic job kind.
     pub kind: MessageKind,
@@ -293,6 +293,35 @@ pub fn route(agent_id: &str, job: AgentJob) {
     guard.insert(agent_id.to_string(), tx);
 }
 
+/// The `MessageKind::UserMessage` envelope every producer of an owner-side
+/// incoming message builds: a routed incoming message ([`route_user_message`]),
+/// the command line's handover ([`deliver_command_line_message`]), and a notice
+/// the product addresses to the owner's assistant
+/// ([`deliver_assistant_notice`]). The routing fields such a message never
+/// carries are the shape's own defaults.
+fn user_message_job(
+    content: String,
+    workspace_name: String,
+    user_name: String,
+    channel: String,
+    role: Role,
+    reply_target: Option<String>,
+) -> AgentJob {
+    AgentJob {
+        content,
+        workspace_name,
+        user_name,
+        channel,
+        kind: MessageKind::UserMessage,
+        role,
+        reply_target,
+        pending_job_id: None,
+        originating_workspace: None,
+        custom_role: None,
+        reply_to_custom: None,
+    }
+}
+
 /// Route a user message to the agent for the given role in a workspace.
 ///
 /// Computes the agent ID via `crate::session::resolve_agent_id` (Manager
@@ -325,19 +354,14 @@ pub async fn route_user_message(
         crate::session::normalize_user_name(&user_name, "route_user_message").to_string();
 
     let agent_id = crate::session::resolve_agent_id(&user_name, role.as_str(), &workspace_name);
-    let job = AgentJob {
+    let job = user_message_job(
         content,
         workspace_name,
         user_name,
         channel,
-        kind: MessageKind::UserMessage,
         role,
         reply_target,
-        pending_job_id: None,
-        originating_workspace: None,
-        custom_role: None,
-        reply_to_custom: None,
-    };
+    );
 
     // DURABLE kinds = UserMessage (manager-bound), AgentMessage, ManagerNotify,
     // CustomRoleNotify, AnalyzeToolResult, ResearchResult, ImplementResult.
@@ -359,33 +383,75 @@ async fn persist_and_stamp(job: &mut AgentJob) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Stamp `job.pending_job_id` from a freshly persisted durable envelope and
-/// route it, unless shutdown drained after persistence (boot replay reclaims
-/// persisted copies).
+/// Who answers for a durable handover: the one thing that decides what a failed
+/// `pending_jobs` write means. The choice belongs to the PRODUCER, never to the
+/// message — the same envelope can be a handover whose caller is answered and
+/// then gone (the command line) or one whose producer's own turn is durable
+/// already (an agent's tool call).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AnsweredFor {
+    /// A handover whose failure nobody is told about: an agent, whose own turn is
+    /// durable already, or a background sweep with no answerable caller at all
+    /// (the alarm sweep). The failed write is logged and the envelope is routed
+    /// best-effort instead (at-most-once): dropping the handover would be worse
+    /// than delivering it unrecorded.
+    Agent,
+    /// The command line. The failure is returned, with NOTHING routed: its
+    /// caller is answered and gone the moment it returns, so it must never be
+    /// told a handover succeeded that a restart could lose.
+    CommandLine,
+}
+
+/// Hand one durable envelope over, under `answered_for`'s contract — the ONE
+/// handover body: persist the envelope to `pending_jobs`, then route it unless
+/// a drain began after the write (the row is left to boot replay, which
+/// reclaims it; the drain must not be raced with a live route). `Err` is the
+/// failed write, and only a [`CommandLine`](AnsweredFor::CommandLine) handover
+/// ever returns it — every other producer's failure is logged here and the
+/// envelope is routed best-effort (at-most-once) instead.
 ///
-/// Persisted during the drain/shutdown → skip routing (boot replay
-/// reclaims). NOT persisted → route best-effort; the realistic rescue
-/// is the non-drain persist-failure case (the consumer is still
-/// pulling). A drain-time best-effort route may land in a consumer that
-/// has already stopped pulling, so the message can still be lost at
-/// exit — the fix primarily closes the silent-drop on the normal-path
-/// double fault, not the drain window.
-pub(crate) async fn stamp_and_route(mut job: AgentJob, target: &str, producer: &str) {
+/// A row persisted during the drain/shutdown is never routed: boot replay
+/// reclaims it. A best-effort route — the failed write, or one that slipped in
+/// as the drain began — may land in a consumer that has already stopped
+/// pulling, so the message can still be lost at exit; that window is the price
+/// of never dropping a handover whose write failed on the normal path.
+pub(crate) async fn hand_over(
+    mut job: AgentJob,
+    target: &str,
+    producer: &str,
+    answered_for: AnsweredFor,
+) -> anyhow::Result<()> {
     let persisted = match persist_and_stamp(&mut job).await {
         Ok(()) => true,
         Err(e) => {
+            if answered_for == AnsweredFor::CommandLine {
+                warn!(
+                    error = %e,
+                    producer,
+                    "the handover could not be made durable — refused",
+                );
+                return Err(e.context("the handover could not be made durable"));
+            }
             warn!(
                 error = %e,
                 producer,
-                "Failed to persist manager-bound envelope — routing best-effort (at-most-once)",
+                "Failed to persist the handover — routing best-effort (at-most-once)",
             );
             false
         }
     };
     if crate::shutdown::aborting() && persisted {
-        return;
+        return Ok(());
     }
     route(target, job);
+    Ok(())
+}
+
+/// [`hand_over`] under [`AnsweredFor::Agent`]: the durable producer whose own
+/// turn is already durable. A failed write is logged and the envelope is
+/// routed best-effort rather than dropped — see [`hand_over`].
+pub(crate) async fn stamp_and_route(job: AgentJob, target: &str, producer: &str) {
+    let _ = hand_over(job, target, producer, AnsweredFor::Agent).await;
 }
 
 /// Build the `<assistant-message>` envelope job addressed to the workspace
@@ -420,15 +486,92 @@ fn agent_message_job(
 /// Assistant via [`route_manager_notify`]. A Manager-bound request from a custom
 /// role DOES have one: `asker` carries the asking branch, and the answer
 /// re-enters it via [`route_manager_reply_to_custom`].
-pub async fn route_agent_message_to_manager(
+///
+/// `answered_for` carries the handover's contract ([`hand_over`]): what a failed
+/// `pending_jobs` write means depends on who answers for the call.
+pub(crate) async fn route_agent_message_to_manager(
     content: String,
     workspace_name: String,
     user_name: String,
     asker: Option<Asker>,
-) {
+    answered_for: AnsweredFor,
+) -> anyhow::Result<()> {
     let job = agent_message_job(content, workspace_name, &user_name, asker);
     let target = crate::jobs::envelope_target(&job);
-    stamp_and_route(job, &target, "agent message").await;
+    hand_over(job, &target, "agent message", answered_for).await
+}
+
+/// Hand one message from the COMMAND LINE to the owner's own assistant.
+///
+/// The message is an ordinary incoming message from the owner and nothing in
+/// its text marks it as scripted: it is broadcast to the GUI, persisted to
+/// `chat_history`, and mirrored to his bound Telegram as one of his own —
+/// exactly as a message typed into the dashboard is
+/// ([`crate::channels::broadcast_and_persist_incoming_message`]) — and it reaches
+/// the assistant's conversation through the same durable envelope every other
+/// handover uses, so the assistant answers the way it normally does. It is
+/// attributed to [`crate::cli::CHANNEL`] for the product's own record — a message
+/// a shell sent can be told apart from one the owner typed (`gui`) or spoke
+/// (`voice`), and the product's own logs record the handover as a command-line
+/// operation — never in the message itself, which carries no trace of its
+/// origin.
+///
+/// The durable handover comes FIRST and the history copy second — deliberately
+/// the opposite of the other incoming-message producers, which broadcast first
+/// so the transcript shows the message while the agent is still working. Here
+/// the caller is answered only once the handover is durable, so the conversation
+/// must not show a message the caller was told did not get through.
+///
+/// `Err` is a call carrying no owner, or a failed `pending_jobs` write — either
+/// way the handover is REFUSED and nothing is routed: see
+/// [`AnsweredFor::CommandLine`].
+pub(crate) async fn deliver_command_line_message(content: String) -> anyhow::Result<()> {
+    // The owner the CALL carries, never a second copy of the constant: the command
+    // line scopes the identity it acts with
+    // ([`crate::cli::instance`]), and every other handover this tool makes is
+    // attributed the same way. Checked rather than defaulted, as the Manager arm
+    // does: an empty identity would attribute the message to nobody and address
+    // it to a `personal:` workspace that does not exist.
+    let user_name = crate::agent::tool_user_name();
+    anyhow::ensure!(
+        !user_name.is_empty(),
+        "No user identity available — a message the command line sends must name the owner it \
+         comes from."
+    );
+    let workspace = crate::users::personal_workspace_name(&user_name);
+
+    let job = user_message_job(
+        content.clone(),
+        workspace.clone(),
+        user_name.clone(),
+        crate::cli::CHANNEL.to_string(),
+        Role::Assistant,
+        None,
+    );
+    let target = crate::jobs::envelope_target(&job);
+    hand_over(
+        job,
+        &target,
+        "command-line message",
+        AnsweredFor::CommandLine,
+    )
+    .await?;
+
+    crate::channels::broadcast_and_persist_incoming_message(
+        &crate::ChannelMessage {
+            user_name,
+            reply_target: String::new(),
+            content: content.clone(),
+            channel: crate::cli::CHANNEL.to_string(),
+            workspace,
+            ..Default::default()
+        },
+        &content,
+        &content,
+    )
+    .await;
+
+    Ok(())
 }
 
 /// Persist an envelope to `pending_jobs`. The target agent id is derived
@@ -467,22 +610,17 @@ pub(crate) async fn deliver_assistant_notice(
     user_name: &str,
     content: String,
 ) -> anyhow::Result<()> {
-    let mut job = AgentJob {
+    let mut job = user_message_job(
         content,
         // The user's own personal workspace — the Assistant is pinned there.
-        workspace_name: crate::users::personal_workspace_name(user_name),
-        user_name: user_name.to_string(),
+        crate::users::personal_workspace_name(user_name),
+        user_name.to_string(),
         // History-attribution tag only — the reply is broadcast to all of the
         // user's channel bindings, so no single transport is claimed here.
-        channel: "gui".to_string(),
-        kind: MessageKind::UserMessage,
-        role: Role::Assistant,
-        reply_target: None,
-        pending_job_id: None,
-        originating_workspace: None,
-        custom_role: None,
-        reply_to_custom: None,
-    };
+        "gui".to_string(),
+        Role::Assistant,
+        None,
+    );
     let durable = persist_and_stamp(&mut job).await;
     route(agent_id, job);
     durable

@@ -905,13 +905,14 @@ const PRODUCT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
 /// The verdict for the product's own binary: only its read-only forms run.
 ///
 /// `mahbot` means the product itself. Its other command lines change it, drive
-/// it or restart it, and its `mahbot config …` / `mahbot workspace …` families
-/// carry the owner's own configuration and workspace authority — the authority
-/// the roles holding those tools already have — so a read-only shell must not
-/// be a way around those roles' permissions. `second` is the word right after
-/// the verb (the only place a subcommand can stand; scanning the list instead
-/// would admit `mahbot foo debug`), `None` for a bare `mahbot`, which is a
-/// daemon launch and is refused with the rest.
+/// it or restart it: its `mahbot config …` / `mahbot workspace …` families carry
+/// the owner's own configuration and workspace authority, and `mahbot send …`
+/// dispatches the very agents the owner's own dispatch tool reaches — the
+/// authority the roles holding those tools already have — so a read-only shell
+/// must not be a way around those roles' permissions. `second` is the word right
+/// after the verb (the only place a subcommand can stand; scanning the list
+/// instead would admit `mahbot foo debug`), `None` for a bare `mahbot`, which is
+/// a daemon launch and is refused with the rest.
 ///
 /// `mahbot chrome …` is refused with those, deliberately: the CLI drives and
 /// stops sessions in the LIVE daemon by name, while the chrome tool a role
@@ -941,10 +942,11 @@ fn check_product_segment(segment: &str, second: Option<&str>) -> Result<(), Stri
         segment,
         &format!(
             "{called} is the product's own binary, and not one of its read-only forms ({allowed}). \
-             Its other command lines change the product, drive it or restart it, and its \
+             Its other command lines change the product, drive it or restart it: its \
              `config`/`workspace` families carry the owner's own configuration and workspace \
-             authority — the same authority the roles holding those tools already have, so a \
-             read-only shell must not be a way around them."
+             authority, and its `send` family dispatches the agents its dispatch tool reaches — \
+             the same authority the roles holding those tools already have, so a read-only shell \
+             must not be a way around them."
         ),
         "use `mahbot debug` for read-only data, and leave anything that changes or drives the product to the assistant.",
     )
@@ -6758,12 +6760,12 @@ mod tests {
 
     /// The product's own binary is judged by its own rule: only its read-only
     /// second words run, everything else — a daemon launch, the chrome frontend,
-    /// the configuration/workspace families, a bench binary — is refused. The
-    /// second word is read POSITIONALLY, so `mahbot foo debug` is a refusal too,
-    /// and the comparison is case-sensitive on every platform (the binary
-    /// compares its own `argv[1]` the same way, so `mahbot DEBUG` launches the
-    /// daemon rather than querying). The path-spelled row is the spelling this
-    /// shell's own grep rewrite carries, so it must keep working.
+    /// the configuration/workspace families, the one-way `send`, a bench binary
+    /// — is refused. The second word is read POSITIONALLY, so `mahbot foo debug`
+    /// is a refusal too, and the comparison is case-sensitive on every platform
+    /// (the binary compares its own `argv[1]` the same way, so `mahbot DEBUG`
+    /// launches the daemon rather than querying). The path-spelled row is the
+    /// spelling this shell's own grep rewrite carries, so it must keep working.
     #[cfg(unix)]
     #[test]
     fn product_binary_runs_only_its_read_only_forms() {
@@ -6773,6 +6775,13 @@ mod tests {
             ("mahbot chrome status", false),
             ("mahbot config add-user --name bob", false),
             ("mahbot workspace pause", false),
+            // The one-way send is refused with the changing families: it hands
+            // work to the agents its dispatch tool reaches.
+            ("mahbot send --message 'go do it'", false),
+            (
+                "mahbot send --addressee manager --place proj --message hi",
+                false,
+            ),
             ("mahbot bench-openrouter", false),
             // The speech command is refused with the rest: `speak` writes a file at
             // a path the caller names, and the whole family stays out of this mode.

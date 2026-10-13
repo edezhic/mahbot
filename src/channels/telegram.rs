@@ -3111,10 +3111,12 @@ pub async fn send_reply(recipient: &str, content: &str) {
 ///
 /// # Guards
 ///
-/// * Only mirrors messages where `channel == "gui"` or `channel == "voice"`
-///   (prevents echo loops: voice is a strictly local source that can never
-///   originate from Telegram, so accepting it cannot create feedback;
-///   Telegram-originated messages remain excluded).
+/// * Only mirrors messages where `channel == "gui"`, `channel == "voice"` or
+///   `channel == "cli"` (prevents echo loops: those are strictly local sources
+///   that can never originate from Telegram, so accepting them cannot create
+///   feedback; Telegram-originated messages remain excluded). A command-line
+///   message is the owner's own, so it mirrors as one of his — with nothing added
+///   to its text, exactly as one he typed into the dashboard carries none.
 /// * Skips empty or whitespace-only messages.
 /// * Silently returns when no Telegram channel is registered or the user has no
 ///   Telegram binding with a `reply_target` (no error, no crash).
@@ -3135,11 +3137,12 @@ pub async fn send_reply(recipient: &str, content: &str) {
 /// blockquote (before the user's text), and a media-only message with a
 /// reference still mirrors — the blockquote then holds only the `↩` line.
 pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
-    // Guard: only mirror local-originated user messages — GUI text and local
-    // voice transcripts (prevents echo loops: voice is a strictly local source
-    // that can never originate from Telegram, so accepting it cannot create
-    // feedback; Telegram-originated messages remain excluded).
-    if msg.channel != "gui" && msg.channel != "voice" {
+    // Guard: only mirror local-originated user messages — text typed into the
+    // dashboard, spoken locally, or sent from the command line (prevents echo
+    // loops: those are strictly local sources that can never originate from
+    // Telegram, so accepting them cannot create feedback; Telegram-originated
+    // messages remain excluded).
+    if msg.channel != "gui" && msg.channel != "voice" && msg.channel != crate::cli::CHANNEL {
         return;
     }
 

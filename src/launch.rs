@@ -38,11 +38,17 @@ fn launch_job(
 /// machine; `None` runs in the owner's personal folder, exactly as the owner's
 /// Assistant does. The launch is persisted as a durable envelope BEFORE it is
 /// routed, so it survives a restart. Returns a one-line confirmation for the caller.
+///
+/// `answered_for` decides what a failed durable write means — see
+/// [`crate::agent::message_router::hand_over`]. An agent's producer keeps the
+/// best-effort route on a failed write; the command line's gets the failure back
+/// and the launch does NOT happen.
 pub(crate) async fn custom_role(
     name: &str,
     message: &str,
     branch: Option<&str>,
     place: Option<&str>,
+    answered_for: crate::agent::message_router::AnsweredFor,
 ) -> Result<String> {
     anyhow::ensure!(
         !message.trim().is_empty(),
@@ -94,7 +100,8 @@ pub(crate) async fn custom_role(
 
     // Durable delivery: the envelope is persisted BEFORE it is routed, so a
     // restart between the two replays it at boot.
-    crate::agent::message_router::stamp_and_route(job, &agent_id, "custom role launch").await;
+    crate::agent::message_router::hand_over(job, &agent_id, "custom role launch", answered_for)
+        .await?;
 
     Ok(format!(
         "custom role '{name}' launched on branch {agent_id} in {workspace_name}"
@@ -118,12 +125,18 @@ pub(crate) async fn custom_role(
 /// the report return into the asking role's branch rather than the admin's
 /// Assistant, addressed by the caller's own workspace. A coder branch has
 /// nothing to configure and no place in Settings.
+///
+/// `answered_for` decides what a failed durable write means — see
+/// [`crate::agent::message_router::hand_over`]. An agent's producer keeps the
+/// best-effort route on a failed write; the command line's gets the failure back
+/// and the launch does NOT happen.
 pub(crate) async fn coder_branch(
     caller_ws: &crate::Workspace,
     branch: &str,
     message: &str,
     place: Option<&crate::Workspace>,
     asker: Option<crate::Launch>,
+    answered_for: crate::agent::message_router::AnsweredFor,
 ) -> Result<String> {
     anyhow::ensure!(
         !message.trim().is_empty(),
@@ -163,7 +176,8 @@ pub(crate) async fn coder_branch(
 
     // Durable delivery: the envelope is persisted BEFORE it is routed (and
     // BEFORE any session write), so a restart between the two replays it at boot.
-    crate::agent::message_router::stamp_and_route(job, &agent_id, "coder branch launch").await;
+    crate::agent::message_router::hand_over(job, &agent_id, "coder branch launch", answered_for)
+        .await?;
 
     // The acknowledgement names the resolved folder path, exactly as the
     // single-run coder's does (same trimmed spelling) — the branch's durable
@@ -171,7 +185,7 @@ pub(crate) async fn coder_branch(
     let folder = place.map_or_else(|| caller_ws.path.clone(), |ws| ws.path.clone());
     let folder = folder.trim_end_matches(std::path::MAIN_SEPARATOR);
     Ok(format!(
-        "Coder branch '{branch}' is on it in {folder}; its report will arrive in this conversation."
+        "Coder branch '{branch}' is on it in {folder}; its report arrives as a <coder-report> message."
     ))
 }
 

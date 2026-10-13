@@ -73,10 +73,16 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
 
     // Everything the tool's task-locals need is read SYNCHRONOUSLY, before the
     // await — the task-local contract: a read inside the awaited tool would see
-    // nothing. The command acts as the machine's owner. No agent id and no
-    // channel are set: there is no agent session behind the command and nothing
-    // to reply to.
+    // nothing. The command acts as the machine's owner. No agent id is set:
+    // there is no agent session behind the command. The channel IS set to the
+    // command line's own: it attributes the operation to the shell rather than
+    // to a dashboard the owner typed into, and it travels with a message the
+    // command line hands over. The MARKER is what makes the call recognisable
+    // as the command line's — it is the flag tool code reads to behave as the
+    // shell caller's (see `SendTool::command_line`), while the channel is set
+    // for provenance and cannot stand in for it.
     let user_name = crate::users::ADMIN_USER_NAME.to_string();
+    let channel = crate::cli::CHANNEL.to_string();
     let tracking = Some(crate::agent::registry::AgentTracking {
         agent_id: "cli".to_string(),
         generation: 0,
@@ -94,26 +100,36 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
 
     let args = call.args.clone();
     let started = Instant::now();
-    let outcome = crate::agent::CURRENT_TOOL_USER_NAME
-        .scope(user_name, async {
-            crate::agent::CURRENT_TOOL_AGENT_TRACKING
-                .scope(tracking, async {
-                    match AssertUnwindSafe(tool.execute_answer(&ws, args))
-                        .catch_unwind()
+    let outcome = crate::agent::CURRENT_TOOL_COMMAND_LINE
+        .scope(true, async {
+            crate::agent::CURRENT_TOOL_USER_NAME
+                .scope(user_name, async {
+                    crate::agent::CURRENT_TOOL_CHANNEL
+                        .scope(channel, async {
+                            crate::agent::CURRENT_TOOL_AGENT_TRACKING
+                                .scope(tracking, async {
+                                    match AssertUnwindSafe(tool.execute_answer(&ws, args))
+                                        .catch_unwind()
+                                        .await
+                                    {
+                                        Ok(Ok(answer)) => Ok(answer),
+                                        // A panic is a refusal carrying the panic's own
+                                        // message, never a severed exchange — the crate builds
+                                        // with `panic = "unwind"` on purpose.
+                                        Err(payload) => Err(crate::util::panic_message(&*payload)),
+                                        // The tool's own wording, unwrapped: the caller reads
+                                        // it as the product's answer, so it must not carry the
+                                        // `Error executing <tool>: …` envelope that is worded
+                                        // for a model's failure block. The record below wraps
+                                        // it the way an agent's failure is recorded. Any
+                                        // context chain is kept — `Display` alone would hide
+                                        // the cause the outermost context names.
+                                        Ok(Err(e)) => Err(format!("{e:#}")),
+                                    }
+                                })
+                                .await
+                        })
                         .await
-                    {
-                        Ok(Ok(answer)) => Ok(answer),
-                        // A panic is a refusal carrying the panic's own
-                        // message, never a severed exchange — the crate builds
-                        // with `panic = "unwind"` on purpose.
-                        Err(payload) => Err(crate::util::panic_message(&*payload)),
-                        // The tool's own wording, unwrapped: the caller reads
-                        // it as the product's answer, so it must not carry the
-                        // `Error executing <tool>: …` envelope that is worded
-                        // for a model's failure block. The record below wraps
-                        // it the way an agent's failure is recorded.
-                        Ok(Err(e)) => Err(e.to_string()),
-                    }
                 })
                 .await
         })
@@ -139,18 +155,36 @@ pub(crate) fn hold_flight() -> crate::agent::registry::NonAgentCallGuard {
     crate::agent::registry::NON_AGENT_CALLS.register("cli_command", &ws.name, None, false, None)
 }
 
-/// The refusal for a tool this command line does not front — a name no family
-/// publishes, or one the owner's toolset does not hold. The caller's own secrets
-/// are removed even here: the tool name is caller input like any other.
+/// The answer for a tool this command line does not serve — a name no family
+/// publishes, or one the owner's toolset does not hold. The running product
+/// cannot take this operation on (one shared command-line contract: see
+/// [`crate::cli::FAMILIES`]), so it is [`Unavailable`](CallReply::unavailable),
+/// NOT `Refused`.
+///
+/// The two callers are not the same kind of thing. A name no family fronts
+/// ([`crate::cli::fronts_tool`]) is the safety net for a frontend whose family
+/// this build does not know while the value it sends is one this build serves —
+/// a build that added a family without bumping that value; the reading side
+/// treats this class as the environment's, so the sentence carries the restart
+/// advice. A tool a family DOES front that the owner's toolset does not hold is a
+/// product-side inconsistency ([`crate::Role::Assistant`]'s own toolset is the
+/// command line's whole surface), where nothing is implied about the build and a
+/// restart is the wrong advice. The caller's own secrets are removed on both
+/// paths: the tool name is caller input like any other.
 fn unknown_tool_refusal(call: &CallRequest) -> CallReply {
-    CallReply::refused(crate::util::redact_secrets(
-        &format!(
-            "no tool named '{}' is available on the command line — it fronts the tools its own \
-             commands expose and nothing else",
+    let wording = if crate::cli::fronts_tool(&call.tool) {
+        format!(
+            "the running product's command line holds no tool named '{}' — nothing ran",
             call.tool
-        ),
-        &call.secrets,
-    ))
+        )
+    } else {
+        format!(
+            "the running product does not serve '{}' on its command line — it was built before \
+             that command existed, so restart it from this build and try again; nothing ran",
+            call.tool
+        )
+    };
+    CallReply::unavailable(crate::util::redact_secrets(&wording, &call.secrets))
 }
 
 /// Record the operation exactly as the agent path records a call, with

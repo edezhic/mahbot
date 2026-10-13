@@ -457,6 +457,42 @@ pub(crate) fn internal_fault(cause: &str) -> anyhow::Error {
     )
 }
 
+/// Run one durable round's own future and catch a panic in it: the panic is
+/// logged against `label` and handed back as its message, so each caller
+/// decides what a panicked round leaves behind — a dispatch routes it as the
+/// round's error envelope, the resume path as the round's failure. A round that
+/// panics never takes the instance with it: `panic = "unwind"` is load-bearing
+/// here.
+pub(crate) async fn caught_round<T>(
+    label: &str,
+    round: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    // Boxed before it is caught: the round's own future is far larger than the
+    // threshold `clippy::large_futures` warns on, and this is once per durable
+    // round.
+    let round = Box::pin(round);
+    match std::panic::AssertUnwindSafe(round).catch_unwind().await {
+        Ok(value) => Ok(value),
+        Err(panic) => {
+            let panic = crate::util::panic_message(&*panic);
+            tracing::error!(panic = %panic, "{label} panicked");
+            Err(panic)
+        }
+    }
+}
+
+/// Gives back a synthetic `dir-…` exec engine when it is dropped, so a round that
+/// unwinds releases it exactly as one that returns does. A registered
+/// workspace's own engine is never touched (see
+/// [`delegation::release_exec_engine`]).
+struct ExecEngineGuard<'a>(&'a crate::Workspace);
+
+impl Drop for ExecEngineGuard<'_> {
+    fn drop(&mut self) {
+        crate::tools::delegation::release_exec_engine(self.0);
+    }
+}
+
 /// Internal error-carrier for a tool call whose durable work was drain-cut by
 /// shutdown/drain. NEVER persisted — the emission-time frame already recorded
 /// the call durably, so the result is simply absent and the universal
@@ -978,6 +1014,12 @@ impl SyncDurableCore {
     /// caller's own (`delivery`) so the result lands in the conversation that
     /// asked.
     ///
+    /// A round that PANICS is caught here and reported through the same arm as
+    /// any other round that produced no outcome: the failure is delivered to the
+    /// conversation that was promised a result, and the row is terminalized. A
+    /// panicked round is over — leaving the row would make every boot retry a
+    /// round that dies the same way, silently.
+    ///
     /// Aborts quietly on shutdown/drain: no routing, no terminalization — the
     /// job row stays for the next boot (checkpointed outcomes are reused, so
     /// already-completed LLM work is never lost or duplicated). A cancel landing
@@ -1001,22 +1043,30 @@ impl SyncDurableCore {
         if self.stopped_by_cancel(job_id) {
             return;
         }
-        let resumed = match exec_dir {
-            None => self.resume_sync_core(delivery, job_id, false).await,
-            Some(dir) => match crate::tools::delegation::workspace_at_dir(dir).await {
-                Ok(exec) => {
-                    let resumed = self.resume_sync_core(&exec, job_id, false).await;
-                    // The resume is over: drop the synthetic `dir-…` engine it
-                    // may have created (the next resume re-creates it on demand).
-                    crate::tools::delegation::release_exec_engine(&exec);
-                    resumed
-                }
-                // The recorded directory is gone: the round ends through
-                // the resume-failure arm below with that plain message — never
-                // left hanging.
-                Err(e) => Err(e),
-            },
-        };
+        // The round's own future is caught: a panic in it is a round that
+        // produced no outcome, and it is reported as one (see the doc above)
+        // rather than left as a launched row nobody is told about.
+        let resumed = caught_round(&format!("{label} resume"), async {
+            match exec_dir {
+                None => self.resume_sync_core(delivery, job_id, false).await,
+                Some(dir) => match crate::tools::delegation::workspace_at_dir(dir).await {
+                    Ok(exec) => {
+                        // Released however this ends: the round may unwind, and a
+                        // directory's engine registered for the process lifetime is
+                        // exactly what a panic must not leave behind. Whatever next
+                        // needs it re-creates it on demand.
+                        let _engine = ExecEngineGuard(&exec);
+                        self.resume_sync_core(&exec, job_id, false).await
+                    }
+                    // The recorded directory is gone: the round ends through
+                    // the resume-failure arm below with that plain message — never
+                    // left hanging.
+                    Err(e) => Err(e),
+                },
+            }
+        })
+        .await
+        .unwrap_or_else(|panic| Err(anyhow::anyhow!("the round panicked: {panic}")));
         let (caller_role, caller, custom, result) = match resumed {
             Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
                 let custom = caller.custom_launch.as_deref().cloned();
@@ -1028,11 +1078,12 @@ impl SyncDurableCore {
             Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
                 return;
             }
-            // Resume infra failure (roster load / checkpoint) or an unusable
-            // recorded directory — deliver an error envelope to the
-            // ORIGINAL caller, exactly like a round-level failure. The job row
-            // is still present (the core never terminalizes), so the caller
-            // identity can be re-loaded for the route.
+            // Resume infra failure (roster load / checkpoint), an unusable
+            // recorded directory, or a round that panicked: deliver an error
+            // envelope to the ORIGINAL caller, exactly like a round-level
+            // failure. The job row is still present (the core never
+            // terminalizes), so the caller identity can be re-loaded for the
+            // route.
             Err(e) => {
                 let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
                     &crate::session::store().conn,
@@ -1171,7 +1222,7 @@ impl SyncDurableCore {
         tokio::spawn(async move {
             let _cancel_guard = cancel_guard;
             let exec_dir = place.as_ref().map(|p| p.path.as_str());
-            let round = std::panic::AssertUnwindSafe(async {
+            let round = caught_round(&format!("{} round dispatch", self.label()), async {
                 self.dispatch_durable(
                     &delivery,
                     place.as_ref(),
@@ -1184,7 +1235,6 @@ impl SyncDurableCore {
                 )
                 .await
             })
-            .catch_unwind()
             .await;
             let envelope = match round {
                 Ok(Some(envelope)) => envelope,
@@ -1193,8 +1243,6 @@ impl SyncDurableCore {
                     return;
                 }
                 Err(panic) => {
-                    let panic = crate::util::panic_message(&*panic);
-                    tracing::error!(panic = %panic, "{} round dispatch panicked", self.label());
                     // The round is over (as a panic): drop the synthetic
                     // `dir-…` engine it may have created before the envelope.
                     if let Some(exec) = place.as_ref() {

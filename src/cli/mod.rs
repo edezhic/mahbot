@@ -1,20 +1,23 @@
 //! Command-line frontends onto the RUNNING product.
 //!
 //! A command line here is not a second implementation of anything: `mahbot
-//! config …` and `mahbot workspace …` carry the operation into the instance
-//! that is already up, where it is executed by the very tool an agent's
-//! assistant calls — the same validation and the same immediate effect on the
-//! live product. The frontend never opens or writes a store itself, so there is
+//! config …`, `mahbot workspace …` and `mahbot send …` carry the operation into
+//! the instance that is already up, where it is executed by the very tool an
+//! agent's assistant calls — the same validation, and for the setting families
+//! the same immediate effect on the live product (a `send` hands its message to
+//! an agent, one-way, and the answer arrives in the owner's own assistant
+//! conversation). The frontend never opens or writes a store itself, so there is
 //! no second writer and no second copy of any rule.
 //!
 //! This file holds the instance's own readiness signal — whether operations may
 //! be served at all, and the waiter the instance side blocks on — plus the
 //! execution entry point in [`instance`], and the frontend's own command line:
-//! the family/operation/flag registry that ties every sub-command to one tool
-//! action, the argv parsing under it, the help, and the [`Exit`] classes a
-//! script reads. The flag grammar itself is [`grammar`], which `mahbot audio`
-//! reads too — the browser-automation command and the OpenRouter benchmark read
-//! their own flags and word their own refusals.
+//! the family registry that ties every sub-command to one tool (an operation per
+//! action, or the family word itself where the tool takes no action at all), the
+//! argv parsing under it, the help, and the [`Exit`] classes a script reads. The
+//! flag grammar itself is [`grammar`], which `mahbot audio` reads too — the
+//! browser-automation command and the OpenRouter benchmark read their own flags
+//! and word their own refusals.
 
 pub(crate) mod grammar;
 pub(crate) mod instance;
@@ -51,10 +54,21 @@ Usage:
                          grants, web search, custom roles)
   mahbot workspace <operation> [flags]
                          Work with the RUNNING product's workspaces and tickets
+  mahbot send [flags]    Hand one message to an agent and finish: one-way — the
+                         answer arrives in your assistant's conversation
 
 Options:
   -h, --help             Print this help and exit
   -V, --version          Print the version and exit";
+
+/// The transport tag the command line's own operations are attributed to. The
+/// one-way `send` presents a message to the owner's assistant over it — an
+/// incoming message from the owner like any other, mirroring to his Telegram as
+/// one of his own and reaching the history the way a message he typed into the
+/// dashboard (`gui`) or spoke (`voice`) does. The tag is the product's own
+/// record: it tells a shell-sent message apart from those, and never reaches the
+/// message.
+pub(crate) const CHANNEL: &str = "cli";
 
 /// Whether this instance can serve a command-line operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -224,10 +238,30 @@ pub(crate) struct Family {
     pub(crate) word: &'static str,
     /// The product tool every operation of this family runs.
     pub(crate) tool: &'static str,
+    /// The protocol value this family's operation frames carry: the generation of
+    /// the command line's surface it needs. A family the channel has already
+    /// served carries the value
+    /// [`CALL_STORE_BASE`](crate::db::ipc::CALL_STORE_BASE) and keeps working
+    /// against a product one build behind; a family this build adds carries the
+    /// current one, so a product that does not know it refuses the call as the
+    /// environment's class instead of answering it as a failed operation (see
+    /// [`crate::db::ipc`]).
+    pub(crate) protocol: &'static str,
     /// One line for `mahbot -h`, and the family's own help opening on it.
     pub(crate) purpose: &'static str,
-    /// The operations, one per action of `tool`.
-    pub(crate) operations: &'static [Operation],
+    /// What follows the family's word: an operation to run, or nothing at all.
+    pub(crate) surface: Surface,
+}
+
+/// What follows a family's word on the command line.
+pub(crate) enum Surface {
+    /// The tool has an `action` enum: `mahbot <word> <operation> [flags]`, one
+    /// operation per action.
+    Operations(&'static [Operation]),
+    /// The tool takes no `action` at all: `mahbot <word> [flags]`. The family
+    /// word IS the operation, these are its flags, and the args the tool is
+    /// handed carry no `action` key.
+    Standalone(&'static [Flag]),
 }
 
 /// One command-line operation: the tool action it runs, under a sub-command
@@ -281,15 +315,16 @@ pub(crate) enum FlagKind {
     Present,
 }
 
-/// The command lines this file fronts: the admin Assistant's own `mahbot_config`
-/// and `workspace` tools — what its toolset holds and nothing else.
+/// The command lines this file fronts: the admin Assistant's own `mahbot_config`,
+/// `workspace` and `send` tools — what its toolset holds and nothing else.
 pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "config",
         tool: "mahbot_config",
+        protocol: crate::db::ipc::CALL_STORE_BASE,
         purpose: "Set the running product up — its Telegram bot, its users and \
                   their tool grants, web search, custom roles",
-        operations: &[
+        surface: Surface::Operations(&[
             Operation {
                 action: "setup_telegram_bot",
                 purpose: "Save the Telegram bot token from BotFather",
@@ -449,13 +484,14 @@ pub(crate) const FAMILIES: &[Family] = &[
                     purpose: "The custom role to delete",
                 }],
             },
-        ],
+        ]),
     },
     Family {
         word: "workspace",
         tool: "workspace",
+        protocol: crate::db::ipc::CALL_STORE_BASE,
         purpose: "Work with the running product's workspaces, their tickets and their board",
-        operations: &[
+        surface: Surface::Operations(&[
             Operation {
                 action: "list",
                 purpose: "List the registered workspaces",
@@ -578,7 +614,59 @@ pub(crate) const FAMILIES: &[Family] = &[
                     },
                 ],
             },
-        ],
+        ]),
+    },
+    Family {
+        word: "send",
+        tool: "send",
+        // The family this build adds: a product built before it answers the call
+        // as a failed operation, so it carries the current value and is refused
+        // as the environment's class instead.
+        protocol: crate::db::ipc::CALL_STORE,
+        purpose: "Hand one message to an agent and finish: one-way — no reply is waited for or \
+                  printed, and the answer arrives in your assistant's conversation",
+        surface: Surface::Standalone(&[
+            Flag {
+                arg: "message",
+                kind: FlagKind::Value,
+                secret: false,
+                purpose: "The work to hand over; make it self-contained — the addressee cannot \
+                          see your conversation (required)",
+            },
+            // The address vocabulary's own words: it lives beside the vocabulary
+            // (`tools::send`), which checks it names every address and every
+            // argument an address requires.
+            Flag {
+                arg: "addressee",
+                kind: FlagKind::Value,
+                secret: false,
+                purpose: crate::tools::send::ADDRESSEE_FLAG_HELP,
+            },
+            Flag {
+                arg: "place",
+                kind: FlagKind::Value,
+                secret: false,
+                purpose: "The folder the addressee works in: for 'manager', the project to \
+                          message, by its registered name or its own folder; for 'role', a \
+                          registered project, a folder path, or 'personal:<user>'; a coder or \
+                          a coder branch works in a directory outside the registered projects \
+                          (one inside is refused), and in your own workspace when it names none",
+            },
+            Flag {
+                arg: "branch",
+                kind: FlagKind::Value,
+                secret: false,
+                purpose: "The branch to continue or create — a coder branch's, or a custom \
+                          role's own named branch (ASCII letters, digits, '_' and '-', at most \
+                          32 chars)",
+            },
+            Flag {
+                arg: "name",
+                kind: FlagKind::Value,
+                secret: false,
+                purpose: "The custom role to start (it must exist)",
+            },
+        ]),
     },
 ];
 
@@ -640,10 +728,11 @@ enum Tail {
 
 /// One parsed command line: what is sent with the call.
 struct Parsed {
-    /// The tool's args object: `{"action": …}` plus exactly the flags that were
-    /// given. An absent flag leaves its key ABSENT, never null — the tools tell
-    /// absent from null, and `pause`/`resume` read the absence of `workspace`
-    /// as the fleet-wide form.
+    /// The tool's args object: an operations family's carries its `action`, a
+    /// standalone family's no `action` key at all (`mahbot send`), plus exactly
+    /// the flags that were given. An absent flag leaves its key ABSENT, never
+    /// null — the tools tell absent from null, and `pause`/`resume` read the
+    /// absence of `workspace` as the fleet-wide form.
     args: serde_json::Value,
     /// The values of the `secret` flags that were given, in the order they were
     /// given. Nothing else is ever sent.
@@ -671,23 +760,30 @@ fn flag_spelling(arg: &str) -> String {
 /// flag the operation DOES take with a value the tool will not accept is not a
 /// mistake this command can judge, so it is sent on: the product refuses it, and
 /// that is a failed operation.
-fn parse_flags(operation: &Operation, tokens: &[String]) -> Result<Tail, String> {
+///
+/// `action` is the tool's own action for the call, and `None` for a family whose
+/// tool takes no `action` at all — there `operation_word` is the family's own
+/// word, since the family word IS the operation.
+fn parse_flags(
+    action: Option<&'static str>,
+    operation_word: &str,
+    flags: &'static [Flag],
+    tokens: &[String],
+) -> Result<Tail, String> {
     let mut args = serde_json::Map::new();
-    args.insert(
-        "action".to_string(),
-        serde_json::Value::String(operation.action.to_string()),
-    );
+    if let Some(action) = action {
+        args.insert(
+            "action".to_string(),
+            serde_json::Value::String(action.to_string()),
+        );
+    }
     let mut secrets = Vec::new();
     // The flags already given, so a `Value`/`Present` repeat is refused instead
     // of silently keeping the last one, and the `List` entries, which only
     // become the array at the end.
     let mut given: Vec<&'static str> = Vec::new();
     let mut lists: Vec<(&'static str, Vec<serde_json::Value>)> = Vec::new();
-    let spellings: Vec<String> = operation
-        .flags
-        .iter()
-        .map(|flag| flag_spelling(flag.arg))
-        .collect();
+    let spellings: Vec<String> = flags.iter().map(|flag| flag_spelling(flag.arg)).collect();
 
     let mut rest = tokens.iter();
     while let Some(token) = rest.next() {
@@ -696,9 +792,9 @@ fn parse_flags(operation: &Operation, tokens: &[String]) -> Result<Tail, String>
             grammar::Token::Flag { name, inline } => (name, inline),
         };
         let Some(index) = spellings.iter().position(|spelling| spelling == name) else {
-            return Err(grammar::unknown_flag(name, &operation.word()));
+            return Err(grammar::unknown_flag(name, operation_word));
         };
-        let flag = &operation.flags[index];
+        let flag = &flags[index];
 
         if !matches!(flag.kind, FlagKind::List) {
             if given.contains(&flag.arg) {
@@ -793,29 +889,72 @@ fn family_help(family: &Family) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "mahbot {} — {}", family.word, family.purpose);
     out.push_str(RUNNING_CONTRACT_HELP);
-    let _ = write!(
-        out,
-        "\nEvery operation below is run by the same `{}` tool the owner's assistant calls, so this \
-         command line offers exactly the operations that tool offers.\n",
-        family.tool
-    );
-    let _ = write!(out, "\nUsage: mahbot {} <operation> [flags]\n", family.word);
-    out.push_str("\nOperations:\n");
-    let width = family
-        .operations
-        .iter()
-        .map(|operation| operation.word().len())
-        .max()
-        .unwrap_or_default();
-    for operation in family.operations {
-        let _ = writeln!(out, "  {:<width$}  {}", operation.word(), operation.purpose);
+    match family.surface {
+        Surface::Operations(operations) => {
+            let _ = write!(
+                out,
+                "\nEvery operation below is run by the same `{}` tool the owner's assistant \
+                 calls, so this command line offers exactly the operations that tool offers.\n",
+                family.tool
+            );
+            let _ = write!(out, "\nUsage: mahbot {} <operation> [flags]\n", family.word);
+            out.push_str("\nOperations:\n");
+            let width = operations
+                .iter()
+                .map(|operation| operation.word().len())
+                .max()
+                .unwrap_or_default();
+            for operation in operations {
+                let _ = writeln!(out, "  {:<width$}  {}", operation.word(), operation.purpose);
+            }
+            out.push_str(
+                "\nFlags:\n  None are common to every operation: a flag belongs to the operation \
+                 whose tool argument it names.\n\n  -h, --help  Print this help and exit\n",
+            );
+        }
+        // The family word IS the operation, so there is no operation list below
+        // and nothing to say about how one of them is run.
+        Surface::Standalone(flags) => {
+            let _ = write!(out, "\nUsage: mahbot {} [flags]\n", family.word);
+            out.push_str("\nFlags:\n");
+            out.push_str(&flag_rows(flags));
+            out.push_str("\n  -h, --help  Print this help and exit\n");
+        }
     }
-    out.push_str(
-        "\nFlags:\n  None are common to every operation: a flag belongs to the operation whose \
-         tool argument it names.\n\n  -h, --help  Print this help and exit\n",
-    );
     out.push_str(EXIT_CLASS_HELP);
     out.push_str(OUTPUT_HELP);
+    out
+}
+
+/// The flag table of a help: one width-aligned row per flag, a secret's value
+/// never echoed here because it is never echoed anywhere.
+fn flag_rows(flags: &[Flag]) -> String {
+    let rows: Vec<(String, String)> = flags
+        .iter()
+        .map(|flag| {
+            let mut spelling = format!("--{}", flag_spelling(flag.arg));
+            match flag.kind {
+                FlagKind::Value => spelling.push_str(" <value>"),
+                FlagKind::List => spelling.push_str(" <value> (repeatable; empty clears the list)"),
+                FlagKind::Present => {}
+            }
+            let description = if flag.secret {
+                format!("{} — the value is never echoed or recorded", flag.purpose)
+            } else {
+                flag.purpose.to_string()
+            };
+            (spelling, description)
+        })
+        .collect();
+    let width = rows
+        .iter()
+        .map(|(spelling, _)| spelling.len())
+        .max()
+        .unwrap_or_default();
+    let mut out = String::new();
+    for (spelling, description) in rows {
+        let _ = writeln!(out, "  {spelling:<width$}  {description}");
+    }
     out
 }
 
@@ -841,32 +980,7 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
     if operation.flags.is_empty() {
         out.push_str("  none\n");
     }
-    let rows: Vec<(String, String)> = operation
-        .flags
-        .iter()
-        .map(|flag| {
-            let mut spelling = format!("--{}", flag_spelling(flag.arg));
-            match flag.kind {
-                FlagKind::Value => spelling.push_str(" <value>"),
-                FlagKind::List => spelling.push_str(" <value> (repeatable; empty clears the list)"),
-                FlagKind::Present => {}
-            }
-            let description = if flag.secret {
-                format!("{} — the value is never echoed or recorded", flag.purpose)
-            } else {
-                flag.purpose.to_string()
-            };
-            (spelling, description)
-        })
-        .collect();
-    let width = rows
-        .iter()
-        .map(|(spelling, _)| spelling.len())
-        .max()
-        .unwrap_or_default();
-    for (spelling, description) in rows {
-        let _ = writeln!(out, "  {spelling:<width$}  {description}");
-    }
+    out.push_str(&flag_rows(operation.flags));
     out.push_str(RUNNING_CONTRACT_HELP);
     out.push_str(EXIT_CLASS_HELP);
     out.push_str(OUTPUT_HELP);
@@ -883,33 +997,54 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
 /// reads — see [`Exit`].
 pub async fn run(cli: Cli, args: &[String]) -> i32 {
     let family = cli.0;
-
-    let Some(operation_word) = args.first().map(String::as_str) else {
-        return misuse(family, "no operation was given");
-    };
-    if grammar::is_help(operation_word) {
-        crate::util::print_stdout(&family_help(family));
-        return Exit::Ok.code();
-    }
-    let Some(operation) = family
-        .operations
-        .iter()
-        .find(|operation| operation.word() == operation_word)
-    else {
-        return misuse(family, &format!("unknown operation '{operation_word}'"));
-    };
-    let parsed = match parse_flags(operation, &args[1..]) {
-        Ok(Tail::Call(parsed)) => parsed,
-        // A `-h`/`--help` where a flag could stand is this operation's help — the
-        // same rule the browser-automation command follows, and it turns a
-        // would-be usage error into help rather than the other way round. A
-        // `-h` where a VALUE stands is that value instead (see `parse_flags`):
-        // a script must never read success for an operation that did not run.
-        Ok(Tail::Help) => {
-            crate::util::print_stdout(&operation_help(family, operation));
-            return Exit::Ok.code();
+    let parsed = match family.surface {
+        Surface::Operations(operations) => {
+            let Some(operation_word) = args.first().map(String::as_str) else {
+                return misuse(family, "no operation was given");
+            };
+            if grammar::is_help(operation_word) {
+                crate::util::print_stdout(&family_help(family));
+                return Exit::Ok.code();
+            }
+            let Some(operation) = operations
+                .iter()
+                .find(|operation| operation.word() == operation_word)
+            else {
+                return misuse(family, &format!("unknown operation '{operation_word}'"));
+            };
+            match parse_flags(
+                Some(operation.action),
+                &operation.word(),
+                operation.flags,
+                &args[1..],
+            ) {
+                Ok(Tail::Call(parsed)) => parsed,
+                // A `-h`/`--help` where a flag could stand is this operation's
+                // help — the same rule the browser-automation command follows,
+                // and it turns a would-be usage error into help rather than the
+                // other way round. A `-h` where a VALUE stands is that value
+                // instead (see `parse_flags`): a script must never read success
+                // for an operation that did not run.
+                Ok(Tail::Help) => {
+                    crate::util::print_stdout(&operation_help(family, operation));
+                    return Exit::Ok.code();
+                }
+                Err(reason) => return misuse(family, &reason),
+            }
         }
-        Err(reason) => return misuse(family, &reason),
+        // The family word IS the operation: the tool takes no `action`, so the
+        // first token is already a flag. A bare `mahbot send` therefore sends
+        // nothing and the product refuses it as the missing message — a failed
+        // operation, exactly as a missing required flag is for every other
+        // family (this frontend never judges what the tool requires).
+        Surface::Standalone(flags) => match parse_flags(None, family.word, flags, args) {
+            Ok(Tail::Call(parsed)) => parsed,
+            Ok(Tail::Help) => {
+                crate::util::print_stdout(&family_help(family));
+                return Exit::Ok.code();
+            }
+            Err(reason) => return misuse(family, &reason),
+        },
     };
 
     // These commands act ON the running product and have no other way to run,
@@ -970,7 +1105,7 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
     };
     let decision = verdict(
         family.word,
-        crate::db::ipc::ipc_call_with_wait(&root, &call).await,
+        crate::db::ipc::ipc_call_with_wait(&root, &call, family.protocol).await,
     );
     if let Some(answer) = decision.answer {
         crate::util::print_stdout(&answer);
@@ -1083,8 +1218,8 @@ fn verdict(word: &str, attempt: CallAttempt) -> Verdict {
         CallAttempt::TooOld => Verdict {
             answer: None,
             diagnostic: Some(format!(
-                "mahbot {word}: the running product was built before these commands existed, so \
-                 it cannot serve them — restart it from this build and try again"
+                "mahbot {word}: the running product is older than this command line and cannot \
+                 serve its operations — restart it from this build and try again"
             )),
             code: Exit::Environment,
         },
@@ -1172,19 +1307,38 @@ mod tests {
     /// The registry a test parses against: `mahbot <family> <operation>`.
     fn operation(family_word: &str, operation_word: &str) -> &'static Operation {
         family(family_word)
-            .and_then(|cli| {
-                cli.0
-                    .operations
+            .and_then(|cli| match cli.0.surface {
+                Surface::Operations(operations) => operations
                     .iter()
-                    .find(|entry| entry.word() == operation_word)
+                    .find(|entry| entry.word() == operation_word),
+                Surface::Standalone(_) => None,
             })
             .unwrap_or_else(|| panic!("no 'mahbot {family_word} {operation_word}' command line"))
     }
 
     /// Parse an operation's flag tail, as one list of tokens.
     fn parse(family: &str, operation_word: &str, tokens: &[&str]) -> Result<Tail, String> {
+        let operation = operation(family, operation_word);
         parse_flags(
-            operation(family, operation_word),
+            Some(operation.action),
+            &operation.word(),
+            operation.flags,
+            &tokens.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        )
+    }
+
+    /// Parse a standalone family's flag tail: it has no operation word, so the
+    /// whole tail is flags.
+    fn parse_standalone(family_word: &str, tokens: &[&str]) -> Result<Tail, String> {
+        let cli =
+            family(family_word).unwrap_or_else(|| panic!("'mahbot {family_word}' is no family"));
+        let Surface::Standalone(flags) = cli.0.surface else {
+            panic!("'mahbot {family_word}' is not a standalone family");
+        };
+        parse_flags(
+            None,
+            cli.0.word,
+            flags,
             &tokens.iter().map(ToString::to_string).collect::<Vec<_>>(),
         )
     }
@@ -1197,13 +1351,40 @@ mod tests {
         }
     }
 
+    /// A standalone parse that must yield a call.
+    fn parsed_standalone(family_word: &str, tokens: &[&str]) -> Parsed {
+        match parse_standalone(family_word, tokens) {
+            Ok(Tail::Call(parsed)) => parsed,
+            Ok(Tail::Help) => panic!("'mahbot {family_word}' must not ask for help"),
+            Err(e) => panic!("'mahbot {family_word}' must parse: {e}"),
+        }
+    }
+
     /// The command line and its tool must agree on what exists, in both
     /// directions: an operation the tool cannot run, an action the command line
-    /// cannot reach, and a duplicate on either side all fail here.
+    /// cannot reach, and a duplicate on either side all fail here. A standalone
+    /// family has no operation word at all, so its tool has no `action` either:
+    /// the family word IS its operation.
     #[test]
     fn operations_match_the_tools_own_actions() {
         for family in FAMILIES {
             let schema = tool_schema(family);
+            let operations = match family.surface {
+                Surface::Operations(operations) => operations,
+                Surface::Standalone(flags) => {
+                    assert!(
+                        !flags.is_empty(),
+                        "the standalone '{}' family is its own operation and publishes no flag",
+                        family.word
+                    );
+                    assert!(
+                        schema["properties"].get("action").is_none(),
+                        "'{}' publishes no operation, but its tool takes an `action`",
+                        family.tool
+                    );
+                    continue;
+                }
+            };
             let mut theirs: Vec<&str> = schema["properties"]["action"]["enum"]
                 .as_array()
                 .expect("the tool's action enum")
@@ -1212,7 +1393,7 @@ mod tests {
                 .collect();
 
             assert!(
-                duplicates(family.operations.iter().map(|operation| operation.action)).is_empty(),
+                duplicates(operations.iter().map(|operation| operation.action)).is_empty(),
                 "the '{}' command line repeats an action",
                 family.word
             );
@@ -1222,8 +1403,7 @@ mod tests {
                 family.tool
             );
 
-            let mut ours: Vec<&str> = family
-                .operations
+            let mut ours: Vec<&str> = operations
                 .iter()
                 .map(|operation| operation.action)
                 .collect();
@@ -1239,7 +1419,9 @@ mod tests {
 
     /// Every flag must be an argument the tool actually reads, and every
     /// argument the tool reads — bar the action — must have a command-line form,
-    /// so a new argument cannot silently arrive with no way to set it.
+    /// so a new argument cannot silently arrive with no way to set it. A
+    /// standalone family's flags are its whole surface: it has no operation to
+    /// hang them on, so they are swept here as well.
     #[test]
     fn flags_stay_tied_to_the_tools_own_arguments() {
         for family in FAMILIES {
@@ -1247,15 +1429,28 @@ mod tests {
             let properties = schema["properties"]
                 .as_object()
                 .expect("the tool's properties");
+            // One command line of the family with the flags it carries: each
+            // operation's own, or — the family word being the operation — the
+            // whole standalone surface.
+            let command_lines: Vec<(String, &'static [Flag])> = match family.surface {
+                Surface::Operations(operations) => operations
+                    .iter()
+                    .map(|operation| {
+                        (
+                            format!("{} {}", family.word, operation.word()),
+                            operation.flags,
+                        )
+                    })
+                    .collect(),
+                Surface::Standalone(flags) => vec![(family.word.to_string(), flags)],
+            };
             let mut reachable: Vec<&str> = Vec::new();
-            for operation in family.operations {
+            for (command_line, flags) in command_lines {
                 assert!(
-                    duplicates(operation.flags.iter().map(|flag| flag.arg)).is_empty(),
-                    "'mahbot {} {}' repeats a flag",
-                    family.word,
-                    operation.word()
+                    duplicates(flags.iter().map(|flag| flag.arg)).is_empty(),
+                    "'mahbot {command_line}' repeats a flag"
                 );
-                for flag in operation.flags {
+                for flag in flags {
                     let property = properties.get(flag.arg).unwrap_or_else(|| {
                         panic!("'{}' is not an argument of '{}'", flag.arg, family.tool)
                     });
@@ -1293,6 +1488,33 @@ mod tests {
         }
     }
 
+    /// Every family declares a protocol value the listener serves. Both sides are
+    /// plain strings in different modules, so nothing else can see a family sent
+    /// under a value the IPC layer does not recognise — every call of it would
+    /// come back as an unknown store (see [`crate::db::ipc`]).
+    #[test]
+    fn every_family_carries_a_protocol_value_the_listener_serves() {
+        for cli in FAMILIES {
+            assert!(
+                crate::db::ipc::CALL_STORES.contains(&cli.protocol),
+                "'mahbot {}' carries '{}', which the listener does not serve",
+                cli.word,
+                cli.protocol
+            );
+        }
+        // Only a family THIS build adds carries the current value: every family
+        // the channel has already served keeps the value those builds know, so a
+        // product one build behind still serves it rather than being told to
+        // restart. The list is the checkpoint — a new family means deciding,
+        // deliberately, which of the two it is.
+        let current: Vec<&str> = FAMILIES
+            .iter()
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE)
+            .map(|cli| cli.word)
+            .collect();
+        assert_eq!(current, vec!["send"], "the family this build adds");
+    }
+
     /// The instance serves a tool by NAME only when a family publishes it, so
     /// the owner's other tools are not reachable through the channel however
     /// privileged the socket is. The three named below are the checkpoint: a
@@ -1310,14 +1532,30 @@ mod tests {
     /// Both helps carry the whole contract: that the product must be running,
     /// that these commands act with the owner's authority, and the exit classes a
     /// script reads — a caller entering through one operation's own help must
-    /// learn no less than one reading the family's.
+    /// learn no less than one reading the family's. A standalone family has no
+    /// operation help to enter through, so its family help must carry its usage
+    /// line and every flag row itself.
     #[test]
     fn every_help_states_the_running_product_and_the_exit_classes() {
         for family in FAMILIES {
-            let helps = [
-                family_help(family),
-                operation_help(family, &family.operations[0]),
-            ];
+            let helps = match family.surface {
+                Surface::Operations(operations) => {
+                    vec![family_help(family), operation_help(family, &operations[0])]
+                }
+                Surface::Standalone(flags) => {
+                    let help = family_help(family);
+                    let usage = format!("Usage: mahbot {} [flags]", family.word);
+                    assert!(help.contains(&usage), "'{usage}' is missing from:\n{help}");
+                    for flag in flags {
+                        let spelling = format!("--{}", flag_spelling(flag.arg));
+                        assert!(
+                            help.contains(&spelling),
+                            "'{spelling}' has no row in:\n{help}"
+                        );
+                    }
+                    vec![help]
+                }
+            };
             for help in helps {
                 for required in [
                     "must be running",
@@ -1325,6 +1563,7 @@ mod tests {
                     "Exit codes:",
                     "0  the operation was carried out",
                     "3  this command was misused",
+                    "Output:",
                 ] {
                     assert!(
                         help.contains(required),
@@ -1569,6 +1808,42 @@ mod tests {
         );
     }
 
+    /// A family whose tool takes no `action` at all: the family word IS the
+    /// operation, so what it sends carries no `action` key and an absent flag
+    /// leaves no key.
+    #[test]
+    fn a_family_with_no_actions_is_its_own_operation() {
+        let sent = parsed_standalone(
+            "send",
+            &[
+                "--message",
+                "do the thing",
+                "--addressee",
+                "manager",
+                "--place",
+                "proj",
+            ],
+        );
+        assert_eq!(
+            sent.args,
+            serde_json::json!({
+                "message": "do the thing",
+                "addressee": "manager",
+                "place": "proj",
+            })
+        );
+        assert!(sent.secrets.is_empty(), "no flag of 'send' is a secret");
+        assert!(
+            sent.args.get("branch").is_none(),
+            "an absent flag leaves no key: {}",
+            sent.args
+        );
+
+        // The required flags are the tool's own judgement, not this frontend's:
+        // a bare family word sends an args object with no key at all.
+        assert_eq!(parsed_standalone("send", &[]).args, serde_json::json!({}));
+    }
+
     /// The exit classes are the browser-automation command's own numbering,
     /// class for class — a script that reads exit codes must not have to learn a
     /// second table. Asserted against that table rather than restated, so the
@@ -1676,7 +1951,7 @@ mod tests {
             too_old
                 .diagnostic
                 .as_deref()
-                .is_some_and(|line| line.contains("built before") && line.contains("restart")),
+                .is_some_and(|line| line.contains("older") && line.contains("restart")),
             "a too-old product must say what to do: {:?}",
             too_old.diagnostic
         );
@@ -1705,12 +1980,13 @@ mod tests {
     /// the answer, and this test has neither.
     #[tokio::test]
     async fn misuse_is_exit_3_before_the_environment_is_probed() {
-        let invocations: [&[&str]; 5] = [
+        let invocations: [&[&str]; 6] = [
             &["config"],
             &["config", "no-such-operation"],
             &["workspace", "list", "--nope", "x"],
             &["workspace", "list", "--workspace"],
             &["workspace", "list", "proj"],
+            &["send", "--nope"],
         ];
         for invocation in invocations {
             let args = invocation

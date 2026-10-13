@@ -10,7 +10,8 @@
 //!
 //! The same socket carries two request shapes:
 //! - the read-only diagnostic query it always did, and
-//! - a command-line operation (`mahbot config …` / `mahbot workspace …`),
+//! - a command-line operation (`mahbot config …` / `mahbot workspace …` /
+//!   `mahbot send …`),
 //!   carried in the SAME frame with an extra `call` field.
 //!
 //! Protocol (length-prefixed JSON over a local socket stream):
@@ -20,14 +21,25 @@
 //!   for a diagnostic query and `CallReply` for an operation.
 //!
 //! The compatibility rule is why the operation rides the old frame instead of a
-//! new one: an operation frame carries the magic `store` value [`CALL_STORE`],
-//! so a product built before this channel existed parses the frame as an
-//! ordinary diagnostic query and refuses it as an unknown store — a clear
-//! refusal of the environment class ("this product does not serve that here")
-//! rather than a protocol complaint about a frame it cannot read. A new frame
-//! type, or any shape the old product could parse as something else, would
-//! answer something misleading or nothing at all; a superset of the old frame
-//! is the only shape that degrades honestly.
+//! new one: an operation frame carries a magic `store` value — the value of the
+//! command-line surface generation its family declares ([`CALL_STORE`] /
+//! [`CALL_STORE_BASE`]), never a store name — so a product that does not know it
+//! parses the frame as an ordinary diagnostic query and refuses it as an unknown
+//! store: a clear refusal of the environment class ("this product does not serve
+//! that here") rather than a protocol complaint about a frame it cannot read. A
+//! new frame type, or any shape the old product could parse as something else,
+//! would answer something misleading or nothing at all; a superset of the old
+//! frame is the only shape that degrades honestly.
+//!
+//! The value belongs to the FAMILY, because a family is what an older product
+//! either serves or would misanswer: every family the channel has already served
+//! carries the generation that served it, so it keeps working against a product
+//! one build behind, and only a family added since carries a value that product
+//! does not know. This build serves every generation at once ([`CALL_STORES`])
+//! while its frontend sends the one its family declares, so the degradation runs
+//! both ways: a product older than the frontend does not know what the frontend
+//! sends for such a family, and a frontend older than the product sends the
+//! value of the generation it was built in.
 //!
 //! The call channel is same-user-only, exactly like the diagnostic one, and it
 //! is FAIL-CLOSED: when the socket could not be restricted to the instance's
@@ -198,7 +210,7 @@ impl WireValue {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IpcRequest {
-    pub store: String, // "core" or "logs" (physical store names), or CALL_STORE
+    pub store: String, // "core" or "logs" (physical store names), or the call's protocol value (CALL_STORES)
     pub sql: String,
     #[serde(default)]
     pub params: Vec<WireValue>,
@@ -208,10 +220,21 @@ pub(crate) struct IpcRequest {
     pub call: Option<CallRequest>,
 }
 
-/// The store name an operation frame carries. Chosen so a product built
-/// before this channel parses the frame as a diagnostic query and answers
-/// "unknown store" — see the module doc.
-pub(crate) const CALL_STORE: &str = "cli";
+/// The CURRENT operation-frame PROTOCOL value: what a family this build adds
+/// carries, so a product built before it refuses the frame as an unknown store —
+/// the environment's class, and the truth (nothing ran) — instead of answering a
+/// call it cannot carry out as a failed operation. Bump it when a family is
+/// added that an older product would misanswer that way.
+pub(crate) const CALL_STORE: &str = "cli2";
+
+/// The value every family the channel has already served carries: any product
+/// that knows the operation channel at all serves it, so those families keep
+/// working against a product one build behind instead of being told to restart.
+pub(crate) const CALL_STORE_BASE: &str = "cli";
+
+/// Every protocol value this build serves — one per generation of the command
+/// line's surface.
+pub(crate) const CALL_STORES: &[&str] = &[CALL_STORE, CALL_STORE_BASE];
 
 /// One command-line operation: the tool the frontend addressed and the
 /// arguments it passed, plus the values the caller handed over as secrets.
@@ -245,9 +268,9 @@ pub(crate) enum CallOutcome {
     NotAccepted,
     /// The instance cannot take this operation on and nothing ran — either it
     /// can never serve operations (a socket it could not restrict to the owner,
-    /// a boot that failed) or it is not ready yet. The client does not retry it
-    /// inside one command invocation; the instance's own sentence says whether a
-    /// later attempt may help.
+    /// a boot that failed), it fronts no family for the named tool, or it is not
+    /// ready yet. The client does not retry it inside one command invocation; the
+    /// instance's own sentence says whether a later attempt may help.
     Unavailable,
 }
 
@@ -411,13 +434,14 @@ async fn handle_connection(
     };
 
     // The operation shape: the magic store plus its `call`. A frame that names
-    // the store and carries nothing to run is malformed — no client writes
-    // `store = "cli"` for a diagnostic query — and is answered exactly like a
-    // frame that failed to decode.
-    if req.store == CALL_STORE {
+    // one of the protocol values this build serves and carries nothing to run is
+    // malformed — no client writes an operation store for a diagnostic query —
+    // and is answered exactly like a frame that failed to decode.
+    if CALL_STORES.contains(&req.store.as_str()) {
         let Some(call) = req.call else {
             let resp = malformed_response(format!(
-                "store \"{CALL_STORE}\" carries no `call` to operate"
+                "store \"{}\" carries no `call` to operate",
+                req.store
             ));
             write_json_frame(&mut stream, &resp).await?;
             return Ok(());
@@ -714,8 +738,9 @@ pub(crate) enum CallAttempt {
     /// instance's own wording — which the caller prints as this command's
     /// diagnostic; nothing re-wraps it.
     NotServed(String),
-    /// The product answered in a form this command cannot read — i.e. it was
-    /// built before the channel existed.
+    /// The product does not know the protocol value this call carried: it was
+    /// built before the channel existed, or before the generation that value
+    /// names. Nothing ran.
     TooOld,
     /// The exchange did not produce a decodable answer: either the frame went
     /// out and the exchange was severed before the product answered, or a reply
@@ -732,15 +757,17 @@ pub(crate) enum CallAttempt {
 /// which is the instance itself saying it did not take the operation on, so it
 /// reads as "nothing ran, may be served later" rather than as an answer.
 ///
-/// Anything else is examined for the one pre-channel shape: a product built
-/// before this channel parses the operation frame as an ordinary diagnostic
-/// query and refuses the magic store, so a `QueryResponse` whose error is
-/// `unknown store 'cli'` is [`TooOld`] — a definite "this product predates the
-/// channel", not an unreadable/severed answer.
+/// Anything else is examined for the unknown-store shape: a product that does
+/// not know the protocol value this call carried parses the operation frame as
+/// an ordinary diagnostic query and refuses that store, so a `QueryResponse`
+/// whose error is `unknown store '<the value the call carried>'` is [`TooOld`] —
+/// a definite "this product cannot serve what this command line sends" (one
+/// built before the channel, or before the generation that value names), not an
+/// unreadable/severed answer.
 ///
 /// [`NotAccepted`]: CallOutcome::NotAccepted
 /// [`TooOld`]: CallAttempt::TooOld
-fn classify_reply(payload: &[u8]) -> CallAttempt {
+fn classify_reply(payload: &[u8], protocol: &str) -> CallAttempt {
     if let Ok(reply) = serde_json::from_slice::<CallReply>(payload) {
         return match reply.outcome {
             CallOutcome::NotAccepted => CallAttempt::NotServed(reply.answer),
@@ -751,7 +778,7 @@ fn classify_reply(payload: &[u8]) -> CallAttempt {
         && resp
             .error
             .as_deref()
-            .is_some_and(|e| e.contains(&format!("unknown store '{CALL_STORE}'")))
+            .is_some_and(|e| e.contains(&format!("unknown store '{protocol}'")))
     {
         return CallAttempt::TooOld;
     }
@@ -791,7 +818,10 @@ fn call_not_served(socket: &Path, detail: &str) -> String {
 /// [`call_not_served`] composes for a pre-write failure, or the instance's own
 /// answer text when it said it did not accept the operation. Nothing re-wraps
 /// either.
-async fn ipc_call_once(storage_root: &Path, call: &CallRequest) -> CallAttempt {
+///
+/// `protocol` is the value the call's family declares (see [`crate::cli`]) and is
+/// what the frame's magic `store` carries.
+async fn ipc_call_once(storage_root: &Path, call: &CallRequest, protocol: &str) -> CallAttempt {
     let socket = socket_path(storage_root);
     let name = match socket.as_path().to_fs_name::<GenericFilePath>() {
         Ok(name) => name,
@@ -804,7 +834,7 @@ async fn ipc_call_once(storage_root: &Path, call: &CallRequest) -> CallAttempt {
         Err(e) => return CallAttempt::NotServed(call_not_served(&socket, &e.to_string())),
     };
     let req = IpcRequest {
-        store: CALL_STORE.to_string(),
+        store: protocol.to_string(),
         // Never reached on the operation shape — the store branch dispatches on
         // `call` before the SQL is looked at.
         sql: String::new(),
@@ -819,7 +849,7 @@ async fn ipc_call_once(storage_root: &Path, call: &CallRequest) -> CallAttempt {
         return CallAttempt::NotServed(call_not_served(&socket, &e.to_string()));
     }
     match read_frame(&mut stream).await {
-        Ok(payload) => classify_reply(&payload),
+        Ok(payload) => classify_reply(&payload, protocol),
         Err(e) => CallAttempt::Severed(
             anyhow::Error::new(e).context("the answer could not be read off the exchange"),
         ),
@@ -848,8 +878,8 @@ async fn ipc_call_once(storage_root: &Path, call: &CallRequest) -> CallAttempt {
 /// circumstance: it reads the answer with NO timeout (an operation the product
 /// is still performing is never given up on), and a read error, EOF or an
 /// undecodable reply is [`CallAttempt::Severed`] — or [`CallAttempt::TooOld`]
-/// when it decodes as the pre-channel shape (a `QueryResponse` whose `error`
-/// contains `unknown store 'cli'`).
+/// when it decodes as the unknown-store shape (a `QueryResponse` whose `error`
+/// contains `unknown store '<the value this build sent>'`).
 ///
 /// This deliberately does NOT go through the diagnostic path's [`ipc_query`]:
 /// that one puts a five-second bound on every attempt, which would give up on an
@@ -857,11 +887,15 @@ async fn ipc_call_once(storage_root: &Path, call: &CallRequest) -> CallAttempt {
 ///
 /// [`NotAccepted`]: CallOutcome::NotAccepted
 /// [`Unavailable`]: CallOutcome::Unavailable
-pub(crate) async fn ipc_call_with_wait(storage_root: &Path, call: &CallRequest) -> CallAttempt {
+pub(crate) async fn ipc_call_with_wait(
+    storage_root: &Path,
+    call: &CallRequest,
+    protocol: &str,
+) -> CallAttempt {
     let deadline = std::time::Instant::now() + ipc_bound_timeout();
     let mut attempt = 0usize;
     loop {
-        let reason = match ipc_call_once(storage_root, call).await {
+        let reason = match ipc_call_once(storage_root, call, protocol).await {
             CallAttempt::NotServed(reason) => reason,
             other => return other,
         };
@@ -895,7 +929,9 @@ mod tests {
         );
 
         let operation = serde_json::to_value(IpcRequest {
-            store: CALL_STORE.to_string(),
+            // The `workspace` family's own protocol value: the generation that
+            // served it, not the current one the `send` family carries.
+            store: CALL_STORE_BASE.to_string(),
             sql: String::new(),
             params: Vec::new(),
             call: Some(CallRequest {
@@ -905,7 +941,7 @@ mod tests {
             }),
         })
         .unwrap();
-        assert_eq!(operation["store"], CALL_STORE);
+        assert_eq!(operation["store"], CALL_STORE_BASE);
         assert_eq!(operation["call"]["tool"], "workspace");
     }
 
@@ -926,7 +962,7 @@ mod tests {
             args: serde_json::json!({ "action": "list" }),
             secrets: Vec::new(),
         };
-        match crate::db::ipc::ipc_call_with_wait(dir.path(), &call).await {
+        match crate::db::ipc::ipc_call_with_wait(dir.path(), &call, CALL_STORE_BASE).await {
             CallAttempt::NotServed(reason) => {
                 assert!(
                     reason.contains(&socket_path(dir.path()).display().to_string()),
@@ -943,34 +979,36 @@ mod tests {
 
     /// The client's classification of one reply frame. A `not_accepted` reply
     /// is the retryable "nothing ran" and an `unavailable` one is final; a
-    /// product built before the channel answers the operation frame as an
-    /// ordinary diagnostic query whose store it refuses, and that exact shape
-    /// must read as `TooOld` rather than as an unreadable/severed answer.
+    /// product that does not know this build's protocol value answers the
+    /// operation frame as an ordinary diagnostic query whose store it refuses,
+    /// and that exact shape must read as `TooOld` rather than as an
+    /// unreadable/severed answer.
     #[test]
     fn replies_classify_as_answered_retryable_or_too_old() {
         let retryable = serde_json::to_vec(&CallReply::not_accepted("still starting")).unwrap();
         assert!(matches!(
-            classify_reply(&retryable),
+            classify_reply(&retryable, CALL_STORE),
             CallAttempt::NotServed(reason) if reason == "still starting"
         ));
 
         let final_reply = serde_json::to_vec(&CallReply::unavailable("no channel")).unwrap();
         assert!(matches!(
-            classify_reply(&final_reply),
+            classify_reply(&final_reply, CALL_STORE),
             CallAttempt::Answered(reply) if reply.outcome == CallOutcome::Unavailable
         ));
 
-        // The exact JSON an old build returns for `store = "cli"`.
+        // The exact JSON a product that does not know the value the call carried
+        // returns.
         let old = serde_json::to_vec(&serde_json::json!({
             "columns": [],
             "rows": [],
-            "error": "unknown store 'cli' (expected \"core\" or \"logs\")",
+            "error": format!("unknown store '{CALL_STORE}' (expected \"core\" or \"logs\")"),
             "truncated": false,
         }))
         .unwrap();
         assert!(
-            matches!(classify_reply(&old), CallAttempt::TooOld),
-            "a pre-channel refusal is TooOld"
+            matches!(classify_reply(&old, CALL_STORE), CallAttempt::TooOld),
+            "an unknown-store refusal is TooOld"
         );
 
         // Any other diagnostic error is an answer this command cannot read, and
@@ -982,7 +1020,7 @@ mod tests {
             "truncated": false,
         }))
         .unwrap();
-        match classify_reply(&other_error) {
+        match classify_reply(&other_error, CALL_STORE) {
             CallAttempt::Severed(e) => assert!(
                 e.to_string().contains("cannot read"),
                 "the severed answer names the unreadable reply: {e}"
@@ -1106,12 +1144,15 @@ mod tests {
     }
 
     /// End-to-end: the same listener serves the OPERATION shape of a frame —
-    /// `handle_connection` reads the `call` off `store = CALL_STORE` and routes
-    /// it through the instance-side executor, and the client reads the
-    /// instance's own `CallReply` back. The tool here is one the owner's own
-    /// toolset does not hold, so the operation is refused before any store
-    /// access — enough to prove the frame is served as an operation and not as
-    /// a diagnostic query. `serial(ipc_bound)`: shares the listener-bound retry
+    /// `handle_connection` reads the `call` off a protocol value it serves and
+    /// routes it through the instance-side executor, and the client reads the
+    /// instance's own `CallReply` back. The tool here is one no family fronts —
+    /// the executor's own guard against a frame this build's value never carries
+    /// in practice — so the frame is served as an operation and refused as
+    /// something the product cannot take on at all, with the restart the
+    /// environment's class carries — enough to prove the frame is served as an
+    /// operation and not as a diagnostic query.
+    /// `serial(ipc_bound)`: shares the listener-bound retry
     /// with the diagnostic e2e test above.
     #[serial_test::serial(ipc_bound)]
     #[tokio::test]
@@ -1132,11 +1173,11 @@ mod tests {
             args: serde_json::json!({}),
             secrets: Vec::new(),
         };
-        match crate::db::ipc::ipc_call_with_wait(&root, &call).await {
+        match crate::db::ipc::ipc_call_with_wait(&root, &call, CALL_STORE).await {
             CallAttempt::Answered(reply) => {
                 assert_eq!(
                     reply.outcome,
-                    CallOutcome::Refused,
+                    CallOutcome::Unavailable,
                     "answer: {}",
                     reply.answer
                 );
@@ -1145,10 +1186,150 @@ mod tests {
                     "the refusal must name the tool: {}",
                     reply.answer
                 );
+                assert!(
+                    reply.answer.contains("restart it from this build"),
+                    "a product that cannot take the operation on says to restart: {}",
+                    reply.answer
+                );
             }
             _ => panic!("the operation frame must be served as an operation"),
         }
 
+        listener.abort();
+        let _ = listener.await;
+    }
+
+    /// End-to-end through the whole command line: the frame a `mahbot send`
+    /// invocation writes is served by the instance-side executor, which hands the
+    /// message to the owner's own assistant — the one-way send with no addressee
+    /// named, which is the command's default address. What comes back is the
+    /// product's own acknowledgement, the handover is durable in `pending_jobs`
+    /// when the caller reads it, the message reaches the assistant's
+    /// conversation, and it is persisted to the conversation's history as the
+    /// owner's own incoming message. The store is shared with the parallel tests,
+    /// so the test reclaims the durable row AND the conversation row it created —
+    /// no other test can pick the handover up and route it into a live turn.
+    /// `serial(ipc_bound, …)`: shares the listener-bound retry with the two e2e
+    /// tests above, and registers the owner's assistant consumer in the
+    /// process-global router, which the dispatch tests hold too.
+    #[serial_test::serial(ipc_bound, provider, channel_registry, drain)]
+    #[tokio::test]
+    async fn ipc_call_serves_the_one_way_send_end_to_end() {
+        crate::util::test::init_management_test_stores().await;
+        // The handover reaches the owner as an ordinary incoming message, so it
+        // mirrors to Telegram on the way — the registry must exist for that leg.
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        crate::cli::mark_ready();
+        let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let root = dir.path().to_path_buf();
+        let listener_root = root.clone();
+        let listener = tokio::spawn(async move {
+            crate::db::ipc::run_ipc_listener(&listener_root, std::sync::Arc::new(store)).await;
+        });
+
+        // Consume the routed envelope so the real agent run never starts.
+        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut rx = crate::agent::message_router::register_agent(&assistant);
+
+        // The durable rows outstanding before this call: the store is shared with
+        // the parallel tests, so what this call created is the DIFF it makes, never
+        // a bare count another test could satisfy.
+        let pending_before: std::collections::HashSet<String> =
+            crate::jobs::list_pending_jobs(&crate::session::store().conn)
+                .await
+                .expect("list pending")
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+
+        let call = CallRequest {
+            tool: "send".to_string(),
+            args: serde_json::json!({ "message": "from the command line" }),
+            secrets: Vec::new(),
+        };
+        match crate::db::ipc::ipc_call_with_wait(&root, &call, CALL_STORE).await {
+            CallAttempt::Answered(reply) => {
+                assert_eq!(reply.outcome, CallOutcome::Done, "answer: {}", reply.answer);
+                assert!(
+                    reply.answer.contains("assistant"),
+                    "the answer names the handover: {}",
+                    reply.answer
+                );
+            }
+            _ => panic!("the send frame must be served as an operation"),
+        }
+
+        let job = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the handover must reach the assistant")
+            .expect("the consumer must still be registered");
+        assert_eq!(job.content, "from the command line");
+        assert_eq!(job.channel, crate::cli::CHANNEL);
+
+        let created: Vec<crate::jobs::PendingJobRow> =
+            crate::jobs::list_pending_jobs(&crate::session::store().conn)
+                .await
+                .expect("list pending")
+                .into_iter()
+                .filter(|row| !pending_before.contains(&row.id))
+                .collect();
+        // The rows this call made, by the message only this call sent — a row a
+        // parallel test added to the shared store in the meantime is not ours and
+        // must not fail the assertion.
+        let mine: Vec<&crate::jobs::PendingJobRow> = created
+            .iter()
+            .filter(|row| row.envelope.contains("from the command line"))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "exactly the handover's own durable row: {created:?}"
+        );
+        let row = mine[0];
+        assert_eq!(
+            row.target_agent_id, assistant,
+            "the row is addressed to the assistant"
+        );
+
+        let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let (entries, _) = crate::channels::chat_history::store()
+            .load_recent(crate::users::ADMIN_USER_NAME, &workspace)
+            .await
+            .unwrap();
+        assert!(
+            entries.iter().any(|entry| {
+                entry.direction == crate::ChatDirection::User
+                    && entry.content == "from the command line"
+            }),
+            "the message is persisted as an incoming user message: {entries:?}"
+        );
+
+        // Reclaim BOTH rows this call created before the test ends: the store is
+        // shared with the parallel tests, and a leftover durable envelope can be
+        // picked up by a parallel scan (or replayed at the next boot) and routed
+        // into a live turn for the owner's assistant.
+        crate::jobs::delete_pending_job(&crate::session::store().conn, &row.id)
+            .await
+            .expect("reclaim the handover's row");
+        let message_id = entries
+            .iter()
+            .find(|entry| {
+                entry.direction == crate::ChatDirection::User
+                    && entry.content == "from the command line"
+            })
+            .expect("the conversation row's own entry")
+            .message_id
+            .clone();
+        crate::channels::chat_history::store()
+            .conn
+            .execute(
+                "DELETE FROM chat_history WHERE message_id = ?1",
+                crate::db::params![message_id],
+            )
+            .await
+            .expect("reclaim the conversation row");
+
+        crate::agent::message_router::unregister_agent(&assistant);
         listener.abort();
         let _ = listener.await;
     }

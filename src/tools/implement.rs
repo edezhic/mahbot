@@ -13,31 +13,136 @@ use crate::session::analyze_agent_id;
 use crate::{Role, Workspace};
 use anyhow::anyhow;
 
+/// Write a fresh round's durable rows — the jobs row and the single-coder
+/// roster, in ONE tx — and return the coder's agent id. The row fields come
+/// from the call's own [`CoreJobArgs`](crate::tools::CoreJobArgs) (the same
+/// bundle every durable sync core takes), whose spawn record must be present.
+/// The fresh-spawn half of [`run_implement_with_job`], shared with the command
+/// line's handover ([`hand_over_coder_round`]), which must have these rows down
+/// BEFORE it answers its caller.
+async fn spawn_implement_rows(
+    exec: &Workspace,
+    task: &str,
+    args: &crate::tools::CoreJobArgs<'_>,
+) -> anyhow::Result<String> {
+    // The helper's own precondition, a fault rather than a caller-facing refusal:
+    // rows are written for a FRESH dispatch only, and a fresh dispatch is exactly
+    // the call whose spawn record is present (a resume inserts no row — see
+    // [`CoreJobArgs::spawn`](crate::tools::CoreJobArgs::spawn)).
+    let Some(record) = args.spawn.as_ref() else {
+        return Err(super::internal_fault(
+            "a fresh coder dispatch carries no spawn record",
+        ));
+    };
+    let coder_agent_id =
+        analyze_agent_id(&exec.name, Role::Coder.as_str()) + &crate::generate_suffix();
+    // Single-coder roster: one tx puts the job + the coder row down before
+    // any session write (caller identity + task persisted on the rows).
+    let agents = vec![crate::jobs::NewAgent {
+        agent_id: coder_agent_id.clone(),
+        kind: crate::jobs::AgentKind::Coder,
+        idx: Some(0),
+        task: task.to_string(),
+    }];
+    crate::jobs::spawn_job(
+        &crate::session::store().conn,
+        args.job_id,
+        task,
+        record.delivery_name,
+        args.user_name,
+        args.channel,
+        args.caller_role,
+        &agents,
+        &crate::jobs::SpawnChild::Implement,
+        args.caller_agent_id,
+        // The round's execution directory (the caller's place, when one was
+        // asked for) so a restart resumes into the same directory.
+        record.exec_dir,
+        // The calling custom role's launch, when there is one, so a
+        // resume rebuilds an envelope addressed to its branch.
+        record.custom_launch,
+    )
+    .await?;
+    Ok(coder_agent_id)
+}
+
+/// The COMMAND LINE's handover of a coder round.
+///
+/// [`crate::tools::SyncDurableCore::spawn_dispatch`] answers its caller as soon
+/// as the round is started, which is right for an agent whose own turn is
+/// durable: the jobs row lands moments later and a restart resumes the round
+/// from it. The command line is answered and gone the moment it returns, so the
+/// round's durable rows are written FIRST (awaited) and the round then runs as a
+/// RESUME of its own rows — exactly the round a crash between the two would have
+/// started at the next boot, so a restart neither loses the handover nor repeats
+/// it.
+///
+/// The round's job row carries the command line's own user and channel. There is
+/// no agent session and no custom-role launch behind a shell caller (the
+/// caller-role branch cannot be reached), so neither is threaded through.
+///
+/// `Err` is a failed row write: nothing was dispatched and nothing is running,
+/// so the caller may be told the handover did not happen.
+pub(crate) async fn hand_over_coder_round(
+    delivery: &Workspace,
+    place: Option<&Workspace>,
+    task: &str,
+    caller_role: Role,
+    job_id: &str,
+) -> anyhow::Result<()> {
+    // Read the caller's identity synchronously BEFORE the spawn (task-local
+    // contract): the round's job row must carry the command line's own user and
+    // channel.
+    let user_name = crate::agent::tool_user_name();
+    let channel = crate::agent::tool_channel();
+
+    let exec = place.unwrap_or(delivery);
+    let args = crate::tools::CoreJobArgs {
+        job_id,
+        caller_role,
+        user_name: &user_name,
+        channel: &channel,
+        spawn: Some(crate::tools::SpawnRecord {
+            delivery_name: &delivery.name,
+            exec_dir: place.map(|ws| ws.path.as_str()),
+            custom_launch: None,
+        }),
+        // The command line has no agent session behind it: no caller session pin,
+        // and the row write is not a caller's retry (nothing is running yet).
+        caller_agent_id: None,
+        fail_on_checkpoint_error: false,
+    };
+    spawn_implement_rows(exec, task, &args).await?;
+
+    // The rows are down: run the round as a RESUME of its own rows, so a restart
+    // that lands between the two starts the very round this call promised. The
+    // resume path reports its own outcome — a failure or a panic included — to
+    // the conversation the report was promised to.
+    let (delivery, job_id) = (delivery.clone(), job_id.to_string());
+    let exec_dir = place.map(|ws| ws.path.clone());
+    tokio::spawn(async move {
+        crate::tools::SyncDurableCore::Coder
+            .resume_durable_round(&job_id, &delivery, exec_dir.as_deref())
+            .await;
+    });
+    Ok(())
+}
+
 /// Spawn the implement job + single-coder roster (one tx), then run the coder.
 /// A resume (`spawn: None`) reuses the stored roster (never regenerate ids —
 /// the PK would conflict AND the new id would not match the stored roster row).
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn run_implement_with_job(
     ws: &Workspace,
     task: &str,
     args: crate::tools::CoreJobArgs<'_>,
 ) -> anyhow::Result<crate::tools::SyncCoreOutcome> {
-    let crate::tools::CoreJobArgs {
-        job_id,
-        caller_role,
-        user_name,
-        channel,
-        spawn,
-        caller_agent_id,
-        fail_on_checkpoint_error,
-    } = args;
-    let resume = spawn.is_none();
-    let (coder_agent_id, pre_done) = match &spawn {
+    let resume = args.spawn.is_none();
+    let (coder_agent_id, pre_done) = match &args.spawn {
         // Resume: reuse the stored roster (never regenerate ids — the PK would
         // conflict AND the new id would not match the stored roster row).
         None => {
-            let rows =
-                crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
+            let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, args.job_id)
+                .await?;
             let row = rows.first().ok_or_else(|| {
                 super::internal_fault("coder round resume found no roster row for the stored job")
             })?;
@@ -49,38 +154,7 @@ pub(crate) async fn run_implement_with_job(
             (row.agent_id.clone(), pre_done)
         }
         // Fresh dispatch: spawn the job + single-coder roster (one tx).
-        Some(spawn) => {
-            let suffix = crate::generate_suffix();
-            let coder_agent_id = analyze_agent_id(&ws.name, Role::Coder.as_str()) + &suffix;
-            // Single-coder roster: one tx puts the job + the coder row down before
-            // any session write (caller identity + task persisted on the rows).
-            let agents = vec![crate::jobs::NewAgent {
-                agent_id: coder_agent_id.clone(),
-                kind: crate::jobs::AgentKind::Coder,
-                idx: Some(0),
-                task: task.to_string(),
-            }];
-            crate::jobs::spawn_job(
-                &crate::session::store().conn,
-                job_id,
-                task,
-                spawn.delivery_name,
-                user_name,
-                channel,
-                caller_role,
-                &agents,
-                &crate::jobs::SpawnChild::Implement,
-                caller_agent_id,
-                // The round's execution directory (the caller's place, when one was
-                // asked for) so a restart resumes into the same directory.
-                spawn.exec_dir,
-                // The calling custom role's launch, when there is one, so a
-                // resume rebuilds an envelope addressed to its branch.
-                spawn.custom_launch,
-            )
-            .await?;
-            (coder_agent_id, None)
-        }
+        Some(_) => (spawn_implement_rows(ws, task, &args).await?, None),
     };
 
     // A completed coder's stored outcome IS the final response — deliver it
@@ -106,8 +180,8 @@ pub(crate) async fn run_implement_with_job(
         ws,
         None,
         if has_session { "" } else { task },
-        user_name.to_string(),
-        channel.to_string(),
+        args.user_name.to_string(),
+        args.channel.to_string(),
         false,
         None,
         resume,
@@ -129,7 +203,7 @@ pub(crate) async fn run_implement_with_job(
     };
     if let Err(e) = crate::jobs::write_agent_outcome(
         &crate::session::store().conn,
-        job_id,
+        args.job_id,
         &coder_agent_id,
         status,
         Some(&outcome),
@@ -139,10 +213,10 @@ pub(crate) async fn run_implement_with_job(
         // Sync calls fail the tool call on a checkpoint DB error so the model
         // retries; async/boot-resume warn-and-continue (the outcome is
         // recomputable on the next resume).
-        if fail_on_checkpoint_error {
+        if args.fail_on_checkpoint_error {
             return Err(e.context("failed to checkpoint coder outcome"));
         }
-        tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint coder outcome");
+        tracing::warn!(job = %args.job_id, error = %e, "Failed to checkpoint coder outcome");
     }
 
     // Drain/shutdown cut the round: leave the job status='launched' for boot

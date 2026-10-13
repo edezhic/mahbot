@@ -766,10 +766,11 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    // `mahbot config …` / `mahbot workspace …`: the command line's frontends onto
-    // the product's own tools. Dispatched before lock acquisition and temp-root
-    // init like the other CLIs — the operations run IN the instance, which holds
-    // the lock, and this process never opens one of its stores.
+    // `mahbot config …` / `mahbot workspace …` / `mahbot send …`: the command
+    // line's frontends onto the product's own tools. Dispatched before lock
+    // acquisition and temp-root init like the other CLIs — the operations run IN
+    // the instance, which holds the lock, and this process never opens one of its
+    // stores.
     if let Some(word) = std::env::args().nth(1)
         && let Some(cli) = mahbot::cli::family(&word)
     {
@@ -821,7 +822,7 @@ fn main() -> Result<()> {
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
     // platform's temp variables to it — BEFORE any temp use (config, logs,
     // stores, shell children). The debug, __grep-engine, __env-dump,
-    // bench-openrouter, audio, chrome, config/workspace and help/version
+    // bench-openrouter, audio, chrome, config/workspace/send and help/version
     // dispatches above must NOT create the root (they exit before this point).
     mahbot::temp::init_temp_root().map_err(|e| {
         mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e)

@@ -5055,9 +5055,9 @@ mod tests {
             &["more chars on this line"],
         );
 
-        // The one profile now covers the `config`/`workspace` families too,
-        // whose answers are prose and can be just as long a single line (a role
-        // or key listing): it must come through intact as well.
+        // The one profile covers the CLI's other prose families too, whose
+        // answers can be just as long a single line (a role or key listing): it
+        // must come through intact as well.
         let prose = format!("custom-role `{}`: write, read, verify", "x".repeat(600));
         let result = process_shell_output(
             "mahbot config list-custom-roles",
