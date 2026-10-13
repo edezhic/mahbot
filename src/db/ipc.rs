@@ -10,9 +10,9 @@
 //!
 //! The same socket carries two request shapes:
 //! - the read-only diagnostic query it always did, and
-//! - a command-line operation (`mahbot config …` / `mahbot workspace …` /
-//!   `mahbot send …`),
-//!   carried in the SAME frame with an extra `call` field.
+//! - a command-line operation (any family [`crate::cli`] publishes — `mahbot
+//!   config …`, `mahbot send …`), carried in the SAME frame with an extra `call`
+//!   field.
 //!
 //! Protocol (length-prefixed JSON over a local socket stream):
 //! - request  → `[u32 LE payload_len][payload]`, payload is JSON `IpcRequest`
@@ -247,6 +247,13 @@ pub(crate) struct CallRequest {
     /// the answer, from the error text and from the recorded arguments.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// The directory the produced files must go into, resolved on the machine the
+    /// command runs on by the caller that named it. It is the command line's own
+    /// operand and never a tool argument, so no tool sees it in `args`; only the
+    /// command line's producing families send one, and the tools that write files
+    /// are the only readers (see [`crate::agent::CURRENT_TOOL_OUTPUT_DIR`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_dir: Option<String>,
 }
 
 /// What became of an operation, as the caller reads it.
@@ -938,6 +945,7 @@ mod tests {
                 tool: "workspace".to_string(),
                 args: serde_json::json!({ "action": "list" }),
                 secrets: Vec::new(),
+                output_dir: None,
             }),
         })
         .unwrap();
@@ -961,6 +969,7 @@ mod tests {
             tool: "workspace".to_string(),
             args: serde_json::json!({ "action": "list" }),
             secrets: Vec::new(),
+            output_dir: None,
         };
         match crate::db::ipc::ipc_call_with_wait(dir.path(), &call, CALL_STORE_BASE).await {
             CallAttempt::NotServed(reason) => {
@@ -1172,6 +1181,7 @@ mod tests {
             tool: "no_such_tool".to_string(),
             args: serde_json::json!({}),
             secrets: Vec::new(),
+            output_dir: None,
         };
         match crate::db::ipc::ipc_call_with_wait(&root, &call, CALL_STORE).await {
             CallAttempt::Answered(reply) => {
@@ -1246,6 +1256,7 @@ mod tests {
             tool: "send".to_string(),
             args: serde_json::json!({ "message": "from the command line" }),
             secrets: Vec::new(),
+            output_dir: None,
         };
         match crate::db::ipc::ipc_call_with_wait(&root, &call, CALL_STORE).await {
             CallAttempt::Answered(reply) => {

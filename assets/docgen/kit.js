@@ -1285,6 +1285,16 @@ function openEdit(req, family) {
   // silent about it.
   const signed = baseline.some((name) => name.startsWith("_xmlsignatures/"));
   const notes = [];
+  // The notes that say part of what the call asked for is NOT in the produced
+  // file: what the edit could not carry over (a replacement that lost the asked
+  // formatting, an inserted paragraph that lost its section break), a reference
+  // it left naming the old cell, or something the call removed beyond what it
+  // named (a table that went with the range deleted inside it). A note about the
+  // INPUT's own properties is not one of them: a signed package whose signature
+  // no longer matches, and a chart or pivot cache nothing recomputes, are
+  // consequences of editing that input rather than work left undone — the caller
+  // reads them, and the Rust side does not turn them into a partial answer.
+  const losses = [];
   let changed = false;
   let touched = false;
   let work = 0;
@@ -1314,8 +1324,11 @@ function openEdit(req, family) {
     diagramText: req.diagram_text ?? {},
     charge,
     // A user-facing note, already bracketed: the Rust side appends it verbatim.
-    // Kept once each, in the order the edits first raised it.
-    note: (message) => { if (!notes.includes(message)) notes.push(message); },
+    // Kept once each, in the order the edits first raised it. `loss` marks a note
+    // that says part of what the call asked for is NOT in the produced file;
+    // every other note — the scope of what was touched, or a property of the
+    // input being edited — is informational (see `losses`).
+    note: (message, loss = false) => { if (!notes.includes(message)) notes.push(message); if (loss && !losses.includes(message)) losses.push(message); },
     // Whether the call changed the sheet's CONTENT — a value written or an address
     // moved — rather than only the markup around it: an insert past the used range
     // adds a line without moving anything and a repeated write states what the cell
@@ -1394,7 +1407,7 @@ function openEdit(req, family) {
     // The result an edit hands back.
     finish() {
       if (changed && signed) notes.push("[the input carries a digital signature, which was carried through unchanged — the file changed, so the signature no longer matches it]");
-      return { buffer: zip.generate({ type: "nodebuffer", compression: "DEFLATE" }), notes };
+      return { buffer: zip.generate({ type: "nodebuffer", compression: "DEFLATE" }), notes, losses };
     },
   };
 }
@@ -1992,7 +2005,7 @@ function replaceOccurrences(xml, runs, slots, offsets, replacement, note, prefix
     const first = locateSlot(slots, start);
     const last = locateSlot(slots, end, true);
     if (replacement && foldsFormatting(first.index, last.index)) {
-      note("[the replaced text spanned several differently formatted runs — it took the formatting of the first one]");
+      note("[the replaced text spanned several differently formatted runs — it took the formatting of the first one]", true);
     }
     if (first.index === last.index) {
       add(first.index, first.offset, last.offset, escaped);
@@ -3006,7 +3019,7 @@ function inheritedParagraph(anchor, text, note) {
   const pPr = paragraphProperties(anchor);
   let inherited;
   if (pPr) {
-    if (firstElement(pPr, "w:sectPr")) note("[the paragraph the new one follows ends a section, so the new one does not carry its section break]");
+    if (firstElement(pPr, "w:sectPr")) note("[the paragraph the new one follows ends a section, so the new one does not carry its section break]", true);
     const kept = withoutTrackedMarkers(pPr.replace(elementPattern("w:sectPr"), ""));
     // What the stripping left may be nothing at all — a paragraph whose only
     // property was the section break — and an empty `<w:pPr>` is a change that
@@ -4204,7 +4217,7 @@ const movedRange = (range, what, kind, at, delta, note) => {
   if (!tokens.length) return [];
   const kept = tokens.map((token) => deleteRangeRef(token, kind, at, delta, false)).filter((token) => token !== null);
   if (kept.length) return kept;
-  note(`[the deleted ${kind} covered the whole ${what}, ${JSON.stringify(range)}, which is gone with it]`);
+  note(`[the deleted ${kind} covered the whole ${what}, ${JSON.stringify(range)}, which is gone with it]`, true);
   return null;
 };
 
@@ -4544,7 +4557,7 @@ function shiftSheet(editor, xml, kind, at, delta, { stale, sheet, removed, addre
   if (!shiftedPart && !removed) return xml;
   editor.markContent();
   formulaNote(editor, moved, kind, at, delta, sheet);
-  if (stale.size) note(`[the shift left ${[...stale].join(" and ")} pointing at the old cells — they were not rewritten]`);
+  if (stale.size) note(`[the shift left ${[...stale].join(" and ")} pointing at the old cells — they were not rewritten]`, true);
   return shiftedPart ? moved : xml;
 }
 
@@ -4708,7 +4721,7 @@ function formulaNote(editor, xml, kind, at, delta, sheet) {
   }
   if (!count) return;
   const one = count === 1;
-  editor.note(`[the sheet's ${count} formula${one ? " was" : "s were"} left as ${one ? "it is" : "they are"} while ${one ? "a cell it names" : "cells they name"} moved — check the references]`);
+  editor.note(`[the sheet's ${count} formula${one ? " was" : "s were"} left as ${one ? "it is" : "they are"} while ${one ? "a cell it names" : "cells they name"} moved — check the references]`, true);
 }
 
 // The addresses a cell- or range-anchored part names in its own text, which is
@@ -5593,6 +5606,11 @@ function xlsxEdit(req) {
   // an address really changed, and a call that changed neither leaves them as
   // valid as they were.
   const content = editor.content();
+  // Informational, not a loss: the condition only knows the sheet's content
+  // changed, not that a chart or pivot reads the changed cells, so marking them a
+  // loss would make every content edit of a chart-bearing workbook answer partial.
+  // Their references are copied intact; only a cached snapshot goes stale, which
+  // the consumer recomputes — unlike a formula the tool left naming a moved cell.
   if (content && charts) editor.note("[the workbook's charts were copied unchanged — nothing recomputes them, so a chart that reads the changed cells keeps the values it had]");
   if (content && pivots) editor.note("[the workbook's pivot tables were copied unchanged — nothing recomputes them, so a pivot that reads the changed cells keeps the values it had]");
   return editor.finish();
@@ -7377,17 +7395,17 @@ const operations = {
   docx_edit: async (req) => {
     const edited = docxEdit(req);
     writeOut(req.output, edited.buffer);
-    return { outputs: [req.output], notes: edited.notes };
+    return { outputs: [req.output], notes: edited.notes, losses: edited.losses };
   },
   xlsx_edit: async (req) => {
     const edited = xlsxEdit(req);
     writeOut(req.output, edited.buffer);
-    return { outputs: [req.output], notes: edited.notes };
+    return { outputs: [req.output], notes: edited.notes, losses: edited.losses };
   },
   pptx_edit: async (req) => {
     const edited = pptxEdit(req);
     writeOut(req.output, edited.buffer);
-    return { outputs: [req.output], notes: edited.notes };
+    return { outputs: [req.output], notes: edited.notes, losses: edited.losses };
   },
   pdf_merge: async (req) => { writeOut(req.output, await pdfMerge(req)); return { outputs: [req.output] }; },
   pdf_split: async (req) => {

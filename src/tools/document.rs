@@ -12,8 +12,10 @@
 //! is resolved with [`crate::tools::path::resolve_read_target`] under the
 //! caller's [`PathAccess`]: workspace-only for a guest's Assistant, anywhere the
 //! shell could name for the admin's. The OUTPUT path is never the model's: the
-//! tool picks a name inside `<workspace>/generated/` and reserves it with a
-//! create-new write before the kit runs.
+//! tool picks a name inside its output directory — the caller's own workspace's
+//! `generated/` for every caller but the command line, which names the
+//! destination itself — and reserves it with a create-new write before the kit
+//! runs.
 //!
 //! # Input rules
 //!
@@ -27,7 +29,8 @@
 //!
 //! `docx_edit`, `xlsx_edit` and `pptx_edit` change an existing Office file. Three
 //! promises hold for every one: the input is never modified, the result is a
-//! new file under `<workspace>/generated/`, and every part an edit does not name
+//! new file under the output directory (the workspace's `generated/`, or the
+//! destination a command-line call was given), and every part an edit does not name
 //! is carried into it with the content it had — a chart, a comment, a header or
 //! a media file the caller never mentioned included. The raw archive is
 //! re-compressed, so byte-identical bytes are not promised; the content is. The
@@ -38,9 +41,9 @@
 //!
 //! # Naming
 //!
-//! `file_name` is sanitized to a single path component and made unique against
-//! `generated/`, so a model-supplied name can neither escape the directory nor
-//! silently overwrite an earlier file. The tool appends the extension it
+//! `file_name` is sanitized to a single path component and made unique within the
+//! output directory, so a model-supplied name can neither escape the directory
+//! nor silently overwrite an earlier file. The tool appends the extension it
 //! produces — the action's own, or the sample's or input's on a fill or an edit
 //! — after dropping a trailing OOXML or PDF extension (any of `.docx`, `.docm`,
 //! `.xlsx`, `.xlsm`, `.pptx`, `.pptm`, `.pdf`), so a name that already carries
@@ -56,7 +59,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// Subdirectory of the workspace the tool writes into, and the only one.
+/// The workspace's own output subdirectory — the fallback for every caller but a
+/// command-line call, which names its destination.
 const GENERATED_DIR: &str = "generated";
 
 /// Longest base name the tool keeps from `file_name`; the extension and the
@@ -404,8 +408,9 @@ static RULES: LazyLock<Rules> = LazyLock::new(|| {
 ///
 /// `access` is the caller's [`PathAccess`], fixed when the role's toolset is
 /// built: it decides where the tool's *inputs* may come from. Every produced
-/// file always lands in the caller's own workspace's `generated/` directory,
-/// whatever the access.
+/// file lands in the caller's own workspace's `generated/` directory, whatever
+/// the access — except for a command-line call, which produces into the
+/// destination the caller was given ([`crate::agent::tool_output_dir`]).
 pub(crate) struct DocumentTool {
     access: PathAccess,
 }
@@ -517,41 +522,11 @@ impl Tool for DocumentTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: Value) -> Result<String> {
-        let args = normalize_call(&args)?;
-        let action = super::get_str(&args, "action")?;
-        // Only a real action is checked against its schema entry: an action the
-        // tool does not have keeps its own refusal below rather than being
-        // reported as taking no arguments.
-        if ACTIONS.contains(&action) {
-            require_declared_arguments(action, &args)?;
-        }
-        let generated = ws.as_path().join(GENERATED_DIR);
-        match action {
-            "create" => self.create(ws, &args, &generated).await,
-            "fill_template" => self.fill_template(ws, &args, &generated).await,
-            "docx_edit" => {
-                self.edit(ws, &args, &generated, crate::ooxml::Family::Docx)
-                    .await
-            }
-            "xlsx_edit" => {
-                self.edit(ws, &args, &generated, crate::ooxml::Family::Xlsx)
-                    .await
-            }
-            "pptx_edit" => {
-                self.edit(ws, &args, &generated, crate::ooxml::Family::Pptx)
-                    .await
-            }
-            "pdf_merge" => self.pdf_merge(ws, &args, &generated).await,
-            "pdf_split" => self.pdf_split(ws, &args, &generated).await,
-            "pdf_rotate" => self.pdf_rotate(ws, &args, &generated).await,
-            "pdf_text" => self.pdf_text(ws, &args, &generated).await,
-            "pdf_image" => self.pdf_image(ws, &args, &generated).await,
-            "pdf_form_fill" => self.pdf_form_fill(ws, &args, &generated).await,
-            other => anyhow::bail!(
-                "usage: unknown action \"{other}\" — hint: use {}",
-                ACTIONS.join(", ")
-            ),
-        }
+        Ok(self.dispatch(ws, args).await?.text)
+    }
+
+    async fn execute_answer(&self, ws: &Workspace, args: Value) -> Result<super::ToolAnswer> {
+        self.dispatch(ws, args).await
     }
 }
 
@@ -713,7 +688,12 @@ fn path_arg() -> Value {
 
 /// `image`: the picture to place — a PNG or a JPEG, by its content — and the one
 /// sizing rule every placement shares.
-fn image_arg() -> Value {
+///
+/// Every field built here NAMES A FILE, which is what the command line reads:
+/// a field inside a structured value whose schema is this one is a reference path
+/// the frontend must resolve in the caller's own directory, so the two cannot
+/// disagree about which fields those are (see `crate::cli`'s field tie).
+pub(crate) fn image_arg() -> Value {
     text_arg(
         "The picture to place (PNG or JPEG); naming one side's size alone keeps its own proportions.",
     )
@@ -1354,8 +1334,56 @@ fn degrees_arg() -> Value {
 }
 
 impl DocumentTool {
+    /// The one action dispatch both faces of the tool go through: `execute`
+    /// renders it to its text (so an agent's view is unchanged) and
+    /// [`Tool::execute_answer`] hands it over with the partiality flag a
+    /// command-line caller reads. There is no second code path to drift from
+    /// this one.
+    async fn dispatch(&self, ws: &Workspace, args: Value) -> Result<super::ToolAnswer> {
+        let args = normalize_call(&args)?;
+        let action = super::get_str(&args, "action")?;
+        // Only a real action is checked against its schema entry: an action the
+        // tool does not have keeps its own refusal below rather than being
+        // reported as taking no arguments.
+        if ACTIONS.contains(&action) {
+            require_declared_arguments(action, &args)?;
+        }
+        let output = super::output_directory(ws, GENERATED_DIR);
+        match action {
+            "create" => self.create(ws, &args, &output).await,
+            "fill_template" => self.fill_template(ws, &args, &output).await,
+            "docx_edit" => {
+                self.edit(ws, &args, &output, crate::ooxml::Family::Docx)
+                    .await
+            }
+            "xlsx_edit" => {
+                self.edit(ws, &args, &output, crate::ooxml::Family::Xlsx)
+                    .await
+            }
+            "pptx_edit" => {
+                self.edit(ws, &args, &output, crate::ooxml::Family::Pptx)
+                    .await
+            }
+            "pdf_merge" => self.pdf_merge(ws, &args, &output).await,
+            "pdf_split" => self.pdf_split(ws, &args, &output).await,
+            "pdf_rotate" => self.pdf_rotate(ws, &args, &output).await,
+            "pdf_text" => self.pdf_text(ws, &args, &output).await,
+            "pdf_image" => self.pdf_image(ws, &args, &output).await,
+            "pdf_form_fill" => self.pdf_form_fill(ws, &args, &output).await,
+            other => anyhow::bail!(
+                "usage: unknown action \"{other}\" — hint: use {}",
+                ACTIONS.join(", ")
+            ),
+        }
+    }
+
     /// `create` — a fresh document from content blocks or sheets.
-    async fn create(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
+    async fn create(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
         let format = super::get_str(args, "format")?;
         if !SUPPORTED_FORMATS.contains(&format) {
             anyhow::bail!(
@@ -1388,7 +1416,7 @@ impl DocumentTool {
             opt_string(args, "file_name")?,
             &format!("{}_{}", default_base(format), crate::util::unix_millis()),
         );
-        let outputs = reserve(generated, std::slice::from_ref(&base), format).await?;
+        let outputs = reserve(output, std::slice::from_ref(&base), format).await?;
         request["output"] = json!(outputs[0].to_string_lossy());
         self.deliver(request, &outputs, "created").await
     }
@@ -1399,8 +1427,8 @@ impl DocumentTool {
         &self,
         ws: &Workspace,
         args: &Value,
-        generated: &Path,
-    ) -> Result<String> {
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
         let (sample, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let values = require_values(args, "placeholder")?;
         require_scalar_values(&values)?;
@@ -1416,7 +1444,7 @@ impl DocumentTool {
             opt_string(args, "file_name")?,
             &input_base(&sample, "filled"),
         );
-        let outputs = reserve(generated, std::slice::from_ref(&base), &extension).await?;
+        let outputs = reserve(output, std::slice::from_ref(&base), &extension).await?;
         let request = json!({
             "op": "fill_template",
             // The kit's own field name for the sample it fills.
@@ -1435,9 +1463,9 @@ impl DocumentTool {
         &self,
         ws: &Workspace,
         args: &Value,
-        generated: &Path,
+        output: &Path,
         family: crate::ooxml::Family,
-    ) -> Result<String> {
+    ) -> Result<super::ToolAnswer> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         // The file's own bytes decide what it is, never its name: the input must
         // really be the package family this action edits — a package of another
@@ -1466,7 +1494,7 @@ impl DocumentTool {
             opt_string(args, "file_name")?,
             &input_base(&input, "edited"),
         );
-        let outputs = reserve(generated, std::slice::from_ref(&base), &extension).await?;
+        let outputs = reserve(output, std::slice::from_ref(&base), &extension).await?;
         let mut request = json!({
             "op": format!("{}_edit", family.name()),
             "input": input.to_string_lossy(),
@@ -1482,7 +1510,12 @@ impl DocumentTool {
     }
 
     /// `pdf_merge` — every input's pages, in order, in one file.
-    async fn pdf_merge(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
+    async fn pdf_merge(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
         let paths = super::get_str_array(args, "paths")?;
         if paths.len() < 2 {
             anyhow::bail!(
@@ -1525,7 +1558,7 @@ impl DocumentTool {
             opt_string(args, "file_name")?,
             &input_base(&inputs[0], "merged"),
         );
-        let outputs = reserve(generated, std::slice::from_ref(&base), "pdf").await?;
+        let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
         let request = json!({
             "op": "pdf_merge",
             "inputs": path_strings(&inputs),
@@ -1536,7 +1569,12 @@ impl DocumentTool {
     }
 
     /// `pdf_split` — one file per page selection.
-    async fn pdf_split(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
+    async fn pdf_split(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let groups = split_groups(args)?;
         require_pdf(&input).await?;
@@ -1547,7 +1585,7 @@ impl DocumentTool {
         let bases: Vec<String> = (0..groups.len())
             .map(|index| format!("{base}_part{}", index + 1))
             .collect();
-        let outputs = reserve(generated, &bases, "pdf").await?;
+        let outputs = reserve(output, &bases, "pdf").await?;
         let request = json!({
             "op": "pdf_split",
             "input": input.to_string_lossy(),
@@ -1558,7 +1596,12 @@ impl DocumentTool {
     }
 
     /// `pdf_rotate` — add a rotation to the selected pages.
-    async fn pdf_rotate(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
+    async fn pdf_rotate(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let degrees = match super::get_opt_i64(args, "degrees")? {
             // Reduced here, so the request carries a value bounded by the turn
@@ -1595,13 +1638,18 @@ impl DocumentTool {
             opt_string(args, "file_name")?,
             &input_base(&input, "rotated"),
         );
-        let outputs = reserve(generated, std::slice::from_ref(&base), "pdf").await?;
+        let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
         request["output"] = json!(outputs[0].to_string_lossy());
         self.deliver(request, &outputs, "rotated").await
     }
 
     /// `pdf_text` — draw text (optionally stamped and rotated) on the pages.
-    async fn pdf_text(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
+    async fn pdf_text(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let text = super::get_str(args, "text")?;
         let mut request = json!({
@@ -1624,13 +1672,18 @@ impl DocumentTool {
         }
         require_pdf(&input).await?;
         let base = sanitize_base(opt_string(args, "file_name")?, &input_base(&input, "text"));
-        let outputs = reserve(generated, std::slice::from_ref(&base), "pdf").await?;
+        let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
         request["output"] = json!(outputs[0].to_string_lossy());
         self.deliver(request, &outputs, "stamped text into").await
     }
 
     /// `pdf_image` — place a PNG/JPEG on the pages.
-    async fn pdf_image(&self, ws: &Workspace, args: &Value, generated: &Path) -> Result<String> {
+    async fn pdf_image(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let (image, _) = resolve_input(ws, super::get_str(args, "image")?, self.access).await?;
         ensure_image(&image)?;
@@ -1646,7 +1699,7 @@ impl DocumentTool {
         set_positive_number(&mut request, args, "height", &RULES.dimension_points)?;
         require_pdf(&input).await?;
         let base = sanitize_base(opt_string(args, "file_name")?, &input_base(&input, "image"));
-        let outputs = reserve(generated, std::slice::from_ref(&base), "pdf").await?;
+        let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
         request["output"] = json!(outputs[0].to_string_lossy());
         self.deliver(request, &outputs, "inserted the image into")
             .await
@@ -1657,8 +1710,8 @@ impl DocumentTool {
         &self,
         ws: &Workspace,
         args: &Value,
-        generated: &Path,
-    ) -> Result<String> {
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let values = require_values(args, "form field")?;
         require_scalar_values(&values)?;
@@ -1670,7 +1723,7 @@ impl DocumentTool {
             opt_string(args, "file_name")?,
             &input_base(&input, "filled"),
         );
-        let outputs = reserve(generated, std::slice::from_ref(&base), "pdf").await?;
+        let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
         let request = json!({
             "op": "pdf_form_fill",
             "input": input.to_string_lossy(),
@@ -1687,7 +1740,12 @@ impl DocumentTool {
     /// `[FILE:…]` markers. A failed run removes the reservations so no empty
     /// placeholder is left behind.
     #[expect(clippy::too_many_lines)] // the one reply builder: verify, describe, and every note an operation can raise
-    async fn deliver(&self, request: Value, outputs: &[PathBuf], prefix: &str) -> Result<String> {
+    async fn deliver(
+        &self,
+        request: Value,
+        outputs: &[PathBuf],
+        prefix: &str,
+    ) -> Result<super::ToolAnswer> {
         // The runtime's absence and a failing probe are mahbot-side faults the
         // model cannot fix; `probe` reports them with that token, so a broken
         // runtime never looks like a broken request. It runs here — once the
@@ -1797,10 +1855,13 @@ impl DocumentTool {
                  substituted; the copy is unchanged]",
             );
         }
-        // Each note is the kit's own caveat about what it could not keep — a chart
-        // or pivot keeping a cached value, a range the delete covered, a part left
-        // naming the old cells — already a bracketed, user-facing sentence, so it
-        // is appended verbatim.
+        // Each note is the kit's own caveat about the input's own properties or
+        // about how it carried a part over — a chart or pivot whose cached value
+        // goes stale, a range the delete covered, a part left naming the old cells
+        // — already a bracketed, user-facing sentence, so it is appended verbatim.
+        // Whether a note means part of the work is MISSING is the kit's own
+        // `lossy` flag and never this text (see the partiality below): a note
+        // about what the input already carried is information, not a shortfall.
         for note in &outcome.notes {
             text = super::with_note(&text, note);
         }
@@ -1808,7 +1869,20 @@ impl DocumentTool {
             text.push('\n');
             text.push_str(&self.format_media_result(path));
         }
-        Ok(text)
+        // `missing` (placeholders left unchanged), `unsupported` (characters the
+        // font cannot draw), `placeholders == Some(0)` (nothing was substituted)
+        // and `outcome.lossy` (the kit's own losses) are the statements that part
+        // of what was asked is not in the produced file. The send-limit note above
+        // informs about delivery and is not partiality.
+        let partial = outcome.lossy
+            || !outcome.missing.is_empty()
+            || !outcome.unsupported.is_empty()
+            || outcome.placeholders == Some(0);
+        Ok(if partial {
+            super::ToolAnswer::partial(text)
+        } else {
+            super::ToolAnswer::done(text)
+        })
     }
 }
 
@@ -4161,12 +4235,14 @@ fn set_positive_number(request: &mut Value, args: &Value, key: &str, span: &Span
     Ok(())
 }
 
-/// Refuse a `generated/` directory that is a symlink: the reservations below name
-/// a single component inside it and never follow a symlink for the file itself,
-/// but a symlinked directory would take the whole call wherever it points — out
-/// of the workspace, where the periodic sweep refuses to follow such an entry, so
-/// what the call wrote would never be reclaimed either.
-async fn refuse_symlinked_generated(dir: &Path) -> Result<()> {
+/// Refuse an output directory that is a symlink: the reservations below name a
+/// single component inside it and never follow a symlink for the file itself, but
+/// a symlinked directory would take the whole call wherever it points — out of the
+/// workspace, where the periodic sweep refuses to follow such an entry, so what
+/// the call wrote would never be reclaimed either. A command-line call cannot
+/// reach this: [`crate::cli`] hands over a destination its own
+/// `resolve_output_dir` has already canonicalized, so it is never a link.
+async fn refuse_symlinked_output(dir: &Path) -> Result<()> {
     if let Ok(meta) = tokio::fs::symlink_metadata(dir).await
         && meta.file_type().is_symlink()
     {
@@ -4183,13 +4259,10 @@ async fn refuse_symlinked_generated(dir: &Path) -> Result<()> {
 /// same name (see [`crate::util::create_unique_file`]). The kit overwrites each
 /// reserved file; a failure removes every reservation.
 async fn reserve(dir: &Path, bases: &[String], ext: &str) -> Result<Vec<PathBuf>> {
-    refuse_symlinked_generated(dir).await?;
-    tokio::fs::create_dir_all(dir).await.with_context(|| {
-        format!(
-            "failed to create the generated directory at {}",
-            dir.display()
-        )
-    })?;
+    refuse_symlinked_output(dir).await?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("failed to create the output directory at {}", dir.display()))?;
     let mut reserved = Vec::with_capacity(bases.len());
     for base in bases {
         match reserve_one(dir, base, ext).await {
@@ -7289,8 +7362,8 @@ mod tests {
 
     /// Every argument of an action that produces a file is checked before an
     /// output is reserved, so a call the tool refuses leaves nothing behind in
-    /// `generated/` — and a file that is not the image it is named as is refused
-    /// rather than embedded.
+    /// the output directory — and a file that is not the image it is named as is
+    /// refused rather than embedded.
     #[tokio::test]
     #[expect(clippy::too_many_lines)] // one case per argument, all refused before anything is reserved
     async fn the_arguments_are_checked_before_an_output_is_reserved() {

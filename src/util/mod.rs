@@ -414,6 +414,25 @@ pub(crate) fn is_within(candidate: &Path, base: &Path) -> bool {
     strip_verbatim_prefix(candidate).starts_with(strip_verbatim_prefix(base))
 }
 
+/// Whether this process may create a file in the directory `dir`.
+///
+/// `access(2)` answers it — through the group/other-write bit and through a
+/// read-only mount, exactly as a shell's own `[ -w dir ]` does — and nothing is
+/// written. Unix-only: the only other answer is a probe file written into the
+/// directory, and both callers are unix-only.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn dir_is_writable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid NUL-terminated C string that outlives the call
+    // and `access` only reads it.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
 /// `s` without a trailing `suffix`, compared without ASCII case — the volumes
 /// the service runs on compare file names that way, so a differently-cased
 /// suffix is the same suffix.
@@ -582,8 +601,8 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// full disk). The subcommand CLIs that always run with wired stdio (the `debug`
 /// verb's own usage and argument errors, chrome, the benchmark) still print through
 /// the macros: a failed write there can only reach a caller that stopped reading.
-/// `mahbot config …`, `mahbot workspace …`, `mahbot send …` and `mahbot audio …` print the
-/// product's answer and their own diagnostics through these two writers too:
+/// The families of [`crate::cli`] and `mahbot audio …` print the product's
+/// answer and their own diagnostics through these two writers too:
 /// their exit code, not the delivered text, reports whether the operation was
 /// carried out, so a reader that closed the pipe (a script piping the answer into
 /// `head`) or a terminated one must not turn a carried-out operation into a

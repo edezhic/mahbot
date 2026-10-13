@@ -189,16 +189,6 @@ pub(crate) fn shell_temp_vars() -> Vec<(String, String)> {
 ///   startup forever over that would be worse).
 pub fn init_temp_root() -> anyhow::Result<()> {
     let legacy = std::env::temp_dir();
-    // The unix root is the fixed shared `/tmp/mahbot` — no `-{uid}` suffix, this
-    // is a single-user deployment, and the ownership check in
-    // `verify_private_root` is what makes a shared path safe (a second OS user's
-    // daemon fails loudly at boot instead of sharing the root). The OS temp dir
-    // does not move it: it stays only a scan root and an allowlist entry, so a
-    // relative `TMPDIR` is harmless here. Off unix the root IS derived from that
-    // dir, which is why the derivation refuses a relative one.
-    #[cfg(unix)]
-    let root = PathBuf::from("/tmp/mahbot");
-    #[cfg(not(unix))]
     let root = private_temp_root(&legacy)?;
 
     // Exclusive create (`create_dir` fails when the path already exists, which
@@ -232,23 +222,39 @@ pub fn init_temp_root() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The private root off unix: the platform's temp location joined with `mahbot`
-/// — on a normal Windows machine that is the calling user's own temp directory,
-/// hence user-only through the DACL it inherits (see the module doc for what
-/// that does and does not cover). Never the machine-wide `C:\Windows\Temp` and
-/// never under the daemon's storage root, which the cleaner must never scan —
-/// except under the SYSTEM account, whose own temp lookup is machine-wide (the
-/// stated deviation in the module doc). The OS temp dir must be absolute:
-/// joining `mahbot` onto a relative one would derive the root from the process's
-/// cwd.
+/// The private temp root this platform derives from the OS temp dir it is
+/// handed.
+///
+/// On unix it is the fixed shared `/tmp/mahbot`, deliberately independent of the
+/// OS temp dir (see the module doc): a relative `TMPDIR` is then harmless, and
+/// the root — which is also one of the cleaner's scan roots — does not move with
+/// the environment. It is fixed — no `-{uid}` suffix, this is a single-user
+/// deployment, and the ownership check in `verify_private_root` is what makes a
+/// shared path safe (a second OS user's daemon fails loudly at boot instead of
+/// sharing the root).
+#[cfg(unix)]
+#[expect(clippy::unnecessary_wraps)] // one signature and one call site for both platforms
+fn private_temp_root(_os_temp: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from("/tmp/mahbot"))
+}
+
+/// The private temp root off unix: the platform's temp location joined with
+/// `mahbot` — on a normal Windows machine that is the calling user's own temp
+/// directory, hence user-only through the DACL it inherits (see the module doc
+/// for what that does and does not cover). Never the machine-wide
+/// `C:\Windows\Temp` and never under the daemon's storage root, which the cleaner
+/// must never scan — except under the SYSTEM account, whose own temp lookup is
+/// machine-wide (the stated deviation in the module doc). The OS temp dir must be
+/// absolute: joining `mahbot` onto a relative one would derive the root from the
+/// process's cwd.
 #[cfg(not(unix))]
-fn private_temp_root(legacy: &Path) -> Result<PathBuf> {
+fn private_temp_root(os_temp: &Path) -> Result<PathBuf> {
     anyhow::ensure!(
-        legacy.is_absolute(),
+        os_temp.is_absolute(),
         "OS temp dir {} is not an absolute path — refusing to derive the private temp root from it",
-        legacy.display()
+        os_temp.display()
     );
-    Ok(legacy.join("mahbot"))
+    Ok(os_temp.join("mahbot"))
 }
 
 /// Restrict a freshly created private root to its owner. Unix only: the Windows
@@ -562,29 +568,28 @@ struct CleanupRoot {
     private: bool,
 }
 
-/// Select the scanner's roots: the platform's candidates in scan order — the
-/// pinned private root, the pre-pin OS temp dir, then (unix only) the literal
-/// `/tmp` and `/private/tmp`, the paths a command reaches without consulting the
-/// environment at all, which is exactly what a bare `mktemp` in a pipeline does
-/// — then resolve each one through [`cleanup_roots_from`].
+/// The candidate roots, for a process whose OS temp dir is `os_temp`: the
+/// private root this platform derives from it, that temp dir itself, and (unix
+/// only) the two literals a command reaches without consulting the environment
+/// at all, which is exactly what a bare `mktemp` in a pipeline does.
 ///
-/// This is also what the cleaner prompt is rendered from, so the prompt and the
-/// read-only guard cannot disagree about where the cleaner may act.
+/// One builder for the cleaner's roots and for the roots a process that never
+/// pinned the temp environment checks a destination against
+/// ([`cleanup_scan_roots_unpinned`]), so the two cannot disagree about where the
+/// product's own cleanup may act.
 #[must_use]
-fn cleanup_scan_roots() -> Vec<CleanupRoot> {
+fn cleanup_root_candidates(os_temp: &Path) -> Vec<CleanupRoot> {
     let mut roots = Vec::new();
-    if let Some(root) = temp_root() {
+    if let Ok(private) = private_temp_root(os_temp) {
         roots.push(CleanupRoot {
-            path: root.to_path_buf(),
+            path: private,
             private: true,
         });
     }
-    if let Some(legacy) = legacy_temp_dir() {
-        roots.push(CleanupRoot {
-            path: legacy.to_path_buf(),
-            private: false,
-        });
-    }
+    roots.push(CleanupRoot {
+        path: os_temp.to_path_buf(),
+        private: false,
+    });
     #[cfg(unix)]
     roots.extend([
         CleanupRoot {
@@ -596,7 +601,42 @@ fn cleanup_scan_roots() -> Vec<CleanupRoot> {
             private: false,
         },
     ]);
-    cleanup_roots_from(roots)
+    roots
+}
+
+/// Select the scanner's roots: the platform's candidates in scan order — the
+/// private root this platform derives from the pre-pin OS temp dir, that temp
+/// dir itself, then (unix only) the literal `/tmp` and `/private/tmp`, the paths
+/// a command reaches without consulting the environment at all, which is exactly
+/// what a bare `mktemp` in a pipeline does — then resolve each one through
+/// [`cleanup_roots_from`].
+///
+/// This is also what the cleaner prompt is rendered from, so the prompt and the
+/// read-only guard cannot disagree about where the cleaner may act.
+#[must_use]
+fn cleanup_scan_roots() -> Vec<CleanupRoot> {
+    let os_temp = legacy_temp_dir().map_or_else(std::env::temp_dir, Path::to_path_buf);
+    cleanup_roots_from(cleanup_root_candidates(&os_temp))
+}
+
+/// The places the product's own temp cleanup is responsible for, as a process
+/// that NEVER pinned the temp environment sees them — the command line's own
+/// destination check, which must refuse a directory whose files its cleaner
+/// would later sweep.
+///
+/// The private root is derived the same way here and the pre-pin OS temp dir is
+/// this process's own `std::env::temp_dir()` — the very lookup the daemon's
+/// pre-pin value comes from, so the two agree wherever a launch's environment is
+/// the machine's own. What a process without the pin cannot see is a daemon
+/// started with a DIFFERENT temp environment, whose private root this derivation
+/// would not name; the candidates themselves are built and resolved by the
+/// cleaner's own code, so the rule is not restated here.
+#[must_use]
+pub(crate) fn cleanup_scan_roots_unpinned() -> Vec<PathBuf> {
+    cleanup_roots_from(cleanup_root_candidates(&std::env::temp_dir()))
+        .into_iter()
+        .map(|root| root.path)
+        .collect()
 }
 
 /// Resolve candidates into usable roots: a candidate that does not resolve to an

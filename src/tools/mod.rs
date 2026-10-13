@@ -1732,13 +1732,32 @@ pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'
         .map(Box::as_ref)
 }
 
+/// The directory a produced file must land in: the destination a
+/// command-line caller chose ([`crate::agent::tool_output_dir`]), and the
+/// workspace's own `fallback` directory for every other caller.
+pub(crate) fn output_directory(ws: &Workspace, fallback: &str) -> PathBuf {
+    crate::agent::tool_output_dir().unwrap_or_else(|| ws.as_path().join(fallback))
+}
+
 /// Canonicalize a local media path and confine it to the workspace's
 /// `uploads/` (received attachments) and `generated/` (tool outputs) dirs — the
 /// shared rule for video_edit's local inputs and the generation tools'
 /// reference images. `kind` names the input in the messages.
 ///
-/// Callers must run it before any other filesystem access on the path: a
-/// refused path is never stat'ed, opened, or sniffed.
+/// The confinement is the AGENTS' rule: a command-line caller is the machine's
+/// own owner, whose shell can already hand any local file to any program, so the
+/// command line adds no capability the owner does not have and this check is
+/// skipped for it. Everything else still happens — the file must exist, be a
+/// regular file and be canonicalized.
+///
+/// The regular-file rule holds for every caller, agent or not: what is given here
+/// is read by the tool (an upload, a duration probe, an image decode) with no
+/// timeout of its own, so a pipe with no writer would hold the daemon — and the
+/// operation's own flight guard — forever and a device would read without end.
+/// Nothing is opened to decide it: metadata is the whole check.
+///
+/// Callers must run it before any other filesystem access on the path: a path
+/// refused here is only canonicalized and stat'ed — never opened or sniffed.
 ///
 /// Roots are canonicalized when they exist; a missing directory cannot contain
 /// a canonicalized (existing) file, so it is skipped — which fails closed when
@@ -1756,6 +1775,21 @@ pub(crate) async fn resolve_local_media_path(
             .await
             .with_context(|| format!("Local {kind} not found: {input}"))?,
     );
+    let meta = tokio::fs::metadata(&canonical)
+        .await
+        .with_context(|| format!("Local {kind} not found: {input}"))?;
+    if !meta.is_file() {
+        anyhow::bail!(
+            "Local {kind} must be a regular file — read with no timeout of its own, a pipe or a \
+             device would hold the operation forever, got: {}",
+            canonical.display()
+        );
+    }
+    // The owner's own shell reaches any local file already, so the command line
+    // is held to the file checks above and nothing more.
+    if crate::agent::tool_command_line() {
+        return Ok(canonical);
+    }
     let roots: Vec<PathBuf> = ["uploads", "generated"]
         .iter()
         .map(|d| ws.as_path().join(d))
@@ -1777,25 +1811,31 @@ pub(crate) async fn resolve_local_media_path(
     Ok(canonical)
 }
 
-/// Save generated media bytes to `workspace/generated/{prefix}_{timestamp}.{ext}`.
+/// Save generated media bytes into the caller's output directory
+/// ([`output_directory`]: the workspace's `generated/` for every caller but a
+/// command-line call, which names its destination), naming the file
+/// `{prefix}_{timestamp}.{ext}` and reserving a free name so a file already
+/// there is never overwritten (see [`crate::util::create_unique_file`]).
 ///
-/// Creates the `generated/` directory if needed, generates a millisecond-precision
-/// timestamp, writes the file, and returns the full `PathBuf`. The bytes are
-/// content-sniffed and stripped (`util::provenance`) on the way out, so the single
-/// written file is what the GUI preview, the Telegram delivery and the model-context
-/// payload all consume; non-image outputs pass through untouched.
+/// Creates the directory if needed, writes the file, and returns the full
+/// `PathBuf`. The bytes are content-sniffed and stripped (`util::provenance`) on
+/// the way out, so the single written file is what the GUI preview, the Telegram
+/// delivery and the model-context payload all consume; non-image outputs pass
+/// through untouched.
 ///
 /// # Security note
 /// This function deliberately bypasses path security (no `resolve_write_target`
-/// check) because `generated/` is an ephemeral tool-owned directory within the
-/// workspace. Do not use this function for user-uploaded or arbitrary content.
+/// check): the output directory is either the tool-owned `generated/` of the
+/// caller's workspace or the destination a command-line caller named, which the
+/// command line itself has already resolved and vetted (`crate::cli`). Do not
+/// use this function for user-uploaded or arbitrary content.
 async fn save_generated_file(
     ws: &Workspace,
     bytes: &[u8],
     prefix: &str,
     ext: &str,
 ) -> anyhow::Result<PathBuf> {
-    let generated_dir = ws.as_path().join("generated");
+    let generated_dir = output_directory(ws, "generated");
     tokio::fs::create_dir_all(&generated_dir)
         .await
         .with_context(|| {
@@ -1806,10 +1846,20 @@ async fn save_generated_file(
         })?;
 
     let timestamp = crate::util::unix_millis();
-    let output_path = generated_dir.join(format!("{prefix}_{timestamp}.{ext}"));
+    let (mut file, output_path) =
+        crate::util::create_unique_file(&generated_dir, &format!("{prefix}_{timestamp}.{ext}"))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to reserve a generated file in {}",
+                    generated_dir.display()
+                )
+            })?;
 
     let stripped = crate::util::provenance::strip_image_provenance(bytes);
-    tokio::fs::write(&output_path, stripped.as_ref())
+    // Write through the handle the reservation returned: the `create_new` open
+    // that picked the name is the only collision check there is.
+    tokio::io::AsyncWriteExt::write_all(&mut file, stripped.as_ref())
         .await
         .with_context(|| {
             format!(
@@ -2352,6 +2402,74 @@ mod tests {
     }
 
     // ── resolve_local_media_path tests ─────────────────────────────────────
+
+    /// The command line's own branch of the rule: the owner IS the machine's own
+    /// user, so the file the caller named is taken wherever it is — while every
+    /// other caller keeps the workspace confinement, and the regular-file rule
+    /// holds for both so the branch cannot be widened into a hang.
+    #[tokio::test]
+    async fn resolve_local_media_path_takes_any_file_for_a_command_line_call() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = crate::Workspace::from_path(tmp.path());
+        let write = |name: &str| {
+            let path = tmp.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"media").unwrap();
+            path
+        };
+        let outside = write("outside/picture.png");
+        let inside = write("generated/clip.mp4");
+
+        // The agents' rule: the workspace's own media dirs, and nowhere else.
+        assert!(
+            resolve_local_media_path(&outside.to_string_lossy(), &ws, "clip")
+                .await
+                .is_err(),
+            "an agent's call must stay confined to the workspace"
+        );
+        assert!(
+            resolve_local_media_path(&inside.to_string_lossy(), &ws, "clip")
+                .await
+                .is_ok()
+        );
+
+        // The command line's: the very file the caller gave it.
+        let taken = crate::agent::CURRENT_TOOL_COMMAND_LINE
+            .scope(true, async {
+                resolve_local_media_path(&outside.to_string_lossy(), &ws, "clip").await
+            })
+            .await
+            .expect("a command-line call takes the file the caller named");
+        assert!(
+            taken.ends_with("outside/picture.png"),
+            "the resolved path is the caller's own file: {}",
+            taken.display()
+        );
+
+        #[cfg(unix)]
+        {
+            // A pipe with no writer would hold the reading tool — and the
+            // operation's flight guard — forever, so it is refused for BOTH
+            // callers, the command line's branch included.
+            let fifo = tmp.path().join("generated/pipe.mp4");
+            let path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes())
+                .expect("a path without a NUL");
+            // SAFETY: `mkfifo` takes a NUL-terminated path and a mode.
+            if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } == 0 {
+                let err = resolve_local_media_path(&fifo.to_string_lossy(), &ws, "clip")
+                    .await
+                    .expect_err("a pipe is no media input");
+                assert!(err.to_string().contains("regular file"), "{err}");
+                let err = crate::agent::CURRENT_TOOL_COMMAND_LINE
+                    .scope(true, async {
+                        resolve_local_media_path(&fifo.to_string_lossy(), &ws, "clip").await
+                    })
+                    .await
+                    .expect_err("a pipe is no media input for the command line either");
+                assert!(err.to_string().contains("regular file"), "{err}");
+            }
+        }
+    }
 
     /// The rule video_edit's local inputs and the generation tools' reference
     /// images share: only the workspace's `uploads/` and `generated/` dirs are

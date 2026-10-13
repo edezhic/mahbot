@@ -566,7 +566,7 @@ pub(crate) fn chrome_use_bin_path(file_name: &str) -> Option<PathBuf> {
     let system = Path::new(SYSTEM_BIN_DIR);
     let dir = chrome_use_dir(
         crate::util::is_executable(&system.join(file_name)),
-        dir_is_writable(system),
+        crate::util::dir_is_writable(system),
         chrome_use_user_bin_dir(),
     )?;
     Some(dir.join(file_name))
@@ -597,23 +597,6 @@ fn chrome_use_dir(
     (system_copy || system_writable)
         .then(|| PathBuf::from(SYSTEM_BIN_DIR))
         .or(user)
-}
-
-/// Whether the helper installer's own test (`[ -w dir ]`) passes for `dir`, so a
-/// root-owned `/usr/local/bin` is not written. `libc::access` rather than a look
-/// at the mode bits: it answers through the group/other-write bit and through a
-/// read-only mount, exactly as the installer's own test does.
-#[cfg(unix)]
-#[must_use]
-fn dir_is_writable(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `path` is a valid NUL-terminated C string that outlives the call
-    // and `access` only reads it.
-    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
 }
 
 /// The system-wide directory the helper's own installer uses when it can be

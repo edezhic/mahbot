@@ -143,9 +143,10 @@ impl Tool for VideoGenTool {
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::GENERATION).await?;
 
-        // Save to workspace/generated/ and format the media marker. The marker
-        // stays first; the transcription is appended for the Assistant to reason
-        // about its own output (fail-open: marker-only on transcription failure).
+        // Save to the caller's output directory and format the media marker. The
+        // marker stays first; the transcription is appended for the Assistant to
+        // reason about its own output (fail-open: marker-only on transcription
+        // failure).
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
         let marker = self.format_media_result(&output_path);
         Ok(super::format_video_result(marker, &output_path).await)

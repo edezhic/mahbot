@@ -100,6 +100,11 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
 
     let args = call.args.clone();
     let started = Instant::now();
+    // The destination a command line chose for the files this call produces, as
+    // the producing tools read it through [`crate::agent::tool_output_dir`]. It
+    // is read here because nothing in the tools' arguments carries it — a tool
+    // argument would be model input, while this is the caller's own operand.
+    let output_dir = call.output_dir.as_deref().map(std::path::PathBuf::from);
     let outcome = crate::agent::CURRENT_TOOL_COMMAND_LINE
         .scope(true, async {
             crate::agent::CURRENT_TOOL_USER_NAME
@@ -108,24 +113,30 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
                         .scope(channel, async {
                             crate::agent::CURRENT_TOOL_AGENT_TRACKING
                                 .scope(tracking, async {
-                                    match AssertUnwindSafe(tool.execute_answer(&ws, args))
-                                        .catch_unwind()
+                                    crate::agent::CURRENT_TOOL_OUTPUT_DIR
+                                        .scope(output_dir, async {
+                                            match AssertUnwindSafe(tool.execute_answer(&ws, args))
+                                                .catch_unwind()
+                                                .await
+                                            {
+                                                Ok(Ok(answer)) => Ok(answer),
+                                                // A panic is a refusal carrying the panic's own
+                                                // message, never a severed exchange — the crate builds
+                                                // with `panic = "unwind"` on purpose.
+                                                Err(payload) => {
+                                                    Err(crate::util::panic_message(&*payload))
+                                                }
+                                                // The tool's own wording, unwrapped: the caller reads
+                                                // it as the product's answer, so it must not carry the
+                                                // `Error executing <tool>: …` envelope that is worded
+                                                // for a model's failure block. The record below wraps
+                                                // it the way an agent's failure is recorded. Any
+                                                // context chain is kept — `Display` alone would hide
+                                                // the cause the outermost context names.
+                                                Ok(Err(e)) => Err(format!("{e:#}")),
+                                            }
+                                        })
                                         .await
-                                    {
-                                        Ok(Ok(answer)) => Ok(answer),
-                                        // A panic is a refusal carrying the panic's own
-                                        // message, never a severed exchange — the crate builds
-                                        // with `panic = "unwind"` on purpose.
-                                        Err(payload) => Err(crate::util::panic_message(&*payload)),
-                                        // The tool's own wording, unwrapped: the caller reads
-                                        // it as the product's answer, so it must not carry the
-                                        // `Error executing <tool>: …` envelope that is worded
-                                        // for a model's failure block. The record below wraps
-                                        // it the way an agent's failure is recorded. Any
-                                        // context chain is kept — `Display` alone would hide
-                                        // the cause the outermost context names.
-                                        Ok(Err(e)) => Err(format!("{e:#}")),
-                                    }
                                 })
                                 .await
                         })
@@ -187,18 +198,17 @@ fn unknown_tool_refusal(call: &CallRequest) -> CallReply {
     CallReply::unavailable(crate::util::redact_secrets(&wording, &call.secrets))
 }
 
+/// What a partly carried-out operation's row says: the tool's own text names the
+/// part that did not happen, and this is the reason a reader sees beside the
+/// unset `success`.
+const PARTIAL_RECORD_REASON: &str = "the operation reported that part of it was not done";
+
 /// Record the operation exactly as the agent path records a call, with
 /// [`CallSource::CommandLine`](crate::stats::CallSource::CommandLine).
 ///
 /// `agent_id`/`role`/`source` are what make a change a script made
 /// distinguishable from one the assistant made — the row is otherwise the same
-/// shape, in the same table, attributed to the owner's workspace path. The
-/// caller's own secrets are removed from the recorded error text as well as
-/// from the arguments: a failed tool can quote what it was given. The reason is
-/// recorded with the same `Error executing <tool>: …` wrap the agent path uses
-/// ([`crate::tools::tool_failure_reason`]), even though the caller was answered
-/// with the tool's own words — the record is read as a tool failure, not as a
-/// human's answer.
+/// shape, in the same table, attributed to the owner's workspace path.
 async fn record_operation(
     call: &CallRequest,
     tool_name: &str,
@@ -206,22 +216,7 @@ async fn record_operation(
     outcome: &Result<ToolAnswer, String>,
     workspace_path: &str,
 ) {
-    let record = crate::ToolCallRecord {
-        tool_name: tool_name.to_string(),
-        // The caller's own secrets are removed before the serialized arguments
-        // are scrubbed and capped.
-        arguments: crate::stats::recorded_arguments(&call.args, &call.secrets),
-        duration_ms,
-        success: outcome.is_ok(),
-        error_message: match outcome {
-            Ok(_) => None,
-            Err(reason) => {
-                let reason = crate::util::redact_secrets(reason, &call.secrets);
-                let reason = crate::tools::tool_failure_reason(tool_name, &reason);
-                (!reason.is_empty()).then_some(reason)
-            }
-        },
-    };
+    let record = operation_record(call, tool_name, duration_ms, outcome);
     // An absent log store is not an error: the operation's own answer is what
     // the caller is owed, and the record is a side benefit of it.
     if let Some(store) = crate::logs::LOG_STORE.get()
@@ -240,6 +235,44 @@ async fn record_operation(
             tool = %tool_name,
             "cli: failed to record the command-line operation"
         );
+    }
+}
+
+/// The row a finished operation becomes.
+///
+/// The caller's own secrets are removed from the recorded error text as well as
+/// from the arguments: a failed tool can quote what it was given. The reason is
+/// recorded with the same `Error executing <tool>: …` wrap the agent path uses
+/// ([`crate::tools::tool_failure_reason`]), even though the caller was answered
+/// with the tool's own words — the record is read as a tool failure, not as a
+/// human's answer. A partly carried-out operation is recorded as
+/// [`PARTIAL_RECORD_REASON`] with `success` unset: the caller is answered with a
+/// failed operation, and the row is what a reader filters on, so the two agree.
+fn operation_record(
+    call: &CallRequest,
+    tool_name: &str,
+    duration_ms: i64,
+    outcome: &Result<ToolAnswer, String>,
+) -> crate::ToolCallRecord {
+    crate::ToolCallRecord {
+        tool_name: tool_name.to_string(),
+        // The caller's own secrets are removed before the serialized arguments
+        // are scrubbed and capped. The DESTINATION is deliberately not among
+        // them: it is this command line's own operand rather than an argument the
+        // tool was handed, and the answer already names every produced file by
+        // its absolute path.
+        arguments: crate::stats::recorded_arguments(&call.args, &call.secrets),
+        duration_ms,
+        success: matches!(outcome, Ok(answer) if !answer.partial),
+        error_message: match outcome {
+            Ok(answer) if answer.partial => Some(PARTIAL_RECORD_REASON.to_string()),
+            Ok(_) => None,
+            Err(reason) => {
+                let reason = crate::util::redact_secrets(reason, &call.secrets);
+                let reason = crate::tools::tool_failure_reason(tool_name, &reason);
+                (!reason.is_empty()).then_some(reason)
+            }
+        },
     }
 }
 
@@ -298,6 +331,56 @@ mod tests {
         assert_eq!(refused.answer, "no workspace named [REDACTED]");
     }
 
+    /// The row a recorded operation leaves behind says what the caller saw: a
+    /// whole operation is a success with nothing to report, a partly carried-out
+    /// one is a failure naming the shortfall, and a refusal keeps the tool's own
+    /// reason — with the caller's secrets scrubbed out of it.
+    #[test]
+    fn a_recorded_row_reports_a_partial_answer_as_a_failure() {
+        let call = |args: serde_json::Value, secrets: Vec<String>| CallRequest {
+            tool: "document".to_string(),
+            args,
+            secrets,
+            output_dir: None,
+        };
+
+        let done = operation_record(
+            &call(serde_json::json!({}), Vec::new()),
+            "document",
+            5,
+            &Ok(ToolAnswer::done("a document was produced")),
+        );
+        assert!(done.success);
+        assert_eq!(done.error_message, None);
+
+        let partial = operation_record(
+            &call(serde_json::json!({}), Vec::new()),
+            "document",
+            5,
+            &Ok(ToolAnswer::partial("produced, but a placeholder stayed")),
+        );
+        assert!(!partial.success);
+        assert_eq!(
+            partial.error_message.as_deref(),
+            Some(PARTIAL_RECORD_REASON)
+        );
+
+        let refused = operation_record(
+            &call(
+                serde_json::json!({ "key": "s3cret" }),
+                vec!["s3cret".to_string()],
+            ),
+            "document",
+            5,
+            &Err("nothing named s3cret".to_string()),
+        );
+        assert!(!refused.success);
+        assert_eq!(
+            refused.error_message.as_deref(),
+            Some("Error executing document: nothing named [REDACTED]")
+        );
+    }
+
     /// End to end through the instance side: the two `workspace` operations that
     /// need a ticket to exist are served on the running product's own tool and
     /// come back as the answers the caller reads — `ticket` and `comment`
@@ -328,6 +411,7 @@ mod tests {
             tool: "workspace".to_string(),
             args: serde_json::json!({ "action": "ticket", "ticket_id": id }),
             secrets: Vec::new(),
+            output_dir: None,
         })
         .await;
         assert_eq!(show.outcome, CallOutcome::Done, "answer: {}", show.answer);
@@ -345,6 +429,7 @@ mod tests {
                 "content": "a note from a script",
             }),
             secrets: Vec::new(),
+            output_dir: None,
         })
         .await;
         assert_eq!(note.outcome, CallOutcome::Done, "answer: {}", note.answer);
@@ -352,6 +437,168 @@ mod tests {
             note.answer.contains(&id) && note.answer.contains("assistant"),
             "a note is recorded as the assistant leaves it: {}",
             note.answer
+        );
+    }
+
+    /// End to end through the instance side for a PRODUCING family: the
+    /// operation runs the owner's own document tool, and what it produces lands
+    /// in the destination the command line carried beside the tool's arguments —
+    /// not in the workspace directory an agent's call would use — with the
+    /// answer naming it by its absolute path. The destination is the command
+    /// line's own operand and never reaches the tool's args, which is why the
+    /// tool's own answer stays word-for-word what an agent reads. An operation
+    /// that produces SEVERAL files puts every one there too.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn execute_produces_a_document_into_the_destination_the_caller_chose() {
+        /// Run one document operation into the destination and return every file
+        /// the product's own answer names, each absolute and the destination's child.
+        async fn drive(
+            destination: &std::path::Path,
+            args: serde_json::Value,
+        ) -> Vec<std::path::PathBuf> {
+            let reply = execute(CallRequest {
+                tool: "document".to_string(),
+                args,
+                secrets: Vec::new(),
+                output_dir: Some(destination.to_string_lossy().into_owned()),
+            })
+            .await;
+            assert_eq!(reply.outcome, CallOutcome::Done, "answer: {}", reply.answer);
+            reply
+                .answer
+                .split("[FILE:")
+                .skip(1)
+                .map(|rest| std::path::PathBuf::from(rest.split(']').next().unwrap_or_default()))
+                .inspect(|file| {
+                    assert!(
+                        file.is_absolute() && file.exists() && file.parent() == Some(destination),
+                        "a produced file is named by its absolute path, is there, and lands in \
+                         the destination the caller chose: {}",
+                        file.display()
+                    );
+                })
+                .collect()
+        }
+
+        if crate::tools::bun::bun_binary_path().is_none() {
+            return;
+        }
+        crate::util::test::init_test_stores().await;
+        crate::cli::mark_ready();
+
+        let destination = crate::util::test::test_root().join("cli-destination");
+        let _ = tokio::fs::remove_dir_all(&destination).await;
+        tokio::fs::create_dir_all(&destination)
+            .await
+            .expect("a destination of the caller's own");
+
+        let created = drive(
+            &destination,
+            serde_json::json!({ "action": "create", "format": "docx", "file_name": "from-a-script", "content": [{ "type": "paragraph", "text": "produced by a script" }] }),
+        )
+        .await;
+        assert_eq!(created, [destination.join("from-a-script.docx")]);
+
+        // The multi-file case: two single-page PDFs merged into one, and that
+        // merge split back into one file per page.
+        let mut pages = Vec::new();
+        for name in ["one", "two"] {
+            let pdf = drive(
+                &destination,
+                serde_json::json!({ "action": "create", "format": "pdf", "file_name": name, "content": [{ "type": "paragraph", "text": name }] }),
+            )
+            .await;
+            pages.push(pdf.into_iter().next().expect("create writes one pdf"));
+        }
+        let merged = drive(
+            &destination,
+            serde_json::json!({ "action": "pdf_merge", "paths": [pages[0].to_string_lossy(), pages[1].to_string_lossy()], "file_name": "merged" }),
+        )
+        .await;
+        let merged = merged.first().expect("a merge writes one file");
+        let parts = drive(
+            &destination,
+            serde_json::json!({ "action": "pdf_split", "path": merged.to_string_lossy(), "pages": ["1", "2"], "file_name": "page" }),
+        )
+        .await;
+        assert_eq!(parts.len(), 2, "one file per page entry: {parts:?}");
+
+        // The agents' own generated directory is untouched: the destination
+        // replaced it for these calls alone.
+        let agents = crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME)
+            .join("generated")
+            .join("from-a-script.docx");
+        assert!(
+            tokio::fs::metadata(&agents).await.is_err(),
+            "a command-line call must not write into the agent's own generated directory"
+        );
+    }
+
+    /// A partly carried-out document operation reaches the caller as `Partial`:
+    /// the tool's own flag, never a reading of its wording — and the answer is
+    /// delivered whole.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn execute_reports_a_shortfall_the_document_tool_found() {
+        if crate::tools::bun::bun_binary_path().is_none() {
+            return;
+        }
+        crate::util::test::init_test_stores().await;
+        crate::cli::mark_ready();
+
+        let destination = crate::util::test::test_root().join("cli-destination-shortfall");
+        let _ = tokio::fs::remove_dir_all(&destination).await;
+        tokio::fs::create_dir_all(&destination)
+            .await
+            .expect("a destination of the caller's own");
+
+        // A template with two placeholders of which the call fills one: the
+        // fill runs, the copy is produced, and the other placeholder is left as
+        // it was — a shortfall the tool's own answer names.
+        let sample = destination.join("sample.docx");
+        let created = execute(CallRequest {
+            tool: "document".to_string(),
+            args: serde_json::json!({
+                "action": "create",
+                "format": "docx",
+                "file_name": "sample",
+                "content": [{ "type": "paragraph", "text": "Hello, {name}! {unfilled}" }],
+            }),
+            secrets: Vec::new(),
+            output_dir: Some(destination.to_string_lossy().into_owned()),
+        })
+        .await;
+        assert_eq!(
+            created.outcome,
+            CallOutcome::Done,
+            "answer: {}",
+            created.answer
+        );
+        assert!(tokio::fs::metadata(&sample).await.is_ok());
+
+        let filled = execute(CallRequest {
+            tool: "document".to_string(),
+            args: serde_json::json!({
+                "action": "fill_template",
+                "path": sample.to_string_lossy(),
+                "values": { "name": "Ada" },
+                "file_name": "filled",
+            }),
+            secrets: Vec::new(),
+            output_dir: Some(destination.to_string_lossy().into_owned()),
+        })
+        .await;
+        assert_eq!(
+            filled.outcome,
+            CallOutcome::Partial,
+            "a shortfall must reach the caller as one: {}",
+            filled.answer
+        );
+        assert!(
+            filled.answer.contains("no values for these placeholders"),
+            "the product's own answer names the part that did not succeed: {}",
+            filled.answer
         );
     }
 }

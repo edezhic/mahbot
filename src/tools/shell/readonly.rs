@@ -906,10 +906,14 @@ const PRODUCT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
 ///
 /// `mahbot` means the product itself. Its other command lines change it, drive
 /// it or restart it: its `mahbot config …` / `mahbot workspace …` families carry
-/// the owner's own configuration and workspace authority, and `mahbot send …`
-/// dispatches the very agents the owner's own dispatch tool reaches — the
-/// authority the roles holding those tools already have — so a read-only shell
-/// must not be a way around those roles' permissions. `second` is the word right
+/// the owner's own configuration and workspace authority, `mahbot send …`
+/// dispatches the very agents the owner's own dispatch tool reaches, and
+/// `mahbot document …` / `mahbot image …` / `mahbot video …` run the assistant's
+/// own document, picture and video tools, making files with the owner's own
+/// account (a picture or a video paid for through his provider account, a
+/// document written where the caller says) — the authority the roles holding
+/// those tools already have — so a read-only shell must not be a way around
+/// those roles' permissions. `second` is the word right
 /// after the verb (the only place a subcommand can stand; scanning the list
 /// instead would admit `mahbot foo debug`), `None` for a bare `mahbot`, which is
 /// a daemon launch and is refused with the rest.
@@ -944,7 +948,10 @@ fn check_product_segment(segment: &str, second: Option<&str>) -> Result<(), Stri
             "{called} is the product's own binary, and not one of its read-only forms ({allowed}). \
              Its other command lines change the product, drive it or restart it: its \
              `config`/`workspace` families carry the owner's own configuration and workspace \
-             authority, and its `send` family dispatches the agents its dispatch tool reaches — \
+             authority, its `send` family dispatches the agents its dispatch tool reaches, and \
+             its `document`/`image`/`video` families run the assistant's own document, picture \
+             and video tools, making files with the owner's own account (a picture or a video \
+             paid for through his provider account, a document written where the caller says) — \
              the same authority the roles holding those tools already have, so a read-only shell \
              must not be a way around them."
         ),
@@ -6760,12 +6767,13 @@ mod tests {
 
     /// The product's own binary is judged by its own rule: only its read-only
     /// second words run, everything else — a daemon launch, the chrome frontend,
-    /// the configuration/workspace families, the one-way `send`, a bench binary
-    /// — is refused. The second word is read POSITIONALLY, so `mahbot foo debug`
-    /// is a refusal too, and the comparison is case-sensitive on every platform
-    /// (the binary compares its own `argv[1]` the same way, so `mahbot DEBUG`
-    /// launches the daemon rather than querying). The path-spelled row is the
-    /// spelling this shell's own grep rewrite carries, so it must keep working.
+    /// the configuration/workspace/send/document/image/video families, a bench
+    /// binary — is refused. The second word is read POSITIONALLY, so `mahbot foo
+    /// debug` is a refusal too, and the comparison is case-sensitive on every
+    /// platform (the binary compares its own `argv[1]` the same way, so `mahbot
+    /// DEBUG` launches the daemon rather than querying). The path-spelled row is
+    /// the spelling this shell's own grep rewrite carries, so it must keep
+    /// working.
     #[cfg(unix)]
     #[test]
     fn product_binary_runs_only_its_read_only_forms() {
@@ -6786,6 +6794,19 @@ mod tests {
             // The speech command is refused with the rest: `speak` writes a file at
             // a path the caller names, and the whole family stays out of this mode.
             ("mahbot audio speak --text hi --output /tmp/x.wav", false),
+            // The document/picture/video families are refused with them: they run
+            // the assistant's own tools, making files with the owner's account and
+            // putting them where the caller names.
+            (
+                "mahbot document create --format pdf --output-dir /tmp",
+                false,
+            ),
+            ("mahbot image gen --prompt a cat", false),
+            ("mahbot video gen --prompt a cat", false),
+            (
+                "mahbot video edit --video-url /tmp/x.mp4 --instruction restyle it",
+                false,
+            ),
             ("mahbot DEBUG", false),     // a daemon launch, not `debug`
             ("mahbot foo debug", false), // the verb's own next word is the one read
             ("mahbot -V", true),

@@ -354,8 +354,8 @@ impl Role {
             Box::new(ImageGenTool),
             Box::new(VideoGenTool),
             Box::new(VideoEditTool),
-            // Likewise, the document tool serves every account: its
-            // outputs always stay inside the caller's own workspace, and
+            // Likewise, the document tool serves every account: an agent's
+            // own call keeps its outputs inside that agent's workspace, and
             // its input paths follow the caller's access.
             Box::new(DocumentTool::new(file_access)),
         ];
@@ -364,8 +364,9 @@ impl Role {
         // what each call may reach.
         t.push(Box::new(CustomTool));
         // A guest's Assistant read access is workspace-bounded; the
-        // admin's reaches any path the shell could name. (Media tools
-        // write only into the workspace's generated/ tree in both cases.)
+        // admin's reaches any path the shell could name. (An agent's own
+        // media call writes only into the workspace's generated/ tree in
+        // both cases.)
         t.push(Box::new(ReadTool::new(file_access)));
         if is_admin {
             t.push(Box::new(ShellTool::new(ShellMode::Full)));

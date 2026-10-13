@@ -1,7 +1,7 @@
 //! The product's flag grammar, in one place.
 //!
-//! The command lines behind [`crate::cli`] (the `config`, `workspace` and `send`
-//! families) and `mahbot audio` read a flag tail the same way: a token is
+//! The command lines behind [`crate::cli`] (every family it publishes) and
+//! `mahbot audio` read a flag tail the same way: a token is
 //! `--<flag>`, `--<flag>=<value>` or `--<flag> <value>`, and a value is the very
 //! next token taken VERBATIM — so a value may itself look like a flag, and a
 //! value mistyped as a positional is never echoed back out. `-h`/`--help` asks

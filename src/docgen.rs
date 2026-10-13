@@ -21,15 +21,21 @@
 //! which is only the run's diagnostics. Both files live in the kit's `scratch/`
 //! directory, which is emptied when the kit is prepared. A result is
 //! `{"ok": bool, "outputs": [...], "missing": [...], "placeholders": N,
-//! "unsupported": [...], "notes": [...], "class": "...", "error": "..."}`, where
-//! `placeholders` is a `fill_template` result only, `unsupported` lists the
-//! distinct characters the embedded PDF font could not draw for a PDF-writing
-//! operation, `notes` are the caveats an editing operation discovered at run time
-//! — already-bracketed, user-facing sentences the reply appends verbatim — and
-//! `class` is present only on a failure the kit blamed on the request ("usage":
-//! the caller can fix it, see [`read_result`]). A failure of the run itself (a
-//! timeout, a kill, a spawn failure) never reaches the result file and is
-//! reported by the runner, with its own class token.
+//! "unsupported": [...], "notes": [...], "losses": [...], "class": "...",
+//! "error": "..."}`, where `placeholders` is a `fill_template` result only,
+//! `unsupported` lists the distinct characters the embedded PDF font could not
+//! draw for a PDF-writing operation, `notes` are the caveats an editing operation
+//! discovered at run time — already-bracketed, user-facing sentences the reply
+//! appends verbatim — `losses` are the subset of those that say part of what the
+//! call asked for is NOT in the produced file (the three edit operations only;
+//! every other operation reports none): what the edit could not carry over, a
+//! reference it left naming the old cell, or something it removed beyond what was
+//! named. A note about the input's own properties — a signature that no longer
+//! matches, a chart or pivot cache nothing recomputes — is not a loss. `class` is
+//! present only on a failure the kit blamed on the request ("usage": the caller
+//! can fix it, see [`read_result`]). A failure of the run itself (a timeout, a
+//! kill, a spawn failure) never reaches the result file and is reported by the
+//! runner, with its own class token.
 //!
 //! # Containment
 //!
@@ -236,11 +242,18 @@ pub(crate) struct KitOutcome {
     /// character, missing from the produced file rather than present in it.
     pub unsupported: Vec<String>,
     /// The caveats an editing operation discovered at run time — already
-    /// bracketed, user-facing sentences the reply appends verbatim: a chart or
-    /// pivot that keeps the values it cached, references or anchors a row or
-    /// column shift left naming the old cells, text that lost several runs'
-    /// formatting. Empty for every operation that reports none.
+    /// bracketed, user-facing sentences the reply appends verbatim: references or
+    /// anchors a row or column shift left naming the old cells, text that lost
+    /// several runs' formatting, a chart or pivot that keeps the values it cached,
+    /// a signature that no longer matches the edited package. Empty for every
+    /// operation that reports none.
     pub notes: Vec<String>,
+    /// Whether the kit itself raised at least one caveat that means part of what
+    /// the call asked for is NOT in the produced file — as opposed to a note that
+    /// records the scope of the edit or a property of the input it edited (see
+    /// [`Self::notes`]). The kit marks these where it raises them, so a shortfall
+    /// is never inferred from anyone reading the wording.
+    pub lossy: bool,
 }
 
 /// Run one kit operation and report what it produced.
@@ -261,6 +274,9 @@ pub(crate) async fn run(request: Value) -> Result<KitOutcome> {
             .and_then(|count| usize::try_from(count).ok()),
         unsupported: string_array(&value, "unsupported"),
         notes: string_array(&value, "notes"),
+        // The kit reports `losses` only for the three edit operations; every
+        // other operation leaves it out, which reads as no loss.
+        lossy: !string_array(&value, "losses").is_empty(),
     })
 }
 

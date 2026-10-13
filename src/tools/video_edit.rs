@@ -523,9 +523,10 @@ async fn resolve_image_input(
 
 /// Tool for editing an existing video clip via OpenRouter's async videos API.
 ///
-/// Accepts a public source clip URL or a local file path (from the workspace
-/// `uploads/` received-attachments dir or the `generated/` output dir,
-/// uploaded to an ephemeral anonymous host at job time), submits exactly one
+/// Accepts a public source clip URL or a local file path (which local paths a
+/// caller may name is [`crate::tools::resolve_local_media_path`]'s rule —
+/// confined to the workspace for an agent, any file for the command line), and
+/// uploads it to an ephemeral anonymous host at job time; submits exactly one
 /// video edit job, polls for completion, downloads the edited clip, and
 /// returns its path so the agent can send it via `[VIDEO:path]` in its reply.
 pub struct VideoEditTool;
@@ -700,9 +701,10 @@ impl Tool for VideoEditTool {
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::EDIT).await?;
 
-        // Save to workspace/generated/ and format the media marker. The marker
-        // stays first; the transcription is appended for the Assistant to reason
-        // about its own output (fail-open: marker-only on transcription failure).
+        // Save to the caller's output directory and format the media marker. The
+        // marker stays first; the transcription is appended for the Assistant to
+        // reason about its own output (fail-open: marker-only on transcription
+        // failure).
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
         let marker = self.format_media_result(&output_path);
         Ok(super::format_video_result(marker, &output_path).await)

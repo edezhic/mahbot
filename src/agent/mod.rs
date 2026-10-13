@@ -114,6 +114,15 @@ pub(crate) fn tool_custom_launch() -> Option<crate::Launch> {
         .unwrap_or(None)
 }
 
+/// Synchronous read of [`CURRENT_TOOL_OUTPUT_DIR`]: where a command-line call's
+/// produced files must land, `None` for every other caller. A producing tool
+/// reads it before its `tokio::spawn` boundary, like the neighbours above.
+pub(crate) fn tool_output_dir() -> Option<std::path::PathBuf> {
+    CURRENT_TOOL_OUTPUT_DIR
+        .try_with(std::clone::Clone::clone)
+        .unwrap_or(None)
+}
+
 tokio::task_local! {
     pub(crate) static CURRENT_TOOL_USER_NAME: String;
     pub(crate) static CURRENT_TOOL_CHANNEL: String;
@@ -162,6 +171,12 @@ tokio::task_local! {
     /// carries the caller's branch address into the round's envelope
     /// and job row. `None` for every built-in role.
     pub(crate) static CURRENT_TOOL_CUSTOM_LAUNCH: Option<crate::Launch>;
+    /// The directory a command-line call's produced files must land in — set
+    /// ONLY by [`crate::cli::instance`] around the one call it serves, because a
+    /// frontend caller knows where it wants the file and the tool's arguments
+    /// never carry it. `None` (the whole agent path) means the tool's own
+    /// workspace directory: the producing tools fall back to it.
+    pub(crate) static CURRENT_TOOL_OUTPUT_DIR: Option<std::path::PathBuf>;
 }
 
 /// Maximum number of completed tool rounds before the agent loop bails out.
