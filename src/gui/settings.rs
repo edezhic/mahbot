@@ -1170,9 +1170,10 @@ impl SettingsState {
                     Ok(outcome) => {
                         self.field_errors.remove(&field);
                         self.sync_persisted(&field, Some(&outcome.value));
-                        // Only the endpoint persist arm can produce a warning —
-                        // a key-field result must never touch the endpoint
-                        // warning slot.
+                        // The endpoint arm's warning has a slot of its own, and it
+                        // is the only arm that carries one: a post-write failure
+                        // that leaves the save standing is logged by the persist
+                        // layer instead.
                         if field == CONFIG_FIELD_PROVIDER_ENDPOINT {
                             self.endpoint_warning = outcome.warning;
                         }

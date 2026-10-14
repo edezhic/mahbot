@@ -89,8 +89,8 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method"];
 
 /// Name (file stem) of the single consolidated domain database file that backs
-/// the board, sessions, workspaces, users, config, chat_history, alarms and
-/// custom_roles stores.
+/// the board, sessions, workspaces, users, config, chat_history, alarms,
+/// custom_roles and telegram_intake stores.
 ///
 /// The domain stores were historically split across separate files; they
 /// now share one file (and one shared [`Connection`]) so that cross-store
@@ -118,6 +118,7 @@ const DOMAIN_STORE_NAMES: &[&str] = &[
     "chat_history",
     "alarms",
     "custom_roles",
+    "telegram_intake",
 ];
 
 /// Name (file stem) of the logs store — the one store that stays a separate
@@ -169,10 +170,10 @@ pub(crate) fn iter_checkpoint_stores()
 ///
 /// # Consolidated layout
 ///
-/// The domain stores (board, sessions, workspaces, users, config,
-/// chat_history, alarms, custom_roles) are consolidated into ONE physical file
-/// ([`CONSOLIDATED_DB_NAME`]); only the logs store is a separate file. This
-/// function returns the LOGICAL store names so `--db board`, `--db sessions`,
+/// The domain stores (board, sessions, workspaces, users, config, chat_history,
+/// alarms, custom_roles, telegram_intake) are consolidated into ONE physical
+/// file ([`CONSOLIDATED_DB_NAME`]); only the logs store is a separate file.
+/// This function returns the LOGICAL store names so `--db board`, `--db sessions`,
 /// etc. resolve to the single consolidated file via [`store_db_path`].
 pub(crate) fn store_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = DOMAIN_STORE_NAMES.to_vec();
@@ -197,7 +198,8 @@ pub(crate) fn debug_db_names() -> Vec<&'static str> {
 /// Initialize all database stores concurrently.
 ///
 /// This is the canonical initialization path for the domain stores (board,
-/// session, workspace, users, chat_history, config, alarms, custom_roles).
+/// session, workspace, users, chat_history, config, alarms, custom_roles,
+/// telegram_intake).
 /// The `logs` store
 /// is **not** included here because it must be initialized earlier via
 /// [`crate::logs::init_tracing`], which requires the log store before any
@@ -235,6 +237,8 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     let workspace = crate::workspace::WorkspaceStore { conn: conn.clone() };
     let config = crate::config_db::ConfigStore { conn: conn.clone() };
     let chat_history = crate::channels::chat_history::ChatHistoryStore { conn: conn.clone() };
+    let telegram_intake =
+        crate::channels::telegram_intake::TelegramIntakeStore { conn: conn.clone() };
     let alarms = crate::alarms::AlarmStore { conn: conn.clone() };
     let custom_roles = crate::custom_role::CustomRoleStore { conn: conn.clone() };
 
@@ -256,6 +260,11 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
         &crate::channels::chat_history::CHAT_HISTORY,
         chat_history,
         "CHAT_HISTORY",
+    )?;
+    init_cell(
+        &crate::channels::telegram_intake::TELEGRAM_INTAKE,
+        telegram_intake,
+        "TELEGRAM_INTAKE",
     )?;
     init_cell(&crate::alarms::ALARMS, alarms, "ALARMS")?;
     init_cell(

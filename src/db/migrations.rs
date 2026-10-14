@@ -62,9 +62,12 @@
 //! session's cached leading context block is measured from what was written
 //! rather than re-derived from live workspace state. `58` adds the
 //! `tool_calls.source` column — the marker that tells a call a command-line
-//! operation performed from an agent's own.
+//! operation performed from an agent's own. `59` adds the `telegram_intake`
+//! table — the Telegram intake's durable record of the incoming updates it has
+//! taken up — and `60` upfills its `claimed_by` column on the installs whose
+//! table was created by the earlier revision of `59`.
 //!
-//! Future schema changes resume the chain at id `59` with monotonically
+//! Future schema changes resume the chain at id `61` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -306,6 +309,17 @@ CREATE TABLE IF NOT EXISTS chat_history (
     timestamp     TEXT,
     reply_author  TEXT,
     reply_snippet TEXT
+);
+-- ── Telegram intake ────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS telegram_intake (
+    account_id TEXT NOT NULL,
+    update_id  INTEGER NOT NULL,
+    state      TEXT NOT NULL,
+    payload    TEXT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    claimed_by TEXT,
+    PRIMARY KEY (account_id, update_id)
 );
 -- ── Ticket chronicle / alarms ──────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ticket_chronicle (
@@ -653,6 +667,23 @@ const CUSTOM_ROLES_TABLE: &str = "CREATE TABLE IF NOT EXISTS custom_roles (
     created_at TEXT NOT NULL
 );";
 
+/// Delta `59` (existing installs): the `telegram_intake` table in its current
+/// shape, `claimed_by` included. The baseline (`24`) already declares it, so on a
+/// fresh install this is an `IF NOT EXISTS` no-op; on an existing install it
+/// creates the table. An install that applied this entry in its earlier revision,
+/// before the column was added, is upfilled by delta `60` — an applied id is
+/// never re-run.
+const TELEGRAM_INTAKE_TABLE: &str = "CREATE TABLE IF NOT EXISTS telegram_intake (
+    account_id TEXT NOT NULL,
+    update_id  INTEGER NOT NULL,
+    state      TEXT NOT NULL,
+    payload    TEXT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    claimed_by TEXT,
+    PRIMARY KEY (account_id, update_id)
+);";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
 /// Entries `24`–`26` are the consolidated current-shape baseline; entries
@@ -748,6 +779,12 @@ const CUSTOM_ROLES_TABLE: &str = "CREATE TABLE IF NOT EXISTS custom_roles (
 ///   recorded call (`agent` or `cli`), so a change a command-line operation
 ///   made is distinguishable from one the assistant made (a no-op on fresh
 ///   installs, whose baseline already declares it).
+/// - `59` adds the `telegram_intake` table — the Telegram intake's durable
+///   record of the incoming updates it has taken up (fresh installs get it from
+///   entry `24`'s `CREATE TABLE`, so this is a no-op there).
+/// - `60` adds the `telegram_intake.claimed_by` column — the run that holds an event
+///   — to a table created without it (entry `59` carries why), a no-op wherever the
+///   table already has it.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -923,6 +960,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "58",
         target: TargetDb::Logs,
         body: MigrationBody::Rust(add_tool_calls_source),
+    },
+    Migration {
+        id: "59",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(TELEGRAM_INTAKE_TABLE),
+    },
+    Migration {
+        id: "60",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_telegram_intake_claimed_by),
     },
 ];
 
@@ -1340,6 +1387,20 @@ async fn run_add_tool_calls_source(conn: &Connection) -> anyhow::Result<()> {
         "TEXT NOT NULL DEFAULT 'agent'",
     )
     .await
+}
+
+fn add_telegram_intake_claimed_by(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_telegram_intake_claimed_by(conn))
+}
+
+/// Guarantee the `telegram_intake.claimed_by` column — the run that holds an event
+/// — on a database whose table was created without it (see entry `59`). A table
+/// that already carries the column (every fresh install, from the baseline's
+/// `CREATE TABLE`) is left alone. Guarded by [`add_column_if_missing`], so this
+/// body is idempotent (non-transactional like every Rust body, re-runnable until
+/// recorded).
+async fn run_add_telegram_intake_claimed_by(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "telegram_intake", "claimed_by", "TEXT").await
 }
 
 fn add_session_metadata_sleep_ended(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -2006,6 +2067,18 @@ mod tests {
             &["id", "agent_id", "role", "content", "created_at"],
         ),
         (
+            "telegram_intake",
+            &[
+                "account_id",
+                "update_id",
+                "state",
+                "payload",
+                "created_at",
+                "decided_at",
+                "claimed_by",
+            ],
+        ),
+        (
             "ticket_chronicle",
             &[
                 "id",
@@ -2257,10 +2330,10 @@ mod tests {
     }
 
     /// Tables a reopen introduces which the pre-reopen fixture cannot carry
-    /// (delta `51`'s `custom_roles`). They have no "before" row count to
-    /// compare, so the reopen snapshot skips them; their arrival is asserted by
-    /// the schema comparison instead.
-    const REOPEN_NEW_CORE_TABLES: &[&str] = &["custom_roles"];
+    /// (delta `51`'s `custom_roles` and delta `59`'s `telegram_intake`). They
+    /// have no "before" row count to compare, so the reopen snapshot skips them;
+    /// their arrival is asserted by the schema comparison instead.
+    const REOPEN_NEW_CORE_TABLES: &[&str] = &["custom_roles", "telegram_intake"];
 
     /// Domain tables whose row counts a reopen snapshot compares: every
     /// expected domain table except the ones the reopen introduces.
@@ -3095,8 +3168,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57` tail, and converges to the exact current core
-    /// shape: the table set (which also proves the required absences of
+    /// upfills and the `36`–`57`/`59`/`60` tail, and converges to the exact current
+    /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
     /// `pipeline_reservation` / `paused_frozen` and of the account-kind
@@ -3123,10 +3196,61 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55", "56", "57"
+                "54", "55", "56", "57", "59", "60"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59/60 tail exactly"
+        );
+    }
+
+    /// A database that applied the `telegram_intake` table in the shape delta `59` first
+    /// landed it — without `claimed_by` — is upgraded by entry `60`. An applied id is
+    /// never re-run, so the column cannot be folded into `59`: `60` is what carries it to
+    /// an install that ran the earlier revision, which is why the entry exists.
+    #[tokio::test]
+    async fn a_telegram_intake_table_without_claimed_by_is_upgraded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_consolidated_store(tmp.path())
+            .await
+            .expect("fresh consolidated store");
+        // The state such an install is in: the table of the earlier `59`, with `60` —
+        // added to the catalog later — not yet applied.
+        conn.execute("DROP TABLE telegram_intake", ())
+            .await
+            .expect("drop the table");
+        conn.execute(
+            "CREATE TABLE telegram_intake (\
+                 account_id TEXT NOT NULL,\
+                 update_id  INTEGER NOT NULL,\
+                 state      TEXT NOT NULL,\
+                 payload    TEXT,\
+                 created_at TEXT NOT NULL,\
+                 decided_at TEXT,\
+                 PRIMARY KEY (account_id, update_id)\
+             )",
+            (),
+        )
+        .await
+        .expect("the table as delta 59 first created it");
+        conn.execute("DELETE FROM schema_migrations WHERE id = '60'", ())
+            .await
+            .expect("forget delta 60");
+        assert!(
+            !column_names(&conn, "telegram_intake")
+                .await
+                .contains(&"claimed_by".to_string()),
+            "the fixture must lack the column the entry adds"
+        );
+
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("reopen the catalog");
+
+        assert!(
+            column_names(&conn, "telegram_intake")
+                .await
+                .contains(&"claimed_by".to_string()),
+            "delta 60 must add claimed_by to a table delta 59 created without it"
         );
     }
 
@@ -3456,7 +3580,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57",
+            "54", "55", "56", "57", "59", "60",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3465,7 +3589,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59/60"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -3476,7 +3600,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         // tickets/ticket_chronicle (delta 34), jobs.exec_dir (delta 47),
         // jobs.custom_launch (delta 54), session_metadata.personal_changes
         // (delta 55), session_metadata.reply_to (delta 56),
-        // session_metadata.context_block_len (delta 57) and the
+        // session_metadata.context_block_len (delta 57),
+        // telegram_intake (delta 59) and the
         // custom-role tail (delta 51's `custom_roles` table plus the
         // session_metadata/alarms columns of deltas 52/53)
         // change in shape and the delta-28
@@ -3500,6 +3625,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "ticket_chronicle",
                 // Introduced by delta 51 — absent from the pre-reopen fixture.
                 "custom_roles",
+                // Introduced by delta 59 — absent from the pre-reopen fixture.
+                "telegram_intake",
             ],
             &["idx_jobs_caller_agent"],
         )
@@ -3698,7 +3825,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`57`: the data migrations (detaching guests from
+    /// entries `36`–`57`/`59`/`60`: the data migrations (detaching guests from
     /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
     /// deleting the command-armed alarm rows, rewriting the retired
     /// `in_review`/`in_qa` stages to `verification`, invalidating the
@@ -3711,7 +3838,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// custom-role tail (`custom_roles` plus the `session_metadata` and
     /// `alarms` columns), and the `jobs.exec_dir` / `jobs.custom_launch` /
     /// `session_metadata.personal_changes` / `session_metadata.reply_to` /
-    /// `session_metadata.context_block_len` columns.
+    /// `session_metadata.context_block_len` columns, and the `telegram_intake`
+    /// table of delta `59` (its `claimed_by` column guaranteed by `60`).
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -3766,6 +3894,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                     && *n != "schema_migrations"
                     // Introduced by delta `51` — absent before the upgrade.
                     && *n != "custom_roles"
+                    // Introduced by delta `59` — absent from the pre-reopen fixture.
+                    && *n != "telegram_intake"
             })
             .collect();
         let before_other = column_sets(&conn, &untouched_tables).await;
@@ -3816,7 +3946,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57",
+            "54", "55", "56", "57", "59", "60",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3825,7 +3955,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59/60"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

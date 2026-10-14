@@ -1,5 +1,6 @@
 use crate::channels::ReplyReference;
 use crate::channels::reply::normalize_reply_text;
+use crate::channels::telegram_intake::{Intake, TelegramIntakeStore, listener_claim};
 use crate::pipeline::board::{Ticket, TicketPhase};
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::util::media_target::{self, MediaTarget};
@@ -11,10 +12,10 @@ use crate::{Channel, ChannelMessage, SendMessage, Workspace};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use strum::IntoEnumIterator;
 
 /// Telegram's maximum message length for text messages
@@ -353,6 +354,7 @@ impl MessageContext {
             message_id: (self.message_id != 0).then_some(self.message_id),
             attachment_dirs: Vec::new(),
             parts: Vec::new(),
+            update_ids: Vec::new(),
         }
     }
 
@@ -988,9 +990,38 @@ fn parse_attachment_markers(
 /// Base URL for the Telegram Bot API.
 const API_BASE: &str = "https://api.telegram.org";
 
-/// Bot-API URL for `method` on the bot identified by `token`.
-fn bot_api_url(token: &str, method: &str) -> String {
-    format!("{API_BASE}/bot{token}/{method}")
+/// Bot-API URL for `method` on the bot identified by `token`, at `api_base`.
+fn bot_api_url(api_base: &str, token: &str, method: &str) -> String {
+    format!("{api_base}/bot{token}/{method}")
+}
+
+/// The `getMe` answer for `token` at `api_base`, once the platform has confirmed
+/// the token is one of its own.
+///
+/// Validating a token and naming the account it belongs to are the same call and
+/// the same answer; the caller is what differs — the intake keys its record on the
+/// account's own identity rather than on the token's text, so a rotated token for
+/// the same account still recovers.
+async fn get_me(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let response = client
+        .get(bot_api_url(api_base, token, "getMe"))
+        .send()
+        .await
+        .context("Failed to reach Telegram API")?;
+    let status = response.status();
+    let data: serde_json::Value = match response.json().await {
+        Ok(data) => data,
+        Err(err) => anyhow::bail!("Failed to parse Telegram API response: {err}"),
+    };
+    if !status.is_success() || data["ok"].as_bool() != Some(true) {
+        let desc = data["description"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("Invalid Telegram bot token: {desc}");
+    }
+    Ok(data)
 }
 
 /// Telegram Bot API maximum file download size.
@@ -1120,10 +1151,23 @@ pub struct TelegramChannel {
     /// channel's listener, not the entire application.
     cancel: std::sync::Arc<tokio_util::sync::CancellationToken>,
 
-    /// Last confirmed `update_id + 1` offset. Shared across old/new listener
-    /// instances during hot-reload so the new listener doesn't replay old
-    /// updates from Telegram's server.
-    offset: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// The Bot API base this listener calls — [`API_BASE`] in production, and an
+    /// endpoint of its own when a check drives the intake.
+    api_base: String,
+    /// The intake's durable store, resolved the first time a listener runs (the
+    /// stores open after the channel is built).
+    intake_store: std::sync::OnceLock<TelegramIntakeStore>,
+    /// The claim this listener's rows are recorded under. Every listener mints its
+    /// own, so the listener that replaces this one is a different run and takes over
+    /// what this one left held instead of leaving it for the rest of the process's
+    /// life.
+    intake_claim: std::sync::Arc<str>,
+    /// Whether a listener frame of this channel is running, and the signal for when it
+    /// stops — what a replacement waits on ([`TelegramChannel::wait_stopped`]). Several
+    /// waiters can be parked on one stop: the teardown of a cleared token, and a hand-over
+    /// that lands while that teardown waits.
+    listener_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    listener_stopped: std::sync::Arc<tokio::sync::Notify>,
 
     /// Per-chat command menu state — change detection + in-flight coalescing
     /// for the per-user `setMyCommands` refresh, so outbound message floods
@@ -1176,37 +1220,41 @@ fn parse_recipient(recipient: &str) -> (&str, Option<&str>) {
 /// `chat_source` is the object carrying the `chat` the event arrived in; it
 /// only supplies the delivery address, never the identity.
 ///
-/// Returns `None` if the sender is not a person ([`telegram_sender_person`]),
+/// Returns `Ok(None)` when the sender is not a person ([`telegram_sender_person`]),
 /// matches no binding, or the chat context is missing; otherwise a 3-tuple
 /// `(canonical_user, chat_id, reply_target)` where `canonical_user` is the
 /// account the binding resolved to, `chat_id` the raw chat ID (e.g. `"123456"`)
 /// and `reply_target` the reply target string (e.g. `"123456"`, or
-/// `"123456:789"` for threads). On auth failure the caller logs; the contact is
-/// updated only on success, and only on the binding that actually matched.
+/// `"123456:789"` for threads). The contact is updated only on success, and only
+/// on the binding that actually matched.
+///
+/// The error is the read of the user bindings failing, which is not a decision:
+/// it is what keeps a caller from turning "cannot decide right now" into a
+/// refusal and dropping the event for good.
 async fn resolve_authorized_sender(
     sender_source: &serde_json::Value,
     chat_source: &serde_json::Value,
-) -> Option<(String, String, String)> {
+) -> anyhow::Result<Option<(String, String, String)>> {
     // Authorization keys on the identity of the person who sent the event — a
     // number first, since it survives a rename or a dropped nickname, then the
     // nickname. The conversation the event arrived in only supplies the
     // delivery address.
-    let sender = telegram_sender_person(sender_source)?;
-    let matched = match crate::users::store()
-        .resolve_telegram_user(sender.numeric_id.as_deref(), sender.nickname.as_deref())
-        .await
-    {
-        Ok(matched) => matched?,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to resolve Telegram sender to an account");
-            return None;
-        }
+    let Some(sender) = telegram_sender_person(sender_source) else {
+        return Ok(None);
     };
-    let (chat_id, reply_target) = extract_chat_context(chat_source)?;
+    let Some(matched) = crate::users::store()
+        .resolve_telegram_user(sender.numeric_id.as_deref(), sender.nickname.as_deref())
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some((chat_id, reply_target)) = extract_chat_context(chat_source) else {
+        return Ok(None);
+    };
     // Update reply_target for future message delivery
     let _ =
         crate::users::update_channel_contact("telegram", &matched.identifier, &reply_target).await;
-    Some((matched.user_name, chat_id, reply_target))
+    Ok(Some((matched.user_name, chat_id, reply_target)))
 }
 
 /// Parse a Markdown link `[label](url)` starting at byte offset `i`, which must
@@ -1507,15 +1555,18 @@ fn to_telegram_html(text: &str) -> String {
 pub(super) const FORWARD_ATTRIBUTION_PREFIX: &str = "[Forwarded from ";
 
 impl TelegramChannel {
-    /// Internal constructor shared by [`new`](Self::new) and
-    /// [`with_offset`](Self::with_offset).
+    /// Internal constructor every other constructor builds on.
     #[must_use]
-    fn new_with(bot_token: String, offset: std::sync::Arc<std::sync::atomic::AtomicI64>) -> Self {
+    fn new_with(bot_token: String, api_base: String) -> Self {
         Self {
             bot_token,
+            api_base,
             http_client: crate::util::http::build_http_client(Duration::from_mins(1)),
             cancel: std::sync::Arc::new(tokio_util::sync::CancellationToken::new()),
-            offset,
+            intake_store: std::sync::OnceLock::new(),
+            intake_claim: std::sync::Arc::from(listener_claim()),
+            listener_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            listener_stopped: std::sync::Arc::new(tokio::sync::Notify::new()),
             menu_cache: std::sync::Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
@@ -1531,21 +1582,71 @@ impl TelegramChannel {
     /// rustls/ring — OpenSSL is not involved).
     #[must_use]
     pub fn new(bot_token: String) -> Self {
-        Self::new_with(
-            bot_token,
-            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        )
+        Self::new_with(bot_token, API_BASE.to_string())
     }
 
-    /// Create a new channel that inherits the update offset from a
-    /// previous instance. Used during hot-reload to avoid replaying
-    /// already-processed Telegram updates.
+    /// The intake's store for this process.
+    fn intake_store(&self) -> TelegramIntakeStore {
+        self.intake_store
+            .get_or_init(|| crate::channels::telegram_intake::store().clone())
+            .clone()
+    }
+
+    /// A channel pointed at an endpoint of its own and recording into `store`
+    /// instead of the process's database — how the intake's checks drive a listener
+    /// without the running service. The claim is the channel's own, exactly as it is
+    /// for a listener the product builds.
+    #[cfg(test)]
     #[must_use]
-    fn with_offset(
-        bot_token: String,
-        inherited_offset: std::sync::Arc<std::sync::atomic::AtomicI64>,
-    ) -> Self {
-        Self::new_with(bot_token, inherited_offset)
+    fn for_test(bot_token: String, api_base: String, store: TelegramIntakeStore) -> Self {
+        Self {
+            intake_store: std::sync::OnceLock::from(store),
+            ..Self::new_with(bot_token, api_base)
+        }
+    }
+
+    /// Whether a listener frame of this channel is running right now.
+    fn running(&self) -> bool {
+        self.listener_running
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait, briefly, for the listener frame of this channel to end — the state a
+    /// replacement asks for before it takes over what the frame left behind
+    /// ([`stop_listeners`]), because a frame whose collector has drained means
+    /// everything it held is settled or left held in the record. The one thing no
+    /// frame covers is the process itself ending, a crash ([`ListenerFrame`]).
+    ///
+    /// Bounded, so a frame that will not end cannot hold a replacement up for good.
+    /// Past the bound the replacement goes ahead and may take over events the
+    /// still-open frame is about to hand on, which risks the same event reaching the
+    /// pipeline twice — the side to err on, and the reason the bound is generous.
+    async fn wait_stopped(&self) {
+        // Enrolled before the check below rather than left to the first poll:
+        // `Notify::notify_waiters` wakes only waiters that are already registered, so a
+        // stop landing in between would be missed and the wait would sit out the whole
+        // bound.
+        let mut stopped = std::pin::pin!(self.listener_stopped.notified());
+        stopped.as_mut().enable();
+        if !self.running() {
+            return;
+        }
+        if tokio::time::timeout(LISTENER_STOP_WAIT, stopped)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Telegram listener: the replaced listener did not stop in time");
+        }
+    }
+
+    /// Wait out a pause in the intake's work, ending it early when this listener is
+    /// being stopped: a failing store or a contended one must not hold a token change or
+    /// a wind-down up for the whole pause.
+    async fn intake_pause(&self, duration: Duration) {
+        tokio::select! {
+            () = self.cancel.cancelled() => {}
+            _ = crate::shutdown::sleep_or_shutdown_or_drain(duration) => {}
+        }
     }
 
     /// Answer a callback query to dismiss the loading spinner.
@@ -1573,9 +1674,16 @@ impl TelegramChannel {
 
     /// Parse a `callback_query` update into a `ChannelMessage`.
     /// The callback data becomes the message content.
-    async fn parse_callback_query(&self, cq: &serde_json::Value) -> Option<ChannelMessage> {
-        let data = cq.get("data").and_then(serde_json::Value::as_str)?;
-        let msg = cq.get("message")?;
+    async fn parse_callback_query(
+        &self,
+        cq: &serde_json::Value,
+    ) -> anyhow::Result<Option<ChannelMessage>> {
+        let Some(data) = cq.get("data").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(msg) = cq.get("message") else {
+            return Ok(None);
+        };
         let callback_query_id = cq
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -1583,13 +1691,13 @@ impl TelegramChannel {
 
         // Auth is clicker-based (cq.from), never msg author; chat_id/message_id
         // identify the pressed keyboard's message so handlers can edit it in place.
-        let Some((user_name, chat_id, reply_target)) = resolve_authorized_sender(cq, msg).await
+        let Some((user_name, chat_id, reply_target)) = resolve_authorized_sender(cq, msg).await?
         else {
             tracing::debug!(
                 "Telegram: ignoring callback query from unknown user '{}'",
                 extract_sender_user_name(cq)
             );
-            return None;
+            return Ok(None);
         };
 
         let message_id = msg
@@ -1603,7 +1711,9 @@ impl TelegramChannel {
             reply_target,
             reply_reference: None,
         };
-        Some(ctx.into_channel_message(data.to_string(), callback_query_id))
+        Ok(Some(
+            ctx.into_channel_message(data.to_string(), callback_query_id),
+        ))
     }
 
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
@@ -1616,29 +1726,35 @@ impl TelegramChannel {
     }
 
     /// Extract sender info, user allow check, chat/message/thread IDs, and
-    /// reply target. Returns `None` if the sender is not allowed.
-    async fn extract_message_context(&self, message: &serde_json::Value) -> Option<MessageContext> {
+    /// reply target. `Ok(None)` if the sender is not allowed; the error is the
+    /// binding read failing, which is not a decision and must not be turned into
+    /// a refusal by the caller — it is logged there, where the event it belongs to
+    /// is known.
+    async fn extract_message_context(
+        &self,
+        message: &serde_json::Value,
+    ) -> anyhow::Result<Option<MessageContext>> {
         let Some((user_name, chat_id, reply_target)) =
-            resolve_authorized_sender(message, message).await
+            resolve_authorized_sender(message, message).await?
         else {
             tracing::debug!(
                 "Telegram: ignoring message from unknown user '{}'",
                 extract_sender_user_name(message)
             );
-            return None;
+            return Ok(None);
         };
 
         let message_id = message
             .get("message_id")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
-        Some(MessageContext {
+        Ok(Some(MessageContext {
             user_name,
             chat_id,
             message_id,
             reply_target,
             reply_reference: build_reply_reference(message),
-        })
+        }))
     }
 
     /// Prepend forwarding attribution (from `forward_from` /
@@ -1687,7 +1803,7 @@ impl TelegramChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        bot_api_url(&self.bot_token, method)
+        bot_api_url(&self.api_base, &self.bot_token, method)
     }
 
     /// Signal this specific channel's listener to stop, without affecting
@@ -1731,6 +1847,7 @@ impl TelegramChannel {
         }
 
         let bot_token = self.bot_token.clone();
+        let api_base = self.api_base.clone();
         let http_client = self.http_client.clone();
         let cache = std::sync::Arc::clone(&self.menu_cache);
         let chat_id = chat_id.to_string();
@@ -1768,7 +1885,7 @@ impl TelegramChannel {
                 return;
             }
 
-            let url = bot_api_url(&bot_token, "setMyCommands");
+            let url = bot_api_url(&api_base, &bot_token, "setMyCommands");
             let body = serde_json::json!({
                 "scope": {
                     "type": "chat",
@@ -1800,27 +1917,8 @@ impl TelegramChannel {
         if token.trim().is_empty() {
             anyhow::bail!("Telegram bot token is empty");
         }
-        let url = bot_api_url(token, "getMe");
         let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to reach Telegram API")?;
-        let status = resp.status();
-        let body: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => anyhow::bail!("Failed to parse Telegram API response: {e}"),
-        };
-        if !status.is_success() || body.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
-        {
-            let desc = body
-                .get("description")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown error");
-            anyhow::bail!("Invalid Telegram bot token: {desc}");
-        }
-        Ok(())
+        get_me(&client, API_BASE, token).await.map(|_| ())
     }
 
     fn handle_non_parseable_message(update: &serde_json::Value) {
@@ -1862,7 +1960,7 @@ impl TelegramChannel {
     /// The request carries [`MEDIA_TRANSFER_TIMEOUT`]: the cap itself takes
     /// longer than the client's one-minute default to pull over a slow link.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!("{API_BASE}/file/bot{}/{file_path}", self.bot_token);
+        let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
@@ -1963,36 +2061,44 @@ impl TelegramChannel {
     ///
     /// Downloads the file into this message's own staging directory in the
     /// Telegram temp root and returns a `ChannelMessage` recording it (see
-    /// [`ChannelMessage::attachment_dirs`]). Returns `None` only when the
-    /// message is not an attachment or the sender is unauthorized: an attachment
-    /// the bot cannot retrieve or store still yields a message, so the caption
-    /// reaches the agent with the failure called out in the content.
+    /// [`ChannelMessage::attachment_dirs`]). `Ok(None)` only when the message is
+    /// not an attachment or the sender is unauthorized — the error is the binding
+    /// read failing, which the caller keeps the event held for. An attachment the
+    /// bot cannot retrieve or store still yields a message, so the caption reaches
+    /// the agent with the failure called out in the content.
     ///
     /// Off macOS a recorded voice message is refused (see
     /// `reject_voice_message`) before any fetch — nothing there can transcribe
     /// it, and the note names no file. An `audio` sound file is not refused: it
     /// takes the ordinary path below, so the agent gets the file itself.
+    #[expect(clippy::too_many_lines)] // one linear fetch-and-refuse run, each gate a distinct outcome
     async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
-    ) -> Option<ChannelMessage> {
-        let message = update.get("message")?;
+    ) -> anyhow::Result<Option<ChannelMessage>> {
+        let Some(message) = update.get("message") else {
+            return Ok(None);
+        };
 
         // Authorization comes first: an unauthorized sender is ignored
         // entirely and silently, before any attachment work happens.
-        let ctx = self.extract_message_context(message).await?;
+        let Some(ctx) = self.extract_message_context(message).await? else {
+            return Ok(None);
+        };
 
-        let attachment = Self::parse_attachment_metadata(message)?;
+        let Some(attachment) = Self::parse_attachment_metadata(message) else {
+            return Ok(None);
+        };
 
         // No local audio here: a recorded voice message cannot be transcribed,
         // so refuse it before anything is fetched. A sound file (`audio`) is
         // not affected — it takes the ordinary attachment path below.
         #[cfg(not(target_os = "macos"))]
         if attachment.kind == IncomingAttachmentKind::Voice {
-            return Some(
+            return Ok(Some(
                 self.reject_voice_message(ctx, attachment.caption.as_deref())
                     .await,
-            );
+            ));
         }
 
         // Declared-size gate. Telegram reports the size on most attachments,
@@ -2002,10 +2108,10 @@ impl TelegramChannel {
             && let Some(reason) = declared_size_refusal(size)
         {
             tracing::info!("Rejecting attachment: declared size {size} bytes ({reason})");
-            return Some(
+            return Ok(Some(
                 self.reject_attachment(ctx, &attachment, None, NOT_RECEIVED, &reason)
                     .await,
-            );
+            ));
         }
 
         // Download file from Telegram. The transport does not always report a
@@ -2017,7 +2123,7 @@ impl TelegramChannel {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to get attachment file path: {e}");
-                return Some(
+                return Ok(Some(
                     self.reject_attachment(
                         ctx,
                         &attachment,
@@ -2026,7 +2132,7 @@ impl TelegramChannel {
                         TELEGRAM_LOOKUP_REFUSED_REASON,
                     )
                     .await,
-                );
+                ));
             }
         };
         let remote_ext = Path::new(&tg_file_path)
@@ -2037,7 +2143,7 @@ impl TelegramChannel {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("Failed to download attachment: {e}");
-                return Some(
+                return Ok(Some(
                     self.reject_attachment(
                         ctx,
                         &attachment,
@@ -2046,7 +2152,7 @@ impl TelegramChannel {
                         download_failure_reason(&e),
                     )
                     .await,
-                );
+                ));
             }
         };
 
@@ -2056,7 +2162,7 @@ impl TelegramChannel {
         let save_dir = crate::util::telegram_files_root().join(&staging_dir);
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
             tracing::warn!("Failed to create telegram attachment directory: {e}");
-            return Some(
+            return Ok(Some(
                 self.reject_attachment(
                     ctx,
                     &attachment,
@@ -2065,7 +2171,7 @@ impl TelegramChannel {
                     ATTACHMENT_DIR_REFUSED_REASON,
                 )
                 .await,
-            );
+            ));
         }
 
         let local_filename =
@@ -2076,7 +2182,7 @@ impl TelegramChannel {
             // A partial write must not linger: nothing downstream will ever
             // reference this per-message directory.
             let _ = tokio::fs::remove_dir_all(&save_dir).await;
-            return Some(
+            return Ok(Some(
                 self.reject_attachment(
                     ctx,
                     &attachment,
@@ -2085,7 +2191,7 @@ impl TelegramChannel {
                     ATTACHMENT_SAVE_REFUSED_REASON,
                 )
                 .await,
-            );
+            ));
         }
 
         let mut content = format_attachment_content(
@@ -2101,7 +2207,7 @@ impl TelegramChannel {
 
         let content = Self::prepend_forward_attribution(content, message);
 
-        Some(ctx.into_attachment_message(content, staging_dir))
+        Ok(Some(ctx.into_attachment_message(content, staging_dir)))
     }
 
     /// Tell the user an attachment could not be taken and return the
@@ -2192,10 +2298,19 @@ impl TelegramChannel {
         }
     }
 
-    async fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let message = update.get("message")?;
-        let text = message.get("text").and_then(serde_json::Value::as_str)?;
-        let ctx = self.extract_message_context(message).await?;
+    async fn parse_update_message(
+        &self,
+        update: &serde_json::Value,
+    ) -> anyhow::Result<Option<ChannelMessage>> {
+        let Some(message) = update.get("message") else {
+            return Ok(None);
+        };
+        let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(ctx) = self.extract_message_context(message).await? else {
+            return Ok(None);
+        };
 
         // Strip @BotUsername suffix from commands (e.g. `/new@MyBot` → `/new`)
         // Telegram appends the bot username to commands in group chats.
@@ -2209,7 +2324,7 @@ impl TelegramChannel {
 
         let content = Self::prepend_forward_attribution(content, message);
 
-        Some(ctx.into_channel_message(content, None))
+        Ok(Some(ctx.into_channel_message(content, None)))
     }
 
     /// POST a JSON body to a Telegram API method; returns the response on 2xx
@@ -2510,7 +2625,8 @@ impl TelegramChannel {
 
 /// Outcome of a single `getUpdates` poll.
 enum PollOutcome {
-    /// Successfully fetched updates (offset already advanced past them).
+    /// Successfully fetched updates. Still unconfirmed on the platform's side —
+    /// the caller's next poll's offset is what confirms them.
     Updates(Vec<serde_json::Value>),
     /// 409 Conflict — caller decides backoff.
     Conflict,
@@ -2521,20 +2637,19 @@ enum PollOutcome {
 }
 
 impl TelegramChannel {
-    /// Call `getUpdates`, advance offset, and classify the outcome.
+    /// Call `getUpdates` and classify the outcome.
+    ///
+    /// The position is the caller's: it asks for everything at or past `offset`,
+    /// and what the next poll resumes from is computed from the intake's record
+    /// rather than from this call.
     ///
     /// `ok_default` controls what happens when the `ok` field is missing from
-    /// the response: `false` (probe) treats it as an error, `true` (main loop)
-    /// assumes success to be lenient.
-    async fn poll_get_updates(
-        &self,
-        offset: &mut i64,
-        timeout: u64,
-        ok_default: bool,
-    ) -> PollOutcome {
+    /// the response: `false` (handshake) treats it as an error, `true` (main
+    /// loop) assumes success to be lenient.
+    async fn poll_get_updates(&self, offset: i64, timeout: u64, ok_default: bool) -> PollOutcome {
         let url = self.api_url("getUpdates");
         let body = serde_json::json!({
-            "offset": *offset,
+            "offset": offset,
             "timeout": timeout,
             "allowed_updates": ["message", "callback_query"]
         });
@@ -2564,12 +2679,6 @@ impl TelegramChannel {
 
         if ok {
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
-                // Advance offset past these updates so they aren't re-delivered.
-                for update in results {
-                    if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
-                        *offset = (*offset).max(uid + 1);
-                    }
-                }
                 return PollOutcome::Updates(results.clone());
             }
             // ok=true with no result array — rare, treat as empty.
@@ -2591,28 +2700,44 @@ impl TelegramChannel {
         }
     }
 
-    /// Probe: claim the `getUpdates` slot before entering the long-poll loop.
+    /// The intake's opening handshake: resolve the account the token belongs to
+    /// and claim the `getUpdates` slot. Both must hold before the intake may take
+    /// an event on — the record is keyed by the account's own identity, so the
+    /// platform has to name it before anything is polled, and a previous daemon's
+    /// 30-second poll may still be active on the platform's side.
     ///
-    /// A previous daemon's 30-second poll may still be active on Telegram's server.
-    /// We retry with `timeout=0` until we receive a successful (non-409) response,
-    /// confirming the slot is ours.
-    ///
-    /// Returns `true` if the probe succeeded, `false` if cancelled (caller should
-    /// return `Ok(())` from `listen`).
-    async fn probe_startup_slot(&self, offset: &mut i64) -> bool {
+    /// Retries until the listener is cancelled or the daemon drains, `None` when
+    /// either happens while waiting. The batch the successful claim fetched is
+    /// returned rather than discarded: it is unconfirmed on the platform's side,
+    /// so discarding it would throw away an event the platform has not given up
+    /// on.
+    async fn open_intake(&self) -> Option<IntakeSlot> {
         loop {
-            if self.cancel.is_cancelled() {
-                tracing::info!("Telegram channel cancelled during startup probe");
-                return false;
+            if self.cancel.is_cancelled() || crate::shutdown::is_draining() {
+                tracing::info!("Telegram intake stopping during its startup handshake");
+                return None;
             }
-            match self.poll_get_updates(offset, 0, false).await {
-                PollOutcome::Updates(_) => return true,
+            let account_id = match self.bot_account_id().await {
+                Ok(account_id) => account_id,
+                Err(err) => {
+                    tracing::warn!("Startup handshake: getMe failed: {err}; retrying in 5s");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            match self.poll_get_updates(0, 0, false).await {
+                PollOutcome::Updates(updates) => {
+                    return Some(IntakeSlot {
+                        account_id,
+                        updates,
+                    });
+                }
                 PollOutcome::Conflict => {
-                    tracing::debug!("Startup probe: slot busy (409), retrying in 5s");
+                    tracing::debug!("Startup handshake: slot busy (409), retrying in 5s");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 PollOutcome::Error(desc) => {
-                    tracing::warn!("Startup probe: API error: {desc}; retrying in 5s");
+                    tracing::warn!("Startup handshake: API error: {desc}; retrying in 5s");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 PollOutcome::Transport => {} // sleep already applied by helper
@@ -2620,17 +2745,36 @@ impl TelegramChannel {
         }
     }
 
-    /// Parse one polled update into a message: a text message, an attachment, or
-    /// (logged and skipped) nothing. A parsed update gets its acknowledgement
-    /// reaction, as it always has.
-    async fn parse_polled_update(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let msg = if let Some(msg) = self.parse_update_message(update).await {
+    /// The account the token belongs to, as the platform reports it.
+    ///
+    /// The intake keys its record on this rather than on the token's text, so
+    /// rotating the token of the same account still recovers what that account is
+    /// holding, while a token pointing at another account neither reads nor is held
+    /// back by what the first one left.
+    async fn bot_account_id(&self) -> anyhow::Result<String> {
+        let data = get_me(self.http_client(), &self.api_base, &self.bot_token).await?;
+        let id = data["result"]["id"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("getMe response carries no bot id"))?;
+        Ok(id.to_string())
+    }
+
+    /// Parse one incoming update into a message — polled or recovered: a text
+    /// message, an attachment, or (logged and skipped) nothing. A parsed update
+    /// gets its acknowledgement reaction, as it always has. The error is the
+    /// sender-resolution read failing, which is not "nothing to make of it" and
+    /// is left for the caller to keep the event held for.
+    async fn parse_incoming_update(
+        &self,
+        update: &serde_json::Value,
+    ) -> anyhow::Result<Option<ChannelMessage>> {
+        let msg = if let Some(msg) = self.parse_update_message(update).await? {
             msg
-        } else if let Some(msg) = self.try_parse_attachment_message(update).await {
+        } else if let Some(msg) = self.try_parse_attachment_message(update).await? {
             msg
         } else {
             Self::handle_non_parseable_message(update);
-            return None;
+            return Ok(None);
         };
 
         // Send ACK reaction for every individual update (fire-and-forget)
@@ -2639,44 +2783,149 @@ impl TelegramChannel {
         {
             self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
         }
-        Some(msg)
+        Ok(Some(msg))
     }
 
-    /// Process a batch of Telegram updates, feeding parsed messages to the
-    /// burst collector through `tx`.
+    /// Take one polled batch on: record every event, then hand on only the events
+    /// this call was the first to record. `None` when the pipeline is gone (the
+    /// listener stops).
     ///
-    /// Each update is handed over as soon as it has been parsed, and the
-    /// hand-over awaits a free queue slot, so a slow attachment download or a
-    /// stalled pipeline delays the updates behind it in the same poll. The one
-    /// thing parsed out of turn is an album (media group): its members are parsed
-    /// together at the position of the album's first member, so an album is
-    /// delivered where the user sent it instead of after the rest of the poll.
+    /// The batch is recorded unit by unit — an album's members as one unit, every
+    /// other update on its own (see [`poll_plan`]) — and a unit the record could not
+    /// be written for holds the position where the unit starts (at the offset the
+    /// request started from, when the platform never identified it), so the platform
+    /// offers the unit again rather than the intake handing on the parts of it that
+    /// could be recorded.
+    async fn take_up(
+        &self,
+        parts_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        intake: &Intake,
+        offset: i64,
+        updates: Vec<serde_json::Value>,
+        origin: BatchOrigin,
+    ) -> Option<Polled> {
+        // A long poll that timed out with nothing to offer leaves the position
+        // where it is: there is nothing behind it the platform has not given up
+        // on already.
+        if updates.is_empty() {
+            return Some(Polled {
+                position: offset,
+                reoffered: false,
+            });
+        }
+        let plan = poll_plan(&updates);
+        let mut fresh = HashSet::new();
+        // The unit the record could not be written for — an unwritable store, or an
+        // update the platform never identified, which can be neither held nor
+        // confirmed past (there is no `update_id` to move past): it holds the
+        // position where the request started, and the platform's own offering window
+        // is what retires it.
+        let mut unrecorded: Option<i64> = None;
+        let mut record_error: Option<anyhow::Error> = None;
+        let mut failed_units = 0usize;
+        for (at, placement) in plan.iter().enumerate() {
+            let unit: Vec<&serde_json::Value> = match placement {
+                PollPlacement::Skip => continue,
+                PollPlacement::Album(members) => {
+                    members.iter().map(|&member| &updates[member]).collect()
+                }
+                PollPlacement::Single | PollPlacement::Callback => vec![&updates[at]],
+            };
+            let first = unit
+                .first()
+                .and_then(|update| update["update_id"].as_i64())
+                .unwrap_or(offset);
+            match intake.hold(&unit).await {
+                Ok(recorded) => fresh.extend(recorded),
+                Err(err) => {
+                    unrecorded = Some(unrecorded.map_or(first, |smallest| smallest.min(first)));
+                    failed_units += 1;
+                    record_error.get_or_insert(err);
+                }
+            }
+        }
+
+        // One warning per batch, not one per event: the pinned position re-offers the
+        // same page every pause, so a persistently unwritable store would otherwise log
+        // a warning per update per poll.
+        if let Some(err) = record_error {
+            tracing::warn!(
+                first_unrecorded = ?unrecorded,
+                units = failed_units,
+                %err,
+                "Telegram intake: could not record part of a batch"
+            );
+        }
+
+        // The position stops at the first event the record could not be written
+        // for: the platform then offers that one, and everything behind it, again.
+        let position = unrecorded.unwrap_or_else(|| {
+            updates
+                .iter()
+                .filter_map(|update| update["update_id"].as_i64())
+                .max()
+                .map_or(offset, |newest| newest + 1)
+        });
+
+        if !self
+            .process_updates(parts_tx, intake, &mut fresh, origin, updates, &plan)
+            .await
+        {
+            return None;
+        }
+        // The platform offers the batch again immediately, so a record that could
+        // not be written for would otherwise spin.
+        if unrecorded.is_some() {
+            self.intake_pause(RECORD_FAILURE_BACKOFF).await;
+        }
+        Some(Polled {
+            position,
+            reoffered: unrecorded.is_some(),
+        })
+    }
+
+    /// Parse a recorded batch and hand it to the collector.
     ///
-    /// Handles text messages (via [`Self::parse_update_message`] /
-    /// [`Self::try_parse_attachment_message`]), callback queries, and photo
-    /// albums (media groups are merged into a single message).
+    /// `fresh` are the events this call was the first to record; the rest are
+    /// skipped. An event nothing can be made of is settled here as the record's
+    /// own decision, so it neither comes back nor grows the record. Returns
+    /// `false` when the collector is gone.
     ///
-    /// Returns `true` if the pipeline is still alive, `false` if the channel was
-    /// closed (`tx.send()` failed) — the caller should exit the long-poll loop.
+    /// The one thing parsed out of turn is an album (media group): its members are
+    /// parsed together at the position of the album's first member, so an album is
+    /// delivered where the user sent it instead of after the rest of the poll. The
+    /// grouping is the caller's ([`poll_plan`]), which is also what recorded the
+    /// batch, so both walk one batch the same way.
     async fn process_updates(
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        intake: &Intake,
+        fresh: &mut HashSet<i64>,
+        origin: BatchOrigin,
         updates: Vec<serde_json::Value>,
+        plan: &[PollPlacement],
     ) -> bool {
-        let plan = poll_plan(&updates);
-
         for (update, placement) in updates.iter().zip(plan) {
             match placement {
                 // A button press is not a message: its `message` is the message
                 // the button sits on (see `poll_plan`).
                 PollPlacement::Callback => {
-                    if !self.handle_callback_press(tx, update).await {
+                    let Some(update_id) = Self::fresh_update(update, fresh) else {
+                        continue;
+                    };
+                    if !self
+                        .handle_callback_press(tx, intake, origin, update_id, update)
+                        .await
+                    {
                         return false;
                     }
                 }
                 PollPlacement::Skip => {}
                 PollPlacement::Single => {
-                    if let Some(msg) = self.parse_polled_update(update).await
+                    let Some(update_id) = Self::fresh_update(update, fresh) else {
+                        continue;
+                    };
+                    if let Some(msg) = self.take_event(intake, origin, update_id, update).await
                         && tx.send(msg).await.is_err()
                     {
                         return false;
@@ -2684,8 +2933,16 @@ impl TelegramChannel {
                 }
                 PollPlacement::Album(members) => {
                     let mut album = None;
-                    for member in members {
-                        if let Some(msg) = self.parse_polled_update(&updates[member]).await {
+                    for &member in members {
+                        let update = &updates[member];
+                        let Some(update_id) = Self::fresh_update(update, fresh) else {
+                            continue;
+                        };
+                        // A member nothing can be made of is settled by `take_event`,
+                        // and one it cannot decide about yet stays held; either way
+                        // the rest of the album goes on.
+                        if let Some(msg) = self.take_event(intake, origin, update_id, update).await
+                        {
                             album = Some(merge_album_member(album, msg));
                         }
                     }
@@ -2701,12 +2958,101 @@ impl TelegramChannel {
         true
     }
 
+    /// The record entry of a batch update, when this call is the first to take it
+    /// up — taken out of `fresh`, so a batch that repeats an `update_id` walks
+    /// the event once.
+    ///
+    /// `fresh` is the set of ids the record accepted rather than one flag per unit:
+    /// an album is recorded whole or not at all, but what `hold` answers is which of
+    /// the unit's ids it inserted, and a member the record already held is not handed
+    /// on with its album.
+    fn fresh_update(update: &serde_json::Value, fresh: &mut HashSet<i64>) -> Option<i64> {
+        let id = update["update_id"].as_i64()?;
+        fresh.remove(&id).then_some(id)
+    }
+
+    /// Take one recorded event on: parse it, and settle it here when there is
+    /// nothing to hand on — an event nothing can be made of, or control input of
+    /// unknown age, which is not executed out of context.
+    ///
+    /// Three things can come of the parse, and they are not the same decision. A
+    /// message is handed on. Nothing can be made of the event — `Ok(None)` — which
+    /// is the record's own decision: it is settled and neither comes back nor grows
+    /// the record. The read the decision needs failed — `Err` — which is no decision
+    /// at all: the event stays held, payload and all, exactly as one a crash left
+    /// behind, and a later run takes it up.
+    async fn take_event(
+        &self,
+        intake: &Intake,
+        origin: BatchOrigin,
+        update_id: i64,
+        update: &serde_json::Value,
+    ) -> Option<ChannelMessage> {
+        let mut msg = match self.parse_incoming_update(update).await {
+            Ok(Some(msg)) => msg,
+            // Nothing can be made of this event: that is a decision of the record's
+            // own, so it is settled and neither comes back nor grows the record.
+            Ok(None) => {
+                intake.settle(&[update_id]).await;
+                return None;
+            }
+            // The read this decision needs failed, so no decision was made: the
+            // event stays held, payload and all, and a later run takes it up — the
+            // same way what a crash left held is taken up. Refusing it here would
+            // drop it for good, and receiving it again is the side to err on.
+            Err(err) => {
+                tracing::warn!(
+                    update_id,
+                    %err,
+                    "Telegram intake: could not decide an event; it stays held for a later run"
+                );
+                return None;
+            }
+        };
+        msg.update_ids.push(update_id);
+        if origin == BatchOrigin::Stale && is_control_message(&msg) {
+            self.refuse_unacted_control(intake, &msg).await;
+            return None;
+        }
+        Some(msg)
+    }
+
+    /// Tell the user a control input the product never acted on was not acted on,
+    /// and settle it. Control input in a batch of unknown age
+    /// ([`BatchOrigin::Stale`]) is not executed out of context, and a press of that
+    /// age had its press-time answer expire just as long ago — so the plain notice
+    /// is all it gets.
+    ///
+    /// An event whose notice could not be sent stays held: being told is the whole
+    /// of what the event is for, so a later run produces the notice again rather than
+    /// the user never hearing it.
+    async fn refuse_unacted_control(&self, intake: &Intake, msg: &ChannelMessage) {
+        let (chat_id, thread_id) = parse_recipient(&msg.reply_target);
+        if let Err(err) = self
+            .send_text_chunks(UNACTED_CONTROL_NOTICE, chat_id, thread_id, None)
+            .await
+        {
+            tracing::warn!(%err, "Telegram: could not report an unacted command to its user");
+            return;
+        }
+        intake.settle(&msg.update_ids).await;
+    }
+
     /// Handle one button press, and report whether the pipeline is still alive.
     /// The press is parsed on its own — never as the message it sits on — and
     /// handed over as control input.
+    ///
+    /// The spinner is dismissed only for a press this run polled — the answer of
+    /// a press of unknown age expired just as long ago, so that would be a doomed
+    /// API call. A press nothing can be made of is settled here, so it is not
+    /// offered again; a press the intake cannot yet decide about stays held, and a
+    /// later run takes it up.
     async fn handle_callback_press(
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        intake: &Intake,
+        origin: BatchOrigin,
+        update_id: i64,
         update: &serde_json::Value,
     ) -> bool {
         let cq = &update["callback_query"];
@@ -2716,34 +3062,363 @@ impl TelegramChannel {
         // For __act__ callbacks, do NOT answer early — the action handler
         // (handle_action_callback in main.rs) will answer with the appropriate
         // toast text. Dismiss the spinner now for all other callbacks.
-        if !cq_data.starts_with(ACTION_PREFIX)
+        if origin == BatchOrigin::Fresh
+            && !cq_data.starts_with(ACTION_PREFIX)
             && let Some(ref id) = cq_id
         {
             self.answer_callback_query(id, None).await;
         }
 
-        let Some(msg) = self.parse_callback_query(cq).await else {
-            return true;
+        let mut msg = match self.parse_callback_query(cq).await {
+            Ok(Some(msg)) => msg,
+            // Nothing can be made of this press: that is a decision of the record's
+            // own, so it is settled and neither comes back nor grows the record.
+            Ok(None) => {
+                intake.settle(&[update_id]).await;
+                return true;
+            }
+            // No decision was made, so none is written: the press stays held,
+            // payload and all, and a later run takes it up (see `take_event`).
+            Err(err) => {
+                tracing::warn!(
+                    update_id,
+                    %err,
+                    "Telegram intake: could not decide an event; it stays held for a later run"
+                );
+                return true;
+            }
         };
+        msg.update_ids.push(update_id);
+        // A press is control input by construction, so it is refused by the same
+        // rule `take_event` applies.
+        if origin == BatchOrigin::Stale {
+            self.refuse_unacted_control(intake, &msg).await;
+            return true;
+        }
         tx.send(msg).await.is_ok()
     }
+
+    /// Take up the events this account's record holds and no run has handed on:
+    /// what a crash, a self-update or a kill in the wrong instant left behind.
+    ///
+    /// A recovered event joins the same collector as a fresh one, which is why an
+    /// event from the record and one from a poll by the same person can land in
+    /// one burst. Returns `false` when the pipeline is gone.
+    async fn recover(
+        &self,
+        intake: &Intake,
+        parts_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> bool {
+        // A take-over that fails leaves every row it would have claimed held, and the
+        // only other thing that takes them up is a whole listener rebuild — so a
+        // failure that is only transient is worth another try before the event waits
+        // that long.
+        let mut attempt = 0;
+        let updates = loop {
+            match intake.take_over().await {
+                Ok(updates) => break updates,
+                Err(err) => {
+                    attempt += 1;
+                    if attempt == TAKE_OVER_ATTEMPTS {
+                        tracing::warn!(
+                            %err,
+                            "Telegram intake: could not take up what the record holds; \
+                             what it holds stays for the next run"
+                        );
+                        return true;
+                    }
+                    tracing::warn!(%err, "Telegram intake: could not take up what the record holds; retrying");
+                    self.intake_pause(TAKE_OVER_RETRY).await;
+                }
+            }
+        };
+        if updates.is_empty() {
+            return true;
+        }
+        tracing::info!(
+            account_id = %intake.account_id,
+            held = updates.len(),
+            "Telegram intake: taking up events the record holds"
+        );
+        let mut fresh: HashSet<i64> = updates
+            .iter()
+            .filter_map(|update| update["update_id"].as_i64())
+            .collect();
+        // The album regrouping the stored updates came back in is the same planning
+        // the poll path uses, so a recovered album is one event here too.
+        let plan = poll_plan(&updates);
+        self.process_updates(
+            parts_tx,
+            intake,
+            &mut fresh,
+            BatchOrigin::Stale,
+            updates,
+            &plan,
+        )
+        .await
+    }
+
+    /// Age resolved decisions out of the record — the intake's own retention job.
+    async fn age_out_record(&self) {
+        match self.intake_store().age_out().await {
+            Ok(0) => {}
+            Ok(dropped) => tracing::debug!(
+                dropped,
+                "Telegram intake: aged resolved events out of the record"
+            ),
+            Err(err) => tracing::warn!(%err, "Telegram intake: could not age the record"),
+        }
+    }
+
+    /// The intake proper, once the handshake has resolved the account and fetched the
+    /// opening batch: the sweep, what the record holds, and the long-poll loop.
+    ///
+    /// Returns when the listener stops, however it stops; the frame stays the collector's
+    /// until the burst it still held has been handed on ([`ListenerFrame`]).
+    async fn intake_loop(
+        &self,
+        parts_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        intake: &Intake,
+        handshake: Vec<serde_json::Value>,
+    ) {
+        // The sweep runs before anything is taken up: a row that outlived the
+        // retention bound must never stand in for a later event the platform has
+        // re-used the id of, and dropping it is the only thing that makes that so.
+        self.age_out_record().await;
+        let mut aged_at = Instant::now();
+
+        if !self.recover(intake, parts_tx).await {
+            tracing::warn!("Telegram listener stopping: the message pipeline is closed");
+            return;
+        }
+
+        // The batch the handshake fetched was fetched at offset 0, before any
+        // position existed, so it is input of unknown age — as is every batch behind
+        // it: a fetch that fills the platform's own page may not have come to the end
+        // of what it was already holding, and only a fetch that comes back short says
+        // the platform has nothing more from before this run. Control input that
+        // arrived in any of those batches must not be executed out of context.
+        let page_full = handshake.len() >= UPDATES_PAGE;
+        let Some(taken) = self
+            .take_up(parts_tx, intake, 0, handshake, BatchOrigin::Stale)
+            .await
+        else {
+            tracing::warn!("Telegram listener stopping: the message pipeline is closed");
+            return;
+        };
+        let mut offset = taken.position;
+        let mut backlog_open = page_full || taken.reoffered;
+
+        let shutdown_token = crate::shutdown::shutdown_token();
+        let per_channel_cancel = self.cancel.clone();
+
+        loop {
+            tokio::select! {
+                () = shutdown_token.cancelled() => {
+                    tracing::info!("Telegram channel shutting down (global shutdown)");
+                    break;
+                }
+                () = per_channel_cancel.cancelled() => {
+                    tracing::info!("Telegram channel shutting down (token hot-reload)");
+                    break;
+                }
+                // The intake stops fetching before it stops handling: an event
+                // arriving during the wind-down is either left unconfirmed for
+                // the next start or already held durably. The channel itself
+                // stays registered — returning from here does not unregister it
+                // — and outbound sending keeps working.
+                () = crate::shutdown::drain_wait() => {
+                    tracing::info!("Telegram channel stopping the intake (daemon draining)");
+                    break;
+                }
+                poll_result = self.poll_get_updates(offset, 30, true) => {
+                    // Every completed poll ages resolved rows out, whatever it
+                    // carried: a run that only ever sees errors or empty batches
+                    // must still trim the record.
+                    if aged_at.elapsed() >= AGE_OUT_INTERVAL {
+                        self.age_out_record().await;
+                        aged_at = Instant::now();
+                    }
+                    let updates = match poll_result {
+                        PollOutcome::Updates(updates) => updates,
+                        PollOutcome::Conflict => {
+                            tracing::warn!(
+                                "Telegram polling conflict (409). \
+                                 Ensure only one `mahbot` process is using this bot token."
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+                            continue;
+                        }
+                        PollOutcome::Error(desc) => {
+                            // Informational: the poll is retried every 5s, so an
+                            // unhealthy API would otherwise keep the issues view full.
+                            tracing::info!("Telegram getUpdates API error: {desc}");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        PollOutcome::Transport => continue,
+                    };
+
+                    let page_full = updates.len() >= UPDATES_PAGE;
+                    let Some(taken) = self
+                        .take_up(parts_tx, intake, offset, updates, batch_origin(backlog_open))
+                        .await
+                    else {
+                        tracing::warn!(
+                            "Telegram listener stopping: the message pipeline is closed"
+                        );
+                        return;
+                    };
+                    offset = taken.position;
+                    backlog_open = (backlog_open && page_full) || taken.reoffered;
+                }
+            }
+        }
+    }
+}
+
+/// What the opening handshake resolves to.
+struct IntakeSlot {
+    /// The bot account the token belongs to, as the platform names it.
+    account_id: String,
+    /// The batch the successful claim fetched — still unconfirmed on the
+    /// platform's side, so exactly an event the intake now has to hold.
+    updates: Vec<serde_json::Value>,
 }
 
 /// Fold a parsed album member into the album message built so far: content
 /// joined with a newline (the album reads as one message) and the member's
 /// staging directories kept, since each member downloads into its own. The
 /// first member starts the album.
+///
+/// The member's record entries come along too: an album is one incoming event
+/// whose every part is its own entry, and the merged message is what settles
+/// them — so no member is left held by the record after the album is handed on.
 fn merge_album_member(album: Option<ChannelMessage>, member: ChannelMessage) -> ChannelMessage {
     match album {
         Some(mut album) => {
             album.content.push('\n');
             album.content.push_str(&member.content);
             album.attachment_dirs.extend(member.attachment_dirs);
+            album.update_ids.extend(member.update_ids);
             album
         }
         None => member,
     }
 }
+
+/// Whether a batch is one this intake's own poll is seeing for the first time.
+///
+/// Control input is acted on only for a fresh batch: everything else may be older
+/// than this run — the opening handshake's batch was fetched before the intake had
+/// ever run, a batch whose record could not be written for is offered again to the
+/// next poll, and what recovery takes up is what a previous run held and never
+/// handed on — so control input in it is not executed out of context. A message is
+/// handed over regardless; only control input is affected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchOrigin {
+    /// A batch this run's own poll fetched with nothing of what the platform was
+    /// already holding left behind it.
+    Fresh,
+    /// A batch that may hold events this run already fetched, or events the platform
+    /// was holding before this run started.
+    Stale,
+}
+/// What one taken-up batch leaves behind.
+struct Polled {
+    /// The position the next `getUpdates` resumes from: past the batch once
+    /// every event in it is held, or at the unit the record could not be written
+    /// for — at the offset the request itself started from, when a unit carries
+    /// no `update_id` to pin it at — which the platform then offers again.
+    position: i64,
+    /// True when part of the batch could not be recorded, so the platform is about
+    /// to offer it again — one of the two reasons the batch the next poll fetches is
+    /// of unknown age ([`batch_origin`]).
+    reoffered: bool,
+}
+
+/// The origin of the batch a poll fetches next, from what the batch just taken up
+/// left unknown: it filled the platform's own page, so the platform may still be
+/// handing over what it was holding before this run (the backlog is open until a
+/// fetch comes back short), or part of it could not be recorded, so the platform
+/// offers it to the next poll again. Either way the next answer may repeat what this
+/// run has already fetched, and control input in it must not run out of context.
+fn batch_origin(unknown_age: bool) -> BatchOrigin {
+    if unknown_age {
+        BatchOrigin::Stale
+    } else {
+        BatchOrigin::Fresh
+    }
+}
+
+/// Marks a listener frame as running for the whole of `listen`, so a listener that
+/// replaces this one can wait for what this frame held to be handed on or left
+/// behind before it takes over ([`TelegramChannel::wait_stopped`]).
+///
+/// The frame is a value the collector owns, not the `listen` future: a listener
+/// whose future is dropped or that panics still leaves the frame open until its
+/// collector has finished — so the frame reads as running for exactly as long as
+/// anything it held may still be handed on. What no frame covers is the process
+/// itself ending, a crash, which is the record's own case.
+pub(crate) struct ListenerFrame {
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stopped: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ListenerFrame {
+    pub(crate) fn enter(
+        running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        stopped: &std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        running.store(true, std::sync::atomic::Ordering::Release);
+        Self {
+            running: std::sync::Arc::clone(running),
+            stopped: std::sync::Arc::clone(stopped),
+        }
+    }
+}
+
+impl Drop for ListenerFrame {
+    fn drop(&mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+        // A running→stopped transition is every waiter's business, not one's: the
+        // frame can be waited on by more than one at a time, and a waiter left
+        // unnotified would sit out the whole bound.
+        self.stopped.notify_waiters();
+    }
+}
+
+/// How long the intake pauses after a poll whose record could not be written for.
+/// The platform offers the batch again immediately, so the pause is what keeps
+/// a failing store from becoming a tight loop. Only the unit that could not be
+/// recorded holds the position back — the rest of the batch is still recorded and
+/// handed on — and the wedge ends with the platform's own offering window, which
+/// is what retires the event.
+const RECORD_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How often the intake drops the record's rows past the retention bound.
+const AGE_OUT_INTERVAL: Duration = Duration::from_hours(1);
+
+/// The platform's own `getUpdates` page size: with no `limit` asked for, a poll
+/// hands back at most this many updates, so a batch this size means the platform
+/// may still be holding more.
+const UPDATES_PAGE: usize = 100;
+
+/// How long a replacement waits for one listener it cancelled to end its frame.
+const LISTENER_STOP_WAIT: Duration = Duration::from_secs(30);
+
+/// How many times the intake tries to take up what the record holds before it leaves
+/// those rows for the next run, and how long it pauses between tries: a read that
+/// fails on contention is worth a retry, and a store that is really unusable must not
+/// delay the listener.
+const TAKE_OVER_ATTEMPTS: u32 = 3;
+const TAKE_OVER_RETRY: Duration = Duration::from_secs(1);
+
+/// What the intake tells a user whose control input it never acted on: the input
+/// arrived in a batch of unknown age ([`BatchOrigin::Stale`]), so it is not
+/// executed out of context and the user is asked to repeat it.
+const UNACTED_CONTROL_NOTICE: &str = "MahBot did not act on that. Please repeat it.";
 
 /// How one update of a poll is parsed.
 ///
@@ -2897,77 +3572,56 @@ impl Channel for TelegramChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        use std::sync::atomic::Ordering;
-        let mut offset = self.offset.load(Ordering::Acquire);
-        if offset > 0 {
-            tracing::info!(offset, "Telegram channel resuming from previous offset");
+        let frame = ListenerFrame::enter(&self.listener_running, &self.listener_stopped);
+        // A listener starting inside a wind-down takes nothing on: the pipeline
+        // is being stopped, so an event fetched now would only have to be held
+        // until the next start.
+        if crate::shutdown::is_draining() {
+            tracing::info!("Telegram channel not starting: the daemon is draining");
+            return Ok(());
         }
 
         tracing::info!("Telegram channel listening for messages...");
 
-        // Startup probe: claim the getUpdates slot before entering the long-poll loop.
-        if !self.probe_startup_slot(&mut offset).await {
+        // Opening handshake: the account the token belongs to and the getUpdates
+        // slot, before entering the long-poll loop.
+        let Some(slot) = self.open_intake().await else {
             return Ok(());
-        }
+        };
 
-        tracing::debug!("Startup probe succeeded; entering main long-poll loop.");
+        tracing::debug!("Startup handshake succeeded; entering main long-poll loop.");
 
-        // Collected bursts are assembled off the poll loop, so getUpdates keeps
-        // being issued while a group waits; the queue's bound and what dropping
-        // its sender does are `telegram_group`'s.
+        let intake = Intake::new(
+            self.intake_store(),
+            self.intake_claim.clone(),
+            &slot.account_id,
+        );
+
+        // Collected bursts are assembled off the poll loop, so getUpdates keeps being
+        // issued while a group waits; the queue's bound and what dropping its sender
+        // does are `telegram_group`'s. The collector also settles the record: a message
+        // it has handed to the pipeline has its events resolved, while one the pipeline
+        // never took leaves them held. It takes the frame, so its life is the
+        // collector's.
         let (parts_tx, parts_rx) =
             tokio::sync::mpsc::channel(crate::channels::telegram_group::QUEUE_CAPACITY);
-        crate::channels::telegram_group::spawn_collector(parts_rx, tx);
+        let collector =
+            crate::channels::telegram_group::spawn_collector(parts_rx, tx, intake.clone(), frame);
 
-        let shutdown_token = crate::shutdown::shutdown_token();
-        let per_channel_cancel = self.cancel.clone();
+        self.intake_loop(&parts_tx, &intake, slot.updates).await;
 
-        loop {
-            tokio::select! {
-                () = shutdown_token.cancelled() => {
-                    tracing::info!("Telegram channel shutting down (global shutdown)");
-                    self.offset.store(offset, Ordering::Release);
-                    return Ok(());
-                }
-                () = per_channel_cancel.cancelled() => {
-                    tracing::info!("Telegram channel shutting down (token hot-reload)");
-                    self.offset.store(offset, Ordering::Release);
-                    return Ok(());
-                }
-                poll_result = self.poll_get_updates(&mut offset, 30, true) => {
-                    // Persist offset after each successful poll so a
-                    // hot-reloaded listener can resume from here.
-                    self.offset.store(offset, Ordering::Release);
-
-                    let updates = match poll_result {
-                        PollOutcome::Updates(updates) => updates,
-                        PollOutcome::Conflict => {
-                            tracing::warn!(
-                                "Telegram polling conflict (409). \
-                                 Ensure only one `mahbot` process is using this bot token."
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
-                            continue;
-                        }
-                        PollOutcome::Error(desc) => {
-                            // Informational: the poll is retried every 5s, so an
-                            // unhealthy API would otherwise keep the issues view full.
-                            tracing::info!("Telegram getUpdates API error: {desc}");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
-                        }
-                        PollOutcome::Transport => continue,
-                    };
-
-                    if !self.process_updates(&parts_tx, updates).await {
-                        tracing::warn!(
-                            "Telegram listener stopping: the message pipeline is closed"
-                        );
-                        return Ok(());
-                    }
-                }
-            }
+        // Every way the intake returns passes through this drain: dropping the sender
+        // releases an open burst, which the collector hands to the pipeline and settles,
+        // so the frame of this listener ends only once that collector has finished
+        // ([`ListenerFrame`]).
+        drop(parts_tx);
+        if let Err(err) = collector.await {
+            tracing::error!(
+                %err,
+                "Telegram intake: the burst collector failed; what it still held stays in the record"
+            );
         }
+        Ok(())
     }
 
     // -- typing indicators --
@@ -2984,58 +3638,87 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 }
-fn cancel_old_listener(old: Option<&std::sync::Arc<dyn Channel>>) {
-    if let Some(old) = old
-        && let Some(tc) = old.as_any().downcast_ref::<TelegramChannel>()
-    {
-        tc.cancel_own();
+
+/// Stop and wait out every listener of the intake's own that may still hold events: the
+/// channels a replace has moved past and no hand-over has confirmed stopped
+/// ([`crate::ReplacedChannels`]). A recorded channel that is not one of them — the registry
+/// is not the intake's alone — has no frame to wait out and is only taken out of the list.
+///
+/// `starting` is the channel the caller is about to start, which is never stopped
+/// ([`hand_over_listener`]); it is left in the list rather than retired, so a hand-over
+/// that lands later still finds it there and stops it.
+///
+/// Taken from the name's own list rather than from what the channels carry, so every
+/// hand-over waits for the same frames: a chain the channels carry is consumed by whichever
+/// hand-over walks it first, and a save landing while an earlier one waited would then start
+/// a listener with the frame that holds undelivered events still open — handing that content
+/// on twice.
+///
+/// A frame still open past the wait bound is left in the list, so the next hand-over waits it
+/// again rather than taking its place behind its back.
+async fn stop_listeners(
+    frames: &crate::ReplacedChannels,
+    starting: Option<&std::sync::Arc<dyn Channel>>,
+) {
+    for frame in frames.snapshot() {
+        if starting.is_some_and(|starting| std::sync::Arc::ptr_eq(starting, &frame)) {
+            continue;
+        }
+        if let Some(telegram) = frame.as_any().downcast_ref::<TelegramChannel>() {
+            telegram.cancel_own();
+            telegram.wait_stopped().await;
+            if telegram.running() {
+                continue;
+            }
+        }
+        frames.retire(&frame);
     }
 }
+
 /// Hot-reload the Telegram bot listener with a new token.
 ///
 /// Used when the user changes the bot token in Settings — no full application
 /// restart required.
 ///
-/// # Behaviour by token state
+/// The hand-over runs in a task of its own, so the caller gets its answer as soon as
+/// the registry holds the new channel: whether the caller is a settings save or the
+/// assistant's config tool, dropping it can no longer leave the registry holding a
+/// channel nothing listens on while the listener it replaced is already stopped.
 ///
-/// - **New token provided** (`Some(token)`):
-///   1. Validate the token via `getMe`
-///   2. Inherit the update offset from the old listener (if any) to avoid replay
-///   3. Atomically swap the channel in the registry (no gap)
-///   4. Cancel the old listener
-///   5. Spawn the new listener on the shared message pipeline
-///
-/// - **Token cleared** (`None`):
-///   1. Cancel the old listener
-///   2. Remove the channel from the registry
-///
-/// # Cancel-safety
-///
-/// Cancelling the returned future may leave the listener in an intermediate
-/// state. This function should be awaited to completion.
+/// - **New token provided** (`Some(token)`): the pipeline is resolved (the listener
+///   cannot run without it), the token is validated and the new channel takes the old
+///   one's place in the registry, which records what it moved past; the hand-over task
+///   then cancels and waits out every such listener — one whose collector has drained
+///   means everything it held is settled or left held, so what is left for the take-over
+///   is exactly what it could not hand on — and listens, never stopping the channel it
+///   starts itself ([`hand_over_listener`]).
+/// - **Token cleared** (`None`): the old listener is cancelled and the channel
+///   unregistered once it has ended its frame — unless a token saved in the meantime
+///   has already put another channel in its place, which must stay registered. The
+///   channel keeps serving outbound sends while it winds down, so a reply that is
+///   already on its way still leaves through the token being removed.
 pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Result<()> {
     let registry = crate::channel_registry();
-    let old_channel = registry.get("telegram");
 
     if let Some(token) = new_token.filter(|t| !t.trim().is_empty()) {
+        // The listener cannot be started without the pipeline, so the pipeline is
+        // resolved before anything is touched — no platform call, no registry entry —
+        // and a missing one is reported to the caller rather than leaving a token the
+        // product never applied looking saved.
+        let Some(tx) = crate::MESSAGE_TX.get().cloned() else {
+            anyhow::bail!(
+                "the message pipeline is not running — the Telegram listener cannot start"
+            );
+        };
+
         // Validate the new token before touching anything.
         TelegramChannel::validate_token(token).await?;
 
-        // Inherit the update offset from the old listener to avoid
-        // replaying already-processed updates from Telegram's server.
-        let offset = old_channel
-            .as_ref()
-            .and_then(|c| c.as_any().downcast_ref::<TelegramChannel>())
-            .map(|tc| std::sync::Arc::clone(&tc.offset));
-
-        // Create the new channel with the inherited offset.
-        let telegram_channel = if let Some(inherited_offset) = offset {
-            TelegramChannel::with_offset(token.to_string(), inherited_offset)
-        } else {
-            TelegramChannel::new(token.to_string())
-        };
-
-        let telegram_arc = std::sync::Arc::new(telegram_channel);
+        // The record's rows are keyed by the account and claimed by the listener
+        // that holds them, so the replacement records and recovers on its own: what
+        // this process already has in flight is left to finish, and what the
+        // listener it replaced left held is taken over by the new one.
+        let telegram_arc = std::sync::Arc::new(TelegramChannel::new(token.to_string()));
 
         // Register commands with Telegram API (fire-and-forget, non-blocking).
         tokio::spawn({
@@ -3047,34 +3730,69 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
 
         let new_channel: std::sync::Arc<dyn Channel> = telegram_arc;
 
-        // Atomically replace in the registry — no gap where
-        // "telegram" returns None.
+        // Atomically replace in the registry — no gap where "telegram" returns None —
+        // which records what it moved past: the listeners the hand-over waits out.
+        let frames = registry.replaced("telegram");
         registry.replace(std::sync::Arc::clone(&new_channel));
 
-        // Cancel the old listener now that the registry has the new one.
-        cancel_old_listener(old_channel.as_ref());
-
-        // Spawn the new listener on the shared message pipeline.
-        if let Some(tx) = crate::MESSAGE_TX.get() {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = new_channel.listen(tx).await {
-                    tracing::error!(error = %e, "Telegram listener error after hot-reload");
-                }
-            });
-        } else {
-            tracing::error!("MESSAGE_TX not set — cannot spawn Telegram listener");
-        }
-
-        tracing::info!("Telegram bot listener restarted with new token");
+        tokio::spawn(hand_over_listener(frames, new_channel, tx));
+        tracing::info!("Telegram bot listener restarting with new token");
     } else {
-        // Token cleared — stop the old listener and unregister.
-        cancel_old_listener(old_channel.as_ref());
-        registry.unregister("telegram");
-        tracing::info!("Telegram bot token cleared — listener stopped");
+        // Token cleared — stop the old listener and unregister it once it has ended,
+        // unless a token saved while it wound down has already taken its place.
+        let frames = registry.replaced("telegram");
+        let old_channel = registry.get("telegram");
+        tokio::spawn(async move { retire_listener(registry, frames, old_channel).await });
     }
 
     Ok(())
+}
+
+/// Stop the listener `old` runs and, once its frame has ended, take it out of the
+/// registry — unless the registry holds a channel registered since (a token saved
+/// while the teardown waited), which is the one that is live by then.
+///
+/// The cleared channel is recorded among the frames a hand-over waits out: nothing
+/// displaced it, so the teardown is what moves past it, and a save landing meanwhile
+/// has to wait it out before it starts its own listener.
+async fn retire_listener(
+    registry: &crate::ChannelRegistry,
+    frames: std::sync::Arc<crate::ReplacedChannels>,
+    old: Option<std::sync::Arc<dyn Channel>>,
+) {
+    let Some(old) = old else {
+        return;
+    };
+    frames.record(std::sync::Arc::clone(&old));
+    stop_listeners(&frames, None).await;
+    if registry.unregister_if(&old) {
+        tracing::info!("Telegram bot token cleared — listener stopped");
+    } else {
+        tracing::info!("Telegram bot token cleared — a channel registered since is live");
+    }
+}
+
+/// The hand-over half of [`restart_telegram_listener`], in a task of its own so a
+/// caller that goes away cannot desynchronise the registry from the listener: the
+/// listeners the replace moved past are stopped and waited out, then the new channel
+/// listens on the shared pipeline.
+///
+/// `new` is the channel this hand-over is about to start, and is passed so the hand-over
+/// never stops it: a stop fires the channel's cancel token, so the listener started right
+/// after would return at once and the token this save applied would have no listener.
+/// `new` is in the list only when a later save's replace has already moved past it, and
+/// that needs no case of its own: the superseding hand-over stops `new` — `new` is not the
+/// channel *that* hand-over starts — while the channel the last save built is the one that
+/// listens.
+async fn hand_over_listener(
+    frames: std::sync::Arc<crate::ReplacedChannels>,
+    new: std::sync::Arc<dyn Channel>,
+    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+) {
+    stop_listeners(&frames, Some(&new)).await;
+    if let Err(e) = new.listen(tx).await {
+        tracing::error!(error = %e, "Telegram listener error after hot-reload");
+    }
 }
 
 /// Send a message directly through the registered Telegram channel, bypassing

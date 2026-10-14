@@ -141,7 +141,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -542,6 +542,13 @@ pub struct ChannelMessage {
     /// envelope then being the message itself. One level deep — a part never
     /// carries parts of its own. Set only by the Telegram burst collector.
     pub parts: Vec<ChannelMessage>,
+    /// The Telegram intake's record entries this message stands for, one per
+    /// incoming update it carries (an album's merged message carries every
+    /// member's, and a burst envelope the union of its parts', which no longer
+    /// keep their own): the intake settles them once the message has been handed
+    /// to the pipeline, so an event it never handed on stays held for a later run
+    /// to take up. Empty for every other channel. One level deep, like `parts`.
+    pub update_ids: Vec<i64>,
 }
 
 /// An outbound message to deliver on a channel.
@@ -682,6 +689,58 @@ pub static GUI_MESSAGE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<ChannelMe
 #[derive(Default)]
 pub struct ChannelRegistry {
     channels: RwLock<HashMap<String, Arc<dyn Channel>>>,
+    /// What the replaces under each name have moved past: [`ReplacedChannels`].
+    replaced: RwLock<HashMap<String, Arc<ReplacedChannels>>>,
+}
+
+/// The channels a name's replaces have moved past and no replacement has confirmed
+/// stopped — what a replacement has to wait out before it takes over.
+///
+/// Held per name by the registry rather than carried by the channels themselves: every
+/// replacement that lands while an earlier one is still waiting has to wait for the same
+/// frames (see `channels::telegram`'s `stop_listeners`).
+///
+/// An entry is kept alive by this list until [`Self::retire`] drops it. Nothing else
+/// clears the list, and the registry holds one `ReplacedChannels` per name for the
+/// process's life, so a recorded channel is pinned alive until the hand-over that owns
+/// the name retires it — for the telegram intake that is `channels::telegram`'s
+/// `stop_listeners`. A second user of [`ChannelRegistry::replaced`] that records without
+/// retiring would keep its channels alive forever.
+///
+/// The channel a hand-over is about to start is deliberately left in the list (see
+/// `stop_listeners`), so an entry may outlive the hand-over that first met it: the
+/// hand-over that displaces it next is what takes it out.
+#[derive(Default)]
+pub(crate) struct ReplacedChannels {
+    channels: Mutex<Vec<Arc<dyn Channel>>>,
+}
+
+impl ReplacedChannels {
+    /// The channels moved past so far, oldest first.
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> Vec<Arc<dyn Channel>> {
+        self.channels.lock().unwrap_poison().clone()
+    }
+
+    /// Note a channel the registry has moved past — what a replacement waits out.
+    ///
+    /// Recording one twice is a no-op: a save and the teardown of a token cleared
+    /// meanwhile can both move past the same channel, and it must not be waited out
+    /// twice.
+    pub(crate) fn record(&self, channel: Arc<dyn Channel>) {
+        let mut held = self.channels.lock().unwrap_poison();
+        if !held.iter().any(|held| Arc::ptr_eq(held, &channel)) {
+            held.push(channel);
+        }
+    }
+
+    /// Drop a channel, once a replacement has confirmed it stopped.
+    pub(crate) fn retire(&self, channel: &Arc<dyn Channel>) {
+        self.channels
+            .lock()
+            .unwrap_poison()
+            .retain(|held| !Arc::ptr_eq(held, channel));
+    }
 }
 
 impl ChannelRegistry {
@@ -702,7 +761,9 @@ impl ChannelRegistry {
         self.channels.read().unwrap_poison().get(name).cloned()
     }
 
-    /// Replace a channel with a new instance, returning the previous one if any.
+    /// Replace a channel with a new instance, returning the previous one if any, and
+    /// recording it as a channel the new instance has to wait out (the name's
+    /// `ReplacedChannels`, reached through `Self::replaced`).
     /// Unlike [`Self::register`], this **always** inserts — it replaces an existing
     /// channel with the same name rather than silently skipping it.
     ///
@@ -710,15 +771,52 @@ impl ChannelRegistry {
     /// a full application restart.
     pub fn replace(&self, channel: Arc<dyn Channel>) -> Option<Arc<dyn Channel>> {
         let name = channel.name().to_string();
-        self.channels.write().unwrap_poison().insert(name, channel)
+        let previous = self
+            .channels
+            .write()
+            .unwrap_poison()
+            .insert(name.clone(), channel);
+        if let Some(previous) = &previous {
+            self.replaced(&name).record(Arc::clone(previous));
+        }
+        previous
     }
 
-    /// Remove a channel by name, returning the removed channel if it existed.
+    /// What the replaces under `name` have moved past (`ReplacedChannels`). The same
+    /// handle every time, so a replacement that lands while an earlier one is still
+    /// waiting reads the same list — and records into it.
+    #[must_use]
+    pub(crate) fn replaced(&self, name: &str) -> Arc<ReplacedChannels> {
+        if let Some(held) = self.replaced.read().unwrap_poison().get(name) {
+            return Arc::clone(held);
+        }
+        let mut map = self.replaced.write().unwrap_poison();
+        Arc::clone(
+            map.entry(name.to_string())
+                .or_insert_with(|| Arc::new(ReplacedChannels::default())),
+        )
+    }
+
+    /// Remove a channel, but only if it is still `expected` — the instance the caller
+    /// stopped — and report whether it was `expected` that came out.
     ///
-    /// Used to tear down a channel that is no longer configured (e.g. Telegram
-    /// token cleared in Settings).
-    pub fn unregister(&self, name: &str) -> Option<Arc<dyn Channel>> {
-        self.channels.write().unwrap_poison().remove(name)
+    /// Used to tear down a channel that is no longer configured (e.g. Telegram token
+    /// cleared in Settings). A teardown that runs after the registry has moved on — a
+    /// new token saved while the old listener was still winding down — must leave the
+    /// channel that is live by then in place, or every outbound send loses its channel
+    /// and no later restart can reach the listener that is actually running.
+    pub fn unregister_if(&self, expected: &Arc<dyn Channel>) -> bool {
+        let name = expected.name().to_string();
+        let mut map = self.channels.write().unwrap_poison();
+        if map
+            .get(&name)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            map.remove(&name);
+            true
+        } else {
+            false
+        }
     }
 
     /// Return a snapshot of all registered channels (name → Arc clone).

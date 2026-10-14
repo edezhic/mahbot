@@ -1,5 +1,10 @@
 use super::*;
+use crate::channels::telegram_intake::{IN_PROGRESS, Intake, RETENTION_HOURS, TelegramIntakeStore};
 use crate::util::test::{TicketFixture, canonical_without_verbatim_prefix};
+use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Create a Telegram Update JSON with sensible defaults, then apply
 /// shallow top-level overrides for test-specific fields.
@@ -401,6 +406,7 @@ async fn parse_update_message_uses_chat_id_as_reply_target() {
     let msg = ch
         .parse_update_message(&update)
         .await
+        .expect("parse the update")
         .expect("message should parse");
 
     assert_eq!(msg.user_name, "alice");
@@ -701,7 +707,10 @@ async fn parse_update_message_denies_user_without_username() {
     )]);
 
     assert!(
-        ch.parse_update_message(&update).await.is_none(),
+        ch.parse_update_message(&update)
+            .await
+            .expect("parse the update")
+            .is_none(),
         "user without username should be denied"
     );
 }
@@ -728,6 +737,7 @@ async fn parse_update_message_extracts_thread_id_for_forum_topic() {
     let msg = ch
         .parse_update_message(&update)
         .await
+        .expect("parse the update")
         .expect("message with thread_id should parse");
 
     assert_eq!(msg.user_name, "alice");
@@ -763,6 +773,7 @@ async fn parse_callback_query_returns_message_with_extracted_fields() {
     let msg = ch
         .parse_callback_query(&cq)
         .await
+        .expect("parse the query")
         .expect("callback query should parse with valid user");
 
     assert_eq!(msg.user_name, "alice");
@@ -786,7 +797,10 @@ async fn parse_callback_query_rejects_invalid_inputs() {
     for (name, overrides) in &cases {
         let cq = test_callback_query(overrides);
         assert!(
-            ch.parse_callback_query(&cq).await.is_none(),
+            ch.parse_callback_query(&cq)
+                .await
+                .expect("parse the query")
+                .is_none(),
             "case {name}: expected rejection"
         );
     }
@@ -819,6 +833,7 @@ async fn parse_callback_query_accepts_empty_data_and_null_id() {
         let msg = ch
             .parse_callback_query(&cq)
             .await
+            .expect("parse the query")
             .unwrap_or_else(|| panic!("case {name}: expected a valid message"));
         assert_eq!(msg.content, *content, "case {name}");
         assert_eq!(msg.callback_query_id.as_deref(), *cq_id, "case {name}");
@@ -1027,6 +1042,7 @@ async fn usernameless_sender_stays_unauthorized_despite_legacy_binding() {
         assert!(
             resolve_authorized_sender(&sender, &serde_json::json!({"chat": {"id": 42}}))
                 .await
+                .expect("resolve the sender")
                 .is_none(),
             "the reserved sentinel must never authorize: {sender}"
         );
@@ -1057,7 +1073,8 @@ async fn usernameless_sender_is_authorized_by_a_numeric_binding() {
             &serde_json::json!({"from": {"id": 31_415_926}}),
             &serde_json::json!({"chat": {"id": 42}}),
         )
-        .await,
+        .await
+        .expect("resolve the sender"),
         Some(("num_user".to_string(), "42".to_string(), "42".to_string())),
     );
     // Clean up so the shared store isn't polluted for later tests.
@@ -1092,6 +1109,7 @@ async fn numeric_binding_outranks_a_nickname_bound_to_another_account() {
         &serde_json::json!({"chat": {"id": 42}}),
     )
     .await
+    .expect("resolve the sender")
     .expect("the number binds");
     assert_eq!(authorized.0, "num_rank");
 
@@ -1119,6 +1137,7 @@ async fn bot_sender_is_refused_even_when_its_nickname_is_bound() {
             &serde_json::json!({"chat": {"id": 42}}),
         )
         .await
+        .expect("resolve the sender")
         .is_none()
     );
 }
@@ -1138,6 +1157,7 @@ async fn chat_attributed_message_is_refused_even_when_its_sender_is_bound() {
             &serde_json::json!({"chat": {"id": 42}}),
         )
         .await
+        .expect("resolve the sender")
         .is_none()
     );
 }
@@ -1159,6 +1179,7 @@ async fn telegram_service_identity_senders_are_refused() {
                 &serde_json::json!({"chat": {"id": 42}}),
             )
             .await
+            .expect("resolve the sender")
             .is_none(),
             "case {name}: expected rejection"
         );
@@ -1183,6 +1204,7 @@ async fn callback_query_authorizes_the_person_when_its_message_is_chat_attribute
     let msg = ch
         .parse_callback_query(&cq)
         .await
+        .expect("parse the query")
         .expect("the clicker's own identity authorizes");
     assert_eq!(msg.user_name, "alice");
     assert_eq!(msg.chat_id.as_deref(), Some("-100200300"));
@@ -1356,7 +1378,11 @@ async fn parse_update_message_populates_reply_reference() {
             }
         }),
     )]);
-    let parsed = ch.parse_update_message(&update).await.unwrap();
+    let parsed = ch
+        .parse_update_message(&update)
+        .await
+        .expect("parse the update")
+        .expect("a message");
     // No leading `> ` quote — the content is the raw user text only.
     assert_eq!(parsed.content, "translate this");
     let reply = parsed
@@ -1385,6 +1411,7 @@ async fn attachment_message_reply_carries_reference() {
     let ctx = ch
         .extract_message_context(&message)
         .await
+        .expect("resolve the context")
         .expect("valid context");
     let reply = ctx.reply_reference.expect("media reply carries reference");
     assert_eq!(reply.author, "@bob");
@@ -1409,7 +1436,11 @@ async fn reply_that_is_a_command_parses_as_command() {
             }
         }),
     )]);
-    let parsed = ch.parse_update_message(&update).await.unwrap();
+    let parsed = ch
+        .parse_update_message(&update)
+        .await
+        .expect("parse the update")
+        .expect("a message");
     // The raw command text reaches the content, so parse_bot_command matches
     // and the command handler takes over (the reply reference is dropped).
     assert_eq!(parsed.content, "/clear");
@@ -1432,7 +1463,11 @@ async fn reply_to_command_keeps_reference() {
             }
         }),
     )]);
-    let parsed = ch.parse_update_message(&update).await.unwrap();
+    let parsed = ch
+        .parse_update_message(&update)
+        .await
+        .expect("parse the update")
+        .expect("a message");
     // A non-command reply to a command message keeps its reference and routes
     // to the agent as usual.
     assert_eq!(parsed.content, "why did you clear?");
@@ -2069,6 +2104,7 @@ fn album_members_merge_into_one_message() {
         chat_id: Some(first_chat.into()),
         content: "a".into(),
         attachment_dirs: vec![crate::util::telegram_staging_dir_name(first_chat, 41)],
+        update_ids: vec![7],
         ..test_msg("alice", "", "telegram", "chat")
     };
     let second = ChannelMessage {
@@ -2079,6 +2115,7 @@ fn album_members_merge_into_one_message() {
             crate::util::telegram_staging_dir_name(second_chat, 42),
             crate::util::telegram_staging_dir_name(second_chat, 43),
         ],
+        update_ids: vec![8],
         ..test_msg("bob", "", "telegram", "other")
     };
 
@@ -2099,6 +2136,11 @@ fn album_members_merge_into_one_message() {
             crate::util::telegram_staging_dir_name(second_chat, 43),
         ]
     );
+    // Every member's record entry comes along: an album is one incoming event
+    // whose parts are each their own entry, and this merged message is what the
+    // hand-over settles — a member left off it would stay held, and a later run
+    // would take the album up a second time.
+    assert_eq!(album.update_ids, vec![7, 8]);
 }
 
 // ── Control message tests ───────────────────────────────────────
@@ -2155,6 +2197,15 @@ fn is_control_message_covers_commands_and_callbacks() {
 
 // ── Forwarded message tests ─────────────────────────────────────
 
+/// The one message `update` parses to, with the parse's own failure named — the shape
+/// every case below reads its content through.
+async fn parsed_message(ch: &TelegramChannel, update: &serde_json::Value) -> ChannelMessage {
+    ch.parse_update_message(update)
+        .await
+        .expect("parse the update")
+        .expect("a message")
+}
+
 #[tokio::test]
 async fn forward_attribution() {
     let ch = test_channel().await;
@@ -2175,7 +2226,7 @@ async fn forward_attribution() {
             "forward_date": 1_700_000_000
         }),
     )]);
-    let msg = ch.parse_update_message(&update).await.unwrap();
+    let msg = parsed_message(&ch, &update).await;
     assert_eq!(msg.content, "[Forwarded from @bob] Check this out");
 
     // forwarded from channel
@@ -2195,7 +2246,7 @@ async fn forward_attribution() {
             "forward_date": 1_700_000_000
         }),
     )]);
-    let msg = ch.parse_update_message(&update).await.unwrap();
+    let msg = parsed_message(&ch, &update).await;
     assert_eq!(
         msg.content,
         "[Forwarded from channel: Daily News] Breaking news"
@@ -2213,7 +2264,7 @@ async fn forward_attribution() {
             "forward_date": 1_700_000_000
         }),
     )]);
-    let msg = ch.parse_update_message(&update).await.unwrap();
+    let msg = parsed_message(&ch, &update).await;
     assert_eq!(msg.content, "[Forwarded from Hidden User] Secret tip");
 
     // non-forwarded unaffected
@@ -2226,7 +2277,7 @@ async fn forward_attribution() {
             "chat": { "id": 999 }
         }),
     )]);
-    let msg = ch.parse_update_message(&update).await.unwrap();
+    let msg = parsed_message(&ch, &update).await;
     assert_eq!(msg.content, "Normal message");
 
     // forwarded from user without username
@@ -2244,7 +2295,7 @@ async fn forward_attribution() {
             "forward_date": 1_700_000_000
         }),
     )]);
-    let msg = ch.parse_update_message(&update).await.unwrap();
+    let msg = parsed_message(&ch, &update).await;
     assert_eq!(msg.content, "[Forwarded from Charlie] Hello there");
 
     // forwarded photo with attribution
@@ -2652,6 +2703,7 @@ fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -
         message_id: None,
         attachment_dirs: Vec::new(),
         parts: Vec::new(),
+        update_ids: Vec::new(),
     }
 }
 
@@ -3238,4 +3290,1704 @@ fn test_update_notification_texts_render_as_plain_single_messages() {
     let html = to_telegram_html(&failure);
     assert_eq!(html.lines().next(), failure.lines().next());
     assert_eq!(split_message_for_telegram(&html).len(), 1);
+}
+
+// ── Telegram intake checks ──────────────────────────────────────────
+//
+// The intake's own guarantee — an event the platform handed over is never lost
+// and is taken up exactly once — is checked against a fake Bot API: a listener
+// is pointed at a local endpoint (`TelegramChannel::for_test`), scripted
+// `getUpdates` batches drive it, and the record it writes into is read back
+// through a store of this check's own.
+//
+// Every check here that starts a listener is serialized on the process-global
+// drain flag: the listener consults it on entry and races it in its poll loop, so
+// a check running while another test winds the daemon down would see its listener
+// stop.
+
+/// How long a check waits for state it can observe before failing. Generous on
+/// purpose: everything waited for here is durable — a record row, a request the
+/// fake logged, a message the pipeline holds — so a longer bound only delays
+/// failure reporting, while a short one turns a machine that stalls a runtime
+/// for seconds into a failing check.
+const OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a check waits for a poll that only arrives after the intake's own
+/// pause on an unrecordable batch. Deliberately loose: that pause is seconds
+/// long by design, and its length is not what the check asserts — a tight retry
+/// would show up as a gap of milliseconds, not of seconds — so the bound only
+/// has to be past the pause, not equal to it.
+const BACKOFF_OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A fake Telegram Bot API: scripted `getUpdates` batches, an account per token,
+/// and a log of the methods a listener called.
+struct FakeTelegram {
+    base: String,
+    state: Arc<FakeState>,
+    /// Set by `Drop`, so the accept loop — which polls — lets go of the socket.
+    stop: Arc<AtomicBool>,
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the fake's accept loop and its per-connection handlers share.
+struct FakeState {
+    /// The bot account each token resolves to.
+    accounts: HashMap<String, i64>,
+    /// The `getUpdates` batches queued for each token, oldest first.
+    batches: Mutex<HashMap<String, VecDeque<Vec<serde_json::Value>>>>,
+    /// Every request a listener made, in arrival order: the method, the
+    /// `getUpdates` offset it asked for (`None` for other methods), and when it
+    /// arrived.
+    requests: Mutex<Vec<(String, Option<i64>, std::time::Instant)>>,
+    /// The `text` of every `sendMessage`, in arrival order.
+    sent_texts: Mutex<Vec<String>>,
+}
+
+/// One request as the fake read it.
+struct FakeRequest {
+    path: String,
+    body: Vec<u8>,
+}
+
+/// A request's head: the request line's path, the `Content-Length` it declares,
+/// and whatever of the body already arrived.
+struct FakeHead {
+    path: String,
+    length: usize,
+    buffer: Vec<u8>,
+    head_end: usize,
+}
+
+impl FakeTelegram {
+    /// Start a fake API for the given `(token, bot account id)` pairs.
+    fn start(accounts: &[(&str, i64)]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake Bot API");
+        listener
+            .set_nonblocking(true)
+            .expect("the fake Bot API accepts without blocking");
+        let port = listener.local_addr().expect("fake Bot API address").port();
+        let state = Arc::new(FakeState {
+            accounts: accounts
+                .iter()
+                .map(|(token, id)| ((*token).to_string(), *id))
+                .collect(),
+            batches: Mutex::new(HashMap::new()),
+            requests: Mutex::new(Vec::new()),
+            sent_texts: Mutex::new(Vec::new()),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let accept = std::thread::spawn({
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            // The accepted socket can inherit the listener's
+                            // non-blocking mode (it does on macOS), and a
+                            // handler that polls would then read nothing (or a
+                            // half-arrived request) and close the connection
+                            // before answering. A handler blocks, so put the
+                            // stream back in blocking mode.
+                            let _ = stream.set_nonblocking(false);
+                            let state = Arc::clone(&state);
+                            std::thread::spawn(move || serve(stream, &state));
+                        }
+                        // Polling rather than blocking, so the loop can see
+                        // `stop`: a blocking accept would outlive the check that
+                        // drops the fake.
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        // A transient accept error (a client that went away
+                        // before it was accepted is `ECONNABORTED`, ordinary on
+                        // macOS) must not kill the fake: an accept loop that
+                        // returns here stops serving every later request.
+                        Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                    }
+                }
+            }
+        });
+        Self {
+            base: format!("http://127.0.0.1:{port}"),
+            state,
+            stop,
+            accept: Some(accept),
+        }
+    }
+
+    /// Queue the next `getUpdates` result for `token`'s account.
+    fn push_batch(&self, token: &str, updates: Vec<serde_json::Value>) {
+        self.state
+            .batches
+            .lock()
+            .expect("fake batches lock")
+            .entry(token.to_string())
+            .or_default()
+            .push_back(updates);
+    }
+
+    /// The `offset` every `getUpdates` poll asked for, in order.
+    fn poll_offsets(&self) -> Vec<i64> {
+        self.state
+            .requests
+            .lock()
+            .expect("fake request log")
+            .iter()
+            .filter(|(method, _, _)| method == "getUpdates")
+            .filter_map(|(_, offset, _)| *offset)
+            .collect()
+    }
+
+    /// How many times `method` was called.
+    fn count(&self, method: &str) -> usize {
+        self.state
+            .requests
+            .lock()
+            .expect("fake request log")
+            .iter()
+            .filter(|(called, _, _)| called == method)
+            .count()
+    }
+
+    /// The texts of the `sendMessage` calls, in order.
+    fn sent_texts(&self) -> Vec<String> {
+        self.state
+            .sent_texts
+            .lock()
+            .expect("fake sendMessage log")
+            .clone()
+    }
+}
+
+impl Drop for FakeTelegram {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+    }
+}
+
+/// The `(token, method)` a Bot API path carries, `None` for anything else.
+fn bot_path(path: &str) -> Option<(&str, &str)> {
+    let (token, method) = path.strip_prefix("/bot")?.split_once('/')?;
+    (!token.is_empty() && !method.is_empty()).then_some((token, method))
+}
+
+/// The API's answer for something it does not serve.
+fn not_found() -> serde_json::Value {
+    serde_json::json!({ "ok": false, "error_code": 404, "description": "Not Found" })
+}
+
+/// Answer one request the way the Bot API does: the JSON envelope, and the
+/// connection closed after it.
+fn serve(mut stream: TcpStream, state: &FakeState) {
+    let Some(head) = read_head(&mut stream) else {
+        return;
+    };
+    let Some(request) = read_body(&mut stream, head) else {
+        return;
+    };
+    let method = request
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    // The `offset` a poll asked for, `None` for the methods that carry none,
+    // read here because the log line below is where it is recorded.
+    let offset = if method == "getUpdates" {
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|body| body["offset"].as_i64())
+    } else {
+        None
+    };
+    // Recorded as the request arrives — before its answer, so the log is the
+    // durable evidence of what a listener called.
+    state.requests.lock().expect("fake request log").push((
+        method.clone(),
+        offset,
+        std::time::Instant::now(),
+    ));
+
+    let Some((token, _)) = bot_path(&request.path) else {
+        respond(&mut stream, &not_found());
+        return;
+    };
+    let Some(account) = state.accounts.get(token).copied() else {
+        // A listener is only ever started on a token the fake was given (see
+        // `FakeTelegram::start`), so nothing here models the platform's own
+        // per-token authorization.
+        respond(&mut stream, &not_found());
+        return;
+    };
+
+    match method.as_str() {
+        "getMe" => respond(
+            &mut stream,
+            &serde_json::json!({ "ok": true, "result": { "id": account } }),
+        ),
+        "getUpdates" => serve_get_updates(&mut stream, state, token, &request),
+        "sendMessage" => serve_send_message(&mut stream, state, &request),
+        "setMessageReaction" | "answerCallbackQuery" | "setMyCommands" | "sendChatAction" => {
+            respond(
+                &mut stream,
+                &serde_json::json!({ "ok": true, "result": true }),
+            );
+        }
+        _ => respond(&mut stream, &not_found()),
+    }
+}
+
+/// The `getUpdates` answer: the oldest queued batch, an immediate empty result
+/// for the handshake's zero-timeout probe, or — for a long poll with nothing to
+/// offer — no answer at all, held open until the client gives up, which is what
+/// the real API's long poll does.
+fn serve_get_updates(
+    stream: &mut TcpStream,
+    state: &FakeState,
+    token: &str,
+    request: &FakeRequest,
+) {
+    let queued = state
+        .batches
+        .lock()
+        .expect("fake batches lock")
+        .get_mut(token)
+        .and_then(VecDeque::pop_front);
+    if let Some(batch) = queued {
+        return respond(stream, &serde_json::json!({ "ok": true, "result": batch }));
+    }
+    // The `timeout` the poll asked for, `0` when it asked for none.
+    let timeout = serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .and_then(|body| body["timeout"].as_u64())
+        .unwrap_or(0);
+    if timeout == 0 {
+        return respond(stream, &serde_json::json!({ "ok": true, "result": [] }));
+    }
+    let mut sink = [0u8; 1024];
+    while let Ok(read) = stream.read(&mut sink) {
+        if read == 0 {
+            break;
+        }
+    }
+}
+
+/// The `sendMessage` answer. The text is logged so a check can read back what
+/// the listener told the user.
+fn serve_send_message(stream: &mut TcpStream, state: &FakeState, request: &FakeRequest) {
+    if let Some(text) = serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .and_then(|body| body["text"].as_str().map(str::to_string))
+    {
+        state
+            .sent_texts
+            .lock()
+            .expect("fake sendMessage log")
+            .push(text);
+    }
+    respond(
+        stream,
+        &serde_json::json!({
+            "ok": true,
+            "result": { "message_id": 1, "chat": { "id": 5 }, "date": 0 },
+        }),
+    );
+}
+
+/// Read a request's head: the request line's path and the `Content-Length` it
+/// declares.
+fn read_head(stream: &mut TcpStream) -> Option<FakeHead> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let head_end = loop {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at + 4;
+        }
+    };
+    let (path, length) = {
+        let head = String::from_utf8_lossy(&buffer[..head_end]);
+        let path = head
+            .lines()
+            .next()?
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        let length = head
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        (path, length)
+    };
+    Some(FakeHead {
+        path,
+        length,
+        buffer,
+        head_end,
+    })
+}
+
+/// Read the body `head` declared, on top of whatever of it already arrived.
+fn read_body(stream: &mut TcpStream, head: FakeHead) -> Option<FakeRequest> {
+    let FakeHead {
+        path,
+        length,
+        mut buffer,
+        head_end,
+    } = head;
+    let mut chunk = [0u8; 1024];
+    while buffer.len() < head_end + length {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let body = buffer[head_end..(head_end + length).min(buffer.len())].to_vec();
+    Some(FakeRequest { path, body })
+}
+
+/// Write one response: the JSON body, and the closed connection `Connection:
+/// close` promises.
+fn respond(stream: &mut TcpStream, body: &serde_json::Value) {
+    let text = body.to_string();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        text.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(text.as_bytes());
+}
+
+/// Poll `probe` until it holds, or fail naming `what`. A check must not lean on
+/// a fixed sleep for state it can observe: one long enough for the slowest
+/// machine is a slow check, and a short one is a flaky check.
+async fn until<F, Fut>(what: &str, probe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    until_within(OBSERVABLE_TIMEOUT, what, probe).await;
+}
+
+/// The same wait, with the failure bound chosen by the caller: state only
+/// reached after the intake's own pause is a pause away, so the cheap bound every
+/// other wait uses would fail on it — and only a failing run pays for the loose
+/// one.
+async fn until_within<F, Fut>(bound: Duration, what: &str, mut probe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if probe().await {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The next message the pipeline receives, or a panic naming `what`. A check
+/// releases a burst through the collector's quiet window, so its message is a
+/// second away, never immediate.
+async fn next_message(
+    rx: &mut tokio::sync::mpsc::Receiver<ChannelMessage>,
+    what: &str,
+) -> ChannelMessage {
+    tokio::time::timeout(OBSERVABLE_TIMEOUT, rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("nothing reached the pipeline: {what}"))
+        .unwrap_or_else(|| panic!("the pipeline closed before delivering: {what}"))
+}
+
+/// A message update from alice carrying `text`.
+fn test_text_update(update_id: i64, text: &str) -> serde_json::Value {
+    test_update(&[
+        ("update_id", serde_json::json!(update_id)),
+        (
+            "message",
+            serde_json::json!({
+                "message_id": 33,
+                "text": text,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300 },
+            }),
+        ),
+    ])
+}
+
+/// One member of an album (a media group) from alice.
+fn test_album_member(update_id: i64, group: &str, text: &str) -> serde_json::Value {
+    test_update(&[
+        ("update_id", serde_json::json!(update_id)),
+        (
+            "message",
+            serde_json::json!({
+                "message_id": 100 + update_id,
+                "text": text,
+                "media_group_id": group,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300 },
+            }),
+        ),
+    ])
+}
+
+/// A store of this check's own plus the `TempDir` holding its rows — one per
+/// check, so no check leans on another's. The store comes back because a check
+/// that restarts builds a second record over the same durable rows.
+async fn test_store() -> (TelegramIntakeStore, tempfile::TempDir) {
+    // Alice must be bound to Telegram for a parsed update to authorize her.
+    crate::users::test_util::init_test_store().await;
+    crate::open_test_store!(TelegramIntakeStore, "telegram_intake")
+}
+
+/// A run's own handle onto `store` — a listener's, or a check's own probe.
+/// `claim_label` names the run it stands for: a restart, or a row a previous run
+/// left behind, is another run, so it must claim under a different id.
+fn run(store: &TelegramIntakeStore, claim_label: &str, account: &str) -> Intake {
+    Intake::new(store.clone(), Arc::from(claim_label), account)
+}
+
+/// A listener pointed at `fake`, recording and claiming through `store`. Its claim
+/// is its own, exactly as it is for a listener the product builds, so a second
+/// listener over one store is the different run a restart makes of it.
+fn channel(token: &str, fake: &FakeTelegram, store: &TelegramIntakeStore) -> TelegramChannel {
+    TelegramChannel::for_test(token.into(), fake.base.clone(), store.clone())
+}
+
+/// The events the account's record still holds in progress, read straight from
+/// the rows so a check observes them without claiming them.
+async fn still_held(store: &TelegramIntakeStore, account: &str) -> Vec<i64> {
+    let rows = store
+        .conn
+        .query(
+            "SELECT update_id FROM telegram_intake \
+             WHERE account_id = ?1 AND state = ?2",
+            crate::db::params![account, IN_PROGRESS],
+        )
+        .await
+        .expect("read the record");
+    rows.into_iter()
+        .map(|row| row.get::<i64>(0).expect("update_id"))
+        .collect()
+}
+
+/// An event the intake recorded but had not handed on when the process died is
+/// taken up by the next run: without this, everything that arrived in the
+/// intake's last moments would be silently dropped. The restart runs the token
+/// rotated for the same account — the record is keyed on the bot account the
+/// platform names rather than on the token's text, so what the dead run held is
+/// this run's to take up.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn restart_takes_up_the_event_a_previous_listener_held() {
+    // Two tokens the platform maps to one account: a rotation, not a new bot.
+    let fake = FakeTelegram::start(&[("token-a", 700), ("token-b", 700)]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+
+    // The first listener records and holds the event under its own claim.
+    let first = channel("token-a", &fake, &store);
+
+    // The process dies mid-flight: the sink is already gone, so the collector's
+    // hand-over can never succeed and the event stays held — exactly what a run
+    // that died before handing the event on leaves behind. Dropping the receiver
+    // up front also keeps the wait below off the collector's one-second window:
+    // what it waits for is a state nothing in this check can clear.
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = first.listen(tx).await;
+    });
+    drop(rx);
+
+    until("the record holds the event", || async {
+        !still_held(&store, "700").await.is_empty()
+    })
+    .await;
+    listener.abort();
+    let _ = listener.await;
+    assert!(
+        !still_held(&store, "700").await.is_empty(),
+        "the event must survive the process that never handed it on"
+    );
+
+    // The restart is a listener of its own, so its claim is its own too, on the
+    // rotated token for the same account, and the event the dead listener left
+    // held is taken up through the claim path.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let restarted = channel("token-b", &fake, &store);
+    let listener = tokio::spawn(async move {
+        let _ = restarted.listen(tx).await;
+    });
+
+    let msg = next_message(&mut rx, "the event the previous run held").await;
+    assert_eq!(msg.content, "hello");
+    assert_eq!(msg.channel, "telegram");
+    // The hand-over takes the record entries it settles off the message, so the
+    // pipeline sees an event already accounted for.
+    assert!(
+        msg.update_ids.is_empty(),
+        "the hand-over must settle the entries it carries"
+    );
+
+    until("the hand-over settles the recovered event", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+    listener.abort();
+}
+
+/// An album is one incoming event: its members are recorded, handed over as one
+/// message and settled together, never taken up as unrelated messages.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn an_album_is_taken_up_and_settled_as_one_event() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_batch(
+        "token-a",
+        vec![
+            test_album_member(1, "group-1", "one"),
+            test_album_member(2, "group-1", "two"),
+        ],
+    );
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message(&mut rx, "the album, as one message").await;
+    assert_eq!(
+        msg.content, "one\ntwo",
+        "an album's members must reach the pipeline as one message"
+    );
+    // Both members are settled by that one hand-over — the record keeps no part of
+    // the album behind.
+    until("the album is settled whole", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+
+    // And no member arrives as a message of its own.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "an album's member was handled as an unrelated message"
+    );
+    listener.abort();
+}
+
+/// An album the record holds is recovered as one event too: recovery re-parses the
+/// stored updates, so the album's members regroup into the one message they are and
+/// settle together.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_recovered_album_is_taken_up_as_one_event() {
+    // Nothing is queued: the handshake's probe gets an empty result and the long
+    // poll then hangs, which keeps the listener quiet while recovery runs.
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    run(&store, "previous-run", "700")
+        .hold(&[
+            &test_album_member(1, "group-1", "one"),
+            &test_album_member(2, "group-1", "two"),
+        ])
+        .await
+        .expect("hold the album");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let telegram = channel("token-a", &fake, &store);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message(&mut rx, "the recovered album, as one message").await;
+    assert_eq!(
+        msg.content, "one\ntwo",
+        "a recovered album's members must reach the pipeline as one message"
+    );
+    until("the recovered album is settled whole", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "a recovered album's member was handled as an unrelated message"
+    );
+    listener.abort();
+}
+
+/// A token change to another account takes up that account's own backlog, and
+/// leaves the previous account's held events alone: an `update_id` is only an
+/// identity inside its account, so the new listener must not read the old
+/// account's event as a repeat of its own.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_token_change_to_another_account_takes_its_own_backlog() {
+    let fake = FakeTelegram::start(&[("token-a", 700), ("token-b", 800)]);
+    let (store, _dir) = test_store().await;
+
+    // A row the previous run left behind under its own claim.
+    run(&store, "previous-run", "700")
+        .hold(&[&test_text_update(1, "a-only")])
+        .await
+        .expect("hold the previous account's event");
+    // The same `update_id` from the account the new token belongs to, carrying
+    // content of its own.
+    fake.push_batch("token-b", vec![test_text_update(1, "b-only")]);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let telegram = channel("token-b", &fake, &store);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message(&mut rx, "the new account's own event").await;
+    assert_eq!(msg.content, "b-only");
+
+    // The previous account's held event is abandoned rather than retried under
+    // the new account, so nothing else arrives.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "the previous account's event was taken up under the new account"
+    );
+    assert!(
+        !still_held(&store, "700").await.is_empty(),
+        "the previous account's held event must be left alone"
+    );
+    listener.abort();
+}
+
+/// The hand-over a token change runs — the replaced listener stopped and waited out,
+/// the new one listening where it left off — takes up what the replaced listener held,
+/// exactly once.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_token_change_hands_over_what_the_replaced_listener_held_once() {
+    // Two tokens the platform maps to one account: a rotation, not a new bot.
+    let fake = FakeTelegram::start(&[("token-a", 700), ("token-b", 700)]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+
+    // The listener being replaced cannot hand its burst on — its sink is gone — which
+    // is what leaves the event held for the replacement to take up.
+    let old: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-a", &fake, &store));
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn({
+        let old = std::sync::Arc::clone(&old);
+        async move {
+            let _ = old.listen(tx).await;
+        }
+    });
+    drop(rx);
+    until("the record holds the event", || async {
+        !still_held(&store, "700").await.is_empty()
+    })
+    .await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let new: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-b", &fake, &store));
+    // The registry's own record of what a replace moves past is what its hand-over
+    // waits out, and the channel this token change displaces is `old`.
+    let registry = crate::ChannelRegistry::default();
+    registry.register(std::sync::Arc::clone(&old));
+    let frames = registry.replaced("telegram");
+    registry.replace(std::sync::Arc::clone(&new));
+    let hand_over = tokio::spawn(hand_over_listener(frames, new, tx));
+
+    let msg = next_message(&mut rx, "the event the replaced listener held").await;
+    assert_eq!(msg.content, "hello");
+    until("the hand-over settles the recovered event", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(crate::channels::telegram_group::QUIET_WINDOW * 2, rx.recv())
+            .await
+            .is_err(),
+        "a recovered event must be handed on exactly once"
+    );
+    listener.abort();
+    hand_over.abort();
+}
+
+/// A token cleared and then set again must not cost the channel that is live by then:
+/// outbound sends and a later restart both reach the listener through the registry, so
+/// a teardown that removed its channel by name would silently stop every Telegram send
+/// after a quick clear-then-set. Both the teardown and the hand-over the save schedules
+/// wait on the one frame the cleared listener runs, so ending that frame has to release
+/// both of them.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_clear_then_set_releases_both_waiters_and_keeps_its_channel() {
+    let fake = FakeTelegram::start(&[("token-a", 700), ("token-b", 700)]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+
+    // A registry of this check's own: the product's is a process global.
+    let registry = crate::ChannelRegistry::default();
+
+    // The listener being cleared, holding a burst it cannot hand on: the pipeline has
+    // no room in it, so the frame the teardown waits for is still open.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(ChannelMessage::default())
+        .await
+        .expect("the pipeline accepts the message that fills it");
+    let old: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-a", &fake, &store));
+    registry.register(std::sync::Arc::clone(&old));
+    let listener = tokio::spawn({
+        let old = std::sync::Arc::clone(&old);
+        async move {
+            let _ = old.listen(tx).await;
+        }
+    });
+    until("the intake takes the event on", || async {
+        !still_held(&store, "700").await.is_empty()
+    })
+    .await;
+
+    // The clear: its teardown records the cleared channel among the frames a hand-over
+    // waits out and waits for the frame the check is holding open.
+    let frames = registry.replaced("telegram");
+    let teardown = retire_listener(
+        &registry,
+        std::sync::Arc::clone(&frames),
+        Some(std::sync::Arc::clone(&old)),
+    );
+    tokio::pin!(teardown);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut teardown)
+            .await
+            .is_err(),
+        "the clear's teardown must wait for the replaced listener's frame"
+    );
+
+    // The save that lands while it waits: the new token's channel takes the cleared
+    // one's place, exactly as `restart_telegram_listener` does — which records it as a
+    // frame to wait out — and the wait its hand-over starts lands on the same frame:
+    // the second waiter. The hand-over is handed the channel it is about to start, as
+    // `hand_over_listener` does.
+    let new: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-b", &fake, &store));
+    registry.replace(std::sync::Arc::clone(&new));
+    let mut hand_over = tokio::spawn({
+        let frames = std::sync::Arc::clone(&frames);
+        let new = std::sync::Arc::clone(&new);
+        async move { stop_listeners(&frames, Some(&new)).await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut hand_over)
+            .await
+            .is_err(),
+        "the hand-over's wait must park on the replaced listener's frame"
+    );
+
+    // Let the replaced frame end — the burst goes through and settles — and the
+    // teardown and the hand-over waiting on it are both released by it. Taking the
+    // filler out is what makes room.
+    rx.recv()
+        .await
+        .expect("the message that filled the pipeline");
+    let msg = next_message(&mut rx, "the burst the cleared listener held").await;
+    assert_eq!(msg.content, "hello");
+    tokio::time::timeout(OBSERVABLE_TIMEOUT, teardown)
+        .await
+        .expect("the clear's teardown must finish once the frame has ended");
+    tokio::time::timeout(OBSERVABLE_TIMEOUT, hand_over)
+        .await
+        .expect("the hand-over waiting on the frame must finish with it")
+        .expect("the hand-over task must not panic");
+
+    assert!(
+        registry
+            .get("telegram")
+            .is_some_and(|live| std::sync::Arc::ptr_eq(&live, &new)),
+        "the channel that is live after a quick clear-then-set must stay registered"
+    );
+    listener.abort();
+}
+
+/// A hand-over never stops the very channel it is about to start, even when that channel
+/// is in the frames list under the name — the state a superseded save leaves: the next
+/// save's replace has already moved past the channel the first one built, while that
+/// channel's own hand-over has not run yet. A stop would fire its cancel token, so the
+/// listener the hand-over starts right after would return at once; it is left in the list
+/// instead, for the hand-over that displaces it to stop.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_hand_over_never_stops_the_channel_it_is_about_to_start() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_batch("token-a", vec![test_text_update(1, "own")]);
+    let (store, _dir) = test_store().await;
+
+    let registry = crate::ChannelRegistry::default();
+    let frames = registry.replaced("telegram");
+    let new: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-a", &fake, &store));
+    // Two saves in a row, each replacing what the one before built: the second's replace
+    // is what moves past `new`.
+    registry.replace(std::sync::Arc::clone(&new));
+    registry.replace(std::sync::Arc::new(channel("token-a", &fake, &store)));
+
+    stop_listeners(&frames, Some(&new)).await;
+
+    assert!(
+        frames
+            .snapshot()
+            .iter()
+            .any(|held| std::sync::Arc::ptr_eq(held, &new)),
+        "a hand-over retired the channel it is about to start"
+    );
+    // And the listener that hand-over starts up still serves its own poll: the channel
+    // was never cancelled.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn({
+        let new = std::sync::Arc::clone(&new);
+        async move {
+            let _ = new.listen(tx).await;
+        }
+    });
+    let msg = next_message(&mut rx, "the batch of the channel a hand-over left alone").await;
+    assert_eq!(msg.content, "own");
+    listener.abort();
+}
+
+/// The other half of a clear: when nothing took the cleared channel's place while its
+/// teardown waited, the channel must not be left registered — outbound sends would
+/// otherwise keep reaching a listener that is no longer running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleared_token_takes_its_channel_out_of_the_registry() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+
+    let registry = crate::ChannelRegistry::default();
+    let old: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-a", &fake, &store));
+    registry.register(std::sync::Arc::clone(&old));
+
+    retire_listener(&registry, registry.replaced("telegram"), Some(old)).await;
+    assert!(
+        registry.get("telegram").is_none(),
+        "a cleared token must leave no channel behind"
+    );
+}
+
+/// Saves landing on each other's heels: each is answered with the channel the one before
+/// it built, whose listener has not begun, while the frame that really holds events — the
+/// one at the head of the rebuild — is still open. The wait therefore cannot live on the
+/// channels: whichever hand-over walks such a chain first consumes it, and the save after
+/// that would start a listener with the frame that holds undelivered events still open,
+/// taking those events over as they are handed on and reaching the pipeline twice with
+/// the same content. It lives under the channel's name, so every hand-over waits out the
+/// same frames.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_save_landing_on_another_waits_out_the_frame_that_holds_events() {
+    let fake = FakeTelegram::start(&[
+        ("token-a", 700),
+        ("token-b", 700),
+        ("token-c", 700),
+        ("token-d", 700),
+    ]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    // A batch of its own for each channel a save builds, left waiting there: a frame
+    // begun on one would fetch it.
+    fake.push_batch("token-b", vec![test_text_update(2, "from-b")]);
+    fake.push_batch("token-c", vec![test_text_update(3, "from-c")]);
+    fake.push_batch("token-d", vec![test_text_update(4, "from-d")]);
+    let (store, _dir) = test_store().await;
+
+    // A registry of this check's own: the product's is a process global.
+    let registry = crate::ChannelRegistry::default();
+
+    // The listener every save replaces, holding a burst it cannot hand on: its pipeline
+    // has no room in it, so its frame stays open.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(ChannelMessage::default())
+        .await
+        .expect("the pipeline accepts the message that fills it");
+    let old: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-a", &fake, &store));
+    registry.register(std::sync::Arc::clone(&old));
+    let listener = tokio::spawn({
+        let old = std::sync::Arc::clone(&old);
+        async move {
+            let _ = old.listen(tx).await;
+        }
+    });
+    until("the intake takes the event on", || async {
+        !still_held(&store, "700").await.is_empty()
+    })
+    .await;
+
+    // Three saves in a row, each spawning its hand-over as the product does: the second
+    // and the third land while the first hand-over is still waiting on the frame that
+    // holds the event, so the channels they are answered with have no frame of their own
+    // yet, and a channel an answer displaced may well fetch its own batch before the save
+    // after it stops it.
+    let first: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-b", &fake, &store));
+    let second: std::sync::Arc<dyn Channel> =
+        std::sync::Arc::new(channel("token-c", &fake, &store));
+    let third: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-d", &fake, &store));
+    let frames = registry.replaced("telegram");
+
+    let (tx_first, mut rx_first) = tokio::sync::mpsc::channel(8);
+    let (tx_second, mut rx_second) = tokio::sync::mpsc::channel(8);
+    let (tx_third, mut rx_third) = tokio::sync::mpsc::channel(8);
+    registry.replace(std::sync::Arc::clone(&first));
+    let hand_over_first = tokio::spawn(hand_over_listener(
+        std::sync::Arc::clone(&frames),
+        std::sync::Arc::clone(&first),
+        tx_first,
+    ));
+    registry.replace(std::sync::Arc::clone(&second));
+    let hand_over_second = tokio::spawn(hand_over_listener(
+        std::sync::Arc::clone(&frames),
+        std::sync::Arc::clone(&second),
+        tx_second,
+    ));
+    registry.replace(std::sync::Arc::clone(&third));
+    let hand_over_third = tokio::spawn(hand_over_listener(
+        std::sync::Arc::clone(&frames),
+        std::sync::Arc::clone(&third),
+        tx_third,
+    ));
+
+    // While the frame that holds the event is still open, the event stays where it is: no
+    // listener of a save that came after it may begin, on pain of taking that event over as
+    // it is handed on. The check holds the frame open while it looks, and the negative wait
+    // is the shape the property takes: `probe` must not come true while it is held.
+    let save_listeners = [&first, &second, &third].map(|channel| {
+        channel
+            .as_any()
+            .downcast_ref::<TelegramChannel>()
+            .expect("the check's own channel")
+    });
+    assert!(
+        tokio::time::timeout(crate::channels::telegram_group::QUIET_WINDOW * 2, async {
+            while !save_listeners.iter().any(|listener| listener.running()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_err(),
+        "a save's listener began before the frame that holds events ended"
+    );
+
+    // Make room: the replaced frame ends, handing its burst on and settling it, and only
+    // then can the hand-overs' listeners begin. Each of them was parked on that frame, so
+    // the end of it releases every one. Taking the filler out is what makes room.
+    rx.recv()
+        .await
+        .expect("the message that filled the pipeline");
+    let msg = next_message(&mut rx, "the event the replaced listener held").await;
+    assert_eq!(msg.content, "hello");
+    until("the replaced frame settles the event", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+    tokio::time::timeout(OBSERVABLE_TIMEOUT, hand_over_first)
+        .await
+        .expect("a hand-over waiting on the frame must finish with it")
+        .expect("the hand-over task must not panic");
+    tokio::time::timeout(OBSERVABLE_TIMEOUT, hand_over_second)
+        .await
+        .expect("a hand-over waiting on the frame must finish with it")
+        .expect("the hand-over task must not panic");
+
+    // Only the last save's listener began: the event the replaced frame handed on is not
+    // handed on again, and what the last save's listener serves is its own batch.
+    let msg = next_message(
+        &mut rx_third,
+        "the last save's listener takes up its own poll",
+    )
+    .await;
+    let carried: Vec<&str> = std::iter::once(msg.content.as_str())
+        .chain(msg.parts.iter().map(|part| part.content.as_str()))
+        .collect();
+    assert!(
+        carried.contains(&"from-d"),
+        "the listener that came last must take up its own batch: {carried:?}"
+    );
+    assert!(
+        !carried.contains(&"hello"),
+        "the event the replaced frame handed on must not reach the listener that came last: {carried:?}"
+    );
+    let handed_on_twice = tokio::time::timeout(
+        crate::channels::telegram_group::QUIET_WINDOW * 2,
+        rx_third.recv(),
+    )
+    .await;
+    assert!(
+        handed_on_twice.is_err(),
+        "the event the replaced frame handed on was handled a second time"
+    );
+    // And the channels the earlier saves built — stopped by the save that came after them
+    // — serve their own batches at most, never the event the replaced frame handed on.
+    for (rx, what) in [
+        (&mut rx_first, "the first save's channel"),
+        (&mut rx_second, "the second save's channel"),
+    ] {
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(crate::channels::telegram_group::QUIET_WINDOW * 2, rx.recv()).await
+        {
+            let carried: Vec<&str> = std::iter::once(msg.content.as_str())
+                .chain(msg.parts.iter().map(|part| part.content.as_str()))
+                .collect();
+            assert!(
+                !carried.contains(&"hello"),
+                "{what} handed on the event the replaced frame held: {carried:?}"
+            );
+        }
+    }
+    assert!(
+        registry
+            .get("telegram")
+            .is_some_and(|live| std::sync::Arc::ptr_eq(&live, &third)),
+        "the listener that came last is the one the registry holds"
+    );
+    listener.abort();
+    hand_over_third.abort();
+}
+
+/// A row past the retention bound is swept before the first batch is matched: the
+/// platform re-uses `update_id` once it has been silent long enough, so a decision
+/// kept past the bound would be taken for the new event and swallow it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn an_event_the_retention_bound_swept_is_not_taken_for_a_repeat() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+
+    // A decision older than the bound, for the very `update_id` the platform now
+    // offers for a new event.
+    let previous = run(&store, "previous-run", "700");
+    previous
+        .hold(&[&test_update(&[])])
+        .await
+        .expect("hold the old event");
+    previous.settle(&[1]).await;
+    let old = (chrono::Utc::now() - chrono::Duration::hours(RETENTION_HOURS + 1)).to_rfc3339();
+    store
+        .conn
+        .execute(
+            "UPDATE telegram_intake SET decided_at = ?1",
+            crate::db::params![old],
+        )
+        .await
+        .expect("age the decision past the bound");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let telegram = channel("token-a", &fake, &store);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message(&mut rx, "the event the platform re-used the id of").await;
+    assert_eq!(msg.content, "hello");
+    listener.abort();
+}
+
+/// A listener's frame is over only once what it held has been handed on: the frame
+/// waits for its collector, and the collector hands over — and settles — the burst it
+/// was still holding. That is what lets the listener replacing a cancelled one take
+/// over only what the cancelled one really left behind.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_cancelled_listener_ends_its_frame_only_once_what_it_held_is_handed_on() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+
+    // A pipeline with no room in it: the collector cannot hand the burst over until
+    // the check takes something out, which is what holds the listener's frame open.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(ChannelMessage::default())
+        .await
+        .expect("the pipeline accepts the message that fills it");
+    let telegram = std::sync::Arc::new(channel("token-a", &fake, &store));
+    let listener = tokio::spawn({
+        let telegram = std::sync::Arc::clone(&telegram);
+        async move {
+            let _ = telegram.listen(tx).await;
+        }
+    });
+
+    until("the intake takes the event on", || async {
+        !still_held(&store, "700").await.is_empty()
+    })
+    .await;
+
+    // How the listener that replaces this one stops it (see `stop_listeners`).
+    telegram.cancel_own();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), telegram.wait_stopped())
+            .await
+            .is_err(),
+        "the frame ended while the burst it held was still unhanded"
+    );
+
+    // Make room: the hand-over goes through, which settles the event, and only then
+    // does the frame end.
+    let filler = rx
+        .recv()
+        .await
+        .expect("the message that filled the pipeline");
+    assert!(filler.content.is_empty());
+    let msg = next_message(&mut rx, "the event the frame held").await;
+    assert_eq!(msg.content, "hello");
+    tokio::time::timeout(OBSERVABLE_TIMEOUT, telegram.wait_stopped())
+        .await
+        .expect("the frame must end once what it held was handed on");
+    until("the hand-over settles the event", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+    listener.abort();
+
+    // The replacement a cancel-and-wait makes room for: because the frame ended only
+    // once what it held had been handed on and settled, there is nothing left for the
+    // replacement to take up, so the event reaches the pipeline exactly once. Nothing
+    // can be delivered sooner than the collector's quiet window, so the wait below is
+    // that window with room to spare.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let replacement = channel("token-a", &fake, &store);
+    let listener = tokio::spawn(async move {
+        let _ = replacement.listen(tx).await;
+    });
+    assert!(
+        tokio::time::timeout(crate::channels::telegram_group::QUIET_WINDOW * 2, rx.recv())
+            .await
+            .is_err(),
+        "the replacement must not hand on what the cancelled frame already settled"
+    );
+    listener.abort();
+}
+
+/// The frame is the collector's, not the listening future's: a listener that ends
+/// abruptly — its task dropped, or a panic — still leaves its frame open while its
+/// collector holds a burst that has not been handed on, so a replacement waits out the
+/// hand-over instead of starting on top of it. The cancelled listener above ends the way
+/// a token change stops one; this is the end nothing asks for.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_dropped_listener_leaves_its_frame_open_until_the_burst_is_handed_on() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+
+    // A pipeline with no room in it: the collector cannot hand the burst over until
+    // the check takes something out, which is what holds the listener's frame open.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(ChannelMessage::default())
+        .await
+        .expect("the pipeline accepts the message that fills it");
+    let telegram = std::sync::Arc::new(channel("token-a", &fake, &store));
+    let listener = tokio::spawn({
+        let telegram = std::sync::Arc::clone(&telegram);
+        async move {
+            let _ = telegram.listen(tx).await;
+        }
+    });
+
+    // The burst is in the collector's hands before the listener is dropped: the poll the
+    // intake issues after taking the event on is the sign of it (a listener whose
+    // hand-over to the collector failed never polls again).
+    until("the intake handed the burst to the collector", || async {
+        fake.count("getUpdates") >= 2
+    })
+    .await;
+    listener.abort();
+    let _ = listener.await;
+
+    assert!(
+        telegram.running(),
+        "the frame must be the collector's, not the listening future's"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), telegram.wait_stopped())
+            .await
+            .is_err(),
+        "the frame ended while the burst it held was still unhanded"
+    );
+
+    // Make room: the collector hands the burst over and settles it, and only then does
+    // the frame end — the state a replacement waits for.
+    let filler = rx
+        .recv()
+        .await
+        .expect("the message that filled the pipeline");
+    assert!(filler.content.is_empty());
+    let msg = next_message(&mut rx, "the burst the dropped listener held").await;
+    assert_eq!(msg.content, "hello");
+    tokio::time::timeout(OBSERVABLE_TIMEOUT, telegram.wait_stopped())
+        .await
+        .expect("the frame must end once what it held was handed on");
+    until("the hand-over settles the event", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+}
+
+/// Once the daemon winds down the intake stops fetching — but the event it already
+/// holds is still handed over and settled. The hand-over happens under the wind-down:
+/// the pipeline has no room for the burst until the check makes it, so the event sits
+/// in the record while the listener winds down, and is neither dropped nor left
+/// unhandled. Serialized on the process-global drain flag, as
+/// `failure_classification_recognizes_drain` is.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_wind_down_stops_fetching_and_keeps_what_it_holds() {
+    /// Restores the process-global drain flag even when an assertion fails: a
+    /// flag left set would misclassify every later check that consults it.
+    struct DrainRestored;
+    impl Drop for DrainRestored {
+        fn drop(&mut self) {
+            crate::shutdown::drain_clear();
+        }
+    }
+
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+
+    // A pipeline with no room in it: the burst the intake takes on cannot be handed
+    // over until the check takes something out, which is what forces the hand-over
+    // under the wind-down below.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(ChannelMessage::default())
+        .await
+        .expect("the pipeline accepts the message that fills it");
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    // The intake has taken the event on: the acknowledgement its own parse sent is
+    // the durable sign of it. The record's hold would not be — the collector clears
+    // it once it hands the burst over — but the pipeline has no room, so the hold
+    // stays where the assertion below reads it.
+    until("the intake takes the event on", || async {
+        fake.count("setMessageReaction") >= 1
+    })
+    .await;
+    // The loop's own poll must be in flight before the count below is read: a
+    // poll issued after the wind-down would answer a different question.
+    until("the intake is polling", || async {
+        fake.count("getUpdates") >= 2
+    })
+    .await;
+    let polls_before = fake.count("getUpdates");
+
+    let _restored = DrainRestored;
+    crate::shutdown::drain_begin();
+
+    // The listener cannot finish here: its frame is the collector's, still holding
+    // the burst the pipeline has no room for, so an await on the task would hang
+    // rather than fail. What the check can see, while the frame is open, is that the
+    // event is still in the record — the wind-down did not drop what the intake had
+    // already taken on.
+    assert_eq!(
+        still_held(&store, "700").await,
+        vec![1],
+        "the wind-down must keep the event the intake already took on"
+    );
+
+    // Make room: the collector hands the burst it held under the wind-down over, and
+    // the event reaches the pipeline as itself, not as the filler the check sent.
+    rx.recv()
+        .await
+        .expect("the message that filled the pipeline");
+    let msg = next_message(&mut rx, "the event the wind-down flushed").await;
+    assert_eq!(msg.content, "hello");
+    until("the wind-down settles the event", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+
+    // What the frame held has been handed on and settled, so the frame — and with it
+    // the listener task — is over.
+    tokio::time::timeout(OBSERVABLE_TIMEOUT, listener)
+        .await
+        .expect("the listener must stop when the daemon winds down")
+        .expect("the listener task must not panic");
+
+    // Nothing was taken on after the wind-down began. The count is read at the end
+    // because the listener's frame cannot end while the burst is unhanded, so the
+    // fetch-stop cannot be asserted any earlier.
+    assert_eq!(
+        fake.count("getUpdates"),
+        polls_before,
+        "the intake kept fetching while winding down"
+    );
+}
+
+/// An event the record already holds is never taken up twice: the platform
+/// re-offers a batch until its position moves past it, so the same update can
+/// legitimately arrive more than once.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn an_event_the_record_already_holds_is_not_taken_up_again() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // The handshake consumes the first batch and the first long poll the second.
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message(&mut rx, "the event, exactly once").await;
+    assert_eq!(msg.content, "hello");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "an event the record already held was taken up again"
+    );
+
+    // The record must also let the position move past what it holds: the
+    // platform re-offers a batch until the position passes it, so a position
+    // that stalls at the held event would re-offer it forever. A stalled
+    // position pauses before its next poll, so the wait uses the widened bound:
+    // with the cheap one it would time out right as the third poll arrives, and
+    // the failure would be timing-luck rather than the assertion below.
+    until_within(
+        BACKOFF_OBSERVABLE_TIMEOUT,
+        "the fake has logged three polls",
+        || async { fake.count("getUpdates") >= 3 },
+    )
+    .await;
+    // The handshake's poll is the first, at offset 0; every poll after it must
+    // ask for an offset past the event the record holds — the fake serves
+    // `update_id` 1 — or the batch is offered again forever because the position
+    // never moved past what the record already holds.
+    let offsets = fake.poll_offsets();
+    assert!(
+        offsets[1..].iter().all(|&offset| offset >= 2),
+        "the batch is offered again forever because the position never moved past \
+         the event the record already holds: poll offsets {offsets:?}"
+    );
+
+    // Settled once, by the one hand-over that happened.
+    until("the hand-over settles the event", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+    listener.abort();
+}
+
+/// Control input recovered after a restart is not executed out of context: the
+/// user is told to repeat it instead, so a stale `/clear` cannot wipe a session
+/// at a moment the user did not choose.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn recovered_control_input_is_not_executed_out_of_context() {
+    // Nothing is queued: the handshake's probe gets an empty result and the long
+    // poll then hangs, which keeps the listener quiet while recovery runs.
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    // A command a previous run left behind, claimed under its own id, so the
+    // listener — a new run — takes it up through the claim path.
+    run(&store, "previous-run", "700")
+        .hold(&[&test_text_update(1, "/clear")])
+        .await
+        .expect("hold the recovered command");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let telegram = channel("token-a", &fake, &store);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    until("the recovered command is settled", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+
+    assert!(
+        fake.sent_texts()
+            .iter()
+            .any(|text| text == UNACTED_CONTROL_NOTICE),
+        "the user must be told the recovered command was not carried out"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "a recovered command must not be executed out of context"
+    );
+    listener.abort();
+}
+
+/// A backlog — what the platform accumulated while the product was down — is input
+/// the product never acted on, wherever in it a command sits: the opening handshake's
+/// batch is of unknown age and so is every page behind it, so a command in any of
+/// them is refused and its user told to repeat it — a stale `/clear` must not wipe a
+/// session at a moment the user did not choose.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn control_input_anywhere_in_a_backlog_is_not_executed() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // A full page of what the platform accumulated while the product was down, with a
+    // command at its end — the batch the opening handshake fetches — and a second page
+    // carrying another command, which only a full first page puts behind the backlog's
+    // end. The rest of the first page parses to nothing, so neither the record nor the
+    // notices below can be confused with traffic those updates produce.
+    let page = i64::try_from(UPDATES_PAGE).expect("a page of updates fits an update_id");
+    let mut first: Vec<serde_json::Value> = (1..page)
+        .map(|update_id| serde_json::json!({ "update_id": update_id }))
+        .collect();
+    first.push(test_text_update(page, "/clear"));
+    fake.push_batch("token-a", first);
+    fake.push_batch("token-a", vec![test_text_update(page + 1, "/clear")]);
+    let (store, _dir) = test_store().await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let telegram = channel("token-a", &fake, &store);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    until("both backlogged commands are refused", || async {
+        fake.sent_texts()
+            .iter()
+            .filter(|text| *text == UNACTED_CONTROL_NOTICE)
+            .count()
+            == 2
+    })
+    .await;
+    until("the backlog is settled", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "control input anywhere in a backlog must not be executed"
+    );
+    listener.abort();
+}
+
+/// The complement of the refusals: a command this run's own poll fetched is acted on
+/// as it always was — the intake hands it to the pipeline instead of refusing it. A
+/// classification that refused every control input would leave every other check here
+/// green while breaking every command in production.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn control_input_of_this_runs_own_poll_is_dispatched() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // The handshake's zero-timeout probe takes the empty batch, which is what ends the
+    // backlog and leaves the loop's own long poll fresh; the command is the batch
+    // after it, so the loop is what fetches it.
+    fake.push_batch("token-a", Vec::new());
+    fake.push_batch("token-a", vec![test_text_update(1, "/clear")]);
+    let (store, _dir) = test_store().await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let telegram = channel("token-a", &fake, &store);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message(&mut rx, "the command this run's own poll fetched").await;
+    assert_eq!(msg.content, "/clear");
+    assert!(
+        !fake
+            .sent_texts()
+            .iter()
+            .any(|text| text == UNACTED_CONTROL_NOTICE),
+        "a command of this run's own poll is carried out, not refused"
+    );
+    until("the dispatched command is settled", || async {
+        still_held(&store, "700").await.is_empty()
+    })
+    .await;
+    listener.abort();
+}
+
+/// Control input in a batch the intake had to fetch twice is not executed: the
+/// record could not be written for the batch the handshake fetched, so the poll
+/// that collects it again is looking at events this run already saw once, and a
+/// command of unknown age must not run.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn control_input_in_a_reoffered_batch_is_not_executed() {
+    // The same command three times over: the handshake fetches the first copy with
+    // the record unwritable, the loop's first poll the second (still unwritable), and
+    // the poll after that the third, once the record is writable again.
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    for _ in 0..3 {
+        fake.push_batch("token-a", vec![test_text_update(1, "/clear")]);
+    }
+    let (store, _dir) = test_store().await;
+    store
+        .conn
+        .execute(
+            "ALTER TABLE telegram_intake RENAME TO telegram_intake_hidden",
+            (),
+        )
+        .await
+        .expect("make the record unwritable");
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    // The handshake's poll is the first `getUpdates` and the loop's the second, so
+    // by the time the second arrives the command's first take-up has run and failed
+    // to record it — which is what held the position at the command and what makes
+    // the batch the loop fetches a re-offer. The handshake's failed take-up waits out
+    // the backoff before the loop starts, hence the widened bound.
+    until_within(BACKOFF_OBSERVABLE_TIMEOUT, "the loop's poll", || async {
+        fake.count("getUpdates") >= 2
+    })
+    .await;
+    store
+        .conn
+        .execute(
+            "ALTER TABLE telegram_intake_hidden RENAME TO telegram_intake",
+            (),
+        )
+        .await
+        .expect("restore the record");
+
+    until_within(
+        BACKOFF_OBSERVABLE_TIMEOUT,
+        "the user is told the re-offered command was not carried out",
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text == UNACTED_CONTROL_NOTICE)
+        },
+    )
+    .await;
+    // The notice and the settle both wait out a backoff, so their bound is the
+    // widened one rather than the bound every other wait here uses.
+    until_within(
+        BACKOFF_OBSERVABLE_TIMEOUT,
+        "the re-offered command is settled",
+        || async { still_held(&store, "700").await.is_empty() },
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "control input in a batch this run already fetched once must not be executed"
+    );
+    listener.abort();
+}
+
+/// An event whose record cannot be written for is neither acknowledged nor
+/// confirmed: nothing is answered before the event's fate is durable, and the
+/// intake backs off instead of re-polling the batch in a tight loop.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn an_event_the_record_cannot_be_written_for_is_neither_acknowledged_nor_confirmed() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // Two batches: the handshake consumes the first and the loop's first poll
+    // the second, which is what gives a poll an event whose record cannot be
+    // written for — dropping the table alone is invisible until one arrives.
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    fake.push_batch("token-a", vec![test_update(&[])]);
+    let (store, _dir) = test_store().await;
+    store
+        .conn
+        .execute("DROP TABLE telegram_intake", ())
+        .await
+        .expect("make the record unwritable");
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    // The handshake consumed the first batch and the loop's first poll the
+    // second, which is the poll whose record could not be written for. The poll
+    // after it is the one the backoff has to hold off, and it arrives with
+    // nothing left to serve, so it hangs (and is still logged on arrival).
+    // Waiting for it needs a bound past a pause — and past two, since the
+    // handshake pauses on the same unrecordable batch before the loop even
+    // starts — hence the widened one rather than `until`, whose bound is the
+    // cheap one every other wait here uses.
+    until_within(
+        BACKOFF_OBSERVABLE_TIMEOUT,
+        "the intake retries the unrecordable batch after its backoff",
+        || async { fake.count("getUpdates") >= 3 },
+    )
+    .await;
+
+    // The pause belongs to the intake's own loop, and the handshake's poll is the
+    // one that asked for offset 0, so the loop's polls are every poll whose
+    // offset is above 0. The gap between the first two of them is the check's
+    // real claim: a tight retry of the same unrecordable batch would put them
+    // milliseconds apart, not a second apart.
+    let loop_polls: Vec<std::time::Instant> = {
+        let requests = fake.state.requests.lock().expect("fake request log");
+        requests
+            .iter()
+            .filter(|(method, offset, _)| method == "getUpdates" && offset.is_some_and(|o| o > 0))
+            .map(|(_, _, at)| *at)
+            .collect()
+    };
+    let gap = loop_polls[1] - loop_polls[0];
+    assert!(
+        gap >= Duration::from_secs(1),
+        "the intake re-polled an unrecordable batch after {gap:?}; it must back off"
+    );
+
+    // Nor is the event confirmed: every poll the fake saw asked for an offset at
+    // or below the offered event's own id (`test_update` carries `update_id` 1),
+    // because an event the record does not hold must stay on offer.
+    let offsets = fake.poll_offsets();
+    assert!(
+        offsets.iter().all(|&offset| offset <= 1),
+        "the intake confirmed an event the record does not hold: poll offsets {offsets:?}"
+    );
+
+    assert_eq!(
+        fake.count("setMessageReaction"),
+        0,
+        "an event must not be acknowledged before its fate is durable"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "an event the record could not be written for must not be handed on"
+    );
+    listener.abort();
 }

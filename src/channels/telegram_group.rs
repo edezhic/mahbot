@@ -5,14 +5,15 @@
 //! request; the collector hands the parts to the pipeline in send order.
 
 use crate::ChannelMessage;
-use crate::channels::telegram::{FORWARD_ATTRIBUTION_PREFIX, is_control_message};
+use crate::channels::telegram::{FORWARD_ATTRIBUTION_PREFIX, ListenerFrame, is_control_message};
+use crate::channels::telegram_intake::Intake;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 /// Quiet window after a lone plain part — imperceptible against an assistant
 /// turn, so a single message still feels immediate.
-const QUIET_WINDOW: Duration = Duration::from_secs(1);
+pub(super) const QUIET_WINDOW: Duration = Duration::from_secs(1);
 /// Quiet window once the group already holds a second part or forwarded content:
 /// the user is evidently still sending, so the longer wait is worth it.
 const EXTENDED_WINDOW: Duration = Duration::from_secs(3);
@@ -165,8 +166,10 @@ impl Collector {
 /// own text, markers, attachments and reply reference until the pipeline expands
 /// them) plus the addressing the pipeline routes with, taken from the newest
 /// part — every part carries the same one, so any of them speaks for the group.
-/// `content` belongs to the parts.
-fn group_message(parts: Vec<ChannelMessage>) -> ChannelMessage {
+/// `content` belongs to the parts. The record entries the parts stand for are
+/// moved onto the envelope, which is what the hand-over settles: a part does not
+/// keep entries the envelope already carries.
+fn group_message(mut parts: Vec<ChannelMessage>) -> ChannelMessage {
     // A released group always holds at least one part (see `OpenGroup`).
     let newest = parts
         .last()
@@ -174,11 +177,16 @@ fn group_message(parts: Vec<ChannelMessage>) -> ChannelMessage {
     let user_name = newest.user_name.clone();
     let reply_target = newest.reply_target.clone();
     let channel = newest.channel.clone();
+    let update_ids = parts
+        .iter_mut()
+        .flat_map(|part| std::mem::take(&mut part.update_ids))
+        .collect();
     ChannelMessage {
         user_name,
         reply_target,
         channel,
         parts,
+        update_ids,
         ..Default::default()
     }
 }
@@ -202,37 +210,45 @@ pub fn compose_group_content(parts: Vec<ChannelMessage>) -> String {
 /// one message per burst. Its input sender lives in the listener, so dropping it
 /// — the listener exiting, which is what a bot-token hot reload does — releases
 /// an open group immediately instead of waiting out its window.
+///
+/// The collector owns the listener's frame for its whole body: a listener whose
+/// future is dropped or that panics still leaves the frame open until its
+/// collector has handed on (and settled) the burst it held.
 pub(crate) fn spawn_collector(
     input: mpsc::Receiver<ChannelMessage>,
     output: mpsc::Sender<ChannelMessage>,
-) {
-    tokio::spawn(run_collector(input, output));
+    intake: Intake,
+    frame: ListenerFrame,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_collector(input, output, intake, frame))
 }
 
 async fn run_collector(
     mut input: mpsc::Receiver<ChannelMessage>,
     output: mpsc::Sender<ChannelMessage>,
+    intake: Intake,
+    _frame: ListenerFrame,
 ) {
     let mut collector = Collector::default();
     loop {
         tokio::select! {
             () = wait_until(collector.deadline()) => {
-                if !hand_over_all(&output, collector.release_due(Instant::now())).await { return; }
+                if !hand_over_all(&output, &intake, collector.release_due(Instant::now())).await { return; }
             }
             msg = input.recv() => {
                 let Some(msg) = msg else {
-                    hand_over_all(&output, collector.release_all()).await;
+                    hand_over_all(&output, &intake, collector.release_all()).await;
                     return;
                 };
                 if is_control_message(&msg) {
                     // Control input is never collected; the group open in that
                     // chat goes on the pipeline ahead of it (`release_chat`).
-                    if !hand_over_all(&output, collector.release_chat(&msg.user_name, &msg.reply_target)).await { return; }
-                    if output.send(msg).await.is_err() { return; }
+                    if !hand_over_all(&output, &intake, collector.release_chat(&msg.user_name, &msg.reply_target)).await { return; }
+                    if !hand_over(&output, &intake, vec![msg]).await { return; }
                     continue;
                 }
                 if let Some(group) = collector.push(msg, Instant::now())
-                    && !hand_over(&output, group).await { return; }
+                    && !hand_over(&output, &intake, group).await { return; }
             }
         }
     }
@@ -250,10 +266,11 @@ async fn wait_until(deadline: Option<Instant>) {
 /// pipeline is gone.
 async fn hand_over_all(
     output: &mpsc::Sender<ChannelMessage>,
+    intake: &Intake,
     groups: Vec<Vec<ChannelMessage>>,
 ) -> bool {
     for group in groups {
-        if !hand_over(output, group).await {
+        if !hand_over(output, intake, group).await {
             return false;
         }
     }
@@ -264,8 +281,15 @@ async fn hand_over_all(
 /// unchanged, a longer burst becomes one message carrying its parts. Returns
 /// `false` when the pipeline is gone — logged, because a released group that
 /// cannot be handed over is the one message the collector itself gives up.
-async fn hand_over(output: &mpsc::Sender<ChannelMessage>, group: Vec<ChannelMessage>) -> bool {
-    let msg = match <[ChannelMessage; 1]>::try_from(group) {
+///
+/// The release is also where the record entries the message stands for are
+/// settled ([`Intake::settle`]).
+async fn hand_over(
+    output: &mpsc::Sender<ChannelMessage>,
+    intake: &Intake,
+    group: Vec<ChannelMessage>,
+) -> bool {
+    let mut msg = match <[ChannelMessage; 1]>::try_from(group) {
         Ok([only]) => only,
         Err(parts) => {
             let merged = group_message(parts);
@@ -277,10 +301,14 @@ async fn hand_over(output: &mpsc::Sender<ChannelMessage>, group: Vec<ChannelMess
             merged
         }
     };
+    let settled = std::mem::take(&mut msg.update_ids);
     if output.send(msg).await.is_ok() {
+        intake.settle(&settled).await;
         return true;
     }
-    tracing::warn!("Telegram burst: the message pipeline is gone; dropped a released group");
+    tracing::warn!(
+        "Telegram burst: the message pipeline is gone; the released group stays held in the intake's record"
+    );
     false
 }
 
@@ -297,6 +325,15 @@ mod tests {
             content: content.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A frame of its own for the collector to own: the check has no listener, so
+    /// nothing waits for it to end.
+    fn test_frame() -> ListenerFrame {
+        ListenerFrame::enter(
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
     }
 
     #[test]
@@ -424,11 +461,28 @@ mod tests {
             .expect("the collector stopped early")
     }
 
+    /// An intake of its own, recording into a store no other test touches, plus
+    /// that store and its backing directory — the directory must stay bound, or
+    /// the store writes to an unlinked file.
+    async fn test_intake() -> (
+        Intake,
+        crate::channels::telegram_intake::TelegramIntakeStore,
+        tempfile::TempDir,
+    ) {
+        let (store, dir) = crate::open_test_store!(
+            crate::channels::telegram_intake::TelegramIntakeStore,
+            "telegram_intake"
+        );
+        let intake = Intake::new(store.clone(), std::sync::Arc::from("run-test"), "42");
+        (intake, store, dir)
+    }
+
     #[tokio::test]
     async fn collector_hands_a_command_over_after_the_open_group() {
         let (input, input_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (output, mut output_rx) = mpsc::channel(8);
-        spawn_collector(input_rx, output);
+        let (intake, _store, _dir) = test_intake().await;
+        spawn_collector(input_rx, output, intake, test_frame());
 
         input.send(part("alice", "chat", "one")).await.unwrap();
         input.send(part("alice", "chat", "two")).await.unwrap();
@@ -443,14 +497,23 @@ mod tests {
 
     #[tokio::test]
     async fn collector_releases_the_intact_group_when_the_listener_goes_away() {
+        let (intake, store, _dir) = test_intake().await;
         let (input, input_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (output, mut output_rx) = mpsc::channel(8);
-        spawn_collector(input_rx, output);
+        spawn_collector(input_rx, output, intake.clone(), test_frame());
 
         let mut first = part("alice", "chat", "[Forwarded from @bob] one");
         first.attachment_dirs = vec!["dir-one".to_string()];
+        first.update_ids = vec![11];
         let mut second = part("alice", "chat", "two");
         second.attachment_dirs = vec!["dir-two".to_string()];
+        second.update_ids = vec![12];
+        for id in [11, 12] {
+            intake
+                .hold(&[&serde_json::json!({ "update_id": id })])
+                .await
+                .expect("hold");
+        }
         input.send(first).await.unwrap();
         input.send(second).await.unwrap();
         drop(input);
@@ -468,11 +531,29 @@ mod tests {
         assert_eq!(group.user_name, "alice");
         assert_eq!(group.reply_target, "chat");
         assert_eq!(group.channel, "telegram");
+        // The record entries the parts stand for move onto the envelope, and the
+        // hand-over takes the envelope's off there to settle them: neither the
+        // parts nor the message that reaches the pipeline keep them. That the
+        // events really were settled is what the take-over at the end of this
+        // check pins.
+        assert!(group.parts[0].update_ids.is_empty());
+        assert!(group.parts[1].update_ids.is_empty());
+        assert!(group.update_ids.is_empty());
         assert_eq!(
             compose_group_content(group.parts.clone()),
             format!("[Forwarded from @bob] one{PART_SEPARATOR}two")
         );
-        // The collector leaves with the listener.
+        // The collector leaves with the listener — which is also the point by
+        // which the hand-over has settled the events: the released burst is
+        // resolved in the record, so a later run has nothing to take up.
         assert!(output_rx.recv().await.is_none());
+        assert!(
+            Intake::new(store.clone(), std::sync::Arc::from("later-run"), "42")
+                .take_over()
+                .await
+                .expect("take over")
+                .is_empty(),
+            "the hand-over must settle the events so no later run takes them up"
+        );
     }
 }

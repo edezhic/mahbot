@@ -1366,8 +1366,18 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
             }
             write_kv_and_update_config(CONFIG_KEY_TELEGRAM_BOT_TOKEN, &trimmed).await?;
             let persisted = CONFIG.telegram_bot_token();
-            if persisted != old_token {
-                crate::channels::telegram::restart_telegram_listener(persisted.as_deref()).await?;
+            if persisted != old_token
+                && let Err(e) =
+                    crate::channels::telegram::restart_telegram_listener(persisted.as_deref()).await
+            {
+                // The token is written and in effect from the next start; only the
+                // hot-reload failed, so the save stands and the failure is logged.
+                // No warning is reported: the one slot that carries one belongs to
+                // the endpoint arm, which the Settings page renders.
+                tracing::warn!(
+                    key,
+                    "Telegram listener restart failed (non-fatal, value saved): {e:#}"
+                );
             }
         }
         // Everything else is read dynamically at use time — persist only.
