@@ -62,6 +62,32 @@ pub(crate) const IN_PROGRESS: &str = "in_progress";
 /// on, or deliberately not answered.
 const DONE: &str = "done";
 
+/// How long a released burst is kept, in days: a complaint about a split burst
+/// arrives days after the fact (see [`BurstRecord`]).
+const BURST_RETENTION_DAYS: i64 = 30;
+
+/// One released burst as the durable record keeps it: who sent it, where, how
+/// many parts it held, which rule released it, and when each part was taken in.
+///
+/// This is the evidence a complaint about a split burst is read from — the log
+/// line a multi-part release writes survives for hours, this for days. A released
+/// group is always exactly one request — the parts travel in the one envelope the
+/// collector hands over — so the record carries the parts and not a turn count.
+pub(crate) struct BurstRecord {
+    pub(crate) user_name: String,
+    pub(crate) reply_target: String,
+    pub(crate) parts: usize,
+    /// [`crate::channels::telegram_group`]'s `Release::as_str`: the window that
+    /// applied, or the cap/control/stop that cut the group short of one.
+    pub(crate) released_by: &'static str,
+    pub(crate) released_at: String,
+    /// One entry per part, oldest first: the platform's own time for the update
+    /// (`sent_at`, null when the update carried none) and the moment the
+    /// collector took the part in (`taken_at`), both RFC 3339 — the two facts
+    /// that decide whether a burst split, and where.
+    pub(crate) part_times: String,
+}
+
 impl TelegramIntakeStore {
     /// Drop rows older than the retention bound. Whichever timestamp a row has
     /// decides its age: a resolved row ages from its decision, a row still held
@@ -70,16 +96,53 @@ impl TelegramIntakeStore {
     ///
     /// This is the record's process-wide retention sweep, the one operation not
     /// scoped to a listener's account — which is why it needs none.
+    ///
+    /// The burst record is swept with the events, each on its own bound: a
+    /// released burst is what the events it stood for resolved to, so the two
+    /// belong to the same sweep. Returns the total dropped across both.
     pub(crate) async fn age_out(&self) -> Result<u64> {
         let cutoff = (chrono::Utc::now() - chrono::Duration::hours(RETENTION_HOURS)).to_rfc3339();
-        let deleted = self
+        let events = self
             .conn
             .execute(
                 "DELETE FROM telegram_intake WHERE COALESCE(decided_at, created_at) < ?1",
                 db::params![cutoff],
             )
             .await?;
-        Ok(deleted)
+        let bursts = self
+            .conn
+            .execute(
+                "DELETE FROM telegram_bursts WHERE released_at < ?1",
+                db::params![
+                    (chrono::Utc::now() - chrono::Duration::days(BURST_RETENTION_DAYS))
+                        .to_rfc3339()
+                ],
+            )
+            .await?;
+        Ok(events + bursts)
+    }
+
+    /// Record one released burst of `account_id` (see [`BurstRecord`]).
+    pub(crate) async fn record_burst(&self, account_id: &str, record: &BurstRecord) -> Result<()> {
+        #[expect(clippy::cast_possible_wrap)] // a released group holds at most `MAX_PARTS` parts
+        let parts = record.parts as i64;
+        self.conn
+            .execute(
+                "INSERT INTO telegram_bursts \
+                 (account_id, user_name, reply_target, parts, released_by, released_at, part_times) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                db::params![
+                    account_id,
+                    record.user_name.as_str(),
+                    record.reply_target.as_str(),
+                    parts,
+                    record.released_by,
+                    record.released_at.as_str(),
+                    record.part_times.as_str()
+                ],
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -165,6 +228,15 @@ impl Intake {
         }
         if let Err(err) = self.resolve(ids).await {
             tracing::warn!(?ids, %err, "Telegram intake: could not settle an event in the record");
+        }
+    }
+
+    /// Write the durable record of a released burst, and log one that cannot be
+    /// written. Fail-open: nothing downstream reads it, so a failure must not cost
+    /// the message its hand-over.
+    pub(crate) async fn record_burst(&self, record: &BurstRecord) {
+        if let Err(err) = self.store.record_burst(&self.account_id, record).await {
+            tracing::warn!(%err, "Telegram burst: could not write the release record");
         }
     }
 
@@ -476,5 +548,42 @@ mod tests {
             .filter_map(|update| update["update_id"].as_i64())
             .collect();
         assert_eq!(held, vec![2]);
+    }
+
+    /// The burst record is swept on its own bound, in days rather than hours: a
+    /// release stays readable long after the events it stood for are gone, and one
+    /// past the bound goes with them.
+    #[tokio::test]
+    async fn age_out_drops_bursts_past_their_own_bound() {
+        let (store, _tmp) = test_store().await;
+        let run_a = intake(&store, "run-a", "1");
+        let record = |released_at: String| BurstRecord {
+            user_name: "alice".to_string(),
+            reply_target: "999".to_string(),
+            parts: 2,
+            released_by: "extended_window",
+            released_at,
+            part_times: "[]".to_string(),
+        };
+        let now = chrono::Utc::now();
+        let fresh = now.to_rfc3339();
+        run_a
+            .record_burst(&record(
+                (now - chrono::Duration::days(BURST_RETENTION_DAYS + 1)).to_rfc3339(),
+            ))
+            .await;
+        run_a.record_burst(&record(fresh.clone())).await;
+
+        assert_eq!(store.age_out().await.expect("age_out"), 1);
+        let rows = store
+            .conn
+            .query("SELECT released_at FROM telegram_bursts", ())
+            .await
+            .expect("read the burst record");
+        let kept: Vec<String> = rows
+            .into_iter()
+            .map(|row| row.get::<String>(0).expect("released_at"))
+            .collect();
+        assert_eq!(kept, vec![fresh]);
     }
 }

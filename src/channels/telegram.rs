@@ -337,10 +337,26 @@ struct MessageContext {
     /// Reply reference parsed from the update's `reply_to_message` — `None`
     /// when this message does not reply to anything.
     reply_reference: Option<ReplyReference>,
+    /// The `[Forwarded from …]` prefix this message's content opens with, when
+    /// it arrived as forwarded content — rendered once, here, so a path that
+    /// hands the message on in another shape (a refusal notice included)
+    /// cannot lose it.
+    forward_prefix: Option<String>,
+    /// Whether the message came in as forwarded content — the fact the burst
+    /// collector's longer window rests on, kept apart from the rendered
+    /// `forward_prefix` so a forward whose origin this product has no label for
+    /// is still forwarded.
+    forwarded: bool,
+    /// Telegram's own time for the message (see `ChannelMessage::update_date`).
+    update_date: Option<i64>,
 }
 
 impl MessageContext {
     fn into_channel_message(self, content: String, cq_id: Option<String>) -> ChannelMessage {
+        let content = match self.forward_prefix {
+            Some(prefix) => format!("{prefix}{content}"),
+            None => content,
+        };
         ChannelMessage {
             user_name: self.user_name,
             reply_target: self.reply_target,
@@ -354,6 +370,8 @@ impl MessageContext {
             message_id: (self.message_id != 0).then_some(self.message_id),
             attachment_dirs: Vec::new(),
             parts: Vec::new(),
+            update_date: self.update_date,
+            forwarded: self.forwarded,
             update_ids: Vec::new(),
         }
     }
@@ -1169,6 +1187,11 @@ pub struct TelegramChannel {
     listener_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     listener_stopped: std::sync::Arc<tokio::sync::Notify>,
 
+    /// The messages this listener is preparing right now — taken up and not yet
+    /// handed to the burst collector, which holds that sender's group for that
+    /// chat while a mark is on it (`telegram_group::Preparations`).
+    preparations: std::sync::Arc<crate::channels::telegram_group::Preparations>,
+
     /// Per-chat command menu state — change detection + in-flight coalescing
     /// for the per-user `setMyCommands` refresh, so outbound message floods
     /// (parallel agent responses) don't trip Telegram's rate limiting. Menu
@@ -1549,10 +1572,48 @@ fn to_telegram_html(text: &str) -> String {
     markdown_to_telegram_html(&decode_html_entities(text))
 }
 
-/// Prefix of the forward attribution prepended to a forwarded message's content.
-/// The burst collector recognises a forwarded part by it (see
-/// `channels::telegram_group`).
-pub(super) const FORWARD_ATTRIBUTION_PREFIX: &str = "[Forwarded from ";
+/// Prefix of the `[Forwarded from …]` attribution a forwarded message's content
+/// opens with. The fact behind it, which the burst collector's longer window
+/// rests on, is a message's `forwarded` flag — never this text.
+const FORWARD_ATTRIBUTION_PREFIX: &str = "[Forwarded from ";
+
+/// What `TelegramChannel::forward` makes of a message's forward fields: whether it
+/// is forwarded content at all, and the attribution to render for it.
+struct Forward {
+    /// Whether any forward field of the message is set. The flag is the fact and
+    /// the prefix only its rendering: an origin the product has no name for is
+    /// still forwarded.
+    forwarded: bool,
+    /// The whole `[Forwarded from …] ` prefix, when one can be rendered.
+    prefix: Option<String>,
+}
+
+/// The label one value of a legacy forward field renders as.
+type ForwardLabel = fn(&serde_json::Value) -> Option<String>;
+
+/// The older fields Telegram attributes a forwarded message in, in the order the
+/// attribution reads them: each field, and the label a value of it renders as.
+/// The flag and the label both come from this one list, because a field can be
+/// present without the product being able to name what it points at — such a
+/// message is still forwarded.
+const LEGACY_FORWARD_FIELDS: [(&str, ForwardLabel); 3] = [
+    // A channel or a group: its title, with the historical "channel: " shape
+    // (these fields carried no reliable kind).
+    ("forward_from_chat", |chat| {
+        Some(format!(
+            "channel: {}",
+            chat.get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown channel")
+        ))
+    }),
+    // A user whose identity the privacy settings allow.
+    ("forward_from", |user| Some(format_sender_label(user))),
+    // A user who hides their identity.
+    ("forward_sender_name", |name| {
+        name.as_str().map(String::from)
+    }),
+];
 
 impl TelegramChannel {
     /// Internal constructor every other constructor builds on.
@@ -1567,6 +1628,7 @@ impl TelegramChannel {
             intake_claim: std::sync::Arc::from(listener_claim()),
             listener_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             listener_stopped: std::sync::Arc::new(tokio::sync::Notify::new()),
+            preparations: std::sync::Arc::new(crate::channels::telegram_group::Preparations::new()),
             menu_cache: std::sync::Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
@@ -1710,6 +1772,9 @@ impl TelegramChannel {
             message_id,
             reply_target,
             reply_reference: None,
+            forward_prefix: None,
+            forwarded: false,
+            update_date: None,
         };
         Ok(Some(
             ctx.into_channel_message(data.to_string(), callback_query_id),
@@ -1748,23 +1813,17 @@ impl TelegramChannel {
             .get("message_id")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
+        let forward = Self::forward(message);
         Ok(Some(MessageContext {
             user_name,
             chat_id,
             message_id,
             reply_target,
             reply_reference: build_reply_reference(message),
+            forward_prefix: forward.prefix,
+            forwarded: forward.forwarded,
+            update_date: message.get("date").and_then(serde_json::Value::as_i64),
         }))
-    }
-
-    /// Prepend forwarding attribution (from `forward_from` /
-    /// `forward_from_chat` / `forward_sender_name`) to content.
-    fn prepend_forward_attribution(content: String, message: &serde_json::Value) -> String {
-        if let Some(attr) = Self::format_forward_attribution(message) {
-            format!("{attr}{content}")
-        } else {
-            content
-        }
     }
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
@@ -2071,6 +2130,13 @@ impl TelegramChannel {
     /// `reject_voice_message`) before any fetch — nothing there can transcribe
     /// it, and the note names no file. An `audio` sound file is not refused: it
     /// takes the ordinary path below, so the agent gets the file itself.
+    ///
+    /// The whole preparation — the fetch included — is marked in
+    /// [`TelegramChannel::preparations`], so the collector holds that sender's
+    /// group for that chat until the part it produces has been handed over. The
+    /// `[Forwarded from …]` attribution (and the `forwarded` flag) is applied by
+    /// [`MessageContext::into_channel_message`], so it survives every refusal
+    /// path below as well as the success one.
     #[expect(clippy::too_many_lines)] // one linear fetch-and-refuse run, each gate a distinct outcome
     async fn try_parse_attachment_message(
         &self,
@@ -2089,6 +2155,11 @@ impl TelegramChannel {
         let Some(attachment) = Self::parse_attachment_metadata(message) else {
             return Ok(None);
         };
+
+        // Held for the whole preparation below — the fetch included — so the group
+        // this sender has open in this chat waits for the part this call produces
+        // (see `Preparations`).
+        let _preparing = self.preparations.begin(&ctx.user_name, &ctx.reply_target);
 
         // No local audio here: a recorded voice message cannot be transcribed,
         // so refuse it before anything is fetched. A sound file (`audio`) is
@@ -2205,8 +2276,6 @@ impl TelegramChannel {
             let _ = write!(content, "\n\n{caption}");
         }
 
-        let content = Self::prepend_forward_attribution(content, message);
-
         Ok(Some(ctx.into_attachment_message(content, staging_dir)))
     }
 
@@ -2273,29 +2342,63 @@ impl TelegramChannel {
         self.refuse_with_notice(ctx, &notice, content).await
     }
 
-    /// Build a forwarding attribution prefix from Telegram's forward fields.
+    /// What Telegram says about a message being forwarded content.
     ///
-    /// Returns `Some("[Forwarded from ...] ")` when the message is forwarded,
-    /// `None` otherwise.
-    fn format_forward_attribution(message: &serde_json::Value) -> Option<String> {
-        if let Some(from_chat) = message.get("forward_from_chat") {
-            // Forwarded from a channel or group
-            let title = from_chat
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown channel");
-            Some(format!("{FORWARD_ATTRIBUTION_PREFIX}channel: {title}] "))
-        } else if let Some(from_user) = message.get("forward_from") {
-            // Forwarded from a user (privacy allows identity)
-            let label = format_sender_label(from_user);
-            Some(format!("{FORWARD_ATTRIBUTION_PREFIX}{label}] "))
-        } else {
-            // Forwarded from a user who hides their identity
-            message
-                .get("forward_sender_name")
-                .and_then(serde_json::Value::as_str)
-                .map(|name| format!("{FORWARD_ATTRIBUTION_PREFIX}{name}] "))
+    /// The modern `forward_origin` is read first and the older fields (see
+    /// [`LEGACY_FORWARD_FIELDS`]) only where it names nothing — an update carrying
+    /// both must still yield ONE attribution, and an origin of a kind this product
+    /// has no label for falls back to the older fields rather than dropping the
+    /// attribution. The message kinds the product does not handle at all (a
+    /// sticker, a poll, a location) produce no message, so nothing here has to
+    /// attribute them.
+    fn forward(message: &serde_json::Value) -> Forward {
+        let mut forwarded = false;
+        let mut label = None;
+        if let Some(origin) = message.get("forward_origin") {
+            forwarded = true;
+            label = Self::forward_origin_label(origin);
         }
+        for (field, render) in LEGACY_FORWARD_FIELDS {
+            let Some(value) = message.get(field) else {
+                continue;
+            };
+            forwarded = true;
+            if label.is_none() {
+                label = render(value);
+            }
+        }
+        Forward {
+            forwarded,
+            prefix: label.map(|label| format!("{FORWARD_ATTRIBUTION_PREFIX}{label}] ")),
+        }
+    }
+
+    /// The label the modern `forward_origin` names, if it names one this product
+    /// knows: an origin of a kind it does not know yields none, so the older fields
+    /// still get their chance to attribute the message.
+    fn forward_origin_label(origin: &serde_json::Value) -> Option<String> {
+        origin
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|kind| match kind {
+                // MessageOriginUser
+                "user" => origin.get("sender_user").map(format_sender_label),
+                // MessageOriginHiddenUser
+                "hidden_user" => origin
+                    .get("sender_user_name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+                // MessageOriginChat / MessageOriginChannel: the chat's title, named
+                // as a channel when the origin says it is one.
+                "chat" | "channel" => origin
+                    .get("sender_chat")
+                    .and_then(|chat| chat.get("title").and_then(serde_json::Value::as_str))
+                    .map(|title| {
+                        let kind = if kind == "channel" { "channel: " } else { "" };
+                        format!("{kind}{title}")
+                    }),
+                _ => None,
+            })
     }
 
     async fn parse_update_message(
@@ -2321,8 +2424,6 @@ impl TelegramChannel {
         };
 
         let content = text.to_string();
-
-        let content = Self::prepend_forward_attribution(content, message);
 
         Ok(Some(ctx.into_channel_message(content, None)))
     }
@@ -3158,13 +3259,14 @@ impl TelegramChannel {
         .await
     }
 
-    /// Age resolved decisions out of the record — the intake's own retention job.
+    /// Age the record out — the intake's own retention job, over the events it
+    /// holds and the releases it recorded.
     async fn age_out_record(&self) {
         match self.intake_store().age_out().await {
             Ok(0) => {}
             Ok(dropped) => tracing::debug!(
                 dropped,
-                "Telegram intake: aged resolved events out of the record"
+                "Telegram intake: aged rows out of the intake's record"
             ),
             Err(err) => tracing::warn!(%err, "Telegram intake: could not age the record"),
         }
@@ -3291,6 +3393,11 @@ struct IntakeSlot {
 /// staging directories kept, since each member downloads into its own. The
 /// first member starts the album.
 ///
+/// A member being forwarded content makes the album forwarded content: whichever
+/// member carries the attribution, the group the album lands in is owed the same
+/// longer window. The album's own record time stays the first member's — the
+/// platform sends an album's members together.
+///
 /// The member's record entries come along too: an album is one incoming event
 /// whose every part is its own entry, and the merged message is what settles
 /// them — so no member is left held by the record after the album is handed on.
@@ -3301,6 +3408,7 @@ fn merge_album_member(album: Option<ChannelMessage>, member: ChannelMessage) -> 
             album.content.push_str(&member.content);
             album.attachment_dirs.extend(member.attachment_dirs);
             album.update_ids.extend(member.update_ids);
+            album.forwarded |= member.forwarded;
             album
         }
         None => member,
@@ -3601,12 +3709,16 @@ impl Channel for TelegramChannel {
         // issued while a group waits; the queue's bound and what dropping its sender
         // does are `telegram_group`'s. The collector also settles the record: a message
         // it has handed to the pipeline has its events resolved, while one the pipeline
-        // never took leaves them held. It takes the frame, so its life is the
-        // collector's.
+        // never took leaves them held. It takes the frame, so its life is the collector's.
         let (parts_tx, parts_rx) =
             tokio::sync::mpsc::channel(crate::channels::telegram_group::QUEUE_CAPACITY);
-        let collector =
-            crate::channels::telegram_group::spawn_collector(parts_rx, tx, intake.clone(), frame);
+        let collector = crate::channels::telegram_group::spawn_collector(
+            parts_rx,
+            tx,
+            intake.clone(),
+            std::sync::Arc::clone(&self.preparations),
+            frame,
+        );
 
         self.intake_loop(&parts_tx, &intake, slot.updates).await;
 

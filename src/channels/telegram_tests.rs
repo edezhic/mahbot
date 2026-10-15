@@ -2116,6 +2116,7 @@ fn album_members_merge_into_one_message() {
             crate::util::telegram_staging_dir_name(second_chat, 43),
         ],
         update_ids: vec![8],
+        forwarded: true,
         ..test_msg("bob", "", "telegram", "other")
     };
 
@@ -2123,11 +2124,19 @@ fn album_members_merge_into_one_message() {
     let album = merge_album_member(None, first.clone());
     assert_eq!(album.content, "a");
     assert_eq!(album.attachment_dirs, first.attachment_dirs);
+    assert!(
+        !album.forwarded,
+        "the first member is not forwarded content"
+    );
 
     // ...and a later member joins its content with a newline and its staging
     // dirs onto the album.
     let album = merge_album_member(Some(album), second);
     assert_eq!(album.content, "a\nb");
+    assert!(
+        album.forwarded,
+        "a forwarded member makes the album forwarded content"
+    );
     assert_eq!(
         album.attachment_dirs,
         vec![
@@ -2206,69 +2215,87 @@ async fn parsed_message(ch: &TelegramChannel, update: &serde_json::Value) -> Cha
         .expect("a message")
 }
 
+/// The older forward fields still attribute a message — and still count it as
+/// forwarded, which is the flag the burst collector's longer window rests on and
+/// which the rendered prefix alone would not pin.
 #[tokio::test]
 async fn forward_attribution() {
     let ch = test_channel().await;
 
-    // forwarded from user with username
-    let update = test_update(&[(
-        "message",
-        serde_json::json!({
-            "message_id": 50,
-            "text": "Check this out",
-            "from": { "id": 1, "username": "alice" },
-            "chat": { "id": 999 },
-            "forward_from": {
-                "id": 42,
-                "first_name": "Bob",
-                "username": "bob"
-            },
-            "forward_date": 1_700_000_000
-        }),
-    )]);
-    let msg = parsed_message(&ch, &update).await;
-    assert_eq!(msg.content, "[Forwarded from @bob] Check this out");
+    let legacy = [
+        (
+            // A user with a username.
+            serde_json::json!({
+                "message_id": 50,
+                "text": "Check this out",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_from": {
+                    "id": 42,
+                    "first_name": "Bob",
+                    "username": "bob"
+                },
+                "forward_date": 1_700_000_000
+            }),
+            "[Forwarded from @bob] Check this out",
+        ),
+        (
+            // A channel.
+            serde_json::json!({
+                "message_id": 51,
+                "text": "Breaking news",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_from_chat": {
+                    "id": -1_001_234_567_890_i64,
+                    "title": "Daily News",
+                    "username": "dailynews",
+                    "type": "channel"
+                },
+                "forward_date": 1_700_000_000
+            }),
+            "[Forwarded from channel: Daily News] Breaking news",
+        ),
+        (
+            // A user who hides their identity.
+            serde_json::json!({
+                "message_id": 52,
+                "text": "Secret tip",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_sender_name": "Hidden User",
+                "forward_date": 1_700_000_000
+            }),
+            "[Forwarded from Hidden User] Secret tip",
+        ),
+        (
+            // A user without a username.
+            serde_json::json!({
+                "message_id": 54,
+                "text": "Hello there",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_from": {
+                    "id": 77,
+                    "first_name": "Charlie"
+                },
+                "forward_date": 1_700_000_000
+            }),
+            "[Forwarded from Charlie] Hello there",
+        ),
+    ];
+    for (message, expected) in legacy {
+        let msg = parsed_message(&ch, &test_update(&[("message", message)])).await;
+        assert_eq!(msg.content, expected);
+        assert!(
+            msg.forwarded,
+            "a legacy forward field must count as forwarded"
+        );
+    }
 
-    // forwarded from channel
-    let update = test_update(&[(
-        "message",
-        serde_json::json!({
-            "message_id": 51,
-            "text": "Breaking news",
-            "from": { "id": 1, "username": "alice" },
-            "chat": { "id": 999 },
-            "forward_from_chat": {
-                "id": -1_001_234_567_890_i64,
-                "title": "Daily News",
-                "username": "dailynews",
-                "type": "channel"
-            },
-            "forward_date": 1_700_000_000
-        }),
-    )]);
-    let msg = parsed_message(&ch, &update).await;
-    assert_eq!(
-        msg.content,
-        "[Forwarded from channel: Daily News] Breaking news"
-    );
-
-    // forwarded hidden sender
-    let update = test_update(&[(
-        "message",
-        serde_json::json!({
-            "message_id": 52,
-            "text": "Secret tip",
-            "from": { "id": 1, "username": "alice" },
-            "chat": { "id": 999 },
-            "forward_sender_name": "Hidden User",
-            "forward_date": 1_700_000_000
-        }),
-    )]);
-    let msg = parsed_message(&ch, &update).await;
-    assert_eq!(msg.content, "[Forwarded from Hidden User] Secret tip");
-
-    // non-forwarded unaffected
-    let update = test_update(&[(
+    // A message with no forward field of any kind carries neither the prefix nor
+    // the fact.
+    let plain = test_update(&[(
         "message",
         serde_json::json!({
             "message_id": 53,
@@ -2277,28 +2304,11 @@ async fn forward_attribution() {
             "chat": { "id": 999 }
         }),
     )]);
-    let msg = parsed_message(&ch, &update).await;
+    let msg = parsed_message(&ch, &plain).await;
     assert_eq!(msg.content, "Normal message");
+    assert!(!msg.forwarded);
 
-    // forwarded from user without username
-    let update = test_update(&[(
-        "message",
-        serde_json::json!({
-            "message_id": 54,
-            "text": "Hello there",
-            "from": { "id": 1, "username": "alice" },
-            "chat": { "id": 999 },
-            "forward_from": {
-                "id": 77,
-                "first_name": "Charlie"
-            },
-            "forward_date": 1_700_000_000
-        }),
-    )]);
-    let msg = parsed_message(&ch, &update).await;
-    assert_eq!(msg.content, "[Forwarded from Charlie] Hello there");
-
-    // forwarded photo with attribution
+    // A forwarded photo's attribution is the prefix the content opens with.
     let message = serde_json::json!({
         "message_id": 60,
         "from": { "id": 1, "username": "alice" },
@@ -2312,12 +2322,163 @@ async fn forward_attribution() {
         },
         "forward_date": 1_700_000_000
     });
-    let attr =
-        TelegramChannel::format_forward_attribution(&message).expect("should detect forward");
+    let attr = TelegramChannel::forward(&message)
+        .prefix
+        .expect("should detect forward");
     assert_eq!(attr, "[Forwarded from @bob] ");
     let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
     let content = format!("{attr}{photo_content}");
     assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
+}
+
+/// Every modern `forward_origin` the product labels renders its attribution, and
+/// an origin it has no label for still counts as forwarded: the flag the burst
+/// collector's longer window rests on is the fact, the prefix only its rendering.
+/// An update carrying both the modern origin and the legacy fields still yields
+/// one attribution, while an origin of a kind the product has no label for falls
+/// back to the legacy fields. The legacy fields on their own are covered by
+/// `forward_attribution`.
+#[tokio::test]
+async fn forward_origin_attribution_covers_every_origin_and_the_legacy_fields() {
+    let ch = test_channel().await;
+
+    let with_origin = |origin: serde_json::Value| {
+        test_update(&[(
+            "message",
+            serde_json::json!({
+                "message_id": 70,
+                "text": "Check this out",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_origin": origin,
+            }),
+        )])
+    };
+
+    let cases = [
+        (
+            serde_json::json!({
+                "type": "user", "date": 1_700_000_000,
+                "sender_user": { "id": 42, "username": "bob" }
+            }),
+            "[Forwarded from @bob] Check this out",
+        ),
+        (
+            serde_json::json!({
+                "type": "user", "date": 1_700_000_000,
+                "sender_user": { "id": 77, "first_name": "Charlie" }
+            }),
+            "[Forwarded from Charlie] Check this out",
+        ),
+        (
+            serde_json::json!({
+                "type": "hidden_user", "date": 1_700_000_000,
+                "sender_user_name": "Hidden User"
+            }),
+            "[Forwarded from Hidden User] Check this out",
+        ),
+        (
+            serde_json::json!({
+                "type": "chat", "date": 1_700_000_000,
+                "sender_chat": { "id": -100_111_i64, "type": "supergroup", "title": "Group Chat" }
+            }),
+            "[Forwarded from Group Chat] Check this out",
+        ),
+        (
+            serde_json::json!({
+                "type": "channel", "date": 1_700_000_000,
+                "sender_chat": { "id": -100_222_i64, "type": "channel", "title": "Daily News" }
+            }),
+            "[Forwarded from channel: Daily News] Check this out",
+        ),
+    ];
+    for (origin, expected) in cases {
+        let msg = parsed_message(&ch, &with_origin(origin)).await;
+        assert_eq!(msg.content, expected);
+        assert!(msg.forwarded, "a modern forward must count as forwarded");
+    }
+
+    // The modern origin wins over the legacy fields: one attribution, not two.
+    let both = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 71,
+            "text": "Check this out",
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 999 },
+            "forward_origin": {
+                "type": "channel",
+                "date": 1_700_000_000,
+                "sender_chat": {
+                    "id": -100_222_i64,
+                    "type": "channel",
+                    "title": "Daily News"
+                }
+            },
+            "forward_from": { "id": 42, "username": "bob" },
+        }),
+    )]);
+    let msg = parsed_message(&ch, &both).await;
+    assert_eq!(msg.content.matches("[Forwarded from").count(), 1);
+    assert!(
+        msg.content
+            .starts_with("[Forwarded from channel: Daily News] ")
+    );
+
+    // An origin this product has no label for renders no attribution of its own,
+    // and the older fields still get their chance to attribute the message.
+    let unknown = with_origin(serde_json::json!({"type": "something_new", "date": 1_700_000_000}));
+    let msg = parsed_message(&ch, &unknown).await;
+    assert_eq!(msg.content, "Check this out");
+    assert!(msg.forwarded);
+
+    let mut unlabelled = with_origin(serde_json::json!({
+        "type": "something_new", "date": 1_700_000_000,
+        "sender_chat": { "id": -100_222_i64, "type": "channel", "title": "Ignored" }
+    }));
+    unlabelled["message"]["forward_from_chat"] =
+        serde_json::json!({ "id": -100_333_i64, "title": "Fallback News" });
+    let msg = parsed_message(&ch, &unlabelled).await;
+    assert_eq!(
+        msg.content,
+        "[Forwarded from channel: Fallback News] Check this out"
+    );
+}
+
+/// A refused forwarded attachment keeps its attribution: a refusal hands on a
+/// message of its own, and the `[Forwarded from …]` prefix (with the forwarded
+/// fact) must ride on it too. A declared size past Telegram's own download cap is
+/// refused before any fetch.
+#[tokio::test]
+async fn a_refused_forwarded_attachment_keeps_its_attribution() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    let update = forwarded_photo_update(1, 33, "huge", 30 * 1024 * 1024);
+
+    let msg = ch
+        .parse_incoming_update(&update)
+        .await
+        .expect("parse the update")
+        .expect("a message");
+    assert!(msg.forwarded);
+    assert!(
+        msg.content
+            .starts_with("[Forwarded from channel: Daily News] [File "),
+        "the refusal must keep its attribution: {}",
+        msg.content
+    );
+    assert!(msg.content.contains("not received"));
+
+    until(
+        "the user is told the file could not be processed",
+        || async {
+            fake.sent_texts()
+                .iter()
+                .any(|text| text.contains("Could not process the file"))
+        },
+    )
+    .await;
 }
 
 // ── strip_html_tags tests ──────────────────────────────────
@@ -2703,6 +2864,8 @@ fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -
         message_id: None,
         attachment_dirs: Vec::new(),
         parts: Vec::new(),
+        update_date: None,
+        forwarded: false,
         update_ids: Vec::new(),
     }
 }
@@ -3319,6 +3482,15 @@ const OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// has to be past the pause, not equal to it.
 const BACKOFF_OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long the injected fetch of a forwarded attachment takes: past the group's
+/// own ceiling, so a pair that reaches the assistant as one turn can only have
+/// been held across the fetch — no window of the collector's own reaches that far.
+const FETCH_DELAY: Duration = Duration::from_secs(6);
+
+/// How long a check waits for a burst that has to fetch a file first: the fetch,
+/// the group's own extended window, and room for a loaded machine.
+const AT_MOST_ONE_TURN: Duration = Duration::from_secs(20);
+
 /// A fake Telegram Bot API: scripted `getUpdates` batches, an account per token,
 /// and a log of the methods a listener called.
 struct FakeTelegram {
@@ -3341,6 +3513,18 @@ struct FakeState {
     requests: Mutex<Vec<(String, Option<i64>, std::time::Instant)>>,
     /// The `text` of every `sendMessage`, in arrival order.
     sent_texts: Mutex<Vec<String>>,
+    /// The files a listener may fetch, keyed by the `file_path` the fake's own
+    /// `getFile` hands back: the bytes the transfer serves and how long it takes
+    /// to answer them.
+    files: Mutex<HashMap<String, FakeFile>>,
+}
+
+/// A file the fake serves over a transfer of its own: the bytes, and how long
+/// the answer takes — a real fetch of a few megabytes takes seconds, which is
+/// what a check about a slow fetch has to be able to reproduce.
+struct FakeFile {
+    bytes: Vec<u8>,
+    delay: Duration,
 }
 
 /// One request as the fake read it.
@@ -3374,6 +3558,7 @@ impl FakeTelegram {
             batches: Mutex::new(HashMap::new()),
             requests: Mutex::new(Vec::new()),
             sent_texts: Mutex::new(Vec::new()),
+            files: Mutex::new(HashMap::new()),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let accept = std::thread::spawn({
@@ -3427,6 +3612,18 @@ impl FakeTelegram {
             .push_back(updates);
     }
 
+    /// Register a file `file_id` can be fetched as: `getFile` answers the path
+    /// [`file_path_of`] builds, and the transfer serves `bytes` after `delay`.
+    fn push_file(&self, file_id: &str, bytes: &[u8], delay: Duration) {
+        self.state.files.lock().expect("fake files lock").insert(
+            file_path_of(file_id),
+            FakeFile {
+                bytes: bytes.to_vec(),
+                delay,
+            },
+        );
+    }
+
     /// The `offset` every `getUpdates` poll asked for, in order.
     fn poll_offsets(&self) -> Vec<i64> {
         self.state
@@ -3475,6 +3672,12 @@ fn bot_path(path: &str) -> Option<(&str, &str)> {
     (!token.is_empty() && !method.is_empty()).then_some((token, method))
 }
 
+/// The path the fake serves `file_id` at. The extension matters: the intake
+/// classifies a downloaded photo by the name the path gives it.
+fn file_path_of(file_id: &str) -> String {
+    format!("photos/{file_id}.jpg")
+}
+
 /// The API's answer for something it does not serve.
 fn not_found() -> serde_json::Value {
     serde_json::json!({ "ok": false, "error_code": 404, "description": "Not Found" })
@@ -3489,12 +3692,10 @@ fn serve(mut stream: TcpStream, state: &FakeState) {
     let Some(request) = read_body(&mut stream, head) else {
         return;
     };
-    let method = request
-        .path
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    // A GET carries its parameters in the request line, so the target is split
+    // before the method is read.
+    let target = request.path.split('?').next().unwrap_or_default();
+    let method = target.rsplit('/').next().unwrap_or_default().to_string();
     // The `offset` a poll asked for, `None` for the methods that carry none,
     // read here because the log line below is where it is recorded.
     let offset = if method == "getUpdates" {
@@ -3512,7 +3713,15 @@ fn serve(mut stream: TcpStream, state: &FakeState) {
         std::time::Instant::now(),
     ));
 
-    let Some((token, _)) = bot_path(&request.path) else {
+    // A file transfer is not a Bot API method: its URL is
+    // `{base}/file/bot<token>/<path>` and its body is the bytes themselves.
+    if let Some(rest) = target.strip_prefix("/file/bot")
+        && let Some((token, file_path)) = rest.split_once('/')
+    {
+        serve_file(&mut stream, state, token, file_path);
+        return;
+    }
+    let Some((token, _)) = bot_path(target) else {
         respond(&mut stream, &not_found());
         return;
     };
@@ -3531,6 +3740,7 @@ fn serve(mut stream: TcpStream, state: &FakeState) {
         ),
         "getUpdates" => serve_get_updates(&mut stream, state, token, &request),
         "sendMessage" => serve_send_message(&mut stream, state, &request),
+        "getFile" => serve_get_file(&mut stream, state, &request),
         "setMessageReaction" | "answerCallbackQuery" | "setMyCommands" | "sendChatAction" => {
             respond(
                 &mut stream,
@@ -3541,23 +3751,75 @@ fn serve(mut stream: TcpStream, state: &FakeState) {
     }
 }
 
+/// The `getFile` answer: the path the registered file is served at, after which
+/// the listener makes a second request — the transfer the check can delay.
+fn serve_get_file(stream: &mut TcpStream, state: &FakeState, request: &FakeRequest) {
+    let Some(target) = request.path.split('?').nth(1) else {
+        respond(stream, &not_found());
+        return;
+    };
+    let Some((_, file_id)) = target.split_once('=') else {
+        respond(stream, &not_found());
+        return;
+    };
+    let path = file_path_of(file_id);
+    let Some(size) = state
+        .files
+        .lock()
+        .expect("fake files lock")
+        .get(&path)
+        .map(|file| file.bytes.len())
+    else {
+        respond(stream, &not_found());
+        return;
+    };
+    respond(
+        stream,
+        &serde_json::json!({
+            "ok": true,
+            "result": { "file_id": file_id, "file_path": path, "file_size": size },
+        }),
+    );
+}
+
+/// The file transfer's answer: the registered bytes, after the transfer's own
+/// delay. The connection is answered and closed like every other one, so a slow
+/// transfer holds nothing but its own handler thread.
+fn serve_file(stream: &mut TcpStream, state: &FakeState, token: &str, file_path: &str) {
+    if !state.accounts.contains_key(token) {
+        respond(stream, &not_found());
+        return;
+    }
+    let registered = state
+        .files
+        .lock()
+        .expect("fake files lock")
+        .get(file_path)
+        .map(|file| (file.bytes.clone(), file.delay));
+    let Some((bytes, delay)) = registered else {
+        respond(stream, &not_found());
+        return;
+    };
+    std::thread::sleep(delay);
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&bytes);
+}
+
 /// The `getUpdates` answer: the oldest queued batch, an immediate empty result
 /// for the handshake's zero-timeout probe, or — for a long poll with nothing to
-/// offer — no answer at all, held open until the client gives up, which is what
-/// the real API's long poll does.
+/// offer yet — the batch queued while the client waits, which is what the real
+/// API's long poll does; the poll ends unanswered only when the client gives up.
 fn serve_get_updates(
     stream: &mut TcpStream,
     state: &FakeState,
     token: &str,
     request: &FakeRequest,
 ) {
-    let queued = state
-        .batches
-        .lock()
-        .expect("fake batches lock")
-        .get_mut(token)
-        .and_then(VecDeque::pop_front);
-    if let Some(batch) = queued {
+    if let Some(batch) = pop_batch(state, token) {
         return respond(stream, &serde_json::json!({ "ok": true, "result": batch }));
     }
     // The `timeout` the poll asked for, `0` when it asked for none.
@@ -3568,12 +3830,38 @@ fn serve_get_updates(
     if timeout == 0 {
         return respond(stream, &serde_json::json!({ "ok": true, "result": [] }));
     }
+    // A long poll with nothing to offer yet: the real API answers the moment an
+    // update arrives, so a batch queued while the client waits is served too —
+    // which is what lets a check queue a later batch after it has observed an
+    // earlier one. The socket is put in non-blocking mode for the wait so the
+    // queue can be re-read between reads; the `Ok(0)` below is the client giving
+    // up, the one case the poll ends unanswered.
+    let _ = stream.set_nonblocking(true);
     let mut sink = [0u8; 1024];
-    while let Ok(read) = stream.read(&mut sink) {
-        if read == 0 {
-            break;
+    loop {
+        if let Some(batch) = pop_batch(state, token) {
+            let _ = stream.set_nonblocking(false);
+            return respond(stream, &serde_json::json!({ "ok": true, "result": batch }));
+        }
+        match stream.read(&mut sink) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return,
         }
     }
+}
+
+/// Take the oldest queued `getUpdates` batch for `token`, if any.
+fn pop_batch(state: &FakeState, token: &str) -> Option<Vec<serde_json::Value>> {
+    state
+        .batches
+        .lock()
+        .expect("fake batches lock")
+        .get_mut(token)
+        .and_then(VecDeque::pop_front)
 }
 
 /// The `sendMessage` answer. The text is logged so a check can read back what
@@ -3713,7 +4001,18 @@ async fn next_message(
     rx: &mut tokio::sync::mpsc::Receiver<ChannelMessage>,
     what: &str,
 ) -> ChannelMessage {
-    tokio::time::timeout(OBSERVABLE_TIMEOUT, rx.recv())
+    next_message_within(OBSERVABLE_TIMEOUT, rx, what).await
+}
+
+/// The next message the pipeline receives within `bound`, or a panic naming
+/// `what`. A check releases a burst through the collector's windows first, so
+/// its message is a second (or a fetch) away, never immediate.
+async fn next_message_within(
+    bound: Duration,
+    rx: &mut tokio::sync::mpsc::Receiver<ChannelMessage>,
+    what: &str,
+) -> ChannelMessage {
+    tokio::time::timeout(bound, rx.recv())
         .await
         .unwrap_or_else(|_| panic!("nothing reached the pipeline: {what}"))
         .unwrap_or_else(|| panic!("the pipeline closed before delivering: {what}"))
@@ -3747,6 +4046,45 @@ fn test_album_member(update_id: i64, group: &str, text: &str) -> serde_json::Val
                 "media_group_id": group,
                 "from": { "id": 555, "username": "alice" },
                 "chat": { "id": -100_200_300 },
+            }),
+        ),
+    ])
+}
+
+/// A forwarded photo from alice, as Telegram sends one: the modern
+/// `forward_origin` names where it came from, and the attachment is the part a
+/// slow fetch is injected for.
+fn forwarded_photo_update(
+    update_id: i64,
+    message_id: i64,
+    file_id: &str,
+    file_size: u64,
+) -> serde_json::Value {
+    test_update(&[
+        ("update_id", serde_json::json!(update_id)),
+        (
+            "message",
+            serde_json::json!({
+                "message_id": message_id,
+                "date": 1_700_000_000,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300 },
+                "photo": [{
+                    "file_id": file_id,
+                    "file_unique_id": "u1",
+                    "width": 320,
+                    "height": 240,
+                    "file_size": file_size,
+                }],
+                "forward_origin": {
+                    "type": "channel",
+                    "date": 1_699_999_000,
+                    "sender_chat": {
+                        "id": -100_1234_5678_i64,
+                        "type": "channel",
+                        "title": "Daily News",
+                    },
+                },
             }),
         ),
     ])
@@ -3789,6 +4127,35 @@ async fn still_held(store: &TelegramIntakeStore, account: &str) -> Vec<i64> {
         .expect("read the record");
     rows.into_iter()
         .map(|row| row.get::<i64>(0).expect("update_id"))
+        .collect()
+}
+
+/// One `telegram_bursts` row as a check reads it back.
+struct BurstRow {
+    user_name: String,
+    parts: i64,
+    released_by: String,
+    part_times: Vec<serde_json::Value>,
+}
+
+/// The burst records written so far, oldest first.
+async fn burst_rows(store: &TelegramIntakeStore) -> Vec<BurstRow> {
+    let rows = store
+        .conn
+        .query(
+            "SELECT user_name, parts, released_by, part_times FROM telegram_bursts ORDER BY id",
+            (),
+        )
+        .await
+        .expect("read the burst record");
+    rows.into_iter()
+        .map(|row| BurstRow {
+            user_name: row.get::<String>(0).expect("user_name"),
+            parts: row.get::<i64>(1).expect("parts"),
+            released_by: row.get::<String>(2).expect("released_by"),
+            part_times: serde_json::from_str(&row.get::<String>(3).expect("part_times"))
+                .expect("part_times is JSON"),
+        })
         .collect()
 }
 
@@ -4989,5 +5356,262 @@ async fn an_event_the_record_cannot_be_written_for_is_neither_acknowledged_nor_c
             .is_err(),
         "an event the record could not be written for must not be handed on"
     );
+    listener.abort();
+}
+
+/// A comment and the slow forwarded attachment it belongs to reach the assistant
+/// as one turn. Both arrive in one poll with the comment first, so the group it
+/// opens would be released after its own quiet window while the attachment is
+/// still being fetched: the collector holds it on the preparation instead, which
+/// is what makes the pair one request — and holds it past the group's own ceiling,
+/// since the fetch takes longer than that.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_comment_and_a_slow_forwarded_attachment_reach_the_assistant_as_one_turn() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // The handshake's zero-timeout probe takes the empty batch, so the pair below
+    // arrives on the loop's own poll, in one batch as the platform delivers it.
+    fake.push_batch("token-a", Vec::new());
+    fake.push_batch(
+        "token-a",
+        vec![
+            test_text_update(1, "look at this"),
+            forwarded_photo_update(2, 34, "photo-1", 1024),
+        ],
+    );
+    fake.push_file("photo-1", b"jpeg-bytes", FETCH_DELAY);
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message_within(
+        AT_MOST_ONE_TURN,
+        &mut rx,
+        "the comment and its forwarded photo, as one turn",
+    )
+    .await;
+    assert_eq!(msg.parts.len(), 2, "the pair must be one turn, not two");
+    assert_eq!(msg.parts[0].content, "look at this");
+    assert!(
+        msg.parts[1]
+            .content
+            .starts_with("[Forwarded from channel: Daily News] [IMAGE:"),
+        "the forwarded photo must keep its attribution: {}",
+        msg.parts[1].content
+    );
+    assert!(
+        msg.parts[1].forwarded,
+        "the fetched forward must come back as forwarded"
+    );
+
+    // The pair is not also answered as its own turn.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "the comment and its forwarded photo must be one turn, not two"
+    );
+
+    // The record is the discriminating part: with nothing holding the group, the
+    // two parts would be a window apart; the window the release names would be the
+    // quiet one, and the attachment a turn of its own. A fetch apart is only
+    // possible because the group was held while the fetch ran.
+    until_within(AT_MOST_ONE_TURN, "the release is recorded", || async {
+        !burst_rows(&store).await.is_empty()
+    })
+    .await;
+    let rows = burst_rows(&store).await;
+    assert_eq!(rows.len(), 1, "one burst must be recorded for the one turn");
+    assert_eq!(rows[0].user_name, "alice");
+    assert_eq!(rows[0].parts, 2);
+    assert_eq!(rows[0].released_by, "extended_window");
+    assert_eq!(rows[0].part_times.len(), 2);
+    let taken_at = |at: usize| {
+        chrono::DateTime::parse_from_rfc3339(
+            rows[0].part_times[at]["taken_at"]
+                .as_str()
+                .expect("taken_at is a string"),
+        )
+        .expect("taken_at is RFC 3339")
+    };
+    let gap = (taken_at(1) - taken_at(0))
+        .to_std()
+        .expect("the second part was taken after the first");
+    assert!(
+        gap >= FETCH_DELAY.saturating_sub(Duration::from_millis(200)),
+        "the two parts must be a fetch apart, not a window apart: {gap:?}"
+    );
+
+    // Each part's platform time rides along from the update itself: the text
+    // message carries none (`test_text_update`), the forwarded photo carries the
+    // date of `forwarded_photo_update`.
+    assert!(rows[0].part_times[0]["sent_at"].is_null());
+    assert_eq!(
+        rows[0].part_times[1]["sent_at"].as_str(),
+        Some(
+            chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .expect("a valid timestamp")
+                .to_rfc3339()
+                .as_str()
+        )
+    );
+    listener.abort();
+}
+
+/// The other arrival order: the slow forwarded attachment lands first and its
+/// comment follows, and the pair still reaches the assistant as one turn.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_slow_forwarded_attachment_and_its_comment_reach_the_assistant_as_one_turn() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // The handshake's zero-timeout probe takes the empty batch, so the photo and
+    // its comment both arrive on the loop's own polls.
+    fake.push_batch("token-a", Vec::new());
+    fake.push_batch(
+        "token-a",
+        vec![forwarded_photo_update(1, 33, "photo-2", 1024)],
+    );
+    fake.push_batch("token-a", vec![test_text_update(2, "my comment")]);
+    fake.push_file("photo-2", b"jpeg-bytes", FETCH_DELAY);
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message_within(
+        AT_MOST_ONE_TURN,
+        &mut rx,
+        "the forwarded photo and its comment, as one turn",
+    )
+    .await;
+    assert_eq!(msg.parts.len(), 2, "the pair must be one turn, not two");
+    assert!(
+        msg.parts[0].forwarded,
+        "the fetched forward must come back as forwarded"
+    );
+    assert!(
+        msg.parts[0]
+            .content
+            .starts_with("[Forwarded from channel: Daily News] [IMAGE:"),
+        "the forwarded photo must keep its attribution: {}",
+        msg.parts[0].content
+    );
+    assert_eq!(msg.parts[1].content, "my comment");
+
+    until_within(AT_MOST_ONE_TURN, "the release is recorded", || async {
+        !burst_rows(&store).await.is_empty()
+    })
+    .await;
+    let rows = burst_rows(&store).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].parts, 2);
+    listener.abort();
+}
+
+/// Ordinary behaviour is unchanged: two plain messages in quick succession still
+/// merge into one turn, and a message that arrives after the group is gone is a
+/// turn of its own — nothing is left holding it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn two_plain_messages_in_quick_succession_still_merge_and_a_later_one_is_its_own_turn() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // The handshake consumes this batch; the loop's poll then waits for the
+    // later one, which is why it is queued only once the first turn is observed:
+    // queued up front it would be fetched straight away and merge into the group.
+    fake.push_batch(
+        "token-a",
+        vec![test_text_update(1, "first"), test_text_update(2, "second")],
+    );
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message_within(AT_MOST_ONE_TURN, &mut rx, "the two messages, as one turn").await;
+    assert_eq!(msg.parts.len(), 2);
+    assert_eq!(msg.parts[0].content, "first");
+    assert_eq!(msg.parts[1].content, "second");
+
+    fake.push_batch("token-a", vec![test_text_update(3, "later")]);
+    let later = next_message(&mut rx, "the later message, as its own turn").await;
+    assert!(
+        later.parts.is_empty(),
+        "a message after the group is gone must be a turn of its own"
+    );
+    assert_eq!(later.content, "later");
+
+    // A group of one is recorded like any other release: the row about the
+    // message that went on its own is what a complaint about a split pair is
+    // read against.
+    until("both releases are recorded", || async {
+        burst_rows(&store).await.len() == 2
+    })
+    .await;
+    let rows = burst_rows(&store).await;
+    assert_eq!(rows[0].parts, 2, "the pair's own row comes first");
+    assert_eq!(rows[1].parts, 1, "the lone message is recorded too");
+    assert_eq!(rows[1].released_by, "quiet_window");
+    listener.abort();
+}
+
+/// Control input still leaves the group open in its chat ahead of itself: a real
+/// bot command in a burst is handed over after the group's own message, never in
+/// front of it, and is a turn of its own.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn a_command_in_a_burst_leaves_the_group_ahead_of_itself() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // The handshake's zero-timeout probe takes the empty batch, which ends the
+    // backlog and leaves the loop's own poll to fetch the burst — a command of
+    // this run's own poll, so it is dispatched rather than refused as stale.
+    fake.push_batch("token-a", Vec::new());
+    fake.push_batch(
+        "token-a",
+        vec![
+            test_text_update(1, "the group"),
+            test_text_update(2, "/pause"),
+        ],
+    );
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let group = next_message(&mut rx, "the group ahead of the command").await;
+    assert_eq!(group.content, "the group");
+    let command = next_message(&mut rx, "the command, as its own turn").await;
+    assert!(command.parts.is_empty());
+    assert_eq!(command.content, "/pause");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "nothing may follow the group and the command"
+    );
+
+    // The release a command forces is recorded like any other — by the rule that
+    // forced it, which is what a complaint about a split burst is read against.
+    until("the group's release is recorded", || async {
+        !burst_rows(&store).await.is_empty()
+    })
+    .await;
+    let rows = burst_rows(&store).await;
+    assert_eq!(rows.len(), 1, "only the group's own release is recorded");
+    assert_eq!(rows[0].released_by, "control");
+    assert_eq!(rows[0].parts, 1);
     listener.abort();
 }

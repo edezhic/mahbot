@@ -545,6 +545,20 @@ pub struct ChannelMessage {
     /// envelope then being the message itself. One level deep — a part never
     /// carries parts of its own. Set only by the Telegram burst collector.
     pub parts: Vec<ChannelMessage>,
+    /// Telegram's own time for the message this came from (`message.date`,
+    /// Unix seconds) — never this product's clock, which is what the burst
+    /// record needs it beside. `None` for every other channel and for an
+    /// update the platform sent without one.
+    pub update_date: Option<i64>,
+    /// True when this message came in as forwarded content, decided from
+    /// Telegram's own fields (`forward_origin`, or the older `forward_*` ones)
+    /// rather than from any rendered text: the burst collector gives a group
+    /// the longer window on the strength of this flag, and the intake's
+    /// `[Forwarded from …]` prefix is written from the same decision. A
+    /// message kind the product does not handle at all — a sticker, a poll, a
+    /// location — yields no message and so carries nothing, which is fine:
+    /// what never arrives needs no attribution.
+    pub forwarded: bool,
     /// The Telegram intake's record entries this message stands for, one per
     /// incoming update it carries (an album's merged message carries every
     /// member's, and a burst envelope the union of its parts', which no longer

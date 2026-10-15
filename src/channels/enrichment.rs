@@ -1116,6 +1116,8 @@ mod tests {
             message_id: None,
             attachment_dirs: Vec::new(),
             parts: Vec::new(),
+            update_date: None,
+            forwarded: false,
             update_ids: Vec::new(),
         }
     }
