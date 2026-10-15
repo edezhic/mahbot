@@ -1125,14 +1125,25 @@ fn agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
 }
 
 /// Render the FINAL per-agent task for a ticket phase roster slot.
+///
+/// `k` is the slot's position within its cohort of `count`. The cohort's
+/// directions are dealt out strided from that position, so no direction is left
+/// unhanded at any cohort size: the slots share the list, and the surplus stacks
+/// onto the leading slots when there are fewer slots than directions (a lone slot
+/// receives them all).
 #[must_use]
-fn agent_slot_task(prompt: &str, angles: &[String], count: usize, global_idx: usize) -> String {
-    if angles.is_empty() {
+fn agent_slot_task(prompt: &str, angles: &[String], count: usize, k: usize) -> String {
+    let assigned = angles
+        .iter()
+        .skip(k)
+        .step_by(count)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if assigned.is_empty() {
         prompt.to_string()
-    } else if count == 1 {
-        format!("{prompt}\n\n{}", angles.join("\n\n"))
     } else {
-        format!("{prompt}\n\n{}", angles[global_idx % angles.len()])
+        format!("{prompt}\n\n{assigned}")
     }
 }
 
@@ -1153,8 +1164,8 @@ async fn read_roster_or_bail(ticket_id: &str, job_id: &str) -> Option<Vec<crate:
     }
 }
 
-/// Build a batch of [`AgentSlot`]s using the canonical agent-id format and
-/// angle-cycling rule.
+/// Build a batch of [`AgentSlot`]s using the canonical agent-id format and the
+/// direction-dealing rule.
 #[must_use]
 fn build_agent_slots(
     ticket_id: &str,
@@ -1166,11 +1177,10 @@ fn build_agent_slots(
 ) -> Vec<AgentSlot> {
     let suffix = crate::generate_suffix();
     let mut slots = Vec::with_capacity(count);
-    let global_start = usize::try_from(start_idx).unwrap_or(usize::MAX);
     for k in 0..count {
         let idx = start_idx + i64::try_from(k).unwrap_or(i64::MAX);
         let agent_id = agent_id(ticket_id, idx, &suffix, role);
-        let task = agent_slot_task(prompt, angles, count, global_start + k);
+        let task = agent_slot_task(prompt, angles, count, k);
         slots.push(AgentSlot {
             idx,
             agent_id,

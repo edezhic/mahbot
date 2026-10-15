@@ -15,8 +15,9 @@ use super::{
 };
 
 /// Default number of parallel analyst agents per round. Reviewers use a
-/// calibrated dynamic count (see [`crate::pipeline::verdict::review_agent_count`]);
-/// the verification stage runs its single functional tester alongside them.
+/// calibrated dynamic count (see
+/// [`crate::pipeline::verification::compute_reviewer_count`]); the verification
+/// stage runs its single functional tester alongside them.
 const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
 
 /// The stage's own name: the role the joint comment is authored under and the

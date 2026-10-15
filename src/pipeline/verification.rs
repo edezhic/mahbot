@@ -265,8 +265,10 @@ impl RoundPlan {
     /// read as the functional tester.
     ///
     /// `None` for a roster this stage cannot read back as a round: it must carry
-    /// exactly [`TESTER_COUNT`] tester row (any number of reviewer rows) and no
-    /// row of any other kind. Such a roster is never resumed — see [`run`].
+    /// exactly [`TESTER_COUNT`] tester row (any number of reviewer rows — a
+    /// resumed round replays the cohort it wrote, so the calibration's ceiling is
+    /// not re-applied to it) and no row of any other kind. Such a roster is never
+    /// resumed — see [`run`].
     fn from_roster(roster: &[crate::jobs::AgentRow]) -> Option<Self> {
         let cohort = |kind: crate::jobs::AgentKind| -> Vec<AgentSlot> {
             roster
@@ -768,19 +770,30 @@ async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
     Ok(snapshot.stats.added + snapshot.stats.removed)
 }
 
-/// Compute the reviewer count for a verification round.
+/// Compute the reviewer count for a verification round: the working tree's
+/// churn calibrates the band (1 up to and including
+/// [`crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN`] changed lines, 2
+/// below [`crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN`], and
+/// [`crate::pipeline::verdict::MAX_REVIEWERS`] from there), the priority floor is
+/// applied on top, and an unmeasurable churn falls back to the ceiling.
 ///
-/// Never fewer than one: the round dispatches a reviewer cohort exactly when the
-/// code review runs, and an empty cohort at that point would be indistinguishable
-/// from the identical-content skip (which the *plan* decides, not the count).
+/// Every path stays between one reviewer and the ceiling — never fewer, because
+/// the round dispatches a reviewer cohort exactly when the code review runs, and
+/// an empty cohort at that point would be indistinguishable from the
+/// identical-content skip (which the *plan* decides, not the count).
 pub(crate) async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
-    let tiny = crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_TINY_CHURN;
-    let low = crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN;
-    let high = crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN;
+    use crate::pipeline::verdict::{
+        DEFAULT_REVIEW_COUNT_HIGH_CHURN, DEFAULT_REVIEW_COUNT_LOW_CHURN, MAX_REVIEWERS,
+        review_agent_count, review_base_from_signals,
+    };
 
-    let count = match working_tree_churn(repo_path).await {
+    let base = match working_tree_churn(repo_path).await {
         Ok(total) => {
-            let base = crate::pipeline::verdict::review_base_from_signals(total, tiny, low, high);
+            let base = review_base_from_signals(
+                total,
+                DEFAULT_REVIEW_COUNT_LOW_CHURN,
+                DEFAULT_REVIEW_COUNT_HIGH_CHURN,
+            );
             // Debug: per-round calibration bookkeeping; an uncomputable churn
             // keeps its warn record below.
             debug!(
@@ -789,18 +802,18 @@ pub(crate) async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) ->
                 reviewer_base = base,
                 "Reviewer count calibration: base {base} from total churn",
             );
-            crate::pipeline::verdict::review_agent_count(base, ticket.priority)
+            base
         }
         Err(e) => {
             warn!(
                 ticket = %ticket.id,
                 error = %e,
-                "Could not compute working-tree churn — reviewer base defaults to 3",
+                "Could not compute working-tree churn — reviewer base defaults to the ceiling",
             );
-            3
+            MAX_REVIEWERS
         }
     };
-    count.max(1)
+    review_agent_count(base, ticket.priority)
 }
 
 /// Write out the ticket's reviewed base from the identity read before the round

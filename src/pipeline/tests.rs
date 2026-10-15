@@ -1406,10 +1406,10 @@ async fn passed_verification_round_records_the_reviewed_content() {
         .await
         .unwrap();
 
-    // Round 1: tiny churn in a fresh temp repo → 1 reviewer + the single tester.
-    // The provider leaves a file in the repository on every call, i.e. after the
-    // round captured the reviewers' content: exactly the "the tester touched the
-    // workspace" case the recorded base must not absorb.
+    // Round 1: churn inside the first band in a fresh temp repo → 1 reviewer +
+    // the single tester. The provider leaves a file in the repository on every
+    // call, i.e. after the round captured the reviewers' content: exactly the
+    // "the tester touched the workspace" case the recorded base must not absorb.
     let artefact_fake = std::sync::Arc::new(ArtefactLeavingProvider {
         repo: repo_path.clone(),
         fake: fake_clean_participants(2),
@@ -2091,8 +2091,8 @@ fn blocker_verification_merge_reduces_two_verifiers_to_one_outcome() {
 #[tokio::test]
 async fn verification_dynamic_count_calibration() {
     use crate::pipeline::verdict::{
-        DEFAULT_REVIEW_COUNT_HIGH_CHURN, DEFAULT_REVIEW_COUNT_LOW_CHURN,
-        DEFAULT_REVIEW_COUNT_TINY_CHURN, review_agent_count, review_base_from_signals,
+        DEFAULT_REVIEW_COUNT_HIGH_CHURN, DEFAULT_REVIEW_COUNT_LOW_CHURN, MAX_REVIEWERS,
+        review_agent_count, review_base_from_signals,
     };
     let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
@@ -2105,43 +2105,39 @@ async fn verification_dynamic_count_calibration() {
         .unwrap();
     let id = make_ticket(store, &ws, "Calib", TicketPhase::Verification).await;
 
-    let (tiny, low, high) = (
-        DEFAULT_REVIEW_COUNT_TINY_CHURN,
+    let (low, high) = (
         DEFAULT_REVIEW_COUNT_LOW_CHURN,
         DEFAULT_REVIEW_COUNT_HIGH_CHURN,
     );
-    // Literal calibration spec (ticket mahbot-2431): 1–199 → 1 reviewer,
-    // 200–999 → 2, 1000–2999 → 3, 3000+ → 4. Each threshold belongs to the
-    // higher band.
-    assert_eq!(tiny, 200);
-    assert_eq!(low, 1000);
+    // The calibration spec: up to and including 500 changed lines → 1 reviewer,
+    // 501–2999 → 2, 3000+ → the ceiling of 3.
+    assert_eq!(low, 500);
     assert_eq!(high, 3000);
-    assert_eq!(review_base_from_signals(0, tiny, low, high), 1);
-    assert_eq!(review_base_from_signals(199, tiny, low, high), 1);
-    assert_eq!(review_base_from_signals(200, tiny, low, high), 2);
-    assert_eq!(review_base_from_signals(999, tiny, low, high), 2);
-    assert_eq!(review_base_from_signals(1000, tiny, low, high), 3);
-    assert_eq!(review_base_from_signals(2999, tiny, low, high), 3);
-    assert_eq!(review_base_from_signals(3000, tiny, low, high), 4);
-    // P0 floor: priority-0 tickets never drop below 2 reviewers.
+    assert_eq!(review_base_from_signals(0, low, high), 1);
+    assert_eq!(review_base_from_signals(500, low, high), 1);
+    assert_eq!(review_base_from_signals(501, low, high), 2);
+    assert_eq!(review_base_from_signals(2999, low, high), 2);
+    assert_eq!(review_base_from_signals(3000, low, high), MAX_REVIEWERS);
+    // Priority floor: priority-0 tickets never drop below 2 reviewers, and the
+    // floor can never push a count past the ceiling.
     assert_eq!(review_agent_count(1, 0), 2);
     assert_eq!(review_agent_count(2, 0), 2);
-    assert_eq!(review_agent_count(4, 0), 4);
+    assert_eq!(review_agent_count(MAX_REVIEWERS, 0), 3);
     assert_eq!(review_agent_count(1, 5), 1);
 
     // `compute_reviewer_count` reads real working-tree churn: a 3000+-line
-    // untracked file yields the highest band (4 reviewers).
+    // untracked file yields the top band (the ceiling).
     std::fs::write(repo_path.join("big.txt"), "x\n".repeat(3000)).unwrap();
     let ticket = expect_ticket(store, &id).await;
     let count =
         crate::pipeline::verification::compute_reviewer_count(&ticket, repo_path.as_path()).await;
-    assert_eq!(count, 4, "churn >= 3000 must calibrate to 4 reviewers");
+    assert_eq!(count, 3, "churn >= 3000 must calibrate to 3 reviewers");
 
     // A clean verification round advances the ticket → InSanitation. The
     // workspace below is not a git repo, so the churn cannot be measured and
-    // the reviewer base falls back to 3: the round is 3 reviewers + the single
-    // tester (8 responses). The skip never fires here (no recorded base), so
-    // this also pins that the tester is always dispatched.
+    // the reviewer base falls back to the ceiling (3): the round is 3 reviewers
+    // + the single tester (8 responses). The skip never fires here (no recorded
+    // base), so this also pins that the tester is always dispatched.
     drop(repo_dir);
     let ws2 = create_test_workspace("/tmp/qa_calib_ws", "qa_calib_ws").await;
     crate::workspace::store()
@@ -2173,6 +2169,49 @@ async fn verification_dynamic_count_calibration() {
         expect_ticket_phase(store, &qa_id).await,
         TicketPhase::InSanitation
     );
+}
+
+/// Every direction of a cohort must reach a slot at every possible cohort size:
+/// the directions are shared out, never truncated, so a round can never leave a
+/// direction unhanded. The reviewer directions are the product's three, and a
+/// reviewer cohort that covers them takes exactly one each.
+#[test]
+fn cohort_directions_are_all_handed_out_at_every_cohort_size() {
+    use crate::pipeline::verdict::MAX_REVIEWERS;
+
+    let reviews = crate::prompt::load_prompt_sections("review_angles.md");
+    assert_eq!(reviews.len(), 3);
+    // The cohort sizes a reviewer round can actually be dispatched with.
+    for count in 1..=MAX_REVIEWERS {
+        let tasks: Vec<String> = (0..count)
+            .map(|k| super::agent_slot_task("PROMPT", &reviews, count, k))
+            .collect();
+        for direction in &reviews {
+            assert!(
+                tasks.iter().any(|task| task.contains(direction.as_str())),
+                "a cohort of {count} must hand out every direction",
+            );
+        }
+    }
+    assert_eq!(
+        (0..reviews.len())
+            .map(|k| super::agent_slot_task("PROMPT", &reviews, reviews.len(), k))
+            .collect::<Vec<_>>(),
+        reviews
+            .iter()
+            .map(|direction| format!("PROMPT\n\n{direction}"))
+            .collect::<Vec<_>>(),
+        "three reviewers get exactly one direction each",
+    );
+    // The functional tester is a cohort of one with its own directions.
+    let qa = crate::prompt::load_prompt_sections("qa_angles.md");
+    assert_eq!(
+        super::agent_slot_task("PROMPT", &qa, 1, 0),
+        format!("PROMPT\n\n{}", qa.join("\n\n")),
+        "the lone functional tester keeps every one of its directions",
+    );
+    // An analysis escalation slot carries no direction at all.
+    assert_eq!(super::agent_slot_task("PROMPT", &[], 2, 1), "PROMPT");
 }
 
 // ── 4. Bounce breaker trips terminal and drains Queued siblings ────────────

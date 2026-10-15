@@ -6,8 +6,4 @@ Maintainability angle: focus your review on maintainability — simplicity, clar
 
 ---
 
-Correctness angle: focus your review on correctness — logic errors, edge cases and boundary conditions, invalid inputs, concurrency, and regressions. Trace the changed code paths for these failure modes while keeping the full review bar.
-
----
-
 Robustness angle: focus your review on robustness — error paths, resource leaks, auth and injection concerns, and retry/backoff behavior. Probe the failure paths while keeping the full review bar.

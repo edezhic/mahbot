@@ -43,8 +43,10 @@ use super::raw_response_dump_section;
 
 // ── Hardcoded review-count calibration defaults (no config surface) ──────
 
-pub(crate) const DEFAULT_REVIEW_COUNT_TINY_CHURN: i64 = 200;
-pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: i64 = 1000;
+/// The reviewer ceiling, and the count an unmeasurable churn falls back to: a
+/// round's calibration never dispatches more reviewers than this.
+pub(crate) const MAX_REVIEWERS: usize = 3;
+pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: i64 = 500;
 pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: i64 = 3000;
 
 // ── Round data ─────────────────────────────────────────────────────────
@@ -323,29 +325,22 @@ fn member_bullet(
 // ── Calibrated dynamic agent counts ─────────────────────────────────────
 
 /// Compute the reviewer-count base from total working-tree churn (added +
-/// deleted lines, including lines of new files): 1 for churn < tiny, 2 for
-/// churn < low, 3 for churn < high, 4 otherwise — each threshold belongs to
-/// the higher band (e.g. churn == low calibrates to 3).
+/// deleted lines, including lines of new files): 1 up to and including
+/// `low_churn`, 2 below `high_churn`, [`MAX_REVIEWERS`] at or above it.
 #[must_use]
-pub(crate) fn review_base_from_signals(
-    total_churn: i64,
-    tiny_churn: i64,
-    low_churn: i64,
-    high_churn: i64,
-) -> usize {
-    if total_churn < tiny_churn {
+pub(crate) fn review_base_from_signals(total_churn: i64, low_churn: i64, high_churn: i64) -> usize {
+    if total_churn <= low_churn {
         1
-    } else if total_churn < low_churn {
-        2
     } else if total_churn < high_churn {
-        3
+        2
     } else {
-        4
+        MAX_REVIEWERS
     }
 }
 
-/// Apply the P0 floor: priority-0 tickets never drop below 2 reviewers
-/// (floor 2). Bounces do not change the count.
+/// Apply the priority floor: priority-0 tickets never drop below 2 reviewers
+/// (floor 2, below [`MAX_REVIEWERS`], so the floor never pushes a count past the
+/// ceiling). Bounces do not change the count.
 #[must_use]
 pub(crate) fn review_agent_count(base: usize, priority: i64) -> usize {
     if priority == 0 { base.max(2) } else { base }

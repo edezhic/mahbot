@@ -469,7 +469,7 @@ mod tests {
     const VARIANT_ASSETS: &[(&str, usize)] = &[
         ("analyze/angles.md", 3),
         ("analyze/ticket_angles.md", 3),
-        ("review_angles.md", 4),
+        ("review_angles.md", 3),
         ("qa_angles.md", 3),
         // Five framings plus the trailing order-contract comment section.
         ("synthesis/repair_framing.md", 6),
