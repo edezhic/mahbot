@@ -225,6 +225,55 @@ const MAX_ALARM_TRIGGER_CHARS: usize = 2000;
 /// overflowing. Also rejects absurd intervals as caller errors at creation.
 const MAX_PERIOD_SECS: i64 = i64::MAX / 1_000_000_000;
 
+/// The alarm sweep's tick: how long the loop waits between passes over due
+/// alarms. The first tick after start is also the overdue scan.
+const SWEEP_TICK: Duration = Duration::from_secs(1);
+
+/// A firing later than its scheduled time by more than this is MISSED, and its
+/// notice says so: 30 sweep ticks. One tick can overrun — its due batch is fired
+/// one alarm at a time, each with a durable write — so a firing past the bound
+/// did not come from a routine tick.
+#[expect(clippy::cast_possible_wrap)] // 30 ticks fit i64 by many orders
+const MISSED_FIRING_TOLERANCE: ChronoDuration =
+    ChronoDuration::seconds(30 * SWEEP_TICK.as_secs() as i64);
+
+/// Whether a firing at `now` was MISSED — the alarm's scheduled time had
+/// already passed by more than [`MISSED_FIRING_TOLERANCE`] when it fired.
+/// `scheduled` is the time the firing belongs to: the value as it stood before
+/// the state advance, never a periodic alarm's next occurrence.
+///
+/// Fail-soft: a scheduled time that cannot be read as a time is not a missed
+/// firing, and neither is one still in the future — a firing error would leave
+/// a due alarm re-firing on every tick.
+fn is_missed_firing(now: &str, scheduled: &str) -> bool {
+    let (Ok(now), Ok(scheduled)) = (
+        db::parse_utc_timestamp(now),
+        db::parse_utc_timestamp(scheduled),
+    ) else {
+        return false;
+    };
+    now.signed_duration_since(scheduled) > MISSED_FIRING_TOLERANCE
+}
+
+/// The opening line of the notices that carry the reminder's own text — the
+/// plain reminder and the triggered check's: what the reminder is, and how the
+/// firing it belongs to was timed — due now when it happened on time, an
+/// explicit MISSED naming the scheduled time when it was late.
+fn reminder_line(alarm: &Alarm, missed: bool) -> String {
+    let asset = if missed {
+        "alarm_reminder_missed.md"
+    } else {
+        "alarm_reminder_due.md"
+    };
+    crate::prompt::substitute(
+        &crate::prompt::load_prompt(asset),
+        &[
+            ("{{text}}", &alarm.text),
+            ("{{fire_at}}", &alarm.next_fire_at),
+        ],
+    )
+}
+
 /// Format an RFC3339 timestamp for display as `"{local} local time ({utc} UTC)"`.
 pub(crate) fn format_fire_time(timestamp: &str) -> Result<String> {
     let dt = DateTime::parse_from_rfc3339(timestamp)?;
@@ -564,14 +613,20 @@ async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
 /// assistant's own session (`alarm.session_id`, resolved directly — never
 /// re-derived from the id, which would double-escape colliding user names).
 /// One-shot alarms are terminalized (`status='fired'`); periodic alarms advance
-/// `next_fire_at` past every missed whole period.
+/// `next_fire_at` past every missed whole period. A firing later than its
+/// scheduled time by more than [`MISSED_FIRING_TOLERANCE`] says so in its notice
+/// (see [`reminder_line`]).
 async fn fire_alarm(alarm: &Alarm) -> Result<()> {
     if alarm.role.is_some() {
         return fire_custom_role_alarm(alarm).await;
     }
+    // Judged at the firing instant — the scheduled time as it stands before the
+    // advance — never when the notice is composed: a slow check, or a notice
+    // delivered late although the firing happened on time, is not a missed firing.
+    let missed = is_missed_firing(&db::now(), &alarm.next_fire_at);
     match &alarm.trigger {
-        Some(trigger) => fire_trigger_alarm(alarm, trigger).await,
-        None => fire_plain_alarm(alarm).await,
+        Some(trigger) => fire_trigger_alarm(alarm, trigger, missed).await,
+        None => fire_plain_alarm(alarm, missed).await,
     }
 }
 
@@ -675,14 +730,11 @@ async fn fire_custom_role_alarm(alarm: &Alarm) -> Result<()> {
 /// [`deliver_alarm_notification`]): a crash after persisting but before the
 /// state advance replays the reminder at boot and leaves the alarm due, so the
 /// reminder is never lost.
-async fn fire_plain_alarm(alarm: &Alarm) -> Result<()> {
+async fn fire_plain_alarm(alarm: &Alarm, missed: bool) -> Result<()> {
     let now = db::now();
     let content = crate::prompt::substitute(
         &crate::prompt::load_prompt("alarm_notification.md"),
-        &[
-            ("{{text}}", &alarm.text),
-            ("{{fire_at}}", &alarm.next_fire_at),
-        ],
+        &[("{{reminder_line}}", &reminder_line(alarm, missed))],
     );
     deliver_alarm_notification(alarm, content).await;
     advance_alarm_state(alarm, &now).await?;
@@ -772,7 +824,11 @@ impl Drop for InFlightGuard {
 /// the stored check and delivers its result. Every non-clean outcome also
 /// soft-deletes the alarm (see [`run_alarm_trigger_task`]); a stored check that
 /// cannot be read never runs at all and takes that same path.
-async fn fire_trigger_alarm(alarm: &Alarm, trigger: &StoredTrigger) -> Result<()> {
+///
+/// `missed` is the firing's lateness, decided before the check starts and
+/// carried into the notice the finished run produces: how long the check itself
+/// takes is not lateness.
+async fn fire_trigger_alarm(alarm: &Alarm, trigger: &StoredTrigger, missed: bool) -> Result<()> {
     // Advance state FIRST — independent of the check's outcome — so a slow or
     // failing check cannot keep the alarm due and re-fire it on every sweep.
     advance_alarm_state(alarm, &db::now()).await?;
@@ -783,7 +839,11 @@ async fn fire_trigger_alarm(alarm: &Alarm, trigger: &StoredTrigger) -> Result<()
         return Ok(());
     }
 
-    tokio::spawn(run_alarm_trigger_task(alarm.clone(), trigger.clone()));
+    tokio::spawn(run_alarm_trigger_task(
+        alarm.clone(),
+        trigger.clone(),
+        missed,
+    ));
     Ok(())
 }
 
@@ -874,7 +934,7 @@ async fn run_trigger(ws: &Workspace, user: &str, trigger: &Trigger) -> TriggerOu
 ///
 /// Every non-clean outcome soft-deletes the alarm before the notification is
 /// delivered, so a broken check can never keep the alarm armed and re-firing.
-async fn run_alarm_trigger_task(alarm: Alarm, trigger: StoredTrigger) {
+async fn run_alarm_trigger_task(alarm: Alarm, trigger: StoredTrigger, missed: bool) {
     // The in-flight marker is removed unconditionally on drop.
     let _in_flight = InFlightGuard(alarm.id.clone());
 
@@ -898,7 +958,7 @@ async fn run_alarm_trigger_task(alarm: Alarm, trigger: StoredTrigger) {
         Some(delete_alarm_after_run(&alarm).await)
     };
 
-    match trigger_notification(&alarm, &trigger, &outcome, deletion.as_ref()) {
+    match trigger_notification(&alarm, &trigger, &outcome, deletion.as_ref(), missed) {
         Some(content) => deliver_alarm_notification(&alarm, content).await,
         None => {
             tracing::debug!(alarm = %alarm.id, "alarm check reported nothing — staying silent");
@@ -911,12 +971,14 @@ async fn run_alarm_trigger_task(alarm: Alarm, trigger: StoredTrigger) {
 /// `<alarm-notification>` with the reminder, the trigger, the status line, the
 /// deletion note (on every non-clean outcome) and the check's output.
 /// `deletion` carries the result of [`delete_alarm_after_run`], `None` on
-/// the clean path.
+/// the clean path; `missed` is the firing's lateness, decided when the firing
+/// happened.
 fn trigger_notification(
     alarm: &Alarm,
     trigger: &StoredTrigger,
     outcome: &TriggerOutcome,
     deletion: Option<&Result<()>>,
+    missed: bool,
 ) -> Option<String> {
     let (status, output) = match outcome {
         TriggerOutcome::Silent => return None,
@@ -954,8 +1016,7 @@ fn trigger_notification(
     Some(crate::prompt::substitute(
         &crate::prompt::load_prompt("alarm_trigger_notification.md"),
         &[
-            ("{{text}}", &alarm.text),
-            ("{{fire_at}}", &alarm.next_fire_at),
+            ("{{reminder_line}}", &reminder_line(alarm, missed)),
             ("{{trigger}}", &trigger.render()),
             ("{{trigger_status}}", &status),
             ("{{trigger_deletion}}", &deletion_line),
@@ -1006,7 +1067,7 @@ async fn run_alarm_sweep(batch_limit: usize) -> Result<()> {
 /// The first tick acts as the boot-time overdue scan.
 pub async fn run_alarm_sweep_loop() {
     loop {
-        if !crate::shutdown::sleep_or_shutdown_or_drain(Duration::from_secs(1)).await {
+        if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_TICK).await {
             break;
         }
         if let Err(e) = run_alarm_sweep(50).await {
@@ -1033,6 +1094,55 @@ mod tests {
     #[test]
     fn format_fire_time_rejects_invalid() {
         assert!(format_fire_time("not-a-time").is_err());
+    }
+
+    /// A firing is MISSED only when it lands well past its scheduled time: a
+    /// routine tick's own delay never counts, and a scheduled time that cannot
+    /// be read is not a miss either — that would fail the firing of an alarm
+    /// that stays due, re-firing it every tick.
+    #[test]
+    fn missed_firing_needs_a_firing_far_past_its_scheduled_time() {
+        let scheduled = "2026-09-04T12:00:00+00:00";
+        assert!(!is_missed_firing("2026-09-04T12:00:00+00:00", scheduled));
+        assert!(!is_missed_firing("2026-09-04T12:00:05+00:00", scheduled));
+        assert!(!is_missed_firing("2026-09-04T12:00:30+00:00", scheduled));
+        assert!(
+            is_missed_firing("2026-09-04T12:01:00+00:00", scheduled),
+            "a firing a minute late is past the tolerance"
+        );
+        assert!(
+            is_missed_firing("2026-09-04T23:00:00+00:00", scheduled),
+            "an overnight gap must be reported as missed"
+        );
+        assert!(!is_missed_firing("2026-09-04T12:00:00+00:00", "not-a-time"));
+        assert!(!is_missed_firing("2026-09-04T11:00:00+00:00", scheduled));
+    }
+
+    /// The opening line is what the notice says about its own timing: today's
+    /// wording when the firing happened on time, and the missed statement with
+    /// the scheduled time when it did not.
+    #[test]
+    fn reminder_line_says_missed_with_the_scheduled_time() {
+        let alarm = trigger_alarm();
+        assert_eq!(
+            reminder_line(&alarm, false),
+            "Your reminder \"check the thing\" is due now \
+             (scheduled for 2026-09-04T12:00:00+00:00)."
+        );
+        let missed = reminder_line(&alarm, true);
+        assert!(missed.contains("was MISSED"), "got: {missed}");
+        assert!(
+            missed.contains("2026-09-04T12:00:00+00:00"),
+            "the scheduled time must be named: {missed}"
+        );
+        assert!(
+            missed.contains("Tell the user"),
+            "the assistant must be told to pass it on: {missed}"
+        );
+        assert!(
+            !missed.contains("due now"),
+            "a missed firing must not read as current: {missed}"
+        );
     }
 
     #[test]
@@ -1262,10 +1372,13 @@ mod tests {
     fn trigger_notification_stays_silent_when_check_reports_nothing() {
         let alarm = trigger_alarm();
         let trigger = StoredTrigger::Tool(weather_trigger());
-        assert!(
-            trigger_notification(&alarm, &trigger, &TriggerOutcome::Silent, None).is_none(),
-            "a silent check must not wake the assistant"
-        );
+        for missed in [false, true] {
+            assert!(
+                trigger_notification(&alarm, &trigger, &TriggerOutcome::Silent, None, missed)
+                    .is_none(),
+                "a silent check must not wake the assistant, late or not"
+            );
+        }
     }
 
     /// The reversal the trigger exists for: only a clean run that reported
@@ -1311,7 +1424,7 @@ mod tests {
         let alarm = trigger_alarm();
         let trigger = StoredTrigger::Tool(weather_trigger());
         let outcome = TriggerOutcome::Ran(ran(true, "exit status 0", "all good", true));
-        let content = trigger_notification(&alarm, &trigger, &outcome, None).unwrap();
+        let content = trigger_notification(&alarm, &trigger, &outcome, None, false).unwrap();
         assert!(content.contains("<alarm-notification>"));
         assert!(content.contains("check the thing"));
         assert!(content.contains("weather {\"city\":\"Minsk\"}"));
@@ -1321,6 +1434,31 @@ mod tests {
             !content.contains("DELETED"),
             "clean path must not report a deletion"
         );
+        assert!(
+            content.contains("is due now (scheduled for 2026-09-04T12:00:00+00:00)."),
+            "a firing on time keeps today's wording: {content}"
+        );
+    }
+
+    /// A late firing is reported as missed, naming the time it was scheduled
+    /// for, on every notice a firing produces.
+    #[test]
+    fn trigger_notification_says_a_late_firing_was_missed() {
+        let alarm = trigger_alarm();
+        let trigger = StoredTrigger::Tool(weather_trigger());
+        for outcome in [
+            TriggerOutcome::Ran(ran(true, "exit status 0", "all good", true)),
+            TriggerOutcome::Ran(ran(false, "exit status 2", "boom", true)),
+            TriggerOutcome::CouldNotRun("the managed bun runtime is unavailable".to_string()),
+        ] {
+            let content = trigger_notification(&alarm, &trigger, &outcome, None, true).unwrap();
+            assert!(content.contains("was MISSED"), "got: {content}");
+            assert!(
+                content.contains("2026-09-04T12:00:00+00:00"),
+                "got: {content}"
+            );
+            assert!(!content.contains("due now"), "got: {content}");
+        }
     }
 
     /// Output that strips away to nothing is still reported, so the notice must
@@ -1330,7 +1468,7 @@ mod tests {
         let alarm = trigger_alarm();
         let trigger = StoredTrigger::Tool(weather_trigger());
         let outcome = TriggerOutcome::Ran(ran(true, "exit status 0", "", true));
-        let content = trigger_notification(&alarm, &trigger, &outcome, None).unwrap();
+        let content = trigger_notification(&alarm, &trigger, &outcome, None, false).unwrap();
         assert!(content.contains("not printable"), "got: {content}");
         assert!(!content.contains("(no output)"), "got: {content}");
     }
@@ -1343,7 +1481,8 @@ mod tests {
         let trigger = StoredTrigger::Tool(weather_trigger());
         let outcome = TriggerOutcome::Ran(ran(false, "exit status 2", "", false));
 
-        let deleted = trigger_notification(&alarm, &trigger, &outcome, Some(&Ok(()))).unwrap();
+        let deleted =
+            trigger_notification(&alarm, &trigger, &outcome, Some(&Ok(())), false).unwrap();
         assert!(deleted.contains("FAILED (exit status 2)"), "got: {deleted}");
         assert!(deleted.contains("(no output)"), "got: {deleted}");
         assert!(deleted.contains("DELETED"), "got: {deleted}");
@@ -1353,6 +1492,7 @@ mod tests {
             &trigger,
             &outcome,
             Some(&Err(anyhow::anyhow!("db down"))),
+            false,
         )
         .unwrap();
         assert!(failed.contains("FAILED"), "got: {failed}");
@@ -1369,7 +1509,8 @@ mod tests {
         let trigger = StoredTrigger::Tool(weather_trigger());
         let outcome =
             TriggerOutcome::CouldNotRun("the custom tool \"weather\" is no longer usable".into());
-        let content = trigger_notification(&alarm, &trigger, &outcome, Some(&Ok(()))).unwrap();
+        let content =
+            trigger_notification(&alarm, &trigger, &outcome, Some(&Ok(())), false).unwrap();
         assert!(
             content.contains("no longer usable"),
             "the reason must reach the assistant: {content}"
@@ -1507,12 +1648,70 @@ mod tests {
         let job = rx.recv().await.expect("plain reminder must route");
         assert!(job.content.contains("<alarm-notification>"));
         assert!(job.content.contains("check the deploy"));
+        assert!(
+            !job.content.contains("MISSED"),
+            "a firing on time must not claim it was missed: {}",
+            job.content
+        );
         crate::agent::message_router::unregister_agent("assistant:alarm-plain-it");
 
         assert_eq!(
             alarm_status(&alarm.id).await,
             "fired",
             "one-shot must be terminalized"
+        );
+    }
+
+    /// Fire-time integration: an alarm the sweep reaches long after its
+    /// scheduled time — a start after the product was down, a machine that was
+    /// suspended — reaches the user as missed, naming the occurrence that was
+    /// due rather than the next one the state advance has already written.
+    #[tokio::test]
+    async fn fire_late_alarm_says_the_firing_was_missed() {
+        crate::util::test::init_management_test_stores().await;
+        let session = "assistant:alarm-late-it";
+        let mut rx = crate::agent::message_router::register_agent(session);
+        let alarm = add_alarm(
+            session,
+            "alarm-late",
+            "check the deploy",
+            None,
+            Some(3600),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Make it due with its scheduled time long past, and fire the row the
+        // sweep's own read selects.
+        store()
+            .conn
+            .execute(
+                "UPDATE alarms SET next_fire_at = ?1 WHERE id = ?2",
+                db::params!["2020-01-01T00:00:00Z", alarm.id.as_str()],
+            )
+            .await
+            .unwrap();
+        let due = due_alarms(&db::now()).await.unwrap();
+        let stored = due
+            .iter()
+            .find(|candidate| candidate.id == alarm.id)
+            .expect("the alarm must be due");
+
+        fire_alarm(stored).await.unwrap();
+
+        let job = rx.recv().await.expect("late reminder must route");
+        crate::agent::message_router::unregister_agent(session);
+        assert!(
+            job.content
+                .contains("scheduled for 2020-01-01T00:00:00Z, which had already passed"),
+            "the occurrence that was missed must be the one named: {}",
+            job.content
+        );
+        assert_eq!(
+            alarm_status(&alarm.id).await,
+            "active",
+            "a periodic alarm survives its firing"
         );
     }
 

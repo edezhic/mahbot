@@ -1,3 +1,3 @@
 <alarm-notification>
-Your reminder "{{text}}" is due now (scheduled for {{fire_at}}).
+{{reminder_line}}
 </alarm-notification>
