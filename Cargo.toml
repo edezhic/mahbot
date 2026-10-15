@@ -286,8 +286,10 @@ minimp3 = "0.5"
 objc2 = "0.6"
 # The AppleEvent features are not for Computer Use: the quit interception (src/shutdown.rs) reads
 # the reason the system names on a Quit AppleEvent — NSAppleEventManager/NSAppleEventDescriptor,
-# plus kAEQuitReason and its reason codes from CoreServices.
-objc2-foundation = { version = "0.3", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "objc2-core-services"] }
+# plus kAEQuitReason and its reason codes from CoreServices. NSProcessInfo, with the NSString its
+# reason argument takes, carries the one activity that takes the process out of App Nap and off
+# timer coalescing (src/power.rs).
+objc2-foundation = { version = "0.3", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "NSProcessInfo", "NSString", "objc2-core-services"] }
 objc2-core-services = "0.3"
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"

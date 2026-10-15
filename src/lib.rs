@@ -70,6 +70,9 @@ pub(crate) mod ooxml;
 /// the shared document converter ([`crate::document`]).
 pub(crate) mod pdf_marks;
 pub mod pipeline;
+/// The platform's own exemption from the way it slows a process whose window is not
+/// visible, asked for once on the daemon's start-up path.
+pub mod power;
 pub(crate) mod prompt;
 pub mod providers;
 /// The marks every document reader prints: the block headers, the unit marks

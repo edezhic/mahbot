@@ -28,6 +28,7 @@ use mahbot::channels::telegram::{ControlInput, control_input, user_command_entri
 use mahbot::config::CONFIG;
 use mahbot::gui::{Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::logs::LogStore;
+use mahbot::power::Report;
 use mahbot::session::clear_session;
 use mahbot::util::UnwrapPoison;
 use mahbot::{BotCommand, Channel, ChannelMessage, Role, Workspace};
@@ -51,8 +52,11 @@ const LOG_RETENTION_HOURS: i64 = 8;
 ///
 /// The log store the boot opened travels with the result — the dashboard's logs
 /// page is built from it, so it is handed over rather than parked in a global.
-async fn bootstrap_mahbot_safe(start_paused: bool) -> Result<LogStore, String> {
-    match AssertUnwindSafe(bootstrap_mahbot(start_paused))
+async fn bootstrap_mahbot_safe(
+    start_paused: bool,
+    slowdown: Option<Report>,
+) -> Result<LogStore, String> {
+    match AssertUnwindSafe(bootstrap_mahbot(start_paused, slowdown))
         .catch_unwind()
         .await
     {
@@ -81,7 +85,10 @@ async fn bootstrap_mahbot_safe(start_paused: bool) -> Result<LogStore, String> {
 ///
 /// `start_paused` is the `mahbot paused` startup mode: every registered
 /// workspace is put on pause before the poll loop that claims work starts.
-async fn bootstrap_mahbot(start_paused: bool) -> Result<LogStore> {
+///
+/// `slowdown` is what the platform answered when the daemon path asked for the
+/// slowdown exemption; it becomes the start-up line below.
+async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Result<LogStore> {
     mahbot::config::load_or_init()
         .await
         .map_err(|e| mahbot::boot::record_startup_failure("config::load_or_init", e))?;
@@ -91,6 +98,17 @@ async fn bootstrap_mahbot(start_paused: bool) -> Result<LogStore> {
     // consolidated domain store. Shared with the store-lock check so the two
     // cannot drift.
     let log_store = mahbot::boot::open_stores().await?;
+
+    // The platform exemption the start-up asked for, as an ordinary status line: an INFO
+    // row, so it is not a problem in the Issues view, written once per start with nothing
+    // de-duplicating it. A platform that made no request says nothing.
+    if let Some(report) = slowdown {
+        info!(
+            request = report.request,
+            result = %report.reply,
+            "Platform slowdown exemption requested for the life of the service"
+        );
+    }
 
     // Start the CDC-driven chronicle subscriber (materializes ticket_chronicle
     // transitions from ticket change events). Must run after the stores are up.
@@ -805,6 +823,15 @@ fn main() -> Result<()> {
     // behaves exactly as before.
     let start_paused = std::env::args().nth(1).as_deref() == Some("paused");
 
+    // The platform's own exemption from slowing this process down because its window is
+    // not visible, asked for here — before anything else the daemon does, so it holds for
+    // the whole life of the service rather than from the moment the dashboard appears.
+    // Every command-line verb above is dispatched before this point on purpose, and a
+    // restart or a self-update comes back through here rather than carrying anything over.
+    // What came back travels into the boot task below, which reports it once the logs store
+    // can hold the line.
+    let slowdown = mahbot::power::exempt_from_slowdown();
+
     // Subscribe to the platform's stop requests before boot and before the interface
     // exists; `shutdown` names the three sources.
     mahbot::shutdown::install_stop_request_sources();
@@ -873,7 +900,10 @@ fn main() -> Result<()> {
         move || {
             (
                 Dashboard::loading(),
-                iced::Task::perform(bootstrap_mahbot_safe(start_paused), DashboardMessage::Boot),
+                iced::Task::perform(
+                    bootstrap_mahbot_safe(start_paused, slowdown),
+                    DashboardMessage::Boot,
+                ),
             )
         },
         Dashboard::update,
