@@ -55,6 +55,22 @@ pub(crate) fn load_prompt_sections(asset_key: &str) -> Vec<String> {
     split_sections(&load_prompt(asset_key))
 }
 
+/// Deal a section list out strided across a cohort of `count` slots, rendered
+/// as the slot `k`'s own share. No section is left unhanded at any cohort size:
+/// the slots share the list in rotation, and the surplus stacks onto the leading
+/// slots when there are fewer slots than sections (a lone slot receives them
+/// all). Every section reaches exactly one slot.
+#[must_use]
+pub(crate) fn deal_sections(sections: &[String], count: usize, k: usize) -> String {
+    sections
+        .iter()
+        .skip(k)
+        .step_by(count)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Split a prompt asset's text into `---`-delimited sections (trimmed, empty
 /// sections dropped).
 fn split_sections(text: &str) -> Vec<String> {

@@ -4,7 +4,7 @@
 //!
 //! Unlike `quick` (one round of parallel analysts for quick clarification), the
 //! pipeline is: round 0 decomposes the question
-//! via three independent plans merged by id-based coverage; round 1 runs one
+//! via two independent plans merged by id-based coverage; round 1 runs one
 //! analyst per sub-question (high-risk items get a decorrelated second
 //! angle); conditional gap rounds with shrinking width follow, each targeting
 //! the named gaps. A coder-in-loop prototype pass (`run_coder_round`) runs before
@@ -61,8 +61,8 @@ use std::time::{Duration, Instant};
 /// orchestrator coordination LLM calls do not. Enforced at reservation time,
 /// never refunded.
 const RESEARCH_MAX_ANALYSTS: usize = 30;
-/// Round-0 decomposition fan-out (three independent plans).
-const DECOMPOSE_FAN_OUT: usize = 3;
+/// Round-0 decomposition fan-out (two independent plans).
+const DECOMPOSE_FAN_OUT: usize = 2;
 /// Gap-round dispatch widths — rounds shrink as they progress.
 const GAP_ROUND_WIDTHS: &[usize] = &[4, 3, 2];
 /// Explicit marker when the orchestrator cannot determine the remaining gaps.
@@ -1623,9 +1623,9 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
 
 // ── Round 0: decomposition ───────────────────────────────────────────────
 
-/// Round 0: three independent decomposition plans merged into one
+/// Round 0: two independent decomposition plans merged into one
 /// consolidated plan with provenance via a single orchestrator LLM call.
-/// Budget: 3 decomposers. The x3 redundancy lives here, at the steering
+/// Budget: 2 decomposers. The x2 redundancy lives here, at the steering
 /// decision. On merge failure the run falls back to the first valid plan
 /// verbatim with an explicit marker; only when ALL decomposers failed does
 /// the run error (no plan = no research).
@@ -1734,7 +1734,7 @@ fn render_plans_with_ids(plans: &[DecompositionPlan]) -> String {
     out
 }
 
-/// Merge 1–3 independent plans into one consolidated plan with provenance
+/// Merge 1–2 independent plans into one consolidated plan with provenance
 /// (orchestrator extraction call — not budgeted).
 async fn merge_decomposition_plans(
     ws: &Workspace,
@@ -3895,11 +3895,8 @@ mod tests {
             DecompositionPlan {
                 sub_questions: vec![sq("q1"), sq("q3")],
             },
-            DecompositionPlan {
-                sub_questions: vec![sq("q4"), sq("q5")],
-            },
         ];
-        // Global flat ids: plan 0: q1=0 q2=1; plan 1: q1=2 q3=3; plan 2: q4=4 q5=5.
+        // Global flat ids: plan 0: q1=0 q2=1; plan 1: q1=2 q3=3.
         let base = |also: bool, dropped: bool| MergedPlan {
             sub_questions: vec![
                 MergedSubQuestion {
@@ -3916,23 +3913,9 @@ mod tests {
                     from_id: 1,
                     also_ids: vec![],
                 },
-                MergedSubQuestion {
-                    question: String::new(),
-                    evidence_needed: String::new(),
-                    risk: String::new(),
-                    from_id: 3,
-                    also_ids: vec![],
-                },
-                MergedSubQuestion {
-                    question: String::new(),
-                    evidence_needed: String::new(),
-                    risk: String::new(),
-                    from_id: 4,
-                    also_ids: vec![],
-                },
             ],
             dropped: if dropped {
-                vec![DroppedSubQuestion { id: 5 }]
+                vec![DroppedSubQuestion { id: 3 }]
             } else {
                 vec![]
             },
@@ -3947,7 +3930,7 @@ mod tests {
         );
         assert!(
             validate_merged_plan(&base(true, false), &plans).is_err(),
-            "silent dropout: q5 (id 5) is never covered"
+            "silent dropout: q3 (id 3) is never covered"
         );
         let mut bad = base(true, true);
         bad.sub_questions[0].from_id = 9;
@@ -3956,7 +3939,7 @@ mod tests {
             "out-of-range from_id is rejected"
         );
         let mut bad = base(true, true);
-        bad.sub_questions[3].from_id = 0;
+        bad.sub_questions[1].from_id = 0;
         assert!(
             validate_merged_plan(&bad, &plans).is_err(),
             "duplicate placement (id 0 twice) is rejected"

@@ -16,7 +16,7 @@
 //! call only. `deep` ignores `place`.
 //! Argument mechanics and refusals live in [`super::delegation`].
 //!
-//! Analyst batches run three decorrelated analysts (distinct research angles)
+//! Analyst batches run two decorrelated analysts (distinct research angles)
 //! that report structured claim-level findings; consolidation runs the shared
 //! LLM grouping pass ([`crate::consensus`]) — semantic grouping + contradiction
 //! judgment with code-computed agreement brackets. Disputed groups (those with
@@ -42,7 +42,7 @@ use std::time::Duration;
 
 /// Number of decorrelated parallel analysts spawned per analyze round (durable and
 /// sync pipelines share the same batch width).
-const PARALLEL_ANALYST_COUNT: usize = 3;
+const PARALLEL_ANALYST_COUNT: usize = 2;
 
 /// Controls sub-agent dispatch behaviour.
 ///
@@ -898,14 +898,14 @@ fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(), String> 
 /// Bounds the shared dispatch — never a per-run analyst budget.
 pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
 
-/// Load the decorrelation angles asset — one distinct research angle per
-/// parallel analyst. Malformed or missing sections degrade to an empty angle
-/// (the plain analyze is used, preserving the original single-question behavior).
+/// Load the decorrelation angles asset — the research angles dealt out across
+/// the parallel analyst cohort ([`crate::prompt::deal_sections`]).
 pub(crate) fn load_analyst_angles() -> Vec<String> {
     load_prompt_sections("analyze/angles.md")
 }
 
-/// Compose an analyst's roster slot (angle appended to the analyze).
+/// Compose an analyst's roster slot: the analyze with the slot's share of the
+/// decorrelation angles appended ([`crate::prompt::deal_sections`]).
 /// KV-cache discipline: vary ONLY the user message (the research
 /// angle) — never per-analyst model/effort/tools.
 fn analyst_slot(
@@ -915,11 +915,11 @@ fn analyst_slot(
     i: usize,
     analyze: &str,
 ) -> AnalyzeSlot {
-    let angle = angles.get(i).cloned().unwrap_or_default();
-    let task = if angle.is_empty() {
+    let assigned = crate::prompt::deal_sections(angles, PARALLEL_ANALYST_COUNT, i);
+    let task = if assigned.is_empty() {
         analyze.to_string()
     } else {
-        format!("{analyze}\n\nResearch angle:\n{angle}")
+        format!("{analyze}\n\n{assigned}")
     };
     AnalyzeSlot {
         agent_id: format!("analyze_{}_{}_{}_analyst", ws.name, suffix, i),
@@ -2239,7 +2239,7 @@ mod tests {
         .map(|text| text.expect("a live round delivers its consolidated text"))
     }
 
-    /// Two analysts agreeing on one claim (2/3, no contradictions).
+    /// Two analysts agreeing on one claim, plus a no-response member.
     fn agreed_outcomes(raw_a: &str, raw_b: &str) -> Vec<AnalystOutcome> {
         vec![
             AnalystOutcome::Findings {

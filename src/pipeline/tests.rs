@@ -1121,7 +1121,7 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         "aged backlog ticket must be claimed into Analysis",
     );
 
-    // Analysis: 3 clean analysts → Planning, job deleted.
+    // Analysis: 2 clean analysts → Planning, job deleted.
     let job_id = crate::generate_id();
     spawn_phase_job(
         &job_id,
@@ -1137,8 +1137,6 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
             .ok("analyst one")
             .ok(r#"{"issues":[]}"#)
             .ok("analyst two")
-            .ok(r#"{"issues":[]}"#)
-            .ok("analyst three")
             .ok(r#"{"issues":[]}"#);
         let _seam = crate::util::test::install_retry_seam(fake);
         super::analysis::run(
@@ -1694,10 +1692,10 @@ async fn run_verification_round(
 
 // ── 2. Analysis escalation + blocker verification ───────────────────────
 
-/// A base analysis round that flags a shared blocker escalates to 2
-/// blocker-verification analysts; the verifiers grade the blocker with
-/// substance (kind/severity/impact/reasoning), the ticket still advances to
-/// Planning, and the joint comment records the enrichment.
+/// A base analysis round whose analysts flag a shared blocker escalates to the
+/// blocker-verification cohort; the verifiers grade the blocker with substance
+/// (kind/severity/impact/reasoning), the ticket still advances to Planning, and
+/// the joint comment records the enrichment.
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -1723,9 +1721,9 @@ async fn analysis_escalation_and_blocker_verification() {
     .await;
 
     {
-        // 3 base analysts: 2 flag the SAME blocker (grade=blocker), 1 passes
-        // clean. The base consolidation groups both blocker findings; the
-        // escalation then runs 2 verifiers that grade the blocker
+        // 2 base analysts: BOTH flag the SAME blocker (grade=blocker). The base
+        // consolidation groups both blocker findings; the escalation then runs
+        // the blocker-verification cohort, which grades the blocker
         // (enrichment-only: one sees it as a risk/edge-case, the other as a
         // main-path blocker).
         let fake = crate::util::test::FakeProvider::new()
@@ -1733,8 +1731,6 @@ async fn analysis_escalation_and_blocker_verification() {
             .ok(r#"{"issues":[{"text":"missing error handling","grade":"blocker"}]}"#)
             .ok("analyst two")
             .ok(r#"{"issues":[{"text":"missing error handling","grade":"blocker"}]}"#)
-            .ok("analyst three")
-            .ok(r#"{"issues":[]}"#)
             .ok(r#"{"summary":"both analysts flag missing error handling.","groups":[{"heading":"Missing error handling","contradiction":false,"members":[{"id":0},{"id":1}]}],"ungrouped":[]}"#)
             .ok("verifier one")
             .ok(r#"{"verdicts":[{"index":0,"kind":"risk_edge_case","severity":"medium","impact":"delays onboarding","reasoning":"present but not blocking"}]}"#)
@@ -1774,7 +1770,7 @@ async fn analysis_escalation_and_blocker_verification() {
 
 /// Slot-resume: an interrupted analysis round whose roster already carries a
 /// Done slot must reconstruct that slot from its stored outcome and re-run ONLY
-/// the not-Done slots with their stored tasks. A fresh rebuild (the pre-fix
+/// the not-Done slot with its stored task. A fresh rebuild (the pre-fix
 /// behavior) would re-run every slot with a new suffix and grow the roster with
 /// duplicate-idx rows; here the Done slot is provably NOT re-run (its stored
 /// verdict is reconstructed without an LLM call).
@@ -1802,8 +1798,8 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     .await;
 
     // Seed a partially-completed round: idx 0 Done (a stored clean verdict),
-    // idx 1/2 Failed (interrupted before they produced a verdict). The stored
-    // per-slot tasks are what the resume re-runs them with.
+    // idx 1 Failed (interrupted before it produced a verdict). The stored
+    // per-slot task is what the resume re-runs it with.
     let conn = &crate::session::store().conn;
     let done_outcome = super::serialize_verdict_outcome(&super::ParallelVerdict::Analysis(
         crate::AnalysisVerdict {
@@ -1820,11 +1816,6 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
         ),
         (
             1_i64,
-            crate::jobs::RowStatus::Failed,
-            Some(fail_outcome.as_str()),
-        ),
-        (
-            2_i64,
             crate::jobs::RowStatus::Failed,
             Some(fail_outcome.as_str()),
         ),
@@ -1849,13 +1840,11 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     }
 
     {
-        // Only the 2 not-Done slots are re-run: each consumes a turn response
-        // and a verdict extraction. The Done slot is reconstructed (0 calls).
+        // Only the not-Done slot is re-run: it consumes a turn response and a
+        // verdict extraction. The Done slot is reconstructed (0 calls).
         let fake: std::sync::Arc<crate::util::test::FakeProvider> = std::sync::Arc::new(
             crate::util::test::FakeProvider::new()
                 .ok("analyst one")
-                .ok(r#"{"issues":[]}"#)
-                .ok("analyst two")
                 .ok(r#"{"issues":[]}"#),
         );
         let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
@@ -1865,23 +1854,18 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
             job_id.clone(),
         )
         .await;
-        // The two not-Done slots are re-run from their STORED tasks (the only
-        // prompts that may appear), while the Done slot's stored task is never
-        // dispatched. An exact call count would be racy here: the slots run in
-        // parallel and pop the shared scripted responses in arbitrary order,
-        // so one slot's verdict extraction can pop the other's prose turn
-        // response and retry — retries still carry only the stored tasks.
+        // The not-Done slot is re-run from its STORED task (the only prompt that
+        // may appear), while the Done slot's stored task is never dispatched. An
+        // exact call count would be racy here: a slot's verdict extraction can
+        // fail and retry — retries still carry only the stored task.
         let fps = fake.request_fingerprints.lock().unwrap();
-        for task in ["resume task 1", "resume task 2"] {
-            assert!(
-                fps.iter().any(|f| f.contains(task)),
-                "the not-Done slot must be re-run with its stored task: {task}"
-            );
-        }
         assert!(
-            fps.iter()
-                .all(|f| f.contains("resume task 1") || f.contains("resume task 2")),
-            "only the not-Done slots' stored tasks may be dispatched — a fresh rebuild \
+            fps.iter().any(|f| f.contains("resume task 1")),
+            "the not-Done slot must be re-run with its stored task"
+        );
+        assert!(
+            fps.iter().all(|f| f.contains("resume task 1")),
+            "only the not-Done slot's stored task may be dispatched — a fresh rebuild \
              (derived tasks) or a re-run of the Done slot is a resume regression"
         );
     }
@@ -1927,11 +1911,13 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     .await;
 
     let conn = &crate::session::store().conn;
-    // Base round (idx 0-2): two analysts flag the SAME blocker (grade=blocker),
-    // one passes clean. Escalation (idx 3-4): idx 3 already graded the blocker
-    // (Done); idx 4 was interrupted (Failed) and must be re-run. The escalation
-    // task bakes the blocker list (marker + numbered line) so the resume can
-    // re-derive the entries from the stored task.
+    // Base cohort (idx 0-1, kind Analyst): one analyst flags a blocker
+    // (grade=blocker), the other passes clean — Done, so both are reconstructed.
+    // Escalation cohort (idx 2-3, kind BlockerVerifier): idx 2 already graded the
+    // blocker (Done); idx 3 was interrupted (Failed) and must be re-run. The
+    // escalation task bakes the blocker list (marker + numbered line) so the
+    // resume can re-derive the entries from the stored task; the base rows carry
+    // a plain base task.
     let blocker_verdict = super::serialize_verdict_outcome(&super::ParallelVerdict::Analysis(
         crate::AnalysisVerdict {
             issues_detected: vec![crate::AnalysisIssue {
@@ -1960,44 +1946,42 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
         super::serialize_verdict_outcome(&super::ParallelVerdict::NoResponse("interrupted".into()));
     let escalation_task = "The list below is indexed from 0 — report the outcome for each blocker \
          using the matching index.\n\nBlocker list:\n0. missing error handling";
+    let base_task = "Base analysis: review the ticket and report graded issues.";
     let seeds = [
         (
             0_i64,
+            crate::jobs::AgentKind::Analyst,
             crate::jobs::RowStatus::Done,
             Some(blocker_verdict.as_str()),
+            base_task,
         ),
         (
             1_i64,
+            crate::jobs::AgentKind::Analyst,
             crate::jobs::RowStatus::Done,
-            Some(blocker_verdict.as_str()),
+            Some(clean_verdict.as_str()),
+            base_task,
         ),
         (
             2_i64,
+            crate::jobs::AgentKind::BlockerVerifier,
             crate::jobs::RowStatus::Done,
-            Some(clean_verdict.as_str()),
+            Some(grade_outcome.as_str()),
+            escalation_task,
         ),
         (
             3_i64,
-            crate::jobs::RowStatus::Done,
-            Some(grade_outcome.as_str()),
-        ),
-        (
-            4_i64,
+            crate::jobs::AgentKind::BlockerVerifier,
             crate::jobs::RowStatus::Failed,
             Some(fail_outcome.as_str()),
+            escalation_task,
         ),
     ];
-    for (idx, status, outcome) in seeds {
+    for (idx, kind, status, outcome, task) in seeds {
         let agent_id = format!("ticket_{id}_{idx}_resume_escalation_analyst");
         conn.execute(
             crate::jobs::AGENT_INSERT_SQL,
-            crate::jobs::agent_params(
-                &job_id,
-                &agent_id,
-                crate::jobs::AgentKind::Analyst,
-                Some(idx),
-                escalation_task,
-            ),
+            crate::jobs::agent_params(&job_id, &agent_id, kind, Some(idx), task),
         )
         .await
         .unwrap();
@@ -2007,7 +1991,7 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     }
 
     {
-        // Only the not-Done escalation slot (idx 4) is re-run: turn + verdict
+        // Only the not-Done escalation slot (idx 3) is re-run: turn + verdict
         // extraction. The joint-comment synthesis falls back on the `{}`
         // scripted responses (base verdicts carry issues, so it is not clean).
         let fake = crate::util::test::FakeProvider::new()
@@ -2044,6 +2028,98 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     assert!(
         analysis_comment.content.contains("Blocker verification"),
         "the joint comment must record the resumed blocker-verification round",
+    );
+}
+
+/// A roster written by a wider (three-analyst) build is never resumed as an
+/// analysis round: the phase job is dropped so the poller re-creates it and the
+/// round re-runs whole — no slot is dispatched off a roster whose cohorts cannot
+/// be read back by label, and no verdict is lost at a guessed cohort boundary.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn legacy_wider_analysis_roster_is_never_resumed() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/legacy_analysis_ws", "legacy_analysis_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "LegacyAnalysis", TicketPhase::Analysis).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+
+    // A legacy base round: three Analyst rows, all Done with stored outcomes.
+    let conn = &crate::session::store().conn;
+    let clean_verdict = super::serialize_verdict_outcome(&super::ParallelVerdict::Analysis(
+        crate::AnalysisVerdict {
+            issues_detected: Vec::new(),
+        },
+    ));
+    for idx in 0_i64..3 {
+        let agent_id = format!("ticket_{id}_{idx}_legacy_analyst");
+        conn.execute(
+            crate::jobs::AGENT_INSERT_SQL,
+            crate::jobs::agent_params(
+                &job_id,
+                &agent_id,
+                crate::jobs::AgentKind::Analyst,
+                Some(idx),
+                &format!("legacy task {idx}"),
+            ),
+        )
+        .await
+        .unwrap();
+        crate::jobs::write_agent_outcome(
+            conn,
+            &job_id,
+            &agent_id,
+            crate::jobs::RowStatus::Done,
+            Some(clean_verdict.as_str()),
+        )
+        .await
+        .unwrap();
+    }
+
+    let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
+    {
+        let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
+        super::analysis::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::Analysis)
+            .await
+            .is_none(),
+        "an unreadable roster must be dropped so the poller re-drives the round",
+    );
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Analysis,
+        "the ticket must stay in Analysis for the re-driven round",
+    );
+    let comments = store.get_comments(&id).await.unwrap();
+    assert!(
+        !comments.iter().any(|c| c.role == "Analysis"),
+        "no round comment may be posted from an unreadable roster",
+    );
+    assert!(
+        fake.request_fingerprints.lock().unwrap().is_empty(),
+        "an unreadable roster must dispatch no agent",
     );
 }
 
@@ -2174,7 +2250,9 @@ async fn verification_dynamic_count_calibration() {
 /// Every direction of a cohort must reach a slot at every possible cohort size:
 /// the directions are shared out, never truncated, so a round can never leave a
 /// direction unhanded. The reviewer directions are the product's three, and a
-/// reviewer cohort that covers them takes exactly one each.
+/// reviewer cohort that covers them takes exactly one each. The analysis base
+/// cohort is dispatched at its fixed width, and a narrower panel must never
+/// silently drop an angle.
 #[test]
 fn cohort_directions_are_all_handed_out_at_every_cohort_size() {
     use crate::pipeline::verdict::MAX_REVIEWERS;
@@ -2212,6 +2290,17 @@ fn cohort_directions_are_all_handed_out_at_every_cohort_size() {
     );
     // An analysis escalation slot carries no direction at all.
     assert_eq!(super::agent_slot_task("PROMPT", &[], 2, 1), "PROMPT");
+    // The analysis base cohort shares its angle sections across fewer analysts
+    // than there are sections.
+    let angles = crate::prompt::load_prompt_sections("analyze/ticket_angles.md");
+    let base = super::analysis::base_slots("ticket-1", "PROMPT");
+    assert_eq!(base.len(), 2, "the base cohort is dispatched at its width");
+    for angle in &angles {
+        assert!(
+            base.iter().any(|slot| slot.task.contains(angle.as_str())),
+            "the analysis base cohort must hand out every angle",
+        );
+    }
 }
 
 // ── 4. Bounce breaker trips terminal and drains Queued siblings ────────────
@@ -2335,10 +2424,6 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         // Every analyst turn + every extraction attempt fails to produce a
         // verdict → `extracted_count == 0` → reset for a fresh attempt.
         let fake = crate::util::test::FakeProvider::new()
-            .ok("not json")
-            .ok("not json")
-            .ok("not json")
-            .ok("not json")
             .ok("not json")
             .ok("not json")
             .ok("not json")
@@ -2529,11 +2614,9 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
 
     let before = expect_ticket(store, &id).await;
     {
+        // Every analyst turn + every extraction attempt fails to produce a
+        // verdict → no usable output → reset for a fresh attempt.
         let fake = crate::util::test::FakeProvider::new()
-            .ok("not json")
-            .ok("not json")
-            .ok("not json")
-            .ok("not json")
             .ok("not json")
             .ok("not json")
             .ok("not json")

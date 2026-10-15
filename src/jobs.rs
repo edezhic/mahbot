@@ -105,13 +105,15 @@ impl std::str::FromStr for JobMode {
 
 /// Values of `agents.kind` — dispatch-slot kinds.
 ///
-/// The verification round's two cohorts carry their own labels (`Reviewer` for
-/// the code reviewers, `Tester` for the single functional tester) because the
-/// resume path reads the cohorts back from the stored roster: the label is the
-/// cohort identity, never the slot's position.
+/// A round whose slots form more than one cohort carries a label per cohort
+/// (`Reviewer`/`Tester` in the verification round, `Analyst`/`BlockerVerifier`
+/// in analysis) because the resume path reads the cohorts back from the stored
+/// roster: the label is the cohort identity, never the slot's position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentKind {
     Analyst,
+    /// The analysis escalation cohort's blocker-verification slots.
+    BlockerVerifier,
     Reviewer,
     Tester,
     Engineer,
@@ -126,6 +128,7 @@ impl AgentKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Analyst => "analyst",
+            Self::BlockerVerifier => "blocker_verifier",
             Self::Reviewer => "reviewer",
             Self::Tester => "tester",
             Self::Engineer => "engineer",

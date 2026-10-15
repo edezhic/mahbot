@@ -1124,22 +1124,12 @@ fn agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
     format!("ticket_{}_{}_{}_{}", ticket_id, idx, suffix, role.as_str())
 }
 
-/// Render the FINAL per-agent task for a ticket phase roster slot.
-///
-/// `k` is the slot's position within its cohort of `count`. The cohort's
-/// directions are dealt out strided from that position, so no direction is left
-/// unhanded at any cohort size: the slots share the list, and the surplus stacks
-/// onto the leading slots when there are fewer slots than directions (a lone slot
-/// receives them all).
+/// Render the FINAL per-agent task for a ticket phase roster slot: the work
+/// prompt plus the slot's share of the cohort's directions (see
+/// [`crate::prompt::deal_sections`]).
 #[must_use]
 fn agent_slot_task(prompt: &str, angles: &[String], count: usize, k: usize) -> String {
-    let assigned = angles
-        .iter()
-        .skip(k)
-        .step_by(count)
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let assigned = crate::prompt::deal_sections(angles, count, k);
     if assigned.is_empty() {
         prompt.to_string()
     } else {

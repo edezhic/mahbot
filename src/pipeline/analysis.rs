@@ -14,20 +14,36 @@ use super::{
     run_parallel_agents, warn, with_comment_and_transition,
 };
 
-/// Default number of parallel analyst agents per round. Reviewers use a
-/// calibrated dynamic count (see
+/// Number of parallel analyst agents in the base cohort of an analysis round.
+/// Reviewers use a calibrated dynamic count (see
 /// [`crate::pipeline::verification::compute_reviewer_count`]); the verification
 /// stage runs its single functional tester alongside them.
-const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
+const BASE_ANALYST_COUNT: usize = 2;
+
+/// Number of blocker-verification analysts in an escalation cohort.
+const ESCALATION_ANALYST_COUNT: usize = 2;
 
 /// The stage's own name: the role the joint comment is authored under and the
 /// stage name the grouping pass reports (mirrors the verification stage's
 /// `STAGE`).
 pub(crate) const STAGE: &str = "Analysis";
 
-/// Load the three base ticket-analysis angle sections for Backlog analysts.
+/// Load the ticket-analysis angle sections the base cohort's analysts share.
 fn load_ticket_analysis_angles() -> Vec<String> {
     load_prompt_sections("analyze/ticket_angles.md")
+}
+
+/// Build the base cohort's slots — the analysts that share the ticket-analysis
+/// angle sections. The tests pin the dispatch shape through this seam.
+pub(super) fn base_slots(ticket_id: &str, prompt: &str) -> Vec<AgentSlot> {
+    build_agent_slots(
+        ticket_id,
+        Role::Analyst,
+        prompt,
+        &load_ticket_analysis_angles(),
+        0,
+        BASE_ANALYST_COUNT,
+    )
 }
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
@@ -44,16 +60,8 @@ async fn ensure_analysis_slots(
     ticket: &Ticket,
     job_id: &str,
     prompt: &str,
-    count: usize,
 ) -> Option<Vec<AgentSlot>> {
-    let slots = build_agent_slots(
-        &ticket.id,
-        Role::Analyst,
-        prompt,
-        &load_ticket_analysis_angles(),
-        0,
-        count,
-    );
+    let slots = base_slots(&ticket.id, prompt);
     match insert_round_slots(job_id, &[(crate::jobs::AgentKind::Analyst, &slots)]).await {
         Ok(()) => Some(slots),
         Err(e) => {
@@ -68,15 +76,14 @@ async fn ensure_analysis_slots(
     }
 }
 
-/// Append escalation slots (3, 4) to an existing phase job. Escalation slots
-/// are purely blocker-verification focused and inherit NO base angle. The
-/// starting idx derives from the max stored idx (not the roster length) so a
-/// resumed roster with prior rows never collides or over-indexes.
+/// Append the escalation cohort to an existing phase job. Escalation slots are
+/// purely blocker-verification focused and inherit NO base angle. The starting
+/// idx derives from the max stored idx (not the roster length) so a resumed
+/// roster with prior rows never collides or over-indexes.
 async fn append_analysis_slots(
     ticket: &Ticket,
     job_id: &str,
     prompt: &str,
-    count: usize,
 ) -> anyhow::Result<Vec<AgentSlot>> {
     let roster = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
     let next_idx = roster
@@ -84,8 +91,15 @@ async fn append_analysis_slots(
         .filter_map(|r| r.idx)
         .max()
         .map_or(0, |m| m + 1);
-    let slots = build_agent_slots(&ticket.id, Role::Analyst, prompt, &[], next_idx, count);
-    insert_round_slots(job_id, &[(crate::jobs::AgentKind::Analyst, &slots)]).await?;
+    let slots = build_agent_slots(
+        &ticket.id,
+        Role::Analyst,
+        prompt,
+        &[],
+        next_idx,
+        ESCALATION_ANALYST_COUNT,
+    );
+    insert_round_slots(job_id, &[(crate::jobs::AgentKind::BlockerVerifier, &slots)]).await?;
     Ok(slots)
 }
 
@@ -423,10 +437,10 @@ fn split_numbered(line: &str) -> Option<&str> {
     Some(after_ws)
 }
 
-/// Escalate a base analysis round that flagged blocker groups: run 2 blocker-
-/// verification analysts on the SAME phase job, extending `results`. Returns
-/// `false` when the ticket left the Analysis phase; sets `paused` when the
-/// escalation round itself was pause-frozen.
+/// Escalate a base analysis round that flagged blocker groups: run a
+/// blocker-verification cohort on the SAME phase job, extending `results`.
+/// Returns `false` when the ticket left the Analysis phase; sets `paused` when
+/// the escalation round itself was pause-frozen.
 ///
 /// This is the FRESH-append path only. An interrupted escalation round is
 /// resumed by [`dispatch_backlog_analysts`] via [`resume_escalation_round`],
@@ -458,13 +472,14 @@ async fn maybe_escalate_analysis(
     info!(
         ticket = %ticket.id,
         blockers = entries.len(),
-        "Base analysis flagged blocker groups — escalating with 2 additional analysts",
+        analysts = ESCALATION_ANALYST_COUNT,
+        "Base analysis flagged blocker groups — escalating with the blocker-verification cohort",
     );
     let escalation_task = substitute(
         &load_prompt("analyze/blocker_verification.md"),
         &[("{{blockers}}", &format_blocker_list(&entries))],
     );
-    let extra_slots = match append_analysis_slots(ticket, job_id, &escalation_task, 2).await {
+    let extra_slots = match append_analysis_slots(ticket, job_id, &escalation_task).await {
         Ok(s) => s,
         Err(e) => {
             warn!(ticket = %ticket.id, error = %e, "Failed to append escalation slots — proceeding with base round");
@@ -513,14 +528,17 @@ async fn run_blocker_verification(
     .await
 }
 
-/// Spawn 3 parallel analyst agents (base) to research a backlog ticket on the
-/// phase job, escalating to 5 when the base round aggregates blockers.
+/// Run an analysis round: the base analyst cohort researches a backlog ticket
+/// on the phase job, escalating to a blocker-verification cohort when the base
+/// round aggregates blockers.
 ///
 /// On a re-drive of an interrupted round (non-empty roster) this slot-resumes:
 /// an incomplete base round re-runs its not-Done base slots from their stored
 /// tasks; a base round that already appended escalation slots has its base
 /// verdicts reconstructed from stored outcomes (freezing the blocker list) and
-/// only the not-Done escalation slots are re-run.
+/// only the not-Done escalation slots are re-run. A roster this build cannot
+/// read back as an analysis round is never resumed at a guessed cohort boundary
+/// — the job is dropped and the round re-runs whole.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     let message = super::analyst_task_prompt(&ticket);
 
@@ -529,30 +547,38 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
         return;
     };
     if roster.is_empty() {
-        let Some(slots) =
-            ensure_analysis_slots(&ticket, job_id, &message, DEFAULT_PARALLEL_AGENT_COUNT).await
-        else {
+        let Some(slots) = ensure_analysis_slots(&ticket, job_id, &message).await else {
             return;
         };
         run_analysis_round(&ticket, &ws, job_id, &slots, false).await;
         return;
     }
 
-    // Resume: an interrupted round lives on in the roster. Split the base cohort
-    // (idx < the base count) from any escalation cohort (idx >= the base count).
-    let base_count = i64::try_from(DEFAULT_PARALLEL_AGENT_COUNT)
-        .expect("DEFAULT_PARALLEL_AGENT_COUNT fits in i64");
-    let escalation_rows: Vec<&crate::jobs::AgentRow> = roster
-        .iter()
-        .filter(|r| r.idx.unwrap_or(0) >= base_count)
-        .collect();
-    if escalation_rows.is_empty() {
+    // Resume: an interrupted round lives on in the roster, split back into its
+    // cohorts by the rows' own labels.
+    let Some(plan) = RoundPlan::from_roster(&roster) else {
+        // A roster that is not an analysis round (a wider build's base round, or
+        // a shape another version wrote) is never resumed as one: dropping the
+        // job makes the poller re-create it, so the round re-runs whole instead
+        // of being resumed at a guessed cohort boundary. The job is gone
+        // afterwards, so the roster's shape is logged here or not at all.
+        warn!(
+            ticket = %ticket.id,
+            job = %job_id,
+            rows = roster.len(),
+            kinds = %roster.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>().join(","),
+            "Unreadable analysis roster — re-driving the round from scratch",
+        );
+        let _ = crate::jobs::terminalize_job(conn, job_id).await;
+        return;
+    };
+    if plan.escalation.is_empty() {
         // Base round not yet escalated: re-run the not-Done base slots with their
         // stored tasks, then re-evaluate escalation on the resumed base verdicts.
         // Re-arm the not-Done slots as launched so comment routing and the
         // Running Agents view track the in-flight members while the round runs.
-        let base_slots: Vec<AgentSlot> = roster.iter().map(agent_slot_from_roster_row).collect();
-        let not_done: Vec<String> = base_slots
+        let not_done: Vec<String> = plan
+            .base
             .iter()
             .filter(|s| s.status != crate::jobs::RowStatus::Done)
             .map(|s| s.agent_id.clone())
@@ -560,25 +586,64 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
         if let Err(e) = crate::jobs::rearm_roster_launched(conn, job_id, &not_done).await {
             warn!(ticket = %ticket.id, error = %e, "Failed to re-arm resumed analysis base slots");
         }
-        run_analysis_round(&ticket, &ws, job_id, &base_slots, true).await;
+        run_analysis_round(&ticket, &ws, job_id, &plan.base, true).await;
     } else {
         // Base round completed (it triggered the escalation). Reconstruct the
         // base verdicts from stored outcomes — NOT a re-run — so the blocker list
         // that the escalation slots were built for stays frozen; only the not-Done
         // escalation slots resume.
-        let base_results: Vec<ParallelVerdict> = roster
+        let base_results: Vec<ParallelVerdict> = plan
+            .base
             .iter()
-            .filter(|r| r.idx.unwrap_or(0) < base_count)
-            .map(|r| deserialize_verdict_outcome(r.outcome.as_deref().unwrap_or("")))
+            .map(|slot| deserialize_verdict_outcome(slot.outcome.as_deref().unwrap_or("")))
             .collect();
-        resume_escalation_round(&ticket, &ws, job_id, base_results).await;
+        resume_escalation_round(&ticket, &ws, job_id, base_results, plan.escalation).await;
     }
 }
 
-/// Build the base-round grouping and finalize: the resume fallthrough arms
-/// (roster-bail, vanished escalation cohort, orphaned escalation slots) pass an
-/// empty escalation report, while the normal resume path passes the re-run
-/// base grouping and the baked-in escalation entries.
+/// One analysis round's dispatch plan: the base analyst cohort and, when the
+/// base round aggregated blockers, the escalation cohort appended to it.
+struct RoundPlan {
+    base: Vec<AgentSlot>,
+    escalation: Vec<AgentSlot>,
+}
+
+impl RoundPlan {
+    /// Split a stored roster back into its cohorts by the rows' own roster
+    /// labels — never by slot position, so a base round written by a
+    /// differently-sized build cannot be cut at the wrong place and silently
+    /// lose a verdict.
+    ///
+    /// `None` for a roster this stage cannot read back as a round: it must carry
+    /// exactly [`BASE_ANALYST_COUNT`] base rows, either no escalation rows or
+    /// exactly [`ESCALATION_ANALYST_COUNT`] of them, and no row of any other
+    /// kind. Such a roster is never resumed at a guessed boundary — see
+    /// [`dispatch_backlog_analysts`].
+    fn from_roster(roster: &[crate::jobs::AgentRow]) -> Option<Self> {
+        let cohort = |kind: crate::jobs::AgentKind| -> Vec<AgentSlot> {
+            roster
+                .iter()
+                .filter(|row| row.kind == kind.as_str())
+                .map(agent_slot_from_roster_row)
+                .collect()
+        };
+        let base = cohort(crate::jobs::AgentKind::Analyst);
+        let escalation = cohort(crate::jobs::AgentKind::BlockerVerifier);
+        let escalation_ok = escalation.is_empty() || escalation.len() == ESCALATION_ANALYST_COUNT;
+        if base.len() != BASE_ANALYST_COUNT
+            || !escalation_ok
+            || base.len() + escalation.len() != roster.len()
+        {
+            return None;
+        }
+        Some(Self { base, escalation })
+    }
+}
+
+/// Build the base-round grouping and finalize: the orphaned-escalation-slots
+/// arm of [`resume_escalation_round`] passes an empty escalation report, while
+/// the normal resume path passes the re-run base grouping and the baked-in
+/// escalation entries.
 async fn finalize_analysis_round_with_grouping(
     ws: &Workspace,
     ticket: &Ticket,
@@ -610,43 +675,21 @@ async fn finalize_analysis_round_with_grouping(
     .await;
 }
 
-/// Resume an escalation round whose base verdicts are already frozen. The
-/// already-Done escalation slots are reconstructed from stored outcomes and the
-/// not-Done ones re-run with their stored tasks; the escalation group list is
-/// re-derived from the task baked into the first escalation slot (it is never
-/// re-run through consolidation).
+/// Resume an escalation round whose base verdicts are already frozen, from the
+/// escalation cohort the plan read back from the roster. The already-Done
+/// escalation slots are reconstructed from stored outcomes and the not-Done
+/// ones re-run with their stored tasks; the escalation group list is re-derived
+/// from the task baked into the first escalation slot (it is never re-run
+/// through consolidation).
 async fn resume_escalation_round(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
     job_id: &str,
     base_results: Vec<ParallelVerdict>,
+    escalation_slots: Vec<AgentSlot>,
 ) {
     let conn = &crate::session::store().conn;
-    let roster = match crate::jobs::list_agents_for_job(conn, job_id).await {
-        Ok(roster) => roster,
-        Err(e) => {
-            // A read failure cannot degrade to a fresh dispatch: the escalation
-            // entries are baked into the stored tasks, and a re-derivation would
-            // orphan the interrupted round's rows. Retreat to base-only finalize.
-            warn!(ticket = %ticket.id, error = %e, "Failed to read escalation roster — retreating to base-only finalize");
-            finalize_analysis_round_with_grouping(ws, ticket, &base_results, &[], &[], job_id)
-                .await;
-            return;
-        }
-    };
-    let base_count = i64::try_from(DEFAULT_PARALLEL_AGENT_COUNT)
-        .expect("DEFAULT_PARALLEL_AGENT_COUNT fits in i64");
-    let escalation_slots: Vec<AgentSlot> = roster
-        .iter()
-        .filter(|r| r.idx.unwrap_or(0) >= base_count)
-        .map(agent_slot_from_roster_row)
-        .collect();
-    if escalation_slots.is_empty() {
-        // The roster's escalation cohort vanished (job raced through a reset) —
-        // finalize on the base verdicts alone.
-        finalize_analysis_round_with_grouping(ws, ticket, &base_results, &[], &[], job_id).await;
-        return;
-    }
+    // The plan only hands this path a non-empty escalation cohort.
     let entries = parse_escalation_entries(&escalation_slots[0].task);
     if entries.is_empty() {
         // Orphaned escalation slots (no blocker list baked into their task) —

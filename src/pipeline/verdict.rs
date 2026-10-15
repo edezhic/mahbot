@@ -407,7 +407,8 @@ pub(crate) enum ExtractionMode {
 /// One roster slot of a ticket phase round.
 #[derive(Clone)]
 pub(crate) struct AgentSlot {
-    /// Dispatch slot index (0-based; escalation continues at 3, 4).
+    /// Dispatch slot index (0-based; the escalation cohort continues after the
+    /// base cohort).
     pub idx: i64,
     pub agent_id: String,
     /// FINAL per-agent rendered prompt (angle appended).

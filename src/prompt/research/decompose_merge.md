@@ -1,4 +1,4 @@
-Three independent analysts produced decomposition plans for the question below. Merge them into ONE consolidated plan that best covers the question's scope: keep the strongest sub-questions, drop redundant or weak ones, and keep the risk labels. Merge a question's scope well — aim for a compact plan that is neither padded with near-duplicates nor so thin it leaves the question under-covered.
+Two independent analysts produced decomposition plans for the question below. Merge them into ONE consolidated plan that best covers the question's scope: keep the strongest sub-questions, drop redundant or weak ones, and keep the risk labels. Merge a question's scope well — aim for a compact plan that is neither padded with near-duplicates nor so thin it leaves the question under-covered.
 
 # Original Question
 
@@ -6,7 +6,7 @@ Three independent analysts produced decomposition plans for the question below. 
 
 # Independent Plans
 
-Each plan item has a GLOBAL item id, numbered flat across all three plans (ids 0..N in plan order: plan 0's items first, then plan 1's, then plan 2's).
+Each plan item has a GLOBAL item id, numbered flat across both plans (ids 0..N in plan order: plan 0's items first, then plan 1's).
 
 {{plans}}
 
