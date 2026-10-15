@@ -33,9 +33,9 @@ use std::borrow::Cow;
 /// [`crate::Agent::record_session_usage`]), persisted per session in
 /// `session_metadata.token_length` and loaded at session init. `None` — no
 /// successful usage-bearing call ever recorded a value (new sessions,
-/// pre-migration sessions; approved no-backfill semantics) — only disables
-/// this token trigger; the image-accumulation trigger
-/// ([`SUMMARIZATION_IMAGE_COUNT`]) still applies.
+/// pre-migration sessions; approved no-backfill semantics) or the last
+/// compaction cleared it — only disables this token trigger; the
+/// image-accumulation trigger ([`SUMMARIZATION_IMAGE_COUNT`]) still applies.
 ///
 /// **200,000** is a conservative default chosen to work across models with
 /// varying context window sizes (250K–1M).
@@ -88,9 +88,8 @@ fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
 
 /// Select the latest [`RETENTION_PER_SIDE`] user messages and assistant answers
 /// from `history`, merged in chronological order. Tool-call frames and tool
-/// results are excluded from both sides. The triggering (in-flight) user
-/// message is the newest entry, so it always lands last — callers must not
-/// re-append it separately.
+/// results are excluded from both sides. The newest user message is always
+/// among them — callers must not re-append it separately.
 #[must_use]
 fn select_retention_window(history: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut users: Vec<(usize, &ChatMessage)> = Vec::new();
@@ -336,6 +335,9 @@ const INSERT_SESSION_ROW: &str =
 struct BatchMetadata<'a> {
     context: Option<(&'a str, &'a str, &'a str, &'a str)>,
     block_len: Option<usize>,
+    /// Clear the recorded provider length in this same transaction — the
+    /// compaction rewrite, see [`SessionStore::replace_messages`].
+    clear_token_length: bool,
 }
 
 impl<'a> BatchMetadata<'a> {
@@ -349,6 +351,7 @@ impl<'a> BatchMetadata<'a> {
         Self {
             context: Some((channel, user_name, workspace_name, role)),
             block_len: None,
+            clear_token_length: false,
         }
     }
 
@@ -459,6 +462,13 @@ async fn insert_messages_in_transaction(
             Value::Integer(len),
         )
         .await?;
+    }
+    // A compaction rewrite clears the recorded provider length in the SAME
+    // transaction, for the same reason: the value described the history this
+    // batch replaces, and one left behind would re-fire the compaction on the
+    // session's next turn.
+    if meta.clear_token_length {
+        set_metadata_value_in_tx(tx, agent_id, MetadataColumn::TokenLength, Value::Null).await?;
     }
     Ok(())
 }
@@ -864,11 +874,16 @@ impl SessionStore {
     /// Rewrite the whole history, recording the leading context block's length in
     /// the same transaction when this rewrite wrote the block (see
     /// [`crate::session::Session::refresh_context_block`]).
+    ///
+    /// `clear_token_length` is set by the compaction rewrite
+    /// ([`crate::session::Session::apply_summary`]); the recorded length went with
+    /// the history it described.
     async fn replace_messages(
         &self,
         agent_id: &str,
         messages: &[ChatMessage],
         block_len: Option<usize>,
+        clear_token_length: bool,
     ) -> Result<()> {
         self.append_messages(
             agent_id,
@@ -877,6 +892,7 @@ impl SessionStore {
             BatchMetadata {
                 context: None,
                 block_len,
+                clear_token_length,
             },
         )
         .await
@@ -2087,7 +2103,7 @@ mod tests {
             .await
             .unwrap();
         store()
-            .replace_messages(&k, &[ChatMessage::user("new")], None)
+            .replace_messages(&k, &[ChatMessage::user("new")], None, false)
             .await
             .unwrap();
         let msgs = store().load(&k).await;
@@ -2484,6 +2500,7 @@ mod tests {
                 &k,
                 &[ChatMessage::system("prompt"), ChatMessage::user("u1")],
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2501,6 +2518,7 @@ mod tests {
                     ChatMessage::assistant("a2"),
                 ],
                 None,
+                false,
             )
             .await
             .unwrap();

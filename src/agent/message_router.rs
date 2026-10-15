@@ -912,7 +912,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             ),
             None => (None, None),
         };
-        let (agent, response) = crate::agent::run_agent(
+        let (mut agent, response) = crate::agent::run_agent(
             agent_id.clone(),
             role,
             &ws,
@@ -1046,6 +1046,12 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
         }
         confirm_pending_delivery(&job).await;
+
+        // A long-lived chat role's session over a summary trigger compacts here,
+        // after this reply is delivered and its pending row confirmed (a crash
+        // during the compaction can then not replay a delivered job), in the pause
+        // before the user's next message.
+        agent.maybe_summarize_after_delivery().await;
     }
 }
 

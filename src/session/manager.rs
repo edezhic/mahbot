@@ -51,7 +51,8 @@ pub(crate) struct Session {
     /// most recent successful agent LLM call), loaded at [`init`](Self::init)
     /// and updated after every successful agent-purpose LLM call. `None` for
     /// sessions that never recorded a value (new sessions, pre-migration
-    /// sessions — approved no-backfill semantics).
+    /// sessions — approved no-backfill semantics) and for sessions whose value
+    /// the last compaction cleared ([`Session::apply_summary`]).
     token_length: Option<u64>,
     /// Shared lock-free holder this session publishes live transcript
     /// snapshots into. `None` when the session is not attached to a running
@@ -366,7 +367,7 @@ impl Session {
         rebuilt.extend_from_slice(&self.history[previous_block_len..]);
         // The rewritten block and its length land in one transaction.
         crate::session::store()
-            .replace_messages(agent_id, &rebuilt, Some(fresh_len))
+            .replace_messages(agent_id, &rebuilt, Some(fresh_len), false)
             .await?;
         self.history = rebuilt;
         self.persisted_len = self.history.len();
@@ -410,7 +411,7 @@ impl Session {
 
     /// Real provider-reported session length (see the field doc), loaded at
     /// [`init`](Self::init). `None` when no successful usage-bearing agent
-    /// call ever recorded a value.
+    /// call ever recorded a value, or the last compaction cleared it.
     #[must_use]
     pub(crate) fn token_length(&self) -> Option<u64> {
         self.token_length
@@ -644,8 +645,9 @@ impl Session {
         let context_block_len = compacted.len();
 
         // Append conversation summary, then the retained latest turns in
-        // chronological order. The in-flight user message is already among
-        // them (newest user message) — no separate re-append here.
+        // chronological order. The newest user message is already among them (the
+        // in-flight one on a pre-turn compaction, the answered one on a
+        // post-delivery one) — no separate re-append here.
         let prefix = load_prompt("context/summary_prefix.md");
         let retained = crate::session::select_retention_window(&self.history);
         // Dump what this compaction deletes BEFORE persisting, so the path
@@ -680,6 +682,8 @@ impl Session {
                 agent_id,
                 &compacted,
                 self.launch.as_ref().map(|_| context_block_len),
+                // A compaction: the recorded length clears in the same transaction.
+                true,
             )
             .await
         {
@@ -688,25 +692,28 @@ impl Session {
                 error = %e,
                 "Failed to persist compacted session after summarization"
             );
-        } else {
-            self.history = compacted;
-            self.persisted_len = self.history.len();
-            self.publish_transcript();
-            // Refresh the change-detection baseline when the block was
-            // (re)rendered: it is the newest authoritative state — a stale
-            // snapshot would fire a spurious change-info on the first turn
-            // after every compaction. Sections that did not re-render
-            // (catalog down) keep their old baseline so a mid-session switch
-            // of that model can still surface as a change line. When no block
-            // rendered at all the baseline is left untouched for the same
-            // reason — the block itself is dropped from the system prompt
-            // until the next compaction or /new (accepted fail-open gap: the
-            // block is only re-rendered through this path).
-            let block_rendered = snapshot.image.is_some() || snapshot.video.is_some();
-            if matches!(role, Role::Assistant) && block_rendered {
-                let merged = Self::merge_active_models_snapshot(agent_id, &snapshot).await;
-                Self::persist_active_models_snapshot(agent_id, &merged).await;
-            }
+            return;
+        }
+        self.history = compacted;
+        self.persisted_len = self.history.len();
+        // The store cleared the length in the same transaction; until this
+        // session's next reply the product shows no token count for it.
+        self.token_length = None;
+        self.publish_transcript();
+        // Refresh the change-detection baseline when the block was
+        // (re)rendered: it is the newest authoritative state — a stale
+        // snapshot would fire a spurious change-info on the first turn
+        // after every compaction. Sections that did not re-render
+        // (catalog down) keep their old baseline so a mid-session switch
+        // of that model can still surface as a change line. When no block
+        // rendered at all the baseline is left untouched for the same
+        // reason — the block itself is dropped from the system prompt
+        // until the next compaction or /new (accepted fail-open gap: the
+        // block is only re-rendered through this path).
+        let block_rendered = snapshot.image.is_some() || snapshot.video.is_some();
+        if matches!(role, Role::Assistant) && block_rendered {
+            let merged = Self::merge_active_models_snapshot(agent_id, &snapshot).await;
+            Self::persist_active_models_snapshot(agent_id, &merged).await;
         }
     }
 

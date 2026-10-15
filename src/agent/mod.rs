@@ -700,6 +700,7 @@ impl Agent {
             failure_class: None,
             sleep_ended: false,
             turn_recorded: false,
+            turn_state: crate::TurnState::default(),
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
@@ -920,12 +921,10 @@ impl Agent {
         // normally by the dead-session poller. Only the Assistant, the Manager
         // and a custom role (which is granted the sleep tool) can write the
         // flag, so other roles skip the read.
-        if matches!(
-            self.role,
-            crate::Role::Assistant | crate::Role::Manager | crate::Role::Custom
-        ) && crate::session::store()
-            .get_sleep_ended(&self.agent_id)
-            .await
+        if self.role.is_long_lived_chat()
+            && crate::session::store()
+                .get_sleep_ended(&self.agent_id)
+                .await
             && let Err(e) = crate::session::store()
                 .set_sleep_ended(&self.agent_id, false)
                 .await
@@ -958,8 +957,10 @@ impl Agent {
         // Universal deterministic resume-completion: settle the session's last
         // tool-call frame's result-less calls BEFORE any LLM call, on every
         // role/path (no resume-flag gating). Drain mid-call, a hard crash and a
-        // stage re-drive all go through this identical mechanism.
-        let settled = if crate::shutdown::aborting() {
+        // stage re-drive all go through this identical mechanism. Recorded on the
+        // agent (not a local): the consumer loop's post-delivery compaction gate
+        // reads it after the reply is delivered.
+        self.turn_state.settled_tool_results = if crate::shutdown::aborting() {
             false
         } else {
             self.complete_pending_tool_calls().await?
@@ -1013,7 +1014,7 @@ impl Agent {
         // compaction right after settling would drop the settled result (e.g. a
         // stage re-drive on a >SUMMARIZATION_THRESHOLD session); summarization
         // happens on the next plain turn instead.
-        if !resume && !settled {
+        if !resume && !self.turn_state.settled_tool_results {
             self.maybe_summarize().await;
         }
 
@@ -1051,9 +1052,10 @@ impl Agent {
     /// converge here. Already-completed calls are never re-run (their result is
     /// present, so `pending_tool_frame` excludes them).
     ///
-    /// Returns `true` when any results were settled this run (used by `work`
-    /// to skip destructive summarization — a turn that just settled dangling
-    /// results is resume-like), `false` otherwise.
+    /// Returns `true` when any results were settled this run — recorded on the
+    /// turn ([`TurnState::settled_tool_results`]) so that both the pre-turn and the
+    /// post-delivery summarization gates skip a resume-like turn, whose just-settled
+    /// result the retention window would drop — `false` otherwise.
     ///
     /// Returns a boxed future (rather than an opaque `impl Future`) so the
     /// agent/tools async-opaque Send cycle around the resume cores (which
@@ -2150,12 +2152,8 @@ impl Agent {
     /// consolidate, synthesis, and research sub-calls use other builders and
     /// are excluded (they are not session context).
     ///
-    /// Post-compaction note: [`Session::apply_summary`] deliberately does NOT
-    /// reset the value — the fixed scope says no logic changes beyond
-    /// replacing estimated tokens with real tokens. After a compaction the
-    /// stale pre-compaction length may re-fire `maybe_summarize` on a
-    /// following turn if no successful agent call lands in between; that
-    /// edge is spec-compliant (accepted, not fixed).
+    /// A compaction clears the value with the history it replaces (see
+    /// [`Session::apply_summary`]).
     async fn record_session_usage(&mut self, response: &ChatResponse) {
         let Some(usage) = &response.usage else {
             return;
@@ -2531,8 +2529,9 @@ impl Agent {
     /// provider-reported value (input + output tokens of the last successful
     /// agent LLM call), loaded at session init; `None` — no successful
     /// usage-bearing call ever recorded a value (new sessions, pre-migration
-    /// sessions; approved no-backfill) — only disables the token trigger. A
-    /// FAILED call never updates the value (the session did not change).
+    /// sessions; approved no-backfill), or the session's last compaction cleared it
+    /// ([`Session::apply_summary`]) — only disables the token trigger. A FAILED call
+    /// never updates the value (the session did not change).
     ///
     /// KV-cache preservation: [`Agent::summarize`] keeps all parameters
     /// identical (see [`Agent::build_chat_request`]) so the cached prefix is
@@ -2579,6 +2578,34 @@ impl Agent {
                 );
             }
         }
+    }
+
+    /// Compact the session of a long-lived chat role — Assistant, Manager or
+    /// custom — right after its reply was delivered, so the user's next message
+    /// does not wait. Runs on the per-session consumer loop: the serialized path
+    /// that already handles one turn at a time for this session.
+    ///
+    /// [`Self::maybe_summarize`] is unchanged (same limit and triggers, prompt,
+    /// result, retention policy) and its pre-turn call in [`Self::work`] stays the
+    /// safety net for every role and case this does not cover; the pre-turn skips
+    /// a turn here can hit carry over — settled tool results, cancellation, going
+    /// down. `resume` needs no clause: this loop runs every job as a plain turn
+    /// (`run_agent(…, resume = false)`), so a resumed round never reaches the call.
+    ///
+    /// Settled: a session over a trigger at delivery compacts, whatever put it
+    /// there — a turn that regrew past the limit after its own compaction in the
+    /// same turn, or one whose compaction failed to persist (still over the limit,
+    /// so this call retries it). A repeat costs at most one extra summarization
+    /// call per turn, accepted over the wait it removes.
+    pub(crate) async fn maybe_summarize_after_delivery(&mut self) {
+        if !self.role.is_long_lived_chat()
+            || self.turn_state.settled_tool_results
+            || self.is_cancelled()
+            || crate::shutdown::aborting()
+        {
+            return;
+        }
+        self.maybe_summarize().await;
     }
 }
 
@@ -3204,6 +3231,7 @@ mod tests {
             failure_class: None,
             sleep_ended: false,
             turn_recorded: false,
+            turn_state: crate::TurnState::default(),
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
@@ -5176,6 +5204,136 @@ mod tests {
         agent.maybe_summarize().await;
     }
 
+    /// The post-delivery compaction of the long-lived chat roles: only they may
+    /// compact with the reply already delivered, and never on a turn that settled
+    /// dangling tool results, was cancelled, or ran while the service was going
+    /// down. Both triggers of the unchanged limit fire there on the next turn's
+    /// own terms, and the recorded length goes with the compacted history in the
+    /// same transaction, so the next turn does not compact a second time.
+    #[tokio::test]
+    #[serial_test::serial(active_models, provider, drain)]
+    async fn post_delivery_summarization_compacts_chat_roles_and_clears_the_length() {
+        crate::util::test::init_test_stores().await;
+        seed_empty_catalogs();
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(FakeProvider::new().ok("the summary"));
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let over_threshold = |role| {
+            let mut agent = make_agent_with_role(vec![], role);
+            agent
+                .session
+                .set_token_length(Some(crate::session::SUMMARIZATION_THRESHOLD + 1));
+            agent
+        };
+        let calls = || fake.request_fingerprints.lock().unwrap().len();
+
+        // Pipeline working roles and coder branches keep the pre-turn behaviour.
+        for role in [
+            crate::Role::Engineer,
+            crate::Role::Analyst,
+            crate::Role::Coder,
+            crate::Role::Maintainer,
+        ] {
+            over_threshold(role).maybe_summarize_after_delivery().await;
+        }
+
+        // A settled turn is resume-like: the retention window would drop the
+        // just-settled result — the trail a resume is recovered from.
+        let mut settled = over_threshold(crate::Role::Assistant);
+        settled.turn_state.settled_tool_results = true;
+        settled.maybe_summarize_after_delivery().await;
+
+        // A cancelled run never spends a summarization call on itself.
+        let mut cancelled = over_threshold(crate::Role::Assistant);
+        cancelled.cancel_token.cancel();
+        cancelled.maybe_summarize_after_delivery().await;
+
+        // Going down: no destructive compaction during the drain window.
+        crate::shutdown::drain_begin();
+        over_threshold(crate::Role::Assistant)
+            .maybe_summarize_after_delivery()
+            .await;
+        crate::shutdown::drain_clear();
+
+        assert_eq!(
+            calls(),
+            0,
+            "no excluded role or turn may spend a summarization call"
+        );
+
+        // Each chat role does compact, and the length recorded for its session —
+        // through the production writer, so the durable half is exercised too —
+        // goes with the history it described.
+        for (role, agent_id) in [
+            (crate::Role::Assistant, "e2e_post_delivery_assistant"),
+            (crate::Role::Manager, "e2e_post_delivery_manager"),
+            (crate::Role::Custom, "e2e_post_delivery_custom"),
+        ] {
+            let mut agent = make_agent_with_role(vec![], role);
+            agent.agent_id = agent_id.to_string();
+            agent.session.push_messages_unpersisted(&[
+                ChatMessage::user("hello"),
+                ChatMessage::assistant("hi"),
+            ]);
+            agent
+                .record_session_usage(&crate::ChatResponse {
+                    usage: Some(crate::ProviderUsage {
+                        input_tokens: Some(crate::session::SUMMARIZATION_THRESHOLD),
+                        output_tokens: Some(1),
+                        ..crate::ProviderUsage::default()
+                    }),
+                    ..crate::ChatResponse::default()
+                })
+                .await;
+            assert_eq!(
+                reload_token_length(agent_id).await,
+                Some(crate::session::SUMMARIZATION_THRESHOLD + 1),
+                "the over-limit length is the one the next turn loads"
+            );
+
+            let before = calls();
+            agent.maybe_summarize_after_delivery().await;
+            assert_eq!(
+                calls(),
+                before + 1,
+                "an over-limit {role} session must compact here"
+            );
+            assert_eq!(
+                agent.session.token_length(),
+                None,
+                "the pre-compaction length must be cleared"
+            );
+            assert_eq!(
+                reload_token_length(agent_id).await,
+                None,
+                "the next turn must compact nothing again"
+            );
+
+            // The second trigger fires here on the same terms: this session is
+            // still over the image count (the compaction above kept every image),
+            // and the delivery call carries no "already compacted" clause.
+            agent.session.push_messages_unpersisted(
+                &(0..crate::session::SUMMARIZATION_IMAGE_COUNT)
+                    .map(|i| ChatMessage::user(format!("[IMAGE:data:image/jpeg;base64,img{i}]")))
+                    .collect::<Vec<_>>(),
+            );
+            let image_count = session_image_marker_count(agent.session.history());
+            assert_eq!(
+                summarization_trigger(agent.session.token_length(), image_count),
+                Some("image count"),
+                "the image trigger must be the one firing here"
+            );
+            agent.maybe_summarize_after_delivery().await;
+            assert_eq!(
+                calls(),
+                before + 2,
+                "an over-image-count {role} session must compact here too"
+            );
+        }
+    }
+
     // ── Provider input-image rejection strip ────────
 
     /// The observed provider rejection body (OpenRouter HTTP 400
@@ -5184,6 +5342,13 @@ mod tests {
 
     /// Same code, text variant — must NOT trigger the strip.
     const TEXT_REJECTION_BODY: &str = r#"{"error":{"message":"Input data may contain inappropriate content.","code":"data_inspection_failed","type":"invalid_request_error"}}"#;
+
+    /// The recorded session length as a fresh turn's session init would load it.
+    async fn reload_token_length(agent_id: &str) -> Option<u64> {
+        let mut session = crate::session::Session::default();
+        session.init(agent_id).await.expect("session init");
+        session.token_length()
+    }
 
     /// Seed empty model catalogs so the Assistant active-models block renders
     /// nothing and performs no network fetch (hermetic e2e).

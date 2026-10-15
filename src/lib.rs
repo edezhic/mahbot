@@ -968,6 +968,18 @@ pub(crate) struct ToolCallRecord {
     pub error_message: Option<String>,
 }
 
+/// The per-turn verdict the post-delivery summarization gate reads:
+/// [`Agent::work`] fills `settled_tool_results` (and reads it for its own
+/// pre-turn gate), then the per-session consumer loop reads it once the reply has
+/// been delivered (see [`crate::agent::Agent::maybe_summarize_after_delivery`]).
+#[derive(Default)]
+pub(crate) struct TurnState {
+    /// The turn settled previously dangling tool results (see
+    /// [`Agent::work`]) — the trail a resume is recovered from, which a
+    /// compaction's retention window would drop.
+    pub(crate) settled_tool_results: bool,
+}
+
 /// Running context for an agent turn.
 pub struct Agent {
     /// Session persistence key; also serves as the registry agent ID.
@@ -1067,6 +1079,8 @@ pub struct Agent {
     /// baseline — its changes stay pending for the next recorded message. Read by
     /// [`crate::agent::run_agent`], set in [`crate::Agent::work`].
     pub(crate) turn_recorded: bool,
+    /// Per-turn state the post-delivery gate reads — see [`TurnState`].
+    pub(crate) turn_state: TurnState,
     /// Agent-scoped registry of background shell sessions (Full shell roles
     /// only). Live sessions are force-killed on agent teardown ([`Drop`]) —
     /// see [`crate::tools::shell::BackgroundSessions`]. Reachable from the

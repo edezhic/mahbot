@@ -253,6 +253,17 @@ impl Role {
     pub fn summary_prompt(&self) -> String {
         crate::prompt::load_prompt(&format!("summarize/{}.md", self.as_str()))
     }
+
+    /// The roles that hold a long-lived, owner-facing session: the admin's and a
+    /// guest's Assistant, each project's Manager, and a custom role. Unlike the
+    /// pipeline roles, whose session ends with its phase, these are meant to be
+    /// continued — the roles granted `sleep`, and the ones whose over-limit
+    /// sessions compact in the pause after a reply rather than at the next
+    /// message.
+    #[must_use]
+    pub(crate) const fn is_long_lived_chat(self) -> bool {
+        matches!(self, Role::Assistant | Role::Manager | Role::Custom)
+    }
 }
 
 // ── Tool set factory ──────────────────────────────────────────────────────
