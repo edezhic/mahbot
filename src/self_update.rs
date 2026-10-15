@@ -1686,16 +1686,18 @@ async fn finalize_source_tree_update(
 ///    `crate::tools::chrome_release::flush_and_close_all_chrome_sessions` releases
 ///    the sessions ended runs left queued and closes the rest.
 /// 2. Checkpoint all databases BEFORE releasing the instance lock and spawning
-///    the replacement. `exit(0)` below bypasses Rust destructors, so Turso
-///    connections are never properly closed. With the lock still held this is
+///    the replacement. The round releases each store's reader connections first
+///    (see `checkpoint_all_databases`); `exit(0)` below bypasses Rust
+///    destructors, so the writing connections themselves are never formally
+///    closed. With the lock still held this is
 ///    the last single-writer checkpoint: no checkpoint runs after the
 ///    replacement is live (the GUI exit path waits while the update is
 ///    finalizing — see `save_and_exit` / `update_is_finalizing`).
 /// 3. Remove the temp update roots BEFORE releasing the instance lock or
 ///    spawning: `exit(0)` below bypasses Rust destructors, so the (potentially
 ///    multi-GB) deletion must complete here while the old process still holds
-///    Turso's exclusive open-time fcntl locks on the store files (connections are
-///    never formally closed). If the child booted while they were held, its
+///    Turso's exclusive open-time fcntl locks on the store files (the writing
+///    connections are never formally closed). If the child booted while they were held, its
 ///    store open would fail on the lock — boot has only a bounded retry, not
 ///    immunity. Keeping the instance flock held during cleanup also prevents a
 ///    manually started second instance from sneaking in. Safe to delete before

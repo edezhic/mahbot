@@ -133,9 +133,11 @@ flate2 = "1"
 tar = "0.4"
 
 # Memory / persistence
-# Pinned exactly: the storage layer drives CDC capture (blob-encoding) and the
-# read-only debug/bench paths, so it must not drift under them.
-turso = { version = "=0.8.0", default-features = false, features = ["fts"] }
+# The wrapper crate is pinned exactly to the newest release of the engine
+# family. The engine layer (turso_core and its siblings) follows the wrapper's
+# own requirement, and the committed Cargo.lock — not this pin — is what holds
+# a build to the versions it was written against.
+turso = { version = "=0.8.3", default-features = false, features = ["fts"] }
 
 # Lock-free read-only snapshot holder for running-agent live transcripts
 # (ArcSwap<TranscriptSnapshot> published by Session, read by the GUI).

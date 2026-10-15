@@ -60,9 +60,23 @@
 //! never reach the rest of the owner's toolset (see
 //! [`crate::cli::fronts_tool`]).
 //!
-//! Write enforcement is the `PRAGMA query_only=1` guard in
-//! [`crate::db::Connection::query_readonly`], which runs and resets the pragma
-//! (back to `0`) under a single hold of the connection mutex.
+//! Write enforcement for the read-only query channel is the store's own, and it
+//! is the same per store. The statement forms a read-only connection refuses
+//! ([`crate::db::reader_refusal`] — transaction control, `ATTACH`/`DETACH`, and
+//! the pragmas that write without being classified as such) are refused on
+//! whichever path serves the query: the reader entry refuses them on a reader,
+//! and [`crate::db::Connection::query_readonly`] refuses them on the
+//! writing-connection fallback. On a store that serves its reads (the core
+//! store) the query then runs on a reader connection: one created read-only
+//! (`PRAGMA query_only = 1`, kept on for its whole life), so nothing has to be
+//! set, reset or carried over. On a store that does not (the log store) it runs
+//! on the writing connection's path in
+//! [`crate::db::Connection::query_readonly`], which sets the pragma, runs the
+//! query and resets it under a single hold of that connection's mutex. Which of
+//! the two serves a query is not the client's business.
+//! The client side of the inspection path (`mahbot debug`, the `mahbot_debug`
+//! tool) applies its own validator on top
+//! ([`crate::db::debug::validate_read_only`]), which takes the same decision.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1086,6 +1100,9 @@ mod tests {
     #[tokio::test]
     async fn ipc_query_serves_readonly_queries_end_to_end() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        // The instance's own connection, kept out of the listener task: the
+        // read-only query path must leave it able to write.
+        let instance_conn = store.conn.clone();
         let store_arc = std::sync::Arc::new(store);
         // Insert a row so COUNT is non-zero (proves the query reads real data).
         store_arc
@@ -1133,20 +1150,42 @@ mod tests {
             "a write statement must be rejected by query_only=ON"
         );
 
-        // The shared connection's query_only must be reset after the query so
-        // the instance's writes are never left disabled.
-        let reset_check = crate::db::ipc::ipc_query_with_wait(
-            &root,
-            &IpcRequest {
-                store: "logs".to_string(),
-                sql: "SELECT 1".to_string(),
-                params: Vec::new(),
-                call: None,
-            },
-        )
-        .await
-        .expect("subsequent query must succeed after reset");
-        assert!(reset_check.error.is_none());
+        // The forms a reader refuses are refused on this store too, where the
+        // writing connection's path serves the query — the same verdict whichever
+        // connection serves it. The CLI's own validator never lets such a
+        // statement out, so this probe speaks the protocol directly.
+        let checkpoint_req = IpcRequest {
+            store: "logs".to_string(),
+            sql: "PRAGMA wal_checkpoint(TRUNCATE)".to_string(),
+            params: Vec::new(),
+            call: None,
+        };
+        let checkpoint_resp = crate::db::ipc::ipc_query_with_wait(&root, &checkpoint_req)
+            .await
+            .expect("IPC checkpoint attempt must reach the listener");
+        assert!(
+            checkpoint_resp
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("refused on a read-only connection")),
+            "the compaction must be refused on the writing-connection path too: {:?}",
+            checkpoint_resp.error
+        );
+
+        // The pragma is set and reset around each query on this store's writing
+        // connection (the log store serves no reads on readers of its own), so
+        // the instance's own writes are never left disabled. Only the instance
+        // side can see that: the check is an ordinary instance write.
+        let instance_write = instance_conn
+            .execute_batch(
+                "INSERT INTO logs (timestamp, level, target, message) \
+                 VALUES ('2026-01-01T00:00:01Z', 'INFO', 'test', 'after the read-only query');",
+            )
+            .await;
+        assert!(
+            instance_write.is_ok(),
+            "the read-only query must leave the connection able to write: {instance_write:?}"
+        );
 
         listener.abort();
         let _ = listener.await;

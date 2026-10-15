@@ -1,7 +1,11 @@
 //! WAL checkpointing for all Turso database stores.
 //!
 //! The daemon runs in turso's default single-process mode (no
-//! `multiprocess_wal`) — a single process holds the sole writer connection.
+//! `multiprocess_wal`) — a single process holds the sole writer connection. Each
+//! store file also has one `Database` that every connection of that store comes
+//! from; the core store serves its ordinary reads on a small set of reader
+//! connections of its own (see [`crate::db::Connection`]), and the log store on
+//! its single connection.
 //! Checkpoints are hygiene, not a durability requirement: committed
 //! transactions are durable at COMMIT time (fsync'd WAL frames), and
 //! checkpointing merely compacts those frames into the main DB file, reclaims
@@ -20,12 +24,24 @@
 //! This module provides the canonical checkpoint entry points:
 //! [`checkpoint_all_databases`] (TRUNCATE, for exit-time paths — self-update
 //! restart is single-writer (agents cancelled, chrome sessions closed, shutdown
-//! signaled before the checkpoint); GUI exit runs while background writers are
-//! still live, but turso serializes via its checkpoint lock, so the practical
-//! effect is busy→warn, not corruption) and
+//! signaled before the checkpoint); GUI exit runs after the runtime drops, and
+//! both call sites release the store's readers before the round, so a reader's
+//! reading position cannot be in the way of the truncate — and what a reader
+//! still in flight can do is make the attempt answer blocked, which is a warn,
+//! never a filed failure) and
 //! [`periodic_checkpoint_and_verify`] (non-truncating below the WAL-size cap,
 //! TRUNCATE above it, plus an independent per-store integrity verification —
 //! the auto-checkpoint loop spawned by the binary's background task set).
+//!
+//! A compaction the engine could not run — blocked by another connection's
+//! reading position, or genuinely failed in its pager — comes back as one
+//! wordless row, which the parse refuses; the engine's own captured reason is
+//! what tells the two apart ([`crate::db::checkpoint_cause`]), and a blocked
+//! attempt is never a failure: it is retried, and a store that stays blocked
+//! through the budget keeps serving with its journal unfolded. Readers make that
+//! answer more frequent — a read holding a position defers the reclaiming
+//! checkpoint — which is accepted: the journal is allowed to grow while a long
+//! read stays open, and the protection itself is unchanged.
 //!
 //! A periodic round makes up to [`CHECKPOINT_ATTEMPTS`] attempts at a store's
 //! checkpoint — the original plus one retry per entry in the growing
@@ -220,8 +236,9 @@ fn truncate_allowed(root: &Path) -> bool {
 /// Which checkpoint mode a store uses.
 #[derive(Debug, Clone, Copy)]
 enum CheckpointPolicy {
-    /// TRUNCATE every checkpoint (exit-time paths; any live writers are
-    /// serialized by turso's checkpoint lock → busy→warn, not corruption).
+    /// TRUNCATE every checkpoint (exit-time paths; the round releases the
+    /// store's readers first, and what a reader still in flight can do is make
+    /// the attempt answer blocked → warn, not corruption).
     Truncate,
     /// PASSIVE while the on-disk `-wal` stays under the cap; TRUNCATE above it.
     PassiveCapped(u64),
@@ -474,8 +491,17 @@ async fn checkpoint_attempt(
 }
 
 /// The exit/self-update round's one attempt: exactly the pre-existing exit
-/// behaviour (one outcome, no retry, no drain). A failure is filed durably —
-/// the process is going away, so the record is the only place it can surface.
+/// behaviour (one outcome, no retry, no drain), plus the step that releases the
+/// store's readers first. A failure is filed durably — the process is going
+/// away, so the record is the only place it can surface.
+///
+/// The readers go first (and the writing connection is a handle that is never
+/// dropped, which is why the step has to be deliberate): a reader still holding
+/// a reading position would make the round's reclaiming checkpoint answer
+/// blocked. A reader that does not fall idle in time is left to the runtime
+/// instead of being waited for, and the attempt then answers blocked — which this
+/// round reports as the warn it is, never as a failure
+/// ([`crate::db::checkpoint_cause::is_blocked_checkpoint`]).
 ///
 /// The attempt is panic-guarded like the periodic round's ([`checkpoint_attempt`]):
 /// a panic becomes this round's error and so reaches the durable record, instead
@@ -487,6 +513,7 @@ async fn exit_checkpoint(
     truncate: bool,
     root: Option<&Path>,
 ) {
+    conn.release_readers().await;
     match checkpoint_attempt(name, conn, truncate, root).await {
         Attempted::ShrinkRefused => {}
         Attempted::Ran(Ok(o)) if o.is_complete() => {
@@ -505,6 +532,15 @@ async fn exit_checkpoint(
                 checkpointed = o.checkpointed_frames,
                 "Checkpoint busy or partial — WAL frames left uncheckpointed",
             );
+        }
+        Attempted::Ran(Err(e)) if checkpoint_cause::is_blocked_checkpoint(&e) => {
+            // A blocked attempt: the engine's wordless row (busy, no frame
+            // counts) is refused by the parse, so a compaction that could not run
+            // arrives as this error, and the captured reason is what says it was
+            // blocked rather than broken. A warn, no durable record — the exit
+            // round has exactly one attempt and no retry, so answering blocked
+            // here is accepted.
+            warn!(error = %e, db = %name, "Checkpoint blocked — WAL left uncheckpointed");
         }
         Attempted::Ran(Err(e)) => {
             warn!(error = %e, db = %name, "Failed to checkpoint database WAL");
@@ -679,7 +715,7 @@ fn cure_failure_window(name: &'static str, key: &Path, round_failures: usize) {
 /// and [`crate::db::shrink_gate`] owns what a refusal is.
 ///
 /// `attempt` is a parameter because a genuinely failing engine checkpoint cannot be
-/// provoked in this process — one serialised connection per store, and no fault
+/// provoked in this process — one writing connection per store, and no fault
 /// injection into the engine ([`crate::db::failure_record`]) — so the table takes
 /// each engine answer directly: [`periodic_checkpoint`] is the single caller and
 /// always passes the gate + engine attempt. It, and the two timing parameters —
@@ -744,9 +780,9 @@ async fn periodic_checkpoint_inner<'a, Fut>(
             // (the level the log store retains) — and with no genuine failure pending
             // it ends the round, closing any window an earlier round opened, because a
             // round that did not fail must not be counted as a failing one. After a
-            // genuine failure the retries it opened still run. A busy flag cannot ride
-            // a successful statement — the engine reports a blocked attempt as the error
-            // below — so this arm is the whole non-completion case.
+            // genuine failure the retries it opened still run. An attempt the engine
+            // could not run at all is not here: it arrives as the error below, since
+            // its row carries no frame counts to parse.
             Attempted::Ran(Ok(o)) => {
                 info!(
                     db = %name,
@@ -785,7 +821,13 @@ async fn periodic_checkpoint_inner<'a, Fut>(
         }
         attempts_made += 1;
         // The runtime FTS repair runs here, after a first attempt that failed or was
-        // answered busy; its outcome is reported, never used to decide.
+        // answered busy; its outcome is reported, never used to decide. A reader
+        // holding a reading position answers a TRUNCATE checkpoint busy (the
+        // long-standing rule, unchanged), so more rounds reach this repair than
+        // before readers existed — and each one pays the repair's own reads on the
+        // writing connection (a filtered quick_check scan plus a MATCH probe). That
+        // second-order cost of reader connections is accepted here rather than
+        // hidden: a blocked round is exactly the round this recovery step is for.
         if attempt_no == 1 {
             repair = Some(crate::db::repair_ticket_title_fts_runtime(conn).await);
         }

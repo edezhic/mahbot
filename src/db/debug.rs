@@ -18,8 +18,10 @@
 //! through the instance's local IPC endpoint (`crate::db::ipc`) instead —
 //! [`query_over_ipc`] for a query and [`dump_over_ipc`] for a schema dump. The
 //! endpoint is scoped to this storage location, so two instances with different
-//! locations never address each other. It applies the same
-//! `PRAGMA query_only=ON` guard as the instance's own read-only path.
+//! locations never address each other. Write enforcement there is the store's
+//! own read-only side — a reader connection refused for every change, or the
+//! writing connection's `PRAGMA query_only` set around the query (see
+//! [`crate::db::Connection::query_readonly`]).
 //!
 //! ## No-instance direct open
 //!
@@ -79,38 +81,6 @@ const BLOCKLIST: &[&str] = &[
 /// `/*` comment starts are likewise handled before it.
 const SQL_PUNCTUATION: &[char] = &[
     '(', ')', ';', ',', '.', '*', '+', '-', '/', '=', '<', '>', '!', '|', '&', '~', '{', '}', ':',
-];
-
-/// PRAGMA names allowed by the read-only validator.
-///
-/// The connection is opened genuinely read-only (`O_RDONLY`), so no PRAGMA can
-/// mutate the database file. This allowlist is defense-in-depth: mutating
-/// PRAGMAs (`wal_checkpoint`, `journal_mode`, `synchronous`, `auto_vacuum`, …)
-/// are rejected with a clear message even though the open would already refuse
-/// them at the file layer.
-const SAFE_PRAGMAS: &[&str] = &[
-    "quick_check",
-    "integrity_check",
-    "table_info",
-    "table_xinfo",
-    "index_info",
-    "index_list",
-    "index_xinfo",
-    "foreign_key_check",
-    "database_list",
-    "compile_options",
-    "page_count",
-    "freelist_count",
-    "page_size",
-    "encoding",
-    "user_version",
-    "schema_version",
-    "collation_list",
-    "function_list",
-    "module_list",
-    "pragma_list",
-    "table_list",
-    "stats",
 ];
 
 /// Run the debug subcommand. Parses `env::args()` for the debug invocation.
@@ -821,9 +791,10 @@ pub(crate) fn open_readonly(
 /// Also used by the `bench-openrouter` subcommand for read-only config-store
 /// lookups — see [`open_readonly`].
 ///
-/// Every turso connection the application opens — the service connection
-/// factory AND this debug CLI path (they do not share an opening path) —
-/// runs with in-memory temp storage, so no statement or transaction can
+/// Every turso connection the application opens — the service's opening path
+/// (the writing connection and each reader connection, both of which set the
+/// pragma as they open) and this debug CLI path (they do not share an opening
+/// path) — runs with in-memory temp storage, so no statement or transaction can
 /// ever fail because a temp directory is missing. turso_core's tempdir
 /// creation has no parent-creation and no fallback chain, and resolves
 /// through `$TMPDIR`, which the service pins to its private root; a missing
@@ -1122,7 +1093,24 @@ fn resolve_db_list(name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// `[x]`, `` `x` ``) are stripped before keyword matching, so a mutation keyword
 /// inside them is ignored rather than rejected. Anything surviving in SQL
 /// position is matched fail-closed.
+///
+/// The allowlist is the reader guard's own ([`turso_mod::READER_PRAGMAS`]): the
+/// connection this validator fronts is opened genuinely read-only (`O_RDONLY`),
+/// so no PRAGMA could mutate the database file anyway — the list is
+/// defense-in-depth on top of that, refusing a mutating PRAGMA with a clear
+/// message instead of a silent no-op.
+///
+/// The reader entry's own rule comes first, taken from where it lives
+/// ([`turso_mod::reader_refusal`]) rather than re-derived: a statement a reader
+/// connection refuses is refused here too, so a query the inspection path
+/// accepts and sends is never turned away by the reader that serves it. This
+/// validator may refuse more (a blocked keyword anywhere, a form the tokenizer
+/// cannot read, a later statement in a multi-statement string) — that direction
+/// only keeps a query from leaving the client.
 pub(crate) fn validate_read_only(sql: &str) -> Result<()> {
+    if let Some(refusal) = turso_mod::reader_refusal(sql) {
+        bail!("query rejected: {refusal}");
+    }
     let tokens = scan_sql(sql).map_err(|e| anyhow!("query rejected: {e}"))?;
     for (idx, token) in tokens.iter().enumerate() {
         if !token.quoted {
@@ -1135,7 +1123,7 @@ pub(crate) fn validate_read_only(sql: &str) -> Result<()> {
             let Some(name) = tokens.get(idx + 1) else {
                 bail!("query rejected: incomplete PRAGMA statement");
             };
-            if !SAFE_PRAGMAS.contains(&name.text.to_lowercase().as_str()) {
+            if !turso_mod::READER_PRAGMAS.contains(&name.text.to_lowercase().as_str()) {
                 bail!(
                     "query rejected: PRAGMA '{}' is not on the read-only allowlist \
                      (mutating PRAGMAs are blocked; the connection is read-only)",

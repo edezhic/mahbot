@@ -156,9 +156,12 @@ fn stat_bytes(path: &Path, what: &str) -> Answer<u64> {
 
 /// Ask the store for its own page count and compare it with the file sizes the
 /// product already stats. `Some(_)` = a reclaiming checkpoint must not be
-/// issued. Reads no store bytes (wal_guard's lock rule).
+/// issued. Reads no store bytes (wal_guard's lock rule). Upkeep: the probe is
+/// what decides whether the compaction may run, so it reads on the writing
+/// connection ([`Connection::upkeep`]) rather than on a reader whose snapshot
+/// could lag the frames the very next statement tries to fold.
 async fn probe(conn: &Connection) -> Option<ShrinkRefusal> {
-    let page_count = match conn.query("PRAGMA page_count;", ()).await {
+    let page_count = match conn.upkeep().query("PRAGMA page_count;", ()).await {
         Ok(rows) => match rows.first().map(|row| row.get_value(0)) {
             Some(value) => page_count_value(value),
             None => Err("the page count query returned no row".to_string()),

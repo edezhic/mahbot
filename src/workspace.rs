@@ -1047,7 +1047,7 @@ impl WorkspaceStore {
         let pending = WorkspaceStatus::Pending.to_string();
         let ws = self
             .conn
-            .query_row(
+            .execute_one(
                 &format!(
                     "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING {WORKSPACE_COLUMNS}"
@@ -1176,7 +1176,7 @@ impl WorkspaceStore {
     /// spawn.
     pub(crate) async fn claim_pending_for_discovery(&self, name: &str) -> Result<Option<i64>> {
         self.conn
-            .query_optional(
+            .execute_optional(
                 "UPDATE workspaces SET status = ?, paused = 1, updated_at = ? \
                  WHERE name = ? AND status = ? RETURNING discovery_generation",
                 db::params![

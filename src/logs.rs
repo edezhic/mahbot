@@ -68,10 +68,15 @@ pub struct LogStore {
 /// # Access model
 ///
 /// This store is initialized inside [`init_tracing()`] — it does NOT have an
-/// `init_global()` like other stores. Do NOT add one. Calling `init_tracing()`
-/// already opens `logs.db`. A second open via `init_global()` would create a
-/// second connection to the same database, causing WAL coordination
-/// conflicts between the two connections.
+/// `init_global()` like other stores. Do NOT add one. A store file is opened
+/// once per process: the engine holds a whole-file lock on it for the process's
+/// life, and closing ANY descriptor for that file drops every record lock the
+/// process holds on it (see [`crate::db::wal_guard`]) — which is why the
+/// running service never opens a store file a second time. (Two connections to
+/// one open database do not conflict — one `Database` serves many, which is how
+/// the core store's readers work — but a second *open* of the file is what must
+/// not happen.) The log store keeps its own single connection and, unlike the
+/// core store, serves no reads on readers of its own.
 ///
 /// In addition to this global, [`init_tracing()`] returns an `Arc<LogStore>` to
 /// its caller, and that store travels on with the boot result to the dashboard —

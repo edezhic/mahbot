@@ -845,9 +845,9 @@ impl BoardStore {
     /// Rust-level writes) and the Turso transaction `tx` (provides
     /// database-level isolation) — no concurrent write can change
     /// prerequisite tickets between validation and the caller's INSERT.
-    /// Validation runs inside the transaction via `tx.query()` (which
-    /// uses the upstream connection through the MutexGuard, avoiding
-    /// mutex deadlock with `self.conn.query()`).
+    /// Validation runs inside the transaction through its own guard; see
+    /// [`TxGuard::query`] for why that is the only read the transaction's work
+    /// may use.
     async fn begin_tx_and_validate_prerequisites(
         &self,
         workspace_name: &str,
@@ -866,7 +866,7 @@ impl BoardStore {
         )
         .await?;
         let seq: i64 = tx
-            .query_row(
+            .execute_one(
                 "UPDATE ticket_counters SET next_id = next_id + 1 WHERE workspace_name = ?1 \
                  RETURNING next_id - 1",
                 db::params![workspace_name],
@@ -878,9 +878,8 @@ impl BoardStore {
             !prerequisites.contains(&id),
             "Ticket cannot depend on itself: {id}"
         );
-        // Validate prerequisites using the transaction's query method —
-        // tx.query() uses the upstream connection through the MutexGuard
-        // so it doesn't deadlock with the mutex held by TxGuard.
+        // Validate prerequisites inside the transaction — see
+        // [`TxGuard::query`].
         Self::validate_prerequisites(&tx, prerequisites, workspace_name).await?;
         Ok((tx, id))
     }
@@ -929,9 +928,7 @@ impl BoardStore {
             .await?;
 
         // Verify the superseded ticket exists and belongs to the same workspace.
-        // This runs INSIDE the transaction (tx.query() uses the upstream
-        // connection through the MutexGuard) to eliminate the TOCTOU race
-        // between validation and cancellation.
+        // This runs INSIDE the transaction — see [`TxGuard::query`].
         let rows = tx
             .query(
                 "SELECT workspace_name FROM tickets WHERE id = ?1",
@@ -1123,7 +1120,7 @@ impl BoardStore {
     /// the oldest ticket (earliest created_at) first.
     ///
     /// The SQL text per (source, grace_cutoff) combination is invariant, which
-    /// the [`Connection::query_cached`] cache contract requires. Note: the
+    /// the [`Connection::execute_rows_cached`] cache contract requires. Note: the
     /// claim SELECT is kept to the tickets table, and the agents roster is a
     /// separate logical table checked by the caller (via the phase-job +
     /// launched-roster guard) — Backlog/Queued tickets have no running agent.
@@ -1147,7 +1144,7 @@ impl BoardStore {
         let rows = match grace_cutoff {
             Some(cutoff) => {
                 self.conn
-                    .query_cached(
+                    .execute_rows_cached(
                         &sql,
                         db::params![
                             target.as_ref(),
@@ -1162,7 +1159,7 @@ impl BoardStore {
             }
             None => {
                 self.conn
-                    .query_cached(
+                    .execute_rows_cached(
                         &sql,
                         db::params![
                             target.as_ref(),
@@ -1204,9 +1201,10 @@ impl BoardStore {
     /// through the prepared-cached path. The SQL text is invariant (phase lists
     /// are compile-time constants; workspace/cutoff are bound parameters), which
     /// the [`Connection::query_cached`] cache contract requires. The text is a
-    /// plain SELECT — read-only by construction, since `query_cached` does not
-    /// enforce read-only the way `query_readonly` does. Existence only, so
-    /// unlike the claim there is no ORDER BY sorter to pay for.
+    /// plain SELECT: `query_cached` is a read entry and does not check the SQL
+    /// itself, so the statement being read-only is what keeps the read where it
+    /// belongs. Existence only, so unlike the claim there is no ORDER BY sorter
+    /// to pay for.
     async fn claim_candidate_exists(
         &self,
         source: TicketPhase,
@@ -1509,24 +1507,26 @@ impl BoardStore {
     /// Called atomically with the bounce-back transition so the counter can
     /// never drift from the transitions that produce it. Returns the
     /// post-increment count.
+    ///
+    /// The change runs through the guard's row-returning change entry — see
+    /// [`TxGuard::execute_one`].
     pub(crate) async fn increment_bounce_count_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
     ) -> Result<i64> {
-        let rows = tx
-            .query(
-                "UPDATE tickets SET bounce_count = bounce_count + 1, updated_at = ?1 \
-                 WHERE id = ?2 RETURNING bounce_count",
-                db::params![db::now(), ticket_id],
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        match rows.into_iter().next() {
-            Some(row) => row.get::<i64>(0).map_err(anyhow::Error::from),
-            None => Err(anyhow::anyhow!(
-                "ticket {ticket_id} not found — bounce counter not incremented"
-            )),
-        }
+        tx.execute_one(
+            "UPDATE tickets SET bounce_count = bounce_count + 1, updated_at = ?1 \
+             WHERE id = ?2 RETURNING bounce_count",
+            db::params![db::now(), ticket_id],
+            |row| row.get::<i64>(0),
+        )
+        .await
+        .map_err(|e| match e {
+            turso::Error::QueryReturnedNoRows => {
+                anyhow::anyhow!("ticket {ticket_id} not found — bounce counter not incremented")
+            }
+            other => anyhow::Error::from(other),
+        })
     }
 
     /// Shared implementation for checking if a workspace has active tickets.
@@ -1778,9 +1778,8 @@ impl BoardStore {
         }
 
         // Batch query: fetch id + workspace_name for all prerequisites in one
-        // round trip. Uses tx.query() — the transaction's query method operates
-        // on the upstream connection through the MutexGuard, avoiding mutex
-        // deadlock with conn.query().
+        // round trip. Reads through the transaction's own entry — see
+        // [`TxGuard::query`].
         let (suffix, params) = Self::in_clause_for_ids(prerequisite_ids);
         let sql = format!("SELECT id, workspace_name FROM tickets {suffix}");
         let rows = tx.query(&sql, params).await?;

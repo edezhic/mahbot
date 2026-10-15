@@ -38,8 +38,8 @@
 //! A checkpoint failure's block carries the engine's own reason on its `reason:`
 //! line ([`crate::db::checkpoint_cause`]). The capture reads that reason from the
 //! engine's own event, and only the engine can fail the checkpoint: a store carries
-//! one serialised connection, and nothing in this process injects a failure into the
-//! engine.
+//! one serialised writing connection, and nothing in this process injects a failure
+//! into the engine.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -492,6 +492,10 @@ pub(crate) async fn remove_alarm(session_id: &str, id: &str) -> Result<Option<Al
         return Ok(None);
     };
     let alarm = alarm_from_row(row)?;
+    // The SELECT and the UPDATE are separate statements, so a concurrent second
+    // removal of this alarm can pass the SELECT too and report it twice; the
+    // UPDATE is idempotent (status stays 'removed'), so the duplicate report is
+    // not a wrong outcome, and the alarm is removed exactly once.
     store()
         .conn
         .execute(
@@ -534,6 +538,11 @@ async fn delete_alarm_after_run(alarm: &Alarm) -> Result<()> {
 }
 
 /// The due alarms at `now` (RFC3339 UTC), ordered by next fire time.
+///
+/// The read here and each alarm's later [`advance_alarm_state`] are separate
+/// statements, so a second sweep overlapping this one can fire the same alarm
+/// twice; the sweep runs in one background loop and [`claim_in_flight`] already
+/// guards a triggered alarm's overlapping run.
 async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
     let sql = format!(
         "SELECT {ALARM_COLUMNS} FROM alarms \

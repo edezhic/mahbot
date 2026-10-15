@@ -29,7 +29,10 @@
 //! ## Pinned-engine caveat
 //!
 //! - CDC is per-connection and mutually exclusive with MVCC (mahbot is WAL, so
-//!   it does not apply).
+//!   it does not apply). Per-connection is what makes the store's change record
+//!   complete with capture enabled on the writing connection alone: no change
+//!   may be committed on any other connection (the reader connections are
+//!   read-only for their whole life — see [`Connection`]).
 //! - The pragma's `full` capture mode guarantees `before`/`after` are populated
 //!   for every `change_type` (`1`=INSERT, `0`=UPDATE, `-1`=DELETE, `2`=COMMIT),
 //!   so business keys are recoverable for all three mutations.
@@ -194,8 +197,11 @@ struct TableInfo {
 }
 
 impl TableInfo {
+    /// Upkeep: the drain's own bookkeeping read, so it runs on the writing
+    /// connection with the rest of the drain (see [`drain_once`]).
     async fn query(conn: &Connection, table: &str) -> anyhow::Result<Self> {
         let rows = conn
+            .upkeep()
             .query(&format!("PRAGMA table_info({table})"), ())
             .await?;
         let mut columns = Vec::with_capacity(rows.len());
@@ -409,6 +415,14 @@ pub(crate) fn spawn_drainer(conn: Connection) {
 /// `change_id` is not pruned), so a transient DB failure during the chronicle
 /// write is retried rather than permanently dropping the transition.
 ///
+/// Read and prune both run on the writing connection (the read through
+/// [`Connection::upkeep`]): this drain is the bookkeeping half of the store's
+/// own change recording, whose other half — the capture itself — lives on that
+/// connection too, and it reads the store's own record of changes rather than
+/// domain state. Kept off a reader connection it also stays a single
+/// read-then-prune sequence on one connection, instead of reading a snapshot a
+/// reader may lag behind.
+///
 /// Concurrent invocations are serialized by [`DRAIN_LOCK`]: the drainer is
 /// called both from the background loop and from synchronous flushes
 /// (`notify_ticket`, the Manager path), and without serialization two drains
@@ -420,6 +434,7 @@ static DRAIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
     let _drain_guard = DRAIN_LOCK.lock().await;
     let rows = conn
+        .upkeep()
         .query_cached(
             // prepare_cached caches by SQL text, so the same formatted string
             // still hits the engine's per-connection statement cache.
@@ -603,6 +618,9 @@ fn resolve_pk(
 
 /// Build (and cache) the column/PK map for `table`, re-querying when the
 /// schema's column count drifts.
+///
+/// Upkeep, like [`TableInfo::query`]: both reads are the drain's own bookkeeping
+/// and so run on the writing connection with the rest of the drain.
 async fn cached_table_info(conn: &Connection, table: &str) -> anyhow::Result<TableInfo> {
     // Fast path: a cached map whose schema is unchanged. The clone is released
     // from the mutex guard before the await below, so the future stays `Send`.
@@ -612,6 +630,7 @@ async fn cached_table_info(conn: &Connection, table: &str) -> anyhow::Result<Tab
         .and_then(|g| g.get(table).cloned());
     if let Some(info) = cached {
         let fresh_count = conn
+            .upkeep()
             .query(&format!("PRAGMA table_info({table})"), ())
             .await?
             .len();

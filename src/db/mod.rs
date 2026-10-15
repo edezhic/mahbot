@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use turso::Builder;
+
+use crate::util::UnwrapPoison;
+
 pub(crate) use turso::{IntoParams, Row, Value, params};
 
 pub(crate) mod cdc;
@@ -93,7 +96,8 @@ pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method"];
 /// custom_roles and telegram_intake stores.
 ///
 /// The domain stores were historically split across separate files; they
-/// now share one file (and one shared [`Connection`]) so that cross-store
+/// now share one file (and one shared [`Connection`] — one writing connection,
+/// one transaction domain, one reader pool) so that cross-store
 /// integrity is enforceable with real foreign keys and phase+stage updates are
 /// atomic within a single transaction domain. The logs store remains a
 /// separate file ([`LOG_DB_NAME`]).
@@ -128,8 +132,9 @@ pub(crate) const LOG_DB_NAME: &str = "logs";
 
 /// The single shared consolidated domain connection, set once by
 /// [`init_all_stores`]. Each domain store struct holds a clone of this
-/// connection (same underlying turso connection — the shared transaction
-/// domain). The logs store does NOT use this connection.
+/// connection — literally one handle, whose writing connection is the one
+/// transaction domain every domain write runs in and whose reader connections
+/// serve the domain reads. The logs store does NOT use this connection.
 pub(crate) static DOMAIN_CONN: tokio::sync::OnceCell<Connection> =
     tokio::sync::OnceCell::const_new();
 
@@ -378,41 +383,66 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
 }
 
-/// A serialized handle to a turso connection.
+/// A handle to one store's connections.
 ///
-/// Mutex-serializes concurrent access (turso connections do not support
-/// concurrent operations) and tracks a dangling transaction: when a
-/// [`TxGuard`] is dropped without explicit commit/rollback, the flag is set
-/// and the next write operation rolls it back first (mirrors the upstream
-/// `turso::Connection::dangling_tx` pattern at wrapper level, avoiding async
-/// in `Drop`).
+/// Every **change** — and every read the store issues to itself (see
+/// [`Connection::upkeep`]) — goes through the one **writing connection** whose
+/// access is serialized by the [`Mutex`] below. Every ordinary **read** is
+/// served by the store's reader connections ([`ReaderPool`]) and never touches
+/// that mutex, so a read no longer queues behind whatever else the store is
+/// doing.
 ///
-/// # Shared-connection discipline (consolidated layout)
+/// The engine is what lets one `Database` carry many connections, and it takes
+/// many reads on one connection at once. It does **not** queue a second *write*
+/// statement behind the first: a write statement that starts while another
+/// writer is still in progress on the same connection is rejected outright
+/// (surfaced at the wrapper as a busy error), because a write statement can
+/// suspend for async I/O, which would make the reset/drop cleanup of such a
+/// statement hard to get right. The one-at-a-time sequencing over the writing
+/// connection is therefore our own queue, and it stays exactly as it is.
 ///
-/// After consolidation all the domain stores hold a **clone of one** connection
-/// (the same [`Mutex`]), so the mutex is NOT reentrant and is never shared
-/// between independent locks. A code path that holds a [`TxGuard`] (which keeps
-/// the mutex locked for the transaction's lifetime) MUST use `tx.query()` /
-/// `tx.execute()` / `tx.begin_tx()` for any further access to that connection —
-/// calling another store's `conn.query()` / `conn.execute()` / `conn.begin_tx()`
-/// while holding the guard deadlocks (the guard's mutex is already held). Before
-/// consolidation each store had its own mutex, so cross-store calls were safe;
-/// they are now a single lock and must be routed through the guard.
+/// A dropped transaction left open on the writing connection is rolled back
+/// before the connection is reused: when a [`TxGuard`] is dropped without
+/// explicit commit/rollback the flag is set and the next write operation rolls
+/// it back first (mirrors the upstream `turso::Connection::dangling_tx` pattern
+/// at wrapper level, avoiding async in `Drop`).
+///
+/// # Writing-connection discipline (consolidated layout)
+///
+/// All the domain stores hold a **clone of one** [`Connection`], so the
+/// writing connection's mutex is NOT reentrant and is never shared between
+/// independent locks. A code path that holds a [`TxGuard`] (which keeps the
+/// mutex locked for the transaction's lifetime) MUST use `tx.query()` /
+/// `tx.execute()` / `tx.begin_tx()` for any further access to that connection.
+/// That is enforced, not merely required: a read issued by the very task that
+/// holds the transaction is refused on the read entry (see
+/// [`Connection::run_read`]), so a cross-store read can no longer quietly miss
+/// what the transaction itself has written. A read issued by any other task is
+/// an unrelated read and is served by a reader connection as usual — it sees
+/// committed state, which may be the state as of just before the transaction
+/// commits.
 #[derive(Clone, Debug)]
 pub(crate) struct Connection {
-    /// Persistent turso connection — reused for all execute/query calls.
-    /// Mutex serializes concurrent access since turso connections
-    /// do not support concurrent operations.
+    /// The writing connection — reused for every change and every read the
+    /// store issues to itself.
     conn: Arc<tokio::sync::Mutex<turso::Connection>>,
     /// Set when a TxGuard is dropped without explicit commit/rollback.
     /// Checked at the start of every write operation (execute, begin_tx).
     /// Mirrors the upstream `turso::Connection::dangling_tx` pattern but
     /// works at our wrapper level so we don't need async in Drop.
     has_dangling_tx: Arc<AtomicBool>,
+    /// The task that opened the transaction currently on `conn`, cleared when it
+    /// commits or rolls back. A read issued by that same task belongs to that
+    /// transaction and is refused on the read entry (see [`Self::run_read`]).
+    tx_task: Arc<std::sync::Mutex<Option<tokio::task::Id>>>,
     /// The store's main-file path, stamped at open. The pre-shrink gate's
     /// stat source (main and `-wal` sizes); never opened — wal_guard's lock
     /// rule.
     db_path: Arc<std::path::Path>,
+    /// The store's reader connections. Handed the already-open store at open;
+    /// it creates reader connections only once the store is final and a read
+    /// first needs one (see [`Connection::enable_readers`]).
+    readers: Arc<ReaderPool>,
 }
 
 /// Result of a read-only query: column names, row values, and whether the
@@ -485,10 +515,10 @@ fn known_fts_dir_false_positive(message: &str) -> bool {
 /// Map each row in a slice through a fallible closure, collecting into a
 /// `Vec<turso::Result<T>>` with per-row error conversion.
 ///
-/// Shared by the strict and per-row mapping entry points on both the free
-/// connection and the transaction guard: [`Connection::query_map`],
-/// [`Connection::query_map_strict`], [`Connection::query_map_strict_cached`],
-/// and [`TxGuard::query_map_strict`].
+/// Shared by the strict and per-row mapping entry points:
+/// [`Connection::query_map`], [`Connection::query_map_strict`],
+/// [`Connection::query_map_strict_cached`], [`Upkeep::query_map`] and
+/// [`TxGuard::query_map_strict`].
 fn map_rows<T, E>(
     rows: &[Row],
     mut map: impl FnMut(&Row) -> std::result::Result<T, E>,
@@ -546,9 +576,34 @@ async fn drain_rows(mut rows: turso::Rows) -> turso::Result<Vec<Row>> {
     Ok(result)
 }
 
+/// Await a detached statement op — shared by the writing connection
+/// ([`Connection::run_detached_capturing`]) and a reader ([`ReaderLease::run`]),
+/// so the two places a statement can run cannot drift apart in what they do
+/// with the outcome.
+///
+/// A panicking op propagates the ORIGINAL panic payload (the hook prints it);
+/// the unwind re-enters at the call site, so only the message, not the
+/// location, survives. A cancelled task means runtime shutdown, not a DB
+/// failure.
+fn join_detached<T>(
+    joined: std::result::Result<turso::Result<T>, tokio::task::JoinError>,
+) -> turso::Result<T> {
+    match joined {
+        Ok(inner) => inner,
+        Err(joined) => match joined.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(_) => Err(turso::Error::Error(
+                "database op cancelled (runtime shutdown)".to_string(),
+            )),
+        },
+    }
+}
+
 /// Run a read-only query against an already-locked turso connection, bounded
-/// to `row_limit` rows using LIMIT+1 semantics. Caller is responsible for the
-/// `PRAGMA query_only` guard and its reset.
+/// to `row_limit` rows using LIMIT+1 semantics. A caller that runs this on the
+/// **writing** connection is responsible for the `PRAGMA query_only` guard and
+/// its reset ([`Connection::query_readonly`]); a reader connection carries the
+/// switch for its whole life and needs neither.
 async fn run_readonly_query(
     conn: &turso::Connection,
     sql: &str,
@@ -764,6 +819,21 @@ where
     }
 }
 
+/// Which connection an access runs on.
+///
+/// The two places differ in that and nothing else: the same detached task, the
+/// same propagation of a panic, the same handling of a cancelled task (see
+/// [`join_detached`]). One runner is what keeps a read and an upkeep read from
+/// drifting apart.
+enum Place {
+    /// The read entry: a reader connection when the store has one free, the
+    /// writing connection otherwise (see [`Connection::run_read`]).
+    Read,
+    /// The writing connection, whatever the readers are doing — the store's own
+    /// upkeep ([`Upkeep`]) and every change.
+    Writer,
+}
+
 impl Connection {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let path_str = path
@@ -783,7 +853,7 @@ impl Connection {
         .await
         .context("failed to open local database")?;
         let conn = db.connect()?;
-        conn.busy_timeout(Duration::from_mins(1))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // In-memory temp storage for this connection (turso's
         // TempStore::Memory): every intermediate query structure — RETURNING
         // buffers, ORDER BY/LIMIT heap sorts, DISTINCT, IN-subqueries,
@@ -802,7 +872,12 @@ impl Connection {
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             has_dangling_tx: Arc::new(AtomicBool::new(false)),
+            tx_task: Arc::new(std::sync::Mutex::new(None)),
             db_path: Arc::from(path),
+            // The store handle is kept so the readers are connections of this
+            // open store and never a second open of its file, and it lives as
+            // long as the readers do.
+            readers: Arc::new(ReaderPool::new(Arc::new(db))),
         })
     }
 
@@ -811,20 +886,67 @@ impl Connection {
         &self.db_path
     }
 
-    /// Lock the inner connection and rollback any dangling transaction.
-    /// Both read and write callers should use this method — dangling
-    /// transactions can affect read visibility in WAL mode if left active.
+    /// Let this store's connections serve reads.
+    ///
+    /// Called once the store is final — after anything that can replace or
+    /// rebuild its file has run — and never for a store whose file a reader
+    /// must not be made from (the log store keeps its own writing connection
+    /// and is not served by a reader pool). Turning readers on costs nothing:
+    /// the reader connections themselves are created later, on the first read
+    /// that needs one.
+    ///
+    /// It says nothing about store maintenance that runs after it: work that
+    /// rebuilds a schema object — the FTS index work at open and in the periodic
+    /// round — takes the readers out of service itself (see
+    /// [`Self::quiet_readers`]) rather than resting on no read having happened
+    /// yet.
+    fn enable_readers(&self) {
+        self.readers.enable();
+    }
+
+    /// Take the store's readers out of service for the duration of work that
+    /// must not run while one is in use — a schema object dropped and recreated
+    /// under a reader's own snapshot — returning `None` when they did not fall
+    /// idle within [`READERS_IDLE_WAIT`] (the caller then leaves that work for a
+    /// later round rather than running it against live readers).
+    ///
+    /// While the guard is held, reads are served by the writing connection and
+    /// the readers are closed, so no reader carries a statement or a schema
+    /// snapshot from before the work. Dropping the guard puts them back in
+    /// service — unless the store has released them for good
+    /// ([`Self::release_readers`]), which a late guard must not undo.
+    async fn quiet_readers(&self) -> Option<QuietReaders> {
+        self.readers.quiet().await
+    }
+
+    /// Release the store's readers for good, before the exit round's
+    /// checkpoint runs on the writing connection.
+    ///
+    /// The writing connection is a handle that is never dropped, so this step
+    /// is what makes sure a reader has no reading position left when the
+    /// exit round's checkpoint tries to truncate the WAL. A reader that does
+    /// not fall idle within [`READERS_IDLE_WAIT`] is left to the runtime: the
+    /// checkpoint then answers "blocked", which the exit round recognises as
+    /// blocked rather than as a failure.
+    pub(crate) async fn release_readers(&self) {
+        self.readers.release().await;
+    }
+
+    /// Lock the writing connection and rollback any dangling transaction.
+    /// Both read and write callers on the writing connection should use this
+    /// method — dangling transactions can affect read visibility in WAL mode if
+    /// left active.
     async fn lock_and_cleanup(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
-        Self::lock_and_cleanup_owned(&self.conn, &self.has_dangling_tx).await
+        Self::lock_and_cleanup_owned(&self.conn, &self.has_dangling_tx, &self.tx_task).await
     }
 
     /// Owned-handle variant of [`Self::lock_and_cleanup`] for the detached
     /// task in [`Self::run_detached`].
     ///
-    /// A transaction left open on the shared connection MUST be rolled back
+    /// A transaction left open on the writing connection MUST be rolled back
     /// before the connection is reused: the engine holds its written pages in
-    /// the shared page cache for as long as the transaction is open, and a WAL
-    /// checkpoint refuses to clear a page cache with dirty pages in it
+    /// that connection's page cache for as long as the transaction is open, and
+    /// a WAL checkpoint refuses to clear a page cache with dirty pages in it
     /// (`Failed to clear page cache: Dirty { pgno: … }`) — every later write
     /// then fails and the WAL keeps the uncommitted frames.
     ///
@@ -833,9 +955,16 @@ impl Connection {
     /// autocommit state, which catches a transaction the arm never saw. A
     /// failed rollback keeps the arm set, so the next access retries it —
     /// one failure must not lose the orphan.
+    ///
+    /// `tx_task` is the record of which task owns the transaction. It is
+    /// cleared here whenever this call leaves nothing open — after the rollback
+    /// it performs, and when it finds the connection already in autocommit — so
+    /// a record left by a dropped guard never outlives the transaction it
+    /// names.
     async fn lock_and_cleanup_owned<'a>(
         conn: &'a tokio::sync::Mutex<turso::Connection>,
         has_dangling_tx: &'a AtomicBool,
+        tx_task: &'a std::sync::Mutex<Option<tokio::task::Id>>,
     ) -> tokio::sync::MutexGuard<'a, turso::Connection> {
         let guard = conn.lock().await;
         let armed = has_dangling_tx.swap(false, Ordering::SeqCst);
@@ -845,19 +974,24 @@ impl Connection {
         // active") would keep the arm set for every later access. An open
         // transaction, or a probe that failed, is rolled back; that is the same
         // rule the `query_only` reset in `query_readonly` uses.
-        if !matches!(guard.is_autocommit(), Ok(true)) {
+        if matches!(guard.is_autocommit(), Ok(true)) {
+            *tx_task.lock().unwrap_poison() = None;
+        } else {
             match guard.execute("ROLLBACK", ()).await {
-                Ok(_) => tracing::warn!(
-                    armed,
-                    "rolled back a transaction left open on the shared connection"
-                ),
+                Ok(_) => {
+                    *tx_task.lock().unwrap_poison() = None;
+                    tracing::warn!(
+                        armed,
+                        "rolled back a transaction left open on the writing connection"
+                    );
+                }
                 Err(e) => {
                     // Keep the arm: one failed rollback must not lose the orphan.
                     has_dangling_tx.store(true, Ordering::SeqCst);
                     tracing::warn!(
                         error = %e,
                         armed,
-                        "failed to roll back a transaction left open on the shared connection — \
+                        "failed to roll back a transaction left open on the writing connection — \
                          the next access retries it"
                     );
                 }
@@ -872,7 +1006,7 @@ impl Connection {
     /// caller abandons only the RESULT, never a half-executed statement.
     ///
     /// Why this is mandatory: dropping a future mid-statement leaves the
-    /// shared connection's pager state inconsistent — a cache-published page
+    /// writing connection's pager state inconsistent — a cache-published page
     /// whose read never completes makes every later read of that page wait on
     /// an explicit yield whose completion nothing will ever wake (turso's
     /// yields assume a fiber scheduler steps other fibers; the tokio wrapper
@@ -883,7 +1017,7 @@ impl Connection {
     where
         T: Send + 'static,
         F: for<'a> FnOnce(
-                &'a tokio::sync::MutexGuard<'a, turso::Connection>,
+                &'a turso::Connection,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
             > + Send
@@ -903,7 +1037,7 @@ impl Connection {
     where
         T: Send + 'static,
         F: for<'a> FnOnce(
-                &'a tokio::sync::MutexGuard<'a, turso::Connection>,
+                &'a turso::Connection,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
             > + Send
@@ -911,29 +1045,16 @@ impl Connection {
     {
         let conn = self.conn.clone();
         let dangling = self.has_dangling_tx.clone();
+        let tx_task = self.tx_task.clone();
         let task = async move {
-            let guard = Self::lock_and_cleanup_owned(&conn, &dangling).await;
+            let guard = Self::lock_and_cleanup_owned(&conn, &dangling, &tx_task).await;
             op(&guard).await
         };
         let joined = match cause.cloned() {
             Some(cause) => tokio::spawn(cause.scoped(task)).await,
             None => tokio::spawn(task).await,
         };
-        match joined {
-            Ok(inner) => inner,
-            Err(joined) => match joined.try_into_panic() {
-                // A panicking op propagates the ORIGINAL panic payload (the
-                // hook prints it); the unwind re-enters at this call site, so
-                // only the message, not the location, survives. Matches the
-                // inline pre-detached behavior where a DB op panicked its
-                // caller.
-                Ok(payload) => std::panic::resume_unwind(payload),
-                // A cancelled task means runtime shutdown, not a DB failure.
-                Err(_) => Err(turso::Error::Error(
-                    "database op cancelled (runtime shutdown)".to_string(),
-                )),
-            },
-        }
+        join_detached(joined)
     }
 
     /// Upsert one row without the engine's `INSERT ... ON CONFLICT ... DO UPDATE`
@@ -1010,8 +1131,75 @@ impl Connection {
             .await
     }
 
-    /// Begin a transaction and return a guard that keeps the connection locked
-    /// until the transaction is committed or rolled back.
+    /// Execute a **change** that reads its own result back — an `INSERT` or
+    /// `UPDATE ... RETURNING`, or a change whose result the caller needs (a
+    /// counter's new value, the row a claim just took).
+    ///
+    /// This is the change entry that hands rows back, and it is what a change
+    /// uses instead of the reading entries: the direction of a call is never
+    /// inferred from its name, so a change issued through [`Self::query`] is a
+    /// bug (it would be served by a reader, and a reader refuses it loudly),
+    /// while a read issued through this one would take the writing connection
+    /// for a read. The engine's `execute` discards rows, which is why the write
+    /// side needs this second form; several changes read their own result back
+    /// in the same statement, which is also what settles those read-then-act
+    /// sequences in one step that cannot interleave.
+    ///
+    /// The statement is prepared per call; use [`Self::execute_rows_cached`]
+    /// for a change whose SQL text is invariant across calls (see
+    /// [`Self::query_cached`] for that contract).
+    pub(crate) async fn execute_rows(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
+        self.query_at(Place::Writer, sql, params).await
+    }
+
+    /// [`Self::execute_rows`] through the writing connection's
+    /// prepared-statement cache (see [`Self::query_cached`] for the contract).
+    pub(crate) async fn execute_rows_cached(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
+        self.query_cached_at(Place::Writer, sql, params).await
+    }
+
+    /// Execute a **change** that reads its own result back and must produce
+    /// exactly one row — [`Self::execute_rows`] with [`Self::query_row`]'s
+    /// no-row semantics.
+    pub(crate) async fn execute_one<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> turso::Result<T>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        self.query_row_at(Place::Writer, sql, params, map).await
+    }
+
+    /// Execute a **change** that reads its own result back and may produce no
+    /// row — [`Self::execute_one`] with [`Self::query_optional`]'s semantics
+    /// (`Ok(None)` when the change matched nothing).
+    pub(crate) async fn execute_optional<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Option<T>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        optional_row(self.execute_one(sql, params, map).await)
+    }
+
+    /// Begin a transaction and return a guard that keeps the writing connection
+    /// locked until the transaction is committed or rolled back.
     pub async fn begin_tx(&self) -> turso::Result<TxGuard<'_>> {
         let conn = self.lock_and_cleanup().await;
         // Arm the flag BEFORE `BEGIN` is awaited: this statement runs in the
@@ -1020,80 +1208,196 @@ impl Connection {
         // with nothing armed to roll it back.
         self.has_dangling_tx.store(true, Ordering::SeqCst);
         conn.execute("BEGIN", ()).await?;
-        // No await between the successful `BEGIN` and this store, so the clear
-        // cannot be cut short and leave a live transaction behind.
+        // Only now is this task the holder of a transaction, and no await
+        // separates the successful `BEGIN` from this store — so a failure, a
+        // dropped future or a panic before this point cannot leave a task
+        // recorded as holding one. Unchanged until the guard clears it, so a
+        // read issued by this task is refused on the read entry for as long as
+        // the transaction is open, instead of being served by a reader behind
+        // the transaction's back.
+        *self.tx_task.lock().unwrap_poison() = tokio::task::try_id();
         self.has_dangling_tx.store(false, Ordering::SeqCst);
         Ok(TxGuard {
             conn,
             has_dangling_tx: Some(self.has_dangling_tx.clone()),
+            tx_task: Some(self.tx_task.clone()),
         })
     }
 
-    /// Execute a read-only query, returning all matching rows.
-    /// Acquires the mutex so reads are serialized with writes — this eliminates
-    /// page-cache races that occurred when reads used `db.connect()` to spawn
-    /// a fresh connection sharing a cache with the write connection.
+    /// Execute a read, returning all matching rows.
+    ///
+    /// Served by a reader connection when the store has one free, by the writing
+    /// connection otherwise — see [`Self::run_read`].
     pub async fn query(
         &self,
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        self.query_with_cause(sql, params, None).await
+        self.query_at(Place::Read, sql, params).await
     }
 
-    /// [`Self::query`] with an optional engine-cause sink armed for the query's
-    /// own polls, so a reason the engine emits belongs to this call and no other
-    /// (see [`checkpoint_cause`]). Used by the checkpoint path, whose failure row
-    /// cannot carry the engine's reason.
-    async fn query_with_cause(
+    /// [`Self::query`] on the connection `place` names.
+    async fn query_at(
         &self,
+        place: Place,
         sql: &str,
         params: impl IntoParams + Send + 'static,
-        cause: Option<&checkpoint_cause::CauseSink>,
     ) -> turso::Result<Vec<Row>> {
-        let sql = sql.to_owned();
-        self.run_detached_capturing(
-            move |conn| Box::pin(async move { Self::query_impl(conn, &sql, params).await }),
-            cause,
-        )
+        let owned = sql.to_owned();
+        self.run_at(place, sql, move |conn| {
+            Box::pin(async move { Self::query_impl(conn, &owned, params).await })
+        })
         .await
+    }
+
+    /// Run an op on the connection `place` names.
+    ///
+    /// The two places are [`Self::run_read`] (a reader when one is free) and the
+    /// writing connection; everything else about running an op — the detached
+    /// task, the propagation of a panic, the handling of a cancelled task — is
+    /// shared, so a read and an upkeep read cannot drift apart. `sql` is the
+    /// statement as written: the read entry needs it for its guard
+    /// ([`reader_refusal`]), the writing connection does not look at it.
+    async fn run_at<T, F>(&self, place: Place, sql: &str, op: F) -> turso::Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a turso::Connection,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
+            > + Send
+            + 'static,
+    {
+        match place {
+            Place::Read => self.run_read(sql, op).await,
+            Place::Writer => self.run_detached(op).await,
+        }
+    }
+
+    /// Run a read on whichever connection serves reads.
+    ///
+    /// A read that belongs to a transaction is served by that transaction: when
+    /// the task calling here is the task holding an open transaction on this
+    /// connection, the read is refused ([`TRANSACTION_READ_REFUSAL`]) — such a
+    /// read must go through the transaction's own [`TxGuard`], or it would be
+    /// served by a reader and quietly miss what the transaction itself has
+    /// written. A read issued by any *other* task is an unrelated read and is
+    /// served as usual.
+    ///
+    /// Otherwise the read is handed to a reader connection when the store has
+    /// one free, and falls back to the writing connection when the store has no
+    /// readers (the log store), when its readers could not be created, and while
+    /// they are out of service for a repair or on the way down. Falling back is
+    /// deliberate: a read that cannot get a reader is still a read the product
+    /// must serve, and the reader connections are an optimisation of its
+    /// latency, never a new way for a read to fail.
+    async fn run_read<T, F>(&self, sql: &str, op: F) -> turso::Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a turso::Connection,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
+            > + Send
+            + 'static,
+    {
+        self.refuse_transaction_read()?;
+        if let Some(lease) = self.readers.lease().await {
+            return lease.run(sql, op).await;
+        }
+        self.run_detached(op).await
+    }
+
+    /// Refuse a read issued by the task that holds the open transaction on this
+    /// connection — the transaction's own work, which must be read through its
+    /// [`TxGuard`].
+    ///
+    /// Reads issued by any other task are unrelated to that transaction and are
+    /// not affected, so this is not a rule that fails unrelated concurrent
+    /// reads; and a read that is genuinely part of the transaction's work cannot
+    /// be served any other way, because the transaction's own uncommitted writes
+    /// are only visible on it. Before readers existed this mistake stopped dead
+    /// on the connection's own mutex instead; the code says so here now.
+    ///
+    /// The hole this leaves: a read issued by a task the transaction's work
+    /// *spawned* is not the same task, so it is served as an unrelated read (it
+    /// sees committed state, never the transaction's own writes).
+    fn refuse_transaction_read(&self) -> turso::Result<()> {
+        // `try_id`: a caller outside a task (a `block_on` caller — the debug CLI,
+        // a test body) has no id to compare with, and reads there are not the
+        // transaction's own work in the sense this rule is about.
+        let holder = *self.tx_task.lock().unwrap_poison();
+        if holder.is_some() && holder == tokio::task::try_id() {
+            return Err(turso::Error::Error(TRANSACTION_READ_REFUSAL.to_string()));
+        }
+        Ok(())
     }
 
     /// Execute a read-only query with engine-level write enforcement.
     ///
-    /// Sets `PRAGMA query_only=1`, runs the query, and resets it to `0` — all
-    /// under a single hold of the connection mutex. The reset is attempted on
-    /// every outcome (including a query-engine panic) and is itself
-    /// panic-guarded, so a reset-phase never unwinds the caller. A reset-phase
-    /// panic, or a failure to roll a leaked transaction back, flags
-    /// `has_dangling_tx` so the next access attempts a rollback; a non-panic
-    /// `query_only=0` failure only surfaces an error. Either way a failed
-    /// `query_only=0` leaves `query_only=1` (rejecting instance writes) — loud,
-    /// with no automatic recovery. Bounds the result set to `row_limit` rows
-    /// using LIMIT+1 semantics (a result of exactly `row_limit` rows is NOT
-    /// flagged truncated; the `row_limit + 1`-th row flags it). Returns column
-    /// names + rows.
+    /// On a reader connection the enforcement is the connection's own state: it
+    /// was created read-only (`PRAGMA query_only = 1`, kept on for its whole
+    /// life) and the reader entry refuses the statement forms that switch does
+    /// not cover, so nothing has to be set, reset or carried over between uses.
+    ///
+    /// On the writing connection (the log store, or the reader fallback) the
+    /// pragma is set, the query runs, and it is reset to `0` — all under a
+    /// single hold of the connection mutex. The reset is attempted on every
+    /// outcome (including a query-engine panic) and is itself panic-guarded, so
+    /// a reset-phase never unwinds the caller. A reset-phase panic, or a failure
+    /// to roll a leaked transaction back, flags `has_dangling_tx` so the next
+    /// access attempts a rollback; a non-panic `query_only=0` failure only
+    /// surfaces an error. Either way a failed `query_only=0` leaves
+    /// `query_only=1` (rejecting instance writes) — loud, with no automatic
+    /// recovery. Bounds the result set to `row_limit` rows using LIMIT+1
+    /// semantics (a result of exactly `row_limit` rows is NOT flagged truncated;
+    /// the `row_limit + 1`-th row flags it). Returns column names + rows.
+    ///
+    /// The statement forms are refused the same way on either connection
+    /// ([`reader_refusal`]): the reader entry refuses them on a reader, and this
+    /// guard refuses them before the fallback path runs the statement — so a
+    /// store gets one verdict per statement whichever connection serves it, and
+    /// a raw client cannot do on the fallback what a reader turns away.
     pub(crate) async fn query_readonly(
         &self,
         sql: &str,
         params: impl IntoParams + Send + 'static,
         row_limit: usize,
     ) -> turso::Result<ReadonlyRows> {
-        let sql = sql.to_owned();
+        self.refuse_transaction_read()?;
+        // Checked before the path is chosen, so a statement a reader refuses is
+        // refused at once instead of after waiting for a reader; the reader entry
+        // applies the same guard for the reads that do not come through here
+        // ([`ReaderLease::run`]), which is what keeps the verdict identical on
+        // either path.
+        if let Some(refusal) = reader_refusal(sql) {
+            return Err(turso::Error::Error(refusal));
+        }
+        if let Some(lease) = self.readers.lease().await {
+            let owned = sql.to_owned();
+            return lease
+                .run(sql, move |conn| {
+                    Box::pin(
+                        async move { run_readonly_query(conn, &owned, params, row_limit).await },
+                    )
+                })
+                .await;
+        }
+        let owned = sql.to_owned();
         let dangling = self.has_dangling_tx.clone();
         self.run_detached(move |conn| {
             Box::pin(async move {
                 conn.execute("PRAGMA query_only = 1;", ()).await?;
                 let result =
-                    AssertUnwindSafe(run_readonly_query(conn, &sql, params, row_limit))
+                    AssertUnwindSafe(run_readonly_query(conn, &owned, params, row_limit))
                         .catch_unwind()
                         .await;
-                // Always restore the shared connection to its normal state (query_only
+                // Always restore the writing connection to its normal state (query_only
                 // off, autocommit) so instance writes are never left disabled. The
                 // `query_only` reset happens first; then a transaction-control statement
                 // (BEGIN/SAVEPOINT) that a raw IPC client could send — not re-validated
                 // instance-side — is rolled back to autocommit, since an open transaction
-                // on the shared connection would poison subsequent instance writes. The
+                // on the writing connection would poison subsequent instance writes. The
                 // whole reset is also panic-guarded: a turso engine panic here must not
                 // unwind (leaving query_only=1), so the caller gets an error instead.
                 let (reset, tx_reset) = match AssertUnwindSafe(async {
@@ -1123,8 +1427,8 @@ impl Connection {
                 if let Err(e) = &reset {
                     tracing::error!(
                         error = %e,
-                        "query_readonly: failed to reset PRAGMA query_only — instance writes may \
-                         be left disabled on the shared connection"
+                        "query_readonly: failed to reset PRAGMA query_only on the writing \
+                         connection — instance writes may be left disabled"
                     );
                 }
                 if let Err(e) = &tx_reset {
@@ -1133,8 +1437,8 @@ impl Connection {
                     dangling.store(true, Ordering::SeqCst);
                     tracing::error!(
                         error = %e,
-                        "query_readonly: failed to roll back a leaked transaction — instance writes may \
-                         be left disabled on the shared connection"
+                        "query_readonly: failed to roll back a leaked transaction — instance writes \
+                         may be left disabled on the writing connection"
                     );
                 }
                 reset?;
@@ -1195,8 +1499,9 @@ impl Connection {
         strict_collect(self.query_map(sql, params, map).await?)
     }
 
-    /// Execute a query that returns exactly one row.
-    /// Acquires the mutex so reads are serialized with writes.
+    /// Execute a read that returns exactly one row.
+    /// Served by a reader connection when the store has one free — see
+    /// [`Self::run_read`].
     pub async fn query_row<T, E>(
         &self,
         sql: &str,
@@ -1207,9 +1512,24 @@ impl Connection {
         T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let sql = sql.to_owned();
-        self.run_detached(move |conn| {
-            Box::pin(async move { Self::query_row_impl(conn, &sql, params, map).await })
+        self.query_row_at(Place::Read, sql, params, map).await
+    }
+
+    /// [`Self::query_row`] on the connection `place` names.
+    async fn query_row_at<T, E>(
+        &self,
+        place: Place,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> turso::Result<T>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let owned = sql.to_owned();
+        self.run_at(place, sql, move |conn| {
+            Box::pin(async move { Self::query_row_impl(conn, &owned, params, map).await })
         })
         .await
     }
@@ -1232,9 +1552,10 @@ impl Connection {
         optional_row(self.query_row(sql, params, map).await)
     }
 
-    /// Core query_row logic shared by [`Connection::query_row`] and
-    /// [`TxGuard::query_row`].  Operates on an already-locked connection.
-    /// Returns [`turso::Error::QueryReturnedNoRows`] when no row matches.
+    /// Core row-mapping logic shared by [`Connection::query_row`],
+    /// [`Connection::execute_one`] and [`TxGuard::execute_one`]. Operates on an
+    /// already-locked connection. Returns [`turso::Error::QueryReturnedNoRows`]
+    /// when no row matches.
     async fn query_row_impl<T, E>(
         conn: &turso::Connection,
         sql: &str,
@@ -1249,9 +1570,11 @@ impl Connection {
         map_first_row(rows, map).await
     }
 
-    /// Execute a query, returning all matching rows, using the connection's
-    /// prepared-statement cache instead of re-preparing the SQL on every call
-    /// (this includes `UPDATE..RETURNING`, which reads rows back).
+    /// Execute a read, returning all matching rows, using the connection's
+    /// prepared-statement cache instead of re-preparing the SQL on every call.
+    /// Served by a reader connection when the store has one free — see
+    /// [`Self::run_read`]. A change with rows to hand back goes through
+    /// [`Self::execute_rows_cached`] instead.
     ///
     /// # Cache contract
     ///
@@ -1267,9 +1590,19 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        let sql = sql.to_owned();
-        self.run_detached(move |conn| {
-            Box::pin(async move { Self::query_cached_impl(conn, &sql, params).await })
+        self.query_cached_at(Place::Read, sql, params).await
+    }
+
+    /// [`Self::query_cached`] on the connection `place` names.
+    async fn query_cached_at(
+        &self,
+        place: Place,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
+        let owned = sql.to_owned();
+        self.run_at(place, sql, move |conn| {
+            Box::pin(async move { Self::query_cached_impl(conn, &owned, params).await })
         })
         .await
     }
@@ -1305,7 +1638,7 @@ impl Connection {
         strict_collect(map_rows(&rows, map))
     }
 
-    /// Execute a query that returns exactly one row, using the cached
+    /// Execute a read that returns exactly one row, using the cached
     /// prepared-statement path (see [`Self::query_cached`] for the cache
     /// contract).
     async fn query_row_cached<T, E>(
@@ -1318,10 +1651,10 @@ impl Connection {
         T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let sql = sql.to_owned();
-        self.run_detached(move |conn| {
+        let owned = sql.to_owned();
+        self.run_at(Place::Read, sql, move |conn| {
             Box::pin(async move {
-                let mut stmt = conn.prepare_cached(&sql).await?;
+                let mut stmt = conn.prepare_cached(&owned).await?;
                 map_first_row(stmt.query(params).await?, map).await
             })
         })
@@ -1359,9 +1692,10 @@ impl Connection {
     /// treat this as a no-op (the result row reports `log == checkpointed == -1`).
     ///
     /// The result row is parsed into a [`CheckpointOutcome`] so callers can
-    /// distinguish a complete checkpoint from a busy or partial one — Turso
-    /// never reports a busy result in the row's first column on its success
-    /// path, so incompleteness must be derived from `log > checkpointed`.
+    /// distinguish a complete checkpoint from a partial one (`log >
+    /// checkpointed`); an attempt the engine could not run (blocked or failed)
+    /// never reaches that parse — it returns the engine's wordless row as an
+    /// error carrying the captured reason, see [`parse_checkpoint_row`].
     ///
     /// A reclaiming checkpoint must pass
     /// [`crate::db::shrink_gate::shrink_allowed`] first — the checkpoint rounds
@@ -1400,10 +1734,12 @@ impl Connection {
     async fn run_checkpoint(&self, mode: CheckpointMode) -> anyhow::Result<CheckpointOutcome> {
         // The engine reports a failed checkpoint as a successful row that cannot
         // carry the reason, so an armed sink is the only source for it (see
-        // [`checkpoint_cause`]).
+        // [`checkpoint_cause`]). The compaction is upkeep: it runs on the
+        // writing connection, never on a reader (see [`Upkeep`]).
         let cause = checkpoint_cause::CauseSink::new();
         let sql = format!("PRAGMA wal_checkpoint({});", mode.label());
         let rows = self
+            .upkeep()
             .query_with_cause(&sql, (), Some(&cause))
             .await
             .map_err(|e| cause.attach(anyhow::Error::from(e)))
@@ -1420,8 +1756,12 @@ impl Connection {
     /// index cardinality. Returns `Ok(())` on success, or an error with the
     /// first corruption message if any corruption is detected.
     ///
-    /// Lightweight (~10ms on a healthy store) and read-only — safe to call
-    /// periodically while the system is running.
+    /// Read-only, and a full scan of the store's b-trees: its cost scales with
+    /// the store, not with a constant. On the live installation the periodic
+    /// integrity round of a ~540 MiB store is what ordinary reads used to wait
+    /// seconds behind — which is why those reads are served by reader
+    /// connections now, and why this runs as upkeep on the writing connection
+    /// ([`Upkeep`]).
     pub async fn quick_check(&self) -> anyhow::Result<()> {
         if let Some(problem) = self.quick_check_problems().await?.into_iter().next() {
             anyhow::bail!("Database integrity check failed: {problem}");
@@ -1434,12 +1774,731 @@ impl Connection {
     /// The class-B repair needs the full list: an overflow-aliasing row
     /// anywhere in the scan must veto the REINDEX even when an earlier row
     /// names an index desync.
+    ///
+    /// Upkeep: the store's own verification, on the writing connection (see
+    /// [`Upkeep`]).
     pub(crate) async fn quick_check_problems(&self) -> anyhow::Result<Vec<String>> {
         let rows = self
+            .upkeep()
             .query("PRAGMA quick_check;", ())
             .await
             .context("Failed to execute PRAGMA quick_check")?;
         scan_integrity_rows(&rows)
+    }
+}
+
+/// The store's own upkeep reads — the reads the store issues to itself, which
+/// stay on the writing connection.
+///
+/// The periodic integrity verification, the compaction, the search-index repair
+/// and its probes, the pre-shrink size probe, and the read of the store's own
+/// record of changes are all upkeep: they judge or maintain the store itself
+/// rather than serve a caller, and the compaction and the repair must not run
+/// against a reader's reading position (and the repair must not run beside live
+/// readers at all). Keeping them behind one entry leaves those exceptions in one
+/// place instead of hunting them down call by call, and it is why the reading
+/// entries can say, without exception, that they serve reads on a reader.
+///
+/// Upkeep is **not** atomic with the change that follows it: each statement takes
+/// the writing connection and gives it back, so another task's change can be
+/// committed between one of them and the change it decides. What relies on that
+/// says so at the place it relies on it.
+#[derive(Clone, Copy)]
+pub(crate) struct Upkeep<'a>(&'a Connection);
+
+impl Connection {
+    /// The entry for the store's own upkeep reads — see [`Upkeep`].
+    #[must_use]
+    pub(crate) fn upkeep(&self) -> Upkeep<'_> {
+        Upkeep(self)
+    }
+}
+
+impl Upkeep<'_> {
+    /// An upkeep read on the writing connection, returning all matching rows.
+    pub(crate) async fn query(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
+        self.0.query_at(Place::Writer, sql, params).await
+    }
+
+    /// [`Self::query`] through the writing connection's prepared-statement
+    /// cache (see [`Connection::query_cached`] for the contract).
+    pub(crate) async fn query_cached(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
+        self.0.query_cached_at(Place::Writer, sql, params).await
+    }
+
+    /// An upkeep read on the writing connection that returns zero or one row.
+    async fn query_optional<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Option<T>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        optional_row(self.query_row(sql, params, map).await)
+    }
+
+    /// An upkeep read on the writing connection that returns exactly one row.
+    async fn query_row<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> turso::Result<T>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        self.0.query_row_at(Place::Writer, sql, params, map).await
+    }
+
+    /// An upkeep read on the writing connection, mapping each row.
+    async fn query_map<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> turso::Result<Vec<turso::Result<T>>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let rows = self.query(sql, params).await?;
+        Ok(map_rows(&rows, map))
+    }
+
+    /// [`Self::query`] with an optional engine-cause sink armed for the read's
+    /// own polls, so a reason the engine emits belongs to this call and no other
+    /// (see [`checkpoint_cause`]). Used by the checkpoint, whose failure row
+    /// cannot carry the engine's reason.
+    async fn query_with_cause(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        cause: Option<&checkpoint_cause::CauseSink>,
+    ) -> turso::Result<Vec<Row>> {
+        let sql = sql.to_owned();
+        self.0
+            .run_detached_capturing(
+                move |conn| {
+                    Box::pin(async move { Connection::query_impl(conn, &sql, params).await })
+                },
+                cause,
+            )
+            .await
+    }
+}
+
+// ── Reader connections ──────────────────────────────────────────────
+
+/// How many reader connections one store keeps.
+///
+/// Two bounds fix this count. The floor is two: one read that is slow, or whose
+/// caller has already given up, must never by itself make the next read wait for
+/// a reader. The ceiling would be the engine's reading positions — the one thing
+/// in this file that could make a read fail where it used to succeed. The source
+/// keeps a handful of frame-valued read marks, four of them for readers, which
+/// reads like four positions is all there is (three readers plus the writing
+/// connection's own statement); the measurement is what settles it, and it is
+/// what this count rests on: `readers_at_distinct_frames_are_all_admitted` holds
+/// twenty-four live, only-partly-stepped reads at twenty-four distinct frames at
+/// once, and every one of them is admitted — the engine hands a reader the
+/// highest read mark at or below its snapshot instead of handing out one
+/// position per reader.
+///
+/// Accepted residual: were the engine ever to deny a reader a position anyway
+/// (the retry-then-`Busy` path the source reads like), it would surface as that
+/// one read's own engine error after the engine's own retry — never as a state
+/// change, and never as a failure of the store.
+///
+/// The cost is per connection and is accepted: each reader carries its own page
+/// cache (2000 pages, ~8 MiB), its own prepared-statement cache (filled from the
+/// same SQL the writing connection prepares, so a statement is prepared once per
+/// reader) and its own connect — the engine's connect is blocking, so the first
+/// read that needs a reader pays for the readers it creates. That steady-state
+/// memory is the price of reads that do not wait.
+const READER_CONNECTIONS: usize = 3;
+
+/// How long a connection waits on a lock another process holds, before giving up
+/// with a busy error — the writing connection ([`Connection::open`]) and every
+/// reader ([`ReaderPool::create_readers`]) alike: every connection carries the
+/// per-connection settings it needs.
+const BUSY_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// How long [`ReaderPool::quiet`] and [`ReaderPool::release`] wait for the
+/// readers to fall idle before giving up on waiting.
+///
+/// A reader serves one read at a time, so the readers fall idle in the time a
+/// read takes; the wait only runs long when a read was abandoned by a caller
+/// that gave up. Giving up on the wait is what keeps a store repair, and the
+/// exit round's checkpoint, from hanging behind such a read.
+const READERS_IDLE_WAIT: Duration = Duration::from_secs(5);
+
+/// Why a read issued by the task that holds a transaction is refused.
+const TRANSACTION_READ_REFUSAL: &str = "a read issued while this task holds an open \
+     transaction on the connection must be served by the transaction itself \
+     (TxGuard::query): a reader connection cannot see what the transaction has \
+     written";
+
+/// PRAGMA names a **read-only** connection may run: the read-shaped pragmas of
+/// the inspection path, shared by the reader guard ([`reader_refusal`]) and the
+/// debug validator ([`crate::db::debug::validate_read_only`]) so the two cannot
+/// drift.
+///
+/// A mutating PRAGMA is not on the list. A bracketed or quoted name is the name
+/// inside it ([`pragma_form`]), which is also how the validator's tokenizer
+/// hands a name over — so the two agree on which name a statement runs. On the
+/// inspection path this allowlist is defense-in-depth on top of the engine's own
+/// read-only switch; on a reader connection it is what covers the pragmas that
+/// switch leaves unclassified (`PRAGMA wal_checkpoint` compacts the store file
+/// and `PRAGMA journal_mode` rewrites its header, and neither is refused by
+/// it).
+///
+/// `foreign_key_check` is on the list because this product issues it as a read
+/// ([`crate::db::migrations`], after a consolidation import) — the engine does
+/// not know the name and answers it with no rows, so it changes nothing either
+/// way. The engine's own foreign-key read is `foreign_key_list`, which is listed
+/// beside it.
+pub(crate) const READER_PRAGMAS: &[&str] = &[
+    "quick_check",
+    "integrity_check",
+    "table_info",
+    "table_xinfo",
+    "index_info",
+    "index_list",
+    "index_xinfo",
+    "foreign_key_check",
+    "foreign_key_list",
+    "database_list",
+    "compile_options",
+    "page_count",
+    "freelist_count",
+    "page_size",
+    "encoding",
+    "user_version",
+    "schema_version",
+    "collation_list",
+    "function_list",
+    "module_list",
+    "pragma_list",
+    "table_list",
+    "stats",
+];
+
+/// The listed pragmas whose body is a **query** whatever it looks like: the ten
+/// names the engine routes to its query path for both the call form and the `=`
+/// form (its `translate/pragma.rs` match on the name behind `Equals | Call`).
+/// That is why `PRAGMA table_info = tickets` reads rather than assigns, and why
+/// [`reader_refusal`] lets their assignment form through; every other listed name
+/// is taken with a value only as a setter, and a reader refuses that.
+const QUERY_BODY_PRAGMAS: &[&str] = &[
+    "quick_check",
+    "integrity_check",
+    "table_info",
+    "table_xinfo",
+    "index_info",
+    "index_xinfo",
+    "index_list",
+    "foreign_key_list",
+    "database_list",
+    "table_list",
+];
+
+/// The statement forms a reader connection refuses, as the reason to show, or
+/// `None` when the statement may run.
+///
+/// A reader connection is read-only for its whole life: it is created with
+/// `PRAGMA query_only = 1` and the switch is never turned off, so the engine
+/// itself refuses every change it classifies as a write when a statement is
+/// prepared — DML, DDL, `VACUUM`, `REINDEX` and the pragma setters it
+/// classifies as writes. What the switch does **not** refuse is what this guard
+/// covers: transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/
+/// `RELEASE`), `ATTACH`/`DETACH`, and the pragmas that write without being
+/// classified as writes (`PRAGMA wal_checkpoint`, `PRAGMA journal_mode`).
+///
+/// It is an allowlist ([`READER_PRAGMAS`]) plus a bounded prefix look at the
+/// statement's leading form and at whether a pragma's body assigns to it
+/// ([`QUERY_BODY_PRAGMAS`]) — not a classification pass over the SQL — so it also
+/// refuses reads it does not need to refuse: a pragma absent from the list, and
+/// any assignment to a name whose body the engine does not route as a query.
+/// Refusing a read costs a caller an error message, never a guarantee, so the
+/// list errs that way on purpose.
+///
+/// One verdict per statement, whichever connection serves it: the reader entry
+/// applies this on a reader ([`ReaderLease::run`]), and the read-only inspection
+/// path applies it on the writing-connection fallback
+/// ([`Connection::query_readonly`]) — a raw client cannot do on the fallback what
+/// a reader turns away. The narrowing that follows for such a client (a no-op
+/// setter like `PRAGMA page_size = 8192` is refused where the fallback used to
+/// accept it) is intended.
+///
+/// The call form of a listed name (`PRAGMA page_size(8192)`) is left to the
+/// engine: of the listed names only `page_size`, `user_version` and
+/// `schema_version` are settable, and against an initialized store the first is
+/// a no-op, the third an explicit no-op, and the second a write the read-only
+/// switch itself refuses — so a reader cannot change state through one.
+///
+/// The failure it prevents is a change that succeeds on a reader and is never
+/// recorded: change capture runs on the writing connection only, so a change
+/// committed anywhere else never reaches the store's own record of changes —
+/// which is what the ticket chronicle (`ticket_chronicle`) is materialized
+/// from.
+pub(crate) fn reader_refusal(sql: &str) -> Option<String> {
+    let (keyword, rest) = leading_form(sql);
+    let upper = keyword.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "ATTACH" | "DETACH"
+    ) {
+        return Some(format!(
+            "refused on a read-only connection: '{upper}' can change state, and the store's \
+             readers never change state"
+        ));
+    }
+    if upper == "PRAGMA" {
+        let (name, args) = pragma_form(rest);
+        let lower = name.to_ascii_lowercase();
+        if !READER_PRAGMAS.contains(&lower.as_str()) {
+            // A name that resolved to nothing (`PRAGMA [wal_checkpoint`, an
+            // unterminated bracket) is not one this guard can clear: name what
+            // was actually written instead of an empty pragma.
+            let shown = if name.is_empty() {
+                rest.trim().trim_end_matches(';').trim_end()
+            } else {
+                name
+            };
+            return Some(format!(
+                "refused on a read-only connection: PRAGMA '{shown}' is not one of the pragmas \
+                 a reader may run"
+            ));
+        }
+        // An assignment is the `=` as the first thing after the name: an
+        // argument (`PRAGMA table_info('a=b')`) is not one, whatever it holds.
+        if skip_leading(args).starts_with('=') && !QUERY_BODY_PRAGMAS.contains(&lower.as_str()) {
+            return Some(format!(
+                "refused on a read-only connection: PRAGMA '{name}' may be read, never assigned — \
+                 a reader's own state never changes"
+            ));
+        }
+    }
+    None
+}
+
+/// The name a `PRAGMA …` statement runs and the text after it: a quoted or
+/// bracketed name (`[table_info]`, `"table_info"`, `` `table_info` ``) is the
+/// name inside, which is how the engine reads it and how the debug validator's
+/// tokenizer hands it over — so a bracketed pragma the inspection path accepts
+/// is not refused here for being bracketed.
+///
+/// An unterminated quoting (`PRAGMA [wal_checkpoint`) resolves to no name at
+/// all, and the allowlist then refuses the statement — as does the engine,
+/// which cannot parse it either.
+fn pragma_form(rest: &str) -> (&str, &str) {
+    let rest = skip_leading(rest);
+    let Some(open) = rest.chars().next().filter(|c| matches!(c, '[' | '"' | '`')) else {
+        return leading_form(rest);
+    };
+    let close = if open == '[' { ']' } else { open };
+    match rest[open.len_utf8()..].split_once(close) {
+        Some((name, tail)) => (name, tail),
+        None => ("", rest),
+    }
+}
+
+/// Split a statement's leading form: the leading word and the rest after it,
+/// with leading whitespace, statement separators and `--` / `/* */` comments
+/// skipped.
+fn leading_form(sql: &str) -> (&str, &str) {
+    let rest = skip_leading(sql);
+    match rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        Some(end) => (&rest[..end], &rest[end..]),
+        None => (rest, ""),
+    }
+}
+
+/// Skip what the engine's parser skips before a statement: whitespace,
+/// statement separators and `--` / `/* */` comments.
+///
+/// The separators matter: the engine runs the statement after a leading `;` (an
+/// empty statement is nothing), so a guard that stopped at one would be
+/// bypassed by a single character.
+fn skip_leading(sql: &str) -> &str {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            return rest;
+        }
+    }
+}
+
+/// A store's reader connections: a small fixed set of read-only connections to
+/// the same open store, each serving one read at a time.
+///
+/// # What they are for
+///
+/// A read used to be issued on the writing connection and therefore queue behind
+/// whatever else the store was doing — a read issued while the periodic
+/// integrity verification was under way waited seconds, against an ordinary read
+/// cost of milliseconds. A read of its own is served at once instead, and reads
+/// do not queue behind one another while a reader is free.
+///
+/// # Discipline
+///
+/// * Every connection here comes from the already-open store
+///   ([`turso::Database::connect`]): a store file is never opened a second time,
+///   because the engine holds a whole-file lock on it for the process's life and
+///   closing any descriptor for that file drops every record lock the process
+///   holds on it (see [`crate::db::wal_guard`]). The pool holds the store handle,
+///   so the handle outlives the connections made from it.
+/// * Readers are created on the first read that needs one, and only after
+///   [`Connection::enable_readers`] — so opening a store, including the many
+///   stores the checks open, pays nothing for readers it never uses.
+/// * Each reader is read-only for its whole life (see [`reader_refusal`]), and
+///   change capture is never enabled on one: the engine records a change on the
+///   connection that commits it, so the record is complete exactly because no
+///   change may be committed anywhere but the writing connection. A reader can
+///   also never be left with a transaction open — transaction control is one of
+///   the forms the guard refuses — so there is nothing to roll back on one.
+///
+/// # What is accepted
+///
+/// * A read waits for a reader only while every reader is busy; one read whose
+///   caller has already given up can hold one reader, never the pool.
+/// * A read no longer queues behind another task's open state change, so it may
+///   see the state as of just before that change is committed — never older than
+///   that.
+/// * A reader's cache is its own and the engine clears it at the start of a
+///   read once it sees the journal has moved — no writer-side code drops another
+///   connection's cache — so a read that follows a commit re-reads what it
+///   needs: a read can be slower than it would have been on the writing
+///   connection while the store is being written to.
+/// * A reading position can be refused to a reader in the engine's own terms
+///   (see the count's doc): the read then fails with the engine's own error
+///   after the engine's own retry, and never as a state change.
+/// * The pool's steady-state memory (three connections' own caches) and the
+///   one-time cost of creating them, paid by the first read that needs one.
+struct ReaderPool {
+    /// The open store the readers are made from.
+    db: Arc<turso::Database>,
+    /// The free readers, and whether they have been created yet.
+    inner: tokio::sync::Mutex<ReaderPoolInner>,
+    /// Woken when a reader is given back to `inner.idle`.
+    freed: tokio::sync::Notify,
+    /// Whether the readers are in service. Reads are served by the writing
+    /// connection while it is `false`: before [`Connection::enable_readers`],
+    /// while a repair holds the store quiet, and once the store is on its way
+    /// down.
+    in_service: tokio::sync::watch::Sender<bool>,
+    /// Set by [`ReaderPool::release`], never cleared: the store is on its way
+    /// down and the readers are gone for good. It is what keeps a repair's
+    /// [`QuietReaders`] guard, dropped after the release, from putting readers
+    /// back in service during the exit sequence.
+    released: AtomicBool,
+}
+
+/// [`ReaderPool`]'s state under its lock.
+struct ReaderPoolInner {
+    /// The free readers — empty until the first read creates them, and while
+    /// every reader is serving a read.
+    idle: Vec<turso::Connection>,
+    /// How far the pool has got with creating them.
+    state: Readers,
+}
+
+/// How far a pool has got with creating its readers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Readers {
+    /// Not created yet: the first read that needs one creates them.
+    Uncreated,
+    /// Created — in `idle`, or serving a read.
+    Created,
+    /// Creation failed, and is not retried: every read from then on is served by
+    /// the writing connection, which is where reads were served before readers
+    /// existed. The reason was logged where the creation failed.
+    Failed,
+}
+
+impl std::fmt::Debug for ReaderPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReaderPool")
+            .field("connections", &READER_CONNECTIONS)
+            .finish()
+    }
+}
+
+impl ReaderPool {
+    fn new(db: Arc<turso::Database>) -> Self {
+        Self {
+            db,
+            inner: tokio::sync::Mutex::new(ReaderPoolInner {
+                idle: Vec::new(),
+                state: Readers::Uncreated,
+            }),
+            freed: tokio::sync::Notify::new(),
+            in_service: tokio::sync::watch::channel(false).0,
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Put the readers in service — see [`Connection::enable_readers`].
+    ///
+    /// `send_replace` rather than `send`: the pool holds no receiver of its own,
+    /// and a `watch` sender refuses to send while no receiver exists.
+    fn enable(&self) {
+        self.in_service.send_replace(true);
+    }
+
+    /// Hand out a reader for one read, creating the readers on first use, or
+    /// `None` when no reader can serve this read (not in service, creation
+    /// failed, or they went out of service while this call waited for a free
+    /// one). The caller then serves the read on the writing connection.
+    async fn lease(self: &Arc<Self>) -> Option<ReaderLease> {
+        let mut in_service = self.in_service.subscribe();
+        loop {
+            if !*in_service.borrow() {
+                return None;
+            }
+            {
+                let mut inner = self.inner.lock().await;
+                // Re-checked while holding the lock: the check above is already
+                // stale by the time this call gets the lock, and a read that got
+                // past it after a quiet() had drained the pool would create
+                // readers and run on one — exactly what the quiet() was for.
+                if !*in_service.borrow() {
+                    return None;
+                }
+                match inner.state {
+                    Readers::Created => {}
+                    // Not retried: a creation that failed stays failed, and the
+                    // reads it could not serve keep being served the way they
+                    // were before the pool existed.
+                    Readers::Failed => return None,
+                    Readers::Uncreated => match self.create_readers().await {
+                        Ok(made) => {
+                            debug!(
+                                connections = made.len(),
+                                "reader connections created — this store's reads are served by \
+                                 them from now on"
+                            );
+                            inner.idle = made;
+                            inner.state = Readers::Created;
+                        }
+                        Err(reason) => {
+                            error!(
+                                reason,
+                                "could not create the store's reader connections — reads stay \
+                                 on the writing connection"
+                            );
+                            inner.state = Readers::Failed;
+                            return None;
+                        }
+                    },
+                }
+                if let Some(conn) = inner.idle.pop() {
+                    return Some(ReaderLease {
+                        pool: Arc::clone(self),
+                        conn,
+                    });
+                }
+            }
+            tokio::select! {
+                () = self.freed.notified() => {}
+                changed = in_service.changed() => {
+                    if changed.is_err() || !*in_service.borrow() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take the readers out of service and wait for them to fall idle, closing
+    /// them so nothing they hold predates the work the caller is about to do.
+    /// `None` when they did not fall idle within [`READERS_IDLE_WAIT`]: the
+    /// caller then defers rather than running against live readers.
+    async fn quiet(self: &Arc<Self>) -> Option<QuietReaders> {
+        if !*self.in_service.borrow() || self.released.load(Ordering::SeqCst) {
+            return Some(QuietReaders { pool: None });
+        }
+        self.in_service.send_replace(false);
+        if self.drain_idle().await {
+            Some(QuietReaders {
+                pool: Some(Arc::clone(self)),
+            })
+        } else {
+            // Back in service — unless the store was released while this call
+            // waited: the release is final.
+            if !self.released.load(Ordering::SeqCst) {
+                self.in_service.send_replace(true);
+            }
+            None
+        }
+    }
+
+    /// Take the readers out of service for good — see
+    /// [`Connection::release_readers`].
+    async fn release(self: &Arc<Self>) {
+        self.released.store(true, Ordering::SeqCst);
+        self.in_service.send_replace(false);
+        let _ = self.drain_idle().await;
+    }
+
+    /// Close the readers once every one of them is idle. `false` when they did
+    /// not all fall idle within [`READERS_IDLE_WAIT`]. A reader still out at
+    /// that point keeps its own connection (and its reading position) until the
+    /// runtime drops it.
+    async fn drain_idle(&self) -> bool {
+        let deadline = tokio::time::Instant::now() + READERS_IDLE_WAIT;
+        loop {
+            {
+                let mut inner = self.inner.lock().await;
+                let all_idle = match inner.state {
+                    // Nothing was created, so nothing is out.
+                    Readers::Uncreated | Readers::Failed => true,
+                    Readers::Created => inner.idle.len() == READER_CONNECTIONS,
+                };
+                if all_idle {
+                    // A pool that had readers is back to not having any: the
+                    // next read that needs one creates them again. A failed
+                    // creation is not one of those — it stays failed.
+                    inner.idle.clear();
+                    if inner.state == Readers::Created {
+                        inner.state = Readers::Uncreated;
+                    }
+                    return true;
+                }
+            }
+            if tokio::time::timeout_at(deadline, self.freed.notified())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    /// Return a reader after a read. A reader given back after the pool was
+    /// drained is closed instead of kept: the drain is what emptied it.
+    async fn give_back(&self, conn: turso::Connection) {
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.state == Readers::Created {
+                inner.idle.push(conn);
+            }
+        }
+        self.freed.notify_one();
+    }
+
+    /// Create the readers. Every reader carries the per-connection settings the
+    /// writing connection gets, plus the read-only switch, which is set here —
+    /// before any statement is prepared on the connection — and never reset.
+    ///
+    /// The engine's connect is blocking (it reads the store header and page 1
+    /// and refreshes its stats snapshot), so it runs off the async worker pool.
+    async fn create_readers(&self) -> Result<Vec<turso::Connection>, String> {
+        let mut made = Vec::with_capacity(READER_CONNECTIONS);
+        for _ in 0..READER_CONNECTIONS {
+            let conn = crate::util::with_block_in_place(|| self.db.connect())
+                .map_err(|e| format!("could not connect a reader: {e}"))?;
+            conn.busy_timeout(BUSY_TIMEOUT)
+                .map_err(|e| format!("could not set a reader's busy timeout: {e}"))?;
+            conn.execute("PRAGMA temp_store = MEMORY;", ())
+                .await
+                .map_err(|e| format!("could not set a reader's in-memory temp storage: {e}"))?;
+            conn.execute("PRAGMA query_only = 1;", ())
+                .await
+                .map_err(|e| format!("could not make a reader read-only: {e}"))?;
+            made.push(conn);
+        }
+        Ok(made)
+    }
+}
+
+/// Held for the duration of a repair that must not run while the readers are in
+/// use: the readers are out of service (reads are served by the writing
+/// connection) and closed. Dropping the guard puts them back in service — unless
+/// the store has already released them for good ([`ReaderPool::release`], the
+/// exit path), which a guard dropped late must not undo — and the next read
+/// creates them again.
+struct QuietReaders {
+    pool: Option<Arc<ReaderPool>>,
+}
+
+impl Drop for QuietReaders {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.pool
+            && !pool.released.load(Ordering::SeqCst)
+        {
+            pool.in_service.send_replace(true);
+        }
+    }
+}
+
+/// One read's hold on one reader connection.
+struct ReaderLease {
+    pool: Arc<ReaderPool>,
+    conn: turso::Connection,
+}
+
+impl ReaderLease {
+    /// Run one read on this reader.
+    ///
+    /// The read runs in a DETACHED task, so a caller that gave up (a timeout, a
+    /// shutdown cut, an aborted task) ends only its own wait: the statement
+    /// finishes on the reader and the reader returns to the pool when it does.
+    /// Stopping a statement in place is what leaves a connection unusable in
+    /// this engine, so it is the caller's limit that ends the caller's wait,
+    /// never the statement.
+    ///
+    /// The statement is checked against [`reader_refusal`] first, so a change
+    /// routed here fails loudly instead of committing without ever being
+    /// recorded.
+    async fn run<T, F>(self, sql: &str, op: F) -> turso::Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a turso::Connection,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
+            > + Send
+            + 'static,
+    {
+        let Self { pool, conn } = self;
+        let sql = sql.to_owned();
+        let task = async move {
+            let outcome = AssertUnwindSafe(async {
+                if let Some(refusal) = reader_refusal(&sql) {
+                    return Err(turso::Error::Error(refusal));
+                }
+                op(&conn).await
+            })
+            .catch_unwind()
+            .await;
+            // The reader goes back before a panic is re-raised: the engine's own
+            // statement cleanup has run by then, and a reader holds no
+            // transaction (the guard above is what keeps one from being opened).
+            pool.give_back(conn).await;
+            match outcome {
+                Ok(inner) => inner,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        };
+        join_detached(tokio::spawn(task).await)
     }
 }
 
@@ -1462,13 +2521,19 @@ fn scan_integrity_rows(rows: &[Row]) -> anyhow::Result<Vec<String>> {
 /// Outcome of `PRAGMA wal_checkpoint`, parsed from its 3-column result row
 /// (`busy`, `log`, `checkpointed`).
 ///
-/// Turso's `op_checkpoint` writes `busy == 0` on its success path; `busy == 1`
-/// is set only on the pager checkpoint error path. A partial checkpoint is
-/// therefore detected via `log > checkpointed` (frames remaining in the WAL).
+/// The engine's success path writes `busy == 0`; a checkpoint it could not run
+/// (blocked or genuinely failed) leaves the row with `busy` set and the frame
+/// columns NULL, and that row is refused by [`parse_checkpoint_row`] — so a
+/// completed or partial checkpoint is the only thing parsed into this type, and
+/// a partial one is detected via `log > checkpointed` (frames remaining in the
+/// WAL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CheckpointOutcome {
-    /// True when the checkpoint returned SQLITE_BUSY (locks held by another
-    /// writer/checkpointer).
+    /// True when the engine's row itself says the attempt was blocked. The
+    /// shipped engine never writes that row with frame counts (its blocked row
+    /// carries none, and the parse refuses it), so this is false for every row
+    /// that reaches here — it stays a field of the outcome so the arms that
+    /// render a partial attempt keep rendering it.
     pub busy: bool,
     /// WAL frame high-water mark after the checkpoint (`-1` for non-WAL
     /// databases). After a complete TRUNCATE the frame index resets, so this
@@ -1496,6 +2561,17 @@ fn int_column(row: &Row, idx: usize) -> anyhow::Result<i64> {
 }
 
 /// `PRAGMA wal_checkpoint`'s three columns as a [`CheckpointOutcome`].
+///
+/// The engine answers a checkpoint it could not run — blocked by another
+/// connection's reading position, or genuinely failed in its pager — with a
+/// *successful* statement whose row is `busy` set and the two frame columns NULL:
+/// it fills those on the success path only, and emits its own reason as a
+/// debug-level event rather than as an SQL error ([`checkpoint_cause`] captures
+/// that event when the caller armed a sink). The two answers are therefore
+/// indistinguishable from the row, and the NULL frame columns are what says so:
+/// the row is refused here, and the captured reason is what tells a blocked
+/// attempt from a genuine failure from then on (see
+/// [`crate::db::checkpoint_cause::is_blocked_checkpoint`]).
 fn parse_checkpoint_row(row: &Row) -> anyhow::Result<CheckpointOutcome> {
     Ok(CheckpointOutcome {
         busy: int_column(row, 0)? != 0,
@@ -1504,8 +2580,19 @@ fn parse_checkpoint_row(row: &Row) -> anyhow::Result<CheckpointOutcome> {
     })
 }
 
-/// A locked connection handle scoped to a single transaction.
-/// Holds the mutex guard for the entire duration — dropped guard triggers rollback.
+/// A locked handle on the writing connection, scoped to a single transaction.
+/// Holds the mutex guard for the entire duration — a dropped guard triggers a
+/// rollback on the next write.
+///
+/// The transaction's own work goes through this guard: `query` for what it
+/// reads, `execute` / `upsert_row` / `execute_batch` for what it changes, and
+/// `execute_one` for a change that reads its own result back.
+///
+/// It is the only place a read can see the
+/// transaction's own uncommitted writes, and the connection's read entry refuses
+/// a read issued by the task holding the guard (see
+/// [`Connection::refuse_transaction_read`]) precisely so that a read cannot
+/// drift onto a reader behind the transaction's back.
 pub(crate) struct TxGuard<'a> {
     conn: tokio::sync::MutexGuard<'a, turso::Connection>,
     /// Shared flag on the parent Connection; set in Drop to signal a deferred
@@ -1513,6 +2600,9 @@ pub(crate) struct TxGuard<'a> {
     /// has been explicitly committed or rolled back, preventing Drop from
     /// flagging a dangling transaction.
     has_dangling_tx: Option<Arc<AtomicBool>>,
+    /// The parent's owning-task record, cleared with the flag above so the
+    /// connection's read entry stops refusing that task's reads.
+    tx_task: Option<Arc<std::sync::Mutex<Option<tokio::task::Id>>>>,
 }
 
 impl TxGuard<'_> {
@@ -1569,8 +2659,25 @@ impl TxGuard<'_> {
         self.conn.execute_batch(sql).await
     }
 
-    /// Execute a query that returns exactly one row.
-    pub async fn query_row<T, E>(
+    /// Execute a read of the transaction's own work, returning zero or more
+    /// rows. Returns an empty Vec when no rows match.
+    ///
+    /// This is the only read that sees what the transaction itself has written,
+    /// and the connection's read entry refuses a read issued by this task while
+    /// the transaction is open (see
+    /// [`Connection::refuse_transaction_read`]) — so the transaction's own work
+    /// reads here.
+    pub async fn query(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
+        Connection::query_impl(&self.conn, sql, params).await
+    }
+
+    /// Execute a **change** of the transaction's own work that returns exactly
+    /// one row.
+    pub async fn execute_one<T, E>(
         &self,
         sql: &str,
         params: impl IntoParams + Send + 'static,
@@ -1583,18 +2690,8 @@ impl TxGuard<'_> {
         Connection::query_row_impl(&self.conn, sql, params, map).await
     }
 
-    /// Execute a query returning zero or more rows.
-    /// Returns an empty Vec when no rows match.
-    pub async fn query(
-        &self,
-        sql: &str,
-        params: impl IntoParams + Send + 'static,
-    ) -> turso::Result<Vec<Row>> {
-        Connection::query_impl(&self.conn, sql, params).await
-    }
-
-    /// Execute a query, mapping each row through a closure, failing on the
-    /// first per-row error.
+    /// Execute a read of the transaction's own work, mapping each row, failing on
+    /// the first per-row error.
     pub async fn query_map_strict<T, E>(
         &self,
         sql: &str,
@@ -1612,17 +2709,29 @@ impl TxGuard<'_> {
     /// Commit the transaction and release the lock.
     pub async fn commit(mut self) -> turso::Result<()> {
         self.conn.execute("COMMIT", ()).await?;
-        // Clear flag so Drop doesn't try to roll back an already-committed tx
+        // Clear the flags so Drop doesn't try to roll back an already-committed
+        // tx, and the read entry stops refusing this task's reads.
         self.has_dangling_tx = None;
+        self.release_task_record();
         Ok(())
     }
 
     /// Rollback the transaction and release the lock.
     pub async fn rollback(mut self) -> turso::Result<()> {
         self.conn.execute("ROLLBACK", ()).await?;
-        // Clear flag so Drop doesn't try to roll back again
+        // Clear the flags so Drop doesn't try to roll back again
         self.has_dangling_tx = None;
+        self.release_task_record();
         Ok(())
+    }
+
+    /// End this guard's hold on the connection's transaction record: from here on
+    /// the task's reads are ordinary reads again. Guard-side only — the parent's
+    /// flag itself is left to the write path (see [`Connection::lock_and_cleanup`]).
+    fn release_task_record(&mut self) {
+        if let Some(task) = self.tx_task.take() {
+            *task.lock().unwrap_poison() = None;
+        }
     }
 }
 
@@ -1636,6 +2745,10 @@ impl Drop for TxGuard<'_> {
         if let Some(flag) = &self.has_dangling_tx {
             flag.store(true, Ordering::SeqCst);
         }
+        // The hold ends with the guard, even when the transaction itself is left
+        // for the deferred rollback: a task that dropped its guard no longer has
+        // a transaction's own work to read.
+        self.release_task_record();
     }
 }
 
@@ -1643,6 +2756,9 @@ impl Drop for TxGuard<'_> {
 
 /// Ensure a full-text search index exists with the correct tokenizer.
 /// Drops and recreates if the existing index has a different tokenizer.
+///
+/// Index maintenance, so its shape probe reads through [`Upkeep`] like the rest
+/// of the repair family.
 pub(crate) async fn ensure_fts_index(
     conn: &Connection,
     index_name: &str,
@@ -1650,6 +2766,7 @@ pub(crate) async fn ensure_fts_index(
     ddl: &str,
 ) -> anyhow::Result<()> {
     let existing_sql: Option<String> = conn
+        .upkeep()
         .query_optional(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1 LIMIT 1",
             params![index_name],
@@ -1666,6 +2783,23 @@ pub(crate) async fn ensure_fts_index(
         .is_none_or(|sql| !sql.to_lowercase().contains(&tokenizer.to_lowercase()));
 
     if needs_rebuild {
+        // The tokenizer migration drops and recreates the index, so it holds the
+        // store's readers off exactly as the corruption rebuilds do — see
+        // [`Connection::quiet_readers`] for the premise. At open time this costs
+        // nothing: the readers are created by the first read, and this hook runs
+        // before any read is served — but the guard is what the code rests on,
+        // not that ordering. A read in flight makes the migration wait for the
+        // readers to fall idle, and a reader that does not fall idle in time
+        // leaves the index as it is: the store still opens, and the next open
+        // retries the migration.
+        let Some(_quiet) = conn.quiet_readers().await else {
+            warn!(
+                index = index_name,
+                "the store's readers did not fall idle — leaving the FTS index unchanged for \
+                 this open; the next open retries the tokenizer migration"
+            );
+            return Ok(());
+        };
         conn.execute(&format!("DROP INDEX IF EXISTS {index_name}"), ())
             .await?;
         // Race-safe: `CREATE INDEX IF NOT EXISTS` prevents failure when two
@@ -1692,17 +2826,19 @@ fn names_ticket_title_fts(problem: &str, index: &str) -> bool {
 }
 
 /// True when the named index is a turso `USING fts` index (its sqlite_master
-/// DDL carries the index-method clause).
+/// DDL carries the index-method clause). Part of the index repair, so it reads
+/// through [`Upkeep`] like the repair's other probes.
 async fn is_fts_index(conn: &Connection, index: &str) -> bool {
-    conn.query_optional(
-        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
-        (index.to_string(),),
-        |row| row.get::<String>(0),
-    )
-    .await
-    .ok()
-    .flatten()
-    .is_some_and(|sql| sql.to_lowercase().contains("using fts"))
+    conn.upkeep()
+        .query_optional(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index.to_string(),),
+            |row| row.get::<String>(0),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|sql| sql.to_lowercase().contains("using fts"))
 }
 
 /// Name of the ticket-title FTS index. This const pair is the single shared
@@ -1727,14 +2863,16 @@ USING fts (title) WITH (tokenizer = 'ngram')";
 /// MATCH query proves the index is readable (the incident's corruption also
 /// failed plain MATCH queries while quick_check looked clean apart from
 /// masked rows). An Err is a detection signal, not a row-count assertion.
+/// Upkeep: part of the index repair, so it reads through [`Upkeep`].
 async fn title_fts_match_probe(conn: &Connection) -> anyhow::Result<()> {
-    conn.query_optional(
-        "SELECT id FROM tickets WHERE title MATCH ?1 LIMIT 1",
-        params![FTS_PROBE_TERM.to_string()],
-        |_| Ok::<_, ::turso::Error>(()),
-    )
-    .await
-    .map(|_: Option<()>| ())
+    conn.upkeep()
+        .query_optional(
+            "SELECT id FROM tickets WHERE title MATCH ?1 LIMIT 1",
+            params![FTS_PROBE_TERM.to_string()],
+            |_| Ok::<_, ::turso::Error>(()),
+        )
+        .await
+        .map(|_: Option<()>| ())
 }
 
 /// Boot-time corruption probe for the ticket-title FTS index. Returns
@@ -1773,6 +2911,7 @@ async fn verify_rebuilt_ticket_title_fts(conn: &Connection, index: &str) -> anyh
         );
     }
     let present = conn
+        .upkeep()
         .query_optional(
             "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
             params![index.to_string()],
@@ -1788,6 +2927,7 @@ async fn verify_rebuilt_ticket_title_fts(conn: &Connection, index: &str) -> anyh
     // must match its own row — robust against multi-token titles and titles
     // whose sanitized form is too short to tokenize.
     let titles: Vec<String> = conn
+        .upkeep()
         .query_map(
             "SELECT title FROM tickets WHERE title IS NOT NULL AND title != '' LIMIT 16",
             (),
@@ -1808,6 +2948,7 @@ async fn verify_rebuilt_ticket_title_fts(conn: &Connection, index: &str) -> anyh
         return Ok(());
     };
     let hit = conn
+        .upkeep()
         .query_optional(
             "SELECT id FROM tickets WHERE title MATCH ?1 LIMIT 1",
             params![term.clone()],
@@ -1931,6 +3072,14 @@ async fn rebuild_ticket_title_fts(
 /// continues. The instance must never crash-loop over this path, and detection
 /// must never be silently skipped.
 ///
+/// The rebuild drops and recreates the index, so it holds the store's readers
+/// off exactly as the runtime repair does ([`Connection::quiet_readers`]; see
+/// [`repair_ticket_title_fts_runtime`] for why a reader must not be in flight
+/// under an index move). At this point in the open nothing has read yet, so the
+/// guard is free; a reader that does not fall idle in time leaves the repair to
+/// the runtime round (`Deferred` there), which is where a boot that cannot take
+/// the store quiet also leaves it.
+///
 /// `store` and `root` are the refusal record's identity and artifact directory:
 /// the post-rebuild TRUNCATE is a reclaiming checkpoint, so it passes the
 /// pre-shrink gate first (see [`crate::db::shrink_gate`]), and a refusal means
@@ -1982,6 +3131,19 @@ pub(crate) async fn repair_ticket_title_fts_if_corrupt(
         evidence = %evidence,
         "ticket-title FTS corruption signature detected at boot — rebuilding the index (ticket rows untouched)"
     );
+    // The rebuild drops and recreates the index: take the readers out of service
+    // for it (see this function's doc) and keep them out through the
+    // post-rebuild checkpoint, whose TRUNCATE a held reading position would
+    // answer busy. A reader that does not fall idle in time leaves the repair to
+    // the runtime round rather than running it under a live reader.
+    let Some(_quiet) = conn.quiet_readers().await else {
+        warn!(
+            index,
+            "the store's readers did not fall idle — leaving the index as it is; the periodic \
+             round retries this repair"
+        );
+        return;
+    };
     // The post-rebuild TRUNCATE is the reclaiming checkpoint this gate
     // protects; a refusal means the rebuild runs without shrinking.
     let reclaim_after_rebuild = crate::db::shrink_gate::shrink_allowed(conn, store, root).await;
@@ -2012,6 +3174,10 @@ pub(crate) enum TicketTitleFtsRuntimeRepair {
     /// Corruption detected and the rebuild ran; payload summarizes detection
     /// evidence and repair outcome for the caller's report.
     Rebuilt(String),
+    /// The repair was not attempted: the store's readers did not fall idle, so
+    /// the rebuild could not be run with the store quiet. Reported as itself,
+    /// never as a failure — the next round tries again.
+    Deferred(String),
     /// Detection errored/panicked or the rebuild panicked — repair incomplete.
     Failed(String),
 }
@@ -2026,6 +3192,7 @@ impl TicketTitleFtsRuntimeRepair {
             Self::NotApplicable => "not applicable (no ticket-title FTS index)".to_string(),
             Self::Healthy => "healthy (index present, probe clean)".to_string(),
             Self::Rebuilt(evidence) => format!("rebuilt after detection — {evidence}"),
+            Self::Deferred(reason) => format!("deferred — {reason}"),
             Self::Failed(reason) => format!("failed — {reason}"),
         }
     }
@@ -2041,18 +3208,31 @@ impl TicketTitleFtsRuntimeRepair {
 /// first makes stores that carry no ticket-title FTS index (e.g. logs.db)
 /// no-ops. Panics use the same `catch_unwind` discipline as the boot path.
 ///
-/// Transient busy from a concurrent writer cannot fail the rebuild's DDL: the
-/// [`Connection`] wrapper serializes every operation behind one mutex, so no
-/// other in-process op (writer or checkpoint) can be in flight during the
-/// DROP+CREATE.
+/// # Readers
+///
+/// The rebuild drops and recreates the index inside one transaction, and its
+/// premise is that nothing else is in flight against the store. The writing
+/// connection's own mutex gives that for writers and checkpoints; the readers
+/// are the one thing it does not cover, so they are taken out of service and
+/// closed first ([`Connection::quiet_readers`]) — reads keep being served, by
+/// the writing connection, and the next read after the repair creates fresh
+/// readers. A reader that does not fall idle in time defers the whole repair to
+/// a later round (`Deferred`) rather than running it against live readers: a
+/// reader is never invalidated on the assumption that the engine would notice
+/// the index move under it.
 pub(crate) async fn repair_ticket_title_fts_runtime(
     conn: &Connection,
 ) -> TicketTitleFtsRuntimeRepair {
+    let Some(_quiet) = conn.quiet_readers().await else {
+        return TicketTitleFtsRuntimeRepair::Deferred(
+            "reader connections did not fall idle".to_string(),
+        );
+    };
     // Absent index → nothing to repair (non-domain stores never carry it).
     // Panic-guarded like every probe on this path: a turso panic must become
     // this repair's own `Failed` outcome, never escape to the outer per-store
     // catch and skip the checkpoint round's record-and-stop.
-    let present = AssertUnwindSafe(conn.query_optional(
+    let present = AssertUnwindSafe(conn.upkeep().query_optional(
         "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
         params![TICKETS_FTS_INDEX_NAME.to_string()],
         |_| Ok::<_, ::turso::Error>(()),
@@ -2466,6 +3646,12 @@ pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Conne
     // init_test_stores both call open_consolidated_store).
     cdc::enable_capture(&conn).await?;
 
+    // The store is final now — nothing past this point replaces or rebuilds its
+    // file — so its reads may be served by reader connections of their own.
+    // (The log store is opened by `logs::init_tracing`, never here, and keeps
+    // its own writing connection without readers.)
+    conn.enable_readers();
+
     Ok(conn)
 }
 
@@ -2593,7 +3779,10 @@ async fn snapshot_store_via_engine(
     // path is single-quote escaped.
     let escaped = dest.display().to_string().replace('\'', "''");
     // `Connection::execute` routes through `run_detached`, which holds the
-    // connection mutex for the whole statement — no other statement is active.
+    // connection mutex for the whole statement — no other statement is active on
+    // the writing connection. (The store's readers, in service by the time the
+    // store-lock check runs this, are statements of their own on their own
+    // connections.)
     match AssertUnwindSafe(conn.execute(&format!("VACUUM INTO '{escaped}'"), ()))
         .catch_unwind()
         .await
@@ -4038,8 +5227,9 @@ mod tests {
     /// (`src/db/mod.rs`) and the debug CLI (`src/db/debug.rs`).
     ///
     /// All database access must go through [`crate::db::Connection`], which
-    /// centralises the experimental feature flags, busy timeout, mutex
-    /// serialization, and dangling-transaction handling. The debug CLI is the
+    /// centralises the experimental feature flags, the per-connection settings,
+    /// the writing connection's serialization, the reader pool, and
+    /// dangling-transaction handling. The debug CLI is the
     /// documented exception: it needs the upstream lazy `Rows` iterator for
     /// `mahbot debug` queries.
     ///
@@ -4085,8 +5275,8 @@ mod tests {
         );
     }
 
-    /// Guard: the in-memory temp-store setting is applied on BOTH turso
-    /// opening paths.
+    /// Guard: the in-memory temp-store setting is applied on EVERY turso
+    /// connection the application opens.
     ///
     /// P0 incident (2026-08-17): a missing pinned temp root failed every
     /// statement whose plan contains eager temp-file opcodes (RETURNING
@@ -4099,23 +5289,26 @@ mod tests {
     /// intermediate query structures stay in RAM and a missing temp root
     /// cannot affect any turso operation.
     ///
-    /// The service connection factory (`Connection::open` in src/db/mod.rs)
-    /// and the debug CLI's separate read-only path (`connect_readonly` in
-    /// src/db/debug.rs) do NOT share an opening path — both must carry the
-    /// PRAGMA. If either regresses, the guarantee silently breaks; this
-    /// source-scanning tripwire fails with a pointer to the requirement.
+    /// The carriers do NOT share an opening path: the service's writing
+    /// connection (`Connection::open`), the store's reader connections
+    /// ([`ReaderPool::create_readers`], made from the same open store), and the
+    /// debug CLI's separate read-only path (`connect_readonly` in
+    /// src/db/debug.rs) each set the pragma itself. If one regresses, the
+    /// guarantee silently breaks; this source-scanning tripwire reads each
+    /// carrier's own body and fails with a pointer to the requirement.
     #[test]
-    fn in_memory_temp_store_applied_on_both_opening_paths() {
+    fn in_memory_temp_store_applied_on_every_opening_path() {
         const PRAGMA: &str = "PRAGMA temp_store = MEMORY";
-        // (file, symbol that must carry the PRAGMA)
-        const EXPECTED: [(&str, &str); 2] = [
-            ("src/db/mod.rs", "impl Connection"),
-            ("src/db/debug.rs", "fn connect_readonly"),
+        // (file, the header of the function that must carry the PRAGMA itself)
+        const CARRIERS: [(&str, &str); 3] = [
+            ("src/db/mod.rs", "pub async fn open(path: &Path)"),
+            ("src/db/mod.rs", "async fn create_readers("),
+            ("src/db/debug.rs", "pub(crate) fn connect_readonly("),
         ];
 
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut violations: Vec<String> = Vec::new();
-        for (file, carrier) in EXPECTED {
+        for (file, header) in CARRIERS {
             let path = manifest_dir.join(file);
             let content =
                 std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
@@ -4127,13 +5320,16 @@ mod tests {
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !code_only.contains(PRAGMA) {
+            let body = function_body(&code_only, header).unwrap_or_else(|| {
+                panic!("{file}: no function body found at `{header}` — the carrier moved")
+            });
+            if !body.contains(PRAGMA) {
                 violations.push(format!(
-                    "{file} ({carrier}) no longer applies the in-memory temp-store \
-                     setting (missing `{PRAGMA}` in code).\n\
+                    "{file}: `{header}…` no longer applies the in-memory temp-store \
+                     setting (missing `{PRAGMA}` in its own body).\n\
                      The missing-temp-root guarantee requires EVERY turso connection \
-                     the application opens — service factory AND debug CLI — to run \
-                     with in-memory temp storage."
+                     the application opens — the writing connection, each reader \
+                     connection AND the debug CLI — to run with in-memory temp storage."
                 ));
             }
         }
@@ -4143,6 +5339,17 @@ mod tests {
             "in-memory temp-store regression guard failed:\n{}",
             violations.join("\n\n")
         );
+    }
+
+    /// The body of the function whose header begins at `header`: from that line
+    /// to the line that closes it (a `}` at the header line's own indentation).
+    fn function_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
+        let start = code.find(header)?;
+        let line_start = code[..start].rfind('\n').map_or(0, |i| i + 1);
+        let indent = code[line_start..].chars().take_while(|c| *c == ' ').count();
+        let close = format!("\n{}}}", " ".repeat(indent));
+        let rest = &code[start..];
+        Some(&rest[..rest.find(&close)?])
     }
 
     #[test]
@@ -4680,6 +5887,527 @@ mod tests {
             "nothing was open, so the arm must be cleared rather than kept"
         );
         assert_eq!(orphan_tx_rows(&conn).await, vec![1]);
+    }
+
+    // ── Reader connections ────────────────────────────────────────────
+
+    /// The debug validator — which the read-only inspection path applies before
+    /// a query is sent anywhere — takes the reader guard's verdict as its own, so
+    /// a query the inspection path accepts can never be turned away by the reader
+    /// that serves it. The validator may refuse more; that direction only keeps a
+    /// query from leaving the client.
+    #[test]
+    fn nothing_a_reader_refuses_survives_the_debug_validator() {
+        // Every statement form the guard must refuse — asserted first, so this
+        // check cannot pass by the guard going quiet.
+        for sql in [
+            "BEGIN",
+            "COMMIT",
+            "SAVEPOINT s",
+            "RELEASE s",
+            "ATTACH DATABASE 'other.db' AS other",
+            "DETACH other",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "PRAGMA [wal_checkpoint]",
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA query_only = 0",
+            "PRAGMA user_version = 5",
+            "PRAGMA [user_version] = 5",
+            ";;  PRAGMA [wal_checkpoint]",
+            "PRAGMA not_a_pragma",
+        ] {
+            let reason =
+                reader_refusal(sql).unwrap_or_else(|| panic!("a reader must refuse '{sql}'"));
+            assert!(
+                crate::db::debug::validate_read_only(sql).is_err(),
+                "the validator must refuse what a reader refuses: '{sql}' ({reason})"
+            );
+        }
+        // And the read forms that do reach a reader pass both.
+        for sql in [
+            "SELECT 1",
+            "SELECT * FROM tickets",
+            "SELECT 'DROP TABLE tickets'",
+            "PRAGMA quick_check",
+            "PRAGMA integrity_check(1)",
+            "PRAGMA table_info(tickets)",
+            "PRAGMA [table_info](tickets)",
+            "PRAGMA table_info = tickets",
+            "PRAGMA table_info('a=b')",
+            "PRAGMA \"quick_check\"",
+            "PRAGMA `stats`",
+            "PRAGMA foreign_key_list(tickets)",
+            // The call form of a settable listed name: no-op on a store the
+            // engine has initialized, so the guard leaves it to the engine.
+            "PRAGMA page_size(8192)",
+            ";;SELECT 1",
+        ] {
+            assert!(
+                reader_refusal(sql).is_none(),
+                "'{sql}' is a read a reader must serve"
+            );
+            assert!(
+                crate::db::debug::validate_read_only(sql).is_ok(),
+                "'{sql}' must pass the validator"
+            );
+        }
+    }
+
+    /// Open a real product store (readers enabled) for the reader-pool tests.
+    async fn open_reader_store() -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let conn = open_consolidated_store(tmp.path())
+            .await
+            .expect("open a store with reader connections");
+        (tmp, conn)
+    }
+
+    /// The reader entry refuses every statement form that changes state — the
+    /// ones the engine's own read-only switch already refuses (DML/DDL) and the
+    /// ones it does not, which is what the reader guard exists for: transaction
+    /// control, `ATTACH`, the compaction, and the pragma setters. A change left
+    /// to a reader would commit and never be recorded, because change capture
+    /// runs on the writing connection only.
+    #[tokio::test]
+    async fn a_change_routed_to_a_reader_is_refused_loudly() {
+        let (_tmp, conn) = open_reader_store().await;
+        conn.execute_batch("CREATE TABLE reader_probe (id INTEGER)")
+            .await
+            .expect("create the probe table");
+        // The forms the reader entry refuses itself: the ones the engine's
+        // read-only switch does not cover. The leading `;;` is the engine's own
+        // empty-statement skip — a guard that stopped at the separator would let
+        // the statement after it through.
+        for sql in [
+            "BEGIN",
+            "COMMIT",
+            "SAVEPOINT s",
+            "RELEASE s",
+            "ATTACH DATABASE 'other.db' AS other",
+            "PRAGMA wal_checkpoint(TRUNCATE);",
+            "PRAGMA query_only = 0;",
+            ";;PRAGMA wal_checkpoint(TRUNCATE);",
+            ";;PRAGMA query_only = 0;",
+        ] {
+            let err = conn
+                .query(sql, ())
+                .await
+                .expect_err("a change must not be served by a reader");
+            assert!(
+                err.to_string()
+                    .contains("refused on a read-only connection"),
+                "'{sql}' must be refused by the reader entry, got: {err}"
+            );
+        }
+        // ...and one the engine's own switch refuses when the statement is
+        // prepared on the read-only connection.
+        assert!(
+            conn.query("INSERT INTO reader_probe VALUES (1)", ())
+                .await
+                .is_err(),
+            "a write statement must be refused on a reader"
+        );
+        // A quoted or bracketed name is the name inside it, which is how the
+        // engine parses it and how the debug validator's tokenizer hands it over:
+        // a bracketed writing pragma is refused all the same...
+        let bracketed = conn
+            .query("PRAGMA [wal_checkpoint];", ())
+            .await
+            .expect_err("a bracketed pragma name must not slip past the guard");
+        assert!(
+            bracketed.to_string().contains("wal_checkpoint"),
+            "the refusal must name the pragma it runs, got: {bracketed}"
+        );
+        // ...and the bracketed form of a listed read pragma is that read.
+        assert!(
+            !conn
+                .query("PRAGMA [table_info](tickets);", ())
+                .await
+                .expect("a bracketed read pragma must be served")
+                .is_empty(),
+            "the bracketed form of a listed pragma is that pragma"
+        );
+        // The same entry still serves reads, and the store's writing connection
+        // is untouched by the refusals.
+        assert_eq!(conn.query("SELECT 1", ()).await.expect("a read").len(), 1);
+        assert!(
+            conn.query("SELECT count(*) FROM reader_probe", ())
+                .await
+                .expect("a read")
+                .first()
+                .is_some_and(|row| {
+                    row.get_value(0)
+                        .is_ok_and(|v| v.as_integer().copied() == Some(0))
+                }),
+            "no refused statement may have changed the store"
+        );
+        conn.execute("INSERT INTO reader_probe VALUES (1)", ())
+            .await
+            .expect("a change on the writing connection still lands");
+    }
+
+    /// A change that has returned is what the next read sees: a reader
+    /// connection is reused between reads, and it must never hand back a view
+    /// from before the change.
+    #[tokio::test]
+    async fn a_read_after_a_change_sees_the_change() {
+        let (_tmp, conn) = open_reader_store().await;
+        conn.execute_batch("CREATE TABLE reader_probe (id INTEGER)")
+            .await
+            .expect("create the probe table");
+        for id in 0..12 {
+            conn.execute("INSERT INTO reader_probe VALUES (?1)", params![id])
+                .await
+                .expect("write");
+            let rows = conn
+                .query("SELECT id FROM reader_probe WHERE id = ?1", params![id])
+                .await
+                .expect("read");
+            assert_eq!(
+                rows.len(),
+                1,
+                "the read after the change must see it (iteration {id})"
+            );
+        }
+    }
+
+    /// A read that belongs to a transaction is served by that transaction: the
+    /// read entry refuses a read issued by the task holding it, so it can no
+    /// longer be served by a reader behind the transaction's back. A read issued
+    /// by any other task is unrelated and stays served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_inside_a_transaction_goes_through_the_transaction() {
+        let (_tmp, conn) = open_reader_store().await;
+        conn.execute_batch("CREATE TABLE reader_probe (id INTEGER)")
+            .await
+            .expect("create the probe table");
+        // The transaction is opened by a spawned task, as the service's own
+        // transaction work is: the rule is about the task that holds it.
+        let (tx_open, opened) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let holder = conn.clone();
+        let holder_task = tokio::spawn(async move {
+            let tx = holder.begin_tx().await.expect("begin tx");
+            tx.execute("INSERT INTO reader_probe VALUES (7)", ())
+                .await
+                .expect("write in the transaction");
+            // The transaction's own read sees its own uncommitted write...
+            let own = tx
+                .query("SELECT id FROM reader_probe", ())
+                .await
+                .expect("the transaction's own read")
+                .len();
+            // ...while this task's read through the connection is refused
+            // instead of being served a view the transaction has not made true.
+            let refused = holder
+                .query("SELECT id FROM reader_probe", ())
+                .await
+                .expect_err("a read of the transaction's own work must go through it");
+            tx_open.send(()).expect("the test is still listening");
+            released.await.expect("the test releases the transaction");
+            tx.commit().await.expect("commit");
+            (own, refused.to_string())
+        });
+        opened.await.expect("the transaction must open");
+        // Another task's read is an unrelated read: served, and seeing committed
+        // state only.
+        let elsewhere = tokio::spawn({
+            let conn = conn.clone();
+            async move { conn.query("SELECT id FROM reader_probe", ()).await }
+        })
+        .await
+        .expect("the other task must read")
+        .expect("the unrelated read must be served");
+        assert!(
+            elsewhere.is_empty(),
+            "an unrelated read sees committed state, never the transaction's own write"
+        );
+        release.send(()).expect("the holder is still listening");
+        let (own, refusal) = holder_task.await.expect("the holder must finish");
+        assert_eq!(
+            own, 1,
+            "the transaction must read its own uncommitted write"
+        );
+        assert!(
+            refusal.contains("must be served by the transaction itself"),
+            "got: {refusal}"
+        );
+        assert_eq!(
+            conn.query("SELECT id FROM reader_probe", ())
+                .await
+                .expect("read after the commit")
+                .len(),
+            1
+        );
+    }
+
+    /// Reading positions, settled by measurement on the engine we ship.
+    ///
+    /// The engine's source keeps a handful of frame-valued read marks (four of
+    /// them for readers), which reads like a ceiling of four readers pinned at
+    /// *different* frames. The measurement disagrees: twenty-four read
+    /// transactions, each holding a live, only-partly-stepped read of a table
+    /// that was written to again before the next one opened its snapshot, are
+    /// every one of them admitted at once. The engine hands a reader the highest
+    /// read mark at or below its snapshot rather than refusing it, so a position
+    /// is shared between readers instead of handed out one per reader.
+    ///
+    /// So a reader of ours cannot be denied a position at
+    /// [`READER_CONNECTIONS`] (nor at many times that count), which is what makes
+    /// the count safe to fix. Were the engine ever to deny one anyway, it would
+    /// arrive as that one read's own engine error after the engine's own retry —
+    /// never as a state change, and accepted as such.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn readers_at_distinct_frames_are_all_admitted() {
+        // Many times the count the store runs, on purpose.
+        const PROBE_READERS: usize = 24;
+        let (_tmp, conn) = open_reader_store().await;
+        conn.execute_batch("CREATE TABLE reader_probe (id INTEGER)")
+            .await
+            .expect("create the probe table");
+        // Each entry keeps its reader connection and the statement it is in the
+        // middle of: it is the unfinished statement that holds the position.
+        let mut held = Vec::new();
+        for id in 0..i64::try_from(PROBE_READERS).expect("the probe count fits an i64") {
+            // A frame of its own per reader: this one is committed before the
+            // next reader opens its snapshot.
+            conn.execute("INSERT INTO reader_probe VALUES (?1)", params![id])
+                .await
+                .expect("write a frame");
+            let reader = crate::util::with_block_in_place(|| conn.readers.db.connect())
+                .expect("connect a probe reader");
+            // LIMIT 1: the first row comes back with the read still open, so no
+            // reader here has finished reading while the next one starts.
+            let mut rows = reader
+                .query("SELECT id FROM reader_probe ORDER BY id LIMIT 1", ())
+                .await
+                .expect("a reader at a distinct frame must be admitted");
+            assert!(
+                rows.next().await.expect("step the probe read").is_some(),
+                "the probe read must produce a row"
+            );
+            held.push((reader, rows));
+        }
+        assert_eq!(held.len(), PROBE_READERS);
+        // And they are holding positions, not merely returning: a compaction
+        // cannot run while an unfinished read is pinned.
+        assert!(
+            conn.checkpoint_ungated().await.is_err(),
+            "the held readings must pin positions — enough of them to block a compaction"
+        );
+    }
+
+    /// A compacting (TRUNCATE) checkpoint blocked by a reader's reading position
+    /// must not come back as a success: the engine answers it with the same
+    /// wordless row it uses for a genuine pager failure (`busy`, no frame
+    /// counts), and the parse refusing that row is what keeps a blocked attempt
+    /// out of the completed arm — the engine's own captured reason is what then
+    /// tells it from a real failure, so the round retries it instead of counting
+    /// it. The attempt is a deferral, not a state failure: the journal stays
+    /// unfolded until a later attempt, which is why the retry here completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checkpoint_blocked_by_a_reader_is_a_deferral() {
+        let (_tmp, conn) = open_reader_store().await;
+        conn.execute_batch("CREATE TABLE reader_probe (id INTEGER)")
+            .await
+            .expect("create the probe table");
+        for id in 0..8i64 {
+            conn.execute("INSERT INTO reader_probe VALUES (?1)", params![id])
+                .await
+                .expect("write a frame");
+        }
+        // A reader whose statement is in flight holds its reading position for as
+        // long as it runs — that is what blocks the compaction.
+        let reader = crate::util::with_block_in_place(|| conn.readers.db.connect())
+            .expect("connect a held reader");
+        let held = tokio::spawn(async move {
+            let mut rows = reader
+                .query(
+                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                     WHERE x < 120000) SELECT count(*) FROM c, reader_probe",
+                    (),
+                )
+                .await?;
+            while rows.next().await?.is_some() {}
+            Ok::<_, turso::Error>(())
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let blocked = conn.checkpoint_ungated().await;
+        assert!(
+            blocked.is_err(),
+            "a compaction blocked by a reading position must not look like a completed one: {blocked:?}"
+        );
+        held.await
+            .expect("the held read must finish")
+            .expect("the held read must succeed");
+        // The deferral is over: the next attempt folds the journal.
+        let retried = conn
+            .checkpoint_ungated()
+            .await
+            .expect("the compaction must go through once the reader is done");
+        assert!(retried.is_complete());
+    }
+
+    /// The runtime search-index repair never runs beside live readers: with a
+    /// reader still out, the readers cannot be brought to rest, so the repair
+    /// defers to a later round instead of rebuilding the index under it — and
+    /// the store keeps serving (the pool goes back in service, and the reader
+    /// that was held is returned to it the way a read returns one).
+    #[tokio::test]
+    async fn the_runtime_repair_defers_while_a_reader_is_still_out() {
+        let (_tmp, conn) = open_reader_store().await;
+        // A reader out of the pool is what a read in flight leaves behind.
+        let held = conn
+            .readers
+            .lease()
+            .await
+            .expect("the store's readers to exist");
+        assert!(
+            matches!(
+                repair_ticket_title_fts_runtime(&conn).await,
+                TicketTitleFtsRuntimeRepair::Deferred(_)
+            ),
+            "a repair that cannot reach a quiet store must defer, not run against a reader"
+        );
+        held.run("SELECT 1", |conn| {
+            Box::pin(async move { Connection::query_impl(conn, "SELECT 1", ()).await })
+        })
+        .await
+        .expect("the held reader serves the read it was held for");
+        assert_eq!(
+            conn.query("SELECT 1", ())
+                .await
+                .expect("reads are served after a deferred repair")
+                .len(),
+            1
+        );
+    }
+
+    /// The open-time index work holds the readers off itself, instead of resting
+    /// on the order in which a store is opened: with a reader still out, the
+    /// tokenizer migration leaves the index alone and the open goes on, rather
+    /// than dropping and recreating the index under a reader's own snapshot.
+    ///
+    /// The migration is made to want to run (the tokenizer given is not the one
+    /// the stored DDL carries) and its DDL names a different index, so an attempt
+    /// is visible as that index appearing — no assertion here depends on the
+    /// engine refusing anything.
+    #[tokio::test]
+    async fn the_tokenizer_migration_leaves_the_index_alone_while_a_reader_is_out() {
+        const PROBE_INDEX: &str = "idx_tokenizer_migration_probe";
+        const PROBE_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_tokenizer_migration_probe \
+                                 ON tickets USING fts (title)";
+        let (_tmp, conn) = open_reader_store().await;
+        ensure_fts_index(
+            &conn,
+            TICKETS_FTS_INDEX_NAME,
+            "ngram",
+            TICKETS_FTS_INDEX_DDL,
+        )
+        .await
+        .expect("the store's ticket-title index");
+        assert!(
+            index_named(&conn, TICKETS_FTS_INDEX_NAME).await,
+            "the store opens with its ticket-title index"
+        );
+        // A reader out of the pool is what a read in flight leaves behind.
+        let held = conn
+            .readers
+            .lease()
+            .await
+            .expect("the store's readers to exist");
+
+        ensure_fts_index(
+            &conn,
+            TICKETS_FTS_INDEX_NAME,
+            "another tokenizer",
+            PROBE_DDL,
+        )
+        .await
+        .expect("the store still opens: the migration is skipped, not attempted");
+        assert!(
+            !index_named(&conn, PROBE_INDEX).await,
+            "the migration must not run while a reader is out"
+        );
+        assert!(
+            index_named(&conn, TICKETS_FTS_INDEX_NAME).await,
+            "the index it would have dropped must still be there"
+        );
+
+        // The reader goes back, so the next open (this call) does the work.
+        held.run("SELECT 1", |conn| {
+            Box::pin(async move { Connection::query_impl(conn, "SELECT 1", ()).await })
+        })
+        .await
+        .expect("the held reader serves the read it was held for");
+        ensure_fts_index(
+            &conn,
+            TICKETS_FTS_INDEX_NAME,
+            "another tokenizer",
+            PROBE_DDL,
+        )
+        .await
+        .expect("with the readers idle the migration runs");
+        assert!(
+            index_named(&conn, PROBE_INDEX).await,
+            "with no reader out the migration is what runs"
+        );
+    }
+
+    /// Whether the schema carries an index of this name.
+    async fn index_named(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![name.to_string()],
+            |row| row.get::<i64>(0),
+        )
+        .await
+        .expect("count the index")
+            > 0
+    }
+
+    /// A read whose caller has already given up finishes by itself, on its own
+    /// connection: the caller's own limit ends the caller's wait, not the
+    /// statement, and what the read still holds cannot stop the next read or the
+    /// next change.
+    /// Multi-threaded on purpose: a read heavy enough to outlive its caller runs
+    /// its steps in one poll, which on the current-thread test runtime would also
+    /// starve the caller's own timer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_read_does_not_hold_up_the_store() {
+        let (_tmp, conn) = open_reader_store().await;
+        conn.execute_batch("CREATE TABLE reader_probe (id INTEGER)")
+            .await
+            .expect("create the probe table");
+        conn.execute("INSERT INTO reader_probe VALUES (1)", ())
+            .await
+            .expect("write");
+        // A read heavy enough that the caller's limit fires while it is running.
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(1),
+            conn.query(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 120000) \
+                 SELECT count(*) FROM c, reader_probe",
+                (),
+            ),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "the caller's own limit must end the caller's wait"
+        );
+        // The store keeps serving: the next read and the next change are both
+        // served while the abandoned read is still in flight.
+        assert_eq!(
+            conn.query("SELECT count(*) FROM reader_probe", ())
+                .await
+                .expect("the next read must be served")
+                .len(),
+            1
+        );
+        conn.execute("INSERT INTO reader_probe VALUES (2)", ())
+            .await
+            .expect("the next change must be served");
     }
 
     // ── Overflow-aliasing rebuild (data-preserving migration) ─────────

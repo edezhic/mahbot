@@ -138,7 +138,7 @@ impl Intake {
         let rows = self
             .store
             .conn
-            .query(
+            .execute_rows(
                 &format!(
                     "INSERT INTO telegram_intake \
                      (account_id, update_id, state, payload, created_at, decided_at, claimed_by) \
@@ -205,7 +205,7 @@ impl Intake {
         let rows = self
             .store
             .conn
-            .query(
+            .execute_rows(
                 "UPDATE telegram_intake SET claimed_by = ?1 \
                  WHERE account_id = ?2 AND state = ?3 \
                    AND (claimed_by IS NULL OR claimed_by <> ?1) \
