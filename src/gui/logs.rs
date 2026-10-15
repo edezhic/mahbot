@@ -68,14 +68,14 @@ impl LogsTab {
             Self::Issues => [
                 "This permanently deletes every stored warning and error record, for \
                  every workspace and user.",
-                "Informational records are kept and stay in the All Logs view.",
+                "Informational records are not touched and stay in the All Logs view.",
                 "Nothing can be recovered.",
             ],
             Self::ToolFailures => [
                 "This permanently deletes every recorded failed tool call, for every \
                  workspace and user.",
-                "Successful tool calls are kept — only the failed rows this tab lists \
-                 are deleted.",
+                "Successful tool calls are not touched — only the failed rows this tab \
+                 lists are deleted.",
                 "Nothing can be recovered.",
             ],
         }

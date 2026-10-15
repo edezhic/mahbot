@@ -4,6 +4,8 @@ Pass the read-only `query` and, optionally, a `db` selector naming the target da
 
 Do not guess table or column names — introspect the schema first: `SELECT name, sql FROM sqlite_master WHERE type = 'table'` lists tables with their DDL, and `PRAGMA table_info(<table>)` lists a table's columns. Guessed names are the most common cause of failed calls here.
 
+The `logs` store keeps a rolling window: log and telemetry records older than 8 hours are trimmed (failed tool calls after 7 days), so an empty answer for an older window is that retention rather than a missing table.
+
 Validator quirks (fail-closed, by design):
 - The validator strips string literals, `--`/`/* */` comments, and quoted identifiers (`"x"`, `[x]`, `` `x` ``) before keyword matching, so a mutation keyword inside them (e.g. `WHERE tool_name = 'analyze'`) is ignored rather than rejected. Any blocklist keyword surviving in SQL position anywhere in the query is still rejected.
 - `BEGIN`/`COMMIT`/`ROLLBACK` and transaction-control statements are rejected.

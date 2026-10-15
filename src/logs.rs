@@ -206,20 +206,6 @@ impl LogStore {
         Ok(())
     }
 
-    /// Delete log entries matching a given `level` whose `timestamp` is older than the given
-    /// RFC 3339 `cutoff`. Returns the number of deleted rows.
-    pub async fn delete_older_than(&self, level: &str, cutoff: &str) -> anyhow::Result<u64> {
-        let n = self
-            .conn
-            .execute(
-                "DELETE FROM logs WHERE level = ?1 AND timestamp < ?2",
-                params![level, cutoff],
-            )
-            .await
-            .context("Failed to delete old log entries")?;
-        Ok(n)
-    }
-
     /// Delete stored log records in one Logs tab's scope, returning the number
     /// of rows deleted. `level_filter` uses [`LogQuery::level`] syntax; `None`
     /// means every level (the All Logs tab).

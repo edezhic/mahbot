@@ -41,10 +41,6 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 /// JetBrainsMono-Italic.ttf embedded for italic narration text in the Iced dashboard.
 const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Italic.ttf");
 
-/// INFO-log retention window (hours): the log-cleanup loop deletes INFO
-/// entries older than this. Independent of the session-purge cutoff.
-const LOG_RETENTION_HOURS: i64 = 8;
-
 /// Run [`bootstrap_mahbot`] and convert panics into `Err` so the dashboard shows
 /// a boot error instead of hanging on "Starting…" forever. A panic is recorded
 /// as a start-up failure like any other; the `Ok(Err(_))` arm is not recorded
@@ -265,17 +261,14 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         ),
     );
 
+    // Retention for the log store's accumulating telemetry — expired records are
+    // removed in bounded, paced batches so the store never stalls the work
+    // flowing through it (`mahbot::log_retention`).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
         "log-cleanup",
-        run_cleanup_loop("Log cleanup", LOG_RETENTION_HOURS, {
-            let store = log_store.clone();
-            move |cutoff| {
-                let store = store.clone();
-                async move { store.delete_older_than("INFO", &cutoff).await }
-            }
-        }),
+        mahbot::log_retention::run_retention_loop(log_store.clone()),
     );
 
     spawn_cancellable(
