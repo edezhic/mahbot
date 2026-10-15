@@ -76,7 +76,9 @@ pub struct LogStore {
 /// one open database do not conflict — one `Database` serves many, which is how
 /// the core store's readers work — but a second *open* of the file is what must
 /// not happen.) The log store keeps its own single connection and, unlike the
-/// core store, serves no reads on readers of its own.
+/// core store, serves no reads on readers of its own — the writes it carries are
+/// the tracing writer's batches, the telemetry drain's records
+/// ([`crate::telemetry`]), the retention pass and the views the Logs page runs.
 ///
 /// In addition to this global, [`init_tracing()`] returns an `Arc<LogStore>` to
 /// its caller, and that store travels on with the boot result to the dashboard —
@@ -86,35 +88,38 @@ pub static LOG_STORE: OnceCell<LogStore> = OnceCell::const_new();
 
 /// One greppable shell call's grep-engine decision, persisted to the dedicated
 /// `grep_telemetry` table (self-contained — no tool_calls.id correlation).
-/// Bundled into a struct so the writer's signature stays shallow; the caller
-/// constructs the row from the serve outcomes + the runtime facts (actual apply,
-/// sentinel re-run, duration, exit). Every platform's grep engine reports
-/// telemetry (the interception runs on both shells).
+/// Owned and bundled into a struct so it can be handed to [`crate::telemetry`];
+/// the caller constructs the row from the serve outcomes + the runtime facts
+/// (actual apply, sentinel re-run, duration, exit). Every platform's grep engine
+/// reports telemetry (the interception runs on both shells).
 #[derive(Debug)]
-pub(crate) struct GrepTelemetryRow<'a> {
-    pub command: &'a str,
+pub(crate) struct GrepTelemetryRow {
+    pub command: String,
     pub served: bool,
-    pub reason: &'a str,
+    pub reason: String,
     pub recursive: bool,
     pub piped: bool,
     pub operand_count: usize,
-    pub flags: &'a str,
-    pub mode: &'a str,
-    pub workspace: &'a str,
+    pub flags: String,
+    pub mode: String,
+    pub workspace: String,
     pub grep_count: usize,
     pub served_count: usize,
     pub skipped_count: usize,
     pub duration_ms: Option<i64>,
     pub exit_code: Option<i32>,
+    /// The instant the search ran — stamped where it ran, not where the row is
+    /// written.
+    pub recorded_at: String,
 }
 
 /// The facts of one event that outlived the call that produced it — the process
 /// a command or a chrome-use call left running — recorded by
-/// [`record_stray_event`] as ONE durable row in the log store.
+/// [`record_stray_event`] as ONE row of its own in the log store.
 ///
 /// A call that ran in a browser chrome-use started itself needs no record of its
 /// own: that call FAILS, so its failure text — the browser note the agent is
-/// shown — is already its durable record.
+/// shown — is already its own record.
 pub(crate) struct StrayEvent<'a> {
     /// The surface that reported it ([`STRAY_SOURCE_SHELL`],
     /// [`STRAY_SOURCE_CHROME_TOOL`]) — the log entry's `target`.
@@ -213,17 +218,37 @@ impl LogStore {
     /// The predicate comes from the same [`build_where_clause`] as the tab's
     /// listing query and is built from the tab's level filter alone — the tab's
     /// search text is deliberately never part of it, because the button empties
-    /// the whole tab rather than the searched subset.
+    /// the whole tab rather than the searched subset. A warning row the telemetry
+    /// queue still holds, at a level this scope covers, goes with it
+    /// ([`crate::telemetry::wipe`]) instead of landing behind the wipe.
+    ///
+    /// Only those rows are held off: the tracing writer's own batched lines and
+    /// [`write_warn_row`]'s straight-to-store row are not queued, so a line or a
+    /// fact produced around the wipe can still land after it — unchanged from
+    /// before, and out of this class's reach.
     pub(crate) async fn clear_logs(&self, level_filter: Option<&str>) -> anyhow::Result<u64> {
         let filters = LogQuery {
             level: level_filter.map(str::to_owned),
             ..LogQuery::default()
         };
         let (where_sql, values) = build_where_clause(&filters);
-        self.conn
-            .execute(&format!("DELETE FROM logs {where_sql}"), values)
-            .await
-            .context("Failed to clear log entries")
+        let levels = level_filter.map_or_else(Vec::new, level_names);
+        crate::telemetry::wipe(
+            |record| match record {
+                crate::telemetry::TelemetryRecord::StrayEvent(entry) => {
+                    // Keep only a row this scope leaves in the store.
+                    !level_in_scope(&levels, &entry.level)
+                }
+                _ => true,
+            },
+            async {
+                self.conn
+                    .execute(&format!("DELETE FROM logs {where_sql}"), values)
+                    .await
+                    .context("Failed to clear log entries")
+            },
+        )
+        .await
     }
 
     /// Whether any row carrying `message` holds `reason` in its `reason` field.
@@ -302,12 +327,10 @@ impl LogStore {
     }
 
     /// Persist one greppable shell call's grep-engine decision to the dedicated
-    /// `grep_telemetry` table. Metadata only; the caller treats failures as
-    /// fail-open. Self-contained for grep-specific analysis.
-    pub(crate) async fn record_grep_telemetry(
-        &self,
-        row: GrepTelemetryRow<'_>,
-    ) -> anyhow::Result<()> {
+    /// `grep_telemetry` table. Metadata only; the caller is the telemetry drain
+    /// task, which drops the row on a failure and notes it. Self-contained for
+    /// grep-specific analysis.
+    pub(crate) async fn record_grep_telemetry(&self, row: &GrepTelemetryRow) -> anyhow::Result<()> {
         self.conn
             .execute(
                 "INSERT INTO grep_telemetry \
@@ -315,16 +338,16 @@ impl LogStore {
                   mode, workspace, grep_count, served_count, skipped_count, duration_ms, exit_code) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
-                    crate::db::now(),
-                    row.command,
+                    row.recorded_at.clone(),
+                    row.command.clone(),
                     i64::from(row.served),
-                    row.reason,
+                    row.reason.clone(),
                     i64::from(row.recursive),
                     i64::from(row.piped),
                     i64::try_from(row.operand_count)?,
-                    row.flags,
-                    row.mode,
-                    row.workspace,
+                    row.flags.clone(),
+                    row.mode.clone(),
+                    row.workspace.clone(),
                     i64::try_from(row.grep_count)?,
                     i64::try_from(row.served_count)?,
                     i64::try_from(row.skipped_count)?,
@@ -337,53 +360,42 @@ impl LogStore {
     }
 }
 
-/// Record one event that outlived its call as ONE durable row in the log store:
-/// written straight to the store (never through the tracing writer, which batches
-/// lines and may drop them), at `WARN`, which the Issues view shows and the
-/// retention pass keeps. The row says what happened and carries the recipe that
-/// stops it, so the occurrence stays readable after the fact; the agent's own note
-/// on the call is the caller-visible text, never a second record.
+/// Record one event that outlived its call as ONE row of its own in the log store:
+/// a `WARN` row, which the Issues view shows and the retention pass keeps — and
+/// which the tracing writer never carries, because that writer batches lines. The
+/// row says what happened and carries the recipe that stops it, so the occurrence
+/// stays readable after the fact; the agent's own note on the call is the
+/// caller-visible text, never a second record.
 ///
 /// The row is attributed to the calling agent from
 /// [`crate::agent::tool_record_attribution`] here, rather than from the caller:
 /// both call sites are tool calls, and that helper documents the attribution.
 ///
-/// Fail-open by design: a failed write never affects the call's result, and a
-/// process with no logs store at all (the `mahbot chrome` CLI dispatches before
-/// [`init_tracing`] ever runs, so [`LOG_STORE`] is unset there) writes nothing.
-/// A write that was attempted and failed is a `debug!` — the fact is lost either
-/// way, and the agent's own note on the call, which carries no less, is what the
-/// caller is shown.
-pub(crate) async fn record_stray_event(event: StrayEvent<'_>) {
-    let Some(store) = LOG_STORE.get() else {
+/// It is handed to [`crate::telemetry`] like the rest of the product's
+/// by-products: the row carries the instant it is reported, not the instant it is
+/// written, and a process with no logs store at all (the `mahbot chrome` CLI
+/// dispatches before [`init_tracing`] ever runs) records nothing — and builds
+/// nothing here.
+pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
+    if !crate::telemetry::recording() {
         return;
-    };
-    let (agent_id, agent_role) = crate::agent::tool_record_attribution();
-    let written = write_warn_row(
-        store,
-        LogEntry {
-            target: event.source.to_string(),
-            message: event.message.to_string(),
-            fields: serde_json::json!({
-                "detail": event.recipe,
-                "scope": event.scope,
-                "session": event.session,
-                "duration_ms": event.duration_ms,
-            }),
-            workspace: event.workspace.to_string(),
-            agent_id,
-            agent_role,
-            ..LogEntry::default()
-        },
-    )
-    .await;
-    if let Err(error) = written {
-        tracing::debug!(
-            %error,
-            target = %event.source,
-            "could not persist the leftover-process record"
-        );
     }
+    let (agent_id, agent_role) = crate::agent::tool_record_attribution();
+    crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::StrayEvent(LogEntry {
+        timestamp: crate::db::now(),
+        level: "WARN".to_string(),
+        target: event.source.to_string(),
+        message: event.message.to_string(),
+        fields: serde_json::json!({
+            "detail": event.recipe,
+            "scope": event.scope,
+            "session": event.session,
+            "duration_ms": event.duration_ms,
+        }),
+        workspace: event.workspace.to_string(),
+        agent_id,
+        agent_role,
+    }));
 }
 
 /// What became of one fact the Issues view is owed ([`record_issue_once`]): a row's own
@@ -402,15 +414,14 @@ pub(crate) enum IssueWrite {
 
 /// Write one durable `WARN` row straight to the logs store — never through the tracing
 /// writer, which batches lines and may drop them. `WARN` is what the Issues view shows and
-/// what the retention pass keeps, so this is the one place a fact the product must not lose
-/// is made to outlive the process: [`record_stray_event`] and [`record_issue_once`] differ in
-/// what they carry, not in how.
+/// what the retention pass keeps, so this is where a fact the product must not lose is made
+/// to outlive the process; [`record_issue_once`] is its one caller. (The warning row a
+/// leftover process leaves is the same shape but not that class: it is a by-product, and
+/// goes through [`crate::telemetry`] like the rest of them.)
 ///
-/// Nothing is logged here: what a failed write means differs by caller — [`record_stray_event`]
-/// notes it at `debug!` because the agent's own answer already carries the fact, and
-/// [`record_issue_once`] warns, because its fact is what the Issues view is owed. Returns
-/// `Ok(())` when this call put the row in the store, `Err` with the store's own error text when
-/// the write was attempted and failed.
+/// Nothing is logged here: [`record_issue_once`] warns on a failed write, because its fact
+/// is what the Issues view is owed. Returns `Ok(())` when this call put the row in the
+/// store, `Err` with the store's own error text when the write was attempted and failed.
 async fn write_warn_row(store: &LogStore, entry: LogEntry) -> Result<(), String> {
     let entry = LogEntry {
         timestamp: crate::db::now(),
@@ -504,6 +515,24 @@ pub struct LogQuery {
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
+/// The level names a [`LogQuery::level`] filter holds, parsed exactly as the
+/// listing query's `WHERE level IN (…)` parses them.
+fn level_names(level_filter: &str) -> Vec<String> {
+    level_filter
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether a row at `level` is inside a clear scope — the Rust side of the
+/// `level IN (…)` [`build_where_clause`] writes for the same filter, over the same
+/// [`level_names`] list. An empty scope is every level (the All Logs tab).
+fn level_in_scope(levels: &[String], level: &str) -> bool {
+    levels.is_empty() || levels.iter().any(|covered| covered == level)
+}
+
 /// Build WHERE clause and bind values from `LogQuery` filters.
 /// Returns `(WHERE ...`, `[values]`) — an empty string when no filters are set.
 fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
@@ -513,11 +542,9 @@ fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
     if let Some(ref levels_str) = filters.level
         && !levels_str.is_empty()
     {
-        let levels: Vec<Value> = levels_str
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| Value::Text(s.to_string()))
+        let levels: Vec<Value> = level_names(levels_str)
+            .into_iter()
+            .map(Value::Text)
             .collect();
         if !levels.is_empty() {
             conditions.push(format!(
@@ -690,6 +717,10 @@ pub async fn init_tracing(
     LOG_STORE
         .set(store.clone())
         .map_err(|_| anyhow::anyhow!("LOG_STORE already initialized"))?;
+    // The telemetry queue and its drain task start with the store they write to:
+    // a record produced before this has nowhere to go and is dropped without
+    // being counted ([`crate::telemetry`]).
+    crate::telemetry::start();
     let log_store = Arc::new(store);
     let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
     let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
@@ -974,8 +1005,13 @@ impl LogWriterPanicState {
 /// Snapshot of the log-writer failure surface, for display and tests.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct LogWriteErrorInfo {
-    /// Total failures recorded since startup — batch insert failures and writer panics.
+    /// Total failures recorded since startup — batch insert failures, writer
+    /// panics, and panics out of one telemetry record's own write.
     pub count: u64,
+    /// Rows the telemetry queue dropped because it was full
+    /// ([`crate::telemetry`]), counted apart from write failures: a drop says the
+    /// queue had no room, which a perfectly healthy store can also cause.
+    pub dropped: u64,
     /// RFC 3339 timestamp of the most recent failure.
     pub last_timestamp: Option<String>,
     /// Message of the most recent failure.
@@ -993,6 +1029,7 @@ pub(crate) struct LogWriteErrorInfo {
 static LOG_WRITE_LAST_ERROR: std::sync::Mutex<LogWriteErrorInfo> =
     std::sync::Mutex::new(LogWriteErrorInfo {
         count: 0,
+        dropped: 0,
         last_timestamp: None,
         last_message: None,
         panic_state: LogWriterPanicState {
@@ -1001,8 +1038,47 @@ static LOG_WRITE_LAST_ERROR: std::sync::Mutex<LogWriteErrorInfo> =
         },
     });
 
-/// Unix millis of the last stderr warning (rate limiter).
-static LOG_WRITE_LAST_STDERR_WARN_MS: AtomicU64 = AtomicU64::new(0);
+/// Rate-limited stderr reporting for this surface.
+///
+/// stderr is not routed through tracing, so this cannot recurse into the writer
+/// task — and it is best-effort delivery (see the `boot` module), which is why
+/// [`log_write_error_info`] is the surface a user can always read.
+///
+/// One reporter per kind of line: a burst of one kind must not hide the other.
+struct StderrReporter {
+    last_ms: AtomicU64,
+}
+
+impl StderrReporter {
+    const fn new() -> Self {
+        Self {
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Print the line `line` builds unless this reporter's last one went out
+    /// within [`LOG_WRITE_STDERR_WARN_INTERVAL_MS`]. The line is built only when
+    /// it is going to be printed, so a suppressed report costs no allocation.
+    fn emit(&self, line: impl FnOnce() -> String) {
+        let now_ms = crate::util::unix_millis();
+        if now_ms.saturating_sub(self.last_ms.load(Ordering::SeqCst))
+            >= LOG_WRITE_STDERR_WARN_INTERVAL_MS
+        {
+            self.last_ms.store(now_ms, Ordering::SeqCst);
+            crate::boot::timestamped_stderr(&line());
+        }
+    }
+}
+
+/// The line about a log-store write failure.
+static LOG_WRITE_STDERR: StderrReporter = StderrReporter::new();
+
+/// The line about telemetry records the queue dropped.
+static TELEMETRY_DROP_STDERR: StderrReporter = StderrReporter::new();
+
+/// Rows the telemetry queue dropped that no line has reported yet. The producing
+/// path only adds here; the drain task prints ([`report_telemetry_drops`]).
+static TELEMETRY_DROPS_UNREPORTED: AtomicU64 = AtomicU64::new(0);
 
 /// Read the log-writer failure surface.
 ///
@@ -1030,12 +1106,25 @@ fn record_log_writer_panic(message: &str) -> u32 {
     record_log_write_failure_impl(message, LogFailureKind::WriterPanic)
 }
 
+/// Record a storage-layer panic absorbed by the telemetry drain task's own write
+/// of one record ([`crate::telemetry`]).
+///
+/// A broken connection is how the engine reports some failures, and it must not
+/// take the drain task with it: the record is dropped like any failed write, and
+/// the next one is still attempted.
+pub(crate) fn record_telemetry_write_panic(message: &str) {
+    record_log_write_failure_impl(message, LogFailureKind::RecordPanic);
+}
+
 /// Which failure kind is being recorded — drives the stderr label and whether
 /// the storage-panic restart counter is bumped.
 #[derive(Clone, Copy)]
 enum LogFailureKind {
     Insert,
     WriterPanic,
+    /// A panic out of one telemetry record's own write — the drain task's write,
+    /// not the log writer's batch, so it leaves the restart counter alone.
+    RecordPanic,
 }
 
 impl LogFailureKind {
@@ -1043,12 +1132,42 @@ impl LogFailureKind {
         match self {
             Self::Insert => "insert failure",
             Self::WriterPanic => "writer panic",
+            Self::RecordPanic => "record write panic",
         }
     }
 
     fn records_panic(self) -> bool {
         matches!(self, Self::WriterPanic)
     }
+}
+
+/// Record rows the telemetry queue dropped because it was full
+/// ([`crate::telemetry`]).
+///
+/// Not a write failure and deliberately not counted as one: the store may be
+/// perfectly healthy while a burst has nowhere to go, so the two numbers are kept
+/// apart and reported through the same surface — the GUI Logs page's banner, which
+/// reads this counter itself, and the line [`report_telemetry_drops`] prints.
+///
+/// The producing path only adds to two counters here; nothing about the records'
+/// fate is decided or printed on it.
+pub(crate) fn record_telemetry_drop(rows: u64) {
+    LOG_WRITE_LAST_ERROR.lock().unwrap_poison().dropped += rows;
+    TELEMETRY_DROPS_UNREPORTED.fetch_add(rows, Ordering::Relaxed);
+}
+
+/// Print the line about the drops the producing path only counted — the drain
+/// task's job, so no thread doing the work ever writes to stderr about its own
+/// bookkeeping. Rate-limited like the write-failure line; a report the limiter
+/// suppresses is still in the counter.
+pub(crate) fn report_telemetry_drops() {
+    let rows = TELEMETRY_DROPS_UNREPORTED.swap(0, Ordering::Relaxed);
+    if rows == 0 {
+        return;
+    }
+    let total = LOG_WRITE_LAST_ERROR.lock().unwrap_poison().dropped;
+    TELEMETRY_DROP_STDERR
+        .emit(|| format!("telemetry queue full: {rows} row(s) dropped, {total} in total"));
 }
 
 /// Shared failure-recording core: bumps the counter, stamps timestamp/message,
@@ -1068,7 +1187,7 @@ fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
         };
         (guard.count, consecutive)
     };
-    emit_stderr_warning(count, message, kind.label());
+    LOG_WRITE_STDERR.emit(|| format!("log store {} #{count}: {message}", kind.label()));
     consecutive
 }
 
@@ -1097,19 +1216,6 @@ fn log_writer_panic_backoff(consecutive: u32) -> std::time::Duration {
     let shift = consecutive.saturating_sub(1).min(6);
     let ms = LOG_WRITER_PANIC_BACKOFF_MS.saturating_mul(1 << shift);
     std::time::Duration::from_millis(ms.min(30_000))
-}
-
-/// Rate-limited stderr warning. stderr is not routed through tracing, so this
-/// cannot recurse into the writer task — and it is best-effort delivery (see the
-/// `boot` module), which is why [`log_write_error_info`] is the surface a user can
-/// always read.
-fn emit_stderr_warning(count: u64, message: &str, kind: &str) {
-    let now_ms = crate::util::unix_millis();
-    let last_warn_ms = LOG_WRITE_LAST_STDERR_WARN_MS.load(Ordering::SeqCst);
-    if now_ms.saturating_sub(last_warn_ms) >= LOG_WRITE_STDERR_WARN_INTERVAL_MS {
-        LOG_WRITE_LAST_STDERR_WARN_MS.store(now_ms, Ordering::SeqCst);
-        crate::boot::timestamped_stderr(&format!("log store {kind} #{count}: {message}"));
-    }
 }
 
 /// Extract a string field from a JSON value, defaulting to `""`.
@@ -1327,6 +1433,8 @@ mod tests {
     /// only, the All Logs scope deletes every stored record (including the ones
     /// the Issues view shows).
     #[tokio::test]
+    // the clear drives a wipe, which purges the process-global telemetry queue
+    #[serial_test::serial(provider)]
     async fn clear_logs_scopes_match_the_tabs() {
         let (store, _dir) = test_store().await;
         seed_entries(
@@ -1489,6 +1597,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(log_surface)] // serializes the process-global write-failure counter
     async fn test_flush_log_batch_records_failure_on_surface() {
         let (store, _dir) = test_store().await;
         let baseline = log_write_error_info().count;
@@ -1528,6 +1637,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(log_surface)] // serializes the process-global write-failure counter
     async fn test_flush_log_batch_persists_without_failure() {
         // A healthy flush clears the batch, persists the entry, and records no
         // write failure. The bounded-retry retry-then-succeed branch

@@ -5,8 +5,9 @@
 //! The sweep never empties a class in one statement. The engine rejects
 //! `DELETE … LIMIT`, so each statement bounds itself with a `LIMIT`ed id
 //! subquery, and the sweep pauses between statements: the log store serves the
-//! log writer, the GUI's pages and the debug IPC from ONE connection, and a
-//! backlog must not be able to hold that connection through a long pass.
+//! log writer, the telemetry drain, the GUI's pages and the debug IPC from ONE
+//! connection, and a backlog must not be able to hold that connection through a
+//! long pass.
 //!
 //! Progress is durable by construction: every batch is its own committed
 //! statement and expiry is a predicate over the data rather than a cursor, so a

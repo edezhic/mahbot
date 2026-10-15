@@ -1,15 +1,19 @@
 //! Tool-call and LLM request statistics, consolidated into the logs database.
 //!
-//! Two persistence families live here, both fail-open (write failures are
-//! logged, never fatal) and both targeting the logs store's tables:
+//! The records of two families are built here, and never written from here on the
+//! performing path:
 //!
-//! * **Tool calls** — each [`crate::Agent`] accumulates
-//!   `ToolCallRecord`s in a `std::sync::Mutex<Vec<ToolCallRecord>>` and
-//!   flushes them on session finalization via [`LogStore::flush_batch`]
-//!   (defined in this module) into `tool_calls`.
+//! * **Tool calls** — each [`crate::Agent`] accumulates `ToolCallRecord`s in a
+//!   `std::sync::Mutex<Vec<ToolCallRecord>>` and hands them to
+//!   [`crate::telemetry`] when the session finalizes; the drain task writes them
+//!   through [`LogStore::flush_batch`] (defined in this module) into `tool_calls`.
 //! * **LLM requests / failures** — per-operation `llm_requests` rows via
 //!   [`record_llm_operation`] / [`record_llm_operation_meta`] and grouped
 //!   `llm_failures` rows via [`LlmOperationCtx`], fed by the retry pipeline.
+//!
+//! A record is built where its facts are — including the instant it describes —
+//! and handed to [`crate::telemetry`], whose one drain task calls the `LogStore`
+//! methods below; a failure there is noted by that task and is never fatal.
 //!
 //! All tables (and their indexes) are created by the logs store's baseline
 //! schema catalog entry (in the append-only catalog) — the sole creator of this
@@ -161,31 +165,55 @@ impl crate::logs::LogStore {
     /// search term, so the clear can never exceed the unfiltered tab: only rows
     /// carrying an `error_message` go, and the other records in the store
     /// (successful calls and the rest of the telemetry) are left untouched.
+    ///
+    /// Runs through [`crate::telemetry::wipe`], so a queued record the delete
+    /// covers cannot land behind it.
     pub(crate) async fn clear_tool_errors(&self) -> Result<u64> {
         let (where_clause, params) = build_tool_error_filter(&ToolErrorQuery::default());
-        self.conn
-            .execute(
-                &format!("DELETE FROM tool_calls WHERE {where_clause}"),
-                params,
-            )
-            .await
-            .context("Failed to clear failed tool calls")
+        crate::telemetry::wipe(
+            // The queued rows this delete covers are the failed calls; a batch
+            // that also holds successful ones keeps them, so the tab's promise
+            // that only the failed rows go holds for what is still queued too. A
+            // batch left with no call at all is dropped whole.
+            |record| {
+                let crate::telemetry::TelemetryRecord::ToolCalls(batch) = record else {
+                    return true;
+                };
+                batch
+                    .records
+                    .retain(|call| !covered_by_tool_error_clear(call));
+                !batch.records.is_empty()
+            },
+            async {
+                self.conn
+                    .execute(
+                        &format!("DELETE FROM tool_calls WHERE {where_clause}"),
+                        params,
+                    )
+                    .await
+                    .context("Failed to clear failed tool calls")
+            },
+        )
+        .await
     }
 
     /// Write a batch of per-call tool records for a single flush.
+    ///
+    /// `recorded_at` is the instant the batch describes — stamped where the batch
+    /// was produced, not when it is written.
     pub(crate) async fn flush_batch(
         &self,
         agent_id: &str,
         role: &str,
         workspace: &str,
         source: CallSource,
+        recorded_at: &str,
         stats: &[crate::ToolCallRecord],
     ) -> Result<()> {
         if stats.is_empty() {
             return Ok(());
         }
 
-        let recorded_at = db::now();
         let tx = self.conn.begin_tx().await?;
         for record in stats {
             tx.execute(
@@ -202,7 +230,7 @@ impl crate::logs::LogStore {
                     i64::from(record.success),
                     record.error_message.clone(),
                     workspace.to_string(),
-                    recorded_at.clone(),
+                    recorded_at,
                 ],
             )
             .await?;
@@ -213,7 +241,7 @@ impl crate::logs::LogStore {
 
     /// Persist one per-operation LLM request stat to the dedicated
     /// `llm_requests` table. Metadata only — no request inputs/outputs.
-    async fn record_llm_request(&self, rec: &LlmRequestRecord) -> Result<()> {
+    pub(crate) async fn record_llm_request(&self, rec: &LlmRequestRecord) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO llm_requests \
@@ -252,7 +280,7 @@ impl crate::logs::LogStore {
     }
 
     /// Persist one per-attempt LLM failure row to the `llm_failures` table.
-    async fn record_llm_failure_row(&self, rec: &LlmFailureRow) -> Result<()> {
+    pub(crate) async fn record_llm_failure_row(&self, rec: &LlmFailureRow) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO llm_failures \
@@ -290,7 +318,7 @@ impl crate::logs::LogStore {
 /// [`LlmRequestRecord::retry_attempts`]. Metadata only: no request inputs or
 /// outputs.
 #[derive(Debug, Clone)]
-struct LlmRequestRecord {
+pub(crate) struct LlmRequestRecord {
     pub purpose: &'static str,
     pub agent_id: String,
     pub role: String,
@@ -328,7 +356,7 @@ struct LlmRequestRecord {
 /// failures of operations that later succeeded and the terminal exhausted
 /// attempt. Grouped per operation via [`LlmFailureRow::operation_id`].
 #[derive(Debug, Clone)]
-struct LlmFailureRow {
+pub(crate) struct LlmFailureRow {
     /// Groups the attempts of one LLM operation (generated at operation start).
     pub operation_id: String,
     pub purpose: &'static str,
@@ -439,47 +467,15 @@ fn llm_request_record_meta(
     }
 }
 
-#[cfg(test)]
-static TEST_LOG_STORE: std::sync::RwLock<Option<crate::logs::LogStore>> =
-    std::sync::RwLock::new(None);
-
-/// Test seam: redirect `record_llm_*` writes to a caller-owned store for the
-/// duration of a test (mirrors `swap_provider_for_test`). Returns the previous
-/// override so a guard can restore it.
-#[cfg(test)]
-pub(crate) fn swap_test_log_store(
-    store: Option<crate::logs::LogStore>,
-) -> Option<crate::logs::LogStore> {
-    let mut guard = TEST_LOG_STORE.write().expect("test log store poisoned");
-    let previous = guard.take();
-    *guard = store;
-    previous
-}
-
-/// Resolve the logs store for stat writes: test override wins, else the global.
-/// Used by the llm_requests persistence path so tests observe its writes
-/// through the same override.
-fn log_store_for_stats() -> Option<crate::logs::LogStore> {
-    #[cfg(test)]
-    if let Some(store) = TEST_LOG_STORE
-        .read()
-        .expect("test log store poisoned")
-        .as_ref()
-    {
-        return Some(store.clone());
-    }
-    crate::logs::LOG_STORE.get().cloned()
-}
-
 /// Emit one per-operation LLM request stat row (best-effort, fail-open).
 ///
 /// Skips when the request carries no metadata (context-free calls — test
-/// doubles, ad-hoc requests) and when the logs store is not yet open.
+/// doubles, ad-hoc requests).
 ///
 /// Failure-path semantics: `upstream_provider` / `system_fingerprint` /
 /// `cost` / `cost_details` are only populated from a successful response
 /// envelope — failed requests have no response, so those columns stay NULL.
-async fn record_llm_operation(
+fn record_llm_operation(
     request: &crate::ChatRequest,
     duration_ms: u64,
     attempts: u32,
@@ -497,8 +493,7 @@ async fn record_llm_operation(
         response,
         finish_reason,
         failure_class,
-    )
-    .await;
+    );
 }
 
 /// Emit one per-operation LLM request stat row from explicit metadata.
@@ -506,10 +501,10 @@ async fn record_llm_operation(
 /// `ChatRequest`; direct callers are for calls made outside the `ChatRequest`
 /// retry pipeline (e.g. raw-HTTP media transcription), which carry no response
 /// envelope. `attempts` is supplied by the caller: the transcription paths
-/// always pass 1 (a single-shot fail-open call never retries). Same fail-open
-/// semantics as [`record_llm_operation`]: a store write failure is logged and
-/// never propagates.
-pub(crate) async fn record_llm_operation_meta(
+/// always pass 1 (a single-shot fail-open call never retries). The row is handed
+/// to [`crate::telemetry`]: a write failure is noted by the drain task and never
+/// propagates.
+pub(crate) fn record_llm_operation_meta(
     call: &LlmCallMeta,
     duration_ms: u64,
     attempts: u32,
@@ -517,26 +512,16 @@ pub(crate) async fn record_llm_operation_meta(
     finish_reason: Option<&str>,
     failure_class: Option<&'static str>,
 ) {
-    let rec = llm_request_record_meta(
-        call,
-        duration_ms,
-        attempts,
-        response,
-        finish_reason,
-        failure_class,
-    );
-    persist_llm_request(&rec).await;
-}
-
-/// Best-effort, fail-open persist of an [`LlmRequestRecord`] to the logs
-/// store; silently skipped when the store is not yet open.
-async fn persist_llm_request(rec: &LlmRequestRecord) {
-    let Some(store) = log_store_for_stats() else {
-        return;
-    };
-    if let Err(e) = store.record_llm_request(rec).await {
-        tracing::debug!(error = %e, "Failed to persist LLM request stat");
-    }
+    crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::LlmRequest(
+        llm_request_record_meta(
+            call,
+            duration_ms,
+            attempts,
+            response,
+            finish_reason,
+            failure_class,
+        ),
+    ));
 }
 
 /// What happened on one failed attempt, beyond the operation identity —
@@ -581,9 +566,9 @@ fn llm_failure_row(
 /// Emit one per-attempt `llm_failures` row for a failed attempt inside an
 /// outer retry loop. `attempt_started` is the failed attempt's launch instant
 /// (`None` when the caller does not track it → NULL `attempt_duration_ms`).
-/// Same fail-open semantics as [`persist_llm_request`]: a store write failure
-/// is logged and never propagates.
-pub(crate) async fn record_llm_attempt_failure(
+/// The row is handed to [`crate::telemetry`]: a write failure is noted by the
+/// drain task and never propagates.
+pub(crate) fn record_llm_attempt_failure(
     ctx: &LlmOperationCtx,
     attempt: u32,
     rec: &crate::retry::RetryFailureRecord,
@@ -597,13 +582,15 @@ pub(crate) async fn record_llm_attempt_failure(
         retry_after_ms: rec.retry_after_ms,
         error_chain: rec.error_chain.clone(),
     };
-    persist_llm_failure(&llm_failure_row(&ctx.operation_id, &ctx.call, outcome)).await;
+    crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::LlmFailure(
+        llm_failure_row(&ctx.operation_id, &ctx.call, outcome),
+    ));
 }
 
 /// Emit one per-attempt `llm_failures` row from explicit metadata — for
 /// single-shot calls outside the `ChatRequest` retry pipeline (raw-HTTP media
 /// transcription), which carry no [`crate::retry::RetryFailureRecord`].
-pub(crate) async fn record_llm_attempt_failure_meta(
+pub(crate) fn record_llm_attempt_failure_meta(
     call: &LlmCallMeta,
     operation_id: &str,
     failure_class: &str,
@@ -618,7 +605,9 @@ pub(crate) async fn record_llm_attempt_failure_meta(
         retry_after_ms: None,
         error_chain: error_chain.to_string(),
     };
-    persist_llm_failure(&llm_failure_row(operation_id, call, outcome)).await;
+    crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::LlmFailure(
+        llm_failure_row(operation_id, call, outcome),
+    ));
 }
 
 /// Elapsed milliseconds since `started`, if tracked.
@@ -626,20 +615,9 @@ fn elapsed_ms(started: Option<std::time::Instant>) -> Option<u64> {
     started.and_then(|t| u64::try_from(t.elapsed().as_millis()).ok())
 }
 
-/// Best-effort, fail-open persist of an [`LlmFailureRow`]; silently skipped
-/// when the store is not yet open.
-async fn persist_llm_failure(row: &LlmFailureRow) {
-    let Some(store) = log_store_for_stats() else {
-        return;
-    };
-    if let Err(e) = store.record_llm_failure_row(row).await {
-        tracing::debug!(error = %e, "Failed to persist LLM attempt failure row");
-    }
-}
-
 /// Emit a success LLM request stat for a completed operation.
 #[expect(clippy::cast_possible_truncation)]
-pub(crate) async fn record_llm_success(
+pub(crate) fn record_llm_success(
     request: &crate::ChatRequest,
     started: std::time::Instant,
     attempt: u32,
@@ -652,13 +630,12 @@ pub(crate) async fn record_llm_success(
         Some(response),
         response.finish_reason.as_deref(),
         None,
-    )
-    .await;
+    );
 }
 
 /// Emit a failure LLM request stat for an exhausted operation.
 #[expect(clippy::cast_possible_truncation)]
-pub(crate) async fn record_llm_failure(
+pub(crate) fn record_llm_failure(
     request: &crate::ChatRequest,
     started: std::time::Instant,
     exhausted: &crate::retry::RetryExhausted,
@@ -673,8 +650,7 @@ pub(crate) async fn record_llm_failure(
             .last()
             .and_then(|r| r.finish_reason.as_deref()),
         Some(exhausted.final_class.label()),
-    )
-    .await;
+    );
 }
 
 /// Build a parameterized WHERE clause and params for tool error (failure) queries.
@@ -684,6 +660,10 @@ pub(crate) async fn record_llm_failure(
 /// suitable for embedding directly into SQL.  All placeholders use unnamed
 /// `?` — pass a `Vec<db::Value>` to bind params positionally (it
 /// implements [`IntoParams`](crate::db::IntoParams)).
+///
+/// Its first clause is the failed-rows rule the Tool Failures clear also applies
+/// to the calls still queued ([`covered_by_tool_error_clear`]): the two are one
+/// rule, stated here in SQL and there over a record.
 #[must_use]
 fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<db::Value>) {
     let mut clauses = vec!["error_message IS NOT NULL".to_string()];
@@ -695,6 +675,14 @@ fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<db::Value>) {
     }
 
     (clauses.join(" AND "), params)
+}
+
+/// Whether a tool call is a row the Tool Failures clear covers — the failed-rows
+/// rule [`build_tool_error_filter`] states in SQL, applied to a call that is still
+/// queued rather than to one already in the store. The two must be changed
+/// together.
+fn covered_by_tool_error_clear(call: &crate::ToolCallRecord) -> bool {
+    call.error_message.is_some()
 }
 
 #[cfg(test)]
@@ -800,6 +788,7 @@ mod tests {
                 "Engineer",
                 "my-workspace",
                 CallSource::Agent,
+                &crate::db::now(),
                 &records,
             )
             .await
@@ -844,6 +833,8 @@ mod tests {
     /// the successful calls — the rows the usage/cost figures are computed
     /// from — must survive.
     #[tokio::test]
+    // the clear drives a wipe, which purges the process-global telemetry queue
+    #[serial_test::serial(provider)]
     async fn clear_tool_errors_keeps_successful_calls() {
         let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
         let records = vec![
@@ -875,6 +866,7 @@ mod tests {
                 "Engineer",
                 "my-workspace",
                 CallSource::Agent,
+                &crate::db::now(),
                 &records,
             )
             .await

@@ -493,12 +493,12 @@ impl std::error::Error for RetryExhausted {}
 /// hard-fail tail of every retry-loop exit. Fail-open loops (research
 /// synthesis partial output, consensus repair fallback) record then continue,
 /// so they deliberately bypass this helper.
-pub(crate) async fn fail_exhausted<T>(
+pub(crate) fn fail_exhausted<T>(
     request: &ChatRequest,
     operation_started: Instant,
     exhausted: RetryExhausted,
 ) -> Result<T, RetryExhausted> {
-    crate::stats::record_llm_failure(request, operation_started, &exhausted).await;
+    crate::stats::record_llm_failure(request, operation_started, &exhausted);
     Err(exhausted)
 }
 
@@ -575,11 +575,11 @@ impl RetryLoop {
     }
 
     /// Record a failed attempt, updating the sticky Retry-After and
-    /// persisting one `llm_failures` row (fail-open, direct-awaited like the
-    /// `llm_requests` rows). A record without a Retry-After (parse /
-    /// NoResponse failures) clears any stale value from an earlier attempt.
-    /// `attempt` is the 1-based sequential failure index within the operation.
-    pub(crate) async fn record(&mut self, rec: RetryFailureRecord) {
+    /// persisting one `llm_failures` row (fail-open). A record without a
+    /// Retry-After (parse / NoResponse failures) clears any stale value from an
+    /// earlier attempt. `attempt` is the 1-based sequential failure index within
+    /// the operation.
+    pub(crate) fn record(&mut self, rec: RetryFailureRecord) {
         self.last_retry_after = rec.retry_after_ms;
         self.attempts_failed = self.attempts_failed.saturating_add(1);
         let attempt_started = self.attempt_started.take();
@@ -589,8 +589,7 @@ impl RetryLoop {
                 self.attempts_failed,
                 &rec,
                 attempt_started,
-            )
-            .await;
+            );
         }
         self.failures.push(rec);
     }
@@ -656,29 +655,29 @@ pub(crate) async fn agent_chat(
         loop_state.begin_attempt(Instant::now());
         match crate::providers::chat_scoped(request.clone()).await {
             Ok(resp) => {
-                crate::stats::record_llm_success(&request, operation_started, attempt, &resp).await;
+                crate::stats::record_llm_success(&request, operation_started, attempt, &resp);
                 return Ok(resp);
             }
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
-                loop_state.record(err.record).await;
+                loop_state.record(err.record);
                 if non_retryable {
                     let exhausted = RetryExhausted::new(loop_state.into_failures(), err.class);
-                    return fail_exhausted(&request, operation_started, exhausted).await;
+                    return fail_exhausted(&request, operation_started, exhausted);
                 }
             }
         }
 
         if let Err(FailureClass::Shutdown) = loop_state.sleep_between(attempt).await {
             let exhausted = RetryExhausted::shutdown(loop_state.into_failures());
-            return fail_exhausted(&request, operation_started, exhausted).await;
+            return fail_exhausted(&request, operation_started, exhausted);
         }
     }
 
     // Exhausted — report the last failure's class.
     let final_class = loop_state.final_class();
     let exhausted = RetryExhausted::new(loop_state.into_failures(), final_class);
-    fail_exhausted(&request, operation_started, exhausted).await
+    fail_exhausted(&request, operation_started, exhausted)
 }
 
 #[cfg(test)]
@@ -748,7 +747,7 @@ mod tests {
             &anyhow::anyhow!("429 rate limited"),
             Some(60_000),
         );
-        loop_state.record(rec).await;
+        loop_state.record(rec);
         assert_eq!(loop_state.last_retry_after, Some(60_000));
 
         // A later parse/NoResponse failure has no Retry-After → clears it.
@@ -757,7 +756,7 @@ mod tests {
             &anyhow::anyhow!("empty response"),
             None,
         );
-        loop_state.record(rec).await;
+        loop_state.record(rec);
         assert_eq!(
             loop_state.last_retry_after, None,
             "stale Retry-After must not stick to later sleeps"

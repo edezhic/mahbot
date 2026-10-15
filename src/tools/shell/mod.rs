@@ -2297,8 +2297,7 @@ impl ShellTool {
         if let Some(cause) =
             unserved_refusal(SHELL_PLATFORM, &grep_serve, exec_str != base.as_ref())
         {
-            self.write_grep_telemetry(ws, command_str, &grep_serve, false, &cause, None)
-                .await;
+            self.write_grep_telemetry(ws, command_str, &grep_serve, false, &cause, None);
             // The remedy follows the text that would run, not the cause: a text that
             // still carries a line break is the one shape only a file can run, whatever
             // cause the engine's refusal carries ([`windows_line::remedy`]). Only this
@@ -2467,8 +2466,7 @@ impl ShellTool {
                     false,
                     &cause,
                     Some(&result),
-                )
-                .await;
+                );
                 // No remedy: a served text carries no break, so the serve decision
                 // above offers none.
                 anyhow::bail!("{}", grep_engine::unserved_failure(&cause, None));
@@ -2547,8 +2545,7 @@ impl ShellTool {
                 .find(|o| !o.reason.is_empty())
                 .map_or("no rewrite produced", |o| o.reason.as_str())
         };
-        self.write_grep_telemetry(ws, command_str, &grep_serve, served, reason, Some(&result))
-            .await;
+        self.write_grep_telemetry(ws, command_str, &grep_serve, served, reason, Some(&result));
 
         // A completed run and one that left a process holding its output are the
         // same result — the command's own exit status and the output above it.
@@ -2615,7 +2612,7 @@ impl ShellTool {
                         // [`crate::logs::record_stray_event`]).
                         let scope_text = scope.map_or_else(String::new, |pid| pid.to_string());
                         let workspace = ws.as_path().to_string_lossy().into_owned();
-                        crate::logs::record_stray_event(crate::logs::StrayEvent {
+                        crate::logs::record_stray_event(&crate::logs::StrayEvent {
                             source: crate::logs::STRAY_SOURCE_SHELL,
                             message: "the command exited while a process it left running still held \
                                       its output channel, so no more of that output could be \
@@ -2625,8 +2622,7 @@ impl ShellTool {
                             session: "",
                             workspace: &workspace,
                             duration_ms: Some(crate::util::millis_i64(elapsed)),
-                        })
-                        .await;
+                        });
                         Some(format_leftover_note(self.mode, SHELL_PLATFORM, scope))
                     }
                     None => None,
@@ -2693,11 +2689,10 @@ impl ShellTool {
         }
     }
 
-    /// Persist one grep-engine telemetry row, best-effort (fail-open: a
-    /// telemetry failure never affects the shell result). One helper because
-    /// the record is required on every platform and on every outcome — the
-    /// post-execution decision as well as the two Windows failure paths, which
-    /// bail with the row's `reason` before ever running a command.
+    /// Queue one grep-engine telemetry row. One helper because the record is
+    /// required on every platform and on every outcome — the post-execution
+    /// decision as well as the two Windows failure paths, which bail with the
+    /// row's `reason` before ever running a command.
     ///
     /// `served` is the ground truth of the actual engine execution and `reason`
     /// the decision's cause; `result` is the run the row describes (`None` for
@@ -2705,7 +2700,7 @@ impl ShellTool {
     /// are empty). A command the analysis never reached a grep member in writes
     /// no row — except a refused Windows search, which is recorded precisely
     /// because it must not be invisible (the shape fields stay empty).
-    async fn write_grep_telemetry(
+    fn write_grep_telemetry(
         &self,
         ws: &Workspace,
         command: &str,
@@ -2715,6 +2710,11 @@ impl ShellTool {
         result: Option<&ShellRunResult>,
     ) {
         if grep_serve.outcomes.is_empty() && grep_serve.refusal.is_none() {
+            return;
+        }
+        // Nothing will take the row with no log store to reach, so a process that
+        // has none builds nothing.
+        if !crate::telemetry::recording() {
             return;
         }
         let shape = grep_serve.telemetry_shape(served);
@@ -2749,25 +2749,25 @@ impl ShellTool {
             // genuine zero-duration run.
             None => (None, None),
         };
-        if let Some(store) = crate::logs::LOG_STORE.get() {
-            let row = crate::logs::GrepTelemetryRow {
-                command,
+        crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::GrepTelemetry(
+            crate::logs::GrepTelemetryRow {
+                command: command.to_string(),
                 served,
-                reason,
+                reason: reason.to_string(),
                 recursive: shape.recursive,
                 piped: shape.piped,
                 operand_count: shape.operand_count,
-                flags: shape.flags.as_str(),
-                mode,
-                workspace: workspace.as_str(),
+                flags: shape.flags.clone(),
+                mode: mode.to_string(),
+                workspace,
                 grep_count: shape.grep_count,
                 served_count: shape.served_count,
                 skipped_count: shape.skipped_count,
                 duration_ms,
                 exit_code,
-            };
-            let _ = store.record_grep_telemetry(row).await;
-        }
+                recorded_at: crate::db::now(),
+            },
+        ));
     }
 }
 

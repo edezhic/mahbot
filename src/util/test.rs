@@ -490,23 +490,23 @@ impl crate::Channel for SpyChannel {
     }
 }
 
-/// Install a caller-owned logs store for `record_llm_*` stat writes for the
+/// Install a caller-owned logs store for the telemetry queue's writes for the
 /// duration of the returned guard (mirrors [`install_fake_provider`]).
 ///
 /// The boot `LOG_STORE` is a process-global `OnceCell` set by `init_tracing`,
-/// which tests never run — so stat recording is normally a silent no-op.
-/// This seam redirects it to a test store so end-to-end tests can assert on
-/// the recorded rows.
+/// which tests never run — so telemetry recording is normally a silent no-op.
+/// This seam redirects EVERY record the queue writes (not only `record_llm_*`)
+/// to a test store so end-to-end tests can assert on the recorded rows.
 ///
-/// While the guard is alive the redirect is PROCESS-GLOBAL: every
-/// `record_llm_*` write in any concurrently-running test lands in this store.
-/// Callers must hold the serial_test keys covering every global their test
-/// touches for the guard's lifetime — the redirect is PROCESS-GLOBAL, so any
-/// concurrently-running LLM-writing test's rows land in this store (the
-/// current sole caller holds `provider`) — and filter queries by a
-/// test-unique `agent_id`.
+/// While the guard is alive the redirect is PROCESS-GLOBAL: every record any
+/// concurrently-running test produces lands in this store. Callers must hold the
+/// serial_test keys covering every global their test touches for the guard's
+/// lifetime — `provider` covers the telemetry drain's records — and filter
+/// queries by a test-unique identifier. A test that reads the rows a record
+/// produced must first await [`crate::telemetry::drain_for_test`]: no test runs
+/// the boot that starts the drain task.
 pub(crate) fn install_test_log_store(store: crate::logs::LogStore) -> TestLogStoreGuard {
-    let previous = crate::stats::swap_test_log_store(Some(store));
+    let previous = crate::telemetry::swap_test_log_store(Some(store));
     TestLogStoreGuard { previous }
 }
 
@@ -519,7 +519,7 @@ pub(crate) struct TestLogStoreGuard {
 
 impl Drop for TestLogStoreGuard {
     fn drop(&mut self) {
-        crate::stats::swap_test_log_store(self.previous.take());
+        crate::telemetry::swap_test_log_store(self.previous.take());
     }
 }
 

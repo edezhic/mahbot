@@ -797,7 +797,7 @@ pub(crate) async fn run_grouping_repair(
             Ok(resp) => resp,
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
-                loop_state.record(err.record).await;
+                loop_state.record(err.record);
                 if non_retryable {
                     break;
                 }
@@ -822,7 +822,7 @@ pub(crate) async fn run_grouping_repair(
                 resp.finish_reason.clone(),
                 None,
             );
-            loop_state.record(rec).await;
+            loop_state.record(rec);
             prev_round = PrevRound::Parse;
             continue;
         }
@@ -862,7 +862,7 @@ pub(crate) async fn run_grouping_repair(
                     resp.finish_reason.clone(),
                     None,
                 );
-                loop_state.record(rec).await;
+                loop_state.record(rec);
                 prev_round = PrevRound::Parse;
                 continue;
             }
@@ -875,7 +875,7 @@ pub(crate) async fn run_grouping_repair(
         let accepted = outcome.froze > 0 || outcome.accepted_refs > 0 || outcome.accepted_summary;
         prev_round = PrevRound::Processed { accepted };
         if accepted {
-            crate::stats::record_llm_success(&request, attempt_started, round, &resp).await;
+            crate::stats::record_llm_success(&request, attempt_started, round, &resp);
         }
         // Typed granular cause for the failure trail: completeness
         // (round-level rejection) or the first per-group/per-entry cause.
@@ -914,7 +914,7 @@ pub(crate) async fn run_grouping_repair(
             let err = anyhow::anyhow!("grouping validation failed: {detail}");
             let rec =
                 RetryFailureRecord::with_metadata(cause, &err, resp.finish_reason.clone(), None);
-            loop_state.record(rec).await;
+            loop_state.record(rec);
         }
         if state.complete() {
             break; // every item is frozen or pinned — nothing left to place
@@ -955,7 +955,7 @@ pub(crate) async fn run_grouping_repair(
             final_class,
             None,
         );
-        crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
+        crate::stats::record_llm_failure(&request, operation_started, &exhausted);
         return RepairOutcome::Fallback;
     }
     let ungrouped: Vec<GroupingMember> = state

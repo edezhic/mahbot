@@ -148,7 +148,7 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
         .await;
     let duration_ms = crate::util::millis_i64(started.elapsed());
 
-    record_operation(&call, tool_name, duration_ms, &outcome, &ws.path).await;
+    record_operation(&call, tool_name, duration_ms, &outcome, &ws.path);
 
     reply(outcome, &call.secrets)
 }
@@ -209,7 +209,7 @@ const PARTIAL_RECORD_REASON: &str = "the operation reported that part of it was 
 /// `agent_id`/`role`/`source` are what make a change a script made
 /// distinguishable from one the assistant made — the row is otherwise the same
 /// shape, in the same table, attributed to the owner's workspace path.
-async fn record_operation(
+fn record_operation(
     call: &CallRequest,
     tool_name: &str,
     duration_ms: i64,
@@ -217,25 +217,18 @@ async fn record_operation(
     workspace_path: &str,
 ) {
     let record = operation_record(call, tool_name, duration_ms, outcome);
-    // An absent log store is not an error: the operation's own answer is what
-    // the caller is owed, and the record is a side benefit of it.
-    if let Some(store) = crate::logs::LOG_STORE.get()
-        && let Err(e) = store
-            .flush_batch(
-                "cli",
-                "cli",
-                workspace_path,
-                crate::stats::CallSource::CommandLine,
-                std::slice::from_ref(&record),
-            )
-            .await
-    {
-        tracing::warn!(
-            error = %e,
-            tool = %tool_name,
-            "cli: failed to record the command-line operation"
-        );
-    }
+    // The row goes on the telemetry queue like the agent path's: the operation's
+    // own answer is what the caller is owed.
+    crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::ToolCalls(
+        crate::telemetry::ToolCallBatch {
+            source: crate::stats::CallSource::CommandLine,
+            agent_id: "cli".to_string(),
+            role: "cli".to_string(),
+            workspace: workspace_path.to_string(),
+            recorded_at: crate::db::now(),
+            records: vec![record],
+        },
+    ));
 }
 
 /// The row a finished operation becomes.

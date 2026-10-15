@@ -90,6 +90,9 @@ pub mod session;
 pub mod shell_env;
 pub mod shutdown;
 pub(crate) mod stats;
+/// The records the product writes about its own work, written by a task of their
+/// own rather than on the path that produced them ([`crate::telemetry`]).
+pub(crate) mod telemetry;
 pub mod temp;
 pub mod tools;
 pub mod users;
@@ -953,8 +956,8 @@ impl Role {
 ///
 /// Each tool invocation produces one record with its full serialized
 /// arguments, execution duration, and success/failure outcome.
-/// Records are accumulated in-memory in the agent and flushed to
-/// the logs store on session finalization.
+/// Records are accumulated in-memory in the agent and handed to the
+/// telemetry queue on session finalization.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallRecord {
     /// The tool's name.
@@ -1026,7 +1029,7 @@ pub struct Agent {
     /// safe deregistration. 0 means not registered (e.g. test agents).
     generation: u64,
     /// Per-call tool stats accumulated during this agent's work loop.
-    /// Flushed to the logs store on [`Agent::finalize_session`]; silently
+    /// Enqueued for the log store on [`Agent::finalize_session`]; silently
     /// lost if the agent is dropped without finalization.
     tool_stats: std::sync::Mutex<Vec<crate::ToolCallRecord>>,
     /// The user who triggered this agent run — used by tools (e.g. AnalyzeTool)

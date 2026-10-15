@@ -619,30 +619,48 @@ impl LogsState {
         )
     }
 
-    /// Render a warning banner when the log-writer task has observed DB insert
-    /// failures (visible on the Logs page — the sanctioned observability
-    /// surface for log-persistence outages). Returns an empty element when
-    /// there is nothing to report.
+    /// Render a warning banner for the log store's own bad news: the write
+    /// failures observed on it — the log-writer task's failed batches and panics,
+    /// and a panic out of one telemetry record's own write — and the telemetry rows
+    /// a full queue dropped (visible on the Logs page — the sanctioned
+    /// observability surface for log-persistence outages). Each number is reported
+    /// on its own sentence, so neither hides the other. Returns an empty element
+    /// when there is nothing to report.
     fn write_error_banner() -> Element<'static, LogMessage> {
         let info = crate::logs::log_write_error_info();
-        if info.count == 0 {
+        if info.count == 0 && info.dropped == 0 {
             return Space::new().height(0).into();
         }
 
-        let last = info
-            .last_timestamp
-            .as_deref()
-            .map(|ts| format!(" (last: {ts})"))
-            .unwrap_or_default();
-        let detail = info
-            .last_message
-            .as_deref()
-            .unwrap_or("unknown log insert failure");
-        let stopped = if info.panic_state.writer_stopped {
-            " Log persistence is STOPPED until the daemon restarts."
-        } else {
-            ""
-        };
+        let mut report = Vec::new();
+        if info.count > 0 {
+            let last = info
+                .last_timestamp
+                .as_deref()
+                .map(|ts| format!(" (last: {ts})"))
+                .unwrap_or_default();
+            let detail = info
+                .last_message
+                .as_deref()
+                .unwrap_or("unknown log insert failure");
+            let stopped = if info.panic_state.writer_stopped {
+                " Log persistence is STOPPED until the daemon restarts."
+            } else {
+                ""
+            };
+            report.push(format!(
+                "Log store write failures: {} — records are not reaching the log store{last}. \
+                 Latest error: {detail}{stopped}",
+                info.count
+            ));
+        }
+        if info.dropped > 0 {
+            report.push(format!(
+                "Telemetry rows dropped by a full queue: {} — recording never waits for the \
+                 store, so a burst with nowhere to go is dropped.",
+                info.dropped
+            ));
+        }
 
         container(
             row![
@@ -650,13 +668,9 @@ impl LogsState {
                     .size(theme::TEXT_14)
                     .color(theme::STATUS_WARNING),
                 Space::new().width(theme::SPACE_6),
-                text(format!(
-                    "Log store write failures: {} — durable log persistence is degraded{last}. \
-                     Latest error: {detail}{stopped}",
-                    info.count
-                ))
-                .size(theme::TEXT_12)
-                .color(theme::TEXT_SECONDARY),
+                text(report.join(" "))
+                    .size(theme::TEXT_12)
+                    .color(theme::TEXT_SECONDARY),
             ]
             .align_y(Alignment::Center),
         )

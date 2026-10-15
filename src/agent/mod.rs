@@ -77,10 +77,13 @@ fn current_agent_id() -> Option<String> {
         .filter(|agent_id| !agent_id.is_empty())
 }
 
-/// The calling agent's identity for a row written STRAIGHT to the log store:
-/// `(agent_id, role)`, empty outside an agent run (inbound enrichment, tests).
-/// The tracing writer takes this attribution from the current span; a row that
-/// bypasses the writer takes it from the same task-local.
+/// The calling agent's identity for the warning row
+/// [`crate::logs::record_stray_event`] leaves: `(agent_id, role)`, empty outside
+/// an agent run (inbound enrichment, tests). The tracing writer takes this
+/// attribution from the current span; a row that travels to the telemetry queue
+/// must take it from the same task-local, read here — synchronously, while the
+/// calling task is still the one running, since no task-local is in scope where
+/// the row is written.
 pub(crate) fn tool_record_attribution() -> (String, String) {
     CURRENT_TOOL_AGENT_TRACKING
         .try_with(|t| t.as_ref().map(|t| (t.agent_id.clone(), t.role.clone())))
@@ -734,9 +737,8 @@ fn format_comment_message(user_name: &str, content: &str) -> String {
 }
 
 impl Agent {
-    /// Flush accumulated tool stats to the logs store, then persist the final
-    /// assistant message via `session.finalize(&self.agent_id)`. Flush failures are logged
-    /// but do not abort finalization.
+    /// Hand the accumulated tool stats to the telemetry queue, then persist the
+    /// final assistant message via `session.finalize(&self.agent_id)`.
     ///
     /// An empty unpersisted tail is logged here with full agent/role/workspace/
     /// ticket attribution: at INFO when the graceful drain cut the turn
@@ -744,29 +746,22 @@ impl Agent {
     /// rounds resume at boot), at DEBUG when the turn ended via the `sleep`
     /// tool (equally expected), at INFO otherwise (genuine anomaly).
     pub async fn finalize_session(&mut self) -> anyhow::Result<()> {
-        // Drain accumulated tool usage stats
+        // The batch leaves on the telemetry queue ([`crate::telemetry`]).
         let stats = {
             let mut guard = self.tool_stats.lock().unwrap_poison();
             std::mem::take(&mut *guard)
         };
-        if !stats.is_empty()
-            && let Some(store) = crate::logs::LOG_STORE.get()
-            && let Err(e) = store
-                .flush_batch(
-                    &self.agent_id,
-                    self.role.as_str(),
-                    &self.workspace.path,
-                    crate::stats::CallSource::Agent,
-                    &stats,
-                )
-                .await
-        {
-            tracing::warn!(
-                agent_id = %self.agent_id,
-                role = %self.role.as_str(),
-                error = %e,
-                "Failed to flush tool usage stats"
-            );
+        if !stats.is_empty() {
+            crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::ToolCalls(
+                crate::telemetry::ToolCallBatch {
+                    source: crate::stats::CallSource::Agent,
+                    agent_id: self.agent_id.clone(),
+                    role: self.role.as_str().to_string(),
+                    workspace: self.workspace.path.clone(),
+                    recorded_at: crate::db::now(),
+                    records: stats,
+                },
+            ));
         }
 
         // When cancelled (deliberate stop or global shutdown), no assistant
@@ -1664,8 +1659,8 @@ impl Agent {
         )
     }
 
-    /// Record one tool invocation into the agent's in-memory stats (flushed to
-    /// the logs store on session finalization). The argument text is built by
+    /// Record one tool invocation into the agent's in-memory stats (handed to
+    /// the telemetry queue on session finalization). The argument text is built by
     /// [`crate::stats::recorded_arguments`] — serialized, redacted, scrubbed and
     /// truncated to the stats budget.
     fn push_tool_call_record(
@@ -2051,8 +2046,7 @@ impl Agent {
                         resp.finish_reason.clone(),
                         None,
                     );
-                    record_continuation_failure(operation.as_ref(), attempt, &rec, attempt_started)
-                        .await;
+                    record_continuation_failure(operation.as_ref(), attempt, &rec, attempt_started);
                     failures.push(rec);
                     tail.push(ChatMessage::assistant(
                         assistant_replay_payload(None, &[], resp.reasoning.as_ref()).to_string(),
@@ -2062,8 +2056,7 @@ impl Agent {
                 }
                 // Real answer or tool calls — the turn resolves normally.
                 Ok(resp) => {
-                    crate::stats::record_llm_success(&request, operation_started, attempt, &resp)
-                        .await;
+                    crate::stats::record_llm_success(&request, operation_started, attempt, &resp);
                     return Ok(resp);
                 }
                 // Provider failure — break on non-retryable (a payload-rejecting
@@ -2075,8 +2068,7 @@ impl Agent {
                         attempt,
                         &err.record,
                         attempt_started,
-                    )
-                    .await;
+                    );
                     failures.push(err.record);
                     if !err.class.is_retryable() {
                         break;
@@ -2090,9 +2082,7 @@ impl Agent {
             .map_or(crate::retry::FailureClass::NoResponse, |r| r.class);
         let exhausted = crate::retry::RetryExhausted::with_last_raw(failures, final_class, None);
         match last_request {
-            Some(request) => {
-                crate::retry::fail_exhausted(&request, operation_started, exhausted).await
-            }
+            Some(request) => crate::retry::fail_exhausted(&request, operation_started, exhausted),
             None => Err(exhausted),
         }
     }
@@ -2669,14 +2659,14 @@ fn is_reasoning_only_stop(response: &ChatResponse) -> bool {
 /// metadata-tracked (fail-open; see
 /// [`crate::stats::record_llm_attempt_failure`]). The per-attempt duration is
 /// measured from `attempt_started` (the attempt's launch instant).
-async fn record_continuation_failure(
+fn record_continuation_failure(
     operation: Option<&crate::stats::LlmOperationCtx>,
     attempt: u32,
     rec: &crate::retry::RetryFailureRecord,
     attempt_started: Instant,
 ) {
     if let Some(op) = operation {
-        crate::stats::record_llm_attempt_failure(op, attempt, rec, Some(attempt_started)).await;
+        crate::stats::record_llm_attempt_failure(op, attempt, rec, Some(attempt_started));
     }
 }
 

@@ -106,8 +106,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                                     operation_started,
                                     attempt,
                                     &response,
-                                )
-                                .await;
+                                );
                                 return Ok(result);
                             }
                         }
@@ -130,7 +129,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                     response.finish_reason.clone(),
                     None,
                 );
-                loop_state.record(rec).await;
+                loop_state.record(rec);
 
                 // Re-prompt: push raw assistant text + retry prompt. Only
                 // needed when another attempt will actually run — the final
@@ -151,14 +150,14 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 // ticket comment never labels it 'last attempt'.
                 last_raw = None;
                 let non_retryable = !scoped_err.class.is_retryable();
-                loop_state.record(scoped_err.record).await;
+                loop_state.record(scoped_err.record);
                 if non_retryable {
                     let exhausted = RetryExhausted::with_last_raw(
                         loop_state.into_failures(),
                         scoped_err.class,
                         last_raw,
                     );
-                    return fail_exhausted(&record_request, operation_started, exhausted).await;
+                    return fail_exhausted(&record_request, operation_started, exhausted);
                 }
             }
         }
@@ -166,7 +165,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
         if let Err(class) = loop_state.sleep_between(attempt).await {
             let exhausted =
                 RetryExhausted::with_last_raw(loop_state.into_failures(), class, last_raw);
-            return fail_exhausted(&record_request, operation_started, exhausted).await;
+            return fail_exhausted(&record_request, operation_started, exhausted);
         }
     }
 
@@ -175,7 +174,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     let final_class = loop_state.final_class();
     let exhausted =
         RetryExhausted::with_last_raw(loop_state.into_failures(), final_class, last_raw);
-    fail_exhausted(&record_request, operation_started, exhausted).await
+    fail_exhausted(&record_request, operation_started, exhausted)
 }
 
 #[cfg(test)]
@@ -551,6 +550,9 @@ mod tests {
             result.is_err(),
             "all-attempt failure must not produce a verdict"
         );
+        // The rows were queued rather than written inline: the drain is what
+        // writes queued records in a test (no test runs the boot's drain task).
+        crate::telemetry::drain_for_test().await;
         let rows = store
             .conn
             .query(

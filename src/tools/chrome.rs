@@ -458,8 +458,7 @@ impl ChromeTool {
         // this call's result is the page, and the record is where the leftover
         // fact lives.
         if leftover_pipes {
-            Self::record_leftover(&self.resolve_session(tab), NO_WORKSPACE, started.elapsed())
-                .await;
+            Self::record_leftover(&self.resolve_session(tab), NO_WORKSPACE, started.elapsed());
         }
 
         Ok(text.output)
@@ -852,7 +851,7 @@ impl ChromeTool {
             // text the agent reads (see [`chrome_leftover_pipe_note`]). The
             // failure keeps its own text and classification — a leftover never
             // decides the outcome.
-            Self::record_leftover(&session, workspace, elapsed).await;
+            Self::record_leftover(&session, workspace, elapsed);
             return Err(anyhow::anyhow!(
                 "{}",
                 crate::tools::with_note(&failed.to_string(), &chrome_leftover_pipe_note(&session))
@@ -932,8 +931,8 @@ impl ChromeTool {
     /// fetch — write it once for the call whose chrome-use calls held the
     /// leftover. `elapsed` is the time the record's call took — that chrome-use
     /// call's dispatch for a failure record, the whole dispatch for the other two.
-    async fn record_leftover(session: &str, workspace: &str, elapsed: Duration) {
-        crate::logs::record_stray_event(crate::logs::StrayEvent {
+    fn record_leftover(session: &str, workspace: &str, elapsed: Duration) {
+        crate::logs::record_stray_event(&crate::logs::StrayEvent {
             source: crate::logs::STRAY_SOURCE_CHROME_TOOL,
             message: "chrome-use exited while a helper it had started still held the call's output \
                       channel, so no more of its output could be collected",
@@ -942,8 +941,7 @@ impl ChromeTool {
             session,
             workspace,
             duration_ms: Some(crate::util::millis_i64(elapsed)),
-        })
-        .await;
+        });
     }
 
     /// The failure text of a `ParsedRun::Failed` call: chrome-use's own error
@@ -1590,7 +1588,7 @@ impl Tool for ChromeTool {
             let session = self.resolve_session(&tab);
             // The durable record of the helper chrome-use left behind, in the
             // same wording the agent's note carries (see [`Self::record_leftover`]).
-            Self::record_leftover(&session, &workspace, started.elapsed()).await;
+            Self::record_leftover(&session, &workspace, started.elapsed());
             return Ok(crate::tools::with_note(
                 &body,
                 &chrome_leftover_pipe_note(&session),

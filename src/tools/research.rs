@@ -1171,7 +1171,7 @@ fn research_call_guard(
 /// Live tracking: one NON_AGENT_CALLS row per wrap-up stage, registered only
 /// when the LLM batch actually runs (the stage is the logical task — the
 /// per-analyst extraction calls share it, never spawning N duplicate rows).
-/// Each extraction call still records its own durable llm_requests row via
+/// Each extraction call still records its own `llm_requests` row via
 /// its `"research_wrap_up"` ChatRequestMeta.
 async fn wrap_up_timed_out(
     ws: &Workspace,
@@ -2735,7 +2735,7 @@ async fn synthesize(
                         resp.finish_reason.clone(),
                         None,
                     );
-                    loop_state.record(rec).await;
+                    loop_state.record(rec);
                     feedback = "Your previous report was truncated by the output limit — \
                                 produce a SHORTER, more compressed version. Keep every \
                                 load-bearing claim and its source, but tighten the prose so \
@@ -2755,19 +2755,19 @@ async fn synthesize(
                         resp.finish_reason.clone(),
                         None,
                     );
-                    loop_state.record(rec).await;
+                    loop_state.record(rec);
                     feedback = "Your previous attempt returned an empty response — \
                                 produce the report now."
                         .to_string();
                     continue;
                 }
                 // Clean completion wins.
-                crate::stats::record_llm_success(&params, operation_started, attempt, &resp).await;
+                crate::stats::record_llm_success(&params, operation_started, attempt, &resp);
                 return Ok(SynthesisOutput { text, marker: None });
             }
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
-                loop_state.record(err.record).await;
+                loop_state.record(err.record);
                 if non_retryable {
                     break;
                 }
@@ -2789,7 +2789,7 @@ async fn synthesize(
         final_class,
         last.clone(),
     );
-    crate::stats::record_llm_failure(&params, operation_started, &exhausted).await;
+    crate::stats::record_llm_failure(&params, operation_started, &exhausted);
     if let Some(text) = last {
         let marker = last_truncated.then(|| SYNTHESIS_TRUNCATED_MARKER.to_string());
         Ok(SynthesisOutput { text, marker })

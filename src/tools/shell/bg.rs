@@ -907,13 +907,23 @@ mod tests {
     /// Launch `command` in the mode every background session runs in, its own text
     /// standing as the reading the platform runs — the two differ on Windows alone,
     /// and no text here is a Windows multi-line shape.
+    ///
+    /// The launch runs under an owner of its own: with no agent identity every
+    /// background output file is recorded under the diagnostics role
+    /// ([`crate::tools::shell::record_spill_owner`]), which a concurrently running
+    /// verification round's own cleanup drains — deleting the file the test is
+    /// about to read.
     async fn launch_command(
         sessions: &Arc<BackgroundSessions>,
         ws: &Path,
         command: &str,
     ) -> Result<PathBuf, String> {
-        sessions
-            .launch(Executed(command), Written(command), ws, ShellMode::Full)
+        crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some("bg_test".to_string()), async {
+                sessions
+                    .launch(Executed(command), Written(command), ws, ShellMode::Full)
+                    .await
+            })
             .await
     }
 

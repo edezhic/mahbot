@@ -182,12 +182,12 @@ impl ModelCallMarker {
     }
 }
 
-/// Record the durable rows for one media-transcription call (fail-open;
+/// Record the rows for one media-transcription call (fail-open;
 /// usage columns stay NULL, retry_attempts always 1). `finish_reason` on
 /// success, `failure_class` + `error_chain` on failure — a failure also
 /// persists one `llm_failures` row (attempt 1) under a fresh operation id.
 #[expect(clippy::cast_possible_truncation)]
-async fn record_transcription(
+fn record_transcription(
     call: &crate::stats::LlmCallMeta,
     started: std::time::Instant,
     finish_reason: Option<&str>,
@@ -201,12 +201,10 @@ async fn record_transcription(
         None,
         finish_reason,
         failure_class,
-    )
-    .await;
+    );
     if let (Some(class), Some(chain)) = (failure_class, error_chain) {
         let operation_id = crate::generate_id();
-        crate::stats::record_llm_attempt_failure_meta(call, &operation_id, class, chain, started)
-            .await;
+        crate::stats::record_llm_attempt_failure_meta(call, &operation_id, class, chain, started);
     }
 }
 
@@ -214,7 +212,7 @@ async fn record_transcription(
 /// text (or the original error). The single place that maps video-transcription
 /// outcomes to `llm_requests`/`llm_failures` rows, so every call records
 /// exactly once.
-async fn finish_transcription(
+fn finish_transcription(
     call: &crate::stats::LlmCallMeta,
     started: std::time::Instant,
     outcome: Result<RawTranscription, anyhow::Error>,
@@ -224,7 +222,7 @@ async fn finish_transcription(
             text,
             finish_reason,
         }) => {
-            record_transcription(call, started, finish_reason.as_deref(), None, None).await;
+            record_transcription(call, started, finish_reason.as_deref(), None, None);
             Ok(text)
         }
         Ok(RawTranscription::EmptyContent) => {
@@ -234,8 +232,7 @@ async fn finish_transcription(
                 None,
                 Some(crate::retry::FailureClass::NoResponse.label()),
                 Some("media transcription returned empty content"),
-            )
-            .await;
+            );
             anyhow::bail!("media transcription returned empty content");
         }
         Err(e) => {
@@ -248,7 +245,7 @@ async fn finish_transcription(
                 false,
             );
             let chain = format!("{e:#}");
-            record_transcription(call, started, None, Some(failure.label()), Some(&chain)).await;
+            record_transcription(call, started, None, Some(failure.label()), Some(&chain));
             Err(e)
         }
     }
@@ -287,7 +284,7 @@ enum LiveTrackingGuard {
 /// capped future below only performs the model call (telemetry-free via
 /// [`MediaTranscriber::transcribe_media_raw`]). A cap drop therefore cannot
 /// race the inner future's own write, so one launched model call always
-/// produces exactly one durable `llm_requests` row (success, failure, or the
+/// produces exactly one `llm_requests` row (success, failure, or the
 /// drop's transport row), never two; upload-phase failures — no model call
 /// launched — record nothing (no phantom rows).
 pub(crate) async fn transcribe_video_file(
@@ -330,7 +327,7 @@ pub(crate) async fn transcribe_video_file(
             }
             return None;
         }
-        match finish_transcription(&call, started, inner).await {
+        match finish_transcription(&call, started, inner) {
             Ok(text) => Some(text),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "Video transcription failed");
@@ -350,8 +347,7 @@ pub(crate) async fn transcribe_video_file(
                 None,
                 Some(crate::retry::FailureClass::Transport.label()),
                 Some("video transcription timed out"),
-            )
-            .await;
+            );
         }
         tracing::warn!(path = %path.display(), "Video transcription timed out");
         None
