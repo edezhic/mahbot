@@ -5,7 +5,7 @@ pub(crate) mod reply;
 pub mod telegram;
 mod telegram_group;
 pub(crate) mod telegram_intake;
-use enrichment::has_inbound_temp_marker;
+pub use chat_history::run_cap_loop;
 pub use enrichment::{enrich_links, enrich_message};
 pub use reply::{ReplyReference, apply_reply_marker};
 pub use telegram::mirror_gui_message_to_telegram;
@@ -16,6 +16,7 @@ use crate::db;
 use crate::util::UnwrapPoison;
 use crate::{Channel, ChannelMessage, ChatDirection, SendMessage};
 use async_trait::async_trait;
+use enrichment::has_inbound_temp_marker;
 // The voice channel (macOS-only) is the only `Arc` user in this module.
 #[cfg(target_os = "macos")]
 use std::sync::Arc;

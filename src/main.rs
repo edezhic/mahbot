@@ -271,6 +271,15 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::log_retention::run_retention_loop(log_store.clone()),
     );
 
+    // The chat window's conversation cap, and the repair of what a store
+    // already holds past it (`mahbot::channels::chat_history`).
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "chat-history-cap",
+        mahbot::channels::run_cap_loop(),
+    );
+
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

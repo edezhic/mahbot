@@ -348,12 +348,12 @@ pub enum HomeMessage {
     InputChanged(super::editor_widget::EditorAction),
     /// Send button pressed or Enter key in editor.
     SendMessage,
-    /// Chat history loaded from the store. `generation` is the load counter the
-    /// read was issued under: a result whose generation is no longer current
-    /// belongs to a superseded load and is dropped.
+    /// The whole conversation loaded from the store — what the cap keeps for it
+    /// and nothing else, in one read. `generation` is the load counter the read
+    /// was issued under: a result whose generation is no longer current belongs
+    /// to a superseded load and is dropped.
     HistoryLoaded {
         entries: Vec<ChatHistoryEntry>,
-        has_more: bool,
         generation: u64,
     },
     /// History load failed. Carries the generation the read was issued under, so
@@ -365,12 +365,6 @@ pub enum HomeMessage {
     StreamLagged,
     /// Scroll position changed in the chat scrollable.
     ScrollChanged(scrollable::Viewport),
-    /// User clicked "Load older messages" button.
-    LoadOlderMessages,
-    /// Older history loaded (entries, has_more, pagination_gen for staleness check).
-    OlderHistoryLoaded(Vec<ChatHistoryEntry>, bool, u64),
-    /// Older history load failed (error, pagination_gen for staleness check).
-    OlderHistoryLoadError(String, u64),
     /// Markdown link was clicked.
     LinkClicked(String),
     /// Reset session button pressed — reset session and display.
@@ -457,17 +451,6 @@ pub struct HomeState {
     sending_gen: u64,
     /// Whether auto-scroll is enabled (user is scrolled to the bottom).
     auto_scroll_enabled: bool,
-    /// The database ID of the oldest loaded message, if any.
-    oldest_loaded_id: Option<i64>,
-    /// Whether there are more older messages to load.
-    has_more: bool,
-    /// Whether an older-messages load is in-flight.
-    loading_older: bool,
-    /// Generation counter for stale OlderHistoryLoaded callback detection.
-    /// Advanced only by [`Self::reset_pagination_state`], which clears
-    /// `loading_older` with it — so a result dropped as stale can never leave
-    /// the "load older" action stuck.
-    pagination_gen: u64,
     /// Undo/redo stack for the chat input text editor.
     undo_stack: super::common::UndoStack,
     /// Captured {author, snippet} of the message being replied to. `Some`
@@ -482,10 +465,6 @@ pub struct HomeState {
     /// the empty-chat hint so a failed read is never mistaken for a legitimately
     /// empty history; cleared on the next successful load.
     history_error: Option<String>,
-    /// Persistent failure of the last "load older messages" read. Rendered
-    /// above the transcript so a failed read is never mistaken for "nothing
-    /// older exists"; cleared on the next successful load.
-    older_history_error: Option<String>,
 }
 
 /// The instant a stored timestamp names, or `None` when it is absent or not a
@@ -515,16 +494,11 @@ impl HomeState {
             onboarding_script_active: false,
             sending_gen: 0,
             auto_scroll_enabled: true,
-            oldest_loaded_id: None,
-            has_more: false,
-            loading_older: false,
-            pagination_gen: 0,
             undo_stack: super::common::UndoStack::new(),
             pending_reply: None,
             drafts: crate::channels::chat_draft::DraftStore::global().clone(),
             draft_save: super::common::DebounceState::new(),
             history_error: None,
-            older_history_error: None,
         }
     }
 
@@ -559,7 +533,8 @@ impl HomeState {
     }
 
     /// Load the conversation — the admin's own single chat, in their personal
-    /// workspace, independent of the selected workspace.
+    /// workspace, independent of the selected workspace. One read carries the
+    /// whole of what the cap keeps for it: there is nothing older to fetch.
     fn refresh_history(&mut self) -> Task<HomeMessage> {
         self.history_gen = self.history_gen.wrapping_add(1);
         let generation = self.history_gen;
@@ -568,14 +543,13 @@ impl HomeState {
             async move {
                 let store = crate::channels::chat_history::store();
                 store
-                    .load_recent(crate::users::ADMIN_USER_NAME, &workspace)
+                    .load_conversation(crate::users::ADMIN_USER_NAME, &workspace)
                     .await
                     .map_err(|e| e.to_string())
             },
             move |result| match result {
-                Ok((entries, has_more)) => HomeMessage::HistoryLoaded {
+                Ok(entries) => HomeMessage::HistoryLoaded {
                     entries,
-                    has_more,
                     generation,
                 },
                 Err(e) => HomeMessage::HistoryLoadError {
@@ -586,28 +560,11 @@ impl HomeState {
         )
     }
 
-    /// Reset the paging window only: the oldest-loaded cursor, has-more, the
-    /// in-flight flag, its failure, and its generation. Called when the stored
-    /// window is (re)built and on a deliberate clear. Auto-scroll is
-    /// deliberately not part of it: resetting the window must never move the
-    /// view.
-    fn reset_pagination_state(&mut self) {
-        self.oldest_loaded_id = None;
-        self.has_more = false;
-        self.loading_older = false;
-        self.older_history_error = None;
-        self.pagination_gen = self.pagination_gen.wrapping_add(1);
-    }
-
-    /// Replace the stored history with `entries` — the page of the conversation
-    /// just read. What is on screen but not stored (the message being sent, the
-    /// scripted introduction) is kept, and nothing is ever shown twice; no task
-    /// is issued (the caller batches the snap and the onboarding check).
-    fn replace_stored_history(&mut self, entries: Vec<ChatHistoryEntry>, has_more: bool) {
-        // The window is rebuilt from this page, so pagination starts over and an
-        // in-flight "load older" read of the old window is dropped.
-        self.reset_pagination_state();
-        self.has_more = has_more;
+    /// Replace the stored history with `entries` — the conversation just read.
+    /// What is on screen but not stored (the message being sent, the scripted
+    /// introduction) is kept, and nothing is ever shown twice; no task is issued
+    /// (the caller batches the snap and the onboarding check).
+    fn replace_stored_history(&mut self, entries: Vec<ChatHistoryEntry>) {
         let mut kept: Vec<DisplayMessage> = std::mem::take(&mut self.messages)
             .into_iter()
             .filter(|m| m.id.is_none())
@@ -657,7 +614,6 @@ impl HomeState {
             });
             merged.insert(at.unwrap_or(merged.len()), msg);
         }
-        self.oldest_loaded_id = merged.iter().find_map(|m| m.id);
         self.messages = merged;
         self.seen_ids.clear();
         self.seen_ids
@@ -1086,58 +1042,11 @@ impl HomeState {
                 children.push(align_bubble(typing_bubble, BubbleSide::Right));
             }
 
-            // Prepend "Load older messages" button when applicable.
-            if self.has_more {
-                let load_text = if self.loading_older {
-                    "Loading older messages\u{2026}"
-                } else {
-                    "▲ Load older messages"
-                };
-                let load_btn = button(
-                    text(load_text)
-                        .size(theme::TEXT_12)
-                        .color(theme::TEXT_SECONDARY),
-                )
-                .style(move |_t: &iced::Theme, _status| {
-                    use iced::widget::button;
-                    button::Style {
-                        background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            width: 0.0,
-                            color: iced::Color::TRANSPARENT,
-                        },
-                        text_color: theme::TEXT_SECONDARY,
-                        ..button::Style::default()
-                    }
-                })
-                .width(Length::Fill)
-                .on_press_maybe(if self.loading_older {
-                    None
-                } else {
-                    Some(HomeMessage::LoadOlderMessages)
-                });
-                // The 4px is the pill's design accent on top of the bubbles'
-                // inset (8 pre-rework column padding, now the wrapper's) —
-                // kept untrimmed so the pill stays 4px deeper than bubbles.
-                children.insert(0, container(load_btn).padding(theme::PAD_4).into());
-            }
-
             // A failed history read must not leave the transcript looking
             // current: the failure stays above the loaded messages until a read
             // succeeds. (This is the resync case — with an empty transcript the
             // same failure renders in the empty state above.)
             if let Some(err) = &self.history_error {
-                children.insert(
-                    0,
-                    super::widgets::scroll_h_inset(super::widgets::error_banner(err)),
-                );
-            }
-
-            // A failed "load older" read must not leave the transcript looking
-            // as if nothing older existed: the failure stays above the loaded
-            // messages until a later load succeeds.
-            if let Some(err) = &self.older_history_error {
                 children.insert(
                     0,
                     super::widgets::scroll_h_inset(super::widgets::error_banner(err)),
@@ -1259,22 +1168,21 @@ impl HomeState {
             HomeMessage::SendMessage => self.send_message(),
             HomeMessage::HistoryLoaded {
                 entries,
-                has_more,
                 generation,
             } => {
-                // A superseded load belongs to a window the page has left.
+                // A superseded load belongs to a transcript the page has left.
                 if generation != self.history_gen {
                     return Task::none();
                 }
                 self.history_error = None;
-                self.replace_stored_history(entries, has_more);
+                self.replace_stored_history(entries);
                 let onboarding = self.maybe_start_onboarding();
                 Task::batch([self.maybe_snap(), onboarding])
             }
             HomeMessage::HistoryLoadError { generation, error } => {
                 tracing::warn!(error = %error, "Home: failed to load chat history");
-                // A failure from a superseded load belongs to a window the page
-                // has left: it must not paint itself over the current one.
+                // A failure from a superseded load belongs to a transcript the
+                // page has left: it must not paint itself over the current one.
                 if generation == self.history_gen {
                     self.history_error = Some(error);
                 }
@@ -1291,7 +1199,6 @@ impl HomeState {
                 // The transcript this failure described is gone; the reload the
                 // `ChatCleared` callback issues reports its own outcome.
                 self.history_error = None;
-                self.reset_pagination_state();
                 // A load in flight describes the transcript this clear just
                 // dropped: superseding it keeps it from landing in front of the
                 // reload.
@@ -1493,78 +1400,6 @@ impl HomeState {
                     }
                 };
                 self.auto_scroll_enabled = at_bottom;
-                Task::none()
-            }
-            HomeMessage::LoadOlderMessages => {
-                // Guard against double-clicks.
-                if self.loading_older {
-                    return Task::none();
-                }
-                self.loading_older = true;
-                let sender = crate::users::ADMIN_USER_NAME.to_string();
-                let workspace = Self::conversation_workspace();
-                let Some(before_id) = self.oldest_loaded_id else {
-                    self.loading_older = false;
-                    return Task::none();
-                };
-                let generation = self.pagination_gen;
-                Task::perform(
-                    async move {
-                        let store = crate::channels::chat_history::store();
-                        store
-                            .load_older(&sender, &workspace, before_id)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    move |result| match result {
-                        Ok((entries, has_more)) => {
-                            HomeMessage::OlderHistoryLoaded(entries, has_more, generation)
-                        }
-                        Err(e) => HomeMessage::OlderHistoryLoadError(e, generation),
-                    },
-                )
-            }
-            HomeMessage::OlderHistoryLoaded(display_entries, has_more, generation) => {
-                // Stale-result guard: only `reset_pagination_state` advances
-                // `pagination_gen`, and it clears `loading_older` with it — so a
-                // dropped result cannot strand the action, and this arm must not
-                // clear a flag a newer load may already own.
-                if generation != self.pagination_gen {
-                    return Task::none();
-                }
-                // An older page can overlap what the transcript already holds; a
-                // message is never shown twice.
-                let mut prepended: Vec<DisplayMessage> = Vec::new();
-                for entry in display_entries {
-                    let msg = DisplayMessage::from(entry);
-                    if self.seen_ids.insert(msg.message_id.clone()) {
-                        prepended.push(msg);
-                    }
-                }
-                let oldest = prepended
-                    .first()
-                    .and_then(|m| m.id)
-                    .or(self.oldest_loaded_id);
-                self.older_history_error = None;
-                prepended.append(&mut self.messages);
-                self.messages = prepended;
-                self.oldest_loaded_id = oldest;
-                self.has_more = has_more;
-                self.loading_older = false;
-                // Snap to end if auto-scroll enabled.
-                self.maybe_snap()
-            }
-            HomeMessage::OlderHistoryLoadError(msg, generation) => {
-                // Stale-result guard, mirroring `OlderHistoryLoaded`: a failed
-                // read of a superseded window must not pin its failure on the
-                // current one (nor touch its in-flight flag).
-                if generation != self.pagination_gen {
-                    return Task::none();
-                }
-                // The persistent banner is the signal; a toast here would report
-                // the same failure a second time and then vanish.
-                self.loading_older = false;
-                self.older_history_error = Some(msg);
                 Task::none()
             }
             HomeMessage::Toast(_) => {
@@ -1973,7 +1808,6 @@ mod tests {
         // the current failure.
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: Vec::new(),
-            has_more: false,
             generation: generation.wrapping_sub(1),
         });
         assert_eq!(
@@ -1989,7 +1823,6 @@ mod tests {
         // A successful load of the current generation clears it.
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: Vec::new(),
-            has_more: false,
             generation,
         });
         assert!(state.history_error.is_none());
@@ -2006,50 +1839,12 @@ mod tests {
         assert!(state.history_error.is_none());
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: vec![stored_entry(1, "old-1", "old")],
-            has_more: false,
             generation: in_flight,
         });
         assert!(
             state.messages.is_empty(),
             "a pre-clear load must not land behind the clear"
         );
-
-        // The older-messages read keeps its own failure until a load of the
-        // same window succeeds.
-        let pagination = state.pagination_gen;
-        let _ = state.update(HomeMessage::OlderHistoryLoadError(
-            "db down".to_string(),
-            pagination,
-        ));
-        assert_eq!(state.older_history_error.as_deref(), Some("db down"));
-        let _ = state.update(HomeMessage::OlderHistoryLoaded(
-            Vec::new(),
-            false,
-            pagination,
-        ));
-        assert!(state.older_history_error.is_none());
-
-        // A paging failure from a superseded window is dropped, like its
-        // successful counterpart.
-        let _ = state.update(HomeMessage::OlderHistoryLoadError(
-            "stale".to_string(),
-            pagination.wrapping_sub(1),
-        ));
-        assert!(state.older_history_error.is_none());
-
-        // ...and a fresh conversation load drops a stale paging failure with
-        // the window it described.
-        let _ = state.update(HomeMessage::OlderHistoryLoadError(
-            "db down".to_string(),
-            state.pagination_gen,
-        ));
-        assert_eq!(state.older_history_error.as_deref(), Some("db down"));
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: Vec::new(),
-            has_more: false,
-            generation: state.history_gen,
-        });
-        assert!(state.older_history_error.is_none());
     }
 
     fn make_msg(
@@ -2420,8 +2215,6 @@ mod tests {
         state.sending = true;
         state.typing = true;
         state.auto_scroll_enabled = false; // the user has scrolled up
-        state.has_more = true;
-        state.oldest_loaded_id = Some(7);
         let generation = state.history_gen;
 
         // A selection change is recorded and nothing else — in any order, back
@@ -2444,10 +2237,6 @@ mod tests {
             assert!(
                 !state.auto_scroll_enabled,
                 "a scrolled-up view must not be snapped back"
-            );
-            assert!(
-                state.has_more && state.oldest_loaded_id == Some(7),
-                "paging continues where it was"
             );
         }
     }
@@ -2532,7 +2321,6 @@ mod tests {
                 stored_entry(1, "old-1", "old"),
                 stored_entry(2, "new-2", "new"),
             ],
-            has_more: false,
             generation: state.history_gen,
         });
 
@@ -2562,7 +2350,6 @@ mod tests {
             .map(|m| m.message_id.as_str())
             .collect();
         assert_eq!(unique.len(), state.messages.len(), "no duplicated ids");
-        assert_eq!(state.oldest_loaded_id, Some(1));
     }
 
     #[test]
@@ -2584,7 +2371,6 @@ mod tests {
         reply.timestamp = Some("2026-01-01T10:00:05.000000000+00:00".to_string());
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: vec![reply],
-            has_more: false,
             generation: state.history_gen,
         });
 
@@ -2598,7 +2384,6 @@ mod tests {
             ["intro-1", "reply"],
             "a kept message stays in front of the stored one it preceded"
         );
-        assert_eq!(state.oldest_loaded_id, Some(5));
     }
 
     #[test]
@@ -2623,7 +2408,6 @@ mod tests {
         // id — its confirmation was dropped with the lag.
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: vec![confirmed],
-            has_more: false,
             generation: state.history_gen,
         });
         let ids: Vec<&str> = state
@@ -2647,7 +2431,6 @@ mod tests {
         older_row.timestamp = Some("2026-01-01T09:00:00.000000000+00:00".to_string());
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: vec![older_row],
-            has_more: false,
             generation: state.history_gen,
         });
         let ids: Vec<&str> = state
@@ -2698,46 +2481,10 @@ mod tests {
         // exactly once — the stored copy, not the live one.
         let _ = state.update(HomeMessage::HistoryLoaded {
             entries: vec![stored_entry(5, "in-flight", "text")],
-            has_more: false,
             generation: state.history_gen,
         });
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].id, Some(5));
-    }
-
-    #[test]
-    fn test_older_history_prepends_and_drops_duplicates() {
-        let mut state = HomeState::new();
-        let mut ten = make_msg("m10", "ten", ChatDirection::User, None, false);
-        ten.id = Some(10);
-        state.messages.push(ten);
-        state.seen_ids.insert("m10".to_string());
-        state.loading_older = true;
-
-        let generation = state.pagination_gen;
-        let _ = state.update(HomeMessage::OlderHistoryLoaded(
-            vec![
-                stored_entry(9, "m9", "nine"),
-                stored_entry(10, "m10", "ten"),
-            ],
-            true,
-            generation,
-        ));
-
-        let ids_and_contents: Vec<(&str, &str)> = state
-            .messages
-            .iter()
-            .map(|m| (m.message_id.as_str(), m.content.as_str()))
-            .collect();
-        assert_eq!(
-            ids_and_contents,
-            [("m9", "nine"), ("m10", "ten")],
-            "the duplicate m10 was dropped, not re-added"
-        );
-        assert_eq!(state.messages.len(), 2);
-        assert_eq!(state.oldest_loaded_id, Some(9));
-        assert!(state.has_more);
-        assert!(!state.loading_older);
     }
 
     // ------------------------------------------------------------------

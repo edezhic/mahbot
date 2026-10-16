@@ -72,9 +72,11 @@
 //! baseline across, and `63` drops the retired column. `64` drops the logs
 //! store's observability indexes that no product query's plan reaches (see
 //! [`DROP_UNUSED_LOGS_INDEXES`]), and `65` does the same for the core store
-//! (see [`DROP_UNUSED_CORE_INDEXES`]).
+//! (see [`DROP_UNUSED_CORE_INDEXES`]). `66` restates the composite index the
+//! chat window's read and its conversation cap are both served by (see
+//! [`ENSURE_CHAT_HISTORY_CONVERSATION_INDEX`]).
 //!
-//! Future schema changes resume the chain at id `66` with monotonically
+//! Future schema changes resume the chain at id `67` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -602,8 +604,8 @@ DROP INDEX IF EXISTS idx_grep_telemetry_command;";
 ///   job_id IS NULL`) plan on the unique `idx_agents_anchor`.
 /// - `pending_jobs` — the per-target delete plans on
 ///   `idx_pending_jobs_agent_created (target_agent_id=?)`.
-/// - `chat_history` — the paged conversation load plans on the composite
-///   `idx_chat_history_user_ws_id`.
+/// - `chat_history` — the conversation read and the removal that holds its cap
+///   both plan on the composite `idx_chat_history_user_ws_id`.
 /// - `tickets` — the board listings plan on `idx_tickets_board_active`, which
 ///   also supplies their `priority ASC, created_at DESC` ordering, and the
 ///   workspace-scoped claim candidates plan on `idx_tickets_workspace_phase`;
@@ -662,6 +664,18 @@ DROP INDEX IF EXISTS idx_jobs_caller_agent;
 DROP INDEX IF EXISTS idx_jobs_updated_at;
 DROP INDEX IF EXISTS idx_chat_history_user;
 DROP INDEX IF EXISTS idx_chat_history_workspace;";
+
+/// Catalog `66`: make sure the one index a conversation is served by exists —
+/// `idx_chat_history_user_ws_id`, `(user_name, workspace, id)`.
+///
+/// Both halves of the chat window's cap need it and neither can do without it:
+/// the read scans one conversation's newest rows in that order, and the cap's
+/// removal walks the same rows oldest first. Earlier work has moved this store's
+/// indexes twice (`24` created it, `65` dropped two of its neighbours), so the
+/// index is restated here — `IF NOT EXISTS`, a no-op on every store that still
+/// carries it — rather than assumed.
+const ENSURE_CHAT_HISTORY_CONVERSATION_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);";
 
 /// One-shot data migration (`37`).
 ///
@@ -1192,6 +1206,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "65",
         target: TargetDb::Core,
         body: MigrationBody::Sql(DROP_UNUSED_CORE_INDEXES),
+    },
+    Migration {
+        id: "66",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(ENSURE_CHAT_HISTORY_CONVERSATION_INDEX),
     },
 ];
 
@@ -3411,7 +3430,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63`/`65` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63`/`65`/`66` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -3439,10 +3458,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65"
+                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65/66 tail exactly"
         );
     }
 
@@ -4080,7 +4099,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4089,7 +4108,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65/66"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -4464,7 +4483,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4473,7 +4492,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65/66"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

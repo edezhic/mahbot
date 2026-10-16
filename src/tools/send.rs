@@ -1535,8 +1535,8 @@ mod tests {
     /// [`crate::channels::broadcast_and_persist_incoming_message`].
     async fn owner_message_ids(contents: &[&str]) -> Vec<String> {
         let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
-        let (entries, _) = crate::channels::chat_history::store()
-            .load_recent(crate::users::ADMIN_USER_NAME, &workspace)
+        let entries = crate::channels::chat_history::store()
+            .load_conversation(crate::users::ADMIN_USER_NAME, &workspace)
             .await
             .expect("the owner's own conversation loads");
         entries

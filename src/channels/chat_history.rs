@@ -1,8 +1,20 @@
-//! Chat history persistence — stores all chat messages (both user and agent)
-//! for GUI display and history loading. Messages are written by the central
-//! broadcast-and-persist paths: `broadcast_and_persist_incoming_message` for
-//! incoming user messages and `broadcast_and_persist_agent_response` /
-//! `BroadcastPersistEntry` for outgoing agent responses.
+//! Chat history persistence — the messages of every conversation (one user in
+//! one workspace), for GUI display.
+//!
+//! One conversation keeps its newest [`CHAT_HISTORY_CAP`] messages and nothing
+//! older. The cap is a standing state, held by two halves: a message is capped
+//! where it is written ([`ChatHistoryStore::insert`], the single write entry
+//! every writer goes through — user messages, agent responses and the
+//! session-reset divider alike) and [`run_cap_loop`] repairs what a store
+//! already holds, including what a copy brought up from an older one holds.
+//! What is over the cap is REMOVED from the store, never merely left out of the
+//! read; and the read is bounded by that same value, so a conversation the
+//! removal has not reached yet still shows the window the cap keeps for it.
+//!
+//! Messages are written by the central broadcast-and-persist paths:
+//! `broadcast_and_persist_incoming_message` for incoming user messages and
+//! `broadcast_and_persist_agent_response` / `BroadcastPersistEntry` for outgoing
+//! agent responses.
 //!
 //! Each message gets a NanoID for deduplication.
 
@@ -10,6 +22,8 @@ use crate::ChatDirection;
 use crate::channels::ReplyReference;
 use crate::db::{self, Row};
 use anyhow::Result;
+use std::time::Duration;
+use tracing::{debug, warn};
 
 crate::define_store! {
     /// Global chat history store.
@@ -53,8 +67,42 @@ pub struct ChatHistoryEntry {
     pub reply_reference: Option<ReplyReference>,
 }
 
-/// Maximum number of history entries to load at once.
-const HISTORY_LIMIT: usize = 100;
+/// The number of messages one conversation keeps — and the number the chat
+/// window reads. One value for both: the window shows what the cap keeps, so no
+/// second bound can drift from the cap and quietly hide what the cap failed to
+/// remove.
+const CHAT_HISTORY_CAP: usize = 100;
+
+/// How many messages one removal statement may take. The engine rejects
+/// `DELETE … LIMIT`, so a removal bounds itself with a `LIMIT`ed id subquery and
+/// leaves the rest to the next statement — the write path trims the
+/// conversation it just wrote, and the sweep re-trims it on its next round.
+const TRIM_BATCH: u64 = 1_000;
+
+/// How often [`run_cap_loop`] repairs every conversation it finds over the cap.
+const SWEEP_INTERVAL: Duration = Duration::from_mins(10);
+
+/// Pause between the statements of a sweep that removed something, so a sweep
+/// never holds the store across the whole of it.
+const SWEEP_PAUSE: Duration = Duration::from_millis(50);
+
+/// The cap's removal: the messages of one conversation that are NOT among its
+/// newest [`CHAT_HISTORY_CAP`], oldest first, at most `?4` of them. A
+/// conversation at or below the cap matches nothing. One statement, so the
+/// boundary it removes to cannot go stale between reading and deleting it.
+const TRIM_SQL: &str = "\
+DELETE FROM chat_history WHERE id IN (
+    SELECT id FROM chat_history
+     WHERE user_name = ?1 AND workspace = ?2
+       AND id NOT IN (
+           SELECT id FROM chat_history
+            WHERE user_name = ?1 AND workspace = ?2
+            ORDER BY id DESC
+            LIMIT ?3
+       )
+     ORDER BY id
+     LIMIT ?4
+)";
 
 // Column definitions for `chat_history` SELECT queries.
 crate::columns! {
@@ -94,30 +142,24 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
     })
 }
 
-/// Process rows from a query that over-fetched by one row (limit = history
-/// limit + 1) into a page of entries with a `has_more` flag. Entries are
-/// returned in chronological order. The extra over-fetched row (if any) is
-/// dropped from the front (oldest entries) so the returned vector contains
-/// at most [`HISTORY_LIMIT`] entries.
-fn rows_to_page(rows: Vec<Row>) -> Result<(Vec<ChatHistoryEntry>, bool)> {
+/// Convert a query's rows — newest first, as a conversation read returns them —
+/// into entries in the order the chat window shows them (oldest first).
+fn rows_to_entries(rows: Vec<Row>) -> Result<Vec<ChatHistoryEntry>> {
     let mut entries: Vec<ChatHistoryEntry> = Vec::with_capacity(rows.len());
     for row in rows {
         entries.push(chat_history_entry_from_row(&row)?);
     }
     entries.reverse();
-    let has_more = entries.len() > HISTORY_LIMIT;
-    if has_more {
-        // Entries are in chronological order (oldest first).
-        // We over-fetched by 1 to detect has_more; remove the oldest entry
-        // (at the front) so we return exactly HISTORY_LIMIT entries.
-        entries.drain(0..(entries.len() - HISTORY_LIMIT));
-    }
-    Ok((entries, has_more))
+    Ok(entries)
 }
 
 impl ChatHistoryStore {
     /// Insert a message into the history. `message_id` is a NanoID for dedup.
     /// Silently ignores duplicate `message_id` values (`INSERT OR IGNORE`).
+    ///
+    /// The message just written is what pushes its conversation over the cap, so
+    /// the removal that keeps the cap runs here — after the row is written,
+    /// never before it.
     pub async fn insert(&self, entry: &ChatHistoryInsert) -> Result<()> {
         self.conn
             .execute(
@@ -139,23 +181,54 @@ impl ChatHistoryStore {
                 ],
             )
             .await?;
+        // The removal's failure is traced where it runs, never silently: the
+        // message is written either way, and the next write to this
+        // conversation — or the sweep — tries the removal again.
+        let _ = self
+            .trim_conversation(&entry.user_name, &entry.workspace)
+            .await;
         Ok(())
     }
 
-    /// Shared paging body for the `load_*` methods. Reads exactly one
-    /// conversation — a user in one workspace. `before_id = None` loads the
-    /// most recent page; `Some(id)` loads only messages older than `id`.
-    /// Ordered by row id, so the composite index
-    /// `idx_chat_history_user_ws_id (user_name, workspace, id)` serves the
-    /// predicate and the ordering directly.
-    async fn load_page(
+    /// Remove the messages one conversation holds past its newest
+    /// [`CHAT_HISTORY_CAP`] — at most [`TRIM_BATCH`] of them, the oldest first.
+    /// Returns how many went; a return short of [`TRIM_BATCH`] means the
+    /// conversation is within the cap. A failure is traced here, so a caller
+    /// only decides what to do next — the conversation stays over the cap until
+    /// a later attempt takes the removal up again.
+    async fn trim_conversation(&self, user_name: &str, workspace: &str) -> Result<u64> {
+        #[expect(clippy::cast_possible_wrap)]
+        let (cap, batch) = (CHAT_HISTORY_CAP as i64, TRIM_BATCH as i64);
+        let removed = self
+            .conn
+            .execute(TRIM_SQL, db::params![user_name, workspace, cap, batch])
+            .await
+            .map_err(|e| {
+                warn!(
+                    user = %user_name,
+                    workspace = %workspace,
+                    error = %e,
+                    "Chat history cap: could not remove the messages past it — \
+                     the conversation stays over it until a later attempt"
+                );
+                e
+            })?;
+        Ok(removed)
+    }
+
+    /// Read a conversation — one user in one workspace — in the order the chat
+    /// window shows it (oldest first). This is the whole of what is kept for it:
+    /// the cap leaves nothing older, and [`CHAT_HISTORY_CAP`] bounds the read
+    /// because it is the same value that bounds the store. Ordered by row id,
+    /// so the composite index `idx_chat_history_user_ws_id (user_name,
+    /// workspace, id)` serves the predicate and the ordering directly.
+    pub async fn load_conversation(
         &self,
         user_name: &str,
         workspace: &str,
-        before_id: Option<i64>,
-    ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
+    ) -> Result<Vec<ChatHistoryEntry>> {
         #[expect(clippy::cast_possible_wrap)]
-        let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
+        let cap = CHAT_HISTORY_CAP as i64;
         let rows = self
             .conn
             .query(
@@ -163,37 +236,13 @@ impl ChatHistoryStore {
                     "SELECT {CHAT_HISTORY_COLUMNS} \
                      FROM chat_history \
                      WHERE user_name = ?1 AND workspace = ?2 \
-                       AND (?3 IS NULL OR id < ?3) \
                      ORDER BY id DESC \
-                     LIMIT ?4",
+                     LIMIT ?3",
                 ),
-                db::params![user_name, workspace, before_id, query_limit],
+                db::params![user_name, workspace, cap],
             )
             .await?;
-        rows_to_page(rows)
-    }
-
-    /// Load the most recent page of one conversation (a user in one
-    /// workspace). Entries are in chronological order (oldest first);
-    /// `has_more` is true when older entries exist beyond the loaded window.
-    pub async fn load_recent(
-        &self,
-        user_name: &str,
-        workspace: &str,
-    ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        self.load_page(user_name, workspace, None).await
-    }
-
-    /// Load the page of one conversation older than `before_id`. Entries are
-    /// in chronological order (oldest first); `has_more` is true when even
-    /// older entries exist beyond the loaded window.
-    pub async fn load_older(
-        &self,
-        user_name: &str,
-        workspace: &str,
-        before_id: i64,
-    ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        self.load_page(user_name, workspace, Some(before_id)).await
+        rows_to_entries(rows)
     }
 
     /// Insert a divider marker row into chat history to indicate where a
@@ -216,6 +265,70 @@ impl ChatHistoryStore {
     }
 }
 
+/// Remove the messages every conversation in `store` holds past the cap — the
+/// repair half, for conversations nothing is being written to: records written
+/// before the cap, and what a store brought up from an older copy carries.
+/// Returns how many were removed; an error means the sweep could not complete,
+/// which the next one takes up again. Each removal is one bounded statement, so
+/// a conversation over the cap by more than one batch is taken in several, and
+/// a removal that fails is traced where it ran and left to the next sweep.
+async fn trim_over_cap_conversations(store: &ChatHistoryStore) -> Result<u64> {
+    let rows = store
+        .conn
+        .query(
+            "SELECT DISTINCT user_name, workspace FROM chat_history",
+            db::params![],
+        )
+        .await?;
+    let mut removed = 0;
+    for row in rows {
+        let user_name: String = row.get(0)?;
+        let workspace: String = row.get(1)?;
+        let before = removed;
+        loop {
+            match store.trim_conversation(&user_name, &workspace).await {
+                Ok(n) => {
+                    removed += n;
+                    if n < TRIM_BATCH {
+                        break;
+                    }
+                }
+                // Traced where the statement ran: this sweep gives up on the
+                // conversation, and the next one — or the next message written
+                // to it — takes the removal up again.
+                Err(_) => break,
+            }
+            // Only a saturated statement is worth a pause: the conversation has
+            // more than one batch to lose, and the rest can wait.
+            if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_PAUSE).await {
+                return Ok(removed);
+            }
+        }
+        // The pause between conversations follows work only, so a sweep over
+        // conversations already within the cap costs the statements alone.
+        if removed > before && !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_PAUSE).await {
+            return Ok(removed);
+        }
+    }
+    Ok(removed)
+}
+
+/// Background loop: hold the cap of every conversation the store holds — one
+/// sweep per [`SWEEP_INTERVAL`], and one straight away, so a launch repairs
+/// what the last one did not finish and what the store carried in.
+pub async fn run_cap_loop() {
+    loop {
+        match trim_over_cap_conversations(store()).await {
+            Ok(0) => debug!("Chat history cap: every conversation is within it"),
+            Ok(removed) => debug!(removed, "Chat history cap: removed messages past it"),
+            Err(e) => warn!("Chat history cap: the sweep did not complete: {e}"),
+        }
+        if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_INTERVAL).await {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +337,54 @@ mod tests {
 
     async fn test_setup() -> (ChatHistoryStore, TempDir) {
         crate::open_test_store!(ChatHistoryStore, "chat_history")
+    }
+
+    async fn insert_message(store: &ChatHistoryStore, user: &str, ws: &str, message_id: &str) {
+        store
+            .insert(&ChatHistoryInsert {
+                message_id: message_id.to_string(),
+                user_name: user.to_string(),
+                direction: "user".to_string(),
+                content: message_id.to_string(),
+                agent_role: None,
+                broadcast_id: None,
+                workspace: ws.to_string(),
+                timestamp: None,
+                reply_reference: None,
+            })
+            .await
+            .expect("insert should succeed");
+    }
+
+    /// What the store holds for one conversation, as the read hands it over.
+    async fn kept(store: &ChatHistoryStore, user: &str, ws: &str) -> Vec<ChatHistoryEntry> {
+        store
+            .load_conversation(user, ws)
+            .await
+            .expect("load should succeed")
+    }
+
+    async fn contents(store: &ChatHistoryStore, user: &str, ws: &str) -> Vec<String> {
+        kept(store, user, ws)
+            .await
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect()
+    }
+
+    /// How many rows the store holds for one conversation — the stored count,
+    /// which the read alone could hide.
+    async fn rows(store: &ChatHistoryStore, user: &str, ws: &str) -> usize {
+        let stored: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_history WHERE user_name = ?1 AND workspace = ?2",
+                db::params![user, ws],
+                |row| row.get::<i64>(0),
+            )
+            .await
+            .expect("count should succeed");
+        usize::try_from(stored).expect("a row count fits in usize")
     }
 
     #[tokio::test]
@@ -242,27 +403,10 @@ mod tests {
         assert!(rows.is_empty(), "agent_id should not exist in fresh schema");
 
         // Verify basic insert and load work.
-        store
-            .insert(&ChatHistoryInsert {
-                message_id: "msg-1".to_string(),
-                user_name: "user".to_string(),
-                direction: "user".to_string(),
-                content: "hello".to_string(),
-                agent_role: None,
-                broadcast_id: None,
-                workspace: "ws".to_string(),
-                timestamp: None,
-                reply_reference: None,
-            })
-            .await
-            .expect("insert should succeed");
-        let (history, has_more) = store
-            .load_recent("user", "ws")
-            .await
-            .expect("load should succeed");
+        insert_message(&store, "user", "ws", "msg-1").await;
+        let history = kept(&store, "user", "ws").await;
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "hello");
-        assert!(!has_more);
+        assert_eq!(history[0].content, "msg-1");
     }
 
     #[tokio::test]
@@ -276,14 +420,10 @@ mod tests {
             .expect("insert_divider should succeed");
 
         // Load history for the same user+workspace.
-        let (history, has_more) = store
-            .load_recent("alice", "ws1")
-            .await
-            .expect("load should succeed");
+        let history = kept(&store, "alice", "ws1").await;
 
         // Should have exactly one entry: the divider.
         assert_eq!(history.len(), 1, "should have exactly one divider entry");
-        assert!(!has_more, "no more entries beyond the divider");
 
         let entry = &history[0];
 
@@ -312,22 +452,14 @@ mod tests {
         );
 
         // Verify the divider is *not* present in another user's history.
-        let (other_history, _) = store
-            .load_recent("bob", "ws1")
-            .await
-            .expect("other user load should succeed");
         assert!(
-            other_history.is_empty(),
+            kept(&store, "bob", "ws1").await.is_empty(),
             "divider inserted for alice should not appear in bob's history"
         );
 
         // Verify the divider is *not* present in another workspace's history.
-        let (other_ws_history, _) = store
-            .load_recent("alice", "ws2")
-            .await
-            .expect("other workspace load should succeed");
         assert!(
-            other_ws_history.is_empty(),
+            kept(&store, "alice", "ws2").await.is_empty(),
             "divider inserted for ws1 should not appear in ws2's history"
         );
     }
@@ -346,14 +478,10 @@ mod tests {
             .await
             .expect("second divider should succeed");
 
-        let (history, has_more) = store
-            .load_recent("alice", "ws1")
-            .await
-            .expect("load should succeed");
+        let history = kept(&store, "alice", "ws1").await;
 
         // Both dividers should be present.
         assert_eq!(history.len(), 2, "should have two dividers");
-        assert!(!has_more);
         assert_eq!(history[0].direction, ChatDirection::Divider);
         assert_eq!(history[1].direction, ChatDirection::Divider);
 
@@ -369,20 +497,7 @@ mod tests {
         let (store, _tmp) = test_setup().await;
 
         // Insert a regular user message first.
-        store
-            .insert(&ChatHistoryInsert {
-                message_id: "msg-1".to_string(),
-                user_name: "alice".to_string(),
-                direction: "user".to_string(),
-                content: "hello".to_string(),
-                agent_role: None,
-                broadcast_id: None,
-                workspace: "ws1".to_string(),
-                timestamp: None,
-                reply_reference: None,
-            })
-            .await
-            .expect("insert should succeed");
+        insert_message(&store, "alice", "ws1", "msg-1").await;
 
         // Insert a divider.
         store
@@ -391,111 +506,153 @@ mod tests {
             .expect("insert_divider should succeed");
 
         // Insert another message after the divider.
-        store
-            .insert(&ChatHistoryInsert {
-                message_id: "msg-2".to_string(),
-                user_name: "alice".to_string(),
-                direction: "user".to_string(),
-                content: "world".to_string(),
-                agent_role: None,
-                broadcast_id: None,
-                workspace: "ws1".to_string(),
-                timestamp: None,
-                reply_reference: None,
-            })
-            .await
-            .expect("insert should succeed");
+        insert_message(&store, "alice", "ws1", "msg-2").await;
 
         // Load all three.
-        let (history, has_more) = store
-            .load_recent("alice", "ws1")
-            .await
-            .expect("load should succeed");
+        let history = kept(&store, "alice", "ws1").await;
 
-        // Load limit is 100, all three should fit.
         assert_eq!(history.len(), 3, "should have all three entries");
-        assert!(!has_more);
 
         // Chronological order (oldest first).
         assert_eq!(history[0].direction, ChatDirection::User);
-        assert_eq!(history[0].content, "hello");
+        assert_eq!(history[0].content, "msg-1");
 
         assert_eq!(history[1].direction, ChatDirection::Divider);
 
         assert_eq!(history[2].direction, ChatDirection::User);
-        assert_eq!(history[2].content, "world");
+        assert_eq!(history[2].content, "msg-2");
     }
 
+    /// The cap is held where a message is written: the row that pushes a
+    /// conversation over it is the one that takes the removal, and what goes is
+    /// the oldest row — a session-reset divider counts toward the cap like any
+    /// other row of the conversation, and no other conversation is touched.
     #[tokio::test]
-    async fn test_load_older_paginates_in_one_conversation() {
+    async fn a_conversation_keeps_only_its_newest_messages() {
+        const WS: &str = "personal:alice";
         let (store, _tmp) = test_setup().await;
 
-        // 6 messages in the conversation's own workspace.
-        for i in 0..6 {
-            store
-                .insert(&ChatHistoryInsert {
-                    message_id: format!("msg-{i}"),
-                    user_name: "alice".to_string(),
-                    direction: "user".to_string(),
-                    content: format!("c{i}"),
-                    agent_role: None,
-                    broadcast_id: None,
-                    workspace: "personal:alice".to_string(),
-                    timestamp: None,
-                    reply_reference: None,
-                })
-                .await
-                .expect("insert should succeed");
+        for i in 0..CHAT_HISTORY_CAP {
+            insert_message(&store, "alice", WS, &format!("msg-{i}")).await;
         }
+        // Nothing is over the cap yet, so the last write took nothing.
+        assert_eq!(rows(&store, "alice", WS).await, CHAT_HISTORY_CAP);
 
-        // Noise that must never leak into the conversation read: the same user
-        // in another workspace, and another user in the conversation's workspace.
-        for (message_id, user, ws) in [
-            ("noise-0", "alice", "project"),
-            ("noise-1", "alice", "project"),
-            ("noise-2", "bob", "personal:alice"),
-        ] {
+        // The same user in another workspace, and another user in this one —
+        // neither is the conversation being capped.
+        insert_message(&store, "alice", "project", "other-workspace").await;
+        insert_message(&store, "bob", WS, "other-user").await;
+
+        // The divider is the newest row and counts toward the cap: writing it is
+        // what takes the oldest message.
+        store
+            .insert_divider("alice", WS)
+            .await
+            .expect("insert_divider should succeed");
+
+        let history = kept(&store, "alice", WS).await;
+        assert_eq!(history.len(), CHAT_HISTORY_CAP);
+        assert_eq!(history[0].content, "msg-1");
+        assert_eq!(history[0].direction, ChatDirection::User);
+        assert_eq!(
+            history[CHAT_HISTORY_CAP - 1].direction,
+            ChatDirection::Divider
+        );
+        assert_eq!(rows(&store, "alice", WS).await, CHAT_HISTORY_CAP);
+
+        assert_eq!(
+            contents(&store, "alice", "project").await,
+            ["other-workspace"]
+        );
+        assert_eq!(contents(&store, "bob", WS).await, ["other-user"]);
+    }
+
+    /// Seed `count` rows straight into the table for one conversation — the way
+    /// the rows of a store that never had the cap were written, bypassing the
+    /// write entry and its removal.
+    async fn seed_rows(store: &ChatHistoryStore, ws: &str, count: usize) {
+        for i in 0..count {
             store
-                .insert(&ChatHistoryInsert {
-                    message_id: message_id.to_string(),
-                    user_name: user.to_string(),
-                    direction: "user".to_string(),
-                    content: message_id.to_string(),
-                    agent_role: None,
-                    broadcast_id: None,
-                    workspace: ws.to_string(),
-                    timestamp: None,
-                    reply_reference: None,
-                })
+                .conn
+                .execute(
+                    "INSERT INTO chat_history (message_id, user_name, direction, content, workspace) \
+                     VALUES (?1, 'alice', 'user', ?1, ?2)",
+                    db::params![format!("msg-{i}"), ws],
+                )
                 .await
-                .expect("insert should succeed");
+                .expect("seed should succeed");
         }
+    }
 
-        let (history, has_more) = store
-            .load_recent("alice", "personal:alice")
-            .await
-            .expect("load should succeed");
-        assert_eq!(history.len(), 6);
-        assert!(!has_more);
-        let contents: Vec<&str> = history.iter().map(|e| e.content.as_str()).collect();
-        assert_eq!(contents, ["c0", "c1", "c2", "c3", "c4", "c5"]);
-        let oldest_id = history[0].id;
+    /// The repair half: a store that already holds more than the cap — rows
+    /// written before it existed, or carried in by a copy restored from an older
+    /// one — is brought within the cap by the sweep alone, with no write needed.
+    #[tokio::test]
+    async fn the_sweep_removes_what_a_store_already_holds() {
+        const WS: &str = "personal:alice";
+        const OVER: usize = 5;
+        let (store, _tmp) = test_setup().await;
 
-        // Load older than the oldest id — nothing left in the conversation.
-        let (older, has_more_older) = store
-            .load_older("alice", "personal:alice", oldest_id)
-            .await
-            .expect("load older should succeed");
-        assert!(older.is_empty());
-        assert!(!has_more_older);
+        seed_rows(&store, WS, CHAT_HISTORY_CAP + OVER).await;
+        assert_eq!(rows(&store, "alice", WS).await, CHAT_HISTORY_CAP + OVER);
+        // The read alone would mask it: the rows are stored and the sweep has
+        // not run.
+        assert_eq!(contents(&store, "alice", WS).await.len(), CHAT_HISTORY_CAP);
 
-        // Loading older than the 4th message returns the 3 older ones.
-        let (older, _) = store
-            .load_older("alice", "personal:alice", history[3].id)
-            .await
-            .expect("load older should succeed");
-        let contents: Vec<&str> = older.iter().map(|e| e.content.as_str()).collect();
-        assert_eq!(contents, ["c0", "c1", "c2"]);
+        assert_eq!(
+            trim_over_cap_conversations(&store)
+                .await
+                .expect("the sweep should complete"),
+            OVER as u64,
+            "exactly the messages past the cap go"
+        );
+        assert_eq!(rows(&store, "alice", WS).await, CHAT_HISTORY_CAP);
+        let history = kept(&store, "alice", WS).await;
+        assert_eq!(history[0].content, format!("msg-{OVER}"));
+        assert_eq!(
+            history[CHAT_HISTORY_CAP - 1].content,
+            format!("msg-{}", CHAT_HISTORY_CAP + OVER - 1)
+        );
+
+        // A second sweep finds nothing left to repair.
+        assert_eq!(
+            trim_over_cap_conversations(&store)
+                .await
+                .expect("the sweep should complete"),
+            0
+        );
+    }
+
+    /// One removal statement takes at most [`TRIM_BATCH`] messages, so a
+    /// conversation far past the cap is brought down over several of them: what
+    /// one write's own removal leaves, the sweep's rounds carry to completion.
+    #[tokio::test]
+    async fn a_backlog_past_one_statement_goes_over_several() {
+        const WS: &str = "personal:alice";
+        const OVER: usize = 1_500;
+        let (store, _tmp) = test_setup().await;
+
+        seed_rows(&store, WS, CHAT_HISTORY_CAP + OVER).await;
+
+        // One statement's worth — what a single write to the conversation takes.
+        assert_eq!(
+            store.trim_conversation("alice", WS).await.unwrap(),
+            TRIM_BATCH
+        );
+        assert_eq!(
+            rows(&store, "alice", WS).await,
+            CHAT_HISTORY_CAP + OVER - usize::try_from(TRIM_BATCH).unwrap()
+        );
+
+        // The sweep keeps taking batches until the conversation is within the
+        // cap, whatever the backlog was.
+        assert_eq!(
+            trim_over_cap_conversations(&store)
+                .await
+                .expect("the sweep should complete"),
+            OVER as u64 - TRIM_BATCH
+        );
+        assert_eq!(rows(&store, "alice", WS).await, CHAT_HISTORY_CAP);
     }
 
     #[tokio::test]
@@ -520,10 +677,7 @@ mod tests {
             .await
             .expect("insert should succeed");
 
-        let (history, _) = store
-            .load_recent("alice", "ws1")
-            .await
-            .expect("load should succeed");
+        let history = kept(&store, "alice", "ws1").await;
         assert_eq!(history.len(), 1);
         let reply = history[0]
             .reply_reference
