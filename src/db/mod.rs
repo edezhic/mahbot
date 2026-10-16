@@ -21,6 +21,7 @@ pub mod debug;
 pub(crate) mod failure_record;
 pub mod ipc;
 pub(crate) mod migrations;
+pub(crate) mod read_limit;
 pub(crate) mod shrink_gate;
 pub(crate) mod store;
 #[cfg(all(unix, test))]

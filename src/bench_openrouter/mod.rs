@@ -188,8 +188,14 @@ fn parse_ladder(s: &str) -> Result<Vec<u64>, CliError> {
 impl BenchOptions {
     /// Parse `bench-openrouter` CLI arguments (no clap — manual, mirroring the
     /// debug subcommand's style). Both `--flag value` and `--flag=value` are
-    /// accepted.
-    pub(crate) fn parse(args: &[String]) -> Result<Self, CliError> {
+    /// accepted. The model lookup below is this subcommand's first store read, so
+    /// it runs under `budget` — the command's one read clock
+    /// ([`crate::db::read_limit`]), which the caller started and also hands to the
+    /// later key lookup.
+    pub(crate) fn parse(
+        args: &[String],
+        budget: &crate::db::read_limit::Budget,
+    ) -> Result<Self, CliError> {
         let mut model: Option<String> = None;
         let mut api_key: Option<String> = None;
         let mut cap_usd = 2.00;
@@ -259,39 +265,21 @@ impl BenchOptions {
             i += 1;
         }
 
-        // Model resolution: --model > env > read-only config store > default.
-        let model = match model {
-            Some(m) => m,
-            None => model_from_env_or_config(),
-        };
-
-        // Output dir: `--output-dir` is an exact override (e.g. a second run
-        // of the same model with a restricted --providers allowlist targets
-        // its own directory). When omitted, the default is per model —
-        // ~/.mahbot/benchmarks/<model-slug>/ — so parallel runs of different
-        // models write separate folders and never contend for the output lock.
-        let output_dir = if let Some(d) = output_dir {
-            d
-        } else {
-            let slug = model_slug(&model);
-            // The slug is a name the product builds for itself, so it must be a
-            // folder name every platform can create before it is used as one.
-            if let Some(problem) = crate::util::folder_name::folder_name_problem(&slug) {
-                return Err(CliError::Usage(format!(
-                    "model '{model}' gives the benchmark folder name '{slug}', which cannot be a \
-                     folder name on every platform this runs on — {problem}"
-                )));
-            }
-            let root = crate::config::default_config_dir()
-                .map_err(|e| CliError::Hard(format!("cannot resolve config dir: {e:#}")))?;
-            root.join("benchmarks").join(slug)
-        };
-
+        // Flag values are validated BEFORE anything is read: the model resolution
+        // below can read the config store (through a running instance), and a
+        // usage error must not wait out a read to say so.
         if !cap_usd.is_finite() || cap_usd <= 0.0 {
             return Err(CliError::Usage(
                 "--cap-usd must be a positive number".to_string(),
             ));
         }
+
+        // Model resolution: --model > env > read-only config store > default.
+        let model = match model {
+            Some(m) => m,
+            None => model_from_env_or_config(budget),
+        };
+        let output_dir = resolve_output_dir(&model, output_dir)?;
 
         Ok(Self {
             model,
@@ -306,10 +294,33 @@ impl BenchOptions {
     }
 }
 
+/// Resolve the output directory: `--output-dir` is an exact override (e.g. a
+/// second run of the same model with a restricted `--providers` allowlist
+/// targets its own directory). When omitted the default is per model —
+/// `~/.mahbot/benchmarks/<model-slug>/` — so parallel runs of different models
+/// write separate folders and never contend for the output lock.
+fn resolve_output_dir(model: &str, output_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    if let Some(dir) = output_dir {
+        return Ok(dir);
+    }
+    let slug = model_slug(model);
+    // The slug is a name the product builds for itself, so it must be a folder
+    // name every platform can create before it is used as one.
+    if let Some(problem) = crate::util::folder_name::folder_name_problem(&slug) {
+        return Err(CliError::Usage(format!(
+            "model '{model}' gives the benchmark folder name '{slug}', which cannot be a folder \
+             name on every platform this runs on — {problem}"
+        )));
+    }
+    let root = crate::config::default_config_dir()
+        .map_err(|e| CliError::Hard(format!("cannot resolve config dir: {e:#}")))?;
+    Ok(root.join("benchmarks").join(slug))
+}
+
 /// Resolve the benchmark model when `--model` was not given:
 /// env `MAHBOT_BENCH_MODEL` > read-only config-store `worker_model` >
 /// [`crate::config::DEFAULT_WORKER_MODEL`]. Never fails.
-fn model_from_env_or_config() -> String {
+fn model_from_env_or_config(budget: &crate::db::read_limit::Budget) -> String {
     if let Ok(m) = std::env::var("MAHBOT_BENCH_MODEL")
         && !m.is_empty()
     {
@@ -318,6 +329,7 @@ fn model_from_env_or_config() -> String {
     if let Ok(root) = crate::config::default_config_dir()
         && let Some(m) = read_config_kv(
             &root,
+            budget,
             "worker_model",
             &format!(
                 "the default worker model ({})",
@@ -334,7 +346,10 @@ fn model_from_env_or_config() -> String {
 /// Resolve the API key: `--api-key` > env `MAHBOT_BENCH_API_KEY` >
 /// env `OPENROUTER_API_KEY` > read-only config-store `provider_key` > hard error.
 /// Returns the key and its source label for the plan.
-fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> {
+fn resolve_key(
+    opts: &BenchOptions,
+    budget: &crate::db::read_limit::Budget,
+) -> Result<(String, &'static str), CliError> {
     if let Some(k) = &opts.api_key
         && !k.is_empty()
     {
@@ -351,7 +366,7 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
         return Ok((k, "env"));
     }
     if let Ok(root) = crate::config::default_config_dir()
-        && let Some(k) = read_config_kv(&root, "provider_key", "no usable API key")
+        && let Some(k) = read_config_kv(&root, budget, "provider_key", "no usable API key")
         && !k.is_empty()
     {
         return Ok((k, "config"));
@@ -380,8 +395,13 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
 /// subcommand's log is not live this early, so the failure and the `fallback`
 /// the caller continues on go to stderr. A not-yet-created config store is
 /// `Ok(None)`, i.e. not a failure.
-fn read_config_kv(storage_root: &Path, key: &str, fallback: &str) -> Option<String> {
-    match read_config_kv_inner(storage_root, key) {
+fn read_config_kv(
+    storage_root: &Path,
+    budget: &crate::db::read_limit::Budget,
+    key: &str,
+    fallback: &str,
+) -> Option<String> {
+    match read_config_kv_inner(storage_root, budget, key) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
@@ -393,7 +413,11 @@ fn read_config_kv(storage_root: &Path, key: &str, fallback: &str) -> Option<Stri
     }
 }
 
-fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option<String>> {
+fn read_config_kv_inner(
+    storage_root: &Path,
+    budget: &crate::db::read_limit::Budget,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
     // In the consolidated layout the config store lives in the single domain
     // database; a not-yet-created consolidated file means no config store yet.
     let db_path = crate::db::store_db_path(storage_root, "config");
@@ -403,13 +427,17 @@ fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option
     // Routing, and why it is fail-closed, is in the caller's doc.
     match crate::util::lock::instance_lock_state_settled(storage_root) {
         InstanceLockState::Held => {
+            // The process-ending half of the read limit, armed for the whole
+            // exchange — the channel client itself carries no watchdog.
+            let read = crate::db::read_limit::Read::over_channel("config", budget);
+            let _watchdog = read.arm()?;
             let req = crate::db::ipc::IpcRequest {
                 store: "core".to_string(),
                 sql: "SELECT value FROM config_kv WHERE key = ?1".to_string(),
                 params: vec![crate::db::ipc::WireValue::Text(key.to_string())],
                 call: None,
             };
-            let resp = crate::db::ipc::ipc_query_sync(storage_root, &req)?;
+            let resp = crate::db::ipc::ipc_query_sync(storage_root, &req, read)?;
             if let Some(err) = &resp.error {
                 bail!("the instance's channel reported a query error: {err}");
             }
@@ -419,7 +447,7 @@ fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option
             });
             Ok(value.filter(|v| !v.is_empty()))
         }
-        InstanceLockState::Free => read_config_kv_file(&db_path, key),
+        InstanceLockState::Free => read_config_kv_file(&db_path, budget, key),
         InstanceLockState::Unknown(e) => {
             bail!(
                 "{}",
@@ -429,13 +457,34 @@ fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option
     }
 }
 
-fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<String>> {
-    // Callers guarantee `db_path` exists (see `read_config_kv_inner`), so this
-    // does not re-check — a missing file degrades to `Ok(None)` there.
+/// Read one `config_kv` value directly from a store file. Callers guarantee
+/// `db_path` exists (see [`read_config_kv_inner`]), so this does not re-check — a
+/// missing file degrades to `Ok(None)` there.
+fn read_config_kv_file(
+    db_path: &Path,
+    budget: &crate::db::read_limit::Budget,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    let read = crate::db::read_limit::Read::direct("config", budget);
+    let _watchdog = read.arm()?;
     let opts = crate::db::experimental_database_opts();
     let (io, db) = crate::db::debug::open_readonly(db_path, opts)?;
     let conn = crate::db::debug::connect_readonly(&db, db_path)?;
+    read_config_value(&conn, &io, key, read)
+}
 
+/// Step one `config_kv` lookup to its end under the command's read limit, asking
+/// the budget as every step comes back — so neither a row nor a "no such key" is
+/// reported past the limit. The first step is kept off a spent budget by the
+/// caller's [`crate::db::read_limit::Read::arm`]. Kept apart from the open so a
+/// check can drive this loop against a store it built itself, with a budget it
+/// spent itself — a lookup this cheap cannot be made to cross a limit by waiting.
+fn read_config_value(
+    conn: &std::sync::Arc<turso::core::Connection>,
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    key: &str,
+    read: crate::db::read_limit::Read<'_>,
+) -> anyhow::Result<Option<String>> {
     let mut stmt = conn
         .query("SELECT value FROM config_kv WHERE key = ?1")
         .map_err(|e| anyhow::anyhow!("config read query failed: {e}"))?
@@ -446,8 +495,12 @@ fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<Strin
     )?;
 
     loop {
-        match stmt.step() {
-            Ok(turso::core::StepResult::Row) => {
+        let step = stmt
+            .step()
+            .map_err(|e| anyhow::anyhow!("config read query failed: {e}"))?;
+        read.check()?;
+        match step {
+            turso::core::StepResult::Row => {
                 let row = stmt
                     .row()
                     .ok_or_else(|| anyhow::anyhow!("row missing after StepResult::Row"))?;
@@ -457,22 +510,19 @@ fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<Strin
                     _ => None,
                 });
             }
-            Ok(turso::core::StepResult::Done) => return Ok(None),
-            Ok(
-                turso::core::StepResult::IO
-                | turso::core::StepResult::Yield
-                | turso::core::StepResult::Sleep { .. },
-            ) => {
+            turso::core::StepResult::Done => return Ok(None),
+            turso::core::StepResult::IO
+            | turso::core::StepResult::Yield
+            | turso::core::StepResult::Sleep { .. } => {
                 io.step()
                     .map_err(|e| anyhow::anyhow!("config read I/O step failed: {e}"))?;
             }
-            Ok(turso::core::StepResult::Interrupt) => {
+            turso::core::StepResult::Interrupt => {
                 bail!("{}", crate::db::store::too_heavy_message());
             }
-            Ok(turso::core::StepResult::Busy) => {
+            turso::core::StepResult::Busy => {
                 bail!("config store busy; try again later");
             }
-            Err(e) => bail!("config read query failed: {e}"),
         }
     }
 }
@@ -494,21 +544,30 @@ pub async fn run_cli() -> i32 {
         return 0;
     }
 
-    let opts = match BenchOptions::parse(&args) {
+    // The command's own read clock ([`crate::db::read_limit`]), started where the
+    // command starts reading and spent by both config lookups — the model
+    // resolution inside `parse` and the key resolution in the preamble.
+    let budget = crate::db::read_limit::Budget::start();
+    let opts = match BenchOptions::parse(&args, &budget) {
         Ok(o) => o,
         Err(e) => return cli_error_exit(e),
     };
 
     if opts.dry_run {
-        dry_run(&opts).await
+        dry_run(&opts, &budget).await
     } else {
-        full_run(&opts).await
+        full_run(&opts, &budget).await
     }
 }
 
-/// Usage text shared by `--help` (stdout) and usage errors (stderr).
-fn usage() -> &'static str {
-    "\
+/// Usage text shared by `--help` (stdout) and usage errors (stderr). Built rather
+/// than a constant so the read-limit knob is printed from its own name
+/// ([`crate::db::read_limit::ENV`]), which cannot then drift from the knob it
+/// bounds the config reads by.
+fn usage() -> String {
+    let knob = crate::db::read_limit::ENV;
+    format!(
+        "\
 mahbot bench-openrouter — OpenRouter provider benchmark
 
 Usage:
@@ -545,6 +604,13 @@ Flags:
                          directory.
   -h, --help             Print this help and exit.
 
+Config-store reads:
+  The --model and --api-key fallbacks above read the config store directly, or
+  through a running instance's debug channel. Both are bounded per command by
+  {knob} (the same limit `mahbot debug` reads under): a read that fails, or that
+  is still running when the limit passes, is reported and the run continues on
+  its fallback — a read that never returns ends this command at the limit.
+
 Exit codes:
   0  Success. In a full run, the artifacts (report.json / summary.md /
      providers.json / manifest.json) are complete; each provider's result is
@@ -561,6 +627,7 @@ as '***' in manifest.json; providers.json marks the key payload redacted.
 Not implemented (design-only): --from-plan, --max-gap-min, --all-endpoints,
 the streaming probe, and the /generation audit.
 "
+    )
 }
 
 // ── Shared helpers (dry-run + full-run) ────────────────────────────
@@ -660,8 +727,11 @@ struct RunPreamble {
 /// Shared preamble for both modes: key resolution → discovery → model config
 /// → selection → affordability preflight. Returns a hard/usage error the
 /// callers turn into an exit code.
-async fn run_preamble(opts: &BenchOptions) -> Result<RunPreamble, CliError> {
-    let (key, key_source) = resolve_key(opts)?;
+async fn run_preamble(
+    opts: &BenchOptions,
+    budget: &crate::db::read_limit::Budget,
+) -> Result<RunPreamble, CliError> {
+    let (key, key_source) = resolve_key(opts, budget)?;
     let client = DiscoveryClient::new(key.clone());
     let snapshot = discover(&client, &opts.model)
         .await
@@ -718,10 +788,10 @@ fn affordability_preflight(snapshot: &DiscoverySnapshot, total_est: f64) -> Opti
 
 /// Discovery → selection → plan JSON to stdout. Never makes a chat-completions
 /// call. Prints nothing secret (the resolved API key is never echoed).
-async fn dry_run(opts: &BenchOptions) -> i32 {
+async fn dry_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -> i32 {
     // 1-4. Shared preamble: key → discovery → model config → selection →
     //      affordability preflight.
-    let preamble = match run_preamble(opts).await {
+    let preamble = match run_preamble(opts, budget).await {
         Ok(p) => p,
         Err(e) => return cli_error_exit(e),
     };
@@ -768,14 +838,14 @@ async fn dry_run(opts: &BenchOptions) -> i32 {
 // One long sequential orchestration (steps 1-15); splitting it
 // would obscure the step ordering.
 #[expect(clippy::too_many_lines)]
-async fn full_run(opts: &BenchOptions) -> i32 {
+async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -> i32 {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     // 1-4. Shared preamble: key → discovery → model config → selection →
     //      affordability preflight.
-    let preamble = match run_preamble(opts).await {
+    let preamble = match run_preamble(opts, budget).await {
         Ok(p) => p,
         Err(e) => return cli_error_exit(e),
     };
@@ -1170,6 +1240,70 @@ pub(crate) fn bench_system_prompt() -> String {
 mod tests {
     use super::*;
 
+    /// The read limit's verdict covers a step that yields NOTHING as well as one
+    /// that yields a row: with the budget spent, a lookup of an absent key is the
+    /// limit's failure — never "no key configured", which is what a check asked
+    /// only on the row path would report. The budget is spent rather than reached
+    /// because this lookup is a key probe on a store the test built: it cannot be
+    /// made to cross a limit by waiting, and the check under test is the same one
+    /// either way.
+    ///
+    /// The direct route's own arm and open are pinned by
+    /// `the_direct_config_read_is_bounded_by_the_read_limit`; the channel half of
+    /// the route (an instance holding the location) runs through the same bounded
+    /// client the debug tests exercise.
+    #[tokio::test]
+    #[serial_test::serial(read_limit)]
+    async fn a_spent_budget_fails_the_config_reads_no_row_path() {
+        let _env = crate::util::test::set_env_var(crate::db::read_limit::ENV, Some("0"));
+        let (store, dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        // The read-only open below is a second opener of this file: close the
+        // fixture's own connection first. The schema is created but no key is set,
+        // so the lookup ends on an empty result (the no-row path).
+        drop(store);
+        let db_path = crate::db::store_db_path(dir.path(), "config");
+        let (io, db) =
+            crate::db::debug::open_readonly(&db_path, crate::db::experimental_database_opts())
+                .expect("open the fixture config store");
+        let conn =
+            crate::db::debug::connect_readonly(&db, &db_path).expect("connect to the fixture");
+        let budget = crate::db::read_limit::Budget::start();
+        let read = crate::db::read_limit::Read::direct("config", &budget);
+        let err = read_config_value(&conn, &io, "provider_key", read)
+            .expect_err("a spent budget must fail the config read, row or no row");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'config'"),
+            "the failure names the target: {msg}"
+        );
+        assert!(
+            msg.contains("0s read limit"),
+            "the failure names the limit: {msg}"
+        );
+    }
+
+    /// The direct config read fails at its own arm — with the budget spent it must
+    /// not even open the store, so a path holding no store at all still fails with
+    /// the limit's failure rather than an open error.
+    #[test]
+    #[serial_test::serial(read_limit)]
+    fn the_direct_config_read_is_bounded_by_the_read_limit() {
+        let _env = crate::util::test::set_env_var(crate::db::read_limit::ENV, Some("0"));
+        let dir = tempfile::TempDir::new().expect("temp dir for the config store");
+        let budget = crate::db::read_limit::Budget::start();
+        let err = read_config_kv_file(&dir.path().join("core.db"), &budget, "worker_model")
+            .expect_err("a spent budget must fail the config read");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'config'"),
+            "the failure names the target: {msg}"
+        );
+        assert!(
+            msg.contains("0s read limit"),
+            "the failure names the limit: {msg}"
+        );
+    }
+
     /// Synthetic discovery snapshot (no HTTP, no DBs).
     fn test_snapshot() -> DiscoverySnapshot {
         let models = serde_json::json!({"data": [{
@@ -1376,7 +1510,8 @@ mod tests {
             "/tmp/out".to_string(),
             "--dry-run".to_string(),
         ];
-        let opts = BenchOptions::parse(&args).expect("parse succeeds");
+        let budget = crate::db::read_limit::Budget::start();
+        let opts = BenchOptions::parse(&args, &budget).expect("parse succeeds");
         assert_eq!(opts.model, "acme/m1");
         assert_eq!(opts.api_key.as_deref(), Some("sk-or-x"));
         assert!((opts.cap_usd - 1.5).abs() < 1e-12);
@@ -1455,8 +1590,12 @@ mod tests {
     fn cli_default_output_dir_is_per_model() {
         // --output-dir omitted → the default derives the per-model folder
         // ~/.mahbot/benchmarks/<model-slug>/.
-        let opts = BenchOptions::parse(&["--model=acme/m1".to_string(), "--dry-run".to_string()])
-            .expect("parse succeeds");
+        let budget = crate::db::read_limit::Budget::start();
+        let opts = BenchOptions::parse(
+            &["--model=acme/m1".to_string(), "--dry-run".to_string()],
+            &budget,
+        )
+        .expect("parse succeeds");
         let root = crate::config::default_config_dir().expect("config dir resolves");
         assert_eq!(
             opts.output_dir,
@@ -1464,8 +1603,11 @@ mod tests {
         );
 
         // A different model gets a different default folder.
-        let other = BenchOptions::parse(&["--model=acme/m2".to_string(), "--dry-run".to_string()])
-            .expect("parse succeeds");
+        let other = BenchOptions::parse(
+            &["--model=acme/m2".to_string(), "--dry-run".to_string()],
+            &budget,
+        )
+        .expect("parse succeeds");
         assert_ne!(opts.output_dir, other.output_dir);
         assert!(opts.output_dir.ends_with(model_slug("acme/m1")));
         assert!(other.output_dir.ends_with(model_slug("acme/m2")));
@@ -1473,33 +1615,34 @@ mod tests {
 
     #[test]
     fn cli_parse_errors() {
+        let budget = crate::db::read_limit::Budget::start();
         // Unknown flag → Usage.
         assert!(matches!(
-            BenchOptions::parse(&["--bogus".to_string()]),
+            BenchOptions::parse(&["--bogus".to_string()], &budget),
             Err(CliError::Usage(_))
         ));
         // Missing value → Usage.
         assert!(matches!(
-            BenchOptions::parse(&["--model".to_string()]),
+            BenchOptions::parse(&["--model".to_string()], &budget),
             Err(CliError::Usage(_))
         ));
         // Bad numeric value → Usage.
         assert!(matches!(
-            BenchOptions::parse(&["--cap-usd".to_string(), "abc".to_string()]),
+            BenchOptions::parse(&["--cap-usd".to_string(), "abc".to_string()], &budget),
             Err(CliError::Usage(_))
         ));
         // Non-positive / non-finite caps → Usage.
         for v in ["0", "-1", "nan", "inf"] {
             assert!(
                 matches!(
-                    BenchOptions::parse(&["--cap-usd".to_string(), v.to_string()]),
+                    BenchOptions::parse(&["--cap-usd".to_string(), v.to_string()], &budget),
                     Err(CliError::Usage(_))
                 ),
                 "--cap-usd {v} must be rejected"
             );
         }
         assert!(matches!(
-            BenchOptions::parse(&["--ladder".to_string(), "0,x".to_string()]),
+            BenchOptions::parse(&["--ladder".to_string(), "0,x".to_string()], &budget),
             Err(CliError::Usage(_))
         ));
 
@@ -1508,7 +1651,7 @@ mod tests {
         for model in [".", "..", "NUL", "acme/."] {
             assert!(
                 matches!(
-                    BenchOptions::parse(&["--model".to_string(), model.to_string()]),
+                    BenchOptions::parse(&["--model".to_string(), model.to_string()], &budget),
                     Err(CliError::Usage(_))
                 ),
                 "--model {model} must be rejected: its benchmark folder name is unusable"

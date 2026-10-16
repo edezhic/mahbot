@@ -55,6 +55,13 @@
 //! an answer, extend [`CallReply`] — the payload is additive JSON, so neither
 //! the framing nor the compatibility rule above has to change for them.
 //!
+//! The two paths are bounded apart. A read-only query is bounded by
+//! [`crate::db::read_limit`]: one command-wide budget that covers the wait to
+//! reach the instance, the instance's answer and the retries alike, and whose
+//! own failure is what a read that ran out is reported with. The operation
+//! channel keeps its own window ([`ipc_bound_timeout`]) and its reply read is
+//! deliberately unbounded (above), so widening one never changes the other.
+//!
 //! The operation surface is the command line's own: a tool is served by name
 //! only when one of [`crate::cli`]'s families fronts it, so the channel can
 //! never reach the rest of the owner's toolset (see
@@ -82,6 +89,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Name};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -101,12 +109,16 @@ const IPC_SOCKET_FILE_NAME: &str = "mahbot-debug.sock";
 #[cfg(windows)]
 const IPC_PIPE_PREFIX: &str = r"\\.\pipe\mahbot-debug-";
 
-/// Bounds how long the client keeps retrying while an instance holds the lock
-/// but has not bound its listener yet (boot / self-update hand-off).
+/// Bounds the retry window of the command-line OPERATION channel
+/// (`mahbot config …`, `mahbot send …`) while an instance holds the lock but
+/// has not bound its listener yet (boot / self-update hand-off).
 ///
 /// Every failed attempt that did not reach the instance is retried while the
 /// window has time left — the window is not restricted to transport failures —
-/// and one that did reach it is never retried at all ([`AnswerTimeout`]).
+/// and an operation that reached the instance is never retried at all
+/// ([`ipc_call_with_wait`]). The read-only query paths answer to
+/// [`crate::db::read_limit`] instead — its own knob, so widening one never
+/// changes the other's responsiveness.
 const IPC_BOUND_TIMEOUT_SECS: u64 = 15;
 
 /// [`IPC_BOUND_TIMEOUT_SECS`], overridable with `MAHBOT_IPC_BOUND_TIMEOUT_SECS`
@@ -115,23 +127,6 @@ const IPC_BOUND_TIMEOUT_SECS: u64 = 15;
 /// waiting out the default.
 pub(crate) fn ipc_bound_timeout() -> std::time::Duration {
     crate::util::env_duration_secs("MAHBOT_IPC_BOUND_TIMEOUT_SECS", IPC_BOUND_TIMEOUT_SECS)
-}
-
-/// Extra patience, on top of the per-statement limit, for the instance to
-/// answer a debug query: a statement the limit terminates answers only when it
-/// is cut, so a client that wants that answer must wait past the limit — this is
-/// how far past.
-const IPC_ANSWER_MARGIN_SECS: u64 = 30;
-
-/// How long one attempt waits for its answer: this side's
-/// [`crate::db::store::statement_limit`] plus [`IPC_ANSWER_MARGIN_SECS`].
-///
-/// The limit is read from the env override the instance arms its own connections
-/// with ([`crate::db::store::STATEMENT_LIMIT_ENV`]), so one environment carrying
-/// it makes both sides agree on when a statement is cut. `saturating_add` keeps
-/// an absurd override (near `u64::MAX` seconds) from panicking the client.
-fn answer_patience() -> Duration {
-    crate::db::store::statement_limit().saturating_add(Duration::from_secs(IPC_ANSWER_MARGIN_SECS))
 }
 
 /// Retry backoff schedule (ms) for the IPC socket-not-yet-bound window.
@@ -627,61 +622,70 @@ pub async fn run_ipc_listener(
     }
 }
 
-/// The instance took this client's query and did not answer it inside
-/// [`answer_patience`].
+/// One attempt at a read-only query, in the shape the retry loop can act on.
 ///
-/// This is not a transport failure and must not be reported as one: the channel
-/// was reached and the instance may still be working on the query, whose answer
-/// comes only once the instance's own per-statement limit cuts the statement.
-/// The wait follows THIS side's limit, so the two sides end up here when they
-/// read different `MAHBOT_STORE_STATEMENT_LIMIT_SECS` overrides and the
-/// instance's is the larger one.
-#[derive(Debug)]
-struct AnswerTimeout;
-
-impl std::fmt::Display for AnswerTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the instance did not answer within {}s: it is reachable and the query may still be \
-             running there, because a statement cut at the per-statement limit is answered only \
-             when it is cut — if the instance runs with a larger {} than this client, its answer \
-             comes later than this wait",
-            answer_patience().as_secs(),
-            crate::db::store::STATEMENT_LIMIT_ENV
-        )
-    }
+/// The distinction that matters is delivery: an attempt that never reached the
+/// instance sent nothing, so it is the only one worth sending again — resending
+/// one the instance took would run a second copy of the same work.
+enum Attempt {
+    /// The instance answered.
+    Answered(QueryResponse),
+    /// The connection was never established: nothing reached the instance.
+    NotDelivered(String),
+    /// The frame went out and no answer came back inside the wait.
+    NoAnswer,
+    /// The frame went out and the exchange broke before a decodable answer.
+    Broken(String),
 }
 
-impl std::error::Error for AnswerTimeout {}
-
-/// Client helper: connect to the instance's IPC socket and run a read-only query.
+/// One attempt: connect, send, and wait what is left of the command's budget for
+/// the answer.
 ///
-/// One attempt awaits its answer for [`answer_patience`]; only a failure that
-/// never reached the instance is worth a second copy of the query, so the wait
-/// running out is reported as [`AnswerTimeout`] and left alone.
-pub(crate) async fn ipc_query(
-    storage_root: &Path,
-    req: IpcRequest,
-) -> anyhow::Result<QueryResponse> {
-    let socket = socket_path(storage_root);
-    let name = socket
-        .as_path()
-        .to_fs_name::<GenericFilePath>()
-        .map_err(|e| anyhow::anyhow!("instance IPC endpoint not reachable: {e}"))?;
-
-    let result = tokio::time::timeout(answer_patience(), async {
-        let mut stream = LocalSocketStream::connect(name).await?;
-        let payload = serde_json::to_vec(&req)?;
+/// The connect is deliberately OUTSIDE the wait: a connection that is refused is
+/// "nothing was delivered" (retryable), which the timeout wrapper could not tell
+/// apart from an instance that took the query and went quiet. The wait is read
+/// AFTER the connect, so an attempt can never run past the budget by the
+/// connect's own duration.
+async fn ipc_query_once(
+    root: &Path,
+    req: &IpcRequest,
+    read: crate::db::read_limit::Read<'_>,
+) -> Attempt {
+    let socket = socket_path(root);
+    let name = match socket.as_path().to_fs_name::<GenericFilePath>() {
+        Ok(name) => name,
+        Err(e) => return Attempt::NotDelivered(e.to_string()),
+    };
+    let mut stream = match LocalSocketStream::connect(name).await {
+        Ok(stream) => stream,
+        Err(e) => return Attempt::NotDelivered(e.to_string()),
+    };
+    let payload = match serde_json::to_vec(req) {
+        Ok(payload) => payload,
+        Err(e) => return Attempt::Broken(e.to_string()),
+    };
+    // A budget spent while the connect ran cannot be waited on at all, and a
+    // zero wait is not an immediate failure for the timer below (its own first
+    // poll can let an answer through), so it is reported as the limit outright —
+    // as `NoAnswer`, because a connect succeeded and the query must not be sent
+    // again.
+    let wait = read.remaining();
+    if wait.is_zero() {
+        return Attempt::NoAnswer;
+    }
+    match tokio::time::timeout(wait, async {
         write_frame(&mut stream, &payload).await?;
-        let payload = read_frame(&mut stream).await?;
-        let resp: QueryResponse = serde_json::from_slice(&payload)?;
-        Ok::<QueryResponse, anyhow::Error>(resp)
+        let p = read_frame(&mut stream).await?;
+        Ok::<QueryResponse, anyhow::Error>(serde_json::from_slice(&p)?)
     })
     .await
-    .map_err(|_| anyhow::Error::new(AnswerTimeout))??;
-
-    Ok(result)
+    {
+        // A timeout that lands during the write is conservatively `NoAnswer`:
+        // nothing is resent after a possible delivery.
+        Err(_elapsed) => Attempt::NoAnswer,
+        Ok(Err(e)) => Attempt::Broken(format!("{e:#}")),
+        Ok(Ok(resp)) => Attempt::Answered(resp),
+    }
 }
 
 /// Backoff delay for retry `attempt` (0-based), clamped to the schedule.
@@ -702,6 +706,66 @@ fn channel_unreachable(socket: &Path) -> String {
     )
 }
 
+/// [`channel_unreachable`] with the transport's own error appended — the shape
+/// every terminal channel failure takes, whichever branch produced it.
+fn unreachable(socket: &Path, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!("{}: {detail}", channel_unreachable(socket))
+}
+
+/// The failure for a budget that is spent before another attempt can be made:
+/// while only never-delivered attempts ran, the instance is what could not be
+/// reached; before the first attempt there is no such history, so the limit's own
+/// failure (`spent`) stands — its smallest value means "fail now".
+fn not_attempted(undelivered: Option<&str>, spent: anyhow::Error, socket: &Path) -> anyhow::Error {
+    undelivered.map_or(spent, |detail| unreachable(socket, detail))
+}
+
+/// What a finished attempt means to the retry loop: one classification for both
+/// clients, so they cannot drift on which failures are sent again or on what a
+/// failure says.
+enum Outcome {
+    /// The instance answered.
+    Answer(QueryResponse),
+    /// The instance never took it: send the next attempt after the backoff. The
+    /// transport's own error is carried along, for the case where the budget runs
+    /// out before an attempt can be made after it.
+    Resend(String),
+    /// Report this; the attempt is not sent again.
+    Report(anyhow::Error),
+}
+
+/// Classify one attempt for the retry loop that made it, framing everything but
+/// the limit's own failure with [`channel_unreachable`]: the caller only gets
+/// here after the probe reported the location held, so a bare OS text would read
+/// as "the store is gone" instead of "an instance is running and its store was
+/// deliberately left alone".
+fn classify(attempt: Attempt, read: crate::db::read_limit::Read<'_>, socket: &Path) -> Outcome {
+    match attempt {
+        // An answer the budget was spent on is not an answer, however well the
+        // exchange itself went.
+        Attempt::Answered(resp) => {
+            if read.remaining().is_zero() {
+                Outcome::Report(read.timeout())
+            } else {
+                Outcome::Answer(resp)
+            }
+        }
+        // A delivery that never happened is retryable only while there is
+        // budget left to send it again.
+        Attempt::NotDelivered(e) => {
+            if read.remaining().is_zero() {
+                Outcome::Report(unreachable(socket, &e))
+            } else {
+                Outcome::Resend(e)
+            }
+        }
+        // The frame went out: the instance took the query, so it is never sent
+        // again — this is the limit's own failure, not an unreachable channel.
+        Attempt::NoAnswer => Outcome::Report(read.timeout()),
+        Attempt::Broken(e) => Outcome::Report(unreachable(socket, &e)),
+    }
+}
+
 /// Bounded-retry async client used by `mahbot debug` when an instance holds the
 /// storage location but the IPC socket is not yet bound (it is between
 /// lock-acquire and listener-bind, e.g. boot or self-update hand-off). The
@@ -709,25 +773,42 @@ fn channel_unreachable(socket: &Path) -> String {
 /// reports the location [`Held`](crate::util::lock::InstanceLockState::Held) —
 /// otherwise the retry would mask a genuinely-down instance.
 ///
-/// The window [`ipc_bound_timeout`] opens bounds the retries; an
-/// [`AnswerTimeout`] is terminal regardless of it, because the instance took the
-/// query and sending it again would run a second copy of the same work.
+/// The whole exchange runs under the command's read budget
+/// ([`crate::db::read_limit`]): every attempt waiting what the budget has left —
+/// never a per-statement window — and a spent budget reported as the limit's own
+/// failure. Only an attempt that never reached the instance is sent again; one
+/// the instance took is never resent, so a slow instance is waited out rather
+/// than misreported as an unreachable channel.
+///
+/// The caller owns the limit's process-ending half ([`crate::db::read_limit::Read::arm`]),
+/// which is what covers a wait that never comes back — armed ONCE for the route
+/// that makes the reads, not per attempt or per round trip.
 pub(crate) async fn ipc_query_with_wait(
     storage_root: &Path,
     req: &IpcRequest,
+    read: crate::db::read_limit::Read<'_>,
 ) -> anyhow::Result<QueryResponse> {
     let socket = socket_path(storage_root);
-    let deadline = std::time::Instant::now() + ipc_bound_timeout();
+    // The transport error of the last attempt that never reached the instance, for
+    // the case where the budget runs out before another attempt can be made.
+    let mut undelivered: Option<String> = None;
     let mut attempt = 0usize;
     loop {
-        match ipc_query(storage_root, req.clone()).await {
-            Ok(resp) => return Ok(resp),
-            Err(e) if e.downcast_ref::<AnswerTimeout>().is_some() => return Err(e),
-            Err(_) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(retry_backoff(attempt)).await;
+        // Checked per attempt: a budget spent while the previous attempt was in
+        // flight or backing off fails here, before another query goes out.
+        if let Err(spent) = read.check() {
+            return Err(not_attempted(undelivered.as_deref(), spent, &socket));
+        }
+        match classify(ipc_query_once(storage_root, req, read).await, read, &socket) {
+            Outcome::Answer(resp) => return Ok(resp),
+            Outcome::Resend(e) => {
+                undelivered = Some(e);
+                // Never sleep past the budget: the next attempt's own check
+                // ends the read at the limit, not somewhere after it.
+                tokio::time::sleep(retry_backoff(attempt).min(read.remaining())).await;
                 attempt += 1;
             }
-            Err(e) => return Err(e.context(channel_unreachable(&socket))),
+            Outcome::Report(e) => return Err(e),
         }
     }
 }
@@ -736,50 +817,108 @@ pub(crate) async fn ipc_query_with_wait(
 /// config-resolution path (which cannot await the async [`ipc_query_with_wait`];
 /// the call blocks the current thread). Like the async client, the caller must
 /// only use it after the instance-lock probe reported the location held.
+///
+/// The whole exchange runs under the command's read budget
+/// ([`crate::db::read_limit`]) exactly like the async client's: every attempt
+/// checked at the top and waiting what is left, and a spent budget failing before
+/// anything is sent. Only an attempt that never reached the instance is sent
+/// again.
+///
+/// As on the async path, the caller owns the process-ending half
+/// ([`crate::db::read_limit::Read::arm`]) — armed once for the route. Here it is
+/// also the only end a wedged exchange has on a platform whose local sockets
+/// carry no timeout (Windows named pipes).
 pub(crate) fn ipc_query_sync(
     storage_root: &Path,
     req: &IpcRequest,
-) -> std::io::Result<QueryResponse> {
+    read: crate::db::read_limit::Read<'_>,
+) -> anyhow::Result<QueryResponse> {
     let socket = socket_path(storage_root);
-    let deadline = std::time::Instant::now() + ipc_bound_timeout();
+    let mut undelivered: Option<String> = None;
     let mut attempt = 0usize;
     loop {
-        match ipc_query_sync_once(storage_root, req) {
-            Ok(resp) => return Ok(resp),
-            Err(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(retry_backoff(attempt));
+        // A budget spent before another query can go out fails here (see the
+        // async client).
+        if let Err(spent) = read.check() {
+            return Err(not_attempted(undelivered.as_deref(), spent, &socket));
+        }
+        match classify(ipc_query_sync_once(storage_root, req, read), read, &socket) {
+            Outcome::Answer(resp) => return Ok(resp),
+            Outcome::Resend(e) => {
+                undelivered = Some(e);
+                // Never sleep past the budget (see the async client).
+                std::thread::sleep(retry_backoff(attempt).min(read.remaining()));
                 attempt += 1;
             }
-            // The bare OS text would read as "the store is gone"; our sentence
-            // says the instance is running and its store was left alone. The
-            // failure kind is not carried through — no caller distinguishes it.
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "{}: {e}",
-                    channel_unreachable(&socket)
-                )));
-            }
+            Outcome::Report(e) => return Err(e),
         }
     }
 }
 
-fn ipc_query_sync_once(storage_root: &Path, req: &IpcRequest) -> std::io::Result<QueryResponse> {
+fn ipc_query_sync_once(
+    storage_root: &Path,
+    req: &IpcRequest,
+    read: crate::db::read_limit::Read<'_>,
+) -> Attempt {
     let socket = socket_path(storage_root);
-    let name = socket
-        .as_path()
-        .to_fs_name::<GenericFilePath>()
-        .map_err(|e| std::io::Error::other(format!("instance IPC endpoint not reachable: {e}")))?;
+    let name = match socket.as_path().to_fs_name::<GenericFilePath>() {
+        Ok(name) => name,
+        Err(e) => return Attempt::NotDelivered(e.to_string()),
+    };
     // `Stream::connect` is an associated function on the sync `Stream` trait,
     // not the enum — call it fully-qualified so `Self` resolves to the enum.
-    let mut stream =
-        <interprocess::local_socket::Stream as interprocess::local_socket::traits::Stream>::connect(
-            name,
-        )?;
-    let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;
-    write_frame_sync(&mut stream, &payload)?;
-    let payload = read_frame_sync(&mut stream)?;
-    let resp: QueryResponse = serde_json::from_slice(&payload).map_err(std::io::Error::other)?;
-    Ok(resp)
+    let mut stream = match <interprocess::local_socket::Stream as interprocess::local_socket::traits::Stream>::connect(
+        name,
+    ) {
+        Ok(stream) => stream,
+        Err(e) => return Attempt::NotDelivered(e.to_string()),
+    };
+    // Read AFTER the connect, like the async client's wait, so an attempt cannot
+    // run past the budget by the connect's own duration; and a budget spent here
+    // is reported as `NoAnswer` rather than waited on (a zero timeout means "no
+    // timeout" to the OS, and the query must not be sent again after a connect).
+    let wait = read.remaining();
+    if wait.is_zero() {
+        return Attempt::NoAnswer;
+    }
+    // Best-effort bound on the blocking exchange: the socket timeouts make a
+    // read that would never return come back as the limit's own failure. Best
+    // effort in both directions — the send/recv side may ignore them, and
+    // Windows named pipes carry no timeout at all (`no_timeouts` error); either
+    // way the read-limit watchdog the caller armed is what ends a wedged read.
+    let _ = stream.set_recv_timeout(Some(wait));
+    let _ = stream.set_send_timeout(Some(wait));
+    let payload = match serde_json::to_vec(req) {
+        Ok(payload) => payload,
+        Err(e) => return Attempt::Broken(e.to_string()),
+    };
+    if let Err(e) = write_frame_sync(&mut stream, &payload) {
+        // A send that ran out of time is the same event the async client's
+        // timeout wrapper sees, and gets the same answer: the limit, not a
+        // channel that could not be reached.
+        return if timed_out(&e) {
+            Attempt::NoAnswer
+        } else {
+            Attempt::Broken(e.to_string())
+        };
+    }
+    match read_frame_sync(&mut stream) {
+        Ok(payload) => match serde_json::from_slice(&payload) {
+            Ok(resp) => Attempt::Answered(resp),
+            Err(e) => Attempt::Broken(e.to_string()),
+        },
+        Err(e) if timed_out(&e) => Attempt::NoAnswer,
+        Err(e) => Attempt::Broken(e.to_string()),
+    }
+}
+
+/// True for the error a socket timeout surfaces as on this platform (both kinds:
+/// interprocess reports a receive timeout as one or the other).
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn write_frame_sync(stream: &mut impl std::io::Write, payload: &[u8]) -> std::io::Result<()> {
@@ -960,10 +1099,10 @@ async fn ipc_call_once(storage_root: &Path, call: &CallRequest, protocol: &str) 
 /// when it decodes as the unknown-store shape (a `QueryResponse` whose `error`
 /// contains `unknown store '<the value this build sent>'`).
 ///
-/// This deliberately does NOT go through the diagnostic path's [`ipc_query`]:
-/// that one bounds each attempt's answer wait, because the query behind it is
-/// itself bound by the per-statement limit. An operation has no such bound, so
-/// that patience would give up on work the instance is still performing.
+/// This deliberately does NOT go through the read-only path's
+/// [`ipc_query_with_wait`]: that one bounds each attempt's wait by the command's
+/// own read budget, which an operation must not inherit — an operation the
+/// product is still performing is never given up on.
 ///
 /// [`NotAccepted`]: CallOutcome::NotAccepted
 /// [`Unavailable`]: CallOutcome::Unavailable
@@ -1151,11 +1290,11 @@ mod tests {
 
     /// End-to-end: the instance-side listener serves a read-only query over the
     /// local socket, returning column names + rows (the IPC path `mahbot debug`
-    /// uses when an instance holds the location). `serial(ipc_bound)`: this
-    /// relies on the bounded retry (the listener task may bind after the first
-    /// attempt) and must not overlap the tests that shrink that bound through
-    /// `MAHBOT_IPC_BOUND_TIMEOUT_SECS`.
-    #[serial_test::serial(ipc_bound)]
+    /// uses when an instance holds the location). `serial(read_limit)`: this
+    /// relies on the bounded retry inside the read limit (the listener task may
+    /// bind after the first attempt), so it must not overlap the tests that
+    /// shrink that knob.
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn ipc_query_serves_readonly_queries_end_to_end() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
@@ -1185,7 +1324,9 @@ mod tests {
             params: Vec::new(),
             call: None,
         };
-        let resp = crate::db::ipc::ipc_query_with_wait(&root, &req)
+        let budget = crate::db::read_limit::Budget::start();
+        let read = crate::db::read_limit::Read::over_channel("logs", &budget);
+        let resp = crate::db::ipc::ipc_query_with_wait(&root, &req, read)
             .await
             .expect("IPC query must reach the listener");
         assert!(resp.error.is_none(), "no error expected: {:?}", resp.error);
@@ -1201,7 +1342,7 @@ mod tests {
             params: Vec::new(),
             call: None,
         };
-        let write_resp = crate::db::ipc::ipc_query_with_wait(&root, &write_req)
+        let write_resp = crate::db::ipc::ipc_query_with_wait(&root, &write_req, read)
             .await
             .expect("IPC write attempt must reach the listener");
         assert!(
@@ -1219,7 +1360,7 @@ mod tests {
             params: Vec::new(),
             call: None,
         };
-        let checkpoint_resp = crate::db::ipc::ipc_query_with_wait(&root, &checkpoint_req)
+        let checkpoint_resp = crate::db::ipc::ipc_query_with_wait(&root, &checkpoint_req, read)
             .await
             .expect("IPC checkpoint attempt must reach the listener");
         assert!(
@@ -1250,6 +1391,256 @@ mod tests {
         let _ = listener.await;
     }
 
+    /// A hand-rolled listener for the client tests below: it accepts EVERY
+    /// connection, reads one request frame, and then answers after
+    /// `answer_after` — or never, when that is `None`, which is the instance
+    /// that took the query and went quiet. Accepted streams are held (nothing
+    /// closes under the client's read), connections are counted so a test can
+    /// prove a taken query was not sent again, and the stop signal — or the
+    /// listener's own drop — ends it.
+    ///
+    /// No store is involved: the socket path is the whole endpoint.
+    fn slow_listener(
+        root: &Path,
+        answer_after: Option<Duration>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use interprocess::local_socket::traits::Listener as _;
+
+        let socket = socket_path(root);
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_in_server = accepted.clone();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let name = socket
+                .as_path()
+                .to_fs_name::<GenericFilePath>()
+                .expect("socket name");
+            let mut opts = ListenerOptions::new();
+            opts = opts.name(name).try_overwrite(true);
+            let listener = opts.create_sync().expect("bind the client-test listener");
+            // Nonblocking accept: EVERY connection must be counted — a resend
+            // would be a second one — and the loop must still notice the stop
+            // signal. The accepted streams stay blocking, so reading the frame
+            // below waits for it as the test means it to.
+            listener
+                .set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)
+                .expect("nonblocking accept");
+            let mut held = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok(mut stream) => {
+                        accepted_in_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = read_frame_sync(&mut stream);
+                        if let Some(after) = answer_after {
+                            std::thread::sleep(after);
+                            let body = serde_json::to_vec(&QueryResponse {
+                                columns: vec!["COUNT(*)".to_string()],
+                                rows: vec![vec![WireValue::Integer(1)]],
+                                error: None,
+                                truncated: false,
+                            })
+                            .expect("serialize the answer");
+                            let _ = write_frame_sync(&mut stream, &body);
+                        }
+                        held.push(stream);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
+                            break;
+                        }
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+        });
+        (server, stop_tx, accepted)
+    }
+
+    /// A spent budget is reported, never raced against: with the limit at zero the
+    /// client must fail at once and must not even open an exchange. A zero wait is
+    /// not an immediate failure on its own — the timer's own first poll can let a
+    /// fast answer through — so the only deterministic reading of the smallest
+    /// limit is to refuse before anything is sent. `serial(read_limit)`: this
+    /// shrinks the read limit, so it must not overlap another test that reads the
+    /// knob.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn a_spent_budget_never_reaches_the_instance() {
+        let _env = crate::util::test::set_env_var(crate::db::read_limit::ENV, Some("0"));
+        let dir = tempfile::TempDir::new().expect("temp dir for the socket");
+        let (server, stop, accepted) = slow_listener(dir.path(), None);
+
+        let budget = crate::db::read_limit::Budget::start();
+        let read = crate::db::read_limit::Read::over_channel("logs", &budget);
+        let req = IpcRequest {
+            store: "logs".to_string(),
+            sql: "SELECT COUNT(*) FROM logs".to_string(),
+            params: Vec::new(),
+            call: None,
+        };
+        let err = crate::db::ipc::ipc_query_with_wait(dir.path(), &req, read)
+            .await
+            .expect_err("a spent budget must fail the read");
+        let text = err.to_string();
+        assert!(
+            text.contains("'logs'"),
+            "the failure names the target: {text}"
+        );
+        assert!(
+            text.contains("0s read limit"),
+            "the failure names the limit: {text}"
+        );
+
+        let _ = stop.send(());
+        server.join().expect("the listener thread must end");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a spent budget must not send the query at all"
+        );
+    }
+
+    /// A service that is slow but alive answers inside the limit: the wait
+    /// follows the command's own budget, so an instance that is merely occupied
+    /// is waited out instead of being cut off as an unreachable channel — the
+    /// wrong diagnosis the fixed channel-wide bound produced. `serial(read_limit)`:
+    /// this shrinks the read limit, so it must not overlap another test that reads
+    /// the knob.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn a_slow_but_alive_instance_answers_inside_the_read_limit() {
+        let _env = crate::util::test::set_env_var(crate::db::read_limit::ENV, Some("5"));
+        let dir = tempfile::TempDir::new().expect("temp dir for the socket");
+        let (server, stop, _accepted) = slow_listener(dir.path(), Some(Duration::from_millis(700)));
+
+        let budget = crate::db::read_limit::Budget::start();
+        let read = crate::db::read_limit::Read::over_channel("logs", &budget);
+        let req = IpcRequest {
+            store: "logs".to_string(),
+            sql: "SELECT COUNT(*) FROM logs".to_string(),
+            params: Vec::new(),
+            call: None,
+        };
+        let resp = crate::db::ipc::ipc_query_with_wait(dir.path(), &req, read)
+            .await
+            .expect("an answer that arrives inside the limit must be returned");
+        assert!(resp.error.is_none(), "no error expected: {:?}", resp.error);
+        assert_eq!(resp.rows, vec![vec![WireValue::Integer(1)]]);
+
+        let _ = stop.send(());
+        server.join().expect("the listener thread must end");
+    }
+
+    /// A read-only query the instance TOOK but never answered must fail with the
+    /// read limit's own wording, never as an unreachable channel — the wrong
+    /// diagnosis the channel-wide 15 s bound produced (a merely slow instance
+    /// reads as "the debug channel could not be reached"). The query is also
+    /// never sent again: the instance has it, so a second copy would run the
+    /// same work twice.
+    ///
+    /// `serial(read_limit)`: this shrinks the read limit, so it must not overlap
+    /// another test that reads the knob.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn a_query_a_silent_instance_took_fails_with_the_read_limit_and_is_not_resent() {
+        let _env = crate::util::test::set_env_var(crate::db::read_limit::ENV, Some("1"));
+        let dir = tempfile::TempDir::new().expect("temp dir for the socket");
+        let (server, stop, accepted) = slow_listener(dir.path(), None);
+
+        let budget = crate::db::read_limit::Budget::start();
+        let read = crate::db::read_limit::Read::over_channel("logs", &budget);
+        let req = IpcRequest {
+            store: "logs".to_string(),
+            sql: "SELECT COUNT(*) FROM logs".to_string(),
+            params: Vec::new(),
+            call: None,
+        };
+        let err = crate::db::ipc::ipc_query_with_wait(dir.path(), &req, read)
+            .await
+            .expect_err("a query the instance took but never answered must fail");
+        let text = err.to_string();
+        assert!(
+            text.contains("logs"),
+            "the failure names the target: {text}"
+        );
+        assert!(
+            text.contains("1s read limit"),
+            "the failure names the limit: {text}"
+        );
+        assert!(
+            text.contains(crate::db::read_limit::ENV),
+            "the failure names the knob: {text}"
+        );
+        assert!(
+            !text.contains("could not be reached"),
+            "a taken query must not be reported as an unreachable channel: {text}"
+        );
+
+        let _ = stop.send(());
+        server.join().expect("the silent listener thread must end");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a query the instance took must never be sent again"
+        );
+    }
+
+    /// The same limit bounds the SYNCHRONOUS client, which is the one
+    /// `bench-openrouter` resolves its config through: a query the instance took
+    /// and never answered fails with the limit's own wording — never as an
+    /// unreachable channel — and is never sent again. `serial(read_limit)`: this
+    /// shrinks the read limit, so it must not overlap another test that reads the
+    /// knob.
+    ///
+    /// Unix only: the sync client's end here is its socket timeout, and named
+    /// pipes carry none — on Windows the only end a wedged exchange has is the
+    /// read-limit watchdog, which a test binary disarms, so this test could never
+    /// finish there.
+    #[cfg(unix)]
+    #[serial_test::serial(read_limit)]
+    #[test]
+    fn a_silent_instance_fails_the_sync_config_read_with_the_read_limit() {
+        let _env = crate::util::test::set_env_var(crate::db::read_limit::ENV, Some("1"));
+        let dir = tempfile::TempDir::new().expect("temp dir for the socket");
+        let (server, stop, accepted) = slow_listener(dir.path(), None);
+
+        let budget = crate::db::read_limit::Budget::start();
+        let read = crate::db::read_limit::Read::over_channel("config", &budget);
+        let req = IpcRequest {
+            store: "core".to_string(),
+            sql: "SELECT value FROM config_kv WHERE key = 'worker_model'".to_string(),
+            params: Vec::new(),
+            call: None,
+        };
+        let err = crate::db::ipc::ipc_query_sync(dir.path(), &req, read)
+            .expect_err("a silent instance must fail the config read");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("'config'"),
+            "the failure names the target: {text}"
+        );
+        assert!(
+            text.contains("1s read limit"),
+            "the failure names the limit: {text}"
+        );
+        assert!(
+            !text.contains("could not be reached"),
+            "a taken query must not be reported as an unreachable channel: {text}"
+        );
+
+        let _ = stop.send(());
+        server.join().expect("the silent listener thread must end");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a query the instance took must never be sent again"
+        );
+    }
+
     /// End-to-end: the same listener serves the OPERATION shape of a frame —
     /// `handle_connection` reads the `call` off a protocol value it serves and
     /// routes it through the instance-side executor, and the client reads the
@@ -1259,8 +1650,9 @@ mod tests {
     /// something the product cannot take on at all, with the restart the
     /// environment's class carries — enough to prove the frame is served as an
     /// operation and not as a diagnostic query.
-    /// `serial(ipc_bound)`: shares the listener-bound retry
-    /// with the diagnostic e2e test above.
+    /// `serial(ipc_bound)`: the call channel's wait is read from that knob (the
+    /// listener may bind after the first attempt), so it must not overlap the
+    /// test that shrinks it.
     #[serial_test::serial(ipc_bound)]
     #[tokio::test]
     async fn ipc_call_serves_an_operation_frame_end_to_end() {
@@ -1317,8 +1709,8 @@ mod tests {
     /// owner's own incoming message. The store is shared with the parallel tests,
     /// so the test reclaims the durable row AND the conversation row it created —
     /// no other test can pick the handover up and route it into a live turn.
-    /// `serial(ipc_bound, …)`: shares the listener-bound retry with the two e2e
-    /// tests above, and registers the owner's assistant consumer in the
+    /// `serial(ipc_bound, …)`: the call channel's wait is read from that knob,
+    /// and this registers the owner's assistant consumer in the
     /// process-global router, which the dispatch tests hold too.
     #[serial_test::serial(ipc_bound, provider, channel_registry, drain)]
     #[tokio::test]

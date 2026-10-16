@@ -31,11 +31,14 @@ use crate::util::UnwrapPoison;
 /// Default limit on how long one statement may hold a store, in seconds.
 const STATEMENT_LIMIT_DEFAULT_SECS: u64 = 180;
 
-/// Env override for [`STATEMENT_LIMIT_DEFAULT_SECS`] — the same env-override
-/// pattern the other bounded waits use, and what lets the limit's behaviour be
-/// exercised without waiting out the default. The diagnostic client reads it too
-/// (see `crate::db::ipc::answer_patience`), so one environment must carry it for
-/// both sides.
+/// Env override for [`STATEMENT_LIMIT_DEFAULT_SECS`], in seconds — the same
+/// env-override pattern the other bounded waits use, and what lets the limit's
+/// behaviour be exercised without waiting out the default. The limit it yields
+/// ([`statement_limit`]) is what every connection the product opens is armed
+/// with, the inspection clients' own direct read-only one included
+/// ([`crate::db::debug::connect_readonly`]); those clients carry their own
+/// command-wide read limit on top of it ([`crate::db::read_limit`]), which is a
+/// separate knob.
 pub(crate) const STATEMENT_LIMIT_ENV: &str = "MAHBOT_STORE_STATEMENT_LIMIT_SECS";
 
 /// The longest one statement may hold a store.

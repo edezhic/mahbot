@@ -44,6 +44,14 @@
 //! upfront file-existence check and a SQL validator (mutation-keyword
 //! blocklist plus a PRAGMA allowlist — see [`validate_read_only`]).
 //!
+//! ## Bounded reads
+//!
+//! One budget bounds the whole command, started where it starts reading (see
+//! [`crate::db::read_limit`]). A read that spends it fails at once with the
+//! limit's own message, naming the store or family the user asked about; a read
+//! that never yields is ended by the watchdog, which exits the process with the
+//! same message. Its own knob is [`crate::db::read_limit::ENV`].
+//!
 //! ## Other verbs
 //!
 //! - `mahbot debug families [--db <name>]` — list every forensic family in the
@@ -61,6 +69,8 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::db as turso_mod;
 use crate::db::ipc;
+use crate::db::read_limit;
+use crate::db::read_limit::{Budget, Read};
 use crate::db::wal_guard;
 use crate::util::lock::InstanceLockState;
 
@@ -434,9 +444,11 @@ fn run_debug_families(args: &[String], home_override: Option<PathBuf>) -> Result
 ///
 /// Snapshot semantics: the family is static, so none of the live-store layers
 /// apply — no IPC routing, no live heuristics. The engine opens the family in
-/// place, read-only (`db` + `-wal`). The whole open+query is panic-guarded: a
-/// damaged family yields a clean error.
-fn execute_family_query(family_id: &str, sql: &str, root: &Path) -> Result<String> {
+/// place, read-only (`db` + `-wal`), on the shared read-only stack
+/// ([`open_and_run_readonly`]) — so the read limit bounds a family read exactly
+/// as it bounds a `--db` one, and a damaged family yields a clean error instead
+/// of a CLI crash.
+fn execute_family_query(read: Read<'_>, family_id: &str, sql: &str, root: &Path) -> Result<String> {
     parse_family_name(family_id).with_context(|| {
         format!("invalid family id '{family_id}' — list valid ids with `mahbot debug families`")
     })?;
@@ -465,9 +477,8 @@ fn execute_family_query(family_id: &str, sql: &str, root: &Path) -> Result<Strin
     if !md.file_type().is_file() {
         bail!("forensic family '{family_id}' main file is not a regular file — refusing to open");
     }
-    let result = guard_panics(|| {
-        let (io, db) = open_readonly(&db_path, turso_mod::experimental_database_opts())?;
-        connect_execute(&io, &db, sql, &db_path)
+    let result = open_and_run_readonly(read, &db_path, |read, io, db, path| {
+        connect_execute(read, io, db, sql, path)
     });
     match result {
         Ok(output) => Ok(output),
@@ -485,8 +496,8 @@ fn execute_family_query(family_id: &str, sql: &str, root: &Path) -> Result<Strin
 }
 
 /// `mahbot debug --family <id> "SQL query"` — execute and print.
-fn query_family(family_id: &str, sql: &str, root: &Path) -> Result<()> {
-    let output = execute_family_query(family_id, sql, root)?;
+fn query_family(read: Read<'_>, family_id: &str, sql: &str, root: &Path) -> Result<()> {
+    let output = execute_family_query(read, family_id, sql, root)?;
     // Write explicitly: a closed stdout (EPIPE) surfaces as an ordinary I/O
     // error, never a panic misreported as an engine crash.
     write_stdout(&output)
@@ -498,6 +509,7 @@ fn query_family(family_id: &str, sql: &str, root: &Path) -> Result<()> {
 /// name, `args[1]` is `"debug"`). `home_override`, when provided, replaces the
 /// `~/.mahbot` storage-root resolution (used by tests with temporary roots and
 /// by the snapshot-copy procedure).
+#[expect(clippy::too_many_lines)] // one linear per-store walk: route, read, per-store failure
 async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) -> Result<()> {
     // args[0] = "mahbot", args[1] = "debug"
     let tail: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
@@ -527,7 +539,9 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
         let mahbot_home = resolve_home(home_override)?;
         let sql = &args[4];
         validate_read_only(sql)?;
-        return query_family(&args[3], sql, &mahbot_home);
+        let budget = Budget::start();
+        let read = Read::direct(&args[3], &budget);
+        return query_family(read, &args[3], sql, &mahbot_home);
     }
 
     // Need at least: mahbot debug --db <name> [SQL]
@@ -544,7 +558,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
 
     let db_name = &args[3];
     // A SQL argument runs a read-only query; without one the command prints a
-    // schema dump (per-table DDL blocks + row counts — see `dump_one_store`).
+    // schema dump (per-table DDL blocks + row counts — see [`dump_schema`]).
     let sql = args.get(4).map(String::as_str);
 
     // Resolve ~/.mahbot/ (or the test/snapshot override).
@@ -577,6 +591,9 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
         ),
     };
 
+    // One read budget for the whole command, spent by every read under it and
+    // never reset per store (see [`crate::db::read_limit`]).
+    let budget = Budget::start();
     let mut failures = 0usize;
     for (label, file_path) in &db_list {
         if db_name == "all" {
@@ -590,10 +607,17 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
             .and_then(|s| s.to_str())
             .map_or_else(|| label.clone(), str::to_string);
 
+        // The user's own label is the target, so a failure names it.
+        let read = if route_via_channel {
+            Read::over_channel(label, &budget)
+        } else {
+            Read::direct(label, &budget)
+        };
+
         let result = if route_via_channel {
             match sql {
-                Some(sql) => query_over_ipc(&mahbot_home, &physical, sql).await,
-                None => dump_over_ipc(&mahbot_home, &physical, label).await,
+                Some(sql) => query_over_ipc(read, &mahbot_home, &physical, sql).await,
+                None => dump_over_ipc(read, &mahbot_home, &physical, label).await,
             }
         } else {
             // No instance holds the location — direct single-process read-only
@@ -612,8 +636,8 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
                 bail!("database file not found: {}", file_path.display());
             }
             match sql {
-                Some(sql) => query_one_store(file_path, sql),
-                None => dump_one_store(file_path, label),
+                Some(sql) => open_and_query_readonly(read, file_path, sql),
+                None => open_and_dump_readonly(read, file_path, label),
             }
         };
         match result {
@@ -641,30 +665,21 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     Ok(())
 }
 
-/// Open one store read-only and run `sql` (pipe-delimited output) — the
-/// no-instance direct path (a single-process read-only open).
-fn query_one_store(file_path: &Path, sql: &str) -> Result<()> {
-    open_and_query_readonly(file_path, sql)
-}
-
-/// Open one store read-only and print its schema dump — a header line naming
-/// the store, then one block per user table (`[table] <name>`, the table's
-/// DDL, and its row count). Internal catalog artifacts are excluded (see
-/// [`dump_schema`]). Same direct path as [`query_one_store`].
-fn dump_one_store(file_path: &Path, label: &str) -> Result<()> {
-    open_and_dump_readonly(file_path, label)
-}
-
 /// Run one read-only SQL query through the instance's debug IPC endpoint,
 /// returning the response or the endpoint's error.
-async fn ipc_query_readonly(root: &Path, store: &str, sql: &str) -> Result<ipc::QueryResponse> {
+async fn ipc_query_readonly(
+    read: Read<'_>,
+    root: &Path,
+    store: &str,
+    sql: &str,
+) -> Result<ipc::QueryResponse> {
     let req = ipc::IpcRequest {
         store: store.to_string(),
         sql: sql.to_string(),
         params: Vec::new(),
         call: None,
     };
-    let resp = ipc::ipc_query_with_wait(root, &req).await?;
+    let resp = ipc::ipc_query_with_wait(root, &req, read).await?;
     if let Some(err) = &resp.error {
         bail!("{err}");
     }
@@ -675,45 +690,61 @@ async fn ipc_query_readonly(root: &Path, store: &str, sql: &str) -> Result<ipc::
 /// holds the storage location and the CLI must not open the store directly).
 /// `physical` is the physical store name the endpoint keys on
 /// ("core" or "logs").
-async fn query_over_ipc(root: &Path, physical: &str, sql: &str) -> Result<()> {
-    let resp = ipc_query_readonly(root, physical, sql).await?;
-    let rows = resp
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(ipc::WireValue::format)
-                .collect::<Vec<_>>()
-                .join("|")
-        })
-        .collect();
-    let out = render_pipe_table(&resp.columns, rows, resp.truncated);
+async fn query_over_ipc(read: Read<'_>, root: &Path, physical: &str, sql: &str) -> Result<()> {
+    // The guard spans the reading only, as on the direct route: the answer is
+    // written after it is dropped, so a read that came back is printed as its
+    // answer and is never cut.
+    let out = {
+        let _watchdog = read.arm()?;
+        let resp = ipc_query_readonly(read, root, physical, sql).await?;
+        let rows = resp
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(ipc::WireValue::format)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        render_pipe_table(&resp.columns, rows, resp.truncated)
+    };
     write_stdout(&out)
 }
 
-/// Schema dump of a live store through the instance's debug IPC endpoint.
-async fn dump_over_ipc(root: &Path, physical: &str, label: &str) -> Result<()> {
+/// Schema dump of a live store through the instance's debug IPC endpoint. One
+/// watchdog for the whole walk — the table list and every per-table count run
+/// under the read's own process-ending half, not one per round trip — and the
+/// dump is written after it is dropped, like the direct route's.
+async fn dump_over_ipc(read: Read<'_>, root: &Path, physical: &str, label: &str) -> Result<()> {
     use std::fmt::Write as _;
-    let tables_sql = USER_TABLES_SQL.replace("{filter}", turso_mod::USER_OBJECT_FILTER);
-    let resp = ipc_query_readonly(root, physical, &tables_sql).await?;
-    let mut out = format!("== schema dump: {label} ==\n");
-    for row in &resp.rows {
-        let name = row.first().map(ipc::WireValue::format).unwrap_or_default();
-        let sql = row.get(1).map(ipc::WireValue::format).unwrap_or_default();
-        if name.is_empty() {
-            continue;
+    let dump = {
+        let _watchdog = read.arm()?;
+        let tables_sql = USER_TABLES_SQL.replace("{filter}", turso_mod::USER_OBJECT_FILTER);
+        let resp = ipc_query_readonly(read, root, physical, &tables_sql).await?;
+        let mut out = format!("== schema dump: {label} ==\n");
+        for row in &resp.rows {
+            // Many round trips: stop the walk on a spent budget instead of starting
+            // another one.
+            read.check()?;
+            let name = row.first().map(ipc::WireValue::format).unwrap_or_default();
+            let sql = row.get(1).map(ipc::WireValue::format).unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let count_sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&name));
+            let count_resp = ipc_query_readonly(read, root, physical, &count_sql).await?;
+            let count = count_resp
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .map(ipc::WireValue::format)
+                .unwrap_or_default();
+            writeln!(out, "\n[table] {name}\n{sql}\nrows: {count}\n").expect("writing to a String");
         }
-        let count_sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&name));
-        let count_resp = ipc_query_readonly(root, physical, &count_sql).await?;
-        let count = count_resp
-            .rows
-            .first()
-            .and_then(|r| r.first())
-            .map(ipc::WireValue::format)
-            .unwrap_or_default();
-        writeln!(out, "\n[table] {name}\n{sql}\nrows: {count}\n").expect("writing to a String");
-    }
-    write_stdout(&out)
+        out
+    };
+    write_stdout(&dump)
 }
 
 /// Prefix of [`guard_panics`] errors — shared with the classifier so a wording
@@ -835,62 +866,62 @@ pub(crate) fn connect_readonly(
 /// output. Output is buffered and returned only on success: a mid-query failure
 /// must not leave a partial column header on stdout.
 fn connect_execute(
+    read: Read<'_>,
     io: &std::sync::Arc<dyn turso::core::IO>,
     db: &std::sync::Arc<turso::core::Database>,
     sql: &str,
     db_path: &Path,
 ) -> Result<String> {
     let conn = connect_readonly(db, db_path)?;
-    execute_query_readonly(io, &conn, sql, db_path)
-}
-
-/// [`connect_execute`] plus a print to stdout. Write explicitly instead of
-/// `print!`: a closed stdout (EPIPE) surfaces as an ordinary I/O error here
-/// rather than a panic misreported as an engine crash by guard_panics.
-fn connect_execute_print(
-    io: &std::sync::Arc<dyn turso::core::IO>,
-    db: &std::sync::Arc<turso::core::Database>,
-    sql: &str,
-    db_path: &Path,
-) -> Result<()> {
-    let output = connect_execute(io, db, sql, db_path)?;
-    write_stdout(&output)
+    execute_query_readonly(read, io, &conn, sql, db_path)
 }
 
 /// Open a store read-only and execute `sql`, printing pipe-delimited results.
-/// See [`open_and_run_readonly`] for the shared open+run stack.
-fn open_and_query_readonly(file_path: &Path, sql: &str) -> Result<()> {
-    open_and_run_readonly(file_path, |io, db, path| {
-        connect_execute_print(io, db, sql, path)
-    })
+/// See [`open_and_run_readonly`] for the shared open+run stack; the write
+/// happens after it returns, so it is never inside the watchdog's scope.
+fn open_and_query_readonly(read: Read<'_>, file_path: &Path, sql: &str) -> Result<()> {
+    let output = open_and_run_readonly(read, file_path, |read, io, db, path| {
+        connect_execute(read, io, db, sql, path)
+    })?;
+    write_stdout(&output)
 }
 
 /// Open a store read-only and run `runner` against it. Used by the query and
-/// schema-dump paths so both share the same open stack. The whole open+run is
-/// panic-guarded — a damaged store must yield a clean error, never a CLI crash.
+/// schema-dump paths and by the `--family` snapshot route, so every direct read
+/// shares one open+limit stack. The watchdog is armed before the open and covers
+/// the READ alone: the caller writes the output after this returns, so a read that
+/// finishes inside the watchdog's grace is never cut mid-write (which is what the
+/// channel route does too). The whole open+run is panic-guarded — a damaged store
+/// must yield a clean error, never a CLI crash.
 fn open_and_run_readonly<T>(
+    read: Read<'_>,
     file_path: &Path,
     runner: impl FnOnce(
+        Read<'_>,
         &std::sync::Arc<dyn turso::core::IO>,
         &std::sync::Arc<turso::core::Database>,
         &Path,
     ) -> Result<T>,
 ) -> Result<T> {
     guard_panics(|| {
+        let _watchdog = read.arm()?;
         let (io, db) = open_readonly(file_path, turso_mod::experimental_database_opts())?;
-        runner(&io, &db, file_path)
+        let out = runner(read, &io, &db, file_path)?;
+        // A read that came back past the limit is not an answer.
+        read.check()?;
+        Ok(out)
     })
 }
 
 /// [`open_and_run_readonly`] runner for the schema dump: build the whole
 /// store's dump text (buffered — a mid-dump failure never leaks a partial
 /// dump to stdout, matching [`connect_execute`]'s all-or-nothing output),
-/// then write it once.
-fn open_and_dump_readonly(file_path: &Path, label: &str) -> Result<()> {
-    open_and_run_readonly(file_path, |io, db, path| {
-        let dump = dump_schema(io, db, path, label)?;
-        write_stdout(&dump)
-    })
+/// then write it once, after the watchdog is disarmed.
+fn open_and_dump_readonly(read: Read<'_>, file_path: &Path, label: &str) -> Result<()> {
+    let dump = open_and_run_readonly(read, file_path, |read, io, db, path| {
+        dump_schema(read, io, db, path, label)
+    })?;
+    write_stdout(&dump)
 }
 
 /// Execute a read-only query on a `turso::core` connection and return the
@@ -900,6 +931,7 @@ fn open_and_dump_readonly(file_path: &Path, label: &str) -> Result<()> {
 /// prints it only on success, so a mid-query failure never leaks a partial
 /// result set (e.g. a bare column header) to stdout.
 fn execute_query_readonly(
+    read: Read<'_>,
     io: &std::sync::Arc<dyn turso::core::IO>,
     conn: &std::sync::Arc<turso::core::Connection>,
     sql: &str,
@@ -915,7 +947,7 @@ fn execute_query_readonly(
     let column_names: Vec<String> = (0..col_count)
         .map(|i| stmt.get_column_name(i).into_owned())
         .collect();
-    let (rows, has_more) = step_rows(io, db_path, &mut stmt, Some(ROW_LIMIT), |row| {
+    let (rows, has_more) = step_rows(read, io, db_path, &mut stmt, Some(ROW_LIMIT), |row| {
         format_core_row(row, col_count)
     })?;
 
@@ -958,6 +990,7 @@ const USER_TABLES_SQL: &str = "SELECT name, sql FROM sqlite_master \
 /// objects, and it reflects the LIVE stored schema (`sqlite_master`), not
 /// source-code constants (live schemas drift from source over time).
 fn dump_schema(
+    read: Read<'_>,
     io: &std::sync::Arc<dyn turso::core::IO>,
     db: &std::sync::Arc<turso::core::Database>,
     db_path: &Path,
@@ -966,7 +999,7 @@ fn dump_schema(
     use std::fmt::Write as _;
     let conn = connect_readonly(db, db_path)?;
     let tables_sql = USER_TABLES_SQL.replace("{filter}", turso_mod::USER_OBJECT_FILTER);
-    let tables = collect_rows(io, &conn, &tables_sql, db_path, |row| {
+    let tables = collect_rows(read, io, &conn, &tables_sql, db_path, |row| {
         let name = format_core_value(row.get_value(0));
         let sql = format_core_value(row.get_value(1));
         (name, sql)
@@ -978,7 +1011,7 @@ fn dump_schema(
             continue;
         }
         let count_sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&name));
-        let counts = collect_rows(io, &conn, &count_sql, db_path, |row| {
+        let counts = collect_rows(read, io, &conn, &count_sql, db_path, |row| {
             format_core_value(row.get_value(0))
         })?;
         let count = counts.first().ok_or_else(|| {
@@ -1017,6 +1050,7 @@ fn prepare_readonly(
 /// it reports the shared caller-facing sentence ([`crate::db::store::too_heavy_message`]),
 /// not the engine's bare "interrupted".
 fn step_rows<T>(
+    read: Read<'_>,
     io: &std::sync::Arc<dyn turso::core::IO>,
     db_path: &Path,
     stmt: &mut turso::core::Statement,
@@ -1026,6 +1060,8 @@ fn step_rows<T>(
     let mut rows = Vec::new();
     let mut has_more = false;
     loop {
+        // Cooperative half of the command's read limit: end the read on a spent budget.
+        read.check()?;
         match stmt
             .step()
             .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?
@@ -1064,6 +1100,7 @@ fn step_rows<T>(
 /// (uncapped [`step_rows`]). A failure propagates and the caller reports it as
 /// a clean error.
 fn collect_rows<T>(
+    read: Read<'_>,
     io: &std::sync::Arc<dyn turso::core::IO>,
     conn: &std::sync::Arc<turso::core::Connection>,
     sql: &str,
@@ -1071,7 +1108,7 @@ fn collect_rows<T>(
     collect: impl FnMut(&turso::core::Row) -> T,
 ) -> Result<Vec<T>> {
     let mut stmt = prepare_readonly(conn, sql, db_path)?;
-    let (rows, _has_more) = step_rows(io, db_path, &mut stmt, None, collect)?;
+    let (rows, _has_more) = step_rows(read, io, db_path, &mut stmt, None, collect)?;
     Ok(rows)
 }
 
@@ -1389,6 +1426,7 @@ fn print_usage() {
     eprintln!("  families    list quarantine/pre-reindex forensic families (--db filters by");
     eprintln!("               store name; a name matching nothing prints an empty list)");
     eprintln!("  --family <id>  read-only SQL against one forensic family (id from `families`)");
+    eprintln!("  reads are bounded per command by {}", read_limit::ENV);
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  mahbot debug --db board");
@@ -1404,6 +1442,10 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every test that lets a read start shares `serial(read_limit)`: a read takes
+    // the process-global read-limit knob, and the read-limit tests below shrink it
+    // to make a read fail at once.
 
     /// The entry names of a store directory — the no-new-files proof for a
     /// read-only open (sorted, so the comparison is order-independent).
@@ -1502,6 +1544,7 @@ mod tests {
 
     /// End-to-end: `run_debug_with_args` opens a real (temporary) store
     /// read-only through the `turso::core` path and runs a query against it.
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_queries_a_real_store_read_only() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
@@ -1531,6 +1574,7 @@ mod tests {
     /// The schema dump (`--db <name>` with no SQL) reflects the LIVE stored
     /// schema: one block per user table with its DDL and row count, excluding
     /// internal catalog artifacts (`sqlite_%`, `__turso_internal_%`).
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn schema_dump_prints_user_tables_with_row_counts() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
@@ -1546,9 +1590,12 @@ mod tests {
             .expect("insert a log row");
 
         let db_path = dir.path().join("db").join("logs.db");
-        let dump =
-            open_and_run_readonly(&db_path, |io, db, path| dump_schema(io, db, path, "logs"))
-                .expect("dump must succeed on a real store");
+        let budget = Budget::start();
+        let read = Read::direct("logs", &budget);
+        let dump = open_and_run_readonly(read, &db_path, |read, io, db, path| {
+            dump_schema(read, io, db, path, "logs")
+        })
+        .expect("dump must succeed on a real store");
 
         assert!(
             dump.starts_with("== schema dump: logs ==\n"),
@@ -1581,6 +1628,7 @@ mod tests {
     /// `mahbot debug --db <name>` without a SQL argument dumps the store schema
     /// and exits 0 — and, like the query path, leaves the store directory
     /// untouched.
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_dumps_schema_without_sql() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
@@ -1607,6 +1655,7 @@ mod tests {
     /// `mahbot debug --db all` without a SQL argument dumps every present
     /// store and reports missing stores per-store with a failure summary
     /// (exit 1) — matching the query verb's `--db all` failure semantics.
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_dump_all_reports_missing_stores() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
@@ -1628,6 +1677,141 @@ mod tests {
         assert!(
             msg.contains(&format!("{} of {total} store(s) failed", total - 1)),
             "must summarize per-store failures, got: {msg}"
+        );
+    }
+
+    // ── read-limit tests ─────────────────────────────────────────────
+
+    /// With the read limit at zero the direct route fails before it opens the
+    /// store: the error names the store and the limit, and the store directory
+    /// is byte-identical (nothing was opened).
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn run_debug_read_limit_fails_the_direct_route_immediately() {
+        let _env = crate::util::test::set_env_var(read_limit::ENV, Some("0"));
+        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let db_dir = dir.path().join("db");
+        let before = dir_names(&db_dir);
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--db".to_string(),
+            "logs".to_string(),
+            "SELECT COUNT(*) FROM logs".to_string(),
+        ];
+        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a spent read budget must fail the read");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("'logs'"), "error must name the store: {msg}");
+        assert!(
+            msg.contains("0s read limit"),
+            "error must name the limit: {msg}"
+        );
+        assert!(
+            msg.contains(read_limit::ENV),
+            "error must name the knob: {msg}"
+        );
+        assert_eq!(
+            dir_names(&db_dir),
+            before,
+            "a spent budget must fail before the store is opened"
+        );
+    }
+
+    /// The limit's verdict is final: a direct read that ran past the limit is the
+    /// limit's failure even though it came back with a value. The runner here
+    /// stands in for a real query — the same open+run stack, only slow enough to
+    /// outlive the budget. In a test binary the watchdog is off, so what ends the
+    /// read is the limit's own check at the end of it.
+    ///
+    /// The dump route shares that stack (`open_and_dump_readonly`), and a dump is
+    /// walked table by table with the budget asked between tables, so its
+    /// end-of-read verdict is the same check this test pins. `--db all` is where a
+    /// spent budget across stores is pinned, by its summary.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn run_debug_read_limit_fails_a_read_that_finished_after_it() {
+        let _env = crate::util::test::set_env_var(read_limit::ENV, Some("1"));
+        let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        // The direct read-only open is a second opener of this file: close the
+        // fixture's writing connection first.
+        drop(store);
+        let db_path = dir.path().join("db").join("logs.db");
+
+        let budget = Budget::start();
+        let read = Read::direct("logs", &budget);
+        let err = open_and_run_readonly(read, &db_path, |_read, _io, _db, _path| {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            Ok("COUNT(*)\n1\n".to_string())
+        })
+        .expect_err("a read that finished after the limit must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("'logs'"), "error must name the store: {msg}");
+        assert!(
+            msg.contains("1s read limit"),
+            "error must name the limit: {msg}"
+        );
+    }
+
+    /// The `--family` snapshot route reads under the same command budget and on the
+    /// same read-only stack as the `--db` routes ([`open_and_run_readonly`]), so with
+    /// the budget spent it fails naming the family id it was given, before the
+    /// snapshot file is opened. The stack's end-of-read verdict — a read that comes
+    /// back past the limit is the limit's failure — is pinned deterministically by
+    /// `run_debug_read_limit_fails_a_read_that_finished_after_it`.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn run_debug_read_limit_fails_the_family_route() {
+        let _env = crate::util::test::set_env_var(read_limit::ENV, Some("0"));
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let fam = "logs.db.quarantine-20260812T120000Z-4242";
+        std::fs::write(db_dir.join(fam), valid_db_bytes()).unwrap();
+
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--family".to_string(),
+            fam.to_string(),
+            "SELECT 1".to_string(),
+        ];
+        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a spent read budget must fail the family read");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(fam), "error must name the family id: {msg}");
+        assert!(
+            msg.contains("0s read limit"),
+            "error must name the limit: {msg}"
+        );
+    }
+
+    /// `--db all` under a spent budget reports every remaining store as not read
+    /// and exits non-zero through the per-store summary — never an empty result
+    /// and never a silent skip. The per-store "was not read" lines are stderr text,
+    /// which a test cannot capture in-process; what is pinned here is that every
+    /// store the walk reached is counted as failed and the exit is non-zero.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn run_debug_read_limit_fails_db_all_with_a_summary() {
+        let _env = crate::util::test::set_env_var(read_limit::ENV, Some("0"));
+        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--db".to_string(),
+            "all".to_string(),
+        ];
+        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a spent budget must fail --db all");
+        let msg = format!("{err:#}");
+        let total = physical_store_list(dir.path()).len();
+        assert!(
+            msg.contains(&format!("{total} of {total} store(s) failed")),
+            "must summarize every store as failed, got: {msg}"
         );
     }
 
@@ -1758,6 +1942,7 @@ mod tests {
     /// Query-error paths report distinct, clear messages: a sidecar-only
     /// quarantine (no main DB) and a garbage main DB both fail without
     /// crashing, naming the family.
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_family_error_paths_report_clear_errors() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1808,6 +1993,7 @@ mod tests {
 
     /// A forensic family (db + wal) is queried **in place** — the read-only
     /// open must not create or modify any file beside the family.
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_queries_a_family_in_place() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
@@ -1889,7 +2075,10 @@ mod tests {
         }
 
         // Data fidelity: the wal-only committed row must be visible.
-        let out = execute_family_query(fam, "SELECT COUNT(*) FROM tool_calls", dir.path()).unwrap();
+        let budget = Budget::start();
+        let read = Read::direct(fam, &budget);
+        let out =
+            execute_family_query(read, fam, "SELECT COUNT(*) FROM tool_calls", dir.path()).unwrap();
         assert_eq!(
             out, "COUNT(*)\n1\n",
             "in-place query must read the wal-only row"
@@ -2013,6 +2202,7 @@ mod tests {
     /// End-to-end no-instance path: a row committed to the WAL (the store is
     /// dropped without a checkpoint) is visible through the direct
     /// single-process read-only open — no IPC, no running instance.
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_without_an_instance_reads_committed_wal() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
@@ -2047,8 +2237,10 @@ mod tests {
 
         // Prove the WAL-only row is actually visible via the direct open.
         let db_path = dir.path().join("db").join("logs.db");
-        let out = open_and_run_readonly(&db_path, |io, db, path| {
-            connect_execute(io, db, "SELECT COUNT(*) FROM logs", path)
+        let budget = Budget::start();
+        let read = Read::direct("logs", &budget);
+        let out = open_and_run_readonly(read, &db_path, |read, io, db, path| {
+            connect_execute(read, io, db, "SELECT COUNT(*) FROM logs", path)
         })
         .expect("direct read-only open must succeed");
         assert_eq!(
@@ -2074,9 +2266,9 @@ mod tests {
     /// through the channel instead of opening the store: the CLI's own root
     /// holds no openable store here, so a successful read can only have come
     /// from the running instance's endpoint.
-    // `ipc_bound` is shared with the refusal test: the bounded retry below is
-    // what shrinking `MAHBOT_IPC_BOUND_TIMEOUT_SECS` turns off.
-    #[serial_test::serial(ipc_bound)]
+    // `read_limit` is shared with the refusal test: both read/shrink the same
+    // process-global read-limit knob.
+    #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_reaches_a_held_location_through_the_channel() {
         // The instance side: a live store in a root of its own.
@@ -2122,13 +2314,15 @@ mod tests {
     /// alone. The store here is a real one the CLI could read directly, so an
     /// `Ok` would mean it opened the live store behind the instance's back.
     #[tokio::test]
-    // `ipc_bound` is shared with the IPC e2e test: shrinking the bound below
-    // would make its bounded retry give up.
-    #[serial_test::serial(ipc_bound)]
+    // `read_limit` is shared with the held-location test: both read the same
+    // process-global knob, and shrinking it is what keeps this refusal short.
+    #[serial_test::serial(read_limit)]
     async fn run_debug_refuses_a_held_location_without_a_channel() {
-        // 0 = give up after the first attempt, so the refusal is immediate
-        // instead of waiting out the default channel-bound window.
-        let _env = crate::util::test::set_env_var("MAHBOT_IPC_BOUND_TIMEOUT_SECS", Some("0"));
+        // One second, not zero: a spent budget is reported as the limit's own
+        // failure without ever reaching the channel, which is a different
+        // sentence — this test is about the channel that cannot be reached, so
+        // the retries must still happen, within a second instead of the default.
+        let _env = crate::util::test::set_env_var(read_limit::ENV, Some("1"));
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let _held = hold_location(dir.path());
 
@@ -2171,5 +2365,69 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("cannot tell whether"), "got: {msg}");
         assert!(msg.contains("left untouched"), "got: {msg}");
+    }
+
+    /// Marker for the spawned child of
+    /// [`run_debug_read_limit_watchdog_ends_a_wedged_read`]: it runs the child
+    /// test instead of the suite's tests. Set only by the driver below.
+    const WATCHDOG_CHILD_ENV: &str = "MAHBOT_DEBUG_READ_WATCHDOG_CHILD";
+
+    /// The watchdog is the half of the read limit that does not depend on the
+    /// read yielding: a read that never returns is ended by the process exiting
+    /// with the limit's own failure. Proven across two processes — the only way
+    /// to observe "the process is gone".
+    #[test]
+    fn run_debug_read_limit_watchdog_ends_a_wedged_read() {
+        let started = std::time::Instant::now();
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--ignored",
+                "--nocapture",
+                "debug_read_limit_watchdog_child",
+            ])
+            .env(WATCHDOG_CHILD_ENV, "1")
+            // 1s budget: the watchdog's own grace puts the cutoff at ~2s, far
+            // short of the child's 30s sleep.
+            .env(read_limit::ENV, "1")
+            .output()
+            .expect("spawn the watchdog child");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        assert!(
+            !child.status.success(),
+            "the watchdog must end the child:\n{text}"
+        );
+        assert!(text.contains("'logs' was not read"), "got: {text}");
+        assert!(text.contains("1s read limit"), "got: {text}");
+        assert!(text.contains(read_limit::ENV), "got: {text}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the watchdog must cut the read well before the child's own idle sleep: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Child mode for [`run_debug_read_limit_watchdog_ends_a_wedged_read`]: hold
+    /// a read that never yields and let the watchdog end the process. The 30s
+    /// sleep then panic is what fails the driver (instead of hanging it) when
+    /// the watchdog does not fire.
+    #[test]
+    #[ignore = "driven by run_debug_read_limit_watchdog_ends_a_wedged_read"]
+    fn debug_read_limit_watchdog_child() {
+        if std::env::var_os(WATCHDOG_CHILD_ENV).is_none() {
+            return;
+        }
+        let budget = Budget::start();
+        let read = Read::direct("logs", &budget);
+        // A test binary's watchdog does not end the process (see
+        // [`read_limit::enable_process_exit`]); this child IS the process that
+        // proves it does.
+        read_limit::enable_process_exit();
+        let _watchdog = read.arm().expect("the child's budget must be live");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        panic!("the read limit's watchdog did not end the process");
     }
 }
