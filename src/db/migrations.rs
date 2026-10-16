@@ -69,9 +69,11 @@
 //! `telegram_bursts` table — the durable record of every released burst. `62`
 //! moves the personal-workspace change baseline off the `session_metadata` row
 //! into its own `session_personal_changes` table, carrying every recorded
-//! baseline across, and `63` drops the retired column.
+//! baseline across, and `63` drops the retired column. `64` drops the logs
+//! store's observability indexes that no product query's plan reaches (see
+//! [`DROP_UNUSED_LOGS_INDEXES`]).
 //!
-//! Future schema changes resume the chain at id `64` with monotonically
+//! Future schema changes resume the chain at id `65` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -464,26 +466,13 @@ CREATE TABLE IF NOT EXISTS grep_telemetry (
     exit_code     INTEGER
 );
 -- ── Indexes ────────────────────────────────────────────────────────────
-CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
+-- Only the indexes a product query's plan reaches. The write-only rest are
+-- dropped by [`DROP_UNUSED_LOGS_INDEXES`], which carries the audit.
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
-CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
-CREATE INDEX IF NOT EXISTS idx_logs_agent_role ON logs(agent_role);
-CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
-CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_recorded_at ON grep_telemetry(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_grep_telemetry_served ON grep_telemetry(served);
-CREATE INDEX IF NOT EXISTS idx_grep_telemetry_reason ON grep_telemetry(reason);
-CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command);
 -- ── Per-attempt LLM failure trail ──────────────────────────────────────
 CREATE TABLE IF NOT EXISTS llm_failures (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -502,14 +491,14 @@ CREATE TABLE IF NOT EXISTS llm_failures (
     finish_reason       TEXT,
     retry_after_ms      INTEGER,
     error_chain         TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_llm_failures_recorded_at ON llm_failures(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_llm_failures_operation_id ON llm_failures(operation_id);
-CREATE INDEX IF NOT EXISTS idx_llm_failures_failure_class ON llm_failures(failure_class);";
+);";
 
 /// Delta `35` (existing installs): the per-attempt `llm_failures` trail for
 /// the logs store. Fresh installs create the table in the baseline (`26`),
 /// making this a no-op there; every statement is `IF NOT EXISTS`.
+///
+/// The table carries no index — no production statement reads it (see
+/// [`DROP_UNUSED_LOGS_INDEXES`]).
 const ADD_LLM_FAILURES: &str = "CREATE TABLE IF NOT EXISTS llm_failures (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_id        TEXT NOT NULL,
@@ -527,10 +516,68 @@ const ADD_LLM_FAILURES: &str = "CREATE TABLE IF NOT EXISTS llm_failures (
     finish_reason       TEXT,
     retry_after_ms      INTEGER,
     error_chain         TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_llm_failures_recorded_at ON llm_failures(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_llm_failures_operation_id ON llm_failures(operation_id);
-CREATE INDEX IF NOT EXISTS idx_llm_failures_failure_class ON llm_failures(failure_class);";
+);";
+
+/// Catalog `64`: drop the logs store's indexes that no product query's plan
+/// reaches.
+///
+/// # The audit
+///
+/// Every production statement against these tables was planned through the
+/// debug surface's `EXPLAIN QUERY PLAN`. The kept indexes are the ones a
+/// predicate or an ordering was planned onto:
+///
+/// - `logs` — the Issues tab's count and list (`level IN (…)`) and the INFO
+///   retention (`level = 'INFO' AND timestamp < ?`) all plan on
+///   `idx_logs_level`. The tab's `target`/`since` filters are never set, and
+///   `agent_id`/`agent_role`/`workspace` appear in no predicate; `timestamp`
+///   loses to `idx_logs_level` for the retention range.
+/// - `tool_calls` — the Tool Failures count plans on
+///   `idx_tool_calls_error_message` (covering) and its list on
+///   `idx_tool_calls_recorded_at` (the `ORDER BY recorded_at DESC`); the two
+///   retention rules search exactly those (`error_message = ?`, then
+///   `recorded_at < ?`). `agent_id`/`role`/`tool_name`/`workspace` appear in no
+///   predicate or ordering.
+/// - `llm_requests` — the retention delete's `recorded_at < ?` plans on
+///   `idx_llm_requests_recorded_at`. `agent_id`/`model`/`purpose` are written
+///   and never read.
+/// - `llm_failures` — no production statement reads this table at all; only
+///   `record_llm_failure_row` writes it, and retention deliberately keeps it.
+/// - `grep_telemetry` — the retention delete's `recorded_at < ?` plans on
+///   `idx_grep_telemetry_recorded_at`. `served`/`reason`/`command` are written
+///   and never read.
+///
+/// A filterless `COUNT(*)` (the All Logs total, and `mahbot debug`'s schema
+/// dump) plans onto whichever index it happens to pick as a covering scan — it
+/// has no predicate and is served by any index or by the table itself, so that
+/// pick is not a dependency and its total is unchanged once the index is gone.
+///
+/// # Effect
+///
+/// Only indexes are dropped — no table, column or row changes, and the freed
+/// pages go to the free pool rather than shrinking the file. Every drop is
+/// `IF EXISTS`, so the entry is a no-op on a store whose baseline (`26`) and
+/// delta (`35`) already carry only the kept set; a fresh install never builds
+/// an index this entry would drop.
+const DROP_UNUSED_LOGS_INDEXES: &str = "\
+DROP INDEX IF EXISTS idx_logs_timestamp;
+DROP INDEX IF EXISTS idx_logs_target;
+DROP INDEX IF EXISTS idx_logs_agent_role;
+DROP INDEX IF EXISTS idx_logs_agent_id;
+DROP INDEX IF EXISTS idx_logs_workspace;
+DROP INDEX IF EXISTS idx_tool_calls_agent_id;
+DROP INDEX IF EXISTS idx_tool_calls_role;
+DROP INDEX IF EXISTS idx_tool_calls_tool_name;
+DROP INDEX IF EXISTS idx_tool_calls_workspace;
+DROP INDEX IF EXISTS idx_llm_requests_agent_id;
+DROP INDEX IF EXISTS idx_llm_requests_model;
+DROP INDEX IF EXISTS idx_llm_requests_purpose;
+DROP INDEX IF EXISTS idx_llm_failures_recorded_at;
+DROP INDEX IF EXISTS idx_llm_failures_operation_id;
+DROP INDEX IF EXISTS idx_llm_failures_failure_class;
+DROP INDEX IF EXISTS idx_grep_telemetry_served;
+DROP INDEX IF EXISTS idx_grep_telemetry_reason;
+DROP INDEX IF EXISTS idx_grep_telemetry_command;";
 
 /// One-shot data migration (`37`).
 ///
@@ -1047,6 +1094,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "63",
         target: TargetDb::Core,
         body: MigrationBody::Rust(drop_personal_changes_column),
+    },
+    Migration {
+        id: "64",
+        target: TargetDb::Logs,
+        body: MigrationBody::Sql(DROP_UNUSED_LOGS_INDEXES),
     },
 ];
 
@@ -2393,30 +2445,14 @@ mod tests {
         ),
     ];
 
+    /// The indexes a fresh logs store carries: only the ones a product query's
+    /// plan reaches (see [`DROP_UNUSED_LOGS_INDEXES`]).
     const EXPECTED_LOGS_INDEXES: &[&str] = &[
-        "idx_logs_timestamp",
         "idx_logs_level",
-        "idx_logs_target",
-        "idx_logs_agent_role",
-        "idx_logs_agent_id",
-        "idx_logs_workspace",
-        "idx_tool_calls_agent_id",
-        "idx_tool_calls_role",
-        "idx_tool_calls_tool_name",
         "idx_tool_calls_recorded_at",
-        "idx_tool_calls_workspace",
         "idx_tool_calls_error_message",
         "idx_llm_requests_recorded_at",
-        "idx_llm_requests_agent_id",
-        "idx_llm_requests_model",
-        "idx_llm_requests_purpose",
-        "idx_llm_failures_recorded_at",
-        "idx_llm_failures_operation_id",
-        "idx_llm_failures_failure_class",
         "idx_grep_telemetry_recorded_at",
-        "idx_grep_telemetry_served",
-        "idx_grep_telemetry_reason",
-        "idx_grep_telemetry_command",
     ];
 
     /// All expected core table names.
@@ -3479,8 +3515,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// A fresh logs store runs the baseline (`26`) plus the delta `35` and
-    /// delta `58` upfills and converges to the exact current logs shape
-    /// (logs/tool_calls/llm_requests/llm_failures + grep_telemetry).
+    /// delta `58` upfills and the delta `64` index drops, and converges to the
+    /// exact current logs shape (logs/tool_calls/llm_requests/llm_failures +
+    /// grep_telemetry, carrying only the indexes a product query's plan
+    /// reaches).
     #[tokio::test]
     async fn fresh_logs_install_converges_to_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3507,14 +3545,84 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         applied.sort();
         assert_eq!(
             applied,
-            vec!["26".to_string(), "35".to_string(), "58".to_string()],
-            "fresh logs applies baseline 26 + delta 35 + delta 58 exactly"
+            vec![
+                "26".to_string(),
+                "35".to_string(),
+                "58".to_string(),
+                "64".to_string()
+            ],
+            "fresh logs applies baseline 26 + delta 35 + delta 58 + delta 64 exactly"
         );
+    }
+
+    /// The upgrade a live install takes: a current-shape store that still
+    /// carries the full pre-`64` index set drops exactly the unused ones on
+    /// reopen and ends with the fresh store's index set — the fresh/existing
+    /// convergence `64` guarantees.
+    #[tokio::test]
+    async fn a_pre_delta_64_store_converges_to_the_kept_index_set_on_reopen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(root, crate::db::LOG_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open logs");
+        run_migrations(&conn, TargetDb::Logs)
+            .await
+            .expect("catalog");
+        // Rebuild the pre-`64` shape: every index the old baseline and the grep
+        // telemetry upfill created, plus the three the old `llm_failures` DDL
+        // carried, with the drop no longer recorded.
+        conn.execute_batch(OLD_BASELINE_LOGS_INDEXES)
+            .await
+            .expect("old baseline index DDL");
+        conn.execute_batch(OLD_DELTA_GREP_TELEMETRY)
+            .await
+            .expect("old grep telemetry DDL");
+        for ddl in [
+            "CREATE INDEX IF NOT EXISTS idx_llm_failures_recorded_at ON llm_failures(recorded_at)",
+            "CREATE INDEX IF NOT EXISTS idx_llm_failures_operation_id ON llm_failures(operation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_llm_failures_failure_class ON llm_failures(failure_class)",
+        ] {
+            conn.execute(ddl, ())
+                .await
+                .expect("old llm_failures index DDL");
+        }
+        conn.execute("DELETE FROM schema_migrations WHERE id = '64'", ())
+            .await
+            .expect("forget delta 64");
+        let before = index_defs(&conn).await;
+        for idx in [
+            "idx_logs_agent_id",
+            "idx_tool_calls_tool_name",
+            "idx_llm_requests_purpose",
+            "idx_llm_failures_operation_id",
+            "idx_grep_telemetry_reason",
+        ] {
+            assert!(
+                before.contains_key(idx),
+                "the fixture must carry the index delta 64 removes, missing {idx}"
+            );
+        }
+
+        run_migrations(&conn, TargetDb::Logs).await.expect("reopen");
+
+        assert_schema_matches(
+            &conn,
+            EXPECTED_LOGS_TABLE_COLUMNS,
+            EXPECTED_LOGS_INDEXES,
+            "pre-delta-64 reopen",
+        )
+        .await;
     }
 
     /// The common upgrade path: a database that already applied the logs
     /// baseline (`26`) — no `llm_failures` — gains the table through delta
-    /// `35` on reopen (and the `tool_calls.source` column through delta `58`).
+    /// `35` on reopen (the `tool_calls.source` column through delta `58`, the
+    /// unused-index drops through delta `64`), converging to the current shape
+    /// with no index on the write-only `llm_failures` table.
     #[tokio::test]
     async fn baseline_logs_db_gains_llm_failures_via_delta_35() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3543,29 +3651,24 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         applied.sort();
         assert_eq!(
             applied,
-            vec!["26".to_string(), "35".to_string(), "58".to_string()],
-            "reopen must record exactly 26 + 35 + 58"
+            vec![
+                "26".to_string(),
+                "35".to_string(),
+                "58".to_string(),
+                "64".to_string()
+            ],
+            "reopen must record exactly 26 + 35 + 58 + 64"
         );
-        let (_, cols) = EXPECTED_LOGS_TABLE_COLUMNS
-            .iter()
-            .find(|(n, _)| *n == "llm_failures")
-            .expect("pinned llm_failures shape");
-        let expected_cols: Vec<String> = cols.iter().map(|s| (*s).to_string()).collect();
-        assert_eq!(
-            column_names(&conn, "llm_failures").await,
-            expected_cols,
-            "delta 35 must create llm_failures with the pinned shape"
-        );
-        for idx in [
-            "idx_llm_failures_recorded_at",
-            "idx_llm_failures_operation_id",
-            "idx_llm_failures_failure_class",
-        ] {
-            assert!(
-                index_defs(&conn).await.contains_key(idx),
-                "delta 35 must create index {idx}"
-            );
-        }
+        // The reopen converges to the current logs shape, which proves both the
+        // delta-35 `llm_failures` upfill and delta 64's exact index set (none
+        // of them on `llm_failures`).
+        assert_schema_matches(
+            &conn,
+            EXPECTED_LOGS_TABLE_COLUMNS,
+            EXPECTED_LOGS_INDEXES,
+            "reopened baseline logs db",
+        )
+        .await;
     }
 
     /// Seed representative domain rows into a fully current-shape core
@@ -3940,18 +4043,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The logs fleet-wide boot-safety pin: an old-catalog logs store (ids
     /// `8`/`9`/`14`) reopens through the logs baseline (`26`), the delta `35`
-    /// upfill and the delta `58` column upfill — everything except the new
-    /// `llm_failures` table (and its indexes) and the appended
-    /// `tool_calls.source` column is unchanged, and the upfill lands the new
-    /// table on existing installs.
+    /// upfill, the delta `58` column upfill and the delta `64` index drops —
+    /// the table DDL is unchanged except the new `llm_failures` table and the
+    /// appended `tool_calls.source` column, and the index set converges to the
+    /// kept indexes (every write-only one the old shape carried is gone).
     #[tokio::test]
     async fn old_catalog_logs_db_reopens_as_noop() {
         const NEW_TABLE: &str = "llm_failures";
-        const NEW_INDEXES: [&str; 3] = [
-            "idx_llm_failures_recorded_at",
-            "idx_llm_failures_operation_id",
-            "idx_llm_failures_failure_class",
-        ];
         // `llm_failures` does not exist in the old-catalog shape, and delta `58`
         // appends a column to `tool_calls` — exclude both from the
         // unchanged-reopen comparison; their arrival on reopen is asserted
@@ -3993,12 +4091,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("26".to_string());
         expected_ids.push("35".to_string());
         expected_ids.push("58".to_string());
+        expected_ids.push("64".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "logs reopen must record exactly old ids ∪ 26 ∪ 35 ∪ 58"
+            "logs reopen must record exactly old ids ∪ 26 ∪ 35 ∪ 58 ∪ 64"
         );
 
         assert_eq!(
@@ -4006,11 +4105,6 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             without(&before_tables, &[NEW_TABLE, "tool_calls"]),
             "logs table DDL (except {NEW_TABLE} and the delta-58 tool_calls column) must be \
              unchanged on reopen"
-        );
-        assert_eq!(
-            without(&index_defs(&conn).await, &NEW_INDEXES),
-            without(&before_indexes, &NEW_INDEXES),
-            "logs index definitions (except {NEW_INDEXES:?}) must be unchanged on reopen"
         );
         assert_eq!(
             table_row_counts(&conn, &counts_tables).await,
@@ -4036,13 +4130,25 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             after_tables.contains_key(NEW_TABLE),
             "delta 35 must create {NEW_TABLE} on existing installs"
         );
-        let after_indexes = index_defs(&conn).await;
-        for idx in NEW_INDEXES {
-            assert!(
-                after_indexes.contains_key(idx),
-                "delta 35 must create index {idx}"
-            );
-        }
+
+        // Delta `64` must drop the write-only observability indexes: the reopen
+        // converges the index set to the kept ones, so every index the old shape
+        // carried and nothing reads is gone.
+        assert!(
+            before_indexes.contains_key("idx_logs_agent_id"),
+            "the old shape must carry an index delta 64 removes"
+        );
+        let mut actual: Vec<String> = index_defs(&conn).await.into_keys().collect();
+        actual.sort();
+        let mut expected: Vec<String> = EXPECTED_LOGS_INDEXES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "reopen must converge the logs index set to the kept indexes"
+        );
     }
 
     /// The 0.5.0 (one-delta-behind) upgrade: a database built by the retired
