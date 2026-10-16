@@ -65,6 +65,17 @@ static LINK_ENRICHER_SEQ: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 const AUDIO_ICON: &str = "🔊✍️";
 
+/// A transcribed message as it is presented: the audio icon combo, one space,
+/// then the text. The one definition of the marker's form — an inbound audio
+/// attachment and a locally recorded voice note (`audio::voice::route_to_agent`)
+/// both go through it, so a spoken message reads the same however it reached
+/// the product.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn marked_transcript(text: &str) -> String {
+    format!("{AUDIO_ICON} {text}")
+}
+
 /// Annotation for an `[AUDIO:...]` marker on a platform with no local audio
 /// subsystem: the marker cannot be consumed there, so the model gets an honest
 /// note instead of the bare icon macOS falls back to.
@@ -106,7 +117,7 @@ async fn transcribe_audio_marker(path: &str) -> String {
                 return if text.is_empty() {
                     AUDIO_ICON.to_string()
                 } else {
-                    format!("{AUDIO_ICON} {text}")
+                    marked_transcript(text)
                 };
             }
             Err(e) => {

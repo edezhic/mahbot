@@ -24,9 +24,9 @@
 //!    sounds (see [`crate::audio::cue`]) mark the start and the end of the
 //!    recording.
 //! 6. **Transcription** — via the shared Qwen3-ASR local transcriber
-//! 7. **Routing** — transcribed text is routed to the admin's Assistant via
-//!    [`route_to_agent`] (the desktop GUI has a single acting identity, the
-//!    seeded admin account).
+//! 7. **Routing** — the transcribed text is marked with the audio-icon combo and
+//!    routed to the admin's Assistant via [`route_to_agent`] (the desktop GUI
+//!    has a single acting identity, the seeded admin account).
 //!
 //! The pipeline runs unconditionally as a boot background task. It does NOT
 //! use an LLM agent loop.
@@ -1678,14 +1678,17 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
     crate::channels::broadcast_and_persist_incoming_message(&msg, transcript, transcript).await;
 }
 
-/// Route a transcribed voice command to the admin's Assistant.
+/// Route a transcribed voice command to the admin's Assistant, marking the
+/// transcript with the audio-icon combo before it is broadcast and routed, so
+/// the owner and the Assistant read the same text.
 ///
 /// The desktop GUI has a single acting identity — the seeded admin — so the
 /// transcript goes to the admin's Assistant session and workspace, then through
 /// the agent-ID message router. Assistant pinning happens here, before the
 /// broadcast, so the transcript is announced in the workspace the agent
 /// actually runs in.
-async fn route_to_agent(text: String) {
+async fn route_to_agent(transcript: String) {
+    let transcript = crate::channels::marked_transcript(&transcript);
     let user_name = crate::users::ADMIN_USER_NAME;
     let role = crate::Role::Assistant;
     let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
@@ -1698,10 +1701,10 @@ async fn route_to_agent(text: String) {
 
     // Broadcast before routing so the transcript appears immediately
     // while the agent is still working.
-    broadcast_voice_transcript(&text, user_name, &ws.name).await;
+    broadcast_voice_transcript(&transcript, user_name, &ws.name).await;
 
     crate::agent::message_router::route_user_message(
-        text,
+        transcript,
         ws.name,
         user_name.to_string(),
         "voice".to_string(),

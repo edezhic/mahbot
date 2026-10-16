@@ -6,6 +6,8 @@ pub mod telegram;
 mod telegram_group;
 pub(crate) mod telegram_intake;
 pub use chat_history::run_cap_loop;
+#[cfg(target_os = "macos")]
+pub(crate) use enrichment::marked_transcript;
 pub use enrichment::{enrich_links, enrich_message};
 pub use reply::{ReplyReference, apply_reply_marker};
 pub use telegram::mirror_gui_message_to_telegram;
