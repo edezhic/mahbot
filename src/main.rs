@@ -243,11 +243,11 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
             "Session cleanup",
             mahbot::jobs::PURGE_CUTOFF_HOURS,
             |cutoff| async move {
-                // Stale-job purge FIRST (single-connection orchestrator: board rollback +
-                // sessions DELETE) — protected sessions only become eligible for
-                // the TTL guard after the purge cascade removes their job rows.
+                // Stale-job purge FIRST: protected sessions only become eligible
+                // for the session TTL after the purge cascade removes their job
+                // rows. The session TTL derives its own, shorter window.
                 let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
-                let cleaned = mahbot::session::cleanup_old_transient_sessions(&cutoff).await?;
+                let cleaned = mahbot::session::cleanup_old_transient_sessions().await?;
                 // Assistant generated/uploads keep-detection — after the purge
                 // so the jobs-state is final; assistant sessions are never
                 // transient, so keep-evidence is live regardless of ordering.
@@ -953,7 +953,8 @@ fn dashboard_window_settings(state: &mahbot::gui::WindowState) -> iced::window::
 
 /// Background cleanup loop adapter — runs every 10 minutes until cancelled
 /// or the graceful drain begins (stale purge must not race the drain).
-/// `cutoff_hours` is the retention window for this specific cleanup policy.
+/// `cutoff_hours` is the window of the one step that takes the derived cutoff
+/// (the stale-job purge); other steps own theirs.
 async fn run_cleanup_loop<F, Fut>(label: &'static str, cutoff_hours: i64, cleanup: F)
 where
     F: Fn(String) -> Fut + Send + 'static,

@@ -257,11 +257,11 @@ impl ResearchState {
     }
 
     /// Collect the given dispatched agents' raw shell commands from their
-    /// persisted sessions (right after each completed round — early sessions
-    /// of >8h runs are TTL'd, so collection must be incremental). UNFILTERED:
-    /// the full command history is written to the run folder dump; the
-    /// Sanitation cleanup agent does the attribution. `job_id` is threaded to
-    /// the dump write for its logging.
+    /// persisted sessions (right after each completed round — a run longer
+    /// than the session TTL loses its early sessions to it, so collection
+    /// must be incremental). UNFILTERED: the full command history is written
+    /// to the run folder dump; the Sanitation cleanup agent does the
+    /// attribution. `job_id` is threaded to the dump write for its logging.
     async fn capture_round(&mut self, job_id: &str, agent_ids: &[String], run_root: &Path) {
         let fresh = crate::research_cleanup::collect_agent_shell_commands(agent_ids).await;
         for cmd in fresh {

@@ -18,7 +18,7 @@ pub(crate) use transcript::{TRANSCRIPT_REGISTRY, TranscriptSnapshot};
 use crate::db::{self, IntoParams, Row, TxGuard, Value, params};
 use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::borrow::Cow;
 
 // The summarization LLM call lives in `crate::Agent::summarize` so that all
@@ -1577,8 +1577,20 @@ impl SessionStore {
     }
 }
 
-/// Delete all transient (background-only) sessions whose `last_activity` is older than
-/// the given RFC 3339 `cutoff`. Returns the number of deleted session metadata rows.
+/// Inactivity window of a transient session: one silent for longer than this
+/// is removed by [`cleanup_old_transient_sessions`] on the next pass.
+///
+/// The clock is `session_metadata.last_activity` — bumped by message traffic
+/// only, so metadata-only work does not extend a session's life.
+///
+/// Deliberately independent of the windows around it: the stale-job purge
+/// keeps [`crate::jobs::PURGE_CUTOFF_HOURS`] and the log store keeps its own,
+/// and neither follows this one.
+const TRANSIENT_SESSION_TTL_HOURS: i64 = 2;
+
+/// Delete all transient (background-only) sessions inactive for longer than
+/// [`TRANSIENT_SESSION_TTL_HOURS`]. Returns the number of deleted session
+/// metadata rows.
 ///
 /// Transient agent IDs start with the prefixes listed in
 /// `TRANSIENT_AGENT_ID_PREFIXES`.
@@ -1587,7 +1599,8 @@ impl SessionStore {
 /// The launch folders of the purged rows are released with them — this is where a
 /// one-off custom-role run's search engine dies (see
 /// [`crate::search_engine::release_path_named_engine`]).
-pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
+pub async fn cleanup_old_transient_sessions() -> Result<u64> {
+    let cutoff = (Utc::now() - ChronoDuration::hours(TRANSIENT_SESSION_TTL_HOURS)).to_rfc3339();
     let session_store = store();
     let tx = session_store.conn.begin_tx().await?;
 
@@ -1598,7 +1611,7 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
         .join(" OR ");
     let prefix_patterns = format!("({likes})");
 
-    let mut build_params = vec![Value::Text(cutoff.to_string())];
+    let mut build_params = vec![Value::Text(cutoff)];
     build_params.extend(
         TRANSIENT_AGENT_ID_PREFIXES
             .iter()
@@ -1891,7 +1904,7 @@ fn transient_agent_id(prefix: &str, ws_name: &str, label: &str) -> String {
 /// A stable ID makes runs resumable: the next maintainer cycle (including after a
 /// daemon restart) picks up the interrupted session instead of restarting from
 /// scratch. Keep `maintainer_` registered in [`TRANSIENT_AGENT_ID_PREFIXES`] so the
-/// 8h TTL purge still applies to stale maintainer sessions.
+/// transient TTL purge still applies to stale maintainer sessions.
 #[must_use]
 pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
     format!("maintainer_{ws_name}")
@@ -2633,17 +2646,40 @@ mod tests {
             )
             .await
             .unwrap();
-        let deleted = cleanup_old_transient_sessions(&crate::db::now())
+        // Backdate past the TTL window — the literal is deliberate, so a window
+        // widened back to the old eight hours fails here.
+        let past = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        store()
+            .conn
+            .execute(
+                "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = ?2",
+                crate::db::params![past, stale.as_str()],
+            )
             .await
             .unwrap();
+
+        // A transient session still inside the window must survive: the reaper
+        // removes what is older than the window, not whatever is transient.
+        let fresh = format!("ticket_{}", unique_key());
+        store()
+            .append_with_context(
+                &fresh,
+                &ChatMessage::user("u1"),
+                BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
+            )
+            .await
+            .unwrap();
+
+        let deleted = cleanup_old_transient_sessions().await.unwrap();
         assert!(deleted >= 1, "TTL cleanup must remove the stale session");
+        let remaining = store().list_sessions_with_metadata().await;
         assert!(
-            !store()
-                .list_sessions_with_metadata()
-                .await
-                .iter()
-                .any(|s| s.agent_id == stale),
+            !remaining.iter().any(|s| s.agent_id == stale),
             "TTL-cleaned session (and its count) must leave the list"
+        );
+        assert!(
+            remaining.iter().any(|s| s.agent_id == fresh),
+            "a transient session inside the TTL window must survive"
         );
     }
 

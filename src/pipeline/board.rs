@@ -33,7 +33,7 @@ pub async fn run_archive_cancelled_loop() {
         // Session-pin terminal deletion (S5): remove permanently-NULL seats
         // for tickets in a terminal phase — the TTL guard stops protecting
         // the accumulated stage session once the pin is gone
-        // (idempotent, ≤5-min delay against the 8h TTL).
+        // (idempotent, ≤5-min delay against the session TTL).
         crate::jobs::purge_terminal_session_pins().await;
 
         let Some(board) = BOARD.get() else {

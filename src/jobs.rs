@@ -2113,9 +2113,10 @@ fn session_pin_ticket_id(agent_id: &str, role: Role) -> Option<String> {
 /// protect the accumulated engineer/sanitation session across bounce rounds and
 /// re-attempts. Once the ticket reaches a terminal phase (Done/Cancelled/Failed
 /// — no future bounces/resets), the pin is removed so the TTL guard stops
-/// protecting the session (cleaned ≤8h later). Centralized here (5-min archive
-/// loop + boot sweep). Idempotent: parse ticket_id from the pin agent_id,
-/// phase-check on the board side (shared consolidated connection), delete.
+/// protecting the session, which the transient-session TTL then reclaims.
+/// Centralized here (5-min archive loop + boot sweep). Idempotent: parse
+/// ticket_id from the pin agent_id, phase-check on the board side (shared
+/// consolidated connection), delete.
 pub(crate) async fn purge_terminal_session_pins() -> usize {
     let conn = &crate::session::store().conn;
     let Ok(rows) = conn
