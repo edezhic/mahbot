@@ -71,9 +71,10 @@
 //! into its own `session_personal_changes` table, carrying every recorded
 //! baseline across, and `63` drops the retired column. `64` drops the logs
 //! store's observability indexes that no product query's plan reaches (see
-//! [`DROP_UNUSED_LOGS_INDEXES`]).
+//! [`DROP_UNUSED_LOGS_INDEXES`]), and `65` does the same for the core store
+//! (see [`DROP_UNUSED_CORE_INDEXES`]).
 //!
-//! Future schema changes resume the chain at id `65` with monotonically
+//! Future schema changes resume the chain at id `66` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -129,11 +130,9 @@ pub(crate) struct Migration {
 /// `ticket_stage_jobs` artifacts, plus the `jobs.ticket_id` /
 /// `jobs.caller_agent_id`, `session_metadata.created_at`, `chat_history`
 /// `timestamp`/`reply_*`/`broadcast_id`, and `ticket_chronicle`/`alarms` additions) and every
-/// core index — including the tickets FTS index and the `idx_jobs_phase_ticket`
-/// unique index. The `idx_jobs_caller_agent` index is created by delta `28`
-/// (which also upfills `jobs.caller_agent_id` / `session_metadata.created_at`
-/// on upgraded databases), not in this batch — the batch cannot reference a
-/// column that a later Rust delta adds.
+/// core index a product query's plan reaches — including the tickets FTS index
+/// and the `idx_jobs_phase_ticket` unique index. The unreached ones a later
+/// delta drops are never created here (see [`DROP_UNUSED_CORE_INDEXES`]).
 ///
 /// `jobs` is created WITH `caller_agent_id`, `mode`, `exec_dir` and
 /// `custom_launch` as its trailing columns, matching the shape the retired
@@ -374,15 +373,15 @@ CREATE TABLE IF NOT EXISTS custom_roles (
     created_at TEXT NOT NULL
 );
 -- ── Indexes ────────────────────────────────────────────────────────────
+-- Only the indexes a product query's plan reaches, plus the uniqueness ones.
+-- The unreached rest are dropped by [`DROP_UNUSED_CORE_INDEXES`], which
+-- carries the audit.
 CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
-CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_anchor ON agents(agent_id) WHERE job_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target_agent_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS workspace_contexts_null_role ON workspace_contexts(workspace_name) WHERE role IS NULL;
-CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_name);
-CREATE INDEX IF NOT EXISTS idx_chat_history_workspace ON chat_history(workspace);
 CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);
 CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets USING fts (title) WITH (tokenizer = 'ngram');
 CREATE INDEX IF NOT EXISTS idx_tickets_board_active ON tickets (is_archived, priority ASC, created_at DESC);
@@ -578,6 +577,91 @@ DROP INDEX IF EXISTS idx_llm_failures_failure_class;
 DROP INDEX IF EXISTS idx_grep_telemetry_served;
 DROP INDEX IF EXISTS idx_grep_telemetry_reason;
 DROP INDEX IF EXISTS idx_grep_telemetry_command;";
+
+/// Catalog `65`: drop the core store's indexes that no product query's plan
+/// reaches.
+///
+/// # The audit
+///
+/// Every production statement against the core store's tables — every page,
+/// tool, background and periodic pass, retention pass and startup pass — was
+/// planned through the debug surface's `EXPLAIN QUERY PLAN`, a mutating
+/// statement through an equivalent read-only form. The store carries no
+/// `ANALYZE` statistics, so these are the shipped engine's stats-free
+/// heuristics and do not depend on row counts. The kept indexes are the ones a
+/// predicate or an ordering was planned onto:
+///
+/// - `ticket_comments` — `get_comments`' `WHERE ticket_id = ?` plans on
+///   `idx_ticket_comments_ticket_id`.
+/// - `sessions` — every read is scoped by `agent_id`, and the paginated ones
+///   also seek `id` within it: `idx_sessions_agent_id`.
+/// - `jobs` — the research-run lookup, the phase-job lookup, the caller's
+///   launched-job read and the stale purge all plan on
+///   `idx_jobs_kind_status (kind=?)`; `idx_jobs_phase_ticket` is unique.
+/// - `agents` — the session-pin upsert and its delete (`WHERE agent_id = ? AND
+///   job_id IS NULL`) plan on the unique `idx_agents_anchor`.
+/// - `pending_jobs` — the per-target delete plans on
+///   `idx_pending_jobs_agent_created (target_agent_id=?)`.
+/// - `chat_history` — the paged conversation load plans on the composite
+///   `idx_chat_history_user_ws_id`.
+/// - `tickets` — the board listings plan on `idx_tickets_board_active`, which
+///   also supplies their `priority ASC, created_at DESC` ordering, and the
+///   workspace-scoped claim candidates plan on `idx_tickets_workspace_phase`;
+///   the title search goes through the FTS index `idx_tickets_title_fts`.
+/// - `ticket_chronicle` — the trim, the cursor seed and the drain plan on
+///   `idx_ticket_chronicle_ws_id`; `idx_ticket_chronicle_dedup` is unique.
+/// - `alarms` — the due sweep and the per-target listings plan on
+///   `idx_alarms_due`.
+/// - `workspace_contexts` — the `role IS NULL` read plans on
+///   `workspace_contexts_null_role`, which is unique.
+/// - The remaining core tables (`users`, `workspaces`, `session_metadata`,
+///   `session_personal_changes`, `config_kv`, `config_model_routing`,
+///   `editor_tabs`, `user_channels`, `research_jobs`, `ticket_counters`,
+///   `custom_roles`, `telegram_intake`, `telegram_bursts`) carry no product
+///   index beyond their primary key's own.
+///
+/// The removed set, with the statements that name their columns but are served
+/// by another path:
+///
+/// - `idx_jobs_caller_agent` — `abandon_session_jobs`' `DELETE … WHERE mode =
+///   'sync' AND caller_agent_id = ?1` scans `jobs`, and `find_owned_launched_jobs`'
+///   read of the caller's launched sync jobs searches
+///   `idx_jobs_kind_status (kind=?)`. A bare `WHERE caller_agent_id = ?` scans
+///   too: the planner does not derive the partial index's
+///   `caller_agent_id IS NOT NULL` from an equality, so no statement reaches
+///   this index.
+/// - `idx_jobs_updated_at` — the only production statement constraining the
+///   column is `purge_stale_jobs`, and its `updated_at < ?1 AND kind IN (…)`
+///   plan searches `idx_jobs_kind_status (kind=?)`. `updated_at` is otherwise
+///   only ever a SET target, and nothing orders by it.
+/// - `idx_chat_history_user` — a strict prefix of the kept composite
+///   `idx_chat_history_user_ws_id`; no production statement filters
+///   `user_name` alone.
+/// - `idx_chat_history_workspace` — no production statement filters
+///   `chat_history` by `workspace` alone; the conversation-load
+///   `user_name = ?1 AND workspace = ?2` predicate is served by the composite.
+///
+/// An index that exists to enforce a guarantee is kept whatever the plans say:
+/// `idx_jobs_phase_ticket` and `idx_ticket_chronicle_dedup` are enforced on
+/// write and named by no plan. The engine's own indexes — the constraint
+/// autoindexes, the FTS backing objects and the change-capture bookkeeping —
+/// are not the product's to drop. Every statement that names a removed index's
+/// columns has its chosen path in another index or in the table itself, so no
+/// screen's rows, order or totals change.
+///
+/// # Effect
+///
+/// Only indexes are dropped — no table, column or row changes, and the freed
+/// pages go to the free pool rather than shrinking the file. Every drop is
+/// `IF EXISTS`, so the entry is a no-op on a store that already carries only
+/// the kept set; a fresh install never builds an index this entry would drop,
+/// because the baseline (`24`) no longer creates the three it owned and delta
+/// `28` no longer creates the fourth.
+const DROP_UNUSED_CORE_INDEXES: &str = "\
+DROP INDEX IF EXISTS idx_jobs_caller_agent;
+DROP INDEX IF EXISTS idx_jobs_updated_at;
+DROP INDEX IF EXISTS idx_chat_history_user;
+DROP INDEX IF EXISTS idx_chat_history_workspace;";
 
 /// One-shot data migration (`37`).
 ///
@@ -795,7 +879,7 @@ INSERT INTO session_personal_changes (agent_id, baseline)
 /// - `27` adds `workspaces.maintainer_recommendations` via a guarded Rust body —
 ///   a real upfill on existing installs, a no-op on fresh ones.
 /// - `28` adds `jobs.caller_agent_id` / `session_metadata.created_at` via a
-///   guarded Rust body plus the `idx_jobs_caller_agent` index.
+///   guarded Rust body.
 /// - `29` adds the per-user `image_gen_model` / `video_model` columns.
 /// - `30` adds `jobs.mode` and backfills it from the `caller_agent_id`
 ///   NULL-sentinel (sync = has caller pin, async = NULL).
@@ -894,6 +978,10 @@ INSERT INTO session_personal_changes (agent_id, baseline)
 ///   `CREATE TABLE`, so the copy matches no row there).
 /// - `63` drops the retired `session_metadata.personal_changes` column, a no-op
 ///   on fresh installs, whose baseline never declares it.
+/// - `64` drops the logs store's observability indexes that no product query's
+///   plan reaches (see [`DROP_UNUSED_LOGS_INDEXES`]).
+/// - `65` drops the core store's indexes that no product query's plan reaches
+///   (see [`DROP_UNUSED_CORE_INDEXES`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -1099,6 +1187,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "64",
         target: TargetDb::Logs,
         body: MigrationBody::Sql(DROP_UNUSED_LOGS_INDEXES),
+    },
+    Migration {
+        id: "65",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(DROP_UNUSED_CORE_INDEXES),
     },
 ];
 
@@ -1328,20 +1421,12 @@ fn add_jobs_caller_agent_and_session_created_at(
 /// `jobs.caller_agent_id` (the caller agent's stable session pin for sync
 /// analyze/implement jobs; NULL for async/boot-resumed jobs) and
 /// `session_metadata.created_at` (the session's creation timestamp). Fresh
-/// installs get both columns from entry `24`'s
-/// `CREATE TABLE`, so the probes make this a no-op there — and the partial
-/// `idx_jobs_caller_agent` index is likewise a no-op on fresh installs.
-/// Idempotent, non-transactional like every Rust body (re-runnable until
-/// recorded).
+/// installs get both columns from entry `24`'s `CREATE TABLE`, so the probes
+/// make this a no-op there. Idempotent, non-transactional like every Rust body
+/// (re-runnable until recorded).
 async fn run_add_jobs_caller_agent_and_session_created_at(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "jobs", "caller_agent_id", "TEXT").await?;
     add_column_if_missing(conn, "session_metadata", "created_at", "TEXT").await?;
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_jobs_caller_agent \
-         ON jobs(caller_agent_id) WHERE caller_agent_id IS NOT NULL;",
-    )
-    .await
-    .with_context(|| "Failed to create idx_jobs_caller_agent")?;
     Ok(())
 }
 
@@ -2321,25 +2406,34 @@ mod tests {
         ),
     ];
 
+    /// The indexes a fresh core store carries: only the ones a product query's
+    /// plan reaches, plus the uniqueness ones (see
+    /// [`DROP_UNUSED_CORE_INDEXES`]).
     const EXPECTED_CORE_INDEXES: &[&str] = &[
         "idx_ticket_comments_ticket_id",
         "idx_sessions_agent_id",
         "idx_jobs_kind_status",
-        "idx_jobs_updated_at",
         "idx_agents_anchor",
         "idx_pending_jobs_agent_created",
         "workspace_contexts_null_role",
-        "idx_chat_history_user",
-        "idx_chat_history_workspace",
         "idx_chat_history_user_ws_id",
         "idx_tickets_title_fts",
         "idx_tickets_board_active",
         "idx_jobs_phase_ticket",
-        "idx_jobs_caller_agent",
         "idx_ticket_chronicle_ws_id",
         "idx_ticket_chronicle_dedup",
         "idx_alarms_due",
         "idx_tickets_workspace_phase",
+    ];
+
+    /// The indexes delta [`DROP_UNUSED_CORE_INDEXES`] drops — the audit's
+    /// outcome. With [`EXPECTED_CORE_INDEXES`] they are the pre-delta-`65` set a
+    /// store upgrading across this release carries.
+    const REMOVED_CORE_INDEXES: &[&str] = &[
+        "idx_jobs_caller_agent",
+        "idx_jobs_updated_at",
+        "idx_chat_history_user",
+        "idx_chat_history_workspace",
     ];
 
     const EXPECTED_LOGS_TABLE_COLUMNS: &[(&str, &[&str])] = &[
@@ -2506,8 +2600,9 @@ mod tests {
 
     /// Assert that `conn`'s schema matches `expected_tables` (table name-set
     /// equality + per-table column-name SET equality, order-insensitive) and
-    /// `expected_indexes` (explicit index name-set equality). Errors list the
-    /// missing/extra items with `context` for a helpful message.
+    /// `expected_indexes` (explicit index name-set equality, see
+    /// [`assert_index_set`]). Errors list the missing/extra items with
+    /// `context` for a helpful message.
     async fn assert_schema_matches(
         conn: &Connection,
         expected_tables: &[(&str, &[&str])],
@@ -2542,21 +2637,19 @@ mod tests {
             );
         }
 
-        let idx_names: Vec<String> = index_defs(conn).await.into_keys().collect();
-        let actual_idx: std::collections::HashSet<&str> =
-            idx_names.iter().map(String::as_str).collect();
-        let expected_idx: std::collections::HashSet<&str> =
-            expected_indexes.iter().copied().collect();
-        let missing_idx: Vec<&str> = expected_idx.difference(&actual_idx).copied().collect();
-        let extra_idx: Vec<&str> = actual_idx.difference(&expected_idx).copied().collect();
-        assert!(
-            missing_idx.is_empty(),
-            "{context}: missing indexes {missing_idx:?}"
-        );
-        assert!(
-            extra_idx.is_empty(),
-            "{context}: unexpected indexes {extra_idx:?}"
-        );
+        assert_index_set(conn, expected_indexes, context).await;
+    }
+
+    /// Assert that `conn`'s explicit index name set is exactly `expected`.
+    /// Errors list the missing/extra names with `context`.
+    async fn assert_index_set(conn: &Connection, expected: &[&str], context: &str) {
+        let names: Vec<String> = index_defs(conn).await.into_keys().collect();
+        let actual: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        let expected: std::collections::HashSet<&str> = expected.iter().copied().collect();
+        let missing: Vec<&str> = expected.difference(&actual).copied().collect();
+        let extra: Vec<&str> = actual.difference(&expected).copied().collect();
+        assert!(missing.is_empty(), "{context}: missing indexes {missing:?}");
+        assert!(extra.is_empty(), "{context}: unexpected indexes {extra:?}");
     }
 
     /// Table → ordered column names, for before/after snapshots.
@@ -3318,7 +3411,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63`/`65` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -3346,11 +3439,85 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55", "56", "57", "59", "60", "61", "62", "63"
+                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65 tail exactly"
         );
+    }
+
+    /// Delta `65` must have nothing to remove on a fresh install: the only
+    /// creators of the four indexes it drops were the old baseline and delta
+    /// `28`'s body, and this replays the catalog up to the drop to show that
+    /// neither creates them any more. A `CREATE` left behind in either would
+    /// make a fresh store build an index only for `65` to drop it again — the
+    /// only place that regression is observable, since a dropped index leaves no
+    /// trace in the store. Only the absence is asserted: what else a pre-`65`
+    /// store carries is [`fresh_install_converges_to_expected_shape`]'s to say,
+    /// and holding this one to the current shape would fail it on the next index
+    /// delta instead of on a regression.
+    #[tokio::test]
+    async fn a_fresh_core_store_before_delta_65_creates_none_of_the_dropped_indexes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        let entry = MIGRATIONS
+            .iter()
+            .position(|m| m.id == "65")
+            .expect("entry 65 in the catalog");
+
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..entry])
+            .await
+            .expect("catalog through delta 64");
+
+        let indexes = index_defs(&conn).await;
+        // The prefix really built the store — a `position` that missed would
+        // leave the check below vacuously true.
+        assert!(
+            indexes.contains_key("idx_tickets_board_active"),
+            "the catalog through delta 64 must have built the core store"
+        );
+        for idx in REMOVED_CORE_INDEXES {
+            assert!(
+                !indexes.contains_key(*idx),
+                "the core catalog before delta 65 must not create {idx}"
+            );
+        }
+    }
+
+    /// The install that ran delta `28` before its index creation was retired
+    /// carries `idx_jobs_caller_agent`, and the reopen must take it away — the
+    /// other three indexes `65` drops are the old baseline's, which the fleet
+    /// pin reopens with.
+    #[tokio::test]
+    async fn delta_65_drops_the_index_the_retired_delta_28_created() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_consolidated_store(tmp.path())
+            .await
+            .expect("fresh consolidated store");
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_caller_agent ON jobs(caller_agent_id) \
+             WHERE caller_agent_id IS NOT NULL",
+            (),
+        )
+        .await
+        .expect("the delta-28 index as it was created before its retirement");
+        conn.execute("DELETE FROM schema_migrations WHERE id = '65'", ())
+            .await
+            .expect("forget delta 65");
+
+        run_migrations(&conn, TargetDb::Core).await.expect("reopen");
+
+        assert_index_set(
+            &conn,
+            EXPECTED_CORE_INDEXES,
+            "core reopen with the retired delta-28 index",
+        )
+        .await;
     }
 
     /// A database that applied the `telegram_intake` table in the shape delta `59` first
@@ -3793,14 +3960,16 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.context_block_len` column, and the
     /// delta-51/52/53 tail — `custom_roles` plus the custom-role columns on
     /// `session_metadata` and
-    /// `alarms`), and `except_indexes`, whose definitions may be added on
-    /// reopen. Row counts, `chat_history` content and `tickets` content are
-    /// asserted to be strictly unchanged.
+    /// `alarms`). Row counts, `chat_history` content and `tickets` content are
+    /// asserted to be strictly unchanged. The index set must lose exactly
+    /// [`REMOVED_CORE_INDEXES`] and keep every other index byte-identical; that
+    /// the result is [`EXPECTED_CORE_INDEXES`] is asserted separately by the
+    /// caller — reopen must converge to it, not merely keep what the pre-reopen
+    /// shape carried (delta `65`).
     async fn assert_core_catalog_unchanged(
         conn: &Connection,
         before: &CoreSnapshot,
         except_tables: &[&str],
-        except_indexes: &[&str],
     ) {
         assert_eq!(
             without(&table_defs(conn).await, except_tables),
@@ -3808,9 +3977,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "core table DDL (except {except_tables:?}) must be unchanged on reopen"
         );
         assert_eq!(
-            without(&index_defs(conn).await, except_indexes),
-            without(&before.indexes, except_indexes),
-            "core index definitions (except {except_indexes:?}) must be unchanged on reopen"
+            without(&before.indexes, REMOVED_CORE_INDEXES),
+            index_defs(conn).await,
+            "core index set must lose exactly the unreached indexes on reopen"
         );
         assert_eq!(
             without(
@@ -3851,11 +4020,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`63`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`57`/`59`–`63`/`65`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
-    /// `session_metadata.created_at` column upfills (plus the delta-28
-    /// `idx_jobs_caller_agent` index), the delta-29 per-user model columns, the
+    /// `session_metadata.created_at` column upfills, the delta-29 per-user model
+    /// columns, the
     /// delta-30 `jobs.mode` column upfill + backfill, the delta-31
     /// `sleep_ended` column upfill, the delta-32 `alarms.command` column
     /// upfill, the delta-33 `chat_history.broadcast_id` column upfill, the
@@ -3866,7 +4035,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `command`) —
     /// plus the delta-36 data rewrite, which detaches the seeded guest from
     /// `users.selected_workspace` (row counts unchanged; the snapshot compares
-    /// only counts, chat content and tickets). All asserted explicitly. The
+    /// only counts, chat content and tickets), and the delta-65 index drops,
+    /// which converge the index set onto the fresh store's. All asserted
+    /// explicitly. The
     /// entry-46 FTS rebuild is invisible to the snapshot by construction (the
     /// index keeps its name and DDL text and the internal backing objects are
     /// excluded), so this also proves Turso honors `IF NOT EXISTS` on the FTS
@@ -3909,7 +4080,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3918,7 +4089,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -3931,16 +4102,14 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         // (delta 55, moved to `session_personal_changes` by deltas 62/63),
         // session_metadata.reply_to (delta 56),
         // session_metadata.context_block_len (delta 57),
-        // telegram_intake (delta 59) and the
-        // custom-role tail (delta 51's `custom_roles` table plus the
-        // session_metadata/alarms columns of deltas 52/53)
-        // change in shape and the delta-28
-        // `idx_jobs_caller_agent` index is added. Delta `36` rewrites
-        // `users.selected_workspace` data (detaching the seeded guest),
-        // which leaves row counts unchanged — the snapshot compares only
-        // counts, chat content and tickets, so the no-op assertions still hold.
-        // The seeded alarm row carries no command, so the delta-41 delete
-        // matches no rows and the count is unchanged there too.
+        // telegram_intake (delta 59) and the custom-role tail (delta 51's
+        // `custom_roles` table plus the session_metadata/alarms columns of
+        // deltas 52/53) change in shape, and delta `65` drops the unreached
+        // indexes. Delta `36` rewrites `users.selected_workspace` data
+        // (detaching the seeded guest), which leaves row counts unchanged — the
+        // snapshot compares only counts, chat content and tickets, so the no-op
+        // assertions still hold. The seeded alarm row carries no command, so the
+        // delta-41 delete matches no rows and the count is unchanged there too.
         assert_core_catalog_unchanged(
             &conn,
             &before,
@@ -3962,9 +4131,25 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 // Introduced by delta 62 — absent from the pre-reopen fixture.
                 "session_personal_changes",
             ],
-            &["idx_jobs_caller_agent"],
         )
         .await;
+
+        // Delta `65` must drop the unreached core indexes: the old shape carries
+        // the old baseline's three of them, and the reopen converges the index
+        // set onto the fresh store's — the fresh/existing equality the entry
+        // guarantees. (`idx_jobs_caller_agent`, the fourth, is delta `28`'s and
+        // is covered by `delta_65_drops_the_index_the_retired_delta_28_created`.)
+        for idx in [
+            "idx_jobs_updated_at",
+            "idx_chat_history_user",
+            "idx_chat_history_workspace",
+        ] {
+            assert!(
+                before.indexes.contains_key(idx),
+                "the old shape must carry the index delta 65 removes, missing {idx}"
+            );
+        }
+        assert_index_set(&conn, EXPECTED_CORE_INDEXES, "core reopen").await;
         let after_ws_cols = column_sets(&conn, &["workspaces"]).await;
         let mut expected_ws_cols = before.cols["workspaces"].clone();
         expected_ws_cols.push("maintainer_recommendations".to_string());
@@ -4131,37 +4316,27 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "delta 35 must create {NEW_TABLE} on existing installs"
         );
 
-        // Delta `64` must drop the write-only observability indexes: the reopen
-        // converges the index set to the kept ones, so every index the old shape
-        // carried and nothing reads is gone.
+        // Delta `64` must drop the unread observability indexes: the old shape
+        // carries `idx_logs_agent_id`, and the reopen converges the index set
+        // onto the fresh store's.
         assert!(
             before_indexes.contains_key("idx_logs_agent_id"),
             "the old shape must carry an index delta 64 removes"
         );
-        let mut actual: Vec<String> = index_defs(&conn).await.into_keys().collect();
-        actual.sort();
-        let mut expected: Vec<String> = EXPECTED_LOGS_INDEXES
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        expected.sort();
-        assert_eq!(
-            actual, expected,
-            "reopen must converge the logs index set to the kept indexes"
-        );
+        assert_index_set(&conn, EXPECTED_LOGS_INDEXES, "logs reopen").await;
     }
 
     /// The 0.5.0 (one-delta-behind) upgrade: a database built by the retired
     /// chain WITHOUT entry `23` has no `chat_history` reply columns; the
     /// baseline entry `25` upfills exactly those two columns, entry `27` adds
     /// `workspaces.maintainer_recommendations`, entry `28` adds
-    /// `jobs.caller_agent_id` / `session_metadata.created_at` (plus its
-    /// partial index), entry `29` adds the per-user `image_gen_model` /
-    /// `video_model` columns, entry `30` adds `jobs.mode`, entry `31` adds
-    /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
-    /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
+    /// `jobs.caller_agent_id` / `session_metadata.created_at`, entry `29` adds
+    /// the per-user `image_gen_model` / `video_model` columns, entry `30` adds
+    /// `jobs.mode`, entry `31` adds `session_metadata.sleep_ended`, entry `32`
+    /// adds `alarms.command`, and entry `33` adds `chat_history.broadcast_id`,
+    /// and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`57`/`59`–`63`: the data migrations (detaching guests from
+    /// entries `36`–`57`/`59`–`63`/`65`: the data migrations (detaching guests from
     /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
     /// deleting the command-armed alarm rows, rewriting the retired
     /// `in_review`/`in_qa` stages to `verification`, invalidating the
@@ -4177,7 +4352,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.context_block_len` columns, and the `telegram_intake`
     /// table of delta `59` (its `claimed_by` column guaranteed by `60`), and the
     /// `telegram_bursts` table of delta `61`, and deltas `62`/`63`, which move
-    /// the personal-changes baseline into `session_personal_changes`.
+    /// the personal-changes baseline into `session_personal_changes`, and `65`,
+    /// which drops the indexes no production query's plan reaches.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -4288,7 +4464,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4297,7 +4473,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
