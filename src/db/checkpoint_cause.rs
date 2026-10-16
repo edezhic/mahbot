@@ -3,7 +3,7 @@
 //!
 //! The engine reports a failed checkpoint as a *successful* statement whose row
 //! is always the same three values (`busy=1`, `NULL`, `NULL`), so
-//! [`crate::db::Connection::run_checkpoint`] fails with the same constant text
+//! [`crate::db::wal_checkpoint`] fails with the same constant text
 //! for a corrupt store and a healthy one. The engine's real reason is emitted
 //! only by a debug-level event inside `turso_core`'s VDBE execution
 //! ([`ENGINE_TARGET`]), which the product's logging filter drops. This module

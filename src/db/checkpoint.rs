@@ -4,8 +4,9 @@
 //! `multiprocess_wal`) — a single process holds the sole writer connection. Each
 //! store file also has one `Database` that every connection of that store comes
 //! from; the core store serves its ordinary reads on a small set of reader
-//! connections of its own (see [`crate::db::Connection`]), and the log store on
-//! its single connection.
+//! connections of its own (see [`crate::db::Connection`]), the log store on its
+//! single connection, and a periodic round adds the store's maintenance
+//! connection ([`crate::db::Maintenance`]) for as long as that round runs.
 //! Checkpoints are hygiene, not a durability requirement: committed
 //! transactions are durable at COMMIT time (fsync'd WAL frames), and
 //! checkpointing merely compacts those frames into the main DB file, reclaims
@@ -38,10 +39,11 @@
 //! wordless row, which the parse refuses; the engine's own captured reason is
 //! what tells the two apart ([`crate::db::checkpoint_cause`]), and a blocked
 //! attempt is never a failure: it is retried, and a store that stays blocked
-//! through the budget keeps serving with its journal unfolded. Readers make that
-//! answer more frequent — a read holding a position defers the reclaiming
-//! checkpoint — which is accepted: the journal is allowed to grow while a long
-//! read stays open, and the protection itself is unchanged.
+//! through the budget keeps serving with its journal unfolded. The store's live
+//! readers and writers make that answer more frequent — a reader holding a
+//! position, or a writer's own statement, defers the reclaiming checkpoint —
+//! which is accepted: the journal is allowed to grow while long work stays open,
+//! and the protection itself is unchanged.
 //!
 //! A periodic round makes up to [`CHECKPOINT_ATTEMPTS`] attempts at a store's
 //! checkpoint — the original plus one retry per entry in the growing
@@ -104,13 +106,44 @@
 //! else ran keeps serving and closes any open window, while a genuine failure from
 //! an earlier attempt in the same round still counts that round as a failing one.
 //!
+//! # Where the round's upkeep runs, and what could not move
+//!
+//! The round's compaction and its integrity verification run on the store's
+//! maintenance connection ([`crate::db::Maintenance`]) rather than on the writing
+//! connection, so no ordinary read or write waits for that connection's mutex
+//! behind them. A store that cannot give the round one issues both on its writing
+//! connection instead: the same round on the one connection the store has, so no
+//! store is left unupkept. The one hold the round still takes on the store is an
+//! above-cap reclaim: the engine serializes its TRUNCATE against the store's live
+//! writers, so a write issued in that window waits on the engine's own writer lock
+//! and is retried by the connection's busy handler, and the journal stays above its
+//! shrink threshold while long work stays open (the accepted cost named above). The
+//! search-index repair is reached exactly after a first attempt that failed or was
+//! answered blocked, so under load its detection — a full `quick_check` scan on the
+//! writing connection — is reached more often.
+//!
+//! What could not move, and why — the round's report: the runtime search-index
+//! repair, because no other operation may be in flight while the index is dropped
+//! and recreated ([`crate::db::repair_ticket_title_fts_runtime`]); and the
+//! exit/self-update round, whose checkpoint stays on the writing connection as the
+//! process goes away. No writer is in flight there — the drain stops them all —
+//! but that round is not alone: a periodic round's statement runs in a DETACHED
+//! task (`spawn_detached`), and `spawn_cancellable` drops only the loop future, so
+//! one already issued — a maintenance statement included — can still be in flight
+//! when the hand-off's TRUNCATE is issued, and can be answered blocked by it.
+//! Bounded and harmless: blocked → warn, and the replacement daemon replays the
+//! journal (it commits nothing on its own). The pre-shrink gate's probe cannot stay
+//! on the writing connection either: its protection is exactly that the store's own
+//! answer and the shrink it decides come from ONE connection, so it travels with
+//! the checkpoint it gates ([`crate::db::shrink_gate`]).
+//!
 //! Both rounds and the periodic integrity check record durably: an exit-round
 //! checkpoint failure (which cannot drain or recover) is its own block, and a
 //! failing periodic `quick_check` records a block once per store per process —
 //! every further failing round only warns with the running count, so a persistent
-//! condition cannot append a block every 5 minutes. The checkpoint block follows
+//! condition cannot append a block every 10 minutes. The checkpoint block follows
 //! that shape for the same reason: every failing round short of the terminal one
-//! would otherwise file a block 5 minutes apart.
+//! would otherwise file a block 10 minutes apart.
 //!
 //! # Reclaiming checkpoints are gated before they run
 //!
@@ -124,12 +157,14 @@
 //!
 //! # The engine's real cause is kept
 //!
-//! [`Connection::run_checkpoint`] arms a per-call sink so the engine's own reason
+//! [`crate::db::wal_checkpoint`] arms a per-call sink so the engine's own reason
 //! for a failed checkpoint travels with the checkpoint error — see
-//! [`crate::db::checkpoint_cause`] for how it is obtained and what it costs. A
-//! failing round's warning and the durable record render the error's whole chain;
-//! the DEBUG lines print its outermost message only. That reason is also what tells
-//! a blocked attempt, which never counts towards a stop, from a genuine pager error
+//! [`crate::db::checkpoint_cause`] for how it is obtained and what it costs. The
+//! arm is what keeps a blocked attempt from being read as a failure wherever the
+//! checkpoint runs, the maintenance connection included. A failing round's warning
+//! and the durable record render the error's whole chain; the DEBUG lines print
+//! its outermost message only. That reason is also what tells a blocked attempt,
+//! which never counts towards a stop, from a genuine pager error
 //! ([`crate::db::checkpoint_cause::is_blocked_checkpoint`]).
 
 use futures_util::future::{FutureExt, join_all};
@@ -143,7 +178,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::db::failure_record::{self, FailureKind, FailureReport, RoundCounter};
 use crate::db::{
-    CheckpointOutcome, Connection, TicketTitleFtsRuntimeRepair, checkpoint_cause, shrink_gate,
+    CheckpointOutcome, Connection, OwnConnection, TicketTitleFtsRuntimeRepair, checkpoint_cause,
+    shrink_gate,
 };
 use crate::util::UnwrapPoison;
 
@@ -151,7 +187,7 @@ use crate::util::UnwrapPoison;
 /// mode. Below the cap the periodic loop runs non-truncating (PASSIVE)
 /// checkpoints; a TRUNCATE runs only when the WAL exceeds the cap, bounding
 /// WAL-file growth while keeping the frame-index reset that TRUNCATE causes
-/// (the live-writer corruption vector) rare instead of every 5 minutes.
+/// (the live-writer corruption vector) rare instead of every 10 minutes.
 const WAL_CHECKPOINT_CAP_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Default minimum free disk space (bytes) below which TRUNCATE checkpoints
@@ -175,7 +211,7 @@ const CHECKPOINT_ATTEMPTS: usize = 6;
 /// worth. The schedule is a fixed, hard bound — six attempts and a capped pause,
 /// never an unbounded wait, so the waiting it adds can never become a hung round
 /// (the duration of an attempt itself is bounded as little as it was before); the
-/// span the schedule adds to a failing store's 5-minute cadence is the accepted
+/// span the schedule adds to a failing store's 10-minute cadence is the accepted
 /// price.
 const CHECKPOINT_RETRY_PAUSES: [Duration; CHECKPOINT_ATTEMPTS - 1] = [
     Duration::from_secs(1),
@@ -191,7 +227,7 @@ const CHECKPOINT_FAILURE_MIN_ROUNDS: u64 = 2;
 
 /// Span, since a window's first failure, the window must cover before a genuine
 /// failure may decide the stop: the "several minutes" the rule asks for, made explicit
-/// next to the round count. At the 5-minute cadence [`CHECKPOINT_FAILURE_MIN_ROUNDS`]
+/// next to the round count. At the 10-minute cadence [`CHECKPOINT_FAILURE_MIN_ROUNDS`]
 /// alone already spans more than this, so the floor is belt-and-braces — it binds only
 /// for rounds run back to back, which no production path does.
 const CHECKPOINT_FAILURE_WINDOW: Duration = Duration::from_secs(120);
@@ -313,7 +349,7 @@ pub async fn checkpoint_all_databases() {
     checkpoint_stores(CheckpointRound::Exit).await;
 }
 
-/// One 5-minute hygiene round: the periodic inspection — WAL checkpoint and an
+/// One 10-minute hygiene round: the periodic inspection — WAL checkpoint and an
 /// independent `quick_check` per store.
 ///
 /// Checkpoint policy: PASSIVE below the WAL-size cap, TRUNCATE above it —
@@ -399,8 +435,7 @@ async fn checkpoint_stores(round: CheckpointRound) {
                     exit_checkpoint(name, conn, truncate, root.as_deref()).await;
                 }
                 CheckpointRound::Periodic => {
-                    periodic_checkpoint(name, conn, truncate, root.as_deref()).await;
-                    verify_integrity(name, conn, root.as_deref()).await;
+                    periodic_store_round(name, conn, truncate, root.as_deref()).await;
                 }
             }
         }
@@ -413,7 +448,7 @@ async fn checkpoint_stores(round: CheckpointRound) {
 /// next boot's store open, not mid-run, and the known FTS count-mismatch false
 /// positive is already filtered by the `quick_check` row scan. Failing rounds are
 /// recorded durably (see [`record_integrity_failure`]).
-async fn verify_integrity(name: &'static str, conn: &Connection, root: Option<&Path>) {
+async fn verify_integrity(name: &'static str, conn: &impl OwnConnection, root: Option<&Path>) {
     // The filtered problem list, not `quick_check()`: a condition the boot path
     // deliberately leaves report-only (an unrecognised signature) is tolerated
     // here too, and only a check that cannot run or names actionable damage is
@@ -437,12 +472,12 @@ async fn verify_integrity(name: &'static str, conn: &Connection, root: Option<&P
         Ok(problems) => {
             record_integrity_failure(
                 name,
-                conn,
+                conn.db_path(),
                 &anyhow::anyhow!("{}", problems.join("; ")),
                 root,
             );
         }
-        Err(e) => record_integrity_failure(name, conn, &e, root),
+        Err(e) => record_integrity_failure(name, conn.db_path(), &e, root),
     }
 }
 
@@ -480,14 +515,14 @@ async fn guarded_checkpoint(
 /// boot-time repair sites gate themselves — see the module doc).
 async fn checkpoint_attempt(
     name: &'static str,
-    conn: &Connection,
+    conn: &impl OwnConnection,
     truncate: bool,
     root: Option<&Path>,
 ) -> Attempted {
     if truncate && !shrink_gate::shrink_allowed(conn, name, root).await {
         return Attempted::ShrinkRefused;
     }
-    Attempted::Ran(guarded_checkpoint(conn.checkpoint_mode(truncate)).await)
+    Attempted::Ran(guarded_checkpoint(conn.checkpoint(truncate)).await)
 }
 
 /// The exit/self-update round's one attempt: exactly the pre-existing exit
@@ -548,7 +583,7 @@ async fn exit_checkpoint(
                 FailureKind::ExitCheckpointFailure,
                 "exit checkpoint failure",
                 name,
-                conn,
+                conn.db_path(),
                 &e,
                 root,
             );
@@ -556,22 +591,68 @@ async fn exit_checkpoint(
     }
 }
 
-/// The periodic round: the attempt loop over the engine's real checkpoint plus
-/// the round's failure-window bookkeeping. `root` is the storage root the failure
-/// report is written under.
-async fn periodic_checkpoint(
+/// One store's periodic round: the round's upkeep runs on the store's own
+/// maintenance connection wherever the store can give it one, so ordinary work
+/// does not wait behind it. A store that cannot give one is still upkept, on the
+/// writing connection — the same round on the one connection the store has, which
+/// is where the module header reports what could not move.
+async fn periodic_store_round(
     name: &'static str,
     conn: &Connection,
     truncate: bool,
     root: Option<&Path>,
 ) {
+    match conn.maintenance().await {
+        Ok(maintenance) => periodic_round(name, conn, &maintenance, truncate, root).await,
+        Err(e) => {
+            warn!(
+                db = %name,
+                error = %e,
+                "The store could not give the round a maintenance connection — \
+                 this round runs on the writing connection"
+            );
+            periodic_round(name, conn, conn, truncate, root).await;
+        }
+    }
+}
+
+/// One periodic round: the attempt loop over the engine's real checkpoint and the
+/// integrity verification that follows it, both on `upkeep`, so neither is
+/// ordinary work's wait. `writer` owns the failure window's key and the runtime
+/// search-index repair.
+async fn periodic_round(
+    name: &'static str,
+    writer: &Connection,
+    upkeep: &impl OwnConnection,
+    truncate: bool,
+    root: Option<&Path>,
+) {
+    periodic_checkpoint(name, writer, upkeep, truncate, root).await;
+    verify_integrity(name, upkeep, root).await;
+}
+
+/// The periodic round: the attempt loop over the engine's real checkpoint plus
+/// the round's failure-window bookkeeping. `writer` is the writing connection —
+/// it owns the failure window's key and the runtime search-index repair
+/// ([`periodic_checkpoint_inner`]); `upkeep` is the connection the round's
+/// compaction and verification run on, the store's maintenance connection (see
+/// the module header). `root` is the storage root the failure report is written
+/// under.
+async fn periodic_checkpoint(
+    name: &'static str,
+    writer: &Connection,
+    upkeep: &impl OwnConnection,
+    truncate: bool,
+    root: Option<&Path>,
+) {
     periodic_checkpoint_inner(
         name,
-        conn,
+        writer,
+        upkeep,
         root,
         CHECKPOINT_RETRY_PAUSES,
         CHECKPOINT_FAILURE_WINDOW,
-        || checkpoint_attempt(name, conn, truncate, root),
+        || checkpoint_attempt(name, upkeep, truncate, root),
     )
     .await;
 }
@@ -715,8 +796,8 @@ fn cure_failure_window(name: &'static str, key: &Path, round_failures: usize) {
 /// and [`crate::db::shrink_gate`] owns what a refusal is.
 ///
 /// `attempt` is a parameter because a genuinely failing engine checkpoint cannot be
-/// provoked in this process — one writing connection per store, and no fault
-/// injection into the engine ([`crate::db::failure_record`]) — so the table takes
+/// provoked in this process — one serialised writing connection per store, and no
+/// fault injection into the engine ([`crate::db::failure_record`]) — so the table takes
 /// each engine answer directly: [`periodic_checkpoint`] is the single caller and
 /// always passes the gate + engine attempt. It, and the two timing parameters —
 /// `retry_pauses`, the real pauses before the retries, and `span`, how long a store's
@@ -724,12 +805,18 @@ fn cure_failure_window(name: &'static str, key: &Path, round_failures: usize) {
 /// both, production passes the two constants. Nothing outside this module can reach
 /// it, and its arms are the failure window's whole rule.
 ///
+/// `conn` is the writing connection — the store's own, which owns the failure
+/// window's key and must run the runtime search-index repair — and `upkeep` is the
+/// connection the round's own upkeep runs on (see [`periodic_checkpoint`]), which
+/// is the one the terminal report's integrity probe is taken through.
+///
 /// The attempt future is `Send` because the periodic round runs inside the
 /// process's spawned task set.
 #[expect(clippy::too_many_lines)] // one arm per engine answer, each owning its own window step, reads as one flow
 async fn periodic_checkpoint_inner<'a, Fut>(
     name: &'static str,
     conn: &'a Connection,
+    upkeep: &'a impl OwnConnection,
     root: Option<&Path>,
     retry_pauses: [Duration; CHECKPOINT_ATTEMPTS - 1],
     span: Duration,
@@ -899,7 +986,7 @@ async fn periodic_checkpoint_inner<'a, Fut>(
     // it. Nothing restarts the process after it and the app shows no reason of its
     // own for it, so this record and the log line below are the operator's only
     // trace. Filed once per condition ([`failure_record::record`]).
-    let report = build_failure_report(name, &failures, repair.as_ref(), &window, conn).await;
+    let report = build_failure_report(name, &failures, repair.as_ref(), &window, upkeep).await;
     let pointer = failure_record::recorded_pointer(
         "checkpoint failure",
         failure_record::record(root, &report.render()),
@@ -953,11 +1040,11 @@ fn record_store_failure(
     kind: FailureKind,
     what: &str,
     name: &'static str,
-    conn: &Connection,
+    db_path: &Path,
     e: &anyhow::Error,
     root: Option<&Path>,
 ) {
-    let report = store_failure_report(kind, name, e, conn.db_path());
+    let report = store_failure_report(kind, name, e, db_path);
     failure_record::record_and_point(root, what, &report);
 }
 
@@ -971,7 +1058,7 @@ static INTEGRITY_FAILURE_ROUNDS: RoundCounter = RoundCounter::new();
 /// condition ([`failure_record::record`]).
 fn record_integrity_failure(
     name: &'static str,
-    conn: &Connection,
+    db_path: &Path,
     e: &anyhow::Error,
     root: Option<&Path>,
 ) {
@@ -990,7 +1077,7 @@ fn record_integrity_failure(
         FailureKind::RuntimeIntegrityFailure,
         "runtime integrity failure",
         name,
-        conn,
+        db_path,
         e,
         root,
     );
@@ -998,7 +1085,7 @@ fn record_integrity_failure(
 
 /// Multi-line failure report for the genuine-failure terminal path. The engine's
 /// own reason travels with each attempt's error when the engine reported one
-/// (attached by [`Connection::run_checkpoint`] via
+/// (attached by [`crate::db::wal_checkpoint`] via
 /// [`crate::db::checkpoint_cause`]), so the report needs no separate fold-in.
 /// Every diagnostic is best-effort — a failing OR panicking probe must
 /// never prevent the report or its write: the `quick_check` probe is wrapped in
@@ -1010,12 +1097,16 @@ fn record_integrity_failure(
 /// line when that stat fails — and deliberately no corruption class: a
 /// header-level class is exactly what the lock rule puts out of reach, and the
 /// `quick_check` section carries the integrity detail instead.
+///
+/// `upkeep` is the connection the round's own upkeep runs on — the terminal path
+/// is still the round, so its probe is taken there too, off the writing connection
+/// like the rest of the round (see [`periodic_checkpoint`]).
 async fn build_failure_report(
     name: &'static str,
     failures: &[(usize, anyhow::Error)],
     repair: Option<&TicketTitleFtsRuntimeRepair>,
     window: &FailureWindow,
-    conn: &Connection,
+    upkeep: &impl OwnConnection,
 ) -> FailureReport {
     // The checkpoint error is the report's reason, rendered as its own
     // long-standing `checkpoint error:` line rather than a `reason:` line; each
@@ -1066,7 +1157,7 @@ async fn build_failure_report(
     let repair = repair.expect("the round runs the repair before it can report");
     report = report.extra(format!("repair outcome: {}", repair.summary()));
     report = report.extra(
-        match AssertUnwindSafe(conn.quick_check_problems())
+        match AssertUnwindSafe(upkeep.quick_check_problems())
             .catch_unwind()
             .await
         {
@@ -1076,7 +1167,7 @@ async fn build_failure_report(
             Err(_) => "quick_check: probe panicked".to_string(),
         },
     );
-    with_store_file_state(report, conn.db_path())
+    with_store_file_state(report, upkeep.db_path())
 }
 
 #[cfg(test)]
@@ -1176,6 +1267,11 @@ mod tests {
     /// Run `rounds` periodic rounds for the store, each attempt answered by
     /// `answer(attempt_no)` — what every test that varies the engine's answer per
     /// attempt drives its rounds through — and return the total attempts made.
+    ///
+    /// The rounds run with the writing connection as their upkeep connection too —
+    /// what a round does when the store cannot give it a second one
+    /// ([`checkpoint_stores`]) — because what these tests drive is the decision
+    /// table, not the connection the upkeep runs on.
     async fn rounds_with_answers<A, Fut>(
         name: &'static str,
         conn: &Connection,
@@ -1192,7 +1288,7 @@ mod tests {
         let mut attempts = 0usize;
         for _ in 0..rounds {
             let mut attempt_no = 0usize;
-            periodic_checkpoint_inner(name, conn, Some(root), retry_pauses, span, || {
+            periodic_checkpoint_inner(name, conn, conn, Some(root), retry_pauses, span, || {
                 attempt_no += 1;
                 attempts += 1;
                 answer(attempt_no)
@@ -1213,7 +1309,7 @@ mod tests {
             FailureKind::ExitCheckpointFailure,
             "exit checkpoint failure",
             "core",
-            &conn,
+            conn.db_path(),
             &anyhow::anyhow!("no space left on device"),
             Some(tmp.path()),
         );
@@ -1265,7 +1361,7 @@ mod tests {
             FailureKind::ExitCheckpointFailure,
             "exit checkpoint failure",
             "core",
-            &conn,
+            conn.db_path(),
             &e,
             Some(tmp.path()),
         );
@@ -1291,7 +1387,7 @@ mod tests {
         for _ in 0..3 {
             record_integrity_failure(
                 name,
-                &conn,
+                conn.db_path(),
                 &anyhow::anyhow!("the integrity check cannot run"),
                 Some(tmp.path()),
             );
@@ -1369,6 +1465,7 @@ mod tests {
         let mut attempt_no = 0;
         periodic_checkpoint_inner(
             "core",
+            &conn,
             &conn,
             Some(tmp.path()),
             TEST_PAUSES,
@@ -1546,6 +1643,7 @@ mod tests {
         let mut attempt_no = 0;
         periodic_checkpoint_inner(
             "core",
+            conn,
             conn,
             Some(root),
             TEST_PAUSES,
@@ -1765,6 +1863,7 @@ mod tests {
         periodic_checkpoint_inner(
             "core",
             &conn,
+            &conn,
             Some(tmp.path()),
             TEST_PAUSES,
             Duration::ZERO,
@@ -1807,6 +1906,7 @@ mod tests {
         let mut attempts = 0usize;
         periodic_checkpoint_inner(
             "core",
+            &conn,
             &conn,
             Some(tmp.path()),
             TEST_PAUSES,
@@ -2037,14 +2137,25 @@ mod tests {
         let conn = Connection::open(&db_path)
             .await
             .expect("open the fixture store");
+        let maintenance = conn
+            .maintenance()
+            .await
+            .expect("open the store's maintenance connection");
         let path = tmp.path();
-        let conn_ref = &conn;
 
         let mut attempts = 0usize;
-        periodic_checkpoint_inner(name, &conn, Some(path), TEST_PAUSES, Duration::ZERO, || {
-            attempts += 1;
-            checkpoint_attempt(name, conn_ref, true, Some(path))
-        })
+        periodic_checkpoint_inner(
+            name,
+            &conn,
+            &maintenance,
+            Some(path),
+            TEST_PAUSES,
+            Duration::ZERO,
+            || {
+                attempts += 1;
+                checkpoint_attempt(name, &maintenance, true, Some(path))
+            },
+        )
         .await;
 
         assert_eq!(attempts, 1, "a refusal must not be retried");
@@ -2337,10 +2448,18 @@ mod tests {
 
         // A round whose first attempt is a real, completing checkpoint: the completion
         // is what closes the window, not a retry.
-        periodic_checkpoint_inner("core", &conn, Some(tmp.path()), retry_pauses, span, || {
-            let conn = conn.clone();
-            async move { Attempted::Ran(conn.checkpoint_ungated().await) }
-        })
+        periodic_checkpoint_inner(
+            "core",
+            &conn,
+            &conn,
+            Some(tmp.path()),
+            retry_pauses,
+            span,
+            || {
+                let conn = conn.clone();
+                async move { Attempted::Ran(conn.checkpoint_ungated().await) }
+            },
+        )
         .await;
         assert!(
             !window_open(&conn),
@@ -2406,6 +2525,7 @@ mod tests {
 
         periodic_checkpoint_inner(
             "core",
+            &conn,
             &conn,
             Some(tmp.path()),
             retry_pauses,
@@ -2650,7 +2770,12 @@ mod tests {
             "the fixture's rows must stay readable",
         );
 
-        periodic_checkpoint("core", &conn, true, Some(tmp)).await;
+        let maintenance = conn
+            .maintenance()
+            .await
+            .expect("open the store's maintenance connection");
+
+        periodic_checkpoint("core", &conn, &maintenance, true, Some(tmp)).await;
 
         assert_refusal_recorded(tmp);
         assert_eq!(
@@ -2678,26 +2803,37 @@ mod tests {
     /// reclaiming mode, and still reclaims the journal — the gate withholds only
     /// an answer it cannot trust; it never downgrades the mode, and it never skips
     /// the checkpoint on a store that answers consistently.
+    ///
+    /// The store is the consolidated one, so this is the shape the periodic round
+    /// reclaims: reader connections enabled and change capture on, with the
+    /// reclaiming checkpoint issued on the store's maintenance connection exactly
+    /// as the round issues it (see the module header).
     #[tokio::test]
     async fn a_healthy_store_still_runs_its_reclaiming_checkpoint() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
-        let db_path = crate::db::store_db_path(tmp.path(), "core");
-        let conn =
-            crate::db::open_with_schema(&db_path, "CREATE TABLE plain (id INTEGER PRIMARY KEY);")
-                .await
-                .expect("open the healthy store");
-        conn.execute("INSERT INTO plain (id) VALUES (1)", ())
+        let conn = crate::db::open_consolidated_store(tmp.path())
             .await
-            .expect("commit a row so the journal holds frames");
-        let wal = crate::db::wal_path(&db_path);
+            .expect("open the healthy store");
+        // A read first: the store's reader connections are made on the first read
+        // that needs one, so the reclaiming checkpoint then meets them — idle, as
+        // the round's compaction meets them.
+        let _ = conn
+            .query("SELECT id FROM tickets", ())
+            .await
+            .expect("read through a reader connection");
+        let wal = crate::db::wal_path(conn.db_path());
         let before = crate::db::wal_guard::stat_size(&wal).expect("stat the store's journal");
         assert!(
             before > crate::db::wal_guard::WAL_HEADER_BYTES,
             "the healthy store must have frames to reclaim, found {before} bytes",
         );
 
+        let maintenance = conn
+            .maintenance()
+            .await
+            .expect("open the store's maintenance connection");
         let Attempted::Ran(Ok(outcome)) =
-            checkpoint_attempt("core", &conn, true, Some(tmp.path())).await
+            checkpoint_attempt("core", &maintenance, true, Some(tmp.path())).await
         else {
             panic!("a healthy store must still run its reclaiming checkpoint");
         };
@@ -2709,6 +2845,70 @@ mod tests {
         assert_eq!(
             after, 0,
             "the reclaiming mode must still reclaim the journal, left {after} bytes",
+        );
+    }
+
+    /// The round the service runs for a store issues its upkeep on the store's
+    /// maintenance connection, which is outside the writing connection's mutex:
+    /// with the writing connection held for the whole test, the round still
+    /// completes, compaction and verification alike. Issued on the writing
+    /// connection instead — the connection this test holds — the round would queue
+    /// behind that hold, so the timeout is what turns a routing regression into a
+    /// failure instead of a hung suite.
+    #[tokio::test]
+    async fn the_round_for_a_store_runs_its_upkeep_off_the_writing_connection() {
+        let (tmp, conn) = temp_store("core").await;
+
+        // Held for the whole test: `BEGIN` is deferred, and no statement is issued
+        // inside, so this takes the writing connection's own mutex without taking
+        // any engine lock or touching the store.
+        let held = conn.begin_tx().await.expect("hold the writing connection");
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            periodic_store_round("core", &conn, false, Some(tmp.path())),
+        )
+        .await
+        .expect("the round must not wait on the writing connection");
+
+        assert!(
+            !window_open(&conn),
+            "a completed round must leave no failure window open",
+        );
+        held.rollback()
+            .await
+            .expect("release the writing connection");
+    }
+
+    /// A store that cannot give the round a maintenance connection is still
+    /// upkept: the round runs on the writing connection — the shape every round had
+    /// before the maintenance connection existed — and nothing is skipped or
+    /// downgraded, the reclaiming checkpoint included.
+    #[tokio::test]
+    async fn a_store_without_a_maintenance_connection_still_runs_its_round() {
+        let (tmp, conn) = temp_store("core").await;
+        let wal = crate::db::wal_path(conn.db_path());
+        let before = crate::db::wal_guard::stat_size(&wal).expect("stat the store's journal");
+        assert!(
+            before > crate::db::wal_guard::WAL_HEADER_BYTES,
+            "the fixture must carry frames to reclaim, found {before} bytes",
+        );
+
+        // The writer as the round's upkeep: what the fallback arm passes.
+        periodic_round("core", &conn, &conn, true, Some(tmp.path())).await;
+
+        let after = crate::db::wal_guard::stat_size(&wal).expect("stat the reclaimed journal");
+        assert_eq!(
+            after, 0,
+            "the round must still reclaim the journal on the writing connection, left {after} bytes",
+        );
+        assert!(
+            !window_open(&conn),
+            "a completed round must leave no failure window open",
+        );
+        assert!(
+            !tmp.path().join("error.log").exists(),
+            "a healthy store's round must file no failure",
         );
     }
 
@@ -2761,7 +2961,11 @@ mod tests {
             "the engine must discard the orphan journal as it opens the empty store",
         );
 
-        periodic_checkpoint("core", &conn, true, Some(tmp.path())).await;
+        let maintenance = conn
+            .maintenance()
+            .await
+            .expect("open the store's maintenance connection");
+        periodic_checkpoint("core", &conn, &maintenance, true, Some(tmp.path())).await;
         assert!(
             !tmp.path().join("error.log").exists(),
             "a round with nothing left to destroy files no refusal",

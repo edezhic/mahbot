@@ -36,7 +36,7 @@ use tracing::{error, warn};
 
 use crate::db::failure_record::{self, FailureKind, FailureReport, RoundCounter};
 use crate::db::wal_guard::WAL_HEADER_BYTES;
-use crate::db::{Connection, Value};
+use crate::db::{OwnConnection, Value};
 
 /// One answer the gate asked for: the value, or why it could not be obtained.
 /// That text is what the durable record keeps.
@@ -157,11 +157,12 @@ fn stat_bytes(path: &Path, what: &str) -> Answer<u64> {
 /// Ask the store for its own page count and compare it with the file sizes the
 /// product already stats. `Some(_)` = a reclaiming checkpoint must not be
 /// issued. Reads no store bytes (wal_guard's lock rule). Upkeep: the probe is
-/// what decides whether the compaction may run, so it reads on the writing
-/// connection ([`Connection::upkeep`]) rather than on a reader whose snapshot
-/// could lag the frames the very next statement tries to fold.
-async fn probe(conn: &Connection) -> Option<ShrinkRefusal> {
-    let page_count = match conn.upkeep().query("PRAGMA page_count;", ()).await {
+/// what decides whether the compaction may run, so it asks the connection that
+/// will run that compaction ([`OwnConnection`]) rather than a reader whose
+/// snapshot could lag the frames the very next statement tries to fold. The
+/// gate's protection is exactly that both come from ONE connection.
+async fn probe(conn: &impl OwnConnection) -> Option<ShrinkRefusal> {
+    let page_count = match conn.own_query("PRAGMA page_count;").await {
         Ok(rows) => match rows.first().map(|row| row.get_value(0)) {
             Some(value) => page_count_value(value),
             None => Err("the page count query returned no row".to_string()),
@@ -198,7 +199,9 @@ static REFUSAL_ROUNDS: RoundCounter = RoundCounter::new();
 /// once per condition ([`failure_record::record`]).
 ///
 /// `store` names the logical store; `db_path` is the main file actually checked
-/// (the caller passes [`Connection::db_path`]) and keys the count, so a probe of
+/// — the path of the connection that runs the checkpoint ([`OwnConnection::db_path`]):
+/// the writing connection for the boot-time repairs, the store's maintenance
+/// connection for the periodic round — and it keys the count, so a probe of
 /// another file — the boot rebuild's temp copy — never consumes this one's
 /// first-refusal slot. `root` is the storage root the block is filed under
 /// (`None` when unresolvable, in which case the block goes to stderr).
@@ -244,7 +247,7 @@ fn record_refusal(
 /// may be issued. `root` is the storage root the refusing store's durable block
 /// is filed under (the caller passes the root it already resolved).
 pub(crate) async fn shrink_allowed(
-    conn: &Connection,
+    conn: &impl OwnConnection,
     store: &'static str,
     root: Option<&Path>,
 ) -> bool {
@@ -261,7 +264,7 @@ pub(crate) async fn shrink_allowed(
 /// and always passes the real probe.
 async fn shrink_allowed_inner<F>(
     probe: F,
-    conn: &Connection,
+    conn: &impl OwnConnection,
     store: &'static str,
     root: Option<&Path>,
 ) -> bool

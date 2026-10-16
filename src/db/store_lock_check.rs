@@ -12,9 +12,11 @@
 //! conflicts with — a lock left only on a `-wal` would not show up this way.
 //!
 //! The pre-shrink gate ([`crate::db::shrink_gate::shrink_allowed`]) is another
-//! path that must not cost the lock: [`verify`] runs it on every live store and
-//! requires it to allow the shrink, and the foreign probes that follow then prove
-//! the lock survived it.
+//! path that must not cost the lock: [`verify`] runs it on every live store,
+//! through the store's own maintenance connection — the connection the periodic
+//! round uses — and requires it to allow the shrink; the foreign probes that
+//! follow then prove the lock survived both that connection's creation and its
+//! probe.
 //!
 //! [`tests::a_store_held_by_another_process_refuses_the_boot`] covers the other
 //! half: while a foreign process holds a store's lock, the daemon's bring-up must
@@ -102,16 +104,23 @@ async fn verify() -> Result<String> {
     }
 
     // The pre-shrink gate is another path that must not cost the store's lock:
-    // it is a stat-only probe plus one pragma in the product. Run it against
-    // every live store and require it to allow the shrink on a healthy store —
-    // the fingerprint and foreign probes below then prove it kept the lock.
+    // it is a stat-only probe plus one pragma in the product. It runs through
+    // the very connection the periodic round uses — the store's maintenance
+    // connection, opened from the live store — so this proves the lock survives
+    // that connection's creation and its probe. Run it against every live store
+    // and require it to allow the shrink on a healthy store — the fingerprint
+    // and foreign probes below then prove it kept the lock.
     let mut gated = Vec::new();
     for (name, store_conn) in super::iter_checkpoint_stores() {
         let Some(store_conn) = store_conn else {
             continue;
         };
+        let maintenance = store_conn
+            .maintenance()
+            .await
+            .context("the store did not give the check a maintenance connection")?;
         ensure!(
-            crate::db::shrink_gate::shrink_allowed(store_conn, name, Some(&root)).await,
+            crate::db::shrink_gate::shrink_allowed(&maintenance, name, Some(&root)).await,
             "the pre-shrink gate refused a healthy store ({name})",
         );
         gated.push(name);

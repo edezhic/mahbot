@@ -1666,9 +1666,9 @@ async fn finalize_source_tree_update(
     finalize_update_and_restart(&current_exe, cleanup_paths).await
 }
 
-/// Shared finalize tail for both update paths: graceful drain, final
-/// single-writer checkpoint, temp-dir removal, instance-lock release, independent
-/// spawn of the replacement, and `exit(0)`.
+/// Shared finalize tail for both update paths: graceful drain, the final
+/// checkpoint, temp-dir removal, instance-lock release, independent spawn of the
+/// replacement, and `exit(0)`.
 ///
 /// `spawn_path` is the file the update left in place — the working file the
 /// replacement instance runs from. The ordering is load-bearing and MUST NOT be
@@ -1690,9 +1690,14 @@ async fn finalize_source_tree_update(
 ///    (see `checkpoint_all_databases`); `exit(0)` below bypasses Rust
 ///    destructors, so the writing connections themselves are never formally
 ///    closed. With the lock still held this is
-///    the last single-writer checkpoint: no checkpoint runs after the
-///    replacement is live (the GUI exit path waits while the update is
-///    finalizing — see `save_and_exit` / `update_is_finalizing`).
+///    the last checkpoint the retiring process issues: no checkpoint runs after
+///    the replacement is live (the GUI exit path waits while the update is
+///    finalizing — see `save_and_exit` / `update_is_finalizing`). No writer can
+///    be in flight either — the drain stopped them all — but a periodic round's
+///    statement is not a writer and runs in a detached task, so one can outlive a
+///    cancelled round and answer this TRUNCATE blocked: a warn, and the
+///    replacement replays the journal (src/db/checkpoint.rs states the same for
+///    the round).
 /// 3. Remove the temp update roots BEFORE releasing the instance lock or
 ///    spawning: `exit(0)` below bypasses Rust destructors, so the (potentially
 ///    multi-GB) deletion must complete here while the old process still holds

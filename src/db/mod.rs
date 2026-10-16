@@ -383,12 +383,13 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
 
 /// A handle to one store's connections.
 ///
-/// Every **change** — and every read the store issues to itself (see
-/// [`Connection::upkeep`]) — goes through the one **writing connection** whose
-/// access is serialized by the [`Mutex`] below. Every ordinary **read** is
-/// served by the store's reader connections ([`ReaderPool`]) and never touches
-/// that mutex, so a read no longer queues behind whatever else the store is
-/// doing.
+/// Every **change** — and the store's own upkeep (see [`Upkeep`]) — goes through
+/// the one **writing connection** whose access is serialized by the [`Mutex`]
+/// below, except the periodic round's checkpoint and its integrity verification,
+/// which run on the store's maintenance connection ([`Maintenance`]). Every
+/// ordinary **read** is served by the store's reader connections ([`ReaderPool`])
+/// and never touches that mutex, so a read no longer queues behind whatever else
+/// the store is doing.
 ///
 /// The engine is what lets one `Database` carry many connections, and it takes
 /// many reads on one connection at once. It does **not** queue a second *write*
@@ -421,8 +422,8 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
 /// commits.
 #[derive(Clone, Debug)]
 pub(crate) struct Connection {
-    /// The writing connection — reused for every change and every read the
-    /// store issues to itself.
+    /// The writing connection — reused for every change and for the store's own
+    /// upkeep reads that stay on it (see [`Upkeep`]).
     conn: Arc<tokio::sync::Mutex<store::Connection>>,
     /// Set when a TxGuard is dropped without explicit commit/rollback.
     /// Checked at the start of every write operation (execute, begin_tx).
@@ -437,6 +438,10 @@ pub(crate) struct Connection {
     /// stat source (main and `-wal` sizes); never opened — wal_guard's lock
     /// rule.
     db_path: Arc<std::path::Path>,
+    /// The open store every connection of this store is made from — the writing
+    /// connection's, the readers' and the maintenance one's ([`Maintenance`]).
+    /// Never a second open of the store's file (wal_guard's lock rule).
+    db: Arc<store::Database>,
     /// The store's reader connections. Handed the already-open store at open;
     /// it creates reader connections only once the store is final and a read
     /// first needs one (see [`Connection::enable_readers`]).
@@ -574,10 +579,11 @@ async fn drain_rows(mut rows: store::Rows) -> turso::Result<Vec<Row>> {
     Ok(result)
 }
 
-/// Await a detached statement op — shared by the writing connection
-/// ([`Connection::run_detached_capturing`]) and a reader ([`ReaderLease::run`]),
-/// so the two places a statement can run cannot drift apart in what they do
-/// with the outcome.
+/// Await a detached statement op — shared by every place a statement can run: the
+/// writing connection ([`Connection::run_detached_capturing`]) and the store's
+/// maintenance connection ([`Maintenance::run_statement`]), both through
+/// [`spawn_detached`], and a reader ([`ReaderLease::run`]) — so the places cannot
+/// drift apart in what they do with the outcome.
 ///
 /// A panicking op propagates the ORIGINAL panic payload (the hook prints it);
 /// the unwind re-enters at the call site, so only the message, not the
@@ -595,6 +601,21 @@ fn join_detached<T>(
             )),
         },
     }
+}
+
+/// Drive `task` — a statement op with its connection already chosen — to
+/// completion in a detached runtime task, with `cause` armed for its polls when
+/// given (see [`checkpoint_cause`]). See [`Connection::run_detached`] for why a
+/// statement must never be driven by a caller's future.
+async fn spawn_detached<T: Send + 'static>(
+    task: impl Future<Output = turso::Result<T>> + Send + 'static,
+    cause: Option<checkpoint_cause::CauseSink>,
+) -> turso::Result<T> {
+    let joined = match cause {
+        Some(cause) => tokio::spawn(cause.scoped(task)).await,
+        None => tokio::spawn(task).await,
+    };
+    join_detached(joined)
 }
 
 /// Run a read-only query against an already-locked turso connection, bounded
@@ -828,7 +849,7 @@ enum Place {
     /// writing connection otherwise (see [`Connection::run_read`]).
     Read,
     /// The writing connection, whatever the readers are doing — the store's own
-    /// upkeep ([`Upkeep`]) and every change.
+    /// upkeep that stays on it ([`Upkeep`]) and every change.
     Writer,
 }
 
@@ -845,6 +866,7 @@ impl Connection {
         })
         .await
         .context("failed to open local database")?;
+        let db = Arc::new(db);
         let conn = db.connect()?;
         conn.busy_timeout(BUSY_TIMEOUT);
         // In-memory temp storage for this connection (turso's
@@ -867,16 +889,29 @@ impl Connection {
             has_dangling_tx: Arc::new(AtomicBool::new(false)),
             tx_task: Arc::new(std::sync::Mutex::new(None)),
             db_path: Arc::from(path),
-            // The store handle is kept so the readers are connections of this
-            // open store and never a second open of its file, and it lives as
-            // long as the readers do.
-            readers: Arc::new(ReaderPool::new(Arc::new(db))),
+            // The store handle is kept so every connection of this store — the
+            // readers and the maintenance one — is a connection of this open
+            // store and never a second open of its file, and it lives as long as
+            // they do.
+            db: Arc::clone(&db),
+            readers: Arc::new(ReaderPool::new(db)),
         })
     }
 
     /// The main-file path this connection was opened on.
     pub(crate) fn db_path(&self) -> &std::path::Path {
         &self.db_path
+    }
+
+    /// Open the store's maintenance connection — see [`Maintenance`].
+    pub(crate) async fn maintenance(&self) -> anyhow::Result<Maintenance> {
+        let conn = read_only_connection(&self.db, "the store's maintenance connection")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok(Maintenance {
+            conn: Arc::new(conn),
+            db_path: Arc::clone(&self.db_path),
+        })
     }
 
     /// Let this store's connections serve reads.
@@ -1043,11 +1078,7 @@ impl Connection {
             let guard = Self::lock_and_cleanup_owned(&conn, &dangling, &tx_task).await;
             op(&guard).await
         };
-        let joined = match cause.cloned() {
-            Some(cause) => tokio::spawn(cause.scoped(task)).await,
-            None => tokio::spawn(task).await,
-        };
-        join_detached(joined)
+        spawn_detached(task, cause.cloned()).await
     }
 
     /// Upsert one row without the engine's `INSERT ... ON CONFLICT ... DO UPDATE`
@@ -1697,50 +1728,15 @@ impl Connection {
         self.run_checkpoint(CheckpointMode::Truncate).await
     }
 
-    /// Run a non-truncating (PASSIVE) WAL checkpoint.
-    ///
-    /// Backfills as many WAL frames as possible into the main database file
-    /// without blocking readers or writers and without truncating the WAL —
-    /// it never resets the shared WAL frame index, so it is safe to run while
-    /// other connections are live. The WAL file keeps growing until a
-    /// TRUNCATE checkpoint runs; callers bound that growth with a size cap.
-    async fn checkpoint_passive(&self) -> anyhow::Result<CheckpointOutcome> {
-        self.run_checkpoint(CheckpointMode::Passive).await
-    }
-
-    /// Run a WAL checkpoint in TRUNCATE mode when `truncate`, PASSIVE
-    /// otherwise — the bool-based mode selection used by the checkpoint rounds
-    /// and tests. `truncate == true` is the same ungated TRUNCATE as
-    /// [`Self::checkpoint_ungated`]: the caller must have passed the pre-shrink
-    /// gate first (see [`crate::db::shrink_gate`]).
-    pub(crate) async fn checkpoint_mode(
-        &self,
-        truncate: bool,
-    ) -> anyhow::Result<CheckpointOutcome> {
-        if truncate {
-            self.checkpoint_ungated().await
-        } else {
-            self.checkpoint_passive().await
-        }
-    }
-
     async fn run_checkpoint(&self, mode: CheckpointMode) -> anyhow::Result<CheckpointOutcome> {
-        // The engine reports a failed checkpoint as a successful row that cannot
-        // carry the reason, so an armed sink is the only source for it (see
-        // [`checkpoint_cause`]). The compaction is upkeep: it runs on the
-        // writing connection, never on a reader (see [`Upkeep`]).
-        let cause = checkpoint_cause::CauseSink::new();
-        let sql = format!("PRAGMA wal_checkpoint({});", mode.label());
-        let rows = self
-            .upkeep()
-            .query_with_cause(&sql, (), Some(&cause))
-            .await
-            .map_err(|e| cause.attach(anyhow::Error::from(e)))
-            .context("Failed to checkpoint WAL")?;
-        let row = rows
-            .first()
-            .context("PRAGMA wal_checkpoint returned no result row")?;
-        parse_checkpoint_row(row).map_err(|e| cause.attach(e))
+        // The compaction is upkeep on the writing connection, never on a reader
+        // (see [`Upkeep`]) — the periodic round issues its own through the store's
+        // maintenance connection, and the two share this body through
+        // [`wal_checkpoint`].
+        wal_checkpoint(mode, |sql, cause| async move {
+            self.upkeep().query_with_cause(&sql, (), Some(&cause)).await
+        })
+        .await
     }
 
     /// Run PRAGMA quick_check to verify database integrity.
@@ -1753,44 +1749,35 @@ impl Connection {
     /// the store, not with a constant. On the live installation the periodic
     /// integrity round of a ~540 MiB store is what ordinary reads used to wait
     /// seconds behind — which is why those reads are served by reader
-    /// connections now, and why this runs as upkeep on the writing connection
-    /// ([`Upkeep`]).
+    /// connections now, and why this is upkeep that runs on whichever of the
+    /// store's own connections runs it (see [`OwnConnection`]): the maintenance
+    /// connection for the periodic round ([`Maintenance`]), the writing
+    /// connection for the boot-time repairs and the store-open checks.
     pub async fn quick_check(&self) -> anyhow::Result<()> {
         if let Some(problem) = self.quick_check_problems().await?.into_iter().next() {
             anyhow::bail!("Database integrity check failed: {problem}");
         }
         Ok(())
     }
-
-    /// All `quick_check` problem rows (the known FTS false positive filtered
-    /// out) — unlike [`Self::quick_check`], which bails on the first problem.
-    /// The class-B repair needs the full list: an overflow-aliasing row
-    /// anywhere in the scan must veto the REINDEX even when an earlier row
-    /// names an index desync.
-    ///
-    /// Upkeep: the store's own verification, on the writing connection (see
-    /// [`Upkeep`]).
-    pub(crate) async fn quick_check_problems(&self) -> anyhow::Result<Vec<String>> {
-        let rows = self
-            .upkeep()
-            .query("PRAGMA quick_check;", ())
-            .await
-            .context("Failed to execute PRAGMA quick_check")?;
-        scan_integrity_rows(&rows)
-    }
 }
 
-/// The store's own upkeep reads — the reads the store issues to itself, which
-/// stay on the writing connection.
+/// The store's own upkeep reads — the reads the store issues to itself.
 ///
-/// The periodic integrity verification, the compaction, the search-index repair
-/// and its probes, the pre-shrink size probe, and the read of the store's own
-/// record of changes are all upkeep: they judge or maintain the store itself
-/// rather than serve a caller, and the compaction and the repair must not run
-/// against a reader's reading position (and the repair must not run beside live
-/// readers at all). Keeping them behind one entry leaves those exceptions in one
-/// place instead of hunting them down call by call, and it is why the reading
-/// entries can say, without exception, that they serve reads on a reader.
+/// The store's record of changes (CDC), the compaction the exit round and the
+/// boot-time repairs run, the search-index repair and its probes, and the
+/// pre-shrink probe those callers ask of the writing connection are all upkeep:
+/// they judge or maintain the store itself rather than serve a caller, and the
+/// compaction and the repair must not run against a reader's reading position
+/// (and the repair must not run beside live readers at all). Keeping them behind
+/// one entry leaves those exceptions in one place instead of hunting them down
+/// call by call, and it is why the reading entries can say, without exception,
+/// that they serve reads on a reader.
+///
+/// The periodic round's compaction and integrity verification are **not** here:
+/// they run on the store's maintenance connection ([`Maintenance`], and see
+/// [`OwnConnection`]), so ordinary work never waits behind them. The pre-shrink
+/// gate is asked of the connection that will run the reclaiming checkpoint, so
+/// its probe travels with it (see [`crate::db::shrink_gate`]).
 ///
 /// Upkeep is **not** atomic with the change that follows it: each statement takes
 /// the writing connection and gives it back, so another task's change can be
@@ -1892,6 +1879,142 @@ impl Upkeep<'_> {
     }
 }
 
+// ── The store's maintenance connection ──────────────────────────────
+
+/// The store's maintenance connection — the second connection of the very store
+/// this handle already has open (never a second open of its file), for the
+/// upkeep that judges or compacts the store itself and must not make ordinary
+/// work wait: the periodic round's checkpoint and its integrity verification
+/// (see [`crate::db::checkpoint`], which is the round's own statement of where it
+/// runs and of what could not move).
+///
+/// It is made for the round that uses it and dropped when that round ends, so
+/// between rounds the store carries exactly the connections it carried before
+/// and nothing a long-lived extra connection could accumulate (schema, header,
+/// page cache) is ever stale. Making it costs no new file descriptor and takes
+/// no lock of its own: the process keeps the single fcntl lock and the
+/// single-writer discipline it had.
+///
+/// It is `query_only` for its whole life, which keeps the store's "only the
+/// writing connection may change it" structural rather than a discipline: the
+/// engine refuses any write statement on it. The three statements it does run
+/// are unaffected — the pre-shrink gate's `PRAGMA page_count` (a read), the
+/// compaction (`PRAGMA wal_checkpoint`, which the engine translates as a
+/// statement that writes nothing; a checkpoint's serialization is the engine's
+/// own WAL checkpoint lock, the same one the writing connection's compaction
+/// takes) and `PRAGMA quick_check`, a read.
+///
+/// A store that cannot give the round one of these ([`Connection::maintenance`])
+/// has the round issue both statements — the compaction and the verification — on
+/// its writing connection instead; that is the round's fallback, not an end to its
+/// upkeep.
+///
+/// Accepted, unchanged: the checkpoint can meet the store's live readers and
+/// writers, and the engine then answers it blocked exactly as it always has —
+/// retried, never a failure (see [`crate::db::checkpoint`]).
+pub(crate) struct Maintenance {
+    conn: Arc<store::Connection>,
+    db_path: Arc<Path>,
+}
+
+impl Maintenance {
+    /// Run one statement the store issues to itself on this connection: a
+    /// DETACHED task, exactly as [`Connection::run_detached`] runs the writing
+    /// connection's statements, with `cause` armed for its polls when given
+    /// (see [`checkpoint_cause`]).
+    ///
+    /// The connection is this round's alone and carries no transaction to clean
+    /// up — it is never issued a `BEGIN`, and could not commit one (it is
+    /// `query_only`) — so the run needs neither a lock nor the writing
+    /// connection's dangling-transaction step.
+    async fn run_statement(
+        &self,
+        sql: String,
+        cause: Option<checkpoint_cause::CauseSink>,
+    ) -> turso::Result<Vec<Row>> {
+        let conn = Arc::clone(&self.conn);
+        spawn_detached(
+            async move { Connection::query_impl(&conn, &sql, ()).await },
+            cause,
+        )
+        .await
+    }
+}
+
+/// A connection the store itself owns — the writing connection, or the store's
+/// maintenance one ([`Maintenance`]) — as opposed to a reader, which serves a
+/// caller's read ([`ReaderLease`]). The store's own upkeep is issued through this,
+/// so one body serves the exit round (which owns the writing connection by
+/// construction) and the periodic round (which owns the maintenance connection;
+/// see [`crate::db::checkpoint`]).
+///
+/// A reader is deliberately not one of these: its snapshot could lag the frames
+/// the very next statement tries to fold. Such a connection is shared by
+/// reference across the awaits of the round's future, which runs on the daemon's
+/// spawned tasks — hence the `Send + Sync` supertrait and the `+ Send` each
+/// future-returning method states for its own future, which an `async fn` in a
+/// trait does not promise.
+pub(crate) trait OwnConnection: Send + Sync {
+    /// Run one statement the store issues to itself, on this connection.
+    fn own_query(&self, sql: &str) -> impl Future<Output = turso::Result<Vec<Row>>> + Send;
+
+    /// The compaction, in the mode `truncate` names (see
+    /// [`crate::db::shrink_gate`] for the gating contract).
+    fn checkpoint(
+        &self,
+        truncate: bool,
+    ) -> impl Future<Output = anyhow::Result<CheckpointOutcome>> + Send;
+
+    /// The store file this connection has open.
+    fn db_path(&self) -> &Path;
+
+    /// `PRAGMA quick_check`'s problem rows — see [`Connection::quick_check`].
+    /// The class-B repair needs the full list: an overflow-aliasing row anywhere
+    /// in the scan must veto the REINDEX even when an earlier row names an index
+    /// desync.
+    fn quick_check_problems(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send {
+        async move {
+            let rows = self
+                .own_query("PRAGMA quick_check;")
+                .await
+                .context("Failed to execute PRAGMA quick_check")?;
+            scan_integrity_rows(&rows)
+        }
+    }
+}
+
+impl OwnConnection for Connection {
+    async fn own_query(&self, sql: &str) -> turso::Result<Vec<Row>> {
+        self.upkeep().query(sql, ()).await
+    }
+
+    async fn checkpoint(&self, truncate: bool) -> anyhow::Result<CheckpointOutcome> {
+        self.run_checkpoint(CheckpointMode::from_truncate(truncate))
+            .await
+    }
+
+    fn db_path(&self) -> &Path {
+        self.db_path()
+    }
+}
+
+impl OwnConnection for Maintenance {
+    async fn own_query(&self, sql: &str) -> turso::Result<Vec<Row>> {
+        self.run_statement(sql.to_owned(), None).await
+    }
+
+    async fn checkpoint(&self, truncate: bool) -> anyhow::Result<CheckpointOutcome> {
+        wal_checkpoint(CheckpointMode::from_truncate(truncate), |sql, cause| {
+            self.run_statement(sql, Some(cause))
+        })
+        .await
+    }
+
+    fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+}
+
 // ── Reader connections ──────────────────────────────────────────────
 
 /// How many reader connections one store keeps.
@@ -1924,9 +2047,36 @@ const READER_CONNECTIONS: usize = 3;
 
 /// How long a connection waits on a lock another process holds, before giving up
 /// with a busy error — the writing connection ([`Connection::open`]) and every
-/// reader ([`ReaderPool::create_readers`]) alike: every connection carries the
-/// per-connection settings it needs.
+/// read-only connection of a store ([`read_only_connection`]) alike: every
+/// connection carries the per-connection settings it needs.
 const BUSY_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Connect one read-only connection of the open store `db` — a reader
+/// ([`ReaderPool`]) or the store's maintenance connection ([`Maintenance`]) —
+/// carrying the per-connection settings every read-only connection of this store
+/// gets: the busy timeout the writing connection gets, in-memory temp storage
+/// (the missing-temp-root guarantee), and the read-only switch, set before any
+/// statement is prepared on the connection and never reset.
+///
+/// The engine's connect is blocking (it reads the store header and page 1 and
+/// refreshes its stats snapshot), so it runs off the async worker pool. `what`
+/// names the connection in the failure text, so a failure still says which one
+/// could not be made.
+async fn read_only_connection(
+    db: &store::Database,
+    what: &str,
+) -> Result<store::Connection, String> {
+    let conn = crate::util::with_block_in_place(|| db.connect())
+        .map_err(|e| format!("could not connect {what}: {e}"))?;
+    conn.busy_timeout(BUSY_TIMEOUT);
+    conn.execute("PRAGMA temp_store = MEMORY;", ())
+        .await
+        .map_err(|e| format!("failed to set in-memory temp storage for {what}: {e}"))?;
+    conn.execute("PRAGMA query_only = 1;", ())
+        .await
+        .map_err(|e| format!("failed to make {what} read-only: {e}"))?;
+    Ok(conn)
+}
 
 /// How long [`ReaderPool::quiet`] and [`ReaderPool::release`] wait for the
 /// readers to fall idle before giving up on waiting.
@@ -2397,25 +2547,13 @@ impl ReaderPool {
         self.freed.notify_one();
     }
 
-    /// Create the readers. Every reader carries the per-connection settings the
-    /// writing connection gets, plus the read-only switch, which is set here —
-    /// before any statement is prepared on the connection — and never reset.
-    ///
-    /// The engine's connect is blocking (it reads the store header and page 1
-    /// and refreshes its stats snapshot), so it runs off the async worker pool.
+    /// Create the readers. Each reader is made by [`read_only_connection`],
+    /// which carries the per-connection settings every read-only connection of
+    /// the store gets.
     async fn create_readers(&self) -> Result<Vec<store::Connection>, String> {
         let mut made = Vec::with_capacity(READER_CONNECTIONS);
         for _ in 0..READER_CONNECTIONS {
-            let conn = crate::util::with_block_in_place(|| self.db.connect())
-                .map_err(|e| format!("could not connect a reader: {e}"))?;
-            conn.busy_timeout(BUSY_TIMEOUT);
-            conn.execute("PRAGMA temp_store = MEMORY;", ())
-                .await
-                .map_err(|e| format!("could not set a reader's in-memory temp storage: {e}"))?;
-            conn.execute("PRAGMA query_only = 1;", ())
-                .await
-                .map_err(|e| format!("could not make a reader read-only: {e}"))?;
-            made.push(conn);
+            made.push(read_only_connection(&self.db, "a reader").await?);
         }
         Ok(made)
     }
@@ -2499,7 +2637,7 @@ impl ReaderLease {
 
 /// Collect problem rows from `PRAGMA quick_check` (skipping `"ok"` and the
 /// known FTS index-cardinality false positive). Used by
-/// [`Connection::quick_check_problems`].
+/// [`OwnConnection::quick_check_problems`].
 fn scan_integrity_rows(rows: &[Row]) -> anyhow::Result<Vec<String>> {
     let mut problems: Vec<String> = Vec::new();
     for row in rows {
@@ -2573,6 +2711,28 @@ fn parse_checkpoint_row(row: &Row) -> anyhow::Result<CheckpointOutcome> {
         log_frames: int_column(row, 1)?,
         checkpointed_frames: int_column(row, 2)?,
     })
+}
+
+/// One `PRAGMA wal_checkpoint(<mode>)`, over whichever of the store's own
+/// connections runs it. `run` issues `sql` with `cause` armed for its polls (see
+/// [`checkpoint_cause`]) — the engine reports a checkpoint it could not run as a
+/// successful row that cannot carry its reason, so the armed sink is the only
+/// source for it — and returns that statement's rows.
+async fn wal_checkpoint<F, Fut>(mode: CheckpointMode, run: F) -> anyhow::Result<CheckpointOutcome>
+where
+    F: FnOnce(String, checkpoint_cause::CauseSink) -> Fut,
+    Fut: Future<Output = turso::Result<Vec<Row>>>,
+{
+    let cause = checkpoint_cause::CauseSink::new();
+    let sql = format!("PRAGMA wal_checkpoint({});", mode.label());
+    let rows = run(sql, cause.clone())
+        .await
+        .map_err(|e| cause.attach(anyhow::Error::from(e)))
+        .context("Failed to checkpoint WAL")?;
+    let row = rows
+        .first()
+        .context("PRAGMA wal_checkpoint returned no result row")?;
+    parse_checkpoint_row(row).map_err(|e| cause.attach(e))
 }
 
 /// A locked handle on the writing connection, scoped to a single transaction.
@@ -3205,18 +3365,28 @@ impl TicketTitleFtsRuntimeRepair {
 /// first makes stores that carry no ticket-title FTS index (e.g. logs.db)
 /// no-ops. Panics use the same `catch_unwind` discipline as the boot path.
 ///
-/// # Readers
+/// # What else may be in flight
 ///
 /// The rebuild drops and recreates the index inside one transaction, and its
 /// premise is that nothing else is in flight against the store. The writing
-/// connection's own mutex gives that for writers and checkpoints; the readers
-/// are the one thing it does not cover, so they are taken out of service and
-/// closed first ([`Connection::quiet_readers`]) — reads keep being served, by
-/// the writing connection, and the next read after the repair creates fresh
-/// readers. A reader that does not fall idle in time defers the whole repair to
-/// a later round (`Deferred`) rather than running it against live readers: a
-/// reader is never invalidated on the assumption that the engine would notice
-/// the index move under it.
+/// connection's own mutex gives that for the product's writers. The periodic
+/// round runs its compaction and verification on the store's maintenance
+/// connection — a sibling connection, outside that mutex — and the round is held
+/// off by construction: its body reaches this repair only after the attempt loop
+/// that used that connection has returned, never beside it. The maintenance
+/// connection itself is named for the same reason it is safe: it holds no reading
+/// position across the repair — it is idle for it, and its next statement is the
+/// verification that follows — and an idle sibling connection is not left on the
+/// old pages. On its next statement's read transaction the engine sees the WAL
+/// has moved, drops that connection's page cache and its cached schema cookie,
+/// and the statement then adopts the writer's committed schema, so it cannot read
+/// the index's old btree. The readers are the remaining case: they are taken out
+/// of service and closed first ([`Connection::quiet_readers`]) — reads keep being
+/// served by the writing connection, and the next read after the repair creates
+/// fresh readers. A reader that does not fall idle in time defers the whole
+/// repair to a later round (`Deferred`) rather than running it against live
+/// readers: a reader is never invalidated on the assumption that the engine would
+/// notice the index move under it.
 pub(crate) async fn repair_ticket_title_fts_runtime(
     conn: &Connection,
 ) -> TicketTitleFtsRuntimeRepair {
@@ -4458,7 +4628,15 @@ fn desynced_index_name(msg: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// WAL checkpoint mode — replaces the stringly-typed mode literals.
+/// WAL checkpoint mode — the engine's two compaction levels.
+///
+/// PASSIVE backfills as many WAL frames as it can without blocking readers or
+/// writers and never resets the shared WAL frame index, so it is safe beside
+/// live connections; the WAL file keeps growing until a TRUNCATE runs, which is
+/// why callers bound that growth with a size cap (see [`crate::db::checkpoint`]).
+/// TRUNCATE additionally resets the shared frame index — the live-writer
+/// corruption vector — so it must pass the pre-shrink gate first
+/// ([`crate::db::shrink_gate`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointMode {
     Passive,
@@ -4466,6 +4644,16 @@ enum CheckpointMode {
 }
 
 impl CheckpointMode {
+    /// The mode a `truncate` flag selects — the rounds' cap decision, and the
+    /// shape [`OwnConnection::checkpoint`] takes.
+    fn from_truncate(truncate: bool) -> Self {
+        if truncate {
+            Self::Truncate
+        } else {
+            Self::Passive
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Passive => "PASSIVE",
@@ -5207,11 +5395,12 @@ mod tests {
     /// intermediate query structures stay in RAM and a missing temp root
     /// cannot affect any turso operation.
     ///
-    /// The carriers do NOT share an opening path: the service's writing
-    /// connection (`Connection::open`), the store's reader connections
-    /// ([`ReaderPool::create_readers`], made from the same open store), and the
-    /// debug CLI's separate read-only path (`connect_readonly` in
-    /// src/db/debug.rs) each set the pragma itself. If one regresses, the
+    /// The carriers do NOT all share one opening path: the writing connection
+    /// (`Connection::open`) sets the pragma itself, while every read-only
+    /// connection of a store — the readers and the maintenance connection — is
+    /// made by `read_only_connection`, so those two have ONE place to keep it
+    /// right. The debug CLI's separate read-only path (`connect_readonly` in
+    /// src/db/debug.rs) has its own opening path. If one regresses, the
     /// guarantee silently breaks; this source-scanning tripwire reads each
     /// carrier's own body and fails with a pointer to the requirement.
     #[test]
@@ -5220,7 +5409,7 @@ mod tests {
         // (file, the header of the function that must carry the PRAGMA itself)
         const CARRIERS: [(&str, &str); 3] = [
             ("src/db/mod.rs", "pub async fn open(path: &Path)"),
-            ("src/db/mod.rs", "async fn create_readers("),
+            ("src/db/mod.rs", "async fn read_only_connection("),
             ("src/db/debug.rs", "pub(crate) fn connect_readonly("),
         ];
 
@@ -5245,9 +5434,11 @@ mod tests {
                 violations.push(format!(
                     "{file}: `{header}…` no longer applies the in-memory temp-store \
                      setting (missing `{PRAGMA}` in its own body).\n\
-                     The missing-temp-root guarantee requires EVERY turso connection \
-                     the application opens — the writing connection, each reader \
-                     connection AND the debug CLI — to run with in-memory temp storage."
+                     The missing-temp-root guarantee requires the writing connection \
+                     to set it itself and every read-only connection of a store — the \
+                     readers and the maintenance connection — to be made by \
+                     `read_only_connection`, which sets it; the debug CLI's own \
+                     opening path sets it too."
                 ));
             }
         }
@@ -5359,16 +5550,22 @@ mod tests {
             .await
             .expect("insert test row");
 
-        for mode in ["checkpoint", "checkpoint_passive"] {
-            let outcome = conn
-                .checkpoint_mode(mode == "checkpoint")
-                .await
-                .expect("checkpoint should succeed on a healthy database");
-            assert!(
-                outcome.is_complete(),
-                "{mode} outcome must be complete: {outcome:?}"
-            );
-        }
+        let truncate = conn
+            .checkpoint_ungated()
+            .await
+            .expect("truncate checkpoint should succeed on a healthy database");
+        assert!(
+            truncate.is_complete(),
+            "TRUNCATE outcome must be complete: {truncate:?}"
+        );
+        let passive = conn
+            .run_checkpoint(CheckpointMode::Passive)
+            .await
+            .expect("passive checkpoint should succeed on a healthy database");
+        assert!(
+            passive.is_complete(),
+            "PASSIVE outcome must be complete: {passive:?}"
+        );
     }
 
     /// Exercise the busy/partial detection directly: `is_complete` is false for

@@ -117,6 +117,13 @@ pub(crate) struct Database {
     inner: Arc<TursoDatabase>,
 }
 
+/// The engine handle is not `Debug`; see the `Connection` impl above.
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database").finish()
+    }
+}
+
 impl Database {
     /// Open the store at `path` for read-write use.
     ///

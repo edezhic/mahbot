@@ -515,10 +515,17 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     // regardless of checkpoints). Non-truncating (PASSIVE) below the WAL-size
     // cap — TRUNCATE resets the shared WAL frame index, which is the
     // live-writer corruption vector under live connections, so the periodic
-    // loop avoids it (see checkpoint::periodic_checkpoint_and_verify).
+    // loop keeps it rare, and the engine itself refuses the reset while another
+    // connection holds the store, answering blocked rather than failing (see
+    // checkpoint::periodic_checkpoint_and_verify). The round runs every ten
+    // minutes and issues its upkeep on the store's own maintenance connection
+    // (db::Maintenance), so ordinary reads and writes do not wait for the writing
+    // connection behind it; a store that cannot give the round one has the round
+    // run on the writing connection instead, which is how every round ran before
+    // the maintenance connection existed.
     spawn_cancellable(&mut tasks, &shutdown_token, "auto-checkpoint", async {
         loop {
-            if !mahbot::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(5)).await {
+            if !mahbot::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)).await {
                 break;
             }
             // The self-update path checkpoints all stores itself and cancels

@@ -75,10 +75,12 @@ pub struct LogStore {
 /// running service never opens a store file a second time. (Two connections to
 /// one open database do not conflict — one `Database` serves many, which is how
 /// the core store's readers work — but a second *open* of the file is what must
-/// not happen.) The log store keeps its own single connection and, unlike the
-/// core store, serves no reads on readers of its own — the writes it carries are
-/// the tracing writer's batches, the telemetry drain's records
-/// ([`crate::telemetry`]), the retention pass and the views the Logs page runs.
+/// not happen.) The log store keeps no reader connections of its own (unlike the
+/// core store) and serves the writes it has on its own writing connection: the
+/// tracing writer's batches, the telemetry drain's records
+/// ([`crate::telemetry`]), the retention pass and the views the Logs page runs. The
+/// only other connection it ever carries is the periodic round's maintenance one
+/// ([`crate::db::Maintenance`]).
 ///
 /// In addition to this global, [`init_tracing()`] returns an `Arc<LogStore>` to
 /// its caller, and that store travels on with the boot result to the dashboard —
