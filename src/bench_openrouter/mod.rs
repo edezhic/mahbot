@@ -467,7 +467,7 @@ fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<Strin
                     .map_err(|e| anyhow::anyhow!("config read I/O step failed: {e}"))?;
             }
             Ok(turso::core::StepResult::Interrupt) => {
-                bail!("config read query interrupted");
+                bail!("{}", crate::db::store::too_heavy_message());
             }
             Ok(turso::core::StepResult::Busy) => {
                 bail!("config store busy; try again later");

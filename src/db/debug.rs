@@ -28,10 +28,12 @@
 //! When no instance holds the location ([`Free`](crate::util::lock::InstanceLockState::Free))
 //! the CLI opens each store directly in single-process read-only mode via
 //! `turso::core::Database::open_file_with_flags` with
-//! `OpenFlags::ReadOnly | OpenFlags::NoLock`. This cannot create or mutate
-//! files (the SDK `Builder` has no read-only option and always passes
-//! `OpenFlags::Create`, which would create a missing `-wal`), and it reads
-//! committed WAL frames in single-process mode.
+//! `OpenFlags::ReadOnly | OpenFlags::NoLock` — no create and no whole-file
+//! lock, so the open cannot create or mutate files. The connection layer is not
+//! used here because it opens read-write and steps asynchronously, which is the
+//! wrong shape for a caller that must never take the store's lock and steps its
+//! statements on the current thread. The open reads committed WAL frames in
+//! single-process mode.
 //!
 //! The routing is fail-closed ([`Unknown`](crate::util::lock::InstanceLockState::Unknown)
 //! is never read as "no instance is running"): the CLI refuses outright and
@@ -752,11 +754,11 @@ fn is_engine_panic_error(err: &anyhow::Error) -> bool {
 /// lookups (worker model / provider key fallbacks) — same guarantees, same
 /// no-write path as the debug CLI.
 ///
-/// Uses the low-level `turso::core` API because the SDK `Builder` cannot open
-/// read-only: `OpenFlags::ReadOnly | OpenFlags::NoLock` guarantees the open
-/// cannot create or mutate files. The core IO is synchronous (`FsIO`), so
-/// this is intentionally blocking; the debug CLI runs on a single-task
-/// current-thread runtime.
+/// Uses the low-level `turso::core` API because only it can express
+/// `OpenFlags::ReadOnly | OpenFlags::NoLock`: no create and no whole-file lock,
+/// so the open cannot create or mutate files. The core IO is synchronous
+/// (`FsIO`), so this is intentionally blocking; the debug CLI runs on a
+/// single-task current-thread runtime.
 pub(crate) fn open_readonly(
     db_path: &Path,
     opts: turso::core::DatabaseOpts,
@@ -786,10 +788,18 @@ pub(crate) fn open_readonly(
     Ok((io, db))
 }
 
-/// Connect to an opened store, applying the in-memory temp-store setting.
+/// Connect to an opened store, applying the in-memory temp-store setting and
+/// the per-statement limit.
 ///
 /// Also used by the `bench-openrouter` subcommand for read-only config-store
 /// lookups — see [`open_readonly`].
+///
+/// The limit is armed here because this connection serves caller-supplied SQL:
+/// it is what stops one statement from holding the store for as long as it
+/// likes. The engine terminates a statement that overruns
+/// [`crate::db::store::statement_limit`] and the connection stays usable, so
+/// the store answers the next query instead of being held until the statement
+/// ends on its own.
 ///
 /// Every turso connection the application opens — the service's opening path
 /// (the writing connection and each reader connection, both of which set the
@@ -811,6 +821,7 @@ pub(crate) fn connect_readonly(
     let conn = db
         .connect()
         .map_err(|e| anyhow!("failed to connect to database '{}': {e}", db_path.display()))?;
+    conn.set_query_timeout(crate::db::store::statement_limit());
     conn.execute("PRAGMA temp_store = MEMORY").map_err(|e| {
         anyhow!(
             "failed to set in-memory temp storage on '{}': {e}",
@@ -1000,6 +1011,11 @@ fn prepare_readonly(
 /// `limit` stops stepping with `has_more = true` when a row would exceed the
 /// cap; that row is NOT collected. Callers buffer output so a mid-query
 /// failure never leaks partial results.
+///
+/// An interrupt is always [`crate::db::store::statement_limit`] terminating a
+/// statement that overran it — nothing else interrupts these connections — so
+/// it reports the shared caller-facing sentence ([`crate::db::store::too_heavy_message`]),
+/// not the engine's bare "interrupted".
 fn step_rows<T>(
     io: &std::sync::Arc<dyn turso::core::IO>,
     db_path: &Path,
@@ -1031,9 +1047,11 @@ fn step_rows<T>(
                     .ok_or_else(|| anyhow!("row missing after StepResult::Row"))?;
                 rows.push(collect(row));
             }
-            turso::core::StepResult::Interrupt => {
-                bail!("query interrupted on '{}'", db_path.display())
-            }
+            turso::core::StepResult::Interrupt => bail!(
+                "SQL query failed on '{}': {}",
+                db_path.display(),
+                crate::db::store::too_heavy_message()
+            ),
             turso::core::StepResult::Busy => {
                 bail!("database busy on '{}'; try again later", db_path.display())
             }

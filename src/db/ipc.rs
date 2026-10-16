@@ -101,8 +101,12 @@ const IPC_SOCKET_FILE_NAME: &str = "mahbot-debug.sock";
 #[cfg(windows)]
 const IPC_PIPE_PREFIX: &str = r"\\.\pipe\mahbot-debug-";
 
-/// Total wall-clock bound for the instance-up-but-channel-not-bound retry
-/// (lock held before the listener binds during boot / self-update hand-off).
+/// Bounds how long the client keeps retrying while an instance holds the lock
+/// but has not bound its listener yet (boot / self-update hand-off).
+///
+/// Every failed attempt that did not reach the instance is retried while the
+/// window has time left — the window is not restricted to transport failures —
+/// and one that did reach it is never retried at all ([`AnswerTimeout`]).
 const IPC_BOUND_TIMEOUT_SECS: u64 = 15;
 
 /// [`IPC_BOUND_TIMEOUT_SECS`], overridable with `MAHBOT_IPC_BOUND_TIMEOUT_SECS`
@@ -111,6 +115,23 @@ const IPC_BOUND_TIMEOUT_SECS: u64 = 15;
 /// waiting out the default.
 pub(crate) fn ipc_bound_timeout() -> std::time::Duration {
     crate::util::env_duration_secs("MAHBOT_IPC_BOUND_TIMEOUT_SECS", IPC_BOUND_TIMEOUT_SECS)
+}
+
+/// Extra patience, on top of the per-statement limit, for the instance to
+/// answer a debug query: a statement the limit terminates answers only when it
+/// is cut, so a client that wants that answer must wait past the limit — this is
+/// how far past.
+const IPC_ANSWER_MARGIN_SECS: u64 = 30;
+
+/// How long one attempt waits for its answer: this side's
+/// [`crate::db::store::statement_limit`] plus [`IPC_ANSWER_MARGIN_SECS`].
+///
+/// The limit is read from the env override the instance arms its own connections
+/// with ([`crate::db::store::STATEMENT_LIMIT_ENV`]), so one environment carrying
+/// it makes both sides agree on when a statement is cut. `saturating_add` keeps
+/// an absurd override (near `u64::MAX` seconds) from panicking the client.
+fn answer_patience() -> Duration {
+    crate::db::store::statement_limit().saturating_add(Duration::from_secs(IPC_ANSWER_MARGIN_SECS))
 }
 
 /// Retry backoff schedule (ms) for the IPC socket-not-yet-bound window.
@@ -606,7 +627,39 @@ pub async fn run_ipc_listener(
     }
 }
 
+/// The instance took this client's query and did not answer it inside
+/// [`answer_patience`].
+///
+/// This is not a transport failure and must not be reported as one: the channel
+/// was reached and the instance may still be working on the query, whose answer
+/// comes only once the instance's own per-statement limit cuts the statement.
+/// The wait follows THIS side's limit, so the two sides end up here when they
+/// read different `MAHBOT_STORE_STATEMENT_LIMIT_SECS` overrides and the
+/// instance's is the larger one.
+#[derive(Debug)]
+struct AnswerTimeout;
+
+impl std::fmt::Display for AnswerTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the instance did not answer within {}s: it is reachable and the query may still be \
+             running there, because a statement cut at the per-statement limit is answered only \
+             when it is cut — if the instance runs with a larger {} than this client, its answer \
+             comes later than this wait",
+            answer_patience().as_secs(),
+            crate::db::store::STATEMENT_LIMIT_ENV
+        )
+    }
+}
+
+impl std::error::Error for AnswerTimeout {}
+
 /// Client helper: connect to the instance's IPC socket and run a read-only query.
+///
+/// One attempt awaits its answer for [`answer_patience`]; only a failure that
+/// never reached the instance is worth a second copy of the query, so the wait
+/// running out is reported as [`AnswerTimeout`] and left alone.
 pub(crate) async fn ipc_query(
     storage_root: &Path,
     req: IpcRequest,
@@ -617,7 +670,7 @@ pub(crate) async fn ipc_query(
         .to_fs_name::<GenericFilePath>()
         .map_err(|e| anyhow::anyhow!("instance IPC endpoint not reachable: {e}"))?;
 
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
+    let result = tokio::time::timeout(answer_patience(), async {
         let mut stream = LocalSocketStream::connect(name).await?;
         let payload = serde_json::to_vec(&req)?;
         write_frame(&mut stream, &payload).await?;
@@ -626,7 +679,7 @@ pub(crate) async fn ipc_query(
         Ok::<QueryResponse, anyhow::Error>(resp)
     })
     .await
-    .map_err(|_| anyhow::anyhow!("instance IPC endpoint timed out"))??;
+    .map_err(|_| anyhow::Error::new(AnswerTimeout))??;
 
     Ok(result)
 }
@@ -655,6 +708,10 @@ fn channel_unreachable(socket: &Path) -> String {
 /// caller must only use this when [`crate::util::lock::instance_lock_state_settled`]
 /// reports the location [`Held`](crate::util::lock::InstanceLockState::Held) —
 /// otherwise the retry would mask a genuinely-down instance.
+///
+/// The window [`ipc_bound_timeout`] opens bounds the retries; an
+/// [`AnswerTimeout`] is terminal regardless of it, because the instance took the
+/// query and sending it again would run a second copy of the same work.
 pub(crate) async fn ipc_query_with_wait(
     storage_root: &Path,
     req: &IpcRequest,
@@ -665,6 +722,7 @@ pub(crate) async fn ipc_query_with_wait(
     loop {
         match ipc_query(storage_root, req.clone()).await {
             Ok(resp) => return Ok(resp),
+            Err(e) if e.downcast_ref::<AnswerTimeout>().is_some() => return Err(e),
             Err(_) if std::time::Instant::now() < deadline => {
                 tokio::time::sleep(retry_backoff(attempt)).await;
                 attempt += 1;
@@ -903,8 +961,9 @@ async fn ipc_call_once(storage_root: &Path, call: &CallRequest, protocol: &str) 
 /// contains `unknown store '<the value this build sent>'`).
 ///
 /// This deliberately does NOT go through the diagnostic path's [`ipc_query`]:
-/// that one puts a five-second bound on every attempt, which would give up on an
-/// operation the instance is still performing.
+/// that one bounds each attempt's answer wait, because the query behind it is
+/// itself bound by the per-statement limit. An operation has no such bound, so
+/// that patience would give up on work the instance is still performing.
 ///
 /// [`NotAccepted`]: CallOutcome::NotAccepted
 /// [`Unavailable`]: CallOutcome::Unavailable

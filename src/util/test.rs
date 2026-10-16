@@ -1254,7 +1254,7 @@ pub(crate) fn init_temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 /// Every `.rs` file under `dir`, recursively, in directory-walk order — the file
-/// list the source-scanning tripwires walk (`db`'s raw-builder guard and
+/// list the source-scanning tripwires walk (`db`'s store-handle guard and
 /// `tools::shell::tree`'s window guarantee).
 ///
 /// # Panics

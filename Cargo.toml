@@ -138,6 +138,14 @@ tar = "0.4"
 # own requirement, and the committed Cargo.lock — not this pin — is what holds
 # a build to the versions it was written against.
 turso = { version = "=0.8.3", default-features = false, features = ["fts"] }
+# The connection layer the product creates its store connections with
+# (src/db/store.rs): the wrapper does not expose the per-statement limit the
+# product arms on them, so the layer is built on the SDK kit the wrapper itself
+# is built on. It is pinned to the wrapper's exact version on purpose — the layer
+# hands the wrapper's own IO backend and open flags into the kit's config, so two
+# engine versions could not be linked into one process against one store file in
+# the first place.
+turso_sdk_kit = "=0.8.3"
 
 # Lock-free read-only snapshot holder for running-agent live transcripts
 # (ArcSwap<TranscriptSnapshot> published by Session, read by the GUI).

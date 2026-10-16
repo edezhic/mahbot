@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
-use turso::Builder;
 
 use crate::util::UnwrapPoison;
 
-pub(crate) use turso::{IntoParams, Row, Value, params};
+pub(crate) use crate::db::store::Row;
+pub(crate) use turso::{IntoParams, Value, params};
 
 pub(crate) mod cdc;
 pub mod checkpoint;
@@ -22,6 +22,7 @@ pub(crate) mod failure_record;
 pub mod ipc;
 pub(crate) mod migrations;
 pub(crate) mod shrink_gate;
+pub(crate) mod store;
 #[cfg(all(unix, test))]
 mod store_lock_check;
 pub mod wal_guard;
@@ -56,39 +57,32 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 /// [`turso::core::DatabaseOpts`] — see [`experimental_database_opts`] for
 /// the canonical construction.
 ///
-/// Which features are active is defined jointly by [`experimental_database_opts`]
-/// (the canonical opts) and the `experimental_*()` builder mapping in
-/// [`Connection::open`]; this constant is the test-verified name list.
-/// Adding a feature is the three-step process in [`experimental_database_opts`]'s
-/// doc. The `experimental_features_are_consistent` test verifies the mapping
-/// enables exactly the features listed here.
+/// This constant is the **single source** for which features are active, and it
+/// is read by both layers of the product: the connection layer
+/// ([`crate::db::store`]) turns it into the comma-separated feature string the
+/// SDK takes when the instance opens a store, and
+/// [`experimental_database_opts`] is the typed form the read-only debug path
+/// opens with. The `db::store::tests::feature_string_matches_the_debug_paths_typed_opts`
+/// test asserts the two are equal — it also catches a typo, because the SDK
+/// silently ignores a feature name it does not know.
+///
+/// Adding a feature is therefore a two-step process: add the `with_*()` call in
+/// [`experimental_database_opts`], and add the feature name string here — a flag
+/// without its name, or a name without its flag, fails the test above.
 ///
 /// # API naming asymmetries
 ///
-/// The `turso::Builder` (used by [`Connection::open`]) and `turso::core::DatabaseOpts`
-/// (used by [`experimental_database_opts`]) have slightly different APIs for the same
-/// underlying features. Known mismatches:
+/// Enabling a feature through the typed opts and naming it in this string form
+/// do not spell it the same way. Known mismatch:
 ///
-/// | DatabaseOpts field / `with_*()` | Builder `experimental_*()` | Feature string |
-/// |---|---:|---|
-/// | `enable_views` / `with_views()` | `experimental_materialized_views()` | `"views"` |
+/// | DatabaseOpts field / `with_*()` | Feature string |
+/// |---|---|
+/// | `enable_views` / `with_views()` | `"views"` |
 ///
-/// Some fields exist on only one side:
-/// - `enable_autovacuum` / `with_autovacuum()` — DatabaseOpts only, no Builder equivalent.
-/// - `unsafe_testing` / `with_unsafe_testing()` — DatabaseOpts only, no Builder equivalent.
-/// - `experimental_triggers()` — Builder only (no-op for backwards compatibility).
-/// - `experimental_strict()` — Builder only (no-op for backwards compatibility).
-///
-/// See the test `builder_mapping_matches_experimental_features` which verifies that
-/// the field-by-field mapping in [`Connection::open`] enables exactly the features
-/// listed here.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Referenced only by assertion tests; kept for documentation"
-    )
-)]
+/// Fields with no string form exist too and can only be set through the typed
+/// opts, so they never belong here:
+/// - `enable_autovacuum` / `with_autovacuum()`.
+/// - `unsafe_testing` / `with_unsafe_testing()`.
 pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method"];
 
 /// Name (file stem) of the single consolidated domain database file that backs
@@ -290,9 +284,14 @@ fn init_cell<T>(cell: &tokio::sync::OnceCell<T>, value: T, name: &str) -> anyhow
 
 /// Create [`turso::core::DatabaseOpts`] with all experimental features enabled.
 ///
-/// This is the **single source of truth** for which experimental features are active.
-/// [`Connection::open`] reads its builder calls from this function, and
-/// [`EXPERIMENTAL_FEATURES`] lists the feature names for test verification.
+/// The typed form of [`EXPERIMENTAL_FEATURES`], used by the read-only debug path
+/// (which opens through the low-level `turso::core` API rather than the
+/// connection layer).
+///
+/// Every engine experimental field is a deliberate decision here: one the engine
+/// adds later defaults off, and a field turned on here is only really active if
+/// its feature name is also in [`EXPERIMENTAL_FEATURES`], which is the string the
+/// instance passes to the engine.
 ///
 /// The instance runs in **default single-process mode**: there is no
 /// `multiprocess_wal` coordination.
@@ -305,11 +304,10 @@ fn init_cell<T>(cell: &tokio::sync::OnceCell<T>, value: T, name: &str) -> anyhow
 /// # Adding a new feature
 ///
 /// 1. Add the `with_*()` call here.
-/// 2. Add the `experimental_*()` mapping in [`Connection::open`].
-/// 3. Add the feature name string to [`EXPERIMENTAL_FEATURES`].
+/// 2. Add the feature name string to [`EXPERIMENTAL_FEATURES`].
 ///
-/// See [`EXPERIMENTAL_FEATURES`] for known API naming asymmetries between
-/// `DatabaseOpts::with_*()` and `Builder::experimental_*()`.
+/// The string [`EXPERIMENTAL_FEATURES`] lists is what the engine takes; see its
+/// doc for the naming asymmetries between the typed field and that string.
 #[must_use]
 pub(crate) fn experimental_database_opts() -> turso::core::DatabaseOpts {
     turso::core::DatabaseOpts::new().with_index_method(true)
@@ -425,7 +423,7 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
 pub(crate) struct Connection {
     /// The writing connection — reused for every change and every read the
     /// store issues to itself.
-    conn: Arc<tokio::sync::Mutex<turso::Connection>>,
+    conn: Arc<tokio::sync::Mutex<store::Connection>>,
     /// Set when a TxGuard is dropped without explicit commit/rollback.
     /// Checked at the start of every write operation (execute, begin_tx).
     /// Mirrors the upstream `turso::Connection::dangling_tx` pattern but
@@ -546,7 +544,7 @@ fn optional_row<T>(r: turso::Result<T>) -> anyhow::Result<Option<T>> {
 /// errors to `turso::Error::Error`. Shared by [`Connection::query_row_impl`]
 /// and [`Connection::query_row_cached`].
 async fn map_first_row<T, E>(
-    mut rows: turso::Rows,
+    mut rows: store::Rows,
     map: impl FnOnce(&Row) -> std::result::Result<T, E>,
 ) -> turso::Result<T>
 where
@@ -568,7 +566,7 @@ fn strict_collect<T>(rows: Vec<turso::Result<T>>) -> anyhow::Result<Vec<T>> {
 
 /// Drain a turso row stream into a `Vec` of [`Row`]s (unbounded — callers
 /// already know the query shape).
-async fn drain_rows(mut rows: turso::Rows) -> turso::Result<Vec<Row>> {
+async fn drain_rows(mut rows: store::Rows) -> turso::Result<Vec<Row>> {
     let mut result = Vec::new();
     while let Some(row) = rows.next().await? {
         result.push(row);
@@ -605,12 +603,12 @@ fn join_detached<T>(
 /// its reset ([`Connection::query_readonly`]); a reader connection carries the
 /// switch for its whole life and needs neither.
 async fn run_readonly_query(
-    conn: &turso::Connection,
+    conn: &store::Connection,
     sql: &str,
     params: impl IntoParams + Send + 'static,
     row_limit: usize,
 ) -> turso::Result<ReadonlyRows> {
-    let mut rows = conn.query(sql, params).await?;
+    let mut rows = conn.query(sql, params)?;
     let columns = rows.column_names();
     let col_count = columns.len();
     let mut result_rows = Vec::new();
@@ -671,7 +669,7 @@ const WINDOWS_LOCK_VIOLATION_CODE: &str = "(os error 33)";
 
 /// Whether an error is the transient open-time store lock from [turso_core].
 ///
-/// Turso's [`turso::Builder::build`] takes a whole-file fcntl `F_SETLK`
+/// [`store::Database::open`] takes a whole-file fcntl `F_SETLK`
 /// `F_WRLCK` record lock on the store files it opens read-write while the
 /// database is opened — the main file and its `-wal` (see `wal_guard`'s lock
 /// rule). When another process already holds that lock the open fails;
@@ -839,21 +837,16 @@ impl Connection {
         let path_str = path
             .to_str()
             .with_context(|| format!("database path must be UTF-8: {}", path.display()))?;
-        // Derive experimental features from the canonical opts function. The
-        // builder mapping below is step 2 of the three-step process in
-        // experimental_database_opts()'s doc: a new feature is added there,
-        // in this mapping, and in EXPERIMENTAL_FEATURES.
-        let opts = experimental_database_opts();
+        // The store handle comes from the connection layer, which opens with the
+        // string form of EXPERIMENTAL_FEATURES (see experimental_database_opts()'s
+        // doc for how the two sides of that single source are kept in step).
         let db = with_open_lock_retry(OPEN_LOCK_RETRY_ATTEMPTS, OPEN_LOCK_RETRY_DELAY, || async {
-            Builder::new_local(path_str)
-                .experimental_index_method(opts.enable_index_method)
-                .build()
-                .await
+            store::Database::open(path_str).await
         })
         .await
         .context("failed to open local database")?;
         let conn = db.connect()?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
+        conn.busy_timeout(BUSY_TIMEOUT);
         // In-memory temp storage for this connection (turso's
         // TempStore::Memory): every intermediate query structure — RETURNING
         // buffers, ORDER BY/LIMIT heap sorts, DISTINCT, IN-subqueries,
@@ -936,7 +929,7 @@ impl Connection {
     /// Both read and write callers on the writing connection should use this
     /// method — dangling transactions can affect read visibility in WAL mode if
     /// left active.
-    async fn lock_and_cleanup(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
+    async fn lock_and_cleanup(&self) -> tokio::sync::MutexGuard<'_, store::Connection> {
         Self::lock_and_cleanup_owned(&self.conn, &self.has_dangling_tx, &self.tx_task).await
     }
 
@@ -962,19 +955,19 @@ impl Connection {
     /// a record left by a dropped guard never outlives the transaction it
     /// names.
     async fn lock_and_cleanup_owned<'a>(
-        conn: &'a tokio::sync::Mutex<turso::Connection>,
+        conn: &'a tokio::sync::Mutex<store::Connection>,
         has_dangling_tx: &'a AtomicBool,
         tx_task: &'a std::sync::Mutex<Option<tokio::task::Id>>,
-    ) -> tokio::sync::MutexGuard<'a, turso::Connection> {
+    ) -> tokio::sync::MutexGuard<'a, store::Connection> {
         let guard = conn.lock().await;
         let armed = has_dangling_tx.swap(false, Ordering::SeqCst);
-        // The engine's autocommit state decides. `Ok(true)` means nothing is
-        // open, so there is nothing to roll back and a stale arm is only
-        // cleared — a doomed ROLLBACK ("cannot rollback - no transaction is
-        // active") would keep the arm set for every later access. An open
-        // transaction, or a probe that failed, is rolled back; that is the same
-        // rule the `query_only` reset in `query_readonly` uses.
-        if matches!(guard.is_autocommit(), Ok(true)) {
+        // The engine's autocommit state decides. `true` means nothing is open,
+        // so there is nothing to roll back and a stale arm is only cleared — a
+        // doomed ROLLBACK ("cannot rollback - no transaction is active") would
+        // keep the arm set for every later access. An open transaction is rolled
+        // back; that is the same rule the `query_only` reset in `query_readonly`
+        // uses.
+        if guard.is_autocommit() {
             *tx_task.lock().unwrap_poison() = None;
         } else {
             match guard.execute("ROLLBACK", ()).await {
@@ -1017,7 +1010,7 @@ impl Connection {
     where
         T: Send + 'static,
         F: for<'a> FnOnce(
-                &'a turso::Connection,
+                &'a store::Connection,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
             > + Send
@@ -1037,7 +1030,7 @@ impl Connection {
     where
         T: Send + 'static,
         F: for<'a> FnOnce(
-                &'a turso::Connection,
+                &'a store::Connection,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
             > + Send
@@ -1118,7 +1111,7 @@ impl Connection {
         let sql = sql.to_owned();
         self.run_detached(move |conn| {
             Box::pin(async move {
-                let mut stmt = conn.prepare_cached(&sql).await?;
+                let mut stmt = conn.prepare_cached(&sql)?;
                 stmt.execute(params).await
             })
         })
@@ -1262,7 +1255,7 @@ impl Connection {
     where
         T: Send + 'static,
         F: for<'a> FnOnce(
-                &'a turso::Connection,
+                &'a store::Connection,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
             > + Send
@@ -1295,7 +1288,7 @@ impl Connection {
     where
         T: Send + 'static,
         F: for<'a> FnOnce(
-                &'a turso::Connection,
+                &'a store::Connection,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
             > + Send
@@ -1402,9 +1395,10 @@ impl Connection {
                 // unwind (leaving query_only=1), so the caller gets an error instead.
                 let (reset, tx_reset) = match AssertUnwindSafe(async {
                     let reset = conn.execute("PRAGMA query_only = 0;", ()).await;
-                    let tx_reset = match conn.is_autocommit() {
-                        Ok(true) => Ok(()),
-                        _ => conn.execute("ROLLBACK;", ()).await.map(|_| ()),
+                    let tx_reset = if conn.is_autocommit() {
+                        Ok(())
+                    } else {
+                        conn.execute("ROLLBACK;", ()).await.map(|_| ())
                     };
                     (reset, tx_reset)
                 })
@@ -1459,11 +1453,11 @@ impl Connection {
     /// Core query logic shared by [`Connection::query`] and [`TxGuard::query`].
     /// Operates on an already-locked connection. Collects all rows into a `Vec`.
     async fn query_impl(
-        conn: &turso::Connection,
+        conn: &store::Connection,
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        let rows = conn.query(sql, params).await?;
+        let rows = conn.query(sql, params)?;
         drain_rows(rows).await
     }
 
@@ -1557,7 +1551,7 @@ impl Connection {
     /// already-locked connection. Returns [`turso::Error::QueryReturnedNoRows`]
     /// when no row matches.
     async fn query_row_impl<T, E>(
-        conn: &turso::Connection,
+        conn: &store::Connection,
         sql: &str,
         params: impl IntoParams + Send + 'static,
         map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
@@ -1566,7 +1560,7 @@ impl Connection {
         T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let rows = conn.query(sql, params).await?;
+        let rows = conn.query(sql, params)?;
         map_first_row(rows, map).await
     }
 
@@ -1611,12 +1605,12 @@ impl Connection {
     /// already-locked connection, obtaining the statement from turso's
     /// per-connection prepared-statement cache. Collects all rows into a `Vec`.
     async fn query_cached_impl(
-        conn: &turso::Connection,
+        conn: &store::Connection,
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        let mut stmt = conn.prepare_cached(sql).await?;
-        let rows = stmt.query(params).await?;
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query(params)?;
         drain_rows(rows).await
     }
 
@@ -1654,8 +1648,8 @@ impl Connection {
         let owned = sql.to_owned();
         self.run_at(Place::Read, sql, move |conn| {
             Box::pin(async move {
-                let mut stmt = conn.prepare_cached(&owned).await?;
-                map_first_row(stmt.query(params).await?, map).await
+                let mut stmt = conn.prepare_cached(&owned)?;
+                map_first_row(stmt.query(params)?, map).await
             })
         })
         .await
@@ -2160,7 +2154,7 @@ fn skip_leading(sql: &str) -> &str {
 /// # Discipline
 ///
 /// * Every connection here comes from the already-open store
-///   ([`turso::Database::connect`]): a store file is never opened a second time,
+///   ([`store::Database::connect`]): a store file is never opened a second time,
 ///   because the engine holds a whole-file lock on it for the process's life and
 ///   closing any descriptor for that file drops every record lock the process
 ///   holds on it (see [`crate::db::wal_guard`]). The pool holds the store handle,
@@ -2194,7 +2188,7 @@ fn skip_leading(sql: &str) -> &str {
 ///   one-time cost of creating them, paid by the first read that needs one.
 struct ReaderPool {
     /// The open store the readers are made from.
-    db: Arc<turso::Database>,
+    db: Arc<store::Database>,
     /// The free readers, and whether they have been created yet.
     inner: tokio::sync::Mutex<ReaderPoolInner>,
     /// Woken when a reader is given back to `inner.idle`.
@@ -2215,7 +2209,7 @@ struct ReaderPool {
 struct ReaderPoolInner {
     /// The free readers — empty until the first read creates them, and while
     /// every reader is serving a read.
-    idle: Vec<turso::Connection>,
+    idle: Vec<store::Connection>,
     /// How far the pool has got with creating them.
     state: Readers,
 }
@@ -2242,7 +2236,7 @@ impl std::fmt::Debug for ReaderPool {
 }
 
 impl ReaderPool {
-    fn new(db: Arc<turso::Database>) -> Self {
+    fn new(db: Arc<store::Database>) -> Self {
         Self {
             db,
             inner: tokio::sync::Mutex::new(ReaderPoolInner {
@@ -2394,7 +2388,7 @@ impl ReaderPool {
 
     /// Return a reader after a read. A reader given back after the pool was
     /// drained is closed instead of kept: the drain is what emptied it.
-    async fn give_back(&self, conn: turso::Connection) {
+    async fn give_back(&self, conn: store::Connection) {
         {
             let mut inner = self.inner.lock().await;
             if inner.state == Readers::Created {
@@ -2410,13 +2404,12 @@ impl ReaderPool {
     ///
     /// The engine's connect is blocking (it reads the store header and page 1
     /// and refreshes its stats snapshot), so it runs off the async worker pool.
-    async fn create_readers(&self) -> Result<Vec<turso::Connection>, String> {
+    async fn create_readers(&self) -> Result<Vec<store::Connection>, String> {
         let mut made = Vec::with_capacity(READER_CONNECTIONS);
         for _ in 0..READER_CONNECTIONS {
             let conn = crate::util::with_block_in_place(|| self.db.connect())
                 .map_err(|e| format!("could not connect a reader: {e}"))?;
-            conn.busy_timeout(BUSY_TIMEOUT)
-                .map_err(|e| format!("could not set a reader's busy timeout: {e}"))?;
+            conn.busy_timeout(BUSY_TIMEOUT);
             conn.execute("PRAGMA temp_store = MEMORY;", ())
                 .await
                 .map_err(|e| format!("could not set a reader's in-memory temp storage: {e}"))?;
@@ -2452,7 +2445,7 @@ impl Drop for QuietReaders {
 /// One read's hold on one reader connection.
 struct ReaderLease {
     pool: Arc<ReaderPool>,
-    conn: turso::Connection,
+    conn: store::Connection,
 }
 
 impl ReaderLease {
@@ -2461,9 +2454,12 @@ impl ReaderLease {
     /// The read runs in a DETACHED task, so a caller that gave up (a timeout, a
     /// shutdown cut, an aborted task) ends only its own wait: the statement
     /// finishes on the reader and the reader returns to the pool when it does.
-    /// Stopping a statement in place is what leaves a connection unusable in
-    /// this engine, so it is the caller's limit that ends the caller's wait,
-    /// never the statement.
+    /// The statement itself is bounded too — every connection this product
+    /// opens carries the per-statement limit
+    /// ([`crate::db::store::statement_limit`]), which the engine arms on the
+    /// connection and enforces as it steps, so a statement that overruns it is
+    /// terminated and the reader stays usable. Nothing here has to stop a
+    /// statement in place; abandoning the caller's wait never needs to.
     ///
     /// The statement is checked against [`reader_refusal`] first, so a change
     /// routed here fails loudly instead of committing without ever being
@@ -2472,7 +2468,7 @@ impl ReaderLease {
     where
         T: Send + 'static,
         F: for<'a> FnOnce(
-                &'a turso::Connection,
+                &'a store::Connection,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
             > + Send
@@ -2594,7 +2590,7 @@ fn parse_checkpoint_row(row: &Row) -> anyhow::Result<CheckpointOutcome> {
 /// [`Connection::refuse_transaction_read`]) precisely so that a read cannot
 /// drift onto a reader behind the transaction's back.
 pub(crate) struct TxGuard<'a> {
-    conn: tokio::sync::MutexGuard<'a, turso::Connection>,
+    conn: tokio::sync::MutexGuard<'a, store::Connection>,
     /// Shared flag on the parent Connection; set in Drop to signal a deferred
     /// rollback on the next write operation. Set to None when the transaction
     /// has been explicitly committed or rolled back, preventing Drop from
@@ -3202,9 +3198,12 @@ impl TicketTitleFtsRuntimeRepair {
 /// after a first attempt that failed or was answered busy. Runs the same boot
 /// primitives (see [`repair_ticket_title_fts_if_corrupt`]) — detection and the
 /// drop+recreate rebuild — via its own wrapper so the post-rebuild checkpoint
-/// mode and the caller-visible outcome can differ from the boot path. Blocking
-/// execution is intentional — a service stall while the repair runs is
-/// acceptable; no timeout/abort is applied. The `sqlite_master` presence check
+/// mode and the caller-visible outcome can differ from the boot path.
+/// Execution is synchronous and holds the writing connection, so the store
+/// serves nothing else while the repair runs — acceptable for this rare recovery
+/// path. Its statements are ordinary statements: the per-statement limit applies
+/// to the rebuild exactly as to everything else, and a rebuild that outran it is
+/// cut like any other statement. The `sqlite_master` presence check
 /// first makes stores that carry no ticket-title FTS index (e.g. logs.db)
 /// no-ops. Panics use the same `catch_unwind` discipline as the boot path.
 ///
@@ -5030,72 +5029,6 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use test_support::{assert_not_quarantined, fts_corruption_ddl, insert_fts_ticket};
 
-    #[test]
-    fn experimental_features_are_consistent() {
-        // Verify that experimental_database_opts() enables exactly
-        // the features listed in EXPERIMENTAL_FEATURES, and no other
-        // known experimental features.
-        let opts = experimental_database_opts();
-
-        // All features listed in the const must be enabled.
-        for feature in EXPERIMENTAL_FEATURES {
-            match *feature {
-                "index_method" => assert!(
-                    opts.enable_index_method,
-                    "index_method should be enabled per EXPERIMENTAL_FEATURES"
-                ),
-                other => panic!("unknown experimental feature: {other}"),
-            }
-        }
-
-        // No other known DatabaseOpts experimental features should be enabled.
-        // If turso_core adds a new field here, add a check below to keep the
-        // test honest — every field should be accounted for.
-        assert!(
-            !opts.enable_views,
-            "views is not an active experimental feature"
-        );
-        assert!(
-            !opts.enable_custom_types,
-            "custom_types is not an active experimental feature"
-        );
-        assert!(
-            !opts.enable_encryption,
-            "encryption is not an active experimental feature"
-        );
-        assert!(
-            !opts.enable_autovacuum,
-            "autovacuum is not an active experimental feature"
-        );
-        assert!(
-            !opts.enable_vacuum,
-            "vacuum is not an active experimental feature"
-        );
-        assert!(
-            !opts.enable_attach,
-            "attach is not an active experimental feature"
-        );
-        assert!(
-            !opts.enable_generated_columns,
-            "generated_columns is not an active experimental feature"
-        );
-        assert!(
-            !opts.enable_without_rowid,
-            "without_rowid is not an active experimental feature"
-        );
-        assert!(
-            !opts.unsafe_testing,
-            "unsafe_testing is not an active experimental feature"
-        );
-
-        // Forensic-family reads use the same live single-process feature set.
-        let fam = experimental_database_opts();
-        assert!(
-            fam.enable_index_method,
-            "family reads need index_method (stores are created with it)"
-        );
-    }
-
     /// An existing store built with raw DDL only (no `schema_migrations`
     /// ledger) was never created by the product: opening it must refuse rather
     /// than build a schema inside it, and the file must stay byte-for-byte as
@@ -5179,67 +5112,53 @@ mod tests {
         assert_eq!(meta.kind, crate::db::debug::FamilyKind::PreReindex);
     }
 
-    #[test]
-    fn builder_mapping_matches_experimental_features() {
-        // Verify that the field-by-field mapping in Connection::open (simulated
-        // below) enables exactly the features listed in EXPERIMENTAL_FEATURES.
-        //
-        // This catches reverse-drift: if someone adds a feature to
-        // experimental_database_opts() and EXPERIMENTAL_FEATURES but forgets
-        // the experimental_*() mapping line in Connection::open, the test
-        // fails because the simulated mapping doesn't enable it.
-        //
-        // To add a new feature:
-        //   1. Add with_*() to experimental_database_opts()
-        //   2. Add experimental_*() to Connection::open
-        //   3. Add feature name to EXPERIMENTAL_FEATURES
-        //   4. Add the if-guard below to this test's mapping table
-        let opts = experimental_database_opts();
-
-        // ── Simulate the builder mapping from Connection::open ────────────
-        // Must stay in sync with the .experimental_*() calls there.
-        let mut mapped: Vec<&str> = Vec::new();
-        if opts.enable_index_method {
-            mapped.push("index_method");
-        }
-        // Note: enable_views maps to experimental_materialized_views() but
-        // is not an active feature — no if-guard needed.
-        // Note: enable_autovacuum and unsafe_testing have no Builder
-        // experimental_*() equivalent — they cannot be mapped here.
-        // ─────────────────────────────────────────────────────────────────
-
-        mapped.sort_unstable();
-        let mut expected: Vec<&str> = EXPERIMENTAL_FEATURES.to_vec();
-        expected.sort_unstable();
-
-        assert_eq!(
-            mapped, expected,
-            "Connection::open builder mapping enables features that differ from \
-             EXPERIMENTAL_FEATURES.\n\
-             If you added a feature: add the experimental_*() guard above AND \
-             add it to Connection::open.\n\
-             If you removed a feature: remove it from both places.\n\
-             See EXPERIMENTAL_FEATURES docs for naming asymmetries."
-        );
-    }
-
-    /// Guard: raw `turso::Builder` usage is confined to the persistence module
-    /// (`src/db/mod.rs`) and the debug CLI (`src/db/debug.rs`).
+    /// Guard: only [`crate::db::store`] may construct a store handle, and only it
+    /// and the read-only debug CLI may arm the per-statement limit.
     ///
     /// All database access must go through [`crate::db::Connection`], which
     /// centralises the experimental feature flags, the per-connection settings,
-    /// the writing connection's serialization, the reader pool, and
-    /// dangling-transaction handling. The debug CLI is the
-    /// documented exception: it needs the upstream lazy `Rows` iterator for
-    /// `mahbot debug` queries.
+    /// the per-statement limit, the writing connection's serialization, the
+    /// reader pool, and dangling-transaction handling. The experiment flags and
+    /// the per-statement limit live on the connection [`crate::db::store`]
+    /// creates, so a store handle built anywhere else — through the SDK kit
+    /// (`TursoDatabase::new`) or through the low-level core API
+    /// (`turso::core::Database::open*`) — would be a connection with neither of
+    /// them, and the limit would be silently disarmed.
     ///
-    /// This is a source-scanning tripwire, not a security boundary: any new
-    /// module that opens a database via `turso::Builder` / `Builder::new_local`
-    /// directly fails this test with a pointer to the canonical path.
+    /// The debug CLI (`src/db/debug.rs`) is the documented exception, and only
+    /// for the limit: it opens the store read-only with no lock and no create
+    /// (`OpenFlags::ReadOnly | OpenFlags::NoLock`) and steps statements
+    /// synchronously, neither of which the connection layer offers (it opens
+    /// read-write with the default flags and steps asynchronously), so the CLI
+    /// opens and drives the engine itself and arms the limit on the connection it
+    /// makes.
+    ///
+    /// This is a source-scanning tripwire, not a security boundary: it covers
+    /// every way this tree's dependencies open a store handle — the SDK kit's
+    /// `TursoDatabase::new`, the facade's `Builder::new_local`, and the core
+    /// API's `turso::core::Database::open*` — so any new module that opens one or
+    /// arms the limit directly fails this test with a pointer to the canonical
+    /// path.
     #[test]
-    fn raw_builder_usage_is_confined_to_persistence_and_debug() {
-        const PATTERNS: [&str; 2] = ["turso::Builder", "Builder::new_local"];
-        const ALLOWED: [&str; 2] = ["src/db/mod.rs", "src/db/debug.rs"];
+    fn store_handle_creation_and_the_statement_limit_are_confined() {
+        // Spelled in halves: this file is scanned too — it is the very place the
+        // handle used to be built — so the literals must not match themselves.
+        // Each pattern carries its own exceptions: the debug CLI may open and arm
+        // a store the way its read-only path needs, but nothing outside the
+        // connection layer may build a store handle.
+        const PATTERNS: [(&str, &[&str]); 4] = [
+            (concat!("TursoDatabase", "::new("), &["src/db/store.rs"]),
+            // The facade's own builder: the store it makes carries neither the
+            // experiment flags nor the limit, and nothing in the tree starts one.
+            (concat!("Builder", "::new_local", "("), &[]),
+            // The low-level open: the handle it makes carries neither the feature
+            // flags nor the limit unless both are set by hand.
+            (concat!("core::Database", "::open"), &["src/db/debug.rs"]),
+            (
+                concat!("set_query_timeout", "("),
+                &["src/db/store.rs", "src/db/debug.rs"],
+            ),
+        ];
 
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let files = crate::util::test::rs_files_under(&manifest_dir.join("src"));
@@ -5247,20 +5166,17 @@ mod tests {
         let mut violations: Vec<(String, &'static str)> = Vec::new();
         for file in files {
             let rel = crate::util::test::rel_source_path(manifest_dir, &file);
-            if ALLOWED.contains(&rel.as_str()) {
-                continue;
-            }
             let content = std::fs::read_to_string(&file).expect("read source file");
             // Skip line comments (// and ///) so doc comments mentioning the
-            // builder don't false-positive — the tripwire targets actual code
-            // usage. Block comments are not handled (best-effort by design).
+            // connection layer don't false-positive — the tripwire targets actual
+            // code usage. Block comments are not handled (best-effort by design).
             let code_only: String = content
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            for pattern in PATTERNS {
-                if code_only.contains(pattern) {
+            for (pattern, allowed) in PATTERNS {
+                if !allowed.contains(&rel.as_str()) && code_only.contains(pattern) {
                     violations.push((rel.clone(), pattern));
                 }
             }
@@ -5268,9 +5184,13 @@ mod tests {
 
         assert!(
             violations.is_empty(),
-            "raw turso::Builder usage outside the persistence module and debug CLI.\n\
-             All database access must go through crate::db::Connection (db/mod.rs);\n\
-             the debug CLI (db/debug.rs) is the only documented exception.\n\
+            "a store handle was built, or the per-statement limit armed, outside the \
+             connection layer and the debug CLI.\n\
+             All database access must go through crate::db::Connection (db/mod.rs), whose \
+             handles come from db/store.rs — the only place a store handle is built and the \
+             limit armed;\n\
+             the debug CLI (db/debug.rs) is the only documented exception, and only for the \
+             limit on the connection it opens itself.\n\
              Violations: {violations:#?}"
         );
     }
@@ -5314,7 +5234,7 @@ mod tests {
                 std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
             // Skip line comments so doc comments mentioning the PRAGMA don't
             // false-positive — the tripwire targets actual code usage (same
-            // best-effort approach as the raw-builder guard).
+            // best-effort approach as the store-handle guard).
             let code_only: String = content
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
@@ -5795,11 +5715,7 @@ mod tests {
     /// Whether the connection is in autocommit (no transaction open) — probed
     /// under the connection's own lock, so the probe cleans nothing up itself.
     async fn orphan_tx_autocommit(conn: &Connection) -> bool {
-        conn.conn
-            .lock()
-            .await
-            .is_autocommit()
-            .expect("probe autocommit")
+        conn.conn.lock().await.is_autocommit()
     }
 
     /// Window (a): a transaction abandoned without commit, rolled back by the
@@ -6180,7 +6096,6 @@ mod tests {
             // reader here has finished reading while the next one starts.
             let mut rows = reader
                 .query("SELECT id FROM reader_probe ORDER BY id LIMIT 1", ())
-                .await
                 .expect("a reader at a distinct frame must be admitted");
             assert!(
                 rows.next().await.expect("step the probe read").is_some(),
@@ -6221,13 +6136,11 @@ mod tests {
         let reader = crate::util::with_block_in_place(|| conn.readers.db.connect())
             .expect("connect a held reader");
         let held = tokio::spawn(async move {
-            let mut rows = reader
-                .query(
-                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+            let mut rows = reader.query(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
                      WHERE x < 120000) SELECT count(*) FROM c, reader_probe",
-                    (),
-                )
-                .await?;
+                (),
+            )?;
             while rows.next().await?.is_some() {}
             Ok::<_, turso::Error>(())
         });
@@ -6367,9 +6280,10 @@ mod tests {
     }
 
     /// A read whose caller has already given up finishes by itself, on its own
-    /// connection: the caller's own limit ends the caller's wait, not the
-    /// statement, and what the read still holds cannot stop the next read or the
-    /// next change.
+    /// connection: the caller's own limit ends the caller's wait, and the
+    /// statement is bounded by the connection's own per-statement limit rather
+    /// than by the caller — so what the read still holds cannot stop the next
+    /// read or the next change.
     /// Multi-threaded on purpose: a read heavy enough to outlive its caller runs
     /// its steps in one poll, which on the current-thread test runtime would also
     /// starve the caller's own timer.

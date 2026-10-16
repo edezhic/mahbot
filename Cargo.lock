@@ -4360,6 +4360,7 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "turso",
+ "turso_sdk_kit",
  "unicase",
  "unicode-normalization",
  "url",

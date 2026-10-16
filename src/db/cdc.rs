@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use turso::core::types::{ImmutableRecordRef, ValueRef};
 
-use crate::db::{Connection, params};
+use crate::db::{Connection, Row, params};
 use crate::util::UnwrapPoison;
 
 /// Capacity of each per-table change-event broadcast channel.
@@ -532,7 +532,7 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
 async fn decode_row(
     conn: &Connection,
     infos: &mut HashMap<String, TableInfo>,
-    row: &turso::Row,
+    row: &Row,
     table: &str,
     change_type: ChangeType,
 ) -> anyhow::Result<ChangeEvent> {
