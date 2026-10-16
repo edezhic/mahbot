@@ -1058,8 +1058,7 @@ impl Connection {
     /// created by another writer in between is not an error; that insert then
     /// reports zero rows and the update runs once more, so the caller's values
     /// win. `update_params` is a closure because the update can run twice.
-    /// Callers that need the pair to be atomic run it inside a transaction (both
-    /// `session_metadata` paths do).
+    /// Callers that need the pair to be atomic run it inside a transaction.
     ///
     /// The engine's upsert form is unusable while change capture is enabled on
     /// the store (`PRAGMA capture_data_changes_conn`); only its `DO UPDATE`
@@ -2610,8 +2609,7 @@ impl TxGuard<'_> {
     /// created by another writer in between is not an error; that insert then
     /// reports zero rows and the update runs once more, so the caller's values
     /// win. `update_params` is a closure because the update can run twice.
-    /// Callers that need the pair to be atomic run it inside a transaction (both
-    /// `session_metadata` paths do).
+    /// Callers that need the pair to be atomic run it inside a transaction.
     ///
     /// The engine's upsert form is unusable while change capture is enabled on
     /// the store (`PRAGMA capture_data_changes_conn`); only its `DO UPDATE`

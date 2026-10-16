@@ -3,9 +3,11 @@
 //! Assistant turn answers ([`prepend_changes`]) — an alarm's, a notice's or a
 //! delegation's turn included — so it never answers from stale knowledge.
 //!
-//! The observed state lives in the Assistant's own `session_metadata` row
-//! ([`crate::session::assistant_agent_id`]) — never inside the watched folder,
-//! which stays the user's alone. [`refresh_after_turn`] rewrites it at the end of
+//! The observed state lives in a row of its own — `session_personal_changes`, a
+//! child of the Assistant's `session_metadata` row
+//! ([`crate::session::assistant_agent_id`]), written there and only when it
+//! changes, and deleted with that row — never inside the watched folder, which
+//! stays the user's alone. [`refresh_after_turn`] rewrites it at the end of
 //! the Assistant's own turn, so what it absorbs is everything that moved during
 //! that turn: the product's own writes, and equally an edit the user made while
 //! the turn was running. Telling writers apart — a raw shell command included —
@@ -642,7 +644,7 @@ pub(crate) async fn prepend_changes(msg: &str, workspace: &Workspace, role: &Rol
         return msg.to_string();
     }
     let agent_id = crate::session::assistant_agent_id(&user_name);
-    // `None` and `NULL` (no session row, no baseline yet, or a read error) mean
+    // `None` (no session row, no baseline recorded yet, or a read error) means
     // there is nothing to compare against — never fabricate a report from one.
     let Some(Some(stored)) = crate::session::store()
         .personal_changes_baseline(&agent_id)
@@ -704,12 +706,14 @@ fn personal_account_of(workspace: &Workspace) -> Option<String> {
 }
 
 /// Refresh the stored baseline for `user_name`'s personal workspace; the name
-/// comes from [`personal_account_of`], so it can address a folder. The write is
-/// update-only, so an account with no Assistant metadata row yet is never given
-/// a phantom one — and, since that write is what the walk exists for, such an
-/// account is not walked at all. An unwalkable folder is a silent no-op and the
-/// DB write is skipped when nothing moved. A baseline that is NULL or unreadable
-/// is the case whose walk is not paid here: it hands off to [`establish`].
+/// comes from [`personal_account_of`], so it can address a folder. The write
+/// lands on the baseline's own child row, whose foreign key rejects it while the
+/// session's row is absent (`SessionStore::update_personal_changes`), so an
+/// account with no Assistant metadata row yet is never given a phantom one
+/// — and, since that write is what the walk exists for, such an account is not
+/// walked at all. An unwalkable folder is a silent no-op and the DB write is
+/// skipped when nothing moved. A baseline that is missing or unreadable is the
+/// case whose walk is not paid here: it hands off to [`establish`].
 ///
 /// Two turns in the same folder (an alarm overlapping a user turn) can interleave
 /// their read-write here. Either write is a fresh observation of the same folder,
@@ -759,7 +763,7 @@ async fn refresh(user_name: &str) {
 /// that observation, so one more (incremental) observation runs before the window
 /// closes, and the product's writes never reach the next block.
 ///
-/// A baseline write that keeps failing (a broken store) leaves the baseline NULL,
+/// A baseline write that keeps failing (a broken store) leaves no baseline stored,
 /// so every later turn retries this observation — off the reply path, logged, and
 /// still silent: the only price is a background walk per turn until a write
 /// lands, and recovery is automatic once one does.
@@ -914,9 +918,9 @@ enum Observation {
 
 /// Walk `root` and return the observation to store.
 ///
-/// `stored` is the baseline the walk compares against; `None` is a NULL column
-/// (a session predating the baseline), whose empty previous snapshot makes this
-/// the folder's first observation.
+/// `stored` is the baseline the walk compares against; `None` is no stored
+/// baseline (a session predating the baseline), whose empty previous snapshot
+/// makes this the folder's first observation.
 async fn observe(root: PathBuf, stored: Option<String>, mode: Scan) -> Observation {
     // Decoding the baseline, walking the folder and re-encoding what the walk
     // found all run on the blocking pool: the baseline is megabytes of JSON.

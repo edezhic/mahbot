@@ -66,9 +66,12 @@
 //! table — the Telegram intake's durable record of the incoming updates it has
 //! taken up — and `60` upfills its `claimed_by` column on the installs whose
 //! table was created by the earlier revision of `59`. `61` adds the
-//! `telegram_bursts` table — the durable record of every released burst.
+//! `telegram_bursts` table — the durable record of every released burst. `62`
+//! moves the personal-workspace change baseline off the `session_metadata` row
+//! into its own `session_personal_changes` table, carrying every recorded
+//! baseline across, and `63` drops the retired column.
 //!
-//! Future schema changes resume the chain at id `62` with monotonically
+//! Future schema changes resume the chain at id `64` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -196,9 +199,12 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     custom_role   TEXT,
     custom_identifier TEXT,
     launch_stopped TEXT,
-    personal_changes TEXT,
     reply_to       TEXT,
     context_block_len INTEGER
+);
+CREATE TABLE IF NOT EXISTS session_personal_changes (
+    agent_id TEXT PRIMARY KEY REFERENCES session_metadata(agent_id) ON DELETE CASCADE,
+    baseline TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id             TEXT PRIMARY KEY,
@@ -711,6 +717,23 @@ const TELEGRAM_BURSTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS telegram_bursts 
     part_times   TEXT NOT NULL
 );";
 
+/// Delta `62` (existing installs): the personal-workspace change baseline moves
+/// out of the `session_metadata` row into a table of its own, and every recorded
+/// baseline is carried across. The engine rewrites a row whole on any update, so
+/// a baseline held on the session's own row made every small bookkeeping update
+/// (activity time, message count, token length) rewrite megabytes and capture a
+/// before/after image of it. The baseline is now stored where it changes — once
+/// per turn — and read back by joining the session's own row. The baseline
+/// (`24`) already declares the new table, so on a fresh install this is an
+/// `IF NOT EXISTS` no-op whose copy matches no row.
+const PERSONAL_CHANGES_TO_OWN_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS session_personal_changes (
+    agent_id TEXT PRIMARY KEY REFERENCES session_metadata(agent_id) ON DELETE CASCADE,
+    baseline TEXT NOT NULL
+);
+INSERT INTO session_personal_changes (agent_id, baseline)
+    SELECT agent_id, personal_changes FROM session_metadata WHERE personal_changes IS NOT NULL;";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
 /// Entries `24`–`26` are the consolidated current-shape baseline; entries
@@ -790,9 +813,10 @@ const TELEGRAM_BURSTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS telegram_bursts 
 ///   [`crate::Launch`] a durable round was dispatched by, so a boot
 ///   resume re-addresses the round to the caller's custom branch (a no-op on
 ///   fresh installs, whose baseline already declares it).
-/// - `55` adds the per-user `session_metadata.personal_changes` column — the
-///   personal-workspace change baseline (a no-op on fresh installs, whose
-///   baseline already declares it).
+/// - `55` adds the nullable `session_metadata.personal_changes` column — the
+///   personal-workspace change baseline: retired storage, whose home is the
+///   `session_personal_changes` table entry `62` moves it to, so the baseline no
+///   longer declares it and entry `63` drops it again.
 /// - `56` adds the nullable `session_metadata.reply_to` column — the JSON
 ///   conversation that asked for a branch's launch (the asking custom role's
 ///   branch), so a coder branch's report survives a restart and returns there
@@ -816,6 +840,13 @@ const TELEGRAM_BURSTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS telegram_bursts 
 ///   burst, so a complaint about a split burst can be read against the timing that
 ///   released it (fresh installs get it from entry `24`'s `CREATE TABLE`, so this is
 ///   a no-op there).
+/// - `62` moves the personal-workspace change baseline off the `session_metadata`
+///   row into its own `session_personal_changes` table (see
+///   [`PERSONAL_CHANGES_TO_OWN_TABLE`] for why), carrying every recorded
+///   baseline across (fresh installs get the table from entry `24`'s
+///   `CREATE TABLE`, so the copy matches no row there).
+/// - `63` drops the retired `session_metadata.personal_changes` column, a no-op
+///   on fresh installs, whose baseline never declares it.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -1006,6 +1037,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "61",
         target: TargetDb::Core,
         body: MigrationBody::Sql(TELEGRAM_BURSTS_TABLE),
+    },
+    Migration {
+        id: "62",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(PERSONAL_CHANGES_TO_OWN_TABLE),
+    },
+    Migration {
+        id: "63",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_personal_changes_column),
     },
 ];
 
@@ -1365,10 +1406,12 @@ fn add_session_metadata_personal_changes(conn: &Connection) -> BoxFuture<'_, any
 /// Upfill the nullable `session_metadata.personal_changes` column for databases
 /// created before delta `55` — the per-user personal-workspace change baseline
 /// (JSON: relative path → size/mtime/content-digest) the Assistant reads at the
-/// head of a turn and refreshes after it. Fresh installs get the column from
-/// entry `24`'s `CREATE TABLE`, so the probe makes this a no-op there. Guarded
-/// by [`add_column_if_missing`], so this body is idempotent
-/// (non-transactional like every Rust body, re-runnable until recorded).
+/// head of a turn and refreshes after it. The baseline no longer declares the
+/// column — its home is now the `session_personal_changes` table — so on a fresh
+/// install this adds `personal_changes`, delta `62` carries it across and delta
+/// `63` drops it again. Guarded by [`add_column_if_missing`], so this body is
+/// idempotent (non-transactional like every Rust body, re-runnable until
+/// recorded).
 async fn run_add_session_metadata_personal_changes(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "session_metadata", "personal_changes", "TEXT").await
 }
@@ -1585,6 +1628,21 @@ fn drop_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// indexed and not part of a PK/UNIQUE/CHECK/FK constraint.
 async fn run_drop_alarms_command(conn: &Connection) -> anyhow::Result<()> {
     drop_column_if_missing(conn, "alarms", "command").await
+}
+
+fn drop_personal_changes_column(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_drop_personal_changes_column(conn))
+}
+
+/// Drop `session_metadata.personal_changes` once delta `62` has carried every
+/// value into `session_personal_changes`. The baseline no longer declares the
+/// column — its home is that table — so on a fresh install there is nothing to
+/// drop; delta `55` re-adds the column there and this body removes it again (see
+/// [`run_add_session_metadata_personal_changes`]). Guarded by
+/// [`drop_column_if_missing`], so this body is idempotent (non-transactional
+/// like every Rust body, re-runnable until recorded).
+async fn run_drop_personal_changes_column(conn: &Connection) -> anyhow::Result<()> {
+    drop_column_if_missing(conn, "session_metadata", "personal_changes").await
 }
 
 /// Case-folded markers of a stored description of the retired two-stage
@@ -2093,11 +2151,11 @@ mod tests {
                 "custom_role",
                 "custom_identifier",
                 "launch_stopped",
-                "personal_changes",
                 "reply_to",
                 "context_block_len",
             ],
         ),
+        ("session_personal_changes", &["agent_id", "baseline"]),
         (
             "sessions",
             &["id", "agent_id", "role", "content", "created_at"],
@@ -2379,11 +2437,17 @@ mod tests {
     }
 
     /// Tables a reopen introduces which the pre-reopen fixture cannot carry
-    /// (delta `51`'s `custom_roles`, delta `59`'s `telegram_intake` and delta
-    /// `61`'s `telegram_bursts`). They have no "before" row count to compare, so
+    /// (delta `51`'s `custom_roles`, delta `59`'s `telegram_intake`, delta
+    /// `61`'s `telegram_bursts` and delta `62`'s `session_personal_changes`).
+    /// They have no "before" row count to compare, so
     /// the reopen snapshot skips them; their arrival is asserted by the schema
     /// comparison instead.
-    const REOPEN_NEW_CORE_TABLES: &[&str] = &["custom_roles", "telegram_intake", "telegram_bursts"];
+    const REOPEN_NEW_CORE_TABLES: &[&str] = &[
+        "custom_roles",
+        "telegram_intake",
+        "telegram_bursts",
+        "session_personal_changes",
+    ];
 
     /// Domain tables whose row counts a reopen snapshot compares: every
     /// expected domain table except the ones the reopen introduces.
@@ -3218,7 +3282,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`61` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -3246,10 +3310,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55", "56", "57", "59", "60", "61"
+                "54", "55", "56", "57", "59", "60", "61", "62", "63"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–61 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63 tail exactly"
         );
     }
 
@@ -3302,6 +3366,116 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 .contains(&"claimed_by".to_string()),
             "delta 60 must add claimed_by to a table delta 59 created without it"
         );
+    }
+
+    /// Delta `62` must copy each recorded `session_metadata.personal_changes`
+    /// value into `session_personal_changes` byte-for-byte before delta `63`
+    /// drops the source column: the baseline is the Assistant's change record,
+    /// so a value that failed to land would silently reset every session's
+    /// change detection. A row whose baseline is NULL gets no child row. The
+    /// copy runs once — a second reopen must not disturb the table.
+    ///
+    /// One seeded baseline is megabytes of JSON, the size the split exists for:
+    /// a value of that size is an overflow chain of its own, so the copy and the
+    /// drop rewrite it out of the session's row rather than editing it in place.
+    #[tokio::test]
+    async fn a_recorded_baseline_moves_to_its_own_table() {
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(root, crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        let entry = MIGRATIONS
+            .iter()
+            .position(|m| m.id == "62")
+            .expect("entry 62 in the catalog");
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..entry])
+            .await
+            .expect("catalog up to delta 62");
+
+        let baseline = r#"{"a.txt":{"size":7,"mtime_ns":11,"digest":13}}"#;
+        // A real baseline is megabytes of JSON: a value that size fills an
+        // overflow chain the copy and the drop must carry intact.
+        let mut large = String::new();
+        while large.len() < 6 * 1024 * 1024 {
+            let at = large.len();
+            let _ = write!(
+                large,
+                r#""dir{at}/file.txt":{{"size":7,"mtime_ns":11,"digest":13}},"#
+            );
+        }
+        let now = crate::db::now();
+        for (agent_id, value) in [
+            ("pc_with_baseline", Some(baseline)),
+            ("pc_large", Some(large.as_str())),
+            ("pc_without", None),
+        ] {
+            conn.execute(
+                "INSERT INTO session_metadata (agent_id, last_activity, personal_changes) \
+                 VALUES (?1, ?2, ?3)",
+                params![agent_id, now.as_str(), value],
+            )
+            .await
+            .unwrap();
+        }
+
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("finish the catalog");
+
+        let moved = baseline_rows(&conn).await;
+        assert_eq!(
+            moved.get("pc_with_baseline").map(String::as_str),
+            Some(baseline),
+            "delta 62 must carry the baseline across byte-for-byte"
+        );
+        assert_eq!(
+            moved.get("pc_large").map(String::as_str),
+            Some(large.as_str()),
+            "a multi-megabyte baseline must survive the copy and the drop intact"
+        );
+        assert!(
+            !moved.contains_key("pc_without"),
+            "a NULL baseline must not get a child row"
+        );
+        assert!(
+            !column_exists(&conn, "session_metadata", "personal_changes")
+                .await
+                .unwrap(),
+            "delta 63 must drop the retired column"
+        );
+
+        let before = baseline_rows(&conn).await;
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("reopen the catalog");
+        assert_eq!(
+            baseline_rows(&conn).await,
+            before,
+            "a recorded baseline must not be rewritten by a later reopen"
+        );
+    }
+
+    async fn baseline_rows(conn: &Connection) -> std::collections::BTreeMap<String, String> {
+        conn.query(
+            "SELECT agent_id, baseline FROM session_personal_changes",
+            (),
+        )
+        .await
+        .expect("read the baseline table")
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String>(0).expect("agent_id"),
+                row.get::<String>(1).expect("baseline"),
+            )
+        })
+        .collect()
     }
 
     /// A fresh logs store runs the baseline (`26`) plus the delta `35` and
@@ -3510,7 +3684,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// reopen (the delta-27 `workspaces` column upfill, the delta-28
     /// `jobs`/`session_metadata` column upfills, the delta-47 `jobs.exec_dir`
     /// column, the delta-54 `jobs.custom_launch` column, the delta-55
-    /// `session_metadata.personal_changes` column, the delta-56
+    /// `session_metadata.personal_changes` column moved into delta-62's
+    /// `session_personal_changes` table by the delta-63 drop, the delta-56
     /// `session_metadata.reply_to` column, the delta-57
     /// `session_metadata.context_block_len` column, and the
     /// delta-51/52/53 tail — `custom_roles` plus the custom-role columns on
@@ -3573,7 +3748,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`55`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`63`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
@@ -3597,8 +3772,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     ///
     /// The stage-merge and phase-retirement tail (`44`/`45`/`48`/`49`), the
     /// image-model retirement (`50`) and the custom-role / custom-launch /
-    /// personal-changes / context-block-length columns (`51`–`55`/`57`) are a
-    /// no-op here too: the seeded rows
+    /// personal-changes / context-block-length columns (`51`–`57`, with deltas
+    /// `62`/`63` moving the personal-changes baseline into a table of its own)
+    /// are a no-op here too: the seeded rows
     /// name none of the retired stages and claim no earlier command run, so no job
     /// is deleted, no phase is rewritten and the empty `workspace_contexts` stays
     /// empty, and the seeded `config_kv` row is an unrelated key while the
@@ -3630,7 +3806,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -3639,7 +3815,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–61"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -3649,7 +3825,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         // chat_history.broadcast_id (delta 33),
         // tickets/ticket_chronicle (delta 34), jobs.exec_dir (delta 47),
         // jobs.custom_launch (delta 54), session_metadata.personal_changes
-        // (delta 55), session_metadata.reply_to (delta 56),
+        // (delta 55, moved to `session_personal_changes` by deltas 62/63),
+        // session_metadata.reply_to (delta 56),
         // session_metadata.context_block_len (delta 57),
         // telegram_intake (delta 59) and the
         // custom-role tail (delta 51's `custom_roles` table plus the
@@ -3679,6 +3856,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "telegram_intake",
                 // Introduced by delta 61 — absent from the pre-reopen fixture.
                 "telegram_bursts",
+                // Introduced by delta 62 — absent from the pre-reopen fixture.
+                "session_personal_changes",
             ],
             &["idx_jobs_caller_agent"],
         )
@@ -3707,13 +3886,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_sm_cols.push("custom_role".to_string());
         expected_sm_cols.push("custom_identifier".to_string());
         expected_sm_cols.push("launch_stopped".to_string());
-        expected_sm_cols.push("personal_changes".to_string());
         expected_sm_cols.push("reply_to".to_string());
         expected_sm_cols.push("context_block_len".to_string());
         assert_eq!(
             after_sm_cols["session_metadata"], expected_sm_cols,
             "reopen must append exactly created_at/sleep_ended/custom_role/custom_identifier/\
-             launch_stopped/personal_changes/reply_to/context_block_len to session_metadata columns"
+             launch_stopped/reply_to/context_block_len to session_metadata columns"
         );
         let after_users_cols = column_sets(&conn, &["users"]).await;
         let mut expected_users_cols = before.cols["users"].clone();
@@ -3877,7 +4055,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
     /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`57`/`59`–`61`: the data migrations (detaching guests from
+    /// entries `36`–`57`/`59`–`63`: the data migrations (detaching guests from
     /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
     /// deleting the command-armed alarm rows, rewriting the retired
     /// `in_review`/`in_qa` stages to `verification`, invalidating the
@@ -3889,10 +4067,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `alarms.command` drop that retire the command-armed alarm feature, the
     /// custom-role tail (`custom_roles` plus the `session_metadata` and
     /// `alarms` columns), and the `jobs.exec_dir` / `jobs.custom_launch` /
-    /// `session_metadata.personal_changes` / `session_metadata.reply_to` /
+    /// `session_metadata.reply_to` /
     /// `session_metadata.context_block_len` columns, and the `telegram_intake`
     /// table of delta `59` (its `claimed_by` column guaranteed by `60`), and the
-    /// `telegram_bursts` table of delta `61`.
+    /// `telegram_bursts` table of delta `61`, and deltas `62`/`63`, which move
+    /// the personal-changes baseline into `session_personal_changes`.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -3951,6 +4130,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                     && *n != "telegram_intake"
                     // Introduced by delta `61` — absent from the pre-reopen fixture.
                     && *n != "telegram_bursts"
+                    // Introduced by delta `62` — absent from the pre-reopen fixture.
+                    && *n != "session_personal_changes"
             })
             .collect();
         let before_other = column_sets(&conn, &untouched_tables).await;
@@ -4001,7 +4182,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4010,7 +4191,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–61"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

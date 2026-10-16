@@ -663,7 +663,6 @@ enum MetadataColumn {
     ReplyTo,
     LaunchStopped,
     WorkspaceName,
-    PersonalChanges,
     ContextBlockLen,
 }
 
@@ -678,7 +677,6 @@ impl MetadataColumn {
             Self::ReplyTo => "reply_to",
             Self::LaunchStopped => "launch_stopped",
             Self::WorkspaceName => "workspace_name",
-            Self::PersonalChanges => "personal_changes",
             Self::ContextBlockLen => "context_block_len",
         }
     }
@@ -1284,9 +1282,32 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Run one `agent_id`-keyed read that keeps the three-way contract — `None`
+    /// is a missing row, `Some(None)` a row without the value, `Some(Some(_))` a
+    /// value — and fails open: a read error is logged with `warn_context` and
+    /// reads as `None`, so a caller that establishes missing state retries it
+    /// rather than acting on a half-read value.
+    async fn read_optional_row<X>(
+        &self,
+        sql: &str,
+        agent_id: &str,
+        warn_context: &str,
+        map: impl FnOnce(&Row) -> std::result::Result<Option<X>, ::turso::Error> + Send + 'static,
+    ) -> Option<Option<X>>
+    where
+        X: Send + 'static,
+    {
+        match self.conn.query_optional(sql, params![agent_id], map).await {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(agent_id = %agent_id, error = %e, "{warn_context}");
+                None
+            }
+        }
+    }
+
     /// Read one `session_metadata` column via `map`. `None` if the row is
-    /// missing, the column is NULL, or the read fails (logged via `warn_context`) —
-    /// see [`Self::get_metadata_row`] when the three cases must be told apart.
+    /// missing, the column is NULL, or the read fails (logged via `warn_context`).
     async fn get_metadata_value<X>(
         &self,
         agent_id: &str,
@@ -1297,32 +1318,13 @@ impl SessionStore {
     where
         X: Send + 'static,
     {
-        self.get_metadata_row(agent_id, column, warn_context, map)
+        let sql = format!(
+            "SELECT {} FROM session_metadata WHERE agent_id = ?1",
+            column.as_str()
+        );
+        self.read_optional_row(&sql, agent_id, warn_context, map)
             .await
             .flatten()
-    }
-
-    /// [`Self::get_metadata_value`] without the flattening: `None` is a missing
-    /// row, `Some(None)` a NULL column, `Some(Some(_))` a value.
-    async fn get_metadata_row<X>(
-        &self,
-        agent_id: &str,
-        column: MetadataColumn,
-        warn_context: &str,
-        map: impl FnOnce(&Row) -> std::result::Result<Option<X>, ::turso::Error> + Send + 'static,
-    ) -> Option<Option<X>>
-    where
-        X: Send + 'static,
-    {
-        let col = column.as_str();
-        let sql = format!("SELECT {col} FROM session_metadata WHERE agent_id = ?1");
-        match self.conn.query_optional(&sql, params![agent_id], map).await {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::warn!(agent_id = %agent_id, error = %e, "{warn_context}");
-                None
-            }
-        }
     }
 
     /// Persist the `<active-models-opts>` snapshot (rendered model ids) for
@@ -1348,35 +1350,45 @@ impl SessionStore {
     }
 
     /// Persist the personal-workspace change baseline (JSON: relative path →
-    /// size/mtime/content-digest) for the Assistant's session. Update-only —
-    /// unlike [`SessionStore::set_metadata_value`] it deliberately never
-    /// inserts, so a refresh can never create a context-less `session_metadata`
-    /// row (a `/clear` landing between the refresh's read and this write would
-    /// otherwise leave a skeleton row in the sessions list).
+    /// size/mtime/content-digest) for the Assistant's session.
+    ///
+    /// The baseline is a row of its own table, a child of the session's own
+    /// `session_metadata` row (`ON DELETE CASCADE`), split out by migration `62`
+    /// so a bookkeeping update of that row no longer rewrites it. The update
+    /// branch runs first and the insert is reached only when the session has no
+    /// baseline yet; the engine rejects the insert when the session row is gone
+    /// (a `/clear` landing between the refresh's read and this write), so a
+    /// deleted session's identifier can never be handed a stale baseline.
     pub(crate) async fn update_personal_changes(&self, agent_id: &str, state: &str) -> Result<()> {
-        let col = MetadataColumn::PersonalChanges.as_str();
-        self.conn
-            .execute(
-                &format!("UPDATE session_metadata SET {col} = ?1 WHERE agent_id = ?2"),
-                params![state, agent_id],
-            )
-            .await?;
+        let tx = self.conn.begin_tx().await?;
+        tx.upsert_row(
+            "UPDATE session_personal_changes SET baseline = ?1 WHERE agent_id = ?2",
+            || params![state, agent_id],
+            "INSERT INTO session_personal_changes (agent_id, baseline) VALUES (?1, ?2) \
+             ON CONFLICT(agent_id) DO NOTHING",
+            params![agent_id, state],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// Read the personal-workspace change baseline (JSON: relative path →
     /// size/mtime/content-digest) for the Assistant's session.
     ///
-    /// `None` means there is no session row at all: the baseline can never be
-    /// written for it ([`SessionStore::update_personal_changes`] never inserts),
-    /// so a refresh must not walk the folder for it. `Some(None)` is a row whose
-    /// column is still NULL — a session predating the baseline — and
-    /// `Some(Some(…))` a stored one; both mean "no block to render". A read
-    /// error reads as `None` after a warning, failing the block open.
+    /// `None` means there is no session row at all — nothing could be recorded
+    /// for it, so a refresh must not walk the folder. `Some(None)` is a session
+    /// row whose baseline is not recorded yet — a new session, or one whose
+    /// baseline the `/clear` race never wrote — and `Some(Some(…))` a stored
+    /// one; both mean "no block to render". The session's own row is what the
+    /// join is anchored on precisely so the two cases stay distinguishable. A
+    /// read error reads as `None` after a warning, failing the block open.
     pub(crate) async fn personal_changes_baseline(&self, agent_id: &str) -> Option<Option<String>> {
-        self.get_metadata_row(
+        self.read_optional_row(
+            "SELECT spc.baseline FROM session_metadata sm \
+             LEFT JOIN session_personal_changes spc ON spc.agent_id = sm.agent_id \
+             WHERE sm.agent_id = ?1",
             agent_id,
-            MetadataColumn::PersonalChanges,
             "Failed to read personal-changes baseline",
             |row| row.get::<Option<String>>(0),
         )
@@ -2193,6 +2205,53 @@ mod tests {
             .unwrap();
         assert!(store().delete(&k).await.unwrap());
         assert!(!store().delete(&k).await.unwrap());
+    }
+
+    /// The baseline lives and dies with its session: a written row reads back
+    /// verbatim, the session's delete cascades to it (leaving no orphan, invisible
+    /// or otherwise), and a refresh racing that delete cannot insert one back —
+    /// the child insert has no parent key to satisfy — so a later session reusing
+    /// the identifier inherits nothing.
+    #[tokio::test]
+    async fn delete_takes_the_personal_changes_baseline_with_it() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        store()
+            .batch_append(&k, &[ChatMessage::user("a")])
+            .await
+            .unwrap();
+        let json = r#"{"a.txt":{"size":1,"mtime_ns":1,"digest":1}}"#;
+        store().update_personal_changes(&k, json).await.unwrap();
+        assert_eq!(
+            store().personal_changes_baseline(&k).await,
+            Some(Some(json.to_string())),
+            "the stored baseline must read back verbatim"
+        );
+
+        assert!(store().delete(&k).await.unwrap());
+        assert_eq!(
+            store().personal_changes_baseline(&k).await,
+            None,
+            "a deleted session has no baseline to render"
+        );
+        let orphans: i64 = store()
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM session_personal_changes WHERE agent_id = ?1",
+                params![k.clone()],
+            )
+            .await
+            .unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            orphans, 0,
+            "the delete must cascade to the baseline row, leaving no orphan"
+        );
+        assert!(
+            store().update_personal_changes(&k, "{}").await.is_err(),
+            "a refresh racing the delete must not insert the baseline back"
+        );
     }
 
     #[tokio::test]
