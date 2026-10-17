@@ -1,7 +1,8 @@
 {
   "heading_levels": [1, 2, 3],
   "scalar_kinds": ["string", "number", "boolean"],
-  "image_extensions": ["png", "jpg", "jpeg"],
+  "image_extensions": ["png", "jpg", "jpeg", "webp"],
+  "table_columns_max": 63,
   "dimension_points": { "min": 0, "max": 20000, "min_exclusive": true },
   "text_size_points": { "min": 0.5, "max": 819, "min_exclusive": false },
   "paragraph_alignments": [["left", "left"], ["center", "center"], ["right", "right"], ["justify", "both"]],

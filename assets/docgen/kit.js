@@ -33,6 +33,13 @@ const CELL_ROW_GAP = 8;
 // 96 px = 72 pt: the one factor a request's points are converted with, whichever
 // arm draws the picture — every writer measures an image in its own pixels.
 const PX_TO_POINTS = 72 / 96;
+// The same pixel in the units a part states a length in: 1in = 914400 EMU = 1440
+// twips, so a 96-dpi pixel is 9525 EMU and 15 twips. Stated once, since every arm
+// converts with them.
+const EMU_PER_INCH = 914400;
+const TWIPS_PER_INCH = 1440;
+const PX_TO_EMU = EMU_PER_INCH / 96;
+const TWIPS_PER_PIXEL = TWIPS_PER_INCH / 96;
 const DOCX_ORDERED = "document-kit-ordered";
 
 const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf8"));
@@ -64,16 +71,18 @@ const readInput = (p) => {
 class UsageError extends Error {}
 
 // ── images ─────────────────────────────────────────────────────
-// Only the extensions the shared rules name are accepted: all three writers
-// embed PNG and JPEG and nothing else, and one rule is what the tool's prompt
-// can state honestly.
+// Only the extensions the shared rules name are accepted: the writers that place
+// a raster picture embed PNG, JPEG and WebP, and one rule is what the tool's
+// prompt can state honestly. WebP is the format the product's own picture tool
+// writes, so a picture it produced is one it can place; a PDF's own two encodings
+// take no WebP and refuse one by name (see `embedImage`).
 function imageType(file) {
   const lower = file.toLowerCase();
   const extension = RULES.image_extensions.find((candidate) => lower.endsWith(`.${candidate}`));
-  if (!extension) throw new UsageError(`only PNG and JPEG images can be embedded, got: ${nodePath.basename(file)}`);
-  return extension === "png"
-    ? { kind: "png", contentType: "image/png" }
-    : { kind: "jpg", contentType: "image/jpeg" };
+  if (!extension) throw new UsageError(`only PNG, JPEG or WebP images can be embedded, got: ${nodePath.basename(file)}`);
+  if (extension === "png") return { kind: "png", contentType: "image/png" };
+  if (extension === "webp") return { kind: "webp", contentType: "image/webp" };
+  return { kind: "jpg", contentType: "image/jpeg" };
 }
 // The shapes the tool's own boundary guarantees, as the kit's last line: a text
 // field is a string and a bullet or a cell is a scalar. A structure reaching a
@@ -118,13 +127,13 @@ function headingLevel(level) {
 function readImage(file) {
   const { kind, contentType } = imageType(file);
   const bytes = readInput(file);
-  const size = kind === "png" ? pngSize(bytes) : jpegSize(bytes);
+  const size = kind === "png" ? pngSize(bytes) : kind === "webp" ? webpSize(bytes) : jpegSize(bytes);
   // A declared size of nothing means the bytes are not a whole image of the kind
   // the name claims — truncated, or another format under that extension — not
   // that the image is small: the proportions every other size is scaled from
   // would not exist.
   if (!size || size.width < 1 || size.height < 1) {
-    const label = kind === "png" ? "PNG" : "JPEG";
+    const label = { png: "PNG", jpg: "JPEG", webp: "WebP" }[kind];
     throw new UsageError(`cannot embed ${nodePath.basename(file)} as a ${label} image: the file's bytes are not a whole ${label} image`);
   }
   return { kind, contentType, bytes, width: size.width, height: size.height };
@@ -192,6 +201,48 @@ function jpegSize(bytes) {
   }
   return null;
 }
+// A WebP: a RIFF container whose form is WEBP, holding the image in one of three
+// chunks — `VP8 ` (lossy), `VP8L` (lossless) or `VP8X` (extended, a canvas with
+// the image's own chunks beside it). The first of them states the pixel size the
+// way the PNG's IHDR and the JPEG's frame header do, and a file that holds none,
+// or whose declared chunk runs past its bytes, is a truncated image or another
+// format under that name rather than a small one.
+function webpSize(bytes) {
+  if (bytes.length < 20 || bytes.toString("latin1", 0, 4) !== "RIFF" || bytes.toString("latin1", 8, 12) !== "WEBP") return null;
+  // The RIFF size counts everything after the eight bytes it follows; a file that
+  // claims more than it holds is cut short.
+  if (bytes.readUInt32LE(4) + 8 > bytes.length) return null;
+  // Chunks are fourcc(4) + length(4) + data, padded to an even length.
+  let offset = 12;
+  while (offset + 8 <= bytes.length) {
+    const fourcc = bytes.toString("latin1", offset, offset + 4);
+    const length = bytes.readUInt32LE(offset + 4);
+    const body = offset + 8;
+    if (body + length > bytes.length) return null;
+    if (fourcc === "VP8 ") {
+      // A three-byte frame tag, the 9d 01 2a start code, then the 14-bit width
+      // and height, each with two bits of scaling above it.
+      if (length < 10 || bytes[body + 3] !== 0x9d || bytes[body + 4] !== 0x01 || bytes[body + 5] !== 0x2a) return null;
+      return { width: bytes.readUInt16LE(body + 6) & 0x3fff, height: bytes.readUInt16LE(body + 8) & 0x3fff };
+    }
+    if (fourcc === "VP8L") {
+      // The 0x2f signature, then 14 bits of width and 14 of height, each one less
+      // than the side it states.
+      if (length < 5 || bytes[body] !== 0x2f) return null;
+      const bits = bytes.readUInt32LE(body + 1);
+      return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >>> 14) & 0x3fff) };
+    }
+    if (fourcc === "VP8X") {
+      // A flags byte and three reserved ones, then the 24-bit canvas width and
+      // height, each one less than the side it states.
+      if (length < 10) return null;
+      const side = (at) => 1 + bytes[at] + (bytes[at + 1] << 8) + (bytes[at + 2] << 16);
+      return { width: side(body + 4), height: side(body + 7) };
+    }
+    offset = body + length + (length & 1);
+  }
+  return null;
+}
 // The size a content image is drawn at, in the pixels every writer measures an
 // image in. A request states its sides in points — the one unit a placed picture
 // is measured in (`RULES.dimension_points`) — and a request that gives one side
@@ -234,17 +285,34 @@ function imageSize(natural, width, height, span, maxWidth = DEFAULT_IMAGE_WIDTH)
   // the request leaves out keeps the image's own proportions.
   const px = (points) => points / PX_TO_POINTS;
   if (width && height) return { width: px(width), height: px(height) };
-  if (width) return { width: px(width), height: Math.max(1, px(width) * natural.height / natural.width) };
-  if (height) return { width: Math.max(1, px(height) * natural.width / natural.height), height: px(height) };
+  if (width || height) {
+    const implied = width ? "height" : "width";
+    const size = width
+      ? { width: px(width), height: px(width) * natural.height / natural.width }
+      : { width: px(height) * natural.width / natural.height, height: px(height) };
+    // A side derived from the one the request names keeps inside the same bound: a
+    // tall height on a wide picture implies a width no page holds, so the request
+    // is refused rather than answered past the rule.
+    const points = size[implied] * PX_TO_POINTS;
+    if (!inSpan(points, span)) {
+      throw new UsageError(`an image's ${implied} implied by its ${width ? "width" : "height"} must be ${spanBounds(span)} points, got: ${Math.round(points)}`);
+    }
+    size[implied] = Math.max(1, size[implied]);
+    return size;
+  }
   // The fallback below reads the image's own size, which is pixels already.
   const round = (side) => Math.max(1, Math.round(side));
   const fit = Math.min(1, maxWidth / natural.width);
   return { width: round(natural.width * fit), height: round(natural.height * fit) };
 }
 // Embed `file` into a PDF document. A file the decoder rejects (truncated, or a
-// kind the magic bytes did not settle) is the request's own input.
+// kind the magic bytes did not settle) is the request's own input. A PDF holds
+// its pictures in a PDF's own two encodings, and pdf-lib decodes neither WebP nor
+// a vector; the refusal names the conversion rather than failing later on bytes
+// it never read.
 async function embedImage(pdf, file) {
   const image = readImage(file);
+  if (image.kind === "webp") throw new UsageError(`a PDF cannot embed ${nodePath.basename(file)}: a PDF holds a picture as PNG or JPEG — convert the WebP picture first`);
   try {
     return image.kind === "png" ? await pdf.embedPng(image.bytes) : await pdf.embedJpg(image.bytes);
   } catch (error) {
@@ -253,8 +321,7 @@ async function embedImage(pdf, file) {
 }
 
 // ── create: docx ───────────────────────────────────────────────
-function docxImage(block) {
-  const image = readImage(block.image);
+function docxImage(image, block) {
   return new ImageRun({
     type: image.kind,
     data: image.bytes,
@@ -271,6 +338,9 @@ function docxTableRow(cells, header) {
 }
 function createDocx(req) {
   const children = [];
+  // Whether any block places a WebP: the library writes the part and declares no
+  // type for it, so the list is completed after packing (`declareWebpMedia`).
+  let webp = false;
   for (const block of req.content) {
     if (block.type === "heading") {
       children.push(new Paragraph({ text: textOf(block.text, "a heading's text"), heading: headingLevel(block.level) }));
@@ -296,7 +366,9 @@ function createDocx(req) {
       }
       children.push(new Table({ rows, width: { size: 100, type: WidthType.PERCENTAGE } }));
     } else if (block.type === "image") {
-      children.push(new Paragraph({ children: [docxImage(block)], spacing: { after: 200 } }));
+      const image = readImage(block.image);
+      if (image.kind === "webp") webp = true;
+      children.push(new Paragraph({ children: [docxImage(image, block)], spacing: { after: 200 } }));
     }
   }
   const numbering = {
@@ -305,7 +377,25 @@ function createDocx(req) {
       levels: [{ level: 0, format: NumberFormat.DECIMAL, text: "%1.", alignment: AlignmentType.START }],
     }],
   };
-  return Packer.toBuffer(new DocxDocument({ numbering, sections: [{ children }] }));
+  return Packer.toBuffer(new DocxDocument({ numbering, sections: [{ children }] })).then((buffer) => declareWebpMedia(buffer, webp));
+}
+
+// A created document's content-type list, completed with the one media type the
+// `docx` library writes a part for and declares none of: its `ImageRun` takes a
+// WebP picture and names the part `.webp`, while the list it writes covers png,
+// jpeg, jpg, bmp, gif and svg only. Each written part is declared by an
+// `<Override>` — the declaration that decides for one part alone, the way the
+// edit path declares the picture it adds. `hasWebp` comes from the request's own
+// blocks, so a document holding none never opens its archive.
+function declareWebpMedia(buffer, hasWebp) {
+  if (!hasWebp) return buffer;
+  const zip = new PizZip(buffer);
+  const types = zip.file("[Content_Types].xml");
+  const parts = Object.keys(zip.files)
+    .filter((name) => name.startsWith(DOCX_MEDIA) && name.toLowerCase().endsWith(".webp"));
+  if (!types || !parts.length) return buffer;
+  zip.file("[Content_Types].xml", parts.reduce((xml, part) => withOverride(xml, part, "image/webp"), types.asText()));
+  return zip.generate({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
 // ── create: xlsx ───────────────────────────────────────────────
@@ -473,7 +563,6 @@ const TITLE_FONTS = `<a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs 
 // all. One rule, read by both writers.
 const titledText = (text) => (text !== undefined && text.trim() !== "" ? text : undefined);
 const TITLE_PLACEHOLDER = `<p:ph type="title"/>`;
-const EMU_PER_INCH = 914400;
 
 // ── create: pptx ───────────────────────────────────────────────
 function createPptx(req) {
@@ -1472,7 +1561,8 @@ const tagPattern = (name) => new RegExp(`${selfClosingTag(name)}|${openTag(name)
 // text box belongs to its own paragraph, so the runs of a field region, of a
 // `<w:fldSimple>`, and of a nested paragraph are excluded from the text an edit
 // addresses. The header, footer, footnote and endnote parts are not read at
-// all: only `word/document.xml` is edited.
+// all: the body is what an edit rewrites, and the only other parts a call ever
+// writes are the ones `add_image` needs to declare and reach its own media part.
 const DOCX_PARAGRAPH = tagPattern("w:p");
 const DOCX_RUN = tagPattern("w:r");
 const DOCX_FIELD = tagPattern("w:fldSimple");
@@ -1481,6 +1571,9 @@ const DOCX_TXBX = tagPattern("w:txbxContent");
 const DOCX_TABLE = tagPattern("w:tbl");
 // A run's text, the same pattern the filler substitutes through.
 const DOCX_TEXT = runPattern("w:");
+// The package directory a docx picture lives in: the one a created document's
+// images are written to, and the one `add_image` places a picture in.
+const DOCX_MEDIA = "word/media/";
 // The part a docx edit rewrites, and the parts a package that saved one of the
 // conventional files elsewhere names through its own relationships (see
 // `documentPart`): the styles part a `format_paragraph` style name resolves
@@ -1596,8 +1689,17 @@ function docxPeripheralHolds(editor, needle) {
 // footnote really holds is named as the footnote's rather than as a label that
 // happens to spell the same words, and a label the part's own text spells is not
 // called the reader's printing. The fallback stays honest about what was searched
-// and about what a body edit addresses.
-function docxFindRefusal(editor, xml, find) {
+// and about what a body edit addresses. `block` says the op adds a block after an
+// anchor rather than editing text: its anchor is a paragraph of the document's own
+// (a table cell's counts, a text box's does not), where a text op reaches a text
+// box's own text too.
+function docxFindRefusal(editor, xml, find, block = false) {
+  const edited = block
+    ? "the body's own paragraphs, a table cell's included"
+    : "the body's own text, a text box's and a table cell's included";
+  const addressed = block
+    ? "a table cell's own text is addressed, a text box's or a field's cached result is not"
+    : "a text box's own text and a table cell's are addressed, a field's cached result is not";
   const paragraphs = docxParagraphTexts(xml);
   // A paragraph's address is the joined text of its runs and the reader prints
   // one paragraph per line, so a fragment that reaches from one paragraph into
@@ -1610,7 +1712,7 @@ function docxFindRefusal(editor, xml, find) {
   if (trimmed) {
     const peripheral = docxPeripheralHolds(editor, trimmed);
     const held = peripheral.filter(({ revised }) => !revised);
-    if (held.length) return `the text ${JSON.stringify(find)} is in ${conjoined(held.map(({ phrase }) => phrase))} of this document, which a docx edit does not change — it edits the body's own text, a text box's and a table cell's included, and not that part`;
+    if (held.length) return `the text ${JSON.stringify(find)} is in ${conjoined(held.map(({ phrase }) => phrase))} of this document, which a docx edit does not change — it edits ${edited}, and not that part`;
     // The parts left hold it as text a tracked revision of their own does, which
     // a reading prints as deleted rather than as live text: the part is named
     // with that, so the miss is not passed off as text the document lacks.
@@ -1632,7 +1734,7 @@ function docxFindRefusal(editor, xml, find) {
   const mark = namedDocxMark(trimmed);
   if (mark !== undefined && !spelledText(xml).includes(mark)) return `the text ${JSON.stringify(find)} is not in the document's body: ${JSON.stringify(mark)} is a label the reader prints, not text in the file`;
   if (/[\t\n\r]/.test(find)) return `the text ${JSON.stringify(find)} is not in the document's body: ${holdsBreakReason("w:", "<w:p>")}`;
-  return `the text ${JSON.stringify(find)} is not in the document's body, its headers, its footers, its footnotes, its endnotes or its comments — a text box's own text and a table cell's are addressed, a field's cached result is not`;
+  return `the text ${JSON.stringify(find)} is not in the document's body, its headers, its footers, its footnotes, its endnotes or its comments — ${addressed}`;
 }
 
 // The one balanced scan every "walk the elements of one tag family" caller here
@@ -2933,38 +3035,41 @@ function formatParagraph(xml, edit, find, editor) {
   return out;
 }
 
-// The `<w:body>` position a paragraph added "at the end" goes to: before the
-// body's OWN `<w:sectPr>` section properties when it has them, since those must
-// stay the body's last element, else at the very end of the body. The first
-// `<w:sectPr>` in the body is not necessarily the body's own — a section break
-// sits inside a paragraph's `<w:pPr>` — so only a `<w:sectPr>` outside every
-// paragraph counts, and the body's own is the last of those.
-function bodyEnd(xml) {
+// The `<w:body>` part of `xml`: the end of its content and the span of its OWN
+// section properties — the last `<w:sectPr>` outside every paragraph, since a
+// section break sits inside the paragraph that ends the section. `undefined`
+// when the part holds no body at all.
+function bodyLayout(xml) {
   const body = xml.match(new RegExp(`${openTag("w:body")}([\\s\\S]*)${closeTag("w:body")}`));
-  if (!body) throw new UsageError("the document has no body to add a paragraph to");
+  if (!body) return undefined;
   // The content is the match's own middle, not a slice up to a close tag spelled
   // out again: a body whose close carries whitespace (`</w:body >`) is read by the
   // pattern above and by nothing else.
   const content = body[1];
-  const open = body[0].indexOf(">") + 1;
+  const open = body.index + body[0].indexOf(">") + 1;
   const paragraphs = docxParagraphs(content);
   const insideParagraph = (at) => paragraphs.some((span) => at >= span.start && at < span.end);
-  let at = content.length;
-  for (const match of content.matchAll(elementPattern("w:sectPr"))) {
-    if (!insideParagraph(match.index)) at = match.index;
-  }
-  return body.index + open + at;
+  const section = tagSpans(content, tagPattern("w:sectPr")).filter((span) => !insideParagraph(span.start)).at(-1);
+  return {
+    end: open + content.length,
+    section: section === undefined ? undefined : { start: open + section.start, end: open + section.end },
+  };
+}
+
+// The `<w:body>` position a paragraph added "at the end" goes to: before the
+// body's own `<w:sectPr>` when it has them, since those must stay the body's
+// last element, else at the very end of the body.
+function bodyEnd(xml) {
+  const body = bodyLayout(xml);
+  if (!body) throw new UsageError("the document has no body to add a paragraph to");
+  return body.section ? body.section.start : body.end;
 }
 
 // `xml` with a paragraph holding `text` added: after the FIRST paragraph whose
 // text holds `after`, or at the end of the body. The first match in part order
 // is the anchor on purpose — the same rule the presentation's `add_paragraph`
 // uses (see `addSlideParagraph`) — so a fragment that matches several paragraphs
-// always lands the new one in the same place. The set searched is the document's
-// OWN paragraphs (`topParagraphs`): a table cell's is one of them, a text box's
-// is not — it is a paragraph nested inside another — and an `after` naming text
-// there is refused with a message saying where the text lies rather than
-// anchoring the new paragraph inside the box.
+// always lands the new one in the same place.
 //
 // A paragraph added after an anchor takes what the anchor holds: the style, the
 // paragraph formatting and the list membership of its own `<w:pPr>` (minus the
@@ -2979,20 +3084,7 @@ function addParagraph(xml, edit, editor) {
     const at = bodyEnd(xml);
     return xml.slice(0, at) + addedParagraph(undefined, undefined, text) + xml.slice(at);
   }
-  const after = editText(edit.after, "after");
-  if (!after) throw new UsageError("after must not be empty");
-  const paragraphs = docxParagraphTexts(xml);
-  const own = new Set(topParagraphs(xml).map((span) => span.start));
-  const span = paragraphs.find((paragraph) => own.has(paragraph.start) && paragraph.text.includes(after));
-  if (!span) {
-    // The fragment may still be text this document holds and the text ops can
-    // edit — a text box's own paragraph — so the refusal says where it is
-    // instead of the body's "not searched" wording, which reads as "not in the
-    // file".
-    const buried = paragraphs.find((paragraph) => paragraph.text.includes(after));
-    if (buried) throw new UsageError(`the text ${JSON.stringify(after)} is inside a text box: an add_paragraph after anchors in the document's own paragraphs (a table cell's counts), and a text box's paragraph is a nested one`);
-    throw new UsageError(docxFindRefusal(editor, xml, after));
-  }
+  const { span } = docxAnchor(xml, edit, editor);
   return xml.slice(0, span.end) + inheritedParagraph(xml.slice(span.start, span.end), text, note) + xml.slice(span.end);
 }
 
@@ -3036,6 +3128,182 @@ function inheritedParagraph(anchor, text, note) {
   // revision — and an empty `<w:rPr>` is a change that states nothing.
   const rPr = stripped && elementParts(stripped, "w:rPr").body.trim() ? stripped : undefined;
   return addedParagraph(inherited, rPr, text);
+}
+
+// ── add_image / add_table ──────────────────────────────────────
+// Both ops add a BLOCK to the body and both are placed the same way as
+// `add_paragraph`: after the first of the document's own paragraphs
+// (`topParagraphs`, so a table cell's anchor counts and a text box's does not)
+// whose text holds `after`. A paragraph inside a table cell addresses the whole
+// table the cell belongs to rather than a place inside it — a block added inside
+// a cell is not the placement a caller means, and a cell must never end with a
+// table — and a fragment the body does not hold is refused, never appended at
+// the end.
+
+// The paragraph a block added after `after` anchors on, with the body position it
+// goes to: the end of the outermost table holding the paragraph — a nested table's
+// end is still inside its cell — else the paragraph's own end. `inTable` says
+// which of the two it was, the fact a table added there needs on its previous
+// side.
+function docxAnchor(xml, edit, editor) {
+  const after = editText(edit.after, "after");
+  if (!after) throw new UsageError("after must not be empty");
+  if (bodyLayout(xml) === undefined) throw new UsageError(`the document has no body, so there is nothing to place an ${edit.op} after`);
+  const paragraphs = docxParagraphTexts(xml);
+  const own = new Set(topParagraphs(xml).map((span) => span.start));
+  const span = paragraphs.find((paragraph) => own.has(paragraph.start) && paragraph.text.includes(after));
+  if (!span) {
+    // The fragment may still be text this document holds and the text ops can
+    // edit — a text box's own paragraph — so the refusal says where it is
+    // instead of the body's "not searched" wording, which reads as "not in the
+    // file".
+    const buried = paragraphs.find((paragraph) => paragraph.text.includes(after));
+    if (buried) throw new UsageError(`the text ${JSON.stringify(after)} is inside a text box: an ${edit.op} after anchors in the document's own paragraphs (a table cell's counts), and a text box's paragraph is a nested one`);
+    throw new UsageError(docxFindRefusal(editor, xml, after, true));
+  }
+  const table = tagSpans(xml, DOCX_TABLE).find((candidate) => !candidate.selfClosing
+    && candidate.depth === 1 && candidate.start < span.start && span.end <= candidate.end);
+  return { span, at: table ? table.end : span.end, inTable: table !== undefined };
+}
+
+// The A4 page and 1in margins the create path writes, in twips: the section a
+// document stating none of its own is read at.
+const A4_WIDTH_TWIPS = 11906;
+
+// The width the body's own text column may use, in twips: the page's width less
+// its left and right margins, from the body's own section. The section in force
+// where a block lands may be another one; this is the measure a picture's own size
+// and a table's columns are capped against, not a fact the file records.
+function docxTextWidth(xml) {
+  const section = bodyLayout(xml)?.section;
+  const column = section === undefined ? "" : xml.slice(section.start, section.end);
+  const number = (name, attribute, fallback) => {
+    const tag = column.match(tagPattern(name))?.[0];
+    const value = tag === undefined ? Number.NaN : Number(xmlAttribute(tag, attribute));
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  };
+  return Math.max(1, number("w:pgSz", "w:w", A4_WIDTH_TWIPS) - number("w:pgMar", "w:left", TWIPS_PER_INCH) - number("w:pgMar", "w:right", TWIPS_PER_INCH));
+}
+
+// The DrawingML namespaces a picture is written in, per dialect: a document
+// resolves the spellings its own dialect states, and the picture declares them
+// on its own element so it does not rely on what the part's root happens to
+// carry.
+const DRAWING_NAMESPACES = {
+  transitional: {
+    wp: "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    a: "http://schemas.openxmlformats.org/drawingml/2006/main",
+    pic: "http://schemas.openxmlformats.org/drawingml/2006/picture",
+  },
+  strict: {
+    wp: "http://purl.oclc.org/ooxml/drawingml/wordprocessingDrawing",
+    a: "http://purl.oclc.org/ooxml/drawingml/main",
+    pic: "http://purl.oclc.org/ooxml/drawingml/picture",
+  },
+};
+
+// `xml` with the picture `edit` names added after the anchor it names: the bytes
+// become a media part, `[Content_Types].xml` declares it, the document gains its
+// relationship, and a `<w:p>` holding the drawing goes at the anchor. A package
+// with no content-type list cannot declare the part it gains and is refused the
+// way a presentation without one is. The size is the one every placement shares:
+// a stated side is points, one side alone keeps the picture's own proportions,
+// and neither keeps its natural size capped to the page's text column.
+function addImage(xml, edit, editor) {
+  const { at } = docxAnchor(xml, edit, editor);
+  const image = readImage(edit.image);
+  if (!editor.zip.file("[Content_Types].xml")) throw missingContentTypes(editor.input);
+  const dialect = dialectOf(xml);
+  const media = nextMediaPart(editor.zip, DOCX_MEDIA, image.kind);
+  editor.add(media, image.bytes);
+  editor.part("[Content_Types].xml", (types) => withOverride(types, media, image.contentType));
+  const relationship = addRelationship(editor, DOCX_DOCUMENT, `${RELATIONSHIP_NAMESPACES[dialect]}/image`, media);
+  const size = imageSize(image, edit.width, edit.height, RULES.dimension_points, Math.round(docxTextWidth(xml) / TWIPS_PER_PIXEL));
+  const cx = Math.max(1, Math.round(size.width * PX_TO_EMU));
+  const cy = Math.max(1, Math.round(size.height * PX_TO_EMU));
+  // A document's drawing ids are unique: the next free one, so a picture this
+  // call adds never renames the ones it already holds. Any prefix a package
+  // bound the wordprocessingDrawing namespace to is counted.
+  const id = Math.max(0, ...[...xml.matchAll(/<[A-Za-z0-9_]+:docPr\b[^>]*\bid="(\d+)"/g)].map((match) => Number(match[1]))) + 1;
+  const namespaces = DRAWING_NAMESPACES[dialect];
+  const drawing = `<w:drawing><wp:inline xmlns:wp="${namespaces.wp}" xmlns:a="${namespaces.a}" xmlns:pic="${namespaces.pic}" xmlns:r="${RELATIONSHIP_NAMESPACES[dialect]}" distT="0" distB="0" distL="0" distR="0">`
+    + `<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent t="0" r="0" b="0" l="0"/>`
+    + `<wp:docPr id="${id}" name="Picture ${id}"/>`
+    + `<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>`
+    + `<a:graphic><a:graphicData uri="${namespaces.pic}"><pic:pic>`
+    + `<pic:nvPicPr><pic:cNvPr id="${id}" name="Picture ${id}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1"/></pic:cNvPicPr></pic:nvPicPr>`
+    + `<pic:blipFill><a:blip r:embed="${relationship}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>`
+    + `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>`
+    + `</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>`;
+  return xml.slice(0, at) + `<w:p><w:r>${drawing}</w:r></w:p>` + xml.slice(at);
+}
+
+// One `<w:tc>`: a cell must hold at least one block element, so every cell
+// carries its own paragraph — the shape `create` writes, a heading's run bold
+// and a body cell's plain. A structure reaching here is refused by the one
+// scalar rule `create`'s cells are written under.
+function docxTableCell(value, header) {
+  const bold = header ? "<w:rPr><w:b/><w:bCs/></w:rPr>" : "";
+  const text = String(scalarOf(value, header ? "a table heading" : "a table cell"));
+  return `<w:tc><w:p><w:r>${bold}<w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r></w:p></w:tc>`;
+}
+
+// The `<w:tbl>` a `create` table block would have written: the same 100 % width
+// and six single borders, and a grid of equal columns over the body's own text
+// width. `CT_Tbl` requires both the `<w:tblPr>` and the `<w:tblGrid>`, and the
+// grid is stated rather than left to a reader's autofit — its count the widest
+// row's, the count the reading prints and Word draws.
+function docxTable(headers, rows, usable) {
+  const columns = rows.reduce((widest, row) => Math.max(widest, row.length), headers.length);
+  if (columns > RULES.table_columns_max) throw new UsageError(`a table may hold at most ${RULES.table_columns_max} columns, got: ${columns}`);
+  const width = Math.max(1, Math.round(usable / columns));
+  const row = (cells, header) => `<w:tr>${cells.map((cell) => docxTableCell(cell, header)).join("")}</w:tr>`;
+  const borders = ["top", "left", "bottom", "right", "insideH", "insideV"]
+    .map((side) => `<w:${side} w:val="single" w:color="auto" w:sz="4"/>`).join("");
+  return `<w:tbl><w:tblPr><w:tblW w:type="pct" w:w="5000"/><w:tblBorders>${borders}</w:tblBorders></w:tblPr>`
+    + `<w:tblGrid>${`<w:gridCol w:w="${width}"/>`.repeat(columns)}</w:tblGrid>`
+    + `${headers.length ? row(headers, true) : ""}${rows.map((cells) => row(cells, false)).join("")}</w:tbl>`;
+}
+
+// The kind of the body's own block that begins at or after `at` — `"w:tbl"`,
+// `"w:p"`, or `undefined` when only the body's section properties and range
+// markers follow, i.e. when a table added at `at` would be the body's last block.
+// A body block is a table no other table holds and a paragraph neither a table nor
+// another paragraph holds — an empty `<w:p/>` is one, as `Word` writes them; a
+// range marker draws nothing, so it is stepped over by not being one, whatever
+// spelling it is written in.
+function nextBlockKind(xml, at) {
+  const tables = tagSpans(xml, DOCX_TABLE).filter((span) => !span.selfClosing && span.depth === 1);
+  const held = (span) => tables.some((table) => table.start < span.start && span.end <= table.end);
+  const paragraphs = tagSpans(xml, DOCX_PARAGRAPH).filter((span) => span.depth === 1 && !held(span));
+  return [
+    ...tables.map((span) => ({ at: span.start, kind: "w:tbl" })),
+    ...paragraphs.map((span) => ({ at: span.start, kind: "w:p" })),
+  ].sort((a, b) => a.at - b.at).find((block) => block.at >= at)?.kind;
+}
+
+// `xml` with the table `edit` names added after the anchor it names. A table
+// that would be the body's last block, or that lands directly beside another
+// table, is followed by an empty paragraph: a document must not end on a table,
+// and two tables with no paragraph between them draw as one.
+function addTable(xml, edit, editor) {
+  const { at, inTable } = docxAnchor(xml, edit, editor);
+  const headers = Array.isArray(edit.headers) ? edit.headers : [];
+  // A cell-less row is dropped the way `create`'s writer drops it, so both take
+  // one table shape; a row that is not a list is still refused.
+  const rows = (Array.isArray(edit.rows) ? edit.rows : []).filter((row) => {
+    if (!Array.isArray(row)) throw new UsageError("every table row must be a list of cells");
+    return row.length > 0;
+  });
+  // A header alone is a table, exactly as it is for `create`.
+  if (!headers.length && !rows.length) throw new UsageError("a table needs at least one row or one heading");
+  // A separator paragraph goes on either side that needs one: after the anchor's
+  // own table when the anchor resolved to one (see `docxAnchor`), and before a
+  // table or the body's end on the next side (see `nextBlockKind`), since two
+  // tables with no paragraph between them draw as one and ECMA-376 forbids a body
+  // ending with a table.
+  const trailing = nextBlockKind(xml, at) !== "w:p";
+  return xml.slice(0, at) + (inTable ? "<w:p/>" : "") + docxTable(headers, rows, docxTextWidth(xml)) + (trailing ? "<w:p/>" : "") + xml.slice(at);
 }
 
 // `element` with every paragraph — itself or a nested one — whose joined text
@@ -3200,12 +3468,16 @@ function noteUnnamed(fragment, spans, note) {
 }
 
 // One docx edit applied to `xml`: the edit addresses the joined text of a
-// paragraph's runs, and every occurrence of `find` is rewritten. `editor` is what
-// an op that reads or writes another part of the package resolves it through —
-// the numbering part a list needs — and withholds its notes.
+// paragraph's runs, and every occurrence of `find` is rewritten — while the ops
+// that ADD a block (`add_paragraph`, `add_image`, `add_table`) are placed by the
+// anchor they name instead. `editor` is what an op that reads or writes another
+// part of the package resolves it through — the numbering part a list needs, the
+// media part and its declaration a picture adds — and withholds its notes.
 function applyDocxEdit(xml, edit, editor) {
   const op = edit && edit.op;
   if (op === "add_paragraph") return addParagraph(xml, edit, editor);
+  if (op === "add_image") return addImage(xml, edit, editor);
+  if (op === "add_table") return addTable(xml, edit, editor);
   const find = editText(edit && edit.find, "find");
   if (!find) throw new UsageError("find must not be empty");
   if (op === "remove_paragraph") {
@@ -5657,8 +5929,6 @@ const SLIDE_ALIGNMENTS = new Map(RULES.slide_alignments);
 // `<p:sldSz cx="9144000" cy="6858000"/>` — when the element is absent. An image
 // on such a slide is placed by fraction of this.
 const SLIDE_SIZE_DEFAULT = { width: 9144000, height: 6858000 };
-// One CSS pixel — the unit an image's own pixel size is stated in — in EMU.
-const PX_TO_EMU = 9525;
 
 // The value of the attribute `name` of an XML tag. A longer name never matches a
 // shorter one (`\bTarget=` is not `TargetMode=`, and the `Id` of a relationship
@@ -6927,17 +7197,19 @@ function formatSlideText(editor, edit) {
   });
 }
 
-// The `N` numbers of the `ppt/media/imageN.ext` parts the package holds, whatever
-// extension each carries.
-const mediaNumbers = (zip) => Object.keys(zip.files).flatMap((name) => {
-  const match = name.match(new RegExp(`^${escapeRegExp(PPT_MEDIA)}image(\\d+)\\.[A-Za-z0-9]+$`));
+// The `N` numbers of the `<directory>imageN.ext` parts the package holds,
+// whatever extension each carries.
+const mediaNumbers = (zip, directory) => Object.keys(zip.files).flatMap((name) => {
+  const match = name.match(new RegExp(`^${escapeRegExp(directory)}image(\\d+)\\.[A-Za-z0-9]+$`));
   return match ? [Number(match[1])] : [];
 });
 
-// A free `ppt/media/imageN.ext` name: one past the largest number the package
-// uses, whatever extension it carries, so the name is free by construction.
-function nextMediaPart(zip, extension) {
-  return `${PPT_MEDIA}image${Math.max(0, ...mediaNumbers(zip)) + 1}.${extension}`;
+// A free `<directory>imageN.ext` name: one past the largest number the package
+// uses in that directory, whatever extension it carries, so the name is free by
+// construction. A package's own media names are left alone — Word writes
+// `imageN.ext`, a library a content hash.
+function nextMediaPart(zip, directory, extension) {
+  return `${directory}image${Math.max(0, ...mediaNumbers(zip, directory)) + 1}.${extension}`;
 }
 
 // The slide's own size in EMU, from the presentation's `<p:sldSz>`, or the
@@ -7033,7 +7305,7 @@ function addSlideImage(editor, edit) {
   const zip = editor.zip;
   const part = addressedSlide(zip, edit.slide);
   const image = readImage(edit.image);
-  const media = nextMediaPart(zip, image.kind);
+  const media = nextMediaPart(zip, PPT_MEDIA, image.kind);
   editor.add(media, image.bytes);
   editor.part("[Content_Types].xml", (xml) => withOverride(xml, media, image.contentType));
   const id = addRelationship(editor, part, IMAGE_REL, media);
@@ -7479,6 +7751,8 @@ const operations = {
         { op: "add_paragraph", after: "Проверка", text: "Добавлено" },
         { op: "add_paragraph", after: "Заголовок", text: "После заголовка" },
         { op: "remove_paragraph", find: "Лишний" },
+        { op: "add_image", after: "Добавлено", image: `${scratch}/probe.png`, width: 60 },
+        { op: "add_table", after: "После заголовка", headers: ["Колонка"], rows: [["значение"]] },
       ] });
       writeOut(`${scratch}/probe_edited.docx`, edited.buffer);
     });

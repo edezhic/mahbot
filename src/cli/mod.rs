@@ -918,7 +918,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 purpose: "Edit a .docx/.docm",
                 flags: &[
                     DOCUMENT_PATH_FLAG,
-                    DOCUMENT_EDITS_FLAG,
+                    IMAGE_EDITS_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -929,7 +929,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 purpose: "Edit an .xlsx/.xlsm",
                 flags: &[
                     DOCUMENT_PATH_FLAG,
-                    DOCUMENT_EDITS_FLAG,
+                    XLSX_EDITS_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -940,7 +940,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 purpose: "Edit a .pptx/.pptm",
                 flags: &[
                     DOCUMENT_PATH_FLAG,
-                    PPTX_EDITS_FLAG,
+                    IMAGE_EDITS_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -1202,19 +1202,18 @@ const DOCUMENT_PAGES_FLAG: Flag = Flag {
               with '@<file>'; left out, every page",
 };
 
-/// The document tool's `edits` argument for the two edit operations that place no
-/// picture (`docx_edit`, `xlsx_edit`).
-const DOCUMENT_EDITS_FLAG: Flag = Flag {
+/// The document tool's `edits` argument for `xlsx_edit`, which places no
+/// picture.
+const XLSX_EDITS_FLAG: Flag = Flag {
     arg: "edits",
     kind: FlagKind::Structured(&[]),
     secret: false,
     purpose: EDITS_PURPOSE,
 };
 
-/// The same argument for `pptx_edit`, whose `add_image` is the one edit that
-/// names a reference file — so its list resolves that `image` where the command
-/// runs, while the other two have no such field to resolve.
-const PPTX_EDITS_FLAG: Flag = Flag {
+/// The same argument for `docx_edit` and `pptx_edit`, whose `add_image` names a
+/// reference file — so their list resolves that `image` where the command runs.
+const IMAGE_EDITS_FLAG: Flag = Flag {
     arg: "edits",
     kind: FlagKind::Structured(&["image"]),
     secret: false,
@@ -3050,27 +3049,31 @@ mod tests {
         names
     }
     /// The property names a schema subtree declares at any depth whose own schema
-    /// IS the tool's picture argument: a field built that way names a FILE, so the
-    /// resolution the command line does is told which fields it owes — the other
-    /// direction of the field tie.
-    fn file_naming_fields(schema: &serde_json::Value, picture: &serde_json::Value) -> Vec<String> {
+    /// IS one of the tool's picture arguments: a field built that way names a FILE,
+    /// so the resolution the command line does is told which fields it owes — the
+    /// other direction of the field tie. The picture's schema differs by target
+    /// (a `create` block may target a PDF), so the whole family is read.
+    fn file_naming_fields(
+        schema: &serde_json::Value,
+        pictures: &[serde_json::Value],
+    ) -> Vec<String> {
         let mut names = Vec::new();
         match schema {
             serde_json::Value::Object(members) => {
                 if let Some(serde_json::Value::Object(properties)) = members.get("properties") {
                     for (name, property) in properties {
-                        if property == picture {
+                        if pictures.contains(property) {
                             names.push(name.clone());
                         }
                     }
                 }
                 for member in members.values() {
-                    names.extend(file_naming_fields(member, picture));
+                    names.extend(file_naming_fields(member, pictures));
                 }
             }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    names.extend(file_naming_fields(item, picture));
+                    names.extend(file_naming_fields(item, pictures));
                 }
             }
             _ => {}
@@ -3162,7 +3165,7 @@ mod tests {
                             );
                         }
                         let naming_a_file =
-                            file_naming_fields(property, &crate::tools::document::image_arg());
+                            file_naming_fields(property, &crate::tools::document::image_args());
                         file_fields += naming_a_file.len();
                         for field in naming_a_file {
                             assert!(
@@ -3196,13 +3199,14 @@ mod tests {
                 }
             }
         }
-        // The reverse direction has to have found something, or it would hold by
-        // being vacuous: the document tool's own picture argument stands in a
-        // create block and in a placing edit.
+        // The reverse direction has to have found every one of them, or it would
+        // hold by being vacuous: the document tool's picture stands in a `create`
+        // block, in a docx placing edit and in a pptx placing edit — three fields
+        // the command line owes a resolution.
         assert!(
-            file_fields >= 2,
-            "no structured field that names a file was found in any schema ({file_fields}) — the \
-             tie would be vacuous"
+            file_fields >= 3,
+            "the picture fields naming a file were not all found ({file_fields}) — the tie would \
+             be vacuous"
         );
     }
 
@@ -4033,6 +4037,18 @@ mod tests {
                 "Cargo.toml",
                 "--edits",
                 r#"[{"op": "add_image", "slide": 1, "image": "Cargo.toml"}]"#,
+            ],
+        );
+        assert_eq!(p.args["edits"][0]["image"], serde_json::json!(joined));
+
+        let p = parsed(
+            "document",
+            "docx-edit",
+            &[
+                "--path",
+                "Cargo.toml",
+                "--edits",
+                r#"[{"op": "add_image", "after": "x", "image": "Cargo.toml"}]"#,
             ],
         );
         assert_eq!(p.args["edits"][0]["image"], serde_json::json!(joined));

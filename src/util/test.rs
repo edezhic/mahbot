@@ -1499,6 +1499,12 @@ pub fn noisy_jpeg(width: u32, height: u32) -> Vec<u8> {
     noisy_image(width, height, image::ImageFormat::Jpeg)
 }
 
+/// The WebP form of [`noisy_image`], for the writers that embed it: the crate's
+/// encoder is lossless, so this is a `VP8L` file.
+pub fn noisy_webp(width: u32, height: u32) -> Vec<u8> {
+    noisy_image(width, height, image::ImageFormat::WebP)
+}
+
 /// The canonical path as the resolvers hand it on: the platform's
 /// [`std::fs::canonicalize`] with the Windows verbatim prefix stripped.
 pub fn canonical_without_verbatim_prefix(path: &Path) -> PathBuf {
