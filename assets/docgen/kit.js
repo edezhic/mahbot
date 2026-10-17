@@ -11,7 +11,10 @@ import {
   Document as DocxDocument, Packer, Paragraph, TextRun, HeadingLevel, ImageRun,
   Table, TableRow, TableCell, WidthType, AlignmentType, NumberFormat,
 } from "docx";
-import { PDFDocument, rgb, degrees } from "pdf-lib";
+import {
+  PDFDocument, rgb, degrees, PDFDict, PDFHexString, PDFName, PDFString,
+  PDFTextField, PDFCheckBox, PDFRadioGroup, PDFDropdown, PDFOptionList,
+} from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 // rules.json is the single statement of the input rules the `document` tool,
 // this kit and the presentation reader share — a set, a bound or a slide mark
@@ -847,7 +850,7 @@ function noteGlyphs(glyphs, text) {
   }
 }
 async function pdfWithFont(req) {
-  const pdf = await PDFDocument.create();
+  const pdf = await freshPdf(req.metadata);
   pdf.registerFontkit(fontkit);
   const bytes = fs.readFileSync(req.font);
   const font = await pdf.embedFont(bytes, { subset: true });
@@ -7072,6 +7075,68 @@ function pptxEdit(req) {
   return editor.finish();
 }
 
+// ── pdf description ────────────────────────────────────────────
+// The document information dictionary: what a reader shows as the file's
+// description. A loaded PDF's own entries are the author's record of the file,
+// so they are preserved unless the request names them.
+const PRODUCT = "mahbot";
+// The request keys a metadata object may name, each with its Info entry name and
+// whether its value is a PDF date.
+const PDF_METADATA = Object.fromEntries(RULES.pdf_metadata_fields
+  .map((field) => [field.key, field]));
+// The file's own Info dictionary, without creating one.
+function existingInfo(pdf) {
+  const existing = pdf.context.lookup(pdf.context.trailerInfo.Info);
+  return existing instanceof PDFDict ? existing : undefined;
+}
+// The caller's entries over a file's own: a field left out keeps what the file
+// had, and dates arrive in the PDF's `D:…` spelling from the tool.
+function applyMetadata(pdf, metadata) {
+  if (metadata === undefined) return;
+  let info = existingInfo(pdf);
+  for (const [key, field] of Object.entries(PDF_METADATA)) {
+    const value = metadata[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string") throw new UsageError(`"${key}" must be text`);
+    const cleared = value === "";
+    // Clearing an entry must not add an Info dictionary to a file that has none;
+    // setting one always does.
+    if (cleared && !info) continue;
+    if (!info) {
+      info = pdf.context.obj({});
+      pdf.context.trailerInfo.Info = pdf.context.register(info);
+    }
+    if (cleared) info.delete(PDFName.of(field.name));
+    else info.set(PDFName.of(field.name), field.date ? PDFString.of(value) : PDFHexString.fromText(value));
+  }
+}
+function pdfDate(date) {
+  // `toString()` wraps the value in literal-string parentheses; `asString()` is
+  // the raw `D:…` the Info dictionary wants.
+  return PDFString.fromDate(date).asString();
+}
+// A document built by this kit names itself as the producer and dates the file
+// it just made; a caller's metadata then overrides or clears any of that.
+async function freshPdf(metadata) {
+  const pdf = await PDFDocument.create({ updateMetadata: false });
+  const now = new Date();
+  applyMetadata(pdf, { producer: PRODUCT, created: pdfDate(now), modified: pdfDate(now) });
+  applyMetadata(pdf, metadata);
+  return pdf;
+}
+// An edit keeps the description the file carried, but dates the write: an entry
+// the file already has reflects the modification, so it advances. A caller
+// naming `modified` — even with an empty string — decides it instead, and a file
+// carrying no modification date gains none (nothing is invented for it).
+function applyEditMetadata(pdf, metadata) {
+  const named = metadata ?? {};
+  const entries = { ...named };
+  if (!Object.hasOwn(named, "modified") && existingInfo(pdf)?.has(PDFName.of("ModDate"))) {
+    entries.modified = pdfDate(new Date());
+  }
+  applyMetadata(pdf, entries);
+}
+
 // ── pdf page operations ────────────────────────────────────────
 // A PDF the library cannot parse is the request's own input, not a kit fault.
 const loadPdf = async (p) => {
@@ -7081,7 +7146,9 @@ const loadPdf = async (p) => {
     // `ignoreEncryption` is what makes an encrypted document load far enough to
     // be NAMED as one: the library refuses it before this side can see why, and
     // a cause the caller recognises is worth more than a library message.
-    pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    // `updateMetadata: false` keeps the file's own producer and dates: loading
+    // must not restamp them with pdf-lib's identity as a side effect of editing.
+    pdf = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
     // The page tree must resolve too: a header-valid file whose body the
     // library cannot read would otherwise fail deep inside an operation, with a
     // raw library message. Touching it here refuses such a file in this same
@@ -7146,7 +7213,7 @@ const hexColor = (hex) => {
 };
 
 async function pdfMerge(req) {
-  const out = await PDFDocument.create();
+  const out = await freshPdf(req.metadata);
   for (const input of req.inputs) {
     const source = await loadPdf(input);
     for (const page of await out.copyPages(source, source.getPageIndices())) out.addPage(page);
@@ -7163,7 +7230,7 @@ async function pdfSplit(req) {
   pageCountLimit(groups.reduce((total, indices) => total + indices.length, 0));
   const outputs = [];
   for (const indices of groups) {
-    const out = await PDFDocument.create();
+    const out = await freshPdf(req.metadata);
     for (const page of await out.copyPages(source, indices)) out.addPage(page);
     outputs.push(await out.save());
   }
@@ -7177,6 +7244,7 @@ async function pdfRotate(req) {
     throw new UsageError(`"degrees" must be a multiple of ${RULES.degrees_step}, got: ${req.degrees}`);
   }
   const pdf = await loadPdf(req.input);
+  applyEditMetadata(pdf, req.metadata);
   for (const index of pageIndices(pdf, req.pages)) {
     const page = pdf.getPage(index);
     page.setRotation(degrees((((page.getRotation().angle + req.degrees) % 360) + 360) % 360));
@@ -7186,6 +7254,7 @@ async function pdfRotate(req) {
 
 async function pdfText(req) {
   const pdf = await loadPdf(req.input);
+  applyEditMetadata(pdf, req.metadata);
   pdf.registerFontkit(fontkit);
   const bytes = fs.readFileSync(req.font);
   const font = await pdf.embedFont(bytes, { subset: true });
@@ -7217,6 +7286,7 @@ async function pdfText(req) {
 
 async function pdfImage(req) {
   const pdf = await loadPdf(req.input);
+  applyEditMetadata(pdf, req.metadata);
   const image = await embedImage(pdf, req.image);
   // The action's own sides are points, as the page is laid out, and the image's
   // natural size and the cap are the pixels `imageSize` measures in: it answers in
@@ -7232,21 +7302,103 @@ async function pdfImage(req) {
   return pdf.save();
 }
 
+// The fields a request can fill, with the kind and the values each accepts.
+// The catalogue is what the refusal for a missing field names, so a caller with
+// a blank form learns every fillable field and its choices from one call. It is
+// bounded like the reading's own list: a pathological form cannot turn one
+// refusal into an unbounded message, and the fill itself is by name unaffected.
+const CATALOGUE_MAX = 1000;
+const CATALOGUE_MAX_CHARS = 4000;
+function fillableFields(form) {
+  const fields = [];
+  for (const field of form.getFields()) {
+    const name = field.getName();
+    if (name === "") continue;
+    let kind;
+    let options = [];
+    if (field instanceof PDFTextField) kind = RULES.pdf_field_kinds.text;
+    else if (field instanceof PDFCheckBox) kind = RULES.pdf_field_kinds.checkbox;
+    else if (field instanceof PDFRadioGroup) {
+      options = field.getOptions();
+      // A radio group with no option to select is one no fill can reach.
+      if (options.length === 0) continue;
+      kind = RULES.pdf_field_kinds.radio;
+    } else if (field instanceof PDFOptionList) {
+      options = field.getOptions();
+      // A list box offers only the options the file names; without one it cannot
+      // be filled. A dropdown (below) accepts a value of its own instead.
+      if (options.length === 0) continue;
+      kind = RULES.pdf_field_kinds.choice;
+    } else if (field instanceof PDFDropdown) {
+      options = field.getOptions();
+      kind = RULES.pdf_field_kinds.choice;
+    } else continue;
+    fields.push({ name, kind, options });
+    // One past the cap tells a truncated catalogue from one that ends exactly at
+    // it, without walking an unbounded form.
+    if (fields.length > CATALOGUE_MAX) break;
+  }
+  return fields;
+}
+function catalogue(form) {
+  const fields = fillableFields(form);
+  if (fields.length === 0) return "no fillable fields";
+  const truncated = fields.length > CATALOGUE_MAX;
+  const listed = fields.slice(0, CATALOGUE_MAX).map(describeField).join(", ");
+  if (truncated) return `${listed}, and more`;
+  return listed.length > CATALOGUE_MAX_CHARS ? `${listed.slice(0, CATALOGUE_MAX_CHARS)}…` : listed;
+}
+function describeField(field) {
+  return field.options.length
+    ? `${field.name} (${field.kind}; options: ${field.options.join(", ")})`
+    : `${field.name} (${field.kind})`;
+}
+// The library refuses an option it does not know with a bare Error that names
+// neither the field nor the accepted values, and it would surface as a kit
+// fault; a request the caller can fix is a usage refusal.
+function selectOption(field, name, value, fieldsHint) {
+  const options = field.getOptions();
+  const chosen = String(value);
+  if (options.length === 0) throw new UsageError(`form field "${name}" offers no choice to select; this document has: ${fieldsHint()}`);
+  if (!options.includes(chosen)) {
+    throw new UsageError(`form field "${name}" takes one of: ${options.join(", ")}; got: ${chosen}`);
+  }
+  // A file whose option list outruns the field's own states makes the library
+  // throw a bare error for an option it advertised; the value is still the
+  // caller's, so it is a usage refusal rather than a kit fault.
+  try {
+    field.select(chosen);
+  } catch (error) {
+    throw new UsageError(`form field "${name}" cannot take "${chosen}": ${(error && error.message) || error}`);
+  }
+}
+
 async function pdfFormFill(req) {
   const pdf = await loadPdf(req.input);
+  applyEditMetadata(pdf, req.metadata);
   pdf.registerFontkit(fontkit);
   const bytes = fs.readFileSync(req.font);
   const font = await pdf.embedFont(bytes, { subset: true });
   const glyphs = fontkit.create(bytes);
   const form = pdf.getForm();
-  const names = form.getFields().map((field) => field.getName());
+  const fieldsHint = () => catalogue(form);
   for (const [name, value] of Object.entries(req.values)) {
-    const field = form.getFieldMaybe(name);
-    if (!field) throw new UsageError(`no such form field: ${name}; this document has: ${names.join(", ") || "no fillable fields"}`);
-    if (typeof value === "boolean" && field.check) { value ? field.check() : field.uncheck(); continue; }
-    if (field.setText) { field.setText(String(value)); noteGlyphs(glyphs, String(value)); continue; }
-    if (field.select) { field.select(String(value)); noteGlyphs(glyphs, String(value)); continue; }
-    throw new UsageError(`form field "${name}" cannot take a value`);
+    // An empty name is never resolvable, so it falls into the refusal below,
+    // which names it as `""`.
+    const field = name ? form.getFieldMaybe(name) : undefined;
+    if (!field) throw new UsageError(`no such form field: ${name === "" ? '""' : name}; this document has: ${fieldsHint()}`);
+    if (field instanceof PDFCheckBox) {
+      if (typeof value !== "boolean") throw new UsageError(`form field "${name}" is a checkbox and takes true or false, got: ${JSON.stringify(value)}`);
+      value ? field.check() : field.uncheck();
+      continue;
+    }
+    if (field instanceof PDFTextField) { field.setText(String(value)); noteGlyphs(glyphs, String(value)); continue; }
+    if (field instanceof PDFRadioGroup) { selectOption(field, name, value, fieldsHint); noteGlyphs(glyphs, String(value)); continue; }
+    if (field instanceof PDFOptionList) { selectOption(field, name, value, fieldsHint); noteGlyphs(glyphs, String(value)); continue; }
+    // A dropdown accepts a value outside its list by turning editing on, which
+    // is the permissive behaviour callers already rely on.
+    if (field instanceof PDFDropdown) { field.select(String(value)); noteGlyphs(glyphs, String(value)); continue; }
+    throw new UsageError(`form field "${name}" cannot take a value — it is not a fillable field; this document has: ${fieldsHint()}`);
   }
   form.updateFieldAppearances(font);
   if (req.flatten) form.flatten();

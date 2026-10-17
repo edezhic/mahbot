@@ -344,6 +344,10 @@ impl Tool for ReadTool {
         let chart_series = crate::reader_output::chart_series(Some("<name>"), 0);
         let chart_series_numbered = crate::reader_output::chart_series(None, 0);
         let chart_size = crate::reader_output::chart_size("<size>");
+        // The kind words a PDF form field is listed with, and the words its line
+        // prints, spelled the way the reading prints them.
+        let pdf_field_kinds = crate::docgen::pdf_field_kinds().spelled();
+        let form_words = crate::docgen::pdf_form_words();
         // The path boundary, in the wording of this read's own access level —
         // the skeleton is shared, so the three statements cannot drift from
         // each other's structure.
@@ -380,6 +384,10 @@ impl Tool for ReadTool {
                 ("{{chart_label}}", crate::reader_output::CHART_LABEL),
                 ("{{chart_series}}", &chart_series),
                 ("{{chart_size}}", &chart_size),
+                ("{{pdf_field_kinds}}", &pdf_field_kinds),
+                ("{{pdf_form_fields}}", &form_words.fields),
+                ("{{pdf_no_value}}", &form_words.no_value),
+                ("{{pdf_not_fillable}}", &form_words.not_fillable),
                 ("{{mark_stored}}", crate::reader_output::MARK_STORED.trim()),
                 ("{{chart_no_values}}", crate::reader_output::CHART_NO_VALUES),
                 (

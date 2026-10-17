@@ -896,6 +896,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                     DOCUMENT_FORMAT_FLAG,
                     DOCUMENT_CONTENT_FLAG,
                     DOCUMENT_SHEETS_FLAG,
+                    DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -950,6 +951,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 purpose: "Merge PDFs into one new file",
                 flags: &[
                     DOCUMENT_PATHS_FLAG,
+                    DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -961,6 +963,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[
                     DOCUMENT_PATH_FLAG,
                     DOCUMENT_PAGES_FLAG,
+                    DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -973,6 +976,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                     DOCUMENT_PATH_FLAG,
                     DOCUMENT_DEGREES_FLAG,
                     DOCUMENT_PAGES_FLAG,
+                    DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -991,6 +995,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                     DOCUMENT_COLOR_FLAG,
                     DOCUMENT_STAMP_FLAG,
                     DOCUMENT_ROTATE_FLAG,
+                    DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -1008,6 +1013,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                     DOCUMENT_Y_FLAG,
                     DOCUMENT_WIDTH_FLAG,
                     DOCUMENT_HEIGHT_FLAG,
+                    DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -1020,6 +1026,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                     DOCUMENT_PATH_FLAG,
                     DOCUMENT_VALUES_FLAG,
                     DOCUMENT_FLATTEN_FLAG,
+                    DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -1154,6 +1161,17 @@ const DOCUMENT_SHEETS_FLAG: Flag = Flag {
     secret: false,
     purpose: "The worksheets to write, as a JSON array — one object per sheet with its 'name', \
               its 'rows' and its own fields",
+};
+
+/// The document tool's `metadata` argument — every operation that writes a PDF.
+const DOCUMENT_METADATA_FLAG: Flag = Flag {
+    arg: "metadata",
+    kind: FlagKind::Structured(&[]),
+    secret: false,
+    purpose: "A PDF's own description, as a JSON object keyed {{pdf_metadata_fields}}; a named \
+              field is set (a date is {{pdf_date_format}}), an empty string clears one, a field \
+              you do not name is left as the file has it, and an existing modified date advances \
+              to the write",
 };
 
 /// The document tool's `path` argument: the one input file most of its
@@ -2128,6 +2146,18 @@ fn family_help(family: &Family) -> String {
     out
 }
 
+/// A flag's purpose with the shared vocabulary filled in: a description field set
+/// or a date grammar the rules state appears in the help as those rules state it,
+/// so neither can drift from the schema and the reading.
+fn flag_purpose(flag: &Flag) -> String {
+    flag.purpose
+        .replace(
+            "{{pdf_metadata_fields}}",
+            &crate::docgen::pdf_metadata_fields_spelled(),
+        )
+        .replace("{{pdf_date_format}}", crate::docgen::pdf_date_format())
+}
+
 /// The flag table of a help: one width-aligned row per flag, a secret's value
 /// never echoed here because it is never echoed anywhere.
 fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
@@ -2148,9 +2178,12 @@ fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
                 FlagKind::Destination => spelling.push_str(" <dir>"),
             }
             let description = if flag.secret {
-                format!("{} — the value is never echoed or recorded", flag.purpose)
+                format!(
+                    "{} — the value is never echoed or recorded",
+                    flag_purpose(flag)
+                )
             } else {
-                flag.purpose.to_string()
+                flag_purpose(flag)
             };
             (spelling, description)
         })
@@ -2690,9 +2723,10 @@ mod tests {
         if !declares_per_action_arguments(operation.tool) {
             return top.into_iter().filter(|(key, _)| key != "action").collect();
         }
-        let entry = schema["properties"]["action"]["oneOf"]
+        let entries = schema["properties"]["action"]["oneOf"]
             .as_array()
-            .expect("the tool's action entries")
+            .expect("the tool's action entries");
+        let entry = entries
             .iter()
             .find_map(|entry| entry["properties"].get(action))
             .unwrap_or_else(|| {
@@ -2701,14 +2735,25 @@ mod tests {
                     operation.tool
                 )
             });
-        let mut args: serde_json::Map<String, serde_json::Value> =
-            top.into_iter().filter(|(key, _)| key != "action").collect();
-        args.extend(
-            entry["properties"]
-                .as_object()
-                .unwrap_or_else(|| panic!("'{action}' must declare its properties"))
-                .clone(),
-        );
+        let declared = entry["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("'{action}' must declare its properties"));
+        // A root argument an action opts into belongs to that action: keeping the
+        // root copy would demand a form for it on an operation whose action
+        // refuses it. Only the root arguments no action declares stand beside
+        // every action.
+        let per_action: Vec<&str> = entries
+            .iter()
+            .flat_map(|entry| entry["properties"].as_object().into_iter())
+            .flat_map(|actions| actions.values())
+            .flat_map(|action| action["properties"].as_object().into_iter())
+            .flat_map(|properties| properties.keys().map(String::as_str))
+            .collect();
+        let mut args: serde_json::Map<String, serde_json::Value> = top
+            .into_iter()
+            .filter(|(key, _)| key != "action" && !per_action.contains(&key.as_str()))
+            .collect();
+        args.extend(declared.clone());
         args
     }
 
@@ -3289,6 +3334,10 @@ mod tests {
                 }
             };
             for help in &helps {
+                assert!(
+                    !help.contains("{{"),
+                    "a help placeholder was not expanded:\n{help}"
+                );
                 for required in [
                     "must be running",
                     "owner's authority",

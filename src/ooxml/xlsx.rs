@@ -222,8 +222,10 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         ));
     }
     notes.extend(skipped.notes());
+    let text = blocks.join("\n\n").trim_end().to_string();
     DocOutcome::Text {
-        text: blocks.join("\n\n").trim_end().to_string(),
+        page_text: !text.is_empty(),
+        text,
         images,
         notes,
         unshown,

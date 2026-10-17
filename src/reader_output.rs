@@ -357,7 +357,9 @@ impl UnshownKind {
 /// parts of a package that hold nothing a model reads (its themes, its styles,
 /// its document properties) — is deliberately absent, and belongs in the
 /// model-facing description of the reading instead: a kind here is a promise the
-/// reading keeps.
+/// reading keeps. A PDF's own description is the exception: it *is* read (see
+/// [`crate::pdf_marks`]), while a Word, Excel or PowerPoint package's document
+/// properties are not.
 #[derive(Default)]
 pub(crate) struct Unshown {
     counts: [usize; UnshownKind::COUNT],

@@ -139,6 +139,111 @@ pub(crate) fn ppt_slide_labels() -> &'static PptSlideLabels {
     })
 }
 
+/// The words a PDF form's field list names a field's kind by. The reading prints
+/// them and the document kit's own refusal lists the same fields, so one
+/// statement of them lives in [`RULES_JSON`] rather than being spelled twice and
+/// drifting.
+#[derive(serde::Deserialize)]
+pub(crate) struct PdfFieldKinds {
+    pub(crate) text: String,
+    pub(crate) checkbox: String,
+    pub(crate) radio: String,
+    pub(crate) choice: String,
+}
+
+impl PdfFieldKinds {
+    /// The kinds spelled for a model-facing sentence: `` `text`, `checkbox`,
+    /// `radio` and `choice` ``.
+    pub(crate) fn spelled(&self) -> String {
+        format!(
+            "`{}`, `{}`, `{}` and `{}`",
+            self.text, self.checkbox, self.radio, self.choice
+        )
+    }
+}
+
+/// [`PdfFieldKinds`] out of [`rules`], as [`ppt_marks`] reads its own.
+pub(crate) fn pdf_field_kinds() -> &'static PdfFieldKinds {
+    static KINDS: OnceLock<PdfFieldKinds> = OnceLock::new();
+    KINDS.get_or_init(|| {
+        serde::Deserialize::deserialize(&rules()["pdf_field_kinds"])
+            .expect("assets/docgen/rules.json must carry the pdf_field_kinds a form list prints")
+    })
+}
+
+/// The words a PDF form reading prints: the section's own heading, the marker for
+/// an empty value, the one for a field a fill cannot reach, and the name of a
+/// field the file gives none. The reading and the prompt that describes it both
+/// take them from [`RULES_JSON`], so the vocabulary the model is told to expect
+/// cannot drift from the one the reader emits.
+#[derive(serde::Deserialize)]
+pub(crate) struct PdfFormWords {
+    /// Heading of the form section, without its colon.
+    pub(crate) fields: String,
+    /// Stands where a field carries no value.
+    pub(crate) no_value: String,
+    /// Marks a field a fill cannot reach.
+    pub(crate) not_fillable: String,
+    /// The name shown for a field with no `/T`.
+    pub(crate) unnamed: String,
+}
+
+/// [`PdfFormWords`] out of [`rules`].
+pub(crate) fn pdf_form_words() -> &'static PdfFormWords {
+    static WORDS: OnceLock<PdfFormWords> = OnceLock::new();
+    WORDS.get_or_init(|| {
+        serde::Deserialize::deserialize(&rules()["pdf_form_words"])
+            .expect("assets/docgen/rules.json must carry the pdf_form_words a form list prints")
+    })
+}
+
+/// The spellings a PDF metadata date accepts, as one model-facing sentence. The
+/// schema, the boundary's refusal, the command line's help and the writing
+/// prompt all state it from here; the kit is handed the value already in the
+/// PDF's own spelling and does not restate the grammar.
+pub(crate) fn pdf_date_format() -> &'static str {
+    rules()["pdf_date_format"]
+        .as_str()
+        .expect("assets/docgen/rules.json must carry the pdf_date_format a metadata date accepts")
+}
+
+/// One of the description fields a PDF's Info dictionary carries: the request
+/// key `metadata` names and a reading prints, the sentence the schema describes
+/// it with, and whether the value is a PDF date. The schema, both refusals, the
+/// reading and the kit's own writer read this one ordered list (the kit also
+/// takes the Info-dictionary entry name each field carries), so the field set
+/// lives in [`RULES_JSON`] rather than being spelled again in each of them and
+/// drifting.
+#[derive(serde::Deserialize)]
+pub(crate) struct PdfMetadataField {
+    /// The `metadata` request key and the label a reading prints.
+    pub(crate) key: String,
+    /// The sentence the schema describes the field with.
+    pub(crate) description: String,
+    /// Whether the value is a PDF date rather than text.
+    pub(crate) date: bool,
+}
+
+/// [`PdfMetadataField`]s out of [`rules`], in the order a reading prints them.
+pub(crate) fn pdf_metadata_fields() -> &'static [PdfMetadataField] {
+    static FIELDS: OnceLock<Vec<PdfMetadataField>> = OnceLock::new();
+    FIELDS.get_or_init(|| {
+        serde::Deserialize::deserialize(&rules()["pdf_metadata_fields"]).expect(
+            "assets/docgen/rules.json must carry the pdf_metadata_fields a description names",
+        )
+    })
+}
+
+/// The description fields spelled for a model-facing sentence, in the rules'
+/// order, each in backticks and joined as a list.
+pub(crate) fn pdf_metadata_fields_spelled() -> String {
+    let keys: Vec<String> = pdf_metadata_fields()
+        .iter()
+        .map(|field| format!("`{}`", field.key))
+        .collect();
+    crate::util::listed(&keys, "and")
+}
+
 /// The marks a Word reading prints that are labels rather than text: the pattern
 /// each is matched by and the spelling the reader prints it as. The editing side
 /// names the same marks in its refusals, so one statement of them lives in

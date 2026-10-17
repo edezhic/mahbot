@@ -171,6 +171,24 @@ pub(crate) fn strip_data_uris(text: &str) -> String {
         .into_owned()
 }
 
+/// `a`, `b` and `c` — the values joined for a model-facing sentence, with
+/// `conjunction` before the last: `"and"` for a set, `"or"` for alternatives.
+/// One spelling of the last-pair rule, so two sentences listing the same kind of
+/// thing do not punctuate it two ways.
+pub(crate) fn listed<T: std::fmt::Display>(values: &[T], conjunction: &str) -> String {
+    match values {
+        [] => String::new(),
+        [only] => only.to_string(),
+        [rest @ .., last] => format!(
+            "{} {conjunction} {last}",
+            rest.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod data_uri_strip_tests {
     use super::{DATA_URI_OMITTED_PREFIX, strip_data_uris};

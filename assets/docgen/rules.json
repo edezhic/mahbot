@@ -15,6 +15,29 @@
   "column_width_chars": { "min": 0, "max": 255, "min_exclusive": false },
   "row_height_points": { "min": 0, "max": 409, "min_exclusive": false },
   "pdf_point_abs_max": 20000,
+  "pdf_field_kinds": {
+    "text": "text",
+    "checkbox": "checkbox",
+    "radio": "radio",
+    "choice": "choice"
+  },
+  "pdf_form_words": {
+    "fields": "Form fields",
+    "no_value": "(no value)",
+    "not_fillable": "not fillable",
+    "unnamed": "unnamed field"
+  },
+  "pdf_date_format": "YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS], with an optional Z or ±HH:MM offset (no offset means UTC)",
+  "pdf_metadata_fields": [
+    { "key": "title", "name": "Title", "description": "The document's title.", "date": false },
+    { "key": "author", "name": "Author", "description": "The document's author.", "date": false },
+    { "key": "subject", "name": "Subject", "description": "The document's subject.", "date": false },
+    { "key": "keywords", "name": "Keywords", "description": "The document's keywords, as one text.", "date": false },
+    { "key": "creator", "name": "Creator", "description": "The application that made the content.", "date": false },
+    { "key": "producer", "name": "Producer", "description": "The application that wrote the file.", "date": false },
+    { "key": "created", "name": "CreationDate", "description": "Creation date.", "date": true },
+    { "key": "modified", "name": "ModDate", "description": "Modification date.", "date": true }
+  ],
   "color_digits": 6,
   "slide_alignments": [["left", "l"], ["center", "ctr"], ["right", "r"], ["justify", "just"]],
   "cell_alignments": ["general", "left", "center", "right", "justify", "distributed", "centerContinuous"],

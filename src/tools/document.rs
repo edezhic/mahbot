@@ -54,8 +54,10 @@ use crate::tools::path::PathAccess;
 use crate::{Tool, Workspace};
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
+use chrono::{Datelike as _, Timelike as _};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -480,12 +482,16 @@ impl Tool for DocumentTool {
         let ppt_notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
         let input_mb = megabytes(crate::util::FILE_MAX_BYTES).to_string();
         let edit_text_max = RULES.edit_text_max.to_string();
+        let pdf_metadata_fields = crate::docgen::pdf_metadata_fields_spelled();
+        let pdf_date_format = crate::docgen::pdf_date_format();
         crate::prompt::substitute(
             &crate::prompt::load_prompt("tool/document.md"),
             &[
                 ("{{input_location}}", self.input_location()),
                 ("{{input_mb}}", &input_mb),
                 ("{{edit_text_max}}", &edit_text_max),
+                ("{{pdf_metadata_fields}}", &pdf_metadata_fields),
+                ("{{pdf_date_format}}", pdf_date_format),
                 // The Word marks are quoted from the shared list: the ones a
                 // reading prints in brackets and the labels it adds without them
                 // (see `spelled_docx_marks`).
@@ -516,6 +522,10 @@ impl Tool for DocumentTool {
                     "oneOf": ACTIONS.iter().map(|action| action_schema(action)).collect::<Vec<_>>()
                 },
                 "file_name": file_name_arg(),
+                // The one description shape several actions take is stated here
+                // once, beside `file_name`; an action's own entry only opts into
+                // it (see [`metadata_entry`]).
+                "metadata": metadata_arg(),
             }),
             &["action"],
         )
@@ -678,6 +688,37 @@ fn file_name_arg() -> Value {
          extension, puts the file in the workspace's generated/ directory and makes the name \
          unique."
     ))
+}
+
+/// `metadata`: the PDF's own description, which every PDF-writing action takes.
+/// A field left out is left as the file has it rather than cleared (an existing
+/// `modified` date advances to the write), so the absence of a key and an empty
+/// string mean different things.
+fn metadata_arg() -> Value {
+    let properties = crate::docgen::pdf_metadata_fields()
+        .iter()
+        .map(|field| (field.key.clone(), text_arg(&field.description)))
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": false,
+        "description": format!(
+            "The PDF's own description. A field left out stays as the file has it — except an \
+             existing modified date, which advances to a write; an empty string clears one; \
+             keywords is the single text the file carries. A date is {}.",
+            crate::docgen::pdf_date_format()
+        ),
+        "properties": properties,
+    })
+}
+
+/// `metadata` as a PDF action's entry declares it: the action opts into the
+/// tool-level argument, whose fields are stated once in
+/// [`parameters_schema`](DocumentTool::parameters_schema) because a copy per PDF
+/// action would cost more contract bytes than the schema has room for.
+fn metadata_entry() -> Value {
+    json!({ "type": "object" })
 }
 
 /// `path`: the one input document every action but `pdf_merge` takes. The file is
@@ -1058,6 +1099,7 @@ fn action_schema(action: &str) -> Value {
                 "format": choice_arg(&SUPPORTED_FORMATS, "The format to write."),
                 "content": content_arg(),
                 "sheets": sheets_arg(),
+                "metadata": metadata_entry(),
             }),
         ),
         "fill_template" => super::action_entry_schema(
@@ -1253,19 +1295,20 @@ fn action_schema(action: &str) -> Value {
             "pdf_merge",
             "Merge PDFs into one new file.",
             &["paths"],
-            &json!({ "paths": paths_arg() }),
+            &json!({ "paths": paths_arg(), "metadata": metadata_entry() }),
         ),
         "pdf_split" => super::action_entry_schema(
             "pdf_split",
             "Split a PDF, one output file per page entry.",
             &["path", "pages"],
-            &json!({ "path": path_arg(), "pages": pages_arg(true) }),
+            &json!({ "path": path_arg(), "pages": pages_arg(true), "metadata": metadata_entry() }),
         ),
         "pdf_rotate" => super::action_entry_schema(
             "pdf_rotate",
             "Add a rotation to a PDF's pages.",
             &["path", "degrees"],
-            &json!({ "path": path_arg(), "degrees": degrees_arg(), "pages": pages_arg(false) }),
+            &json!({ "path": path_arg(), "degrees": degrees_arg(), "pages": pages_arg(false),
+                     "metadata": metadata_entry() }),
         ),
         "pdf_text" => super::action_entry_schema(
             "pdf_text",
@@ -1287,6 +1330,7 @@ fn action_schema(action: &str) -> Value {
                     "Rotation in degrees, within ±{}.",
                     RULES.pdf_point_abs_max
                 )),
+                "metadata": metadata_entry(),
             }),
         ),
         "pdf_image" => super::action_entry_schema(
@@ -1301,6 +1345,7 @@ fn action_schema(action: &str) -> Value {
                 "y": point_arg("Y position"),
                 "width": placed_size_arg("Placed width"),
                 "height": placed_size_arg("Placed height"),
+                "metadata": metadata_entry(),
             }),
         ),
         "pdf_form_fill" => super::action_entry_schema(
@@ -1311,6 +1356,7 @@ fn action_schema(action: &str) -> Value {
                 "path": path_arg(),
                 "values": values_arg("form field"),
                 "flatten": bool_arg("Bake the fields into the page content and remove them."),
+                "metadata": metadata_entry(),
             }),
         ),
         other => unreachable!("the schema lists exactly the dispatched actions: {other}"),
@@ -1391,7 +1437,15 @@ impl DocumentTool {
                 SUPPORTED_FORMATS.join(", ")
             );
         }
+        let metadata = opt_metadata(args)?;
+        if metadata.is_some() && format != "pdf" {
+            anyhow::bail!(
+                "usage: a {format} file carries no PDF description — hint: pass \"metadata\" only \
+                 for format \"pdf\""
+            );
+        }
         let mut request = json!({ "op": "create", "format": format });
+        set_metadata(&mut request, metadata);
         if format == "xlsx" {
             // A workbook is built from `sheets`; content blocks passed beside it
             // would be dropped in silence, which is worse than being told they do
@@ -1517,6 +1571,7 @@ impl DocumentTool {
         output: &Path,
     ) -> Result<super::ToolAnswer> {
         let paths = super::get_str_array(args, "paths")?;
+        let metadata = opt_metadata(args)?;
         if paths.len() < 2 {
             anyhow::bail!(
                 "usage: `paths` needs at least 2 PDFs to merge, got {} — hint: pass two or \
@@ -1559,11 +1614,12 @@ impl DocumentTool {
             &input_base(&inputs[0], "merged"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
-        let request = json!({
+        let mut request = json!({
             "op": "pdf_merge",
             "inputs": path_strings(&inputs),
             "output": outputs[0].to_string_lossy(),
         });
+        set_metadata(&mut request, metadata);
         self.deliver(request, &outputs, "merged the files into")
             .await
     }
@@ -1577,6 +1633,7 @@ impl DocumentTool {
     ) -> Result<super::ToolAnswer> {
         let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
         let groups = split_groups(args)?;
+        let metadata = opt_metadata(args)?;
         require_pdf(&input).await?;
         let base = sanitize_base(
             opt_string(args, "file_name")?,
@@ -1586,12 +1643,13 @@ impl DocumentTool {
             .map(|index| format!("{base}_part{}", index + 1))
             .collect();
         let outputs = reserve(output, &bases, "pdf").await?;
-        let request = json!({
+        let mut request = json!({
             "op": "pdf_split",
             "input": input.to_string_lossy(),
             "groups": groups,
             "outputs": path_strings(&outputs),
         });
+        set_metadata(&mut request, metadata);
         self.deliver(request, &outputs, "split the file into").await
     }
 
@@ -1633,6 +1691,7 @@ impl DocumentTool {
             "degrees": degrees,
         });
         request["pages"] = opt_pages(args)?.kit_value();
+        set_metadata(&mut request, opt_metadata(args)?);
         require_pdf(&input).await?;
         let base = sanitize_base(
             opt_string(args, "file_name")?,
@@ -1670,6 +1729,7 @@ impl DocumentTool {
         if let Some(stamp) = super::get_opt_bool(args, "stamp")? {
             request["stamp"] = json!(stamp);
         }
+        set_metadata(&mut request, opt_metadata(args)?);
         require_pdf(&input).await?;
         let base = sanitize_base(opt_string(args, "file_name")?, &input_base(&input, "text"));
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
@@ -1697,6 +1757,7 @@ impl DocumentTool {
         set_number(&mut request, args, "y")?;
         set_positive_number(&mut request, args, "width", &RULES.dimension_points)?;
         set_positive_number(&mut request, args, "height", &RULES.dimension_points)?;
+        set_metadata(&mut request, opt_metadata(args)?);
         require_pdf(&input).await?;
         let base = sanitize_base(opt_string(args, "file_name")?, &input_base(&input, "image"));
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
@@ -1718,19 +1779,21 @@ impl DocumentTool {
         // Every argument is read before anything is reserved: a call the tool
         // refuses must not leave an empty output file behind.
         let flatten = super::get_bool(args, "flatten", false)?;
+        let metadata = opt_metadata(args)?;
         require_pdf(&input).await?;
         let base = sanitize_base(
             opt_string(args, "file_name")?,
             &input_base(&input, "filled"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
-        let request = json!({
+        let mut request = json!({
             "op": "pdf_form_fill",
             "input": input.to_string_lossy(),
             "values": values,
             "flatten": flatten,
             "output": outputs[0].to_string_lossy(),
         });
+        set_metadata(&mut request, metadata);
         self.deliver(request, &outputs, "filled the form into")
             .await
     }
@@ -3832,17 +3895,7 @@ fn require_table_body(object: &serde_json::Map<String, Value>, index: usize) -> 
 /// `1, 2 or 3` — how a refusal hint and the description name the values a rule
 /// allows.
 fn listed<T: std::fmt::Display>(values: &[T]) -> String {
-    match values {
-        [] => String::new(),
-        [only] => only.to_string(),
-        [rest @ .., last] => format!(
-            "{} or {last}",
-            rest.iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
+    crate::util::listed(values, "or")
 }
 
 /// Whole megabytes of `bytes`, the unit the tool's messages state a size in.
@@ -3940,6 +3993,140 @@ fn optional_string<'a>(value: Option<&'a Value>, at: &str, key: &str) -> Result<
 /// A present optional string of a top-level argument.
 fn opt_string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
     optional_string(args.get(key), "", key)
+}
+
+/// The PDF description `metadata` names, in the kit's shape: every field it
+/// names is passed through (a date in the PDF's own spelling), and a field it
+/// does not name is absent rather than null, so the kit leaves the file's own
+/// entry as it is — except the modification date an edit advances. Read with the
+/// rest of the arguments, before any output is reserved.
+fn opt_metadata(args: &Value) -> Result<Option<Value>> {
+    let Some(value) = args.get("metadata") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(object) = value.as_object() else {
+        return Err(super::wrong_type("metadata", "an object", value));
+    };
+    let fields = crate::docgen::pdf_metadata_fields();
+    let keys = fields
+        .iter()
+        .map(|field| field.key.as_str())
+        .collect::<Vec<_>>();
+    if object.is_empty() {
+        anyhow::bail!(
+            "usage: \"metadata\" is empty — hint: name at least one of {}",
+            listed(&keys)
+        );
+    }
+    let mut metadata = serde_json::Map::with_capacity(object.len());
+    for (key, value) in object {
+        let Some(field) = fields.iter().find(|field| field.key == *key) else {
+            anyhow::bail!(
+                "usage: unknown metadata field \"{key}\" — hint: use {}",
+                listed(&keys)
+            );
+        };
+        let Some(text) = value.as_str() else {
+            return Err(super::wrong_type(
+                &format!("metadata.{key}"),
+                "a string",
+                value,
+            ));
+        };
+        metadata.insert(
+            key.clone(),
+            Value::String(if field.date {
+                pdf_date(text)?
+            } else {
+                text.to_string()
+            }),
+        );
+    }
+    Ok(Some(Value::Object(metadata)))
+}
+
+/// Attach a PDF action's `metadata` to its request, when the caller named it.
+fn set_metadata(request: &mut Value, metadata: Option<Value>) {
+    if let Some(metadata) = metadata {
+        request["metadata"] = metadata;
+    }
+}
+
+/// The PDF spelling of a metadata date: `D:YYYYMMDDHHMMSS` with `Z` for UTC or
+/// `±HH'MM'` for another offset. A calendar date alone is midnight UTC, a time
+/// follows `T` with optional seconds, and the only offset spellings are `Z` and
+/// `±HH:MM`. An empty string clears the entry and passes through.
+fn pdf_date(text: &str) -> Result<String> {
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    let refused = || {
+        anyhow::anyhow!(
+            "usage: \"{text}\" is not a date — hint: use {}",
+            crate::docgen::pdf_date_format()
+        )
+    };
+    let date = text.get(..10).ok_or_else(refused)?;
+    let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| refused())?;
+    let mut rest = &text[10..];
+    let offset_minutes = if let Some(stripped) = rest.strip_suffix('Z') {
+        rest = stripped;
+        0
+    } else if let Some(index) = rest.rfind(['+', '-']) {
+        let (time, offset) = rest.split_at(index);
+        rest = time;
+        pdf_offset(offset).ok_or_else(refused)?
+    } else {
+        0
+    };
+    let time = if rest.is_empty() {
+        chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is a valid time")
+    } else {
+        let time = rest.strip_prefix('T').ok_or_else(refused)?;
+        ["%H:%M", "%H:%M:%S"]
+            .iter()
+            .find_map(|format| chrono::NaiveTime::parse_from_str(time, format).ok())
+            .ok_or_else(refused)?
+    };
+    let mut rendered = format!(
+        "D:{:04}{:02}{:02}{:02}{:02}{:02}",
+        date.year(),
+        date.month(),
+        date.day(),
+        time.hour(),
+        time.minute(),
+        time.second()
+    );
+    if offset_minutes == 0 {
+        rendered.push('Z');
+    } else {
+        let sign = if offset_minutes < 0 { '-' } else { '+' };
+        let minutes = offset_minutes.abs();
+        let _ = write!(rendered, "{sign}{:02}'{:02}'", minutes / 60, minutes % 60);
+    }
+    Ok(rendered)
+}
+
+/// A `±HH:MM` offset as minutes from UTC.
+fn pdf_offset(text: &str) -> Option<i32> {
+    let (sign, rest) = match text.as_bytes().first()? {
+        b'+' => (1, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':')?;
+    if hours.len() != 2 || minutes.len() != 2 {
+        return None;
+    }
+    let hours: i32 = hours.parse().ok()?;
+    let minutes: i32 = minutes.parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
 }
 
 /// Require a fill's `values` to be present and non-empty, and hand the map back:
@@ -5112,18 +5299,17 @@ mod tests {
             "<< /Type /Filespec /F (x) /EF << /F {embedded} >> >>"
         ));
         let info = fixture.push("<< /Title (Fixture title) >>".to_string());
-        let assembled = fixture.build(&format!(
-            "/Pages {pages} /Outlines {outlines} /MarkInfo << /Marked true >> \
-             /StructTreeRoot {struct_root} /PageLabels << /Nums [0 << /S /D >>] >> \
-             /Names << /EmbeddedFiles << /Names [(x) {filespec}] >> >> \
-             /AcroForm << /Fields [{field}] >> /Dests << /Names [(target) [{page} /Fit]] >>"
-        ));
         // The information dictionary hangs off the trailer, not the catalog, so
-        // the assembled trailer is given the `/Info` key a producer would write.
-        String::from_utf8(assembled)
-            .expect("the fixture is ASCII")
-            .replace("/Root 1 0 R >>", &format!("/Root 1 0 R /Info {info} >>"))
-            .into_bytes()
+        // the trailer is given the `/Info` key a producer would write.
+        fixture.build_with_trailer(
+            &format!(
+                "/Pages {pages} /Outlines {outlines} /MarkInfo << /Marked true >> \
+                 /StructTreeRoot {struct_root} /PageLabels << /Nums [0 << /S /D >>] >> \
+                 /Names << /EmbeddedFiles << /Names [(x) {filespec}] >> >> \
+                 /AcroForm << /Fields [{field}] >> /Dests << /Names [(target) [{page} /Fit]] >>"
+            ),
+            &format!(" /Info {info}"),
+        )
     }
 
     /// A Word document is created and read back: the text survives a round trip
@@ -7949,6 +8135,456 @@ mod tests {
         .await;
         let text = converted_text(&ws, &single(&filled)).await;
         assert!(text.contains("Имя"), "form value not readable: {text}");
+    }
+
+    /// A metadata date is canonicalised to the PDF's own spelling: a calendar
+    /// date is midnight UTC, `T` separates the time, seconds and offsets are
+    /// optional, and a zero offset is written `Z`.
+    #[test]
+    fn pdf_dates_are_written_in_the_pdfs_own_spelling() {
+        assert_eq!(
+            pdf_date("2024-05-17").expect("a calendar date"),
+            "D:20240517000000Z"
+        );
+        assert_eq!(
+            pdf_date("2024-05-17T10:30").expect("a date and minutes"),
+            "D:20240517103000Z"
+        );
+        assert_eq!(
+            pdf_date("2024-05-17T10:30:15Z").expect("a date, seconds and Z"),
+            "D:20240517103015Z"
+        );
+        assert_eq!(
+            pdf_date("2024-05-17T10:30:00+03:00").expect("a positive offset"),
+            "D:20240517103000+03'00'"
+        );
+        assert_eq!(pdf_date("").expect("an empty string clears"), "");
+        for bad in [
+            "2024-13-01",
+            "2024-05-17T10:30:00 o'clock",
+            "2024-05-17 10:30:15Z",
+            "2024-05-17T10:30:00-0530",
+        ] {
+            let err = pdf_date(bad).expect_err("a bad date must be refused");
+            let message = err.to_string();
+            assert!(message.starts_with("usage:"), "got: {message}");
+            assert!(
+                message.contains(bad),
+                "the refusal must echo {bad:?}: {message}"
+            );
+            assert!(
+                message.contains("YYYY-MM-DD"),
+                "the refusal must spell the accepted form: {message}"
+            );
+        }
+    }
+
+    /// A PDF text string's value as text: the kit writes a metadata value as a
+    /// UTF-16BE hex string, while a fixture's own literal string is plain bytes.
+    fn metadata_text(bytes: Option<&[u8]>) -> Option<String> {
+        let bytes = bytes?;
+        Some(match bytes.strip_prefix(&[0xFE, 0xFF]) {
+            Some(units) => String::from_utf16_lossy(
+                &units
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_be_bytes(*pair))
+                    .collect::<Vec<_>>(),
+            ),
+            None => String::from_utf8_lossy(bytes).into_owned(),
+        })
+    }
+
+    /// A one-page PDF whose trailer names `info` as its `/Info` dictionary —
+    /// where a description lives, rather than in the catalog.
+    fn pdf_with_info(info: &str) -> Vec<u8> {
+        use crate::document::test_fixtures::PdfFixture;
+        let mut fixture = PdfFixture::new();
+        let font =
+            fixture.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        let content = "BT /F1 24 Tf 72 700 Td (Described page) Tj ET";
+        let contents = fixture.push(format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ));
+        let page = fixture.reserve();
+        let pages = fixture.push(format!("<< /Type /Pages /Kids [{page}] /Count 1 >>"));
+        fixture.set(
+            &page,
+            format!(
+                "<< /Type /Page /Parent {pages} /MediaBox [0 0 595 842] /Resources \
+                 << /Font << /F1 {font} >> >> /Contents {contents} >>"
+            ),
+        );
+        let info = fixture.push(info.to_string());
+        fixture.build_with_trailer(&format!("/Pages {pages}"), &format!(" /Info {info}"))
+    }
+
+    /// An edit keeps the description it does not name — the producer above all —
+    /// and dates the write, since the modification date is what reflects it; the
+    /// one field the call names changes too, and no creation date is invented.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_editing_keeps_the_description_it_does_not_name() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "described.pdf",
+            &pdf_with_info(
+                "<< /Producer (Keep me) /ModDate (D:20200102030405Z) /Title (Old title) >>",
+            ),
+        );
+        let rotated = run(
+            &ws,
+            json!({
+                "action": "pdf_rotate", "file_name": "rotated",
+                "path": source.to_string_lossy(), "degrees": 90,
+                "metadata": { "title": "New title" },
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&rotated));
+        let metadata = pdf.metadata();
+        assert_eq!(
+            metadata_text(metadata.title.as_deref()).as_deref(),
+            Some("New title")
+        );
+        assert_eq!(
+            metadata_text(metadata.producer.as_deref()).as_deref(),
+            Some("Keep me"),
+            "the edit rewrote the producer it did not name"
+        );
+        let modified = metadata
+            .modification_date
+            .expect("the write dates the file");
+        let modified = chrono::NaiveDate::from_ymd_opt(
+            i32::from(modified.year),
+            u32::from(modified.month),
+            u32::from(modified.day),
+        )
+        .and_then(|date| {
+            date.and_hms_opt(
+                u32::from(modified.hour),
+                u32::from(modified.minute),
+                u32::from(modified.second),
+            )
+        })
+        .expect("the modification date is a calendar date");
+        assert!(
+            (modified - chrono::Utc::now().naive_utc())
+                .num_seconds()
+                .abs()
+                < 300,
+            "the edit did not date the file it wrote: {modified}"
+        );
+        assert!(metadata.creation_date.is_none(), "the edit added a date");
+
+        // A caller that names the modification date decides it: the write does
+        // not stamp its own date over the one the call chose.
+        let dated = run(
+            &ws,
+            json!({
+                "action": "pdf_rotate", "file_name": "dated",
+                "path": source.to_string_lossy(), "degrees": 90,
+                "metadata": { "modified": "2021-02-03" },
+            }),
+        )
+        .await;
+        let dated = parsed_pdf(&single(&dated));
+        let modified = dated
+            .metadata()
+            .modification_date
+            .expect("the named date is written");
+        assert_eq!(
+            (
+                modified.year,
+                modified.month,
+                modified.day,
+                modified.hour,
+                modified.minute,
+            ),
+            (2021, 2, 3, 0, 0),
+            "the write overrode the date the caller named"
+        );
+    }
+
+    /// A file carrying no modification date gains none: a write advances the
+    /// date a file has, it does not invent one (nor a creation date).
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_editing_invents_no_date_for_a_file_without_one() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "undescribed.pdf",
+            &pdf_with_info("<< /Title (Only a title) >>"),
+        );
+        let rotated = run(
+            &ws,
+            json!({
+                "action": "pdf_rotate", "file_name": "undescribed-rotated",
+                "path": source.to_string_lossy(), "degrees": 90,
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&rotated));
+        let metadata = pdf.metadata();
+        assert!(
+            metadata.modification_date.is_none(),
+            "the write invented a modification date"
+        );
+        assert!(
+            metadata.creation_date.is_none(),
+            "the write invented a creation date"
+        );
+    }
+
+    /// A file the tool builds takes the description it was given, in the PDF
+    /// spelling the boundary writes, and names `mahbot` as its producer when no
+    /// metadata says otherwise.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_creation_writes_the_description_it_is_given() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let described = run(
+            &ws,
+            json!({
+                "action": "create", "format": "pdf", "file_name": "described",
+                "content": [{ "type": "paragraph", "text": "Report body" }],
+                "metadata": {
+                    "title": "Report",
+                    "author": "Ann",
+                    "created": "2024-05-17",
+                    "modified": "2024-05-17T10:30:00+03:00",
+                },
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&described));
+        let metadata = pdf.metadata();
+        assert_eq!(
+            metadata_text(metadata.title.as_deref()).as_deref(),
+            Some("Report")
+        );
+        assert_eq!(
+            metadata_text(metadata.author.as_deref()).as_deref(),
+            Some("Ann")
+        );
+        let created = metadata.creation_date.expect("the creation date is set");
+        assert_eq!(
+            (
+                created.year,
+                created.month,
+                created.day,
+                created.hour,
+                created.minute,
+                created.second,
+                created.utc_offset_hour,
+                created.utc_offset_minute
+            ),
+            (2024, 5, 17, 0, 0, 0, 0, 0),
+            "a calendar date is midnight UTC"
+        );
+        let modified = metadata
+            .modification_date
+            .expect("the modification date is set");
+        assert_eq!(
+            (
+                modified.year,
+                modified.month,
+                modified.day,
+                modified.hour,
+                modified.minute,
+                modified.second,
+                modified.utc_offset_hour,
+                modified.utc_offset_minute
+            ),
+            (2024, 5, 17, 10, 30, 0, 3, 0),
+            "the offset the caller gave is kept"
+        );
+
+        let plain = run(
+            &ws,
+            json!({
+                "action": "create", "format": "pdf", "file_name": "plain",
+                "content": [{ "type": "paragraph", "text": "Plain body" }],
+            }),
+        )
+        .await;
+        let plain = parsed_pdf(&single(&plain));
+        assert_eq!(
+            metadata_text(plain.metadata().producer.as_deref()).as_deref(),
+            Some("mahbot"),
+            "a file the tool builds names itself as the producer"
+        );
+    }
+
+    /// An empty string clears one description entry and leaves the rest as the
+    /// file has them.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_metadata_clears_an_entry_it_names_empty() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = write_fixture(
+            &ws,
+            "described.pdf",
+            &pdf_with_info("<< /Producer (Keep me) /Title (Kept) >>"),
+        );
+        let rotated = run(
+            &ws,
+            json!({
+                "action": "pdf_rotate", "file_name": "cleared",
+                "path": source.to_string_lossy(), "degrees": 90,
+                "metadata": { "producer": "" },
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&rotated));
+        let metadata = pdf.metadata();
+        assert!(
+            metadata.producer.is_none(),
+            "the cleared producer is still there"
+        );
+        assert_eq!(
+            metadata_text(metadata.title.as_deref()).as_deref(),
+            Some("Kept"),
+            "clearing one entry touched another"
+        );
+    }
+
+    /// A blank form with one field of each kind a fill accepts — text, checkbox,
+    /// a two-state radio group and a dropdown — plus the two kinds it cannot
+    /// fill, a pushbutton and a signature. pdf-lib reads the radio's states from
+    /// each widget's `/AP /N` dictionary keys and the dropdown's from `/Opt`; a
+    /// state's appearance value is never read, so an empty dictionary stands for
+    /// each.
+    fn blank_form_pdf() -> Vec<u8> {
+        use crate::document::test_fixtures::PdfFixture;
+        let mut fixture = PdfFixture::new();
+        let font =
+            fixture.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        let page = fixture.reserve();
+        let pages = fixture.push(format!("<< /Type /Pages /Kids [{page}] /Count 1 >>"));
+        let radio = fixture.reserve();
+        let red = fixture.push(format!(
+            "<< /Type /Annot /Subtype /Widget /Parent {radio} /Rect [100 600 120 620] /P \
+             {page} /AS /Red /AP << /N << /Red << >> /Off << >> >> >> >>"
+        ));
+        let blue = fixture.push(format!(
+            "<< /Type /Annot /Subtype /Widget /Parent {radio} /Rect [130 600 150 620] /P \
+             {page} /AS /Off /AP << /N << /Blue << >> /Off << >> >> >> >>"
+        ));
+        fixture.set(
+            &radio,
+            format!("<< /FT /Btn /Ff 32768 /T (color) /Kids [{red} {blue}] >>"),
+        );
+        let text = fixture.push(format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (text) /Rect [72 700 300 730] /P \
+             {page} /DA (/Helv 12 Tf 0 g) /V () >>"
+        ));
+        let agree = fixture.push(format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Btn /T (agree) /Rect [72 660 90 678] /P \
+             {page} /AS /Off /AP << /N << /Yes << >> /Off << >> >> >> >>"
+        ));
+        let choice = fixture.push(format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Ch /Ff 131072 /T (choice) /Rect \
+             [72 620 300 648] /P {page} /DA (/Helv 12 Tf 0 g) /Opt [(One) (Two)] >>"
+        ));
+        let push = fixture.push(format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (submit) /Rect \
+             [72 580 200 600] /P {page} >>"
+        ));
+        let sign = fixture.push(format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (signature) /Rect [72 540 300 560] /P \
+             {page} >>"
+        ));
+        let widgets = [&text, &agree, &red, &blue, &choice, &push, &sign]
+            .map(String::as_str)
+            .join(" ");
+        fixture.set(
+            &page,
+            format!(
+                "<< /Type /Page /Parent {pages} /MediaBox [0 0 595 842] /Resources \
+                 << /Font << /Helv {font} >> >> /Annots [{widgets}] >>"
+            ),
+        );
+        fixture.build(&format!(
+            "/Pages {pages} /AcroForm << /Fields [{text} {agree} {radio} {choice} {push} \
+             {sign}] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv {font} >> >> >>"
+        ))
+    }
+
+    /// An unknown form field is refused with the fillable catalogue — each
+    /// field's kind and its choice/radio options — while the pushbutton and the
+    /// signature, which no fill can reach, are not offered; each fillable kind
+    /// then takes its value.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_form_fill_lists_the_fillable_fields_and_fills_each_kind() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let form = write_fixture(&ws, "form.pdf", &blank_form_pdf());
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "pdf_form_fill", "file_name": "filled",
+                    "path": form.to_string_lossy(), "values": { "absent": "x" },
+                }),
+            )
+            .await
+            .expect_err("an unknown field name must be refused");
+        let message = err.to_string();
+        for expected in [
+            "text (text)",
+            "agree (checkbox)",
+            "color (radio; options: Red, Blue)",
+            "choice (choice; options: One, Two)",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal does not name {expected:?}: {message}"
+            );
+        }
+        for unfillable in ["submit", "signature"] {
+            assert!(
+                !message.contains(unfillable),
+                "the refusal offered the unfillable {unfillable:?}: {message}"
+            );
+        }
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+
+        let filled = run(
+            &ws,
+            json!({
+                "action": "pdf_form_fill", "file_name": "filled",
+                "path": form.to_string_lossy(),
+                "values": { "text": "Hello", "agree": true, "color": "Blue", "choice": "Two" },
+            }),
+        )
+        .await;
+        let text = converted_text(&ws, &single(&filled)).await;
+        for value in ["Hello", "Blue", "Two"] {
+            assert!(
+                text.contains(value),
+                "the filled {value:?} did not read back: {text}"
+            );
+        }
     }
 
     /// A workspace-only tool refuses a path outside the workspace.

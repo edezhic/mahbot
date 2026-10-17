@@ -219,8 +219,10 @@ fn convert_doc(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
             // way any other reading's are.
             let mut unshown = Unshown::default();
             let images = write_pictures(|| doc.images(), out_dir, &mut unshown, &mut notes);
+            let text = sections.join("\n").trim_end().to_string();
             DocOutcome::Text {
-                text: sections.join("\n").trim_end().to_string(),
+                page_text: !text.is_empty(),
+                text,
                 images,
                 notes,
                 unshown,
@@ -317,8 +319,10 @@ fn convert_xls(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
                     .filter(|sheet| sheet.kind == SheetKind::Chart)
                     .count(),
             );
+            let text = blocks.join("\n\n").trim_end().to_string();
             DocOutcome::Text {
-                text: blocks.join("\n\n").trim_end().to_string(),
+                page_text: !text.is_empty(),
+                text,
                 images,
                 notes,
                 unshown,
@@ -417,8 +421,10 @@ fn convert_ppt(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
                     1,
                 );
             }
+            let text = blocks.join("\n\n").trim_end().to_string();
             DocOutcome::Text {
-                text: blocks.join("\n\n").trim_end().to_string(),
+                page_text: !text.is_empty(),
+                text,
                 images,
                 notes,
                 unshown,

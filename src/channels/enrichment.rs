@@ -576,7 +576,13 @@ async fn handle_file(
             notes,
             unshown,
             all_page_text_lost,
+            page_text,
         } => {
+            // Extracted images go through the ordinary IMAGE pipeline before the
+            // annotations are composed, because whether an image was delivered
+            // decides how the no-text sentence reads. Its batch effects are applied
+            // below, in their old order.
+            let images = deliver_document_images(images, uploads_dir, staging_dirs).await;
             // The reader failed on every page it was asked for, so the pages
             // carry no text of their own: the notes below name them, and the
             // "no text could be extracted" sentence — which would report a reader
@@ -586,7 +592,7 @@ async fn handle_file(
             // conversion actually produced.
             if !all_page_text_lost || !text.trim().is_empty() {
                 batch.annotations.push(
-                    extracted_text_annotation(uploads_dir, name, &text, !images.is_empty()).await,
+                    extracted_text_annotation(uploads_dir, name, &text, images.kept > 0).await,
                 );
             }
             // The report of what the reading did not show leads the notes, the
@@ -598,42 +604,24 @@ async fn handle_file(
             for note in notes {
                 batch.annotations.push(format!("[File {name}: {note}]"));
             }
-            // Extracted images go through the ordinary IMAGE pipeline: a native
-            // data-URI part plus a workspace copy, so the model sees them and the
-            // agent can reopen them. An image the pipeline rejects is counted into
-            // one note, like the converter's own skipped-media note.
-            let mut unreadable_images = 0usize;
-            for image in images {
-                let image_path = image.to_string_lossy().to_string();
-                match handle_image(&image_path, &image, Some(uploads_dir), staging_dirs).await {
-                    ImageAction::Keep => {}
-                    ImageAction::Invalid { delete_temp } => {
-                        // The image is a temp artifact written by this pass into
-                        // the attachment's per-message directory, so the note
-                        // must not name it — the file is deleted right below.
-                        unreadable_images += 1;
-                        if delete_temp {
-                            batch.files_to_delete.push(image);
-                        }
-                    }
-                    ImageAction::Replace {
-                        replacement,
-                        upload_annotation,
-                        delete_temp,
-                    } => {
-                        batch.appended_markers.push(replacement);
-                        if let Some(annotation) = upload_annotation {
-                            batch.upload_annotations.push(annotation);
-                        }
-                        if delete_temp {
-                            batch.files_to_delete.push(image);
-                        }
-                    }
-                }
+            // A description, an annotation or a form list can carry the text
+            // while no page produced any: the reading still says so, and names an
+            // image only when one was delivered.
+            if !page_text && !all_page_text_lost && !text.trim().is_empty() {
+                let note = if images.kept == 0 {
+                    crate::document::NO_TEXT_NOTE
+                } else {
+                    crate::document::NO_TEXT_LAYER_NOTE
+                };
+                batch.annotations.push(format!("[File {name}: {note}]"));
             }
-            if unreadable_images > 0 {
+            batch.appended_markers.extend(images.replacements);
+            batch.upload_annotations.extend(images.uploads);
+            batch.files_to_delete.extend(images.deletes);
+            if images.unreadable > 0 {
                 batch.annotations.push(format!(
-                    "[File {name}: {unreadable_images} extracted image(s) could not be read]"
+                    "[File {name}: {} extracted image(s) could not be read]",
+                    images.unreadable
                 ));
             }
         }
@@ -654,6 +642,65 @@ async fn handle_file(
         }
     }
     Some(replacement)
+}
+
+/// The images a document reading extracted, delivered through the ordinary IMAGE
+/// pipeline: a native data-URI part plus a workspace copy, so the model sees them
+/// and the agent can reopen them. An image the pipeline rejects is counted into
+/// one note, like the converter's own skipped-media note; the batch effects are
+/// collected here and applied by the caller in the order it composes its answer.
+struct DeliveredImages {
+    /// How many images the model actually received.
+    kept: usize,
+    unreadable: usize,
+    replacements: Vec<String>,
+    uploads: Vec<String>,
+    deletes: Vec<std::path::PathBuf>,
+}
+
+/// Run a reading's extracted images through the ordinary IMAGE pipeline.
+async fn deliver_document_images(
+    images: Vec<std::path::PathBuf>,
+    uploads_dir: &std::path::Path,
+    staging_dirs: &[String],
+) -> DeliveredImages {
+    let mut delivered = DeliveredImages {
+        kept: 0,
+        unreadable: 0,
+        replacements: Vec::new(),
+        uploads: Vec::new(),
+        deletes: Vec::new(),
+    };
+    for image in images {
+        let image_path = image.to_string_lossy().to_string();
+        match handle_image(&image_path, &image, Some(uploads_dir), staging_dirs).await {
+            ImageAction::Keep => delivered.kept += 1,
+            ImageAction::Invalid { delete_temp } => {
+                // The image is a temp artifact written by this pass into the
+                // attachment's per-message directory, so the note must not name
+                // it — the file is deleted right below.
+                delivered.unreadable += 1;
+                if delete_temp {
+                    delivered.deletes.push(image);
+                }
+            }
+            ImageAction::Replace {
+                replacement,
+                upload_annotation,
+                delete_temp,
+            } => {
+                delivered.kept += 1;
+                delivered.replacements.push(replacement);
+                if let Some(annotation) = upload_annotation {
+                    delivered.uploads.push(annotation);
+                }
+                if delete_temp {
+                    delivered.deletes.push(image);
+                }
+            }
+        }
+    }
+    delivered
 }
 
 /// Annotation block for a document's extracted text.
@@ -1862,7 +1909,7 @@ mod tests {
             msg.content
         );
         assert!(
-            msg.content.contains("Name on page 1: Иван Петров"),
+            msg.content.contains("Name (text) on page 1: Иван Петров"),
             "the filled field must survive the lost page text, got: {}",
             msg.content
         );

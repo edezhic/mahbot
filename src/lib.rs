@@ -67,8 +67,9 @@ pub(crate) mod onnx;
 /// OOXML package reading (Word/Excel/PowerPoint): the ZIP-container arm of the
 /// shared document converter ([`crate::document`]).
 pub(crate) mod ooxml;
-/// PDF marks (annotations and filled form fields): the annotation/form arm of
-/// the shared document converter ([`crate::document`]).
+/// PDF content beside the page text — the file's own description, its
+/// annotations and its form fields: the metadata/annotation/form arm of the
+/// shared document converter ([`crate::document`]).
 pub(crate) mod pdf_marks;
 pub mod pipeline;
 /// The platform's own exemption from the way it slows a process whose window is not

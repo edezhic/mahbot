@@ -97,9 +97,22 @@ pub(super) async fn read_document(
             notes,
             unshown,
             all_page_text_lost,
-        } => {
-            Some(compose_output(res, &dir, text, images, notes, unshown, all_page_text_lost).await)
-        }
+            page_text,
+        } => Some(
+            compose_output(
+                res,
+                &dir,
+                ConvertedDocument {
+                    text,
+                    images,
+                    notes,
+                    unshown,
+                    all_page_text_lost,
+                    page_text,
+                },
+            )
+            .await,
+        ),
     };
     // Empty-only removal (`remove_dir` refuses a non-empty directory): an answer
     // pointing at nothing leaves no directory behind, anything it points at keeps
@@ -165,18 +178,69 @@ async fn peek_head(path: &Path) -> Option<Vec<u8>> {
     Some(head[..filled].to_vec())
 }
 
+/// The payloads a reading's rasters became, and how many could not be encoded.
+/// Over the per-call cap nothing is attached; an image that cannot be encoded is
+/// counted rather than failing the call, because the document itself was read.
+async fn attach_images(images: &[PathBuf]) -> (Vec<ImagePayload>, usize) {
+    let mut attached = Vec::new();
+    let mut unattached = 0usize;
+    if images.len() > MAX_INJECTED_IMAGES {
+        return (attached, unattached);
+    }
+    // The payloads carry no recovery note: a document answer is content, so its
+    // text block already opens with that note and repeating it on every image
+    // annotation would say the same thing 1+N times.
+    for image in images {
+        match crate::util::local_image_to_compressed_data_uri_with_meta(image).await {
+            // The image is this tool's own artifact — it never opened it as a
+            // file — so the annotation labels it a produced image.
+            Ok(meta) => attached.push(ImagePayload::from_compressed_meta(
+                image,
+                meta,
+                None,
+                ImagePayloadSource::Generated,
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    path = %image.display(),
+                    error = %e,
+                    "Failed to encode an extracted document image"
+                );
+                unattached += 1;
+            }
+        }
+    }
+    (attached, unattached)
+}
+
+/// A converted reading's parts, as [`compose_output`] takes them — the
+/// [`DocOutcome::Text`] fields as one value, so the answer's composition needs
+/// one argument rather than six.
+struct ConvertedDocument {
+    text: String,
+    images: Vec<PathBuf>,
+    notes: Vec<String>,
+    unshown: Unshown,
+    all_page_text_lost: bool,
+    page_text: bool,
+}
+
 /// Turn a converted document's parts into the read tool's result: scrub the text,
 /// attach the rasters when there are few enough, and say what was delivered and
 /// what the reading did not show.
 async fn compose_output(
     res: &super::read::ResolvedRead,
     dir: &Path,
-    text: String,
-    images: Vec<PathBuf>,
-    notes: Vec<String>,
-    unshown: Unshown,
-    all_page_text_lost: bool,
+    converted: ConvertedDocument,
 ) -> ToolOutput {
+    let ConvertedDocument {
+        text,
+        images,
+        notes,
+        unshown,
+        all_page_text_lost,
+        page_text,
+    } = converted;
     let display = res.path.display().to_string();
     // The read tool returns `false` from `should_scrub_output`, and the scrub it
     // does instead is path-based inside `read_resolved` — it sees the container's
@@ -186,35 +250,7 @@ async fn compose_output(
     let text = crate::util::scrub_credentials(text.trim());
 
     let over_cap = images.len() > MAX_INJECTED_IMAGES;
-    let mut attached = Vec::new();
-    let mut unattached = 0usize;
-    if !over_cap {
-        // The payloads carry no recovery note: a document answer is content, so
-        // its text block already opens with that note and repeating it on every
-        // image annotation would say the same thing 1+N times.
-        for image in &images {
-            // An image that cannot be encoded is counted in a note rather than
-            // failing the call: the document itself was read.
-            match crate::util::local_image_to_compressed_data_uri_with_meta(image).await {
-                // The image is this tool's own artifact — it never opened it as a
-                // file — so the annotation labels it a produced image.
-                Ok(meta) => attached.push(ImagePayload::from_compressed_meta(
-                    image,
-                    meta,
-                    None,
-                    ImagePayloadSource::Generated,
-                )),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %image.display(),
-                        error = %e,
-                        "Failed to encode an extracted document image"
-                    );
-                    unattached += 1;
-                }
-            }
-        }
-    }
+    let (attached, unattached) = attach_images(&images).await;
 
     let mut text_block = if text.is_empty() {
         // The reader failed on every page it was asked for: the notes below name
@@ -244,6 +280,20 @@ async fn compose_output(
         .chain(&notes)
         .map(|body| answer_line(&display, body))
         .collect();
+    // A description, an annotation or a form list can carry the text while no
+    // page produced any: that is still a reading with no page text, and it says
+    // so. An image is named only when one was actually delivered. The empty-text
+    // case already says it as the whole answer above.
+    if !page_text && !all_page_text_lost && !text.is_empty() {
+        trailing.push(answer_line(
+            &display,
+            if attached.is_empty() {
+                crate::document::NO_TEXT_NOTE
+            } else {
+                crate::document::NO_TEXT_LAYER_NOTE
+            },
+        ));
+    }
     if unattached > 0 {
         // Not the inbound sentence ("could not be read"): there the image
         // pipeline rejected an image it was handed, here the image could not be
@@ -603,7 +653,9 @@ mod tests {
 
     /// A scan whose page has no text layer but whose form carries a value is not
     /// an empty document: the value is text, delivered as the `Form fields:`
-    /// section, so neither "no text" sentence applies.
+    /// section, while the page itself comes back as an image — and the reading
+    /// still says no page text was extracted, because the only text it carried is
+    /// the form list.
     #[tokio::test]
     async fn a_scan_that_carries_only_form_values_is_not_an_empty_document() {
         let owner = SpillOwner::new();
@@ -620,18 +672,13 @@ mod tests {
         );
         assert!(
             out.text
-                .contains("Form fields:\nName on page 1: Иван Петров"),
+                .contains("Form fields:\nName (text) on page 1: Иван Петров"),
             "the filled value is the document's text: {}",
             out.text
         );
         assert!(
-            !out.text.contains(crate::document::NO_TEXT_NOTE),
-            "a document that delivered a field value is not one without text: {}",
-            out.text
-        );
-        assert!(
-            !out.text.contains(crate::document::NO_TEXT_LAYER_NOTE),
-            "the value is text, not a raster-only document: {}",
+            out.text.contains(crate::document::NO_TEXT_LAYER_NOTE),
+            "the only text is the field list, so the page came back as an image: {}",
             out.text
         );
     }
