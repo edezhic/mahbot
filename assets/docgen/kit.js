@@ -255,11 +255,12 @@ function webpSize(bytes) {
 // neither keeps the image's own size, fitted whole into `box`. `span` is the range
 // the shared rules allow a stated side (points), and `box` is the largest the
 // fallback may draw (pixels, both sides) — the arm's container, or a cap narrower
-// than it. Neither side the fallback decides may exceed it, so a picture taller or
-// wider than the page or slide it lands on is drawn whole and smaller rather than
-// cut off by an edge the call reported success past. `natural` and the answer are
-// pixels — the points-to-pixels conversion lives here alone, so no arm converts a
-// measure the others do not.
+// than it — or `null` for an arm with no container, where the image keeps its own
+// size. Neither side the fallback decides may exceed the box, so a picture taller
+// or wider than the page or slide it lands on is drawn whole and smaller rather
+// than cut off by an edge the call reported success past. `natural` and the answer
+// are pixels — the points-to-pixels conversion lives here alone, so no arm converts
+// a measure the others do not.
 const DEFAULT_IMAGE_WIDTH = 400;
 // The note both page-shaped arms owe when a picture they placed reaches past the
 // page it lands on: a size the caller named is drawn as named, and the answer says
@@ -315,8 +316,10 @@ function imageSize(natural, width, height, span, box) {
   // fits the picture whole into the arm's container — never enlarged past the
   // image's own size — so a picture the page or slide has no room for is drawn
   // smaller rather than to an edge the writer would cut it at. Both sides of the
-  // box are stated, and neither side decided here may exceed it.
+  // box are stated, and neither side decided here may exceed it; an arm with no
+  // container (`box` is `null`) draws the image at its own size.
   const round = (side) => Math.max(1, Math.round(side));
+  if (box === null) return { width: round(natural.width), height: round(natural.height) };
   const fit = Math.min(1, box.width / natural.width, box.height / natural.height);
   return { width: round(natural.width * fit), height: round(natural.height * fit) };
 }
@@ -436,6 +439,26 @@ const XLSX_WORKBOOK = "xl/workbook.xml";
 const XLSX_WORKBOOK_RELS = "xl/_rels/workbook.xml.rels";
 const STYLES_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml";
 const STYLES_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
+// A worksheet part, the content type and relationship type OPC declares one with,
+// and the parts an added picture lives in: its media, the drawing that anchors it,
+// and the type and relationship a drawing part is declared and named with.
+const WORKSHEET_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+const WORKSHEET_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+const DRAWING_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.drawing+xml";
+const DRAWING_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing";
+const XLSX_MEDIA = "xl/media/";
+const XLSX_DRAWINGS = "xl/drawings/";
+// Where a chart sheet's part lives: a `<sheet>` list holds both kinds, and this
+// tool edits worksheets only.
+const XLSX_CHARTSHEETS = "xl/chartsheets/";
+// A chart, as the format names its part: a chart's colour or style sidecar
+// (`xl/charts/colors1.xml`) is not one, and raises no caveat of its own.
+const CHART_PART = /^xl\/charts\/chart[^/]*\.xml$/;
+// The drawing root's namespaces: the one a `<xdr:wsDr>` anchor is written in, the
+// DrawingML one its picture body is written in, and the relationships one `r:embed`
+// is read through.
+const XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+const DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const xmlEscape = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]));
 const colName = (index) => {
   let name = "";
@@ -483,22 +506,26 @@ function xlsxCell(reference, value) {
 // the call reports success. The tool's boundary sends every name explicitly and
 // refuses first; this is the writer's own last line, over the names it will
 // actually write (a defaulted one included). Length is counted in code points,
-// the unit the rule states.
+// the unit the rule states. `where` names the place the caller wrote the name —
+// a sheet's position, or the workbook a sheet is being added to or renamed in.
+function checkSheetName(name, where) {
+  if (typeof name !== "string") {
+    throw new UsageError(`${where}: a sheet name must be text, got: ${String(name)}`);
+  }
+  const length = [...name].length;
+  if (length < 1 || length > RULES.sheet_name_max) {
+    throw new UsageError(`${where}: a sheet name must be 1 to ${RULES.sheet_name_max} characters, got: ${name}`);
+  }
+  if ([...RULES.sheet_name_forbidden].some((character) => name.includes(character))) {
+    throw new UsageError(`${where}: a sheet name must not contain any of ${JSON.stringify(RULES.sheet_name_forbidden)}, got: ${name}`);
+  }
+  return name;
+}
 function checkSheetNames(sheets) {
   const seen = new Set();
   sheets.forEach((sheet, i) => {
     const where = `sheet ${i + 1}`;
-    const name = sheet.name;
-    if (typeof name !== "string") {
-      throw new UsageError(`${where}: a sheet name must be text, got: ${String(name)}`);
-    }
-    const length = [...name].length;
-    if (length < 1 || length > RULES.sheet_name_max) {
-      throw new UsageError(`${where}: a sheet name must be 1 to ${RULES.sheet_name_max} characters, got: ${name}`);
-    }
-    if ([...RULES.sheet_name_forbidden].some((character) => name.includes(character))) {
-      throw new UsageError(`${where}: a sheet name must not contain any of ${JSON.stringify(RULES.sheet_name_forbidden)}, got: ${name}`);
-    }
+    const name = checkSheetName(sheet.name, where);
     const lower = name.toLowerCase();
     if (seen.has(lower)) throw new UsageError(`${where}: a sheet name must be unique, ignoring case, got: ${name}`);
     seen.add(lower);
@@ -514,21 +541,25 @@ function createXlsx(req) {
     if (typeof sheet !== "object" || sheet === null) {
       throw new UsageError(`sheet ${i + 1} must be an object, got: ${JSON.stringify(sheet)}`);
     }
-    return { name: sheet.name === undefined ? `Sheet${i + 1}` : sheet.name, rows: sheet.rows || [] };
+    if (sheet.merges !== undefined && !Array.isArray(sheet.merges)) {
+      throw new UsageError(`sheet ${i + 1}: merges must be a list of A1:B2 ranges`);
+    }
+    return { name: sheet.name === undefined ? `Sheet${i + 1}` : sheet.name, rows: sheet.rows || [], merges: sheet.merges || [] };
   });
   checkSheetNames(sheets);
+  const merges = sheets.map(createdMerges);
   const contentTypes = [
     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
     '<Default Extension="xml" ContentType="application/xml"/>',
     `<Override PartName="/${XLSX_WORKBOOK}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>`,
-    ...sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`),
+    ...sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="${WORKSHEET_CONTENT_TYPE}"/>`),
     `<Override PartName="/${XLSX_STYLES}" ContentType="${STYLES_CONTENT_TYPE}"/>`,
   ];
   zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">${contentTypes.join("")}</Types>`);
   zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="${XLSX_WORKBOOK}"/></Relationships>`);
   zip.file(XLSX_WORKBOOK, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((sheet, i) => `<sheet name="${xmlEscape(sheet.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`);
   const workbookRels = [
-    ...sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`),
+    ...sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="${WORKSHEET_REL_TYPE}" Target="worksheets/sheet${i + 1}.xml"/>`),
     `<Relationship Id="rId${sheets.length + 1}" Type="${STYLES_REL_TYPE}" Target="styles.xml"/>`,
   ];
   zip.file(XLSX_WORKBOOK_RELS, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${workbookRels.join("")}</Relationships>`);
@@ -546,9 +577,28 @@ function createXlsx(req) {
       });
       if (cells.length) rows.push(`<row r="${r + 1}">${cells.join("")}</row>`);
     });
-    zip.file(`xl/worksheets/sheet${i + 1}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rows.join("")}</sheetData></worksheet>`);
+    // A merged block follows the sheet's own `<sheetData>`, the place
+    // `CT_Worksheet` gives it. A created sheet always states a `<sheetData>`, so
+    // the block is written directly after it.
+    zip.file(`xl/worksheets/sheet${i + 1}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rows.join("")}</sheetData>${merges[i]}</worksheet>`);
   });
   return zip.generate({ type: "nodebuffer", compression: "DEFLATE" });
+}
+
+// The `<mergeCells>` block a created sheet states for the ranges it names: each
+// range checked the way `merge_cells` checks one (two corners, at least two
+// cells, on the grid) under the sheet's own name, and two merges over one cell
+// refused — a workbook holding them is one a reader offers to repair, while the
+// call reports success. `""` for a sheet naming none.
+function createdMerges(sheet) {
+  const where = `sheet ${JSON.stringify(sheet.name)}: `;
+  const rects = sheet.merges.map((range) => mergeRect(range, where));
+  rects.forEach((rect, i) => {
+    const overlap = rects.find((other, j) => j < i && rectsOverlap(other, rect));
+    if (overlap) throw new UsageError(`${where}the merge ${rectLabel(overlap)} overlaps ${rectLabel(rect)}, and a workbook with two merges over one cell needs repairing`);
+  });
+  if (!rects.length) return "";
+  return `<mergeCells count="${rects.length}">${rects.map((rect) => `<mergeCell ref="${rectLabel(rect)}"/>`).join("")}</mergeCells>`;
 }
 
 // ── slide titles ───────────────────────────────────────────────
@@ -3879,49 +3929,77 @@ const colEntries = (sheet) => {
   }));
 };
 
-// The workbook's sheets in its own order, each `<sheet>` element's name beside the
-// part it addresses: the target of the relationship its `r:id` names, resolved by
-// the one OPC resolver `resolvePart` — an absolute `/xl/worksheets/sheet1.xml`, a
-// relative `worksheets/sheet1.xml` and a target spelled with `..` all name the part
-// the resolver folds them to — and, for a relationship the workbook does not
-// declare, the conventional part name for that position, the same fallback the
-// reader makes. `named` says which of the two it was. Both parts are read through
-// the editor (`read`), so the workbook and its relationships are charged like every
-// other part an edit takes into hand: reading them is work a check can spend the
-// call's budget on, and a read that skipped the charge would be a hole in the bound
-// the caller is refused by.
-function workbookSheets(editor) {
+// The workbook's sheets in its own order: each `<sheet>` element's name, the
+// `state` it declares (absent for a visible sheet), its `sheetId` and `r:id`, the
+// part it addresses and the element's own span in the workbook text. The part is
+// the target of the relationship its `r:id` names, resolved by the one OPC resolver
+// `resolvePart` — an absolute `/xl/worksheets/sheet1.xml`, a relative
+// `worksheets/sheet1.xml` and a target spelled with `..` all name the part the
+// resolver folds them to — and, for a relationship the workbook does not declare,
+// the conventional part name for that position, the same fallback the reader makes.
+// `named` says which of the two it was. Both parts are read through the editor
+// (`read`), so the workbook and its relationships are charged like every other part
+// an edit takes into hand: reading them is work a check can spend the call's budget
+// on, and a read that skipped the charge would be a hole in the bound the caller is
+// refused by. The span is what an edit that removes or moves the element splices
+// on, so it is measured off the very text these entries were read from — the whole
+// element in either shape a file may write it (`elementPattern`), since a splice
+// over an open tag alone would leave the close behind it. That text comes back with
+// the entries, so an edit that also rewrites the workbook writes it against the text
+// it read (`rewrite`) instead of reading and charging it a second time.
+function workbookSheetList(editor) {
   const workbook = editor.read(XLSX_WORKBOOK);
-  if (workbook === undefined) return [];
-  const targets = relationshipMap(editor.read(XLSX_WORKBOOK_RELS) ?? "");
-  return [...workbook.matchAll(new RegExp(`${selfClosingTag("sheet")}|${openTag("sheet")}`, "g"))].map((match, index) => {
+  if (workbook === undefined) return { workbook, sheets: [] };
+  const relations = relationships(editor.read(XLSX_WORKBOOK_RELS) ?? "");
+  const sheets = [...workbook.matchAll(elementPattern("sheet"))].map((match, index) => {
     const id = xmlAttribute(match[0], "r:id");
-    const target = id === undefined ? undefined : targets.get(id);
+    const relation = id === undefined ? undefined : relations.find((entry) => entry.id === id);
+    const target = relation?.target;
+    const sheetId = xmlAttribute(match[0], "sheetId");
     return {
       name: xmlUnescape(xmlAttribute(match[0], "name") ?? ""),
+      state: xmlAttribute(match[0], "state"),
+      sheetId: sheetId === undefined ? undefined : Number(sheetId),
+      id,
+      type: relation?.type,
       part: target ? resolvePart("xl/", target) : `xl/worksheets/sheet${index + 1}.xml`,
       named: target !== undefined,
+      text: match[0],
+      start: match.index,
+      end: match.index + match[0].length,
     };
   });
+  return { workbook, sheets };
 }
 
 // The part a sheet NAME addresses, through `xl/workbook.xml` and its
 // relationships. The name is matched the way Excel matches one — ignoring case,
 // in the workbook's own order — while a refusal keeps the file's spelling. The
 // part's own presence is checked on the archive (`zip.file`), which decompresses
-// nothing; the sheet's text is the caller's own read, charged once there.
+// nothing; the sheet's text is the caller's own read, charged once there. The
+// entries the name was found among come back with it (`index` into `sheets`) and the
+// workbook text they were read from (`workbook`), so an edit that also renames, moves
+// or removes the element writes the workbook back against that text (`rewrite`)
+// rather than reading and charging it again.
 function sheetPart(editor, name) {
-  const sheets = workbookSheets(editor);
+  const { workbook, sheets } = workbookSheetList(editor);
   const wanted = typeof name === "string" ? name.toLowerCase() : null;
   const index = wanted === null ? -1 : sheets.findIndex((sheet) => sheet.name.toLowerCase() === wanted);
   if (index < 0) throw new UsageError(`there is no sheet named ${JSON.stringify(name)}: this workbook has ${listed(sheets.map((sheet) => sheet.name)) || "no sheets"}`);
-  const { part, named } = sheets[index];
+  const { part, named, type } = sheets[index];
+  const sheetName = sheets[index].name;
+  // A chart sheet is a `<sheet>` in the same list and not a worksheet: naming one
+  // is refused with that reason rather than rewritten as a worksheet it is not.
+  const chart = part.startsWith(XLSX_CHARTSHEETS) || (type !== undefined && type.endsWith("/chartsheet"));
+  if (chart || (type !== undefined && !type.endsWith("/worksheet"))) {
+    throw new UsageError(`the sheet ${JSON.stringify(sheetName)} is ${chart ? "a chart sheet" : "not a worksheet"}, and this tool edits worksheets only`);
+  }
   if (!editor.zip.file(part)) {
     throw new UsageError(named
-      ? `the sheet ${JSON.stringify(sheets[index].name)} names the part ${part}, which the package does not have`
-      : `the sheet ${JSON.stringify(sheets[index].name)} has no worksheet part: the workbook's relationships do not name one and the package has no ${part}`);
+      ? `the sheet ${JSON.stringify(sheetName)} names the part ${part}, which the package does not have`
+      : `the sheet ${JSON.stringify(sheetName)} has no worksheet part: the workbook's relationships do not name one and the package has no ${part}`);
   }
-  return { part, name: sheets[index].name };
+  return { part, name: sheetName, index, sheets, workbook };
 }
 
 // The row and zero-based column an A1 address names, refusing a reference to a
@@ -4725,6 +4803,16 @@ const shiftBreaks = (block, at, delta, max) => block.replace(/<brk\b[^<>]*>/g, (
 // or without its `$` markers.
 const A1_OR_LINE = "(?:\\$?[A-Za-z]{1,3}\\$?\\d+(?::\\$?[A-Za-z]{1,3}\\$?\\d+)?|\\$?[A-Za-z]{1,3}:\\$?[A-Za-z]{1,3}|\\$?\\d+:\\$?\\d+)";
 
+// One end of a sheet qualifier, as two capture groups: a quoted name and a bare one.
+// The quoted spelling is the literal `'` a formula is written with, never the
+// `&apos;` XML escapes it to: a quote is the one character a greedy name body cannot
+// tell from content, so an escaped one in the pattern would let the body run past its
+// own closing quote and swallow every qualifier after it. The scans that read markup
+// unescape the text first instead (`cellFormulas`, `chartFormulas`, `ruleFormulas`,
+// `hyperlinkLocations`, `definedNameTexts`); the shift that WRITES a formula back
+// works on the part's own text and leaves an escaped qualifier as it stands.
+const SHEET_NAME = "(?:'((?:[^']|'')*)'|([\\p{L}_][\\p{L}\\p{N}_.]*))";
+
 // An A1 reference or whole-line range inside a conditional-format or
 // data-validation formula, with the sheet qualifier such a reference may carry.
 // Moved the way the range the rule names is moved: a reference to a line the
@@ -4740,26 +4828,39 @@ const A1_OR_LINE = "(?:\\$?[A-Za-z]{1,3}\\$?\\d+(?::\\$?[A-Za-z]{1,3}\\$?\\d+)?|
 // `Данные!$B$2:$B$4` is as ordinary a reference as `Sheet1!A1`, and an
 // ASCII-only class would leave the whole range invisible to the shift. The
 // qualifier is part of the match, so a qualified range cannot be
-// half-rewritten by its tail matching alone, and a `:` in front of a match (a 3-D
-// `Sheet1:Sheet3!A1`) blocks it the way it blocked the tail before. A whole-line
-// range takes the same guard on its own tail (`!`): a 3-D reference spelled with
-// sheet names that carry no digits (`Jan:Mar!A1`) reads as one, and the `!` is
-// what tells it apart.
+// half-rewritten by its tail matching alone, and a `:` in front of a match still
+// blocks it: a 3-D range (`Sheet1:Sheet3!A1`, and `'Week 1:Week 5'!A1` when a name
+// needs quoting) reads as ONE reference with both ends (`refMatch`), which a row or
+// column shift then leaves as it stands, rather than as a reference to its last
+// sheet. A whole-line range takes the same guard on its own tail (`!`): a 3-D
+// reference spelled with sheet names that carry no digits
+// (`Jan:Mar!A1`) reads as one, and the `!` is what tells it apart.
 const A1_REFERENCE = new RegExp([
   '"(?:[^"]|"")*"',
-  `(?<![\\w.!$[:])(?:'((?:[^']|'')*)'|([\\p{L}_][\\p{L}\\p{N}_.]*))!(${A1_OR_LINE})(?![\\w(!])`,
+  `(?<![\\w.!$[:])${SHEET_NAME}(?::${SHEET_NAME})?!(${A1_OR_LINE})(?![\\w(!])`,
   `(?<![\\w.!$[:])(${A1_OR_LINE})(?![\\w(!])`,
 ].join("|"), "gu");
 
-// One match of `A1_REFERENCE` split into what it names: the reference itself, and
-// the sheet its qualifier names — `undefined` for a bare reference, which belongs
-// to the sheet the formula sits on — with a quoted name's doubled quotes folded.
-// The qualifier is XML markup (`R&amp;D`) while the name it stands for is not, so
-// it is unescaped the way the workbook's own name is before the two are compared.
-const refMatch = (whole, quotedSheet, bareSheet, qualified, local) => ({
-  reference: qualified ?? local,
-  sheet: qualified === undefined ? undefined : xmlUnescape(quotedSheet ?? bareSheet).replace(/''/g, "'"),
-});
+// One match of `A1_REFERENCE` split into what it names: the reference itself, the
+// sheet its qualifier names — `undefined` for a bare reference, which belongs to the
+// sheet the formula sits on — and, for a 3-D range, the qualifier's other end. A name
+// read out of markup is unescaped the way the workbook's own name is before the two
+// are compared, and a quoted name's doubled quotes are folded. A 3-D range whose end
+// needs quoting wraps BOTH ends in the one quoted qualifier (`'Week 1:Week 5'!D5`),
+// the spelling Excel writes; a colon cannot occur in a sheet name, so a quoted body
+// holding exactly one is that range's two ends.
+const refMatch = (whole, quoted, bare, lastQuoted, lastBare, qualified, local) => {
+  const name = (quotedName, bareName) => (quotedName === undefined && bareName === undefined
+    ? undefined
+    : xmlUnescape(quotedName ?? bareName).replace(/''/g, "'"));
+  const ends = (quoted ?? "").split(":");
+  const range = ends.length === 2;
+  return {
+    reference: qualified ?? local,
+    sheet: range ? name(ends[0]) : name(quoted, bare),
+    lastSheet: range ? name(ends[1]) : name(lastQuoted, lastBare),
+  };
+};
 
 // `text` with every reference to the sheet named `sheet` moved by the shift.
 // `sheet` is the name the workbook spells for the sheet being edited, so a
@@ -4769,10 +4870,13 @@ const refMatch = (whole, quotedSheet, bareSheet, qualified, local) => ({
 function shiftFormula(text, kind, at, delta, sheet) {
   const wanted = typeof sheet === "string" ? sheet.toLowerCase() : null;
   return text.replace(A1_REFERENCE, (whole, ...groups) => {
-    const { reference, sheet: qualifier } = refMatch(whole, ...groups);
+    const { reference, sheet: qualifier, lastSheet } = refMatch(whole, ...groups);
     // A quoted string is a list of values rather than a reference: it matches with
     // the whole text and nothing else.
     if (reference === undefined) return whole;
+    // A 3-D range names the same cells on every sheet between its ends, and this
+    // shift moves the cells of ONE sheet, so its text stays as it is.
+    if (lastSheet !== undefined) return whole;
     if (qualifier !== undefined && qualifier.toLowerCase() !== wanted) return whole;
     const next = deleteRangeRef(reference, kind, at, delta, false);
     if (next === null) return "#REF!";
@@ -4782,13 +4886,14 @@ function shiftFormula(text, kind, at, delta, sheet) {
 
 // The references `text` spells under a qualifier naming the sheet `sheet` — what a
 // formula held by ANOTHER part writes about this one, where a bare reference
-// belongs to the sheet the formula itself sits on.
+// belongs to the sheet the formula itself sits on. Either end of a 3-D range names
+// the sheet, since the range covers every sheet between them.
 function qualifiedRefs(text, sheet) {
   const wanted = sheet.toLowerCase();
   const out = [];
   for (const match of text.matchAll(A1_REFERENCE)) {
-    const { reference, sheet: qualifier } = refMatch(...match);
-    if (qualifier !== undefined && qualifier.toLowerCase() === wanted) out.push(reference);
+    const { reference, sheet: qualifier, lastSheet } = refMatch(...match);
+    if ([qualifier, lastSheet].some((name) => name !== undefined && name.toLowerCase() === wanted)) out.push(reference);
   }
   return out;
 }
@@ -5033,7 +5138,7 @@ function insertCell(rowXml, cells, column, element) {
 // first child the sequence puts after it, so the part stays one a reader accepts.
 // The tail is the schema's own, `drawingHF` included — a sheet's header/footer
 // images are declared there — which some published copies of the type leave out.
-const WORKSHEET_AFTER_SHEET_DATA = ["sheetCalcPr", "sheetProtection", "protectedRanges", "scenarios", "autoFilter", "sortState", "dataConsolidate", "customSheetViews", "mergeCells", "phoneticPr", "conditionalFormatting", "dataValidations", "hyperlinks", "printOptions", "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks", "customProperties", "cellWatches", "ignoredErrors", "smartTags", "drawing", "legacyDrawing", "legacyDrawingHF", "drawingHF", "picture", "oleObjects", "controls", "webPublishItems", "tableParts", "extLst"];
+const WORKSHEET_ORDER = ["sheetData", "sheetCalcPr", "sheetProtection", "protectedRanges", "scenarios", "autoFilter", "sortState", "dataConsolidate", "customSheetViews", "mergeCells", "phoneticPr", "conditionalFormatting", "dataValidations", "hyperlinks", "printOptions", "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks", "customProperties", "cellWatches", "ignoredErrors", "smartTags", "drawing", "legacyDrawing", "legacyDrawingHF", "drawingHF", "picture", "oleObjects", "controls", "webPublishItems", "tableParts", "extLst"];
 
 // The worksheet root's two tags, in the shared spellings (`openTag`/`closeTag`), for
 // the two places that need a position in the root rather than the elements it holds.
@@ -5042,18 +5147,26 @@ const WORKSHEET_CLOSE = new RegExp(closeTag("worksheet"));
 
 // `xml` with a `<sheetData/>` written at its `CT_Worksheet` place when the sheet
 // part states none: an edit that brings a value or formatting to such a sheet
-// writes the element it needs rather than refusing a legal part.
-function ensureSheetData(xml) {
-  // The element a written `<sheetData/>` would go beside, or none: one the part leaves
-  // open is refused (`writableElement`).
-  if (writableElement(xml, "sheetData", "the sheet part")) return xml;
-  for (const later of WORKSHEET_AFTER_SHEET_DATA) {
+// writes the element it needs rather than refusing a legal part. A part that leaves
+// it open rather than stating it is refused (`writableElement`).
+const ensureSheetData = (xml) => (writableElement(xml, "sheetData", "the sheet part") ? xml : insertWorksheetChild(xml, "sheetData", "<sheetData/>"));
+
+// `xml` with `element` written at `name`'s own `CT_Worksheet` place: before the
+// first child the sequence puts after it, else before the worksheet's close. A
+// sheet's `<sheetData>`, its `<mergeCells>` and its `<drawing>` are all placed by
+// it, so none lands where a reader may drop it. A name the sequence does not list
+// has no place it could state — an `indexOf` of −1 would make it the root's first
+// child, before `sheetPr` — so it is refused.
+function insertWorksheetChild(xml, name, element) {
+  const at = WORKSHEET_ORDER.indexOf(name);
+  if (at < 0) throw new UsageError(`<${name}> has no place in this kit's worksheet order, so nothing was written`);
+  for (const later of WORKSHEET_ORDER.slice(at + 1)) {
     const found = firstElement(xml, later);
-    if (found) return xml.slice(0, found.index) + "<sheetData/>" + xml.slice(found.index);
+    if (found) return xml.slice(0, found.index) + element + xml.slice(found.index);
   }
   const close = xml.match(WORKSHEET_CLOSE);
-  if (!close) throw new UsageError("the sheet part has no </worksheet> to write a <sheetData> into");
-  return xml.slice(0, close.index) + "<sheetData/>" + xml.slice(close.index);
+  if (!close) throw new UsageError(`the sheet part has no </worksheet> to write a <${name}> into`);
+  return xml.slice(0, close.index) + element + xml.slice(close.index);
 }
 
 // The `<sheetData>` a row- or cell-writing edit works in: the index its open tag starts
@@ -5110,11 +5223,23 @@ function removeColumn(xml, column) {
 }
 
 // The `<f>` elements a part holds: a cell's formula, with the `ref` a shared
-// formula states and the formula's own text. A formula is the only place a
-// reference lives, so this is what a scan for one reads — a cell's own text is
-// content, and one that merely reads like a reference names nothing.
+// formula states and the formula's own text, unescaped so a name it spells through
+// markup (`&apos;My Data&apos;!B2`, the spelling this kit's own writer gives a quote)
+// reads as the name it means. A formula is the only place a reference lives, so this
+// is what a scan for one reads — a cell's own text is content, and one that merely
+// reads like a reference names nothing.
 const cellFormulas = (text) => [...text.matchAll(new RegExp(`${selfClosingTag("f", "\\b([^<>]*)")}|${openTag("f", "\\b([^<>]*)")}([\\s\\S]*?)${closeTag("f")}`, "g"))]
-  .map((match) => ({ range: ((match[1] ?? match[2]).match(/\bref="([^"]*)"/) || [])[1], text: match[3] ?? "" }));
+  .map((match) => ({ range: ((match[1] ?? match[2]).match(/\bref="([^"]*)"/) || [])[1], text: xmlUnescape(match[3] ?? "") }));
+
+// The formulas a SHEET part holds outside its cells: a conditional format's
+// `<formula>` and a data validation's `<formula1>`/`<formula2>` — the elements a row
+// or column shift rewrites like a cell's `<f>` (see `shiftSheet`) — plus the
+// `<xm:f>` body an extended rule writes its copy of one in. Each is unescaped for the
+// same reason `cellFormulas` is.
+const ruleFormulas = (xml) => [
+  ...["formula", "formula1", "formula2"].flatMap((name) => [...xml.matchAll(elementPattern(name))].map((match) => elementParts(match[0], name).body)),
+  ...[...xml.matchAll(EXTENDED_FORMULA)].map((match) => match[2]),
+].map(xmlUnescape);
 
 // One note when a sheet a row or column shift touched holds cell formulas naming a
 // cell the shift moved: their own text is not rewritten — rewriting references is a
@@ -5185,7 +5310,7 @@ function staleRefs(editor, part, xml, stale, kind, at, delta, sheet) {
       const text = editor.read(resolvePart(base, rel.target));
       return text === undefined || anyMoves(addresses(text));
     });
-  const workbook = editor.read(XLSX_WORKBOOK);
+  const { workbook, sheets } = workbookSheetList(editor);
   if (workbook !== undefined && anyMoves(definedNameTexts(workbook))) stale.add("the workbook's defined names");
   // A table declared by the sheet's `<tableParts>` but named by no relationship of
   // its own can be neither read nor ruled out.
@@ -5200,13 +5325,15 @@ function staleRefs(editor, part, xml, stale, kind, at, delta, sheet) {
   // not the one being edited — so a reference it qualifies with this sheet's name
   // keeps naming cells that moved. A bare reference belongs to the sheet the
   // formula sits on, which is what the qualifier tells apart. The scan reads the
-  // `<f>` elements the part holds rather than its whole text: a cell's own text
-  // can read like a reference and is content, not a formula, and naming it would
-  // state a loss that did not happen.
-  const others = workbookSheets(editor).map((entry) => entry.part).filter((name) => name !== part);
+  // formulas the part holds — a cell's `<f>` and the part's own rule formulas — rather
+  // than its whole text: a cell's own text can read like a reference and is content,
+  // not a formula, and naming it would state a loss that did not happen.
+  const others = sheets.map((entry) => entry.part).filter((name) => name !== part);
   const staleElsewhere = others.some((name) => {
     const text = editor.read(name);
-    return text !== undefined && cellFormulas(text).some((formula) => qualifiedRefs(formula.text, sheet).some(movesAddress));
+    if (text === undefined) return false;
+    const formulas = [...cellFormulas(text).map((formula) => formula.text), ...ruleFormulas(text)];
+    return formulas.some((formula) => qualifiedRefs(formula, sheet).some(movesAddress));
   });
   if (staleElsewhere) stale.add("the other sheets' formulas naming this sheet");
 }
@@ -5480,9 +5607,10 @@ function requireStylesRoot(styles) {
 // is one whose formatting has to go where the relationship points, or it lands in a
 // part no reader consults while the cells' own `s=` keep pointing at the part the
 // relationship names. The relationship list is read whether or not it can be written
-// into — the same reading `workbookSheets` makes, so sheets and styles resolve by one
-// rule — and the conventional name is the fallback for a package that names no styles
-// part at all: the name a relationship has to be added for, by `nameStylesPart`.
+// into — the same reading `workbookSheetList` makes, so sheets and styles resolve
+// by one rule — and the conventional name is the fallback for a package that names no
+// styles part at all: the name a relationship has to be added for, by
+// `nameStylesPart`.
 function stylesPart(editor) {
   const named = relationships(editor.read(XLSX_WORKBOOK_RELS) ?? "").find((rel) => rel.type === STYLES_REL_TYPE);
   return named ? resolvePart(partDirectory(XLSX_WORKBOOK), named.target) : XLSX_STYLES;
@@ -5494,8 +5622,8 @@ function stylesPart(editor) {
 // `false` is a package whose relationship list cannot be written into — absent, or
 // holding no close of its own — which this kit does not refuse: a reader falls back to
 // the conventional part names for such a package and so does this kit (see
-// `workbookSheets`), and an edit that writes no style has nothing to gain from the
-// naming. An edit that DOES write styles cannot accept it — see `stylesText`.
+// `workbookSheetList`), and an edit that writes no style has nothing to gain from
+// the naming. An edit that DOES write styles cannot accept it — see `stylesText`.
 function nameStylesPart(editor, name) {
   const rels = editor.read(XLSX_WORKBOOK_RELS);
   if (!relsWritable(rels)) return false;
@@ -5560,35 +5688,75 @@ const rectLabel = (rect) => {
   return first === last ? first : `${first}:${last}`;
 };
 
+// Whether two rectangles share a cell.
+const rectsOverlap = (a, b) => a.firstRow <= b.lastRow && b.firstRow <= a.lastRow && a.firstColumn <= b.lastColumn && b.firstColumn <= a.lastColumn;
+
+// Whether two rectangles name the same cells.
+const sameRect = (a, b) => a.firstRow === b.firstRow && a.lastRow === b.lastRow && a.firstColumn === b.firstColumn && a.lastColumn === b.lastColumn;
+
+// The rectangle a merge's range names, refused when it covers a single cell: a
+// merge joins at least two. `where` names the sheet a created one was written on
+// (`""` for an edit, whose own sentence already does).
+const mergeRect = (range, where = "") => {
+  let rect;
+  try { rect = gridRect(range); } catch (error) { throw new UsageError(`${where}${error.message}`); }
+  if (rect.firstRow === rect.lastRow && rect.firstColumn === rect.lastColumn) {
+    throw new UsageError(`${where}the range ${rectLabel(rect)} covers one cell, and a merge needs at least two — hint: name a range like A1:B2`);
+  }
+  return rect;
+};
+
+// A sheet's own merges, the ONE reading of them: its `<mergeCells>` block, each
+// `<mergeCell>`'s ref as written, the rectangle it names and the element's own text,
+// and how many refs no reader can place (`rect` is `null` for one this kit cannot
+// parse or the grid cannot hold — the caller's own range is grid-checked, a merge's
+// is not). The unreadable ones are never dropped in silence: the ops that map onto
+// the block refuse over them (`mergeCells`), while the widening one skips them rather
+// than widening to an address no sheet has (`mergedRect`).
+function sheetMerges(xml) {
+  const block = firstElement(xml, "mergeCells");
+  // One opened and never closed is invisible to `firstElement`, and a second
+  // block written beside it is a part a reader offers to repair.
+  if (!block && openedNotClosed(xml, "mergeCells")) {
+    throw new UsageError("the sheet part holds <mergeCells> opened and never closed, so its merges cannot be read");
+  }
+  // A child opened and never closed is invisible to `MERGE_CELL` the same way, and a
+  // merge written at the end of the block's body would land inside it — lost, while
+  // the answer claimed otherwise. Unreadable, like a ref no reader can place.
+  if (block && openedNotClosed(block[0], "mergeCell")) {
+    throw new UsageError("the sheet part holds a <mergeCell> opened and never closed, so its merges cannot be read");
+  }
+  const merges = block
+    ? [...block[0].matchAll(MERGE_CELL)].map((match) => {
+      const ref = (match[0].match(/\bref="([^"]*)"/) || [])[1];
+      let rect = null;
+      if (ref !== undefined) { try { rect = gridRect(ref); } catch { rect = null; } }
+      return { ref, rect, text: match[0] };
+    })
+    : [];
+  return { block, merges, unreadable: merges.filter((merge) => merge.rect === null).length };
+}
+
 // A rectangle widened to cover every `<mergeCell>` it touches: Excel formats a
 // merged cell as one, so a format aimed at part of one must land on the whole.
 // Returns the widened rectangle, the label a reply names it by, whether it
 // changed, and how many merges the widened rectangle covers — an L of merges
 // closes over more than one, and the note a reply carries must not call them one.
-// Each `<mergeCell ref>` is read through `gridRect`, so one this reader
-// cannot parse or one the grid cannot hold is skipped rather than allowed to widen
-// the rectangle to nonsense; the caller's own range is grid-checked, a merge's is
-// not (see `gridRect`). Widening can bring a merge the rectangle did not touch into
-// reach — an L of merges whose far arm only the first widening reaches — so the
-// passes repeat until the rectangle stops growing, each pass taking in at least one
-// merge. A merge that widens the rectangle past the cap is NOT skipped:
-// `requireRangeCap` runs on the WIDENED rect at the call site, so a merge that
-// covers more cells than the rule allows still refuses the call.
+// The merges are `sheetMerges`' own reading, whose unreadable ones are skipped
+// here. Widening can bring a merge the rectangle did not touch into reach — an L of
+// merges whose far arm only the first widening reaches — so the passes repeat until
+// the rectangle stops growing, each pass taking in at least one merge. A merge that
+// widens the rectangle past the cap is NOT skipped: `requireRangeCap` runs on the
+// WIDENED rect at the call site, so a merge that covers more cells than the rule
+// allows still refuses the call.
 function mergedRect(xml, rect) {
-  const merges = [...xml.matchAll(elementPattern("mergeCell"))].flatMap((match) => {
-    const ref = (match[0].match(/\bref="([^"]*)"/) || [])[1];
-    if (ref === undefined) return [];
-    // A ref this reader cannot parse or one the grid cannot hold is skipped: the
-    // caller's own range is grid-checked, a merge's is not, and widening to a ref
-    // the grid cannot hold would write an address no sheet has.
-    try { return [gridRect(ref)]; } catch { return []; }
-  });
+  const merges = sheetMerges(xml).merges.map((merge) => merge.rect).filter((rect) => rect !== null);
   let out = { ...rect };
   let growing = true;
   while (growing) {
     growing = false;
     for (const merge of merges) {
-      if (merge.lastRow < out.firstRow || merge.firstRow > out.lastRow || merge.lastColumn < out.firstColumn || merge.firstColumn > out.lastColumn) continue;
+      if (!rectsOverlap(merge, out)) continue;
       const grown = {
         firstRow: Math.min(out.firstRow, merge.firstRow),
         lastRow: Math.max(out.lastRow, merge.lastRow),
@@ -5604,7 +5772,7 @@ function mergedRect(xml, rect) {
   // format landed on one merged cell or on several: widening closes over every
   // merge a merge reaches, so a rectangle grown by an L of them covers more than
   // one and a note that called them one would be wrong.
-  const covered = merges.filter((merge) => !(merge.lastRow < out.firstRow || merge.firstRow > out.lastRow || merge.lastColumn < out.firstColumn || merge.firstColumn > out.lastColumn)).length;
+  const covered = merges.filter((merge) => rectsOverlap(merge, out)).length;
   return { rect: out, label: rectLabel(out), widened, covered };
 }
 
@@ -5971,16 +6139,312 @@ function xlsxFormatCells(editor, edit, input, stylesName) {
   formatRow(editor, part, edit);
 }
 
+// ── xlsx_edit: merges, sheets and pictures ─────────────────────
+// `xlsx_edit`'s `merge_cells`: the range is normalized to its top-left corner and
+// written as one `<mergeCell>` at the end of the sheet's own block — merges need no
+// order — or as a block of its own at the element's `CT_Worksheet` place. The cells
+// the range covers are never touched: a merge changes what the sheet says about
+// them, not what they hold.
+function mergeCells(editor, edit) {
+  const { part, name } = sheetPart(editor, edit.sheet);
+  const rect = mergeRect(edit.range);
+  const label = rectLabel(rect);
+  editor.sheet(part, (xml) => {
+    const { block, merges, unreadable } = sheetMerges(xml);
+    const overlap = merges.find((merge) => merge.rect !== null && rectsOverlap(merge.rect, rect));
+    if (overlap) {
+      throw new UsageError(sameRect(overlap.rect, rect)
+        ? `sheet ${JSON.stringify(name)} already has ${label} merged — hint: unmerge ${overlap.ref} first, or name a range that is not merged`
+        : `the range ${label} overlaps ${overlap.ref}, which sheet ${JSON.stringify(name)} already has merged — hint: unmerge ${overlap.ref} first`);
+    }
+    if (unreadable) {
+      throw new UsageError(`sheet ${JSON.stringify(name)} holds a merge this kit cannot read, so a merge into it was refused rather than written over it`);
+    }
+    if (!block) return insertWorksheetChild(xml, "mergeCells", `<mergeCells count="1"><mergeCell ref="${label}"/></mergeCells>`);
+    const { open, body } = elementParts(block[0], "mergeCells");
+    const count = (open.match(/\bcount="(\d+)"/) || [])[1];
+    const nextOpen = count === undefined ? open : open.replace(/\bcount="\d*"/, () => `count="${Number(count) + 1}"`);
+    return xml.slice(0, block.index) + `${nextOpen}${body}<mergeCell ref="${label}"/></mergeCells>` + xml.slice(block.index + block[0].length);
+  });
+}
+
+// `xlsx_edit`'s `unmerge_cells`: the `<mergeCell>` naming the range, after the same
+// normalization the merge was written with — reversed corners included. A ref this
+// kit cannot parse can never be the match and is left exactly as it stands, keeping
+// the block alive; a block the removal empties goes with it, since the element
+// requires a child.
+function unmergeCells(editor, edit) {
+  const { part, name } = sheetPart(editor, edit.sheet);
+  const rect = gridRect(edit.range);
+  const label = rectLabel(rect);
+  editor.sheet(part, (xml) => {
+    const { block, merges } = sheetMerges(xml);
+    const target = merges.find((merge) => merge.rect !== null && sameRect(merge.rect, rect));
+    if (!target) {
+      const refs = merges.map((merge) => merge.ref).filter((ref) => ref !== undefined);
+      throw new UsageError(`the range ${label} is not a merge in sheet ${JSON.stringify(name)}: it has ${refs.length ? refs.join(", ") : "none"}`);
+    }
+    let gone = false;
+    const rewritten = countedContainer(block[0], MERGE_CELL, (entry) => {
+      if (!gone && entry === target.text) { gone = true; return null; }
+      return entry;
+    });
+    return xml.slice(0, block.index) + rewritten + xml.slice(block.index + block[0].length);
+  });
+}
+
+// `xlsx_edit`'s `add_sheet`: a fresh worksheet part, declared in the content types,
+// named by a workbook relationship and written last in the workbook's own sheet
+// list. The part number is one past the highest the package uses, so an existing
+// sheet and the references to it are never renamed.
+function addSheet(editor, edit) {
+  const name = checkSheetName(edit.name, "the new sheet");
+  const { workbook, sheets: entries } = workbookSheetList(editor);
+  if (entries.some((entry) => entry.name.toLowerCase() === name.toLowerCase())) {
+    throw new UsageError(`a sheet named ${JSON.stringify(name)} already exists — hint: pick a name no sheet uses, ignoring case`);
+  }
+  const list = workbook === undefined ? undefined : firstElement(workbook, "sheets");
+  if (list === undefined) throw new UsageError("the workbook has no sheet list to add a sheet to");
+  if (!editor.zip.file("[Content_Types].xml")) throw missingContentTypes(editor.input);
+  const number = Math.max(0, ...numberedParts(editor.zip, "xl/worksheets/sheet").map((entry) => entry.number)) + 1;
+  const part = `xl/worksheets/sheet${number}.xml`;
+  editor.add(part, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>`);
+  editor.part("[Content_Types].xml", (xml) => withOverride(xml, part, WORKSHEET_CONTENT_TYPE));
+  const id = addRelationship(editor, XLSX_WORKBOOK, WORKSHEET_REL_TYPE, part);
+  const sheetId = Math.max(0, ...entries.map((entry) => (Number.isFinite(entry.sheetId) ? entry.sheetId : 0))) + 1;
+  // The list holds `<sheet>` children alone, and a self-closing `<sheets/>` is
+  // opened to take the new one. The part is written back from the text already read
+  // rather than read and checked a second time.
+  const { open, body } = elementParts(list[0], "sheets");
+  const element = `<sheet name="${xmlEscape(name)}" sheetId="${sheetId}" r:id="${id}"/>`;
+  editor.rewrite(XLSX_WORKBOOK, workbook, workbook.slice(0, list.index) + `${open}${body}${element}</sheets>` + workbook.slice(list.index + list[0].length));
+}
+
+// `xlsx_edit`'s `rename_sheet`: the `<sheet>` element's own `name` attribute, and
+// every other part left byte-identical. Formulas, defined names, chart series and
+// links that still spell the old name are reported rather than rewritten — a wrong
+// rewrite of a reference is worse than a stale one, and rewriting references is a
+// spreadsheet engine's job.
+function renameSheet(editor, edit) {
+  const { workbook, name, index, sheets } = sheetPart(editor, edit.sheet);
+  const next = checkSheetName(edit.name, "the new sheet");
+  const target = sheets[index];
+  const clash = sheets.find((entry) => entry !== target && entry.name.toLowerCase() === next.toLowerCase());
+  if (clash) throw new UsageError(`a sheet named ${JSON.stringify(next)} already exists — hint: pick a name no sheet uses, ignoring case`);
+  if (next === name) return;
+  const renamed = workbook.slice(0, target.start) + setXmlAttribute(target.text, "name", xmlEscape(next)) + workbook.slice(target.end);
+  editor.rewrite(XLSX_WORKBOOK, workbook, renamed);
+  // A rename that only changes the spelling's case orphans nothing: a formula's
+  // qualifier is matched ignoring case, so `Data!A1` still names the sheet.
+  const kinds = name.toLowerCase() === next.toLowerCase() ? [] : sheetReferenceKinds(editor, name, sheets, renamed);
+  if (kinds.length) {
+    editor.note(`[the sheet ${JSON.stringify(name)} is now ${JSON.stringify(next)}, but ${joinedKinds(kinds)} still name ${JSON.stringify(name)} — those references were not rewritten]`, true);
+  }
+}
+
+// A `<sheet>` is hidden when its `state` says so: `hidden` and `veryHidden` are the
+// two ECMA-376 spells, and a visible sheet states nothing or `visible`. Hidden
+// sheets are ordinary sheets for every other purpose.
+const sheetHidden = (entry) => entry.state === "hidden" || entry.state === "veryHidden";
+
+// A `<definedName>`, in both shapes a part may write it in.
+const DEFINED_NAME = elementPattern("definedName");
+
+// The workbook's own indices into its sheet list, moved: a `<workbookView>`'s
+// `activeTab` and `firstSheet` through `sheetIndex`, and each `<definedName
+// localSheetId>` through `nameIndex`, where `null` drops the name with the sheet it
+// was scoped to. An attribute that is absent or no number is left as it stands, and
+// a `<definedNames>` block left with no child goes with it, since the element
+// requires one.
+function remapWorkbookIndices(xml, sheetIndex, nameIndex) {
+  let dropped = false;
+  const attribute = (tag, name, remap) => tag.replace(new RegExp(`(\\b${name}=")([^"]*)(")`), (whole, before, value, after) => {
+    if (!/^\d+$/.test(value)) return whole;
+    const moved = remap(Number(value));
+    return moved === null ? whole : `${before}${moved}${after}`;
+  });
+  const remapped = xml
+    .replace(/<workbookView\b[^>]*>/g, (tag) => attribute(attribute(tag, "activeTab", sheetIndex), "firstSheet", sheetIndex))
+    .replace(elementPattern("definedNames"), (block) => countedContainer(block, DEFINED_NAME, (element) => {
+      const value = xmlAttribute(element, "localSheetId");
+      if (value === undefined || !/^\d+$/.test(value)) return element;
+      const moved = nameIndex(Number(value));
+      if (moved === null) { dropped = true; return null; }
+      return setXmlAttribute(element, "localSheetId", String(moved));
+    }));
+  return { xml: remapped, dropped };
+}
+
+// `xlsx_edit`'s `delete_sheet`: the `<sheet>` element, the workbook relationship and
+// the worksheet part that belong to it alone, and the workbook's own indices kept
+// pointing at the sheets they named. A drawing, media or chart part it referenced is
+// left as it stands — a part nothing points at is a valid OPC part, and removing one
+// another part still names is not this edit's to do.
+function deleteSheet(editor, edit) {
+  const { workbook, part, name, index: at, sheets: entries } = sheetPart(editor, edit.sheet);
+  if (entries.length <= 1) throw new UsageError(`sheet ${JSON.stringify(name)} is the workbook's only sheet, and a workbook keeps at least one`);
+  const rest = entries.filter((entry, index) => index !== at);
+  if (!sheetHidden(entries[at]) && rest.every(sheetHidden)) {
+    throw new UsageError(`sheet ${JSON.stringify(name)} is the workbook's only visible sheet, and a workbook keeps at least one`);
+  }
+  // The first visible sheet an index landing on a hidden one moves to; a workbook
+  // whose remaining sheets are all hidden keeps index 0.
+  const visible = Math.max(0, rest.findIndex((entry) => !sheetHidden(entry)));
+  const sheetIndex = (index) => {
+    if (index >= entries.length) return index;
+    const moved = Math.min(Math.max(index > at ? index - 1 : index, 0), rest.length - 1);
+    return sheetHidden(rest[moved]) ? visible : moved;
+  };
+  const nameIndex = (index) => (index === at ? null : index > at ? index - 1 : index);
+  const without = workbook.slice(0, entries[at].start) + workbook.slice(entries[at].end);
+  const remapped = remapWorkbookIndices(without, sheetIndex, nameIndex);
+  editor.rewrite(XLSX_WORKBOOK, workbook, remapped.xml);
+  if (remapped.dropped) editor.note(`[the workbook's sheet-scoped names for ${JSON.stringify(name)} went with the sheet]`);
+  if (entries[at].id !== undefined && !rest.some((entry) => entry.id === entries[at].id)) {
+    editor.part(XLSX_WORKBOOK_RELS, (xml) => xml.replace(elementWithAttribute("Relationship", "Id", entries[at].id), ""));
+  }
+  if (!rest.some((entry) => entry.part === part)) {
+    editor.remove(part);
+    editor.remove(relsPartFor(part));
+    removeOverride(editor, part);
+  }
+  // Values left the workbook, so a chart or a pivot reading them keeps what it had.
+  editor.markContent();
+  const kinds = sheetReferenceKinds(editor, name, entries, remapped.xml);
+  if (kinds.length) {
+    editor.note(`[the sheet ${JSON.stringify(name)} is gone, but ${joinedKinds(kinds)} still name it — those references were not rewritten]`, true);
+  }
+}
+
+// `xlsx_edit`'s `move_sheet`: the `<sheet>` element is taken out of the workbook's
+// sheet list and put back at the position the caller names in the RESULTING order,
+// so the order is the only thing that changes. The workbook's own indices are
+// remapped through the same move, so the active sheet stays the active sheet.
+function moveSheet(editor, edit) {
+  const { workbook, name, index: from, sheets: entries } = sheetPart(editor, edit.sheet);
+  const to = edit.to;
+  if (!Number.isInteger(to) || to < 1 || to > entries.length) {
+    throw new UsageError(`no position ${to}: this workbook has ${entries.length} sheet${entries.length === 1 ? "" : "s"}`);
+  }
+  if (to === from + 1) throw new UsageError(`sheet ${JSON.stringify(name)} is already at position ${to} — moving it there would change nothing`);
+  const remap = (index) => {
+    if (index >= entries.length) return index;
+    if (index === from) return to - 1;
+    const rest = index < from ? index : index - 1;
+    return rest < to - 1 ? rest : rest + 1;
+  };
+  const moved = entries[from];
+  const rest = entries.filter((entry, index) => index !== from);
+  const without = workbook.slice(0, moved.start) + workbook.slice(moved.end);
+  // A span after the removed element moved up by the element's own length.
+  const at = (position) => (position > moved.start ? position - moved.text.length : position);
+  const next = rest[to - 1];
+  const close = without.match(new RegExp(closeTag("sheets")));
+  if (!next && !close) throw new UsageError("the workbook's sheet list has no close to place the moved sheet before");
+  const position = next ? at(next.start) : close.index;
+  const inserted = without.slice(0, position) + moved.text + without.slice(position);
+  editor.rewrite(XLSX_WORKBOOK, workbook, remapWorkbookIndices(inserted, remap, remap).xml);
+}
+
+// The formulas a chart part's series carry: the body of each `<c:f>`, unescaped like
+// a cell's own formula.
+const chartFormulas = (xml) => [...xml.matchAll(elementPattern("c:f"))].map((match) => xmlUnescape(elementParts(match[0], "c:f").body));
+// The target each `<hyperlink>` element names through its `location` attribute,
+// unescaped: the attribute is markup, and a target is a formula's own text.
+const hyperlinkLocations = (xml) => [...xml.matchAll(elementPattern("hyperlink"))].map((match) => xmlUnescape(xmlAttribute(match[0], "location") ?? ""));
+
+// The kinds of reference that still name the sheet `name`, in the words the answer
+// uses: the workbook's cell formulas, the sheet parts' own rule formulas, its defined
+// names, every chart's series and the sheets' hyperlink targets. `sheets` and
+// `workbook` are the reading the caller already made (`sheetPart`), so the sheet list
+// and the defined names come from text already in hand; the sheet parts and the
+// charts are read here, through the editor, so the scan is charged like every other
+// walk — a check that read whole parts around the budget would be the very hole the
+// bound exists to close.
+function sheetReferenceKinds(editor, name, sheets, workbook) {
+  const names = (text) => qualifiedRefs(text, name).length > 0;
+  const parts = sheets.map((entry) => editor.read(entry.part)).filter((xml) => xml !== undefined);
+  const kinds = [];
+  if (parts.some((xml) => cellFormulas(xml).some((formula) => names(formula.text)))) kinds.push("the workbook's formulas");
+  if (parts.some((xml) => ruleFormulas(xml).some(names))) kinds.push("the sheets' conditional-format and data-validation formulas");
+  if (workbook !== undefined && definedNameTexts(workbook).some(names)) kinds.push("the workbook's defined names");
+  const charts = Object.keys(editor.zip.files).filter((part) => CHART_PART.test(part));
+  if (charts.some((part) => chartFormulas(editor.read(part) ?? "").some(names))) kinds.push("the charts' series");
+  if (parts.some((xml) => hyperlinkLocations(xml).some(names))) kinds.push("the sheets' links");
+  return kinds;
+}
+
+// Those kinds as one phrase: "a and b", or "a, b and c".
+const joinedKinds = (kinds) => (kinds.length < 2 ? kinds[0] ?? "" : `${kinds.slice(0, -1).join(", ")} and ${kinds.at(-1)}`);
+
+// `xlsx_edit`'s `add_image`: the picture becomes a media part, declared in the
+// content types, and is anchored at the cell the caller names by the SHEET'S OWN
+// drawing — the one the sheet already declares, or a new part the sheet gains a
+// relationship and a `<drawing>` element for. A single-cell anchor is what keeps
+// the picture where the caller put it: a later row or column shift moves the cells
+// under it and leaves the anchor naming the cell it was written for (see
+// `staleRefs`, which reports that). The size is the one every placement shares: a
+// stated side is points, one side alone keeps the picture's own proportions, and
+// neither keeps the picture's own size, since a sheet has no page to fit it into.
+// The sheet part is read once: a `<drawing>` adds no row or cell, so the text is
+// written back with `rewrite` and needs none of `sheet`'s duplicate-address check.
+function addSheetImage(editor, edit) {
+  const { part, name } = sheetPart(editor, edit.sheet);
+  const address = cellAddress(edit.cell);
+  const image = readImage(edit.image);
+  const size = imageSize(image, edit.width, edit.height, RULES.dimension_points, null);
+  const cx = Math.max(1, Math.round(size.width * PX_TO_EMU));
+  const cy = Math.max(1, Math.round(size.height * PX_TO_EMU));
+  if (!editor.zip.file("[Content_Types].xml")) throw missingContentTypes(editor.input);
+  const media = nextMediaPart(editor.zip, XLSX_MEDIA, image.kind);
+  editor.add(media, image.bytes);
+  editor.part("[Content_Types].xml", (xml) => withOverride(xml, media, image.contentType));
+  const sheetXml = editor.read(part);
+  const declared = writableElement(sheetXml, "drawing", "the sheet part");
+  let drawingPart;
+  if (declared) {
+    const declaredId = relationshipId(declared[0]);
+    const target = declaredId === undefined ? undefined : relationshipMap(editor.read(relsPartFor(part)) ?? "").get(declaredId);
+    drawingPart = target === undefined ? undefined : resolvePart(partDirectory(part), target);
+    if (drawingPart === undefined || !editor.zip.file(drawingPart)) {
+      throw new UsageError(`sheet ${JSON.stringify(name)} names a drawing part this kit cannot find, so the picture was not added`);
+    }
+  } else {
+    const number = Math.max(0, ...numberedParts(editor.zip, `${XLSX_DRAWINGS}drawing`).map((entry) => entry.number)) + 1;
+    drawingPart = `${XLSX_DRAWINGS}drawing${number}.xml`;
+    editor.part("[Content_Types].xml", (xml) => withOverride(xml, drawingPart, DRAWING_CONTENT_TYPE));
+    const drawingId = addRelationship(editor, part, DRAWING_REL_TYPE, drawingPart);
+    editor.rewrite(part, sheetXml, insertWorksheetChild(withRelationshipNamespace(sheetXml, "worksheet"), "drawing", `<drawing r:id="${drawingId}"/>`));
+  }
+  const relationship = addRelationship(editor, drawingPart, IMAGE_REL, media);
+  const existing = editor.read(drawingPart);
+  // One past the highest picture id the drawing already numbers, so the picture
+  // never renames one the part holds.
+  const pictureId = Math.max(2, Math.max(0, ...[...(existing ?? "").matchAll(/<xdr:cNvPr\b[^>]*\bid="(\d+)"/g)].map((match) => Number(match[1]))) + 1);
+  const anchor = `<xdr:oneCellAnchor><xdr:from><xdr:col>${address.column}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${address.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>`
+    + `<xdr:ext cx="${cx}" cy="${cy}"/>`
+    + `<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${pictureId}" name="Picture ${pictureId}"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>`
+    + `<xdr:blipFill><a:blip r:embed="${relationship}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>`
+    + `<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>`
+    + `</xdr:pic><xdr:clientData/></xdr:oneCellAnchor>`;
+  if (existing === undefined) {
+    editor.add(drawingPart, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="${XDR_NS}" xmlns:a="${DRAWING_NS}" xmlns:r="${REL_NS}">${anchor}</xdr:wsDr>`);
+    return;
+  }
+  const namespaced = withNamespace(withRelationshipNamespace(existing, "xdr:wsDr"), "xdr:wsDr", "a", DRAWING_NS);
+  const close = namespaced.match(new RegExp(closeTag("xdr:wsDr")));
+  if (!close) throw new UsageError(`the drawing part ${drawingPart} has no </xdr:wsDr> to place a picture in`);
+  editor.rewrite(drawingPart, existing, namespaced.slice(0, close.index) + anchor + namespaced.slice(close.index));
+}
+
 function xlsxEdit(req) {
   const editor = openEdit(req, "xlsx");
   const edits = editList(req);
   const names = Object.keys(editor.zip.files);
   // A chart or a pivot that reads the edited cells keeps the values it was
   // written with: the parts are copied through and nothing recomputes them. The
-  // test is on the part names the format gives those objects — a chart's colour
-  // or style sidecar (`xl/charts/colors1.xml`) is not a chart and raises no
-  // caveat of its own.
-  const charts = names.some((name) => /^xl\/charts\/chart[^/]*\.xml$/.test(name));
+  // test is on the part names the format gives those objects (`CHART_PART`).
+  const charts = names.some((name) => CHART_PART.test(name));
   const pivots = names.some((name) => /^xl\/pivotTables\/pivotTable[^/]*\.xml$/.test(name) || /^xl\/pivotCache\/pivotCache(?:Definition|Records)[^/]*\.xml$/.test(name));
   // The styles part is taken into hand before any edit runs, whatever the edit is: the
   // part the workbook's own relationships name (`stylesPart`), a root not one a child
@@ -6010,6 +6474,13 @@ function xlsxEdit(req) {
     else if (op === "insert_column") insertColumn(editor, edit, stale);
     else if (op === "delete_column") deleteColumn(editor, edit, stale);
     else if (op === "format_cells") xlsxFormatCells(editor, edit, req.input, stylesName);
+    else if (op === "merge_cells") mergeCells(editor, edit);
+    else if (op === "unmerge_cells") unmergeCells(editor, edit);
+    else if (op === "add_sheet") addSheet(editor, edit);
+    else if (op === "rename_sheet") renameSheet(editor, edit);
+    else if (op === "delete_sheet") deleteSheet(editor, edit);
+    else if (op === "move_sheet") moveSheet(editor, edit);
+    else if (op === "add_image") addSheetImage(editor, edit);
     else throw new UsageError(`unknown xlsx edit: ${JSON.stringify(op)}`);
   }
   // The editor knows whether the call changed the sheet's content at all — a
@@ -6131,7 +6602,7 @@ const partDirectory = (part) => part.slice(0, part.lastIndexOf("/") + 1);
 // spelling rule (see `closeTag`), so a part spelled `</Relationships >` is not read
 // as one that never closes. A package whose relationships cannot be read is still
 // edited — a reader falls back to the conventional part names for it and so does
-// this kit (`workbookSheets`) — so this says what can be written, not what is
+// this kit (`workbookSheetList`) — so this says what can be written, not what is
 // refused.
 const RELATIONSHIPS_CLOSE = new RegExp(closeTag("Relationships"));
 const relsWritable = (rels) => rels !== undefined && RELATIONSHIPS_CLOSE.test(rels);
@@ -7433,15 +7904,18 @@ function shapeTreeEnd(xml) {
   return extension ? extension.start : close;
 }
 
-// The slide part's root declaring the relationships namespace as `r` when it does
-// not already: the picture reaches its media part through `r:embed`, and an
-// undeclared prefix is not XML — in a part the kit did not write itself.
-function withRelationshipNamespace(xml) {
-  const root = xml.match(new RegExp(openTag("p:sld")));
-  if (!root || /\bxmlns:r=/.test(root[0])) return xml;
-  const declared = setXmlAttribute(root[0], "xmlns:r", REL_NS);
-  return xml.slice(0, root.index) + declared + xml.slice(root.index + root[0].length);
+// The part's root declaring `prefix` when it does not already: the picture reaches
+// its media part through `r:embed`, and the run properties it writes are
+// DrawingML's `a:` — an undeclared prefix is not XML, in a part the kit did not
+// write itself. `root` is the element the part opens with (`p:sld`, `worksheet`,
+// `xdr:wsDr`).
+function withNamespace(xml, root, prefix, uri) {
+  const found = xml.match(new RegExp(openTag(root)));
+  if (!found || new RegExp(`\\bxmlns:${prefix}=`).test(found[0])) return xml;
+  const declared = setXmlAttribute(found[0], `xmlns:${prefix}`, uri);
+  return xml.slice(0, found.index) + declared + xml.slice(found.index + found[0].length);
 }
+const withRelationshipNamespace = (xml, root) => withNamespace(xml, root, "r", REL_NS);
 
 // `pptx_edit`'s `add_image`: the file's bytes become a media part, the slide
 // gains a relationship to it and a `<p:pic>` is appended to the slide's shape
@@ -7462,7 +7936,7 @@ function addSlideImage(editor, edit) {
   editor.part("[Content_Types].xml", (xml) => withOverride(xml, media, image.contentType));
   const id = addRelationship(editor, part, IMAGE_REL, media);
   editor.part(part, (xml) => {
-    const namespaced = withRelationshipNamespace(xml);
+    const namespaced = withRelationshipNamespace(xml, "p:sld");
     const at = shapeTreeEnd(namespaced);
     if (at === null) throw new UsageError("the slide has no shape tree to place an image in");
     const shapeId = nextShapeId(namespaced);
@@ -8044,7 +8518,7 @@ const operations = {
       writeOut(`${scratch}/probe_edited.docx`, edited.buffer);
     });
     await step("edit_xlsx", () => {
-      writeOut(`${scratch}/probe_edit.xlsx`, createXlsx({ sheets: [{ name: "Данные", rows: [["Проверка", 1], ["черновик", 2]] }] }));
+      writeOut(`${scratch}/probe_edit.xlsx`, createXlsx({ sheets: [{ name: "Данные", rows: [["Проверка", 1], ["черновик", 2]], merges: ["A1:B1"] }] }));
       const edited = xlsxEdit({ input: `${scratch}/probe_edit.xlsx`, edits: [
         { op: "set_cell", sheet: "Данные", cell: "C3", value: "правка" },
         { op: "clear_cell", sheet: "Данные", cell: "A2" },
@@ -8055,6 +8529,13 @@ const operations = {
         { op: "delete_row", sheet: "Данные", row: 4 },
         { op: "insert_column", sheet: "Данные", column: "A" },
         { op: "delete_column", sheet: "Данные", column: "A" },
+        { op: "merge_cells", sheet: "Данные", range: "E5:D6" },
+        { op: "unmerge_cells", sheet: "Данные", range: "D5:E6" },
+        { op: "add_sheet", name: "Лист2" },
+        { op: "rename_sheet", sheet: "Лист2", name: "Лист3" },
+        { op: "move_sheet", sheet: "Лист3", to: 1 },
+        { op: "add_image", sheet: "Данные", cell: "B2", image: `${scratch}/probe.png`, width: 60 },
+        { op: "delete_sheet", sheet: "Лист3" },
       ] });
       writeOut(`${scratch}/probe_edited.xlsx`, edited.buffer);
     });

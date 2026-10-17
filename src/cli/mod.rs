@@ -930,7 +930,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 purpose: "Edit an .xlsx/.xlsm",
                 flags: &[
                     DOCUMENT_PATH_FLAG,
-                    XLSX_EDITS_FLAG,
+                    IMAGE_EDITS_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
                 ],
@@ -1212,17 +1212,8 @@ const DOCUMENT_PAGES_FLAG: Flag = Flag {
               with '@<file>'; left out, every page",
 };
 
-/// The document tool's `edits` argument for `xlsx_edit`, which places no
-/// picture.
-const XLSX_EDITS_FLAG: Flag = Flag {
-    arg: "edits",
-    kind: FlagKind::Structured(&[]),
-    secret: false,
-    purpose: EDITS_PURPOSE,
-};
-
-/// The same argument for `docx_edit` and `pptx_edit`, whose `add_image` names a
-/// reference file — so their list resolves that `image` where the command runs.
+/// The document tool's `edits` argument, whose `add_image` names a reference
+/// file — so the list resolves that `image` where the command runs.
 const IMAGE_EDITS_FLAG: Flag = Flag {
     arg: "edits",
     kind: FlagKind::Structured(&["image"]),
@@ -3211,10 +3202,10 @@ mod tests {
         }
         // The reverse direction has to have found every one of them, or it would
         // hold by being vacuous: the document tool's picture stands in a `create`
-        // block, in a docx placing edit and in a pptx placing edit — three fields
-        // the command line owes a resolution.
+        // block and in a docx, a pptx and an xlsx placing edit — four fields the
+        // command line owes a resolution.
         assert!(
-            file_fields >= 3,
+            file_fields >= 4,
             "the picture fields naming a file were not all found ({file_fields}) — the tie would \
              be vacuous"
         );

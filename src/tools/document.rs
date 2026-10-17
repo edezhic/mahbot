@@ -187,6 +187,13 @@ fn edit_op_fields(
             ("delete_row", &["sheet", "row"]),
             ("insert_column", &["sheet", "column"]),
             ("delete_column", &["sheet", "column"]),
+            ("merge_cells", &["sheet", "range"]),
+            ("unmerge_cells", &["sheet", "range"]),
+            ("add_sheet", &["name"]),
+            ("rename_sheet", &["sheet", "name"]),
+            ("delete_sheet", &["sheet"]),
+            ("move_sheet", &["sheet", "to"]),
+            ("add_image", &["sheet", "cell", "image", "width", "height"]),
         ],
         crate::ooxml::Family::Pptx => &[
             ("replace_text", &["slide", "find", "replace"]),
@@ -925,16 +932,17 @@ fn placed_size_arg(what: &str) -> Value {
     number_arg(&format!("{what} {}.", picture_size_rule()))
 }
 
-/// A content-block image's or a docx `add_image`'s placed width: the shared
-/// placement rule, and the fallback only a laid-out block has — with neither side
-/// named the picture keeps its own size, fitted whole into the page's or slide's
-/// own text column so neither side of it runs past.
-fn content_image_width_arg(what: &str) -> Value {
-    number_arg(&format!(
-        "{what} {}; with neither side named the picture keeps its own size, fitted whole into the \
-         page's or slide's own text column.",
-        picture_size_rule()
-    ))
+/// With neither side of a placed picture named, a laid-out block's keeps its own
+/// size, fitted whole into the page's or slide's own text column so neither side of
+/// it runs past. A picture in a sheet has no column to fit and keeps its own size.
+const BLOCK_IMAGE_FIT: &str = "with neither side named the picture keeps its own size, fitted \
+                                whole into the page's or slide's own text column.";
+
+/// A placed picture's width: the shared placement rule, then `fallback` — what
+/// happens with neither side named, the one part a laid-out block's picture and one
+/// in a sheet do not share.
+fn picture_width_arg(what: &str, fallback: &str) -> Value {
+    number_arg(&format!("{what} {}; {fallback}", picture_size_rule()))
 }
 
 /// A `format_cells` `border`: the sides to set, each a boolean — true puts a thin
@@ -1033,7 +1041,7 @@ fn block_field(name: &str) -> Value {
             ),
         ),
         "image" => content_image_arg(),
-        "width" => content_image_width_arg("Placed width"),
+        "width" => picture_width_arg("Placed width", BLOCK_IMAGE_FIT),
         "height" => placed_size_arg("Placed height"),
         other => unreachable!("every block field has a declaration: {other}"),
     }
@@ -1079,6 +1087,7 @@ const SHEET_FIELDS: &[(&str, bool)] = &[
     // field, required
     ("name", false),
     ("rows", true),
+    ("merges", false),
 ];
 
 /// The field names of [`SHEET_FIELDS`].
@@ -1086,8 +1095,9 @@ fn sheet_field_names() -> Vec<&'static str> {
     SHEET_FIELDS.iter().map(|(name, _)| *name).collect()
 }
 
-/// `sheets`: a workbook's sheets, each with a name and its rows. The characters a
-/// name may not hold are stated inline in the name's own description.
+/// `sheets`: a workbook's sheets, each with a name, its rows and the ranges it
+/// merges. The characters a name may not hold are stated inline in the name's own
+/// description.
 fn sheets_arg() -> Value {
     let properties = SHEET_FIELDS
         .iter()
@@ -1120,6 +1130,11 @@ fn sheet_field(name: &str) -> Value {
             RULES.sheet_name_max, RULES.sheet_name_forbidden,
         )),
         "rows" => array_arg(&sheet_row_arg(), "The rows, top to bottom."),
+        "merges" => array_arg(
+            &text_arg("A range like A1:C1, corners in either order."),
+            "Ranges to merge, each covering at least two cells; a merge never clears what its cells \
+             hold.",
+        ),
         other => unreachable!("every sheet field has a declaration: {other}"),
     }
 }
@@ -1300,7 +1315,7 @@ fn action_schema(action: &str) -> Value {
                         "list": list_arg(),
                         "level": integer_arg(&format!("List level, 0 to {}.", RULES.paragraph_level_max)),
                         "image": image_arg(),
-                        "width": content_image_width_arg("Picture width"),
+                        "width": picture_width_arg("Picture width", BLOCK_IMAGE_FIT),
                         "height": placed_size_arg("Picture height"),
                         "headers": array_arg(
                             &scalar_arg(),
@@ -1328,7 +1343,9 @@ fn action_schema(action: &str) -> Value {
         ),
         "xlsx_edit" => super::action_entry_schema(
             "xlsx_edit",
-            "Edit an .xlsx/.xlsm; an .xlsx package is required.",
+            "Edit an .xlsx/.xlsm; an .xlsx package is required. Rewrite cells and formatting, shift \
+             rows and columns, merge and unmerge a range, add, rename, move or delete a sheet, and \
+             place a picture in a sheet.",
             &["path", "edits"],
             &json!({
                 "path": path_arg(),
@@ -1336,6 +1353,15 @@ fn action_schema(action: &str) -> Value {
                     crate::ooxml::Family::Xlsx,
                     &json!({
                         "sheet": text_arg("Sheet name, as a reading prints it."),
+                        "name": text_arg(&format!(
+                            "A sheet name: at most {} characters, none of {:?}, unique ignoring \
+                             case.",
+                            RULES.sheet_name_max, RULES.sheet_name_forbidden
+                        )),
+                        "to": integer_arg(
+                            "The 1-based position the sheet takes, counting the sheets as a reading \
+                             prints them."
+                        ),
                         "cell": text_arg("A1 address, like B7."),
                         "value": cell_arg(),
                         "number_format": text_arg(&format!(
@@ -1343,7 +1369,8 @@ fn action_schema(action: &str) -> Value {
                             RULES.number_format_max
                         )),
                         "range": text_arg(&format!(
-                            "Cells, like B2:D2, corners in either order, at most {} cells.",
+                            "Cells, like B2:D2, corners in either order; a format_cells range \
+                             holds at most {} cells.",
                             RULES.format_cells_max
                         )),
                         "column": text_arg(&format!(
@@ -1380,10 +1407,16 @@ fn action_schema(action: &str) -> Value {
                         "align": choice_arg(&RULES.cell_alignments, "Horizontal alignment."),
                         "vertical": choice_arg(&RULES.cell_verticals, "Vertical alignment."),
                         "wrap": bool_arg("Wrap the text."),
+                        "image": image_arg(),
+                        "width": picture_width_arg(
+                            "Picture width",
+                            "with neither side named the picture keeps its own size.",
+                        ),
+                        "height": placed_size_arg("Picture height"),
                     }),
-                    "One target only: range, column or row, with at least one of its own properties. \
-                     An inserted row or column may be one past the sheet's used range; a deleted \
-                     one must be inside it.",
+                    "An edit names one sheet unless it adds one. One target only: range, column or \
+                     row, with at least one of its own properties. An inserted row or column may be \
+                     one past the sheet's used range; a deleted one must be inside it.",
                 ),
             }),
         ),
@@ -1711,21 +1744,16 @@ impl DocumentTool {
         // claims.
         require_edit_family(&input, family).await?;
         let mut edits = validate_edits(family, args)?;
-        // A docx `add_image` and a pptx one both place a picture, so both
-        // families resolve the path the kit is handed; only a presentation also
-        // needs the diagram text a refusal about the slide's own text may name.
-        // What a slide's diagrams show is the reader's rule, so the text is read
-        // from the input — under the conversion bound, since it walks a whole
-        // deck — and the kit looks it up rather than restating how a diagram is
-        // read. An edit that never looks text up on the slide (a notes edit, a
-        // slide reshape) reads no diagram text at all.
+        // Every family's `add_image` places a picture, so its path is resolved
+        // before the kit is handed it; only a presentation also needs the diagram
+        // text a refusal about the slide's own text may name. What a slide's
+        // diagrams show is the reader's rule, so the text is read from the input
+        // — under the conversion bound, since it walks a whole deck — and the kit
+        // looks it up rather than restating how a diagram is read. An edit that
+        // never looks text up on the slide (a notes edit, a slide reshape) reads
+        // no diagram text at all.
         let mut diagram_text = HashMap::new();
-        if matches!(
-            family,
-            crate::ooxml::Family::Docx | crate::ooxml::Family::Pptx
-        ) {
-            resolve_edit_images(ws, &mut edits, self.access).await?;
-        }
+        resolve_edit_images(ws, &mut edits, self.access).await?;
         if family == crate::ooxml::Family::Pptx && edits_search_slide_text(&edits) {
             diagram_text = crate::document::read_pptx_diagram_text(&input).await;
         }
@@ -3046,6 +3074,25 @@ fn require_format_cells_target(
     }
 }
 
+/// The corners an A1 range names — one cell, or two corners in either order —
+/// inside the sheet's grid. `what` names the field in a refusal.
+fn range_corners(range: &str, what: &str) -> Result<((u32, u32), (u32, u32))> {
+    let mut corners = range.split(':');
+    let first = corners.next().unwrap_or_default();
+    let second = corners.next();
+    if corners.next().is_some() {
+        anyhow::bail!(
+            "usage: {what} must be a cell or a rectangular range like B2:D2, got \"{range}\""
+        );
+    }
+    let first = check_cell_address(first, what)?;
+    let second = match second {
+        Some(second) => check_cell_address(second, what)?,
+        None => first,
+    };
+    Ok((first, second))
+}
+
 /// Require a xlsx `format_cells`'s `range` to be a cell (`"B2"`) or a
 /// rectangular range (`"B2:D2"`) inside the sheet's grid. The corners may be
 /// named in either order — the rectangle is what they enclose — and it may hold
@@ -3055,19 +3102,7 @@ fn require_format_cells_target(
 fn require_format_cells_range(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
     let field = format!("{at}.range");
     let range = edit_string_non_empty(object, "range", at)?;
-    let mut corners = range.split(':');
-    let first = corners.next().unwrap_or_default();
-    let second = corners.next();
-    if corners.next().is_some() {
-        anyhow::bail!(
-            "usage: {field} must be a cell or a rectangular range like B2:D2, got \"{range}\""
-        );
-    }
-    let (first_row, first_column) = check_cell_address(first, &field)?;
-    let (last_row, last_column) = match second {
-        Some(second) => check_cell_address(second, &field)?,
-        None => (first_row, first_column),
-    };
+    let ((first_row, first_column), (last_row, last_column)) = range_corners(range, &field)?;
     let rows = u64::from(last_row.abs_diff(first_row)) + 1;
     let columns = u64::from(last_column.abs_diff(first_column)) + 1;
     let cells = rows * columns;
@@ -3079,6 +3114,29 @@ fn require_format_cells_range(object: &serde_json::Map<String, Value>, at: &str)
         );
     }
     Ok(())
+}
+
+/// Require `range` to name one merge: two corners in either order, inside the
+/// sheet's grid, covering at least two cells. Overlap is the kit's to refuse —
+/// only its writer sees what is merged there.
+fn require_merge_text(range: &str, what: &str) -> Result<()> {
+    let ((first_row, first_column), (last_row, last_column)) = range_corners(range, what)?;
+    let cells = (u64::from(last_row.abs_diff(first_row)) + 1)
+        * (u64::from(last_column.abs_diff(first_column)) + 1);
+    if cells < 2 {
+        anyhow::bail!(
+            "usage: {what} \"{range}\" covers one cell, and a merge needs at least two — hint: name \
+             a range like A1:B2"
+        );
+    }
+    Ok(())
+}
+
+/// Require a xlsx `merge_cells`'s `range` to name a merge (see
+/// [`require_merge_text`]).
+fn require_merge_range(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let range = edit_string_non_empty(object, "range", at)?;
+    require_merge_text(range, &format!("{at}.range"))
 }
 
 /// Require an optional `color` — a `format_text`'s or a xlsx `format_cells`'s
@@ -3228,18 +3286,22 @@ fn require_block_keys(object: &serde_json::Map<String, Value>, at: &str, kind: &
     require_taken_keys(object, at, &format!("the {kind} block"), fields, &["type"])
 }
 
-/// The xlsx edit vocabulary and the cell, row and column shapes its writer
-/// knows: a sheet is named, a cell is an A1 address, a row and a column are the
-/// 1-based units the reader shows, and `format_cells` names one of a cell range,
-/// a column's width or a row's height and the properties it applies to it.
+/// The xlsx edit vocabulary and the shapes its writer knows: a sheet is named by
+/// every op but `add_sheet`, a cell is an A1 address, a row and a column are the
+/// 1-based units the reader shows, a merge is a range of at least two cells, and
+/// `format_cells` names one of a cell range, a column's width or a row's height
+/// and the properties it applies to it.
+#[expect(clippy::too_many_lines)] // the one place the xlsx op vocabulary is checked
 fn validate_xlsx_edit(
     edit: &Value,
     object: &serde_json::Map<String, Value>,
     op: &str,
     at: &str,
 ) -> Result<Value> {
-    let sheet = edit_string_non_empty(object, "sheet", at)?;
-    require_sheet_name_length(sheet, &format!("{at}.sheet"))?;
+    // Ahead of the arm, so an op added later cannot forget it.
+    if op != "add_sheet" {
+        require_sheet_field(object, at)?;
+    }
     match op {
         "set_cell" => {
             require_cell(object, at)?;
@@ -3325,9 +3387,61 @@ fn validate_xlsx_edit(
         "insert_column" | "delete_column" => {
             require_column(object, at)?;
         }
+        "merge_cells" => {
+            require_merge_range(object, at)?;
+        }
+        "unmerge_cells" => {
+            // The corners alone: a one-cell range is refused by the kit, which names
+            // the merges the sheet really has, where `require_merge_text` would refuse
+            // it without them.
+            let field = format!("{at}.range");
+            range_corners(edit_string_non_empty(object, "range", at)?, &field)?;
+        }
+        "add_sheet" | "rename_sheet" => {
+            require_sheet_name_field(object, at)?;
+        }
+        // Nothing beyond the `sheet` checked above: the op names that one field, and
+        // the last-sheet and last-visible refusals are the kit's, which sees the list.
+        "delete_sheet" => {}
+        "move_sheet" => {
+            require_one_based_number(object, "to", at)?;
+        }
+        "add_image" => {
+            require_cell(object, at)?;
+            edit_string_non_empty(object, "image", at)?;
+            require_span_number(
+                object,
+                "width",
+                &RULES.dimension_points,
+                "a picture's width in points",
+                at,
+            )?;
+            require_span_number(
+                object,
+                "height",
+                &RULES.dimension_points,
+                "a picture's height in points",
+                at,
+            )?;
+        }
         _ => unreachable!("the op was checked against the family's vocabulary"),
     }
     Ok(edit.clone())
+}
+
+/// Require an xlsx edit's `sheet` — every op but `add_sheet` names one — and its
+/// length.
+fn require_sheet_field(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let sheet = edit_string_non_empty(object, "sheet", at)?;
+    require_sheet_name_length(sheet, &format!("{at}.sheet"))
+}
+
+/// Require an xlsx edit's `name` to be a non-empty sheet name of the shape the
+/// shared rules state (see [`require_sheet_name_text`]). Whether the workbook
+/// already holds the name is the kit's refusal — it is the side that sees the list.
+fn require_sheet_name_field(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let name = edit_string_non_empty(object, "name", at)?;
+    require_sheet_name_text(name, &format!("{at}.name"))
 }
 
 /// The 1-based column number A1-style letters name (`"A"` -> 1, `"XFD"` ->
@@ -3490,7 +3604,7 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
         }
         "move_slide" => {
             require_slide(object, at)?;
-            require_slide_number(object, "to", at)?;
+            require_one_based_number(object, "to", at)?;
         }
         "add_notes" => {
             require_slide(object, at)?;
@@ -3518,12 +3632,12 @@ fn require_pptx_lookup(text: &str, key: &str, at: &str) -> Result<()> {
 /// Require an edit's `slide` to be a 1-based slide number; a deck's length is
 /// the kit's to know, so only the lower bound is enforced here.
 fn require_slide(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
-    require_slide_number(object, "slide", at)
+    require_one_based_number(object, "slide", at)
 }
 
-/// Require a 1-based slide number under `key` — an edit's `slide` or a
-/// `move_slide`'s `to`.
-fn require_slide_number(
+/// Require a 1-based number under `key` — an edit's `slide`, a `move_slide`'s
+/// `to` or a `move_sheet`'s `to`.
+fn require_one_based_number(
     object: &serde_json::Map<String, Value>,
     key: &str,
     at: &str,
@@ -3846,7 +3960,8 @@ fn edits_search_slide_text(edits: &Value) -> bool {
 }
 
 /// Resolve and validate the `sheets` argument: every sheet is an object with a
-/// name and rows of cells, and every cell is a shape the kit's writer knows.
+/// name, rows of cells and the ranges it merges, and every cell is a shape the
+/// kit's writer knows.
 fn resolve_sheets(args: &Value) -> Result<Value> {
     let sheets = match args.get("sheets") {
         Some(Value::Array(sheets)) if !sheets.is_empty() => sheets,
@@ -3910,9 +4025,40 @@ fn resolve_sheets(args: &Value) -> Result<Value> {
         let mut normalized_sheet = object.clone();
         normalized_sheet.insert("name".to_owned(), json!(name));
         normalized_sheet.insert("rows".to_owned(), rows);
+        // The clone carries the sheet's own `merges` as it was written, so the
+        // entries are checked in place. A null reads as absent everywhere else,
+        // and the kit tests only `!== undefined`.
+        match object.get("merges") {
+            None => {}
+            Some(Value::Null) => {
+                normalized_sheet.remove("merges");
+            }
+            Some(Value::Array(merges)) => require_sheet_merges(merges, index)?,
+            Some(v) => {
+                return Err(super::wrong_type(
+                    &format!("sheets[{index}].merges"),
+                    "an array",
+                    v,
+                ));
+            }
+        }
         normalized.push(Value::Object(normalized_sheet));
     }
     Ok(Value::Array(normalized))
+}
+
+/// Require the `merges` a `create` sheet names: each entry is an A1 range, corners
+/// in either order, inside the sheet's grid and covering at least two cells.
+/// Overlap is the kit's to refuse — only its writer sees what is merged there.
+fn require_sheet_merges(merges: &[Value], index: usize) -> Result<()> {
+    for (position, merge) in merges.iter().enumerate() {
+        let at = format!("sheets[{index}].merges[{position}]");
+        match merge {
+            Value::String(range) => require_merge_text(range, &at)?,
+            other => return Err(super::wrong_type(&at, "a string", other)),
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a sheet name longer than the shared cap, naming `at` in the message.
@@ -3935,7 +4081,22 @@ fn require_sheet_name_length(name: &str, at: &str) -> Result<()> {
 /// rule as its last line, over the names it actually writes.
 fn require_sheet_name(name: &str, index: usize, seen: &mut HashSet<String>) -> Result<()> {
     let at = format!("sheets[{index}].name");
-    require_sheet_name_length(name, &at)?;
+    require_sheet_name_text(name, &at)?;
+    if !seen.insert(name.to_lowercase()) {
+        anyhow::bail!(
+            "usage: {at} is not unique, ignoring case, got \"{name}\" — hint: give every sheet a \
+             distinct name"
+        );
+    }
+    Ok(())
+}
+
+/// Require a sheet name to have the shared shape: at most `sheet_name_max`
+/// characters and none of `sheet_name_forbidden`. Uniqueness is not this function's:
+/// `create` checks it across the sheets it writes, and an edit's clash with a sheet
+/// the workbook already holds is the kit's refusal.
+fn require_sheet_name_text(name: &str, at: &str) -> Result<()> {
+    require_sheet_name_length(name, at)?;
     if let Some(forbidden) = RULES
         .sheet_name_forbidden
         .chars()
@@ -3947,12 +4108,6 @@ fn require_sheet_name(name: &str, index: usize, seen: &mut HashSet<String>) -> R
             "usage: {at} must not contain {:?} — hint: a sheet name cannot hold any of {:?}",
             forbidden.to_string(),
             RULES.sheet_name_forbidden
-        );
-    }
-    if !seen.insert(name.to_lowercase()) {
-        anyhow::bail!(
-            "usage: {at} is not unique, ignoring case, got \"{name}\" — hint: give every sheet a \
-             distinct name"
         );
     }
     Ok(())
@@ -8958,6 +9113,40 @@ mod tests {
                         "edits": [{ "op": "format_cells", "sheet": "S", "range": "A1",
                                     "align": "middle" }],
                         "output": out.join("p.xlsx").to_string_lossy() }),
+            ),
+            (
+                "a merge of one cell",
+                json!({ "action": "xlsx_edit", "path": book.to_string_lossy(),
+                        "edits": [{ "op": "merge_cells", "sheet": "S", "range": "A1" }] }),
+                json!({ "op": "xlsx_edit", "input": book.to_string_lossy(),
+                        "edits": [{ "op": "merge_cells", "sheet": "S", "range": "A1" }],
+                        "output": out.join("q4.xlsx").to_string_lossy() }),
+            ),
+            (
+                "a sheet name a workbook refuses",
+                json!({ "action": "xlsx_edit", "path": book.to_string_lossy(),
+                        "edits": [{ "op": "add_sheet", "name": "a:b" }] }),
+                json!({ "op": "xlsx_edit", "input": book.to_string_lossy(),
+                        "edits": [{ "op": "add_sheet", "name": "a:b" }],
+                        "output": out.join("q5.xlsx").to_string_lossy() }),
+            ),
+            (
+                "a picture anchored at no cell",
+                json!({ "action": "xlsx_edit", "path": book.to_string_lossy(),
+                        "edits": [{ "op": "add_image", "sheet": "S", "cell": "nope",
+                                    "image": whole.to_string_lossy() }] }),
+                json!({ "op": "xlsx_edit", "input": book.to_string_lossy(),
+                        "edits": [{ "op": "add_image", "sheet": "S", "cell": "nope",
+                                    "image": whole.to_string_lossy() }],
+                        "output": out.join("q6.xlsx").to_string_lossy() }),
+            ),
+            (
+                "a sheet move to no position",
+                json!({ "action": "xlsx_edit", "path": book.to_string_lossy(),
+                        "edits": [{ "op": "move_sheet", "sheet": "S", "to": 0 }] }),
+                json!({ "op": "xlsx_edit", "input": book.to_string_lossy(),
+                        "edits": [{ "op": "move_sheet", "sheet": "S", "to": 0 }],
+                        "output": out.join("q7.xlsx").to_string_lossy() }),
             ),
         ];
         for (what, tool_args, kit_request) in cases {
@@ -21692,8 +21881,8 @@ mod tests {
     /// the path-access variant this test builds, and the description and the
     /// serialized schema together. Adding to the contract re-records both here, so
     /// growth is a decision made in this test rather than a drift.
-    const BASELINE_DESCRIPTION: usize = 7_963;
-    const BASELINE_TOTAL: usize = 30_437;
+    const BASELINE_DESCRIPTION: usize = 9_010;
+    const BASELINE_TOTAL: usize = 32_984;
 
     /// The whole per-action contract is one compact value: every action has an
     /// entry, each entry declares exactly the arguments that action takes (and the
@@ -21759,5 +21948,793 @@ mod tests {
             crate::tools::bun::bun_binary_path().is_some(),
             "the tool must be offered exactly while the managed bun runtime is present"
         );
+    }
+
+    /// A merge is written by a created workbook's own `merges` and by `merge_cells`
+    /// on an existing one, and a reading marks it either way. Merging never clears
+    /// what the covered cells hold, `unmerge_cells` takes exactly the range that is
+    /// merged, and a merge that overlaps one already there is refused naming it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_merges_are_written_read_back_and_unmerged() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "merged",
+                    "sheets": [
+                        { "name": "Data", "rows": [["Title", 1], ["x", 2]],
+                          "merges": ["A1:B1"] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let sheet = part_text(&created, "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(r#"<mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>"#),
+            "a created workbook lost its merge: {sheet}"
+        );
+        let text = converted_text(&ws, &created).await;
+        assert!(text.contains("A1: Title (merged A1:B1)"), "{text}");
+        assert!(
+            text.contains("B1: 1 (in merged range A1:B1)"),
+            "a covered cell lost its value: {text}"
+        );
+
+        // The edit names the same two cells from the other corners, and neither
+        // cell loses what it holds.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "path": created, "file_name": "merged-edit",
+                "edits": [{ "op": "merge_cells", "sheet": "Data", "range": "B2:A2" }],
+            }),
+        )
+        .await;
+        let edited = single(&reply);
+        let sheet = part_text(&edited, "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(
+                r#"<mergeCells count="2"><mergeCell ref="A1:B1"/><mergeCell ref="A2:B2"/></mergeCells>"#
+            ),
+            "the merge was not normalized and appended: {sheet}"
+        );
+        let text = converted_text(&ws, &edited).await;
+        assert!(text.contains("A2: x (merged A2:B2)"), "{text}");
+        assert!(
+            text.contains("B2: 2 (in merged range A2:B2)"),
+            "merging cleared a covered cell: {text}"
+        );
+
+        // A merge over a range the sheet has merged is refused, naming it.
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": edited.to_string_lossy(), "file_name": "no",
+                    "edits": [{ "op": "merge_cells", "sheet": "Data", "range": "B1:C5" }],
+                }),
+            )
+            .await
+            .expect_err("a merge overlapping one already there");
+        assert!(
+            err.to_string()
+                .contains(r#"overlaps A1:B1, which sheet "Data" already has merged"#),
+            "{err}"
+        );
+        // Merging the very range that is merged says so, rather than naming it twice.
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": edited.to_string_lossy(), "file_name": "no",
+                    "edits": [{ "op": "merge_cells", "sheet": "Data", "range": "A1:B1" }],
+                }),
+            )
+            .await
+            .expect_err("a merge of a range already merged");
+        assert!(
+            err.to_string()
+                .contains(r#"sheet "Data" already has A1:B1 merged"#),
+            "{err}"
+        );
+        // Removing a range the sheet has not merged names the merges it does have.
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": edited.to_string_lossy(), "file_name": "no",
+                    "edits": [{ "op": "unmerge_cells", "sheet": "Data", "range": "C1:D1" }],
+                }),
+            )
+            .await
+            .expect_err("a range the sheet has not merged");
+        let message = err.to_string();
+        assert!(
+            message.contains(r#"is not a merge in sheet "Data""#),
+            "{message}"
+        );
+        assert!(
+            message.contains("A1:B1, A2:B2"),
+            "the refusal must name the merges there: {message}"
+        );
+
+        // The merge goes, and a reading no longer marks it — while the cells it
+        // covered are what they were.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "path": edited, "file_name": "unmerged",
+                "edits": [{ "op": "unmerge_cells", "sheet": "Data", "range": "B1:A1" }],
+            }),
+        )
+        .await;
+        let unmerged = single(&reply);
+        let sheet = part_text(&unmerged, "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(r#"<mergeCells count="1"><mergeCell ref="A2:B2"/></mergeCells>"#),
+            "the merge was not removed: {sheet}"
+        );
+        let text = converted_text(&ws, &unmerged).await;
+        assert!(!text.contains("merged A1:B1"), "{text}");
+        assert!(
+            text.contains("A1: Title"),
+            "the untouched cell must keep its value: {text}"
+        );
+
+        // A created sheet's own merges are held to the same rules as an edit's: a
+        // single cell, two merges over one cell and an entry that is no range are
+        // all refused, so no workbook needing repair is produced.
+        for (merges, expected) in [
+            (
+                json!(["C3"]),
+                "covers one cell, and a merge needs at least two",
+            ),
+            (
+                json!(["A1:B1", "B1:C1"]),
+                "overlaps B1:C1, and a workbook with two merges over one cell needs repairing",
+            ),
+            (json!([7]), "must be a string"),
+        ] {
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "create", "format": "xlsx", "file_name": "no",
+                        "sheets": [{ "name": "Data", "rows": [[1]], "merges": merges }],
+                    }),
+                )
+                .await
+                .expect_err("a created sheet's merge the writer must refuse");
+            assert!(err.to_string().contains(expected), "{expected}: {err}");
+        }
+
+        // A block whose child is opened and never closed is one no reading can place a
+        // merge in: the merge is refused rather than written inside the open element,
+        // where the answer would claim a merge the produced file does not hold.
+        let damaged = with_parts(
+            &std::fs::read(&unmerged).expect("read the produced workbook"),
+            &[(
+                "xl/worksheets/sheet1.xml",
+                with_first(
+                    &part_text(&unmerged, "xl/worksheets/sheet1.xml"),
+                    "</mergeCells>",
+                    r#"<mergeCell ref="C3:D4"></mergeCells>"#,
+                )
+                .as_bytes(),
+            )],
+        );
+        let damaged = write_fixture(&ws, "unclosed-merge.xlsx", &damaged);
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": damaged.to_string_lossy(), "file_name": "no",
+                    "edits": [{ "op": "merge_cells", "sheet": "Data", "range": "E1:F2" }],
+                }),
+            )
+            .await
+            .expect_err("a merge block whose child never closes");
+        assert!(
+            err.to_string()
+                .contains("a <mergeCell> opened and never closed"),
+            "{err}"
+        );
+    }
+
+    /// A sheet joins at the end of the order and is then renamed and moved: every
+    /// part the call does not name is carried through, and the workbook's own
+    /// indices follow their sheets. A rename or a removal that leaves a reference
+    /// naming a sheet that is no longer there is reported as a partial answer, with
+    /// the reference itself untouched.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_sheets_are_added_renamed_moved_and_removed() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "sheets",
+                    "sheets": [
+                        { "name": "Data", "rows": [["a", { "formula": "SUM('Other'!A1)" }]] },
+                        { "name": "Other", "rows": [["q"]] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "path": created, "file_name": "sheets-edit",
+                "edits": [
+                    { "op": "add_sheet", "name": "Report" },
+                    { "op": "rename_sheet", "sheet": "Report", "name": "Summary" },
+                    { "op": "move_sheet", "sheet": "Summary", "to": 1 },
+                ],
+            }),
+        )
+        .await;
+        let moved = single(&reply);
+        let workbook = part_text(&moved, "xl/workbook.xml");
+        assert!(
+            workbook.contains(
+                r#"<sheets><sheet name="Summary" sheetId="3" r:id="rId4"/><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Other" sheetId="2" r:id="rId2"/></sheets>"#
+            ),
+            "the sheet was not added, renamed and moved in that order: {workbook}"
+        );
+        assert!(
+            zip_names(&moved).contains(&"xl/worksheets/sheet3.xml".to_owned()),
+            "the added sheet has no part"
+        );
+        let text = converted_text(&ws, &moved).await;
+        let summary = text.find(r#"Sheet "Summary":"#).expect("the added sheet");
+        let data = text.find(r#"Sheet "Data":"#).expect("Data");
+        assert!(summary < data, "the moved sheet is not read first: {text}");
+
+        // The rename runs, leaves the formula spelling the old name, and says so.
+        let answer = confined_document()
+            .execute_answer(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": moved.to_string_lossy(),
+                    "file_name": "renamed",
+                    "edits": [{ "op": "rename_sheet", "sheet": "Other", "name": "Archive" }],
+                }),
+            )
+            .await
+            .expect("the rename must run");
+        assert!(
+            answer.partial,
+            "a rename that orphans a reference must not report success: {}",
+            answer.text
+        );
+        assert!(
+            answer.text.contains(r#"still name "Other""#),
+            "{}",
+            answer.text
+        );
+        let renamed = single(&answer.text);
+        // The created formula's quotes reach the part as `&apos;`, the way this
+        // kit's own writer escapes them, and are read back as the name they spell.
+        assert!(
+            part_text(&renamed, "xl/worksheets/sheet1.xml")
+                .contains("<f>SUM(&apos;Other&apos;!A1)</f>"),
+            "a reference is never rewritten by a rename"
+        );
+        assert!(
+            part_text(&renamed, "xl/workbook.xml").contains(r#"name="Archive""#),
+            "the sheet itself was not renamed"
+        );
+
+        // The removal runs, the sheet's own parts go with it, and the reference
+        // the sheet's own name held is reported the same way.
+        let answer = confined_document()
+            .execute_answer(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": created.to_string_lossy(),
+                    "file_name": "dropped",
+                    "edits": [{ "op": "delete_sheet", "sheet": "Other" }],
+                }),
+            )
+            .await
+            .expect("the delete must run");
+        assert!(
+            answer.partial,
+            "a delete that orphans a reference must not report success: {}",
+            answer.text
+        );
+        assert!(
+            answer
+                .text
+                .contains("is gone, but the workbook's formulas still name it"),
+            "{}",
+            answer.text
+        );
+        let dropped = single(&answer.text);
+        assert!(
+            !part_text(&dropped, "xl/workbook.xml").contains("Other"),
+            "the sheet element stayed"
+        );
+        let names = zip_names(&dropped);
+        assert!(
+            !names.iter().any(|name| name == "xl/worksheets/sheet2.xml"),
+            "the removed sheet's part stayed: {names:?}"
+        );
+        assert!(
+            !part_text(&dropped, "[Content_Types].xml").contains("sheet2.xml"),
+            "the removed sheet's content type stayed"
+        );
+
+        // A hidden sheet is an ordinary sheet in the order, but the workbook keeps
+        // one visible tab and one valid active sheet.
+        let workbook = part_text(&created, "xl/workbook.xml");
+        let hidden = with_first(
+            &workbook,
+            r#"<sheet name="Other""#,
+            r#"<sheet name="Other" state="hidden""#,
+        );
+        let package = with_parts(
+            &std::fs::read(&created).expect("read the created workbook"),
+            &[("xl/workbook.xml", hidden.as_bytes())],
+        );
+        let hidden_book = write_fixture(&ws, "hidden.xlsx", &package);
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": hidden_book.to_string_lossy(),
+                    "file_name": "no",
+                    "edits": [{ "op": "delete_sheet", "sheet": "Data" }],
+                }),
+            )
+            .await
+            .expect_err("the only visible sheet");
+        assert!(
+            err.to_string()
+                .contains("is the workbook's only visible sheet"),
+            "{err}"
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "path": hidden_book.to_string_lossy(),
+                "file_name": "hidden-drop",
+                "edits": [{ "op": "delete_sheet", "sheet": "Other" }],
+            }),
+        )
+        .await;
+        assert!(
+            part_text(&single(&reply), "xl/workbook.xml").contains(r#"name="Data""#),
+            "a hidden sheet is an ordinary sheet and can go"
+        );
+
+        // A chart sheet is a `<sheet>` in the same list and not a worksheet:
+        // naming one is refused with that reason, never rewritten as a worksheet.
+        let workbook = part_text(&created, "xl/workbook.xml");
+        let chart_sheet = with_first(
+            &workbook,
+            "</sheets>",
+            r#"<sheet name="Chart1" sheetId="9" r:id="rId8"/></sheets>"#,
+        );
+        let rels = part_text(&created, "xl/_rels/workbook.xml.rels");
+        let chart_rel = with_first(
+            &rels,
+            "</Relationships>",
+            r#"<Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>"#,
+        );
+        let types = part_text(&created, "[Content_Types].xml");
+        let chart_type = with_first(
+            &types,
+            "</Types>",
+            r#"<Override PartName="/xl/chartsheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml"/></Types>"#,
+        );
+        let package = with_parts(
+            &std::fs::read(&created).expect("read the created workbook"),
+            &[
+                ("xl/workbook.xml", chart_sheet.as_bytes()),
+                ("xl/_rels/workbook.xml.rels", chart_rel.as_bytes()),
+                ("[Content_Types].xml", chart_type.as_bytes()),
+                (
+                    "xl/chartsheets/sheet1.xml",
+                    br#"<?xml version="1.0"?><chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#,
+                ),
+            ],
+        );
+        let chart_book = write_fixture(&ws, "chart.xlsx", &package);
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "xlsx_edit", "path": chart_book.to_string_lossy(),
+                    "file_name": "no",
+                    "edits": [{ "op": "merge_cells", "sheet": "chart1", "range": "A1:B2" }],
+                }),
+            )
+            .await
+            .expect_err("a chart sheet is no worksheet");
+        assert!(
+            err.to_string()
+                .contains("is a chart sheet, and this tool edits worksheets only"),
+            "{err}"
+        );
+
+        // The workbook's own indices follow their sheets: the active tab and a
+        // sheet-scoped name keep naming the sheets they named, and the name scoped
+        // to the deleted sheet goes with it.
+        let workbook = part_text(&created, "xl/workbook.xml");
+        let indexed = with_first(
+            &workbook,
+            "<sheets>",
+            r#"<bookViews><workbookView activeTab="1" firstSheet="1"/></bookViews><sheets>"#,
+        );
+        let indexed = with_first(
+            &indexed,
+            "</sheets>",
+            r#"</sheets><definedNames><definedName name="Local" localSheetId="0">Data!$A$1</definedName><definedName name="Moved" localSheetId="1">Other!$A$1</definedName></definedNames>"#,
+        );
+        let package = with_parts(
+            &std::fs::read(&created).expect("read the created workbook"),
+            &[("xl/workbook.xml", indexed.as_bytes())],
+        );
+        let indexed_book = write_fixture(&ws, "indexed.xlsx", &package);
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "path": indexed_book.to_string_lossy(),
+                "file_name": "indexed-drop",
+                "edits": [{ "op": "delete_sheet", "sheet": "Data" }],
+            }),
+        )
+        .await;
+        let indexed_workbook = part_text(&single(&reply), "xl/workbook.xml");
+        assert!(
+            indexed_workbook.contains(r#"<workbookView activeTab="0" firstSheet="0"/>"#),
+            "the active tab did not follow its sheet: {indexed_workbook}"
+        );
+        assert!(
+            indexed_workbook
+                .contains(r#"<definedName name="Moved" localSheetId="0">Other!$A$1</definedName>"#),
+            "a sheet-scoped name did not follow its sheet: {indexed_workbook}"
+        );
+        assert!(
+            !indexed_workbook.contains(r#"name="Local""#),
+            "the name scoped to the deleted sheet stayed: {indexed_workbook}"
+        );
+
+        // The workbook's only sheet, a name already used and a position it does
+        // not have are all refused.
+        let alone = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "alone",
+                    "sheets": [{ "name": "Only", "rows": [["a"]] }],
+                }),
+            )
+            .await,
+        );
+        for (edits, expected) in [
+            (
+                json!([{ "op": "delete_sheet", "sheet": "Only" }]),
+                "is the workbook's only sheet",
+            ),
+            (
+                json!([{ "op": "move_sheet", "sheet": "Only", "to": 2 }]),
+                "no position 2: this workbook has 1 sheet",
+            ),
+            (
+                json!([{ "op": "add_sheet", "name": "only" }]),
+                "already exists",
+            ),
+        ] {
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "xlsx_edit", "path": alone.to_string_lossy(),
+                        "file_name": "no", "edits": edits,
+                    }),
+                )
+                .await
+                .expect_err("a sheet operation the workbook cannot take");
+            assert!(err.to_string().contains(expected), "{expected}: {err}");
+        }
+
+        // A file may spell `<sheet>` with a close tag. The element is spliced whole
+        // wherever a sheet is moved or removed, so no close is left behind and the
+        // workbook stays one a reader opens.
+        let workbook = part_text(&created, "xl/workbook.xml");
+        let paired = with_first(
+            &workbook,
+            r#"<sheet name="Data" sheetId="1" r:id="rId1"/>"#,
+            r#"<sheet name="Data" sheetId="1" r:id="rId1"></sheet>"#,
+        );
+        let paired = with_first(
+            &paired,
+            r#"<sheet name="Other" sheetId="2" r:id="rId2"/>"#,
+            r#"<sheet name="Other" sheetId="2" r:id="rId2"></sheet>"#,
+        );
+        let package = with_parts(
+            &std::fs::read(&created).expect("read the created workbook"),
+            &[("xl/workbook.xml", paired.as_bytes())],
+        );
+        let paired_book = write_fixture(&ws, "paired.xlsx", &package);
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "path": paired_book.to_string_lossy(),
+                "file_name": "paired",
+                "edits": [
+                    { "op": "move_sheet", "sheet": "Other", "to": 1 },
+                    { "op": "delete_sheet", "sheet": "Data" },
+                ],
+            }),
+        )
+        .await;
+        let paired_workbook = part_text(&single(&reply), "xl/workbook.xml");
+        assert_eq!(
+            paired_workbook.matches("</sheet>").count(),
+            1,
+            "a paired <sheet> must be spliced whole: {paired_workbook}"
+        );
+        assert!(
+            paired_workbook.contains(r#"<sheet name="Other" sheetId="2" r:id="rId2"></sheet>"#),
+            "{paired_workbook}"
+        );
+
+        // Two quoted references, in the escaped spelling the writer gives a quote:
+        // each is read as the name it means, so a rename or a removal never reports
+        // success while a formula of the workbook still names the vanished sheet.
+        let two = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "refs",
+                    "sheets": [
+                        { "name": "Report",
+                          "rows": [["a", { "formula": "SUM('Left Side'!A1,'Right Side'!B2)" }]] },
+                        { "name": "Left Side", "rows": [["b", 1]] },
+                        { "name": "Right Side", "rows": [["c", 2]] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        for (index, (edits, expected)) in [
+            (
+                json!([{ "op": "rename_sheet", "sheet": "Left Side", "name": "L2" }]),
+                r#"still name "Left Side""#,
+            ),
+            (
+                json!([{ "op": "delete_sheet", "sheet": "Right Side" }]),
+                "still name it",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let answer = confined_document()
+                .execute_answer(
+                    &ws,
+                    json!({
+                        "action": "xlsx_edit", "path": two.to_string_lossy(),
+                        "file_name": format!("refs-out-{index}"), "edits": edits,
+                    }),
+                )
+                .await
+                .expect("the edit must run");
+            assert!(
+                answer.partial && answer.text.contains(expected),
+                "a reference left naming a sheet that is gone: {}",
+                answer.text
+            );
+        }
+
+        // The 3-D spelling Excel writes when a name needs quoting wraps BOTH ends in
+        // the one quoted qualifier: either end names the range, so a rename of the
+        // first and a removal of the last are both reported rather than passed off as
+        // success.
+        let span = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "span",
+                    "sheets": [
+                        { "name": "Report",
+                          "rows": [["a", { "formula": "SUM('Week 1:Week 5'!D5)" }]] },
+                        { "name": "Week 1", "rows": [["b", 1]] },
+                        { "name": "Week 5", "rows": [["c", 2]] },
+                    ],
+                }),
+            )
+            .await,
+        );
+        for (index, (edits, expected)) in [
+            (
+                json!([{ "op": "rename_sheet", "sheet": "Week 1", "name": "W2" }]),
+                r#"still name "Week 1""#,
+            ),
+            (
+                json!([{ "op": "delete_sheet", "sheet": "Week 5" }]),
+                "still name it",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let answer = confined_document()
+                .execute_answer(
+                    &ws,
+                    json!({
+                        "action": "xlsx_edit", "path": span.to_string_lossy(),
+                        "file_name": format!("span-out-{index}"), "edits": edits,
+                    }),
+                )
+                .await
+                .expect("the edit must run");
+            assert!(
+                answer.partial && answer.text.contains(expected),
+                "a quoted 3-D reference left naming a sheet that is gone: {}",
+                answer.text
+            );
+        }
+    }
+
+    /// A picture placed in a sheet is anchored by that sheet's OWN drawing: the
+    /// worksheet gains a `<drawing>`, the drawing part holds a one-cell anchor at the
+    /// cell the caller named, and the drawing's relationship names the media part.
+    /// A side named is points, one side alone keeps the picture's proportions, and
+    /// neither named is the picture's own size.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn xlsx_edit_anchors_a_picture_in_the_sheet_drawing() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let image = ws.as_path().join("mark.png");
+        std::fs::write(&image, noisy_png(40, 20)).expect("write png");
+        let created = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "xlsx", "file_name": "pictured",
+                    "sheets": [{ "name": "Data", "rows": [["a"]] }],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "xlsx_edit", "path": created, "file_name": "pictured-edit",
+                "edits": [
+                    { "op": "add_image", "sheet": "Data", "cell": "C7",
+                      "image": image.to_string_lossy() },
+                    { "op": "add_image", "sheet": "Data", "cell": "E2",
+                      "image": image.to_string_lossy(), "width": 100 },
+                ],
+            }),
+        )
+        .await;
+        let output = single(&reply);
+        let sheet = part_text(&output, "xl/worksheets/sheet1.xml");
+        assert!(
+            sheet.contains(r#"<drawing r:id="rId1"/>"#),
+            "the sheet must name its own drawing: {sheet}"
+        );
+        let sheet_rels = part_text(&output, "xl/worksheets/_rels/sheet1.xml.rels");
+        assert!(
+            sheet_rels.contains(
+                r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml""#
+            ),
+            "{sheet_rels}"
+        );
+        let drawing = part_text(&output, "xl/drawings/drawing1.xml");
+        // A 40×20 picture at its own size is 40 px and 20 px of 9525 EMU each, and
+        // the anchor is C7's own zero-based cell.
+        assert!(
+            drawing.contains(
+                r#"<xdr:oneCellAnchor><xdr:from><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>6</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="381000" cy="190500"/>"#
+            ),
+            "{drawing}"
+        );
+        // A 100 pt width is 1_270_000 EMU and keeps the 2:1 proportions.
+        assert!(
+            drawing.contains(
+                r#"<xdr:oneCellAnchor><xdr:from><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="1270000" cy="635000"/>"#
+            ),
+            "{drawing}"
+        );
+        let drawing_rels = part_text(&output, "xl/drawings/_rels/drawing1.xml.rels");
+        assert!(
+            drawing_rels.contains(
+                r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png""#
+            ) && drawing_rels.contains("Target=\"../media/image2.png\""),
+            "{drawing_rels}"
+        );
+        let names = zip_names(&output);
+        assert!(
+            names.contains(&"xl/media/image1.png".to_owned())
+                && names.contains(&"xl/media/image2.png".to_owned()),
+            "the pictures are not media parts: {names:?}"
+        );
+        let types = part_text(&output, "[Content_Types].xml");
+        assert!(
+            types.contains(
+                r#"<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#
+            ),
+            "{types}"
+        );
+        assert!(
+            types
+                .contains(r#"<Override PartName="/xl/media/image1.png" ContentType="image/png"/>"#),
+            "{types}"
+        );
+        assert!(
+            converted_text(&ws, &output).await.contains("A1: a"),
+            "a placed picture disturbed the sheet's cells"
+        );
+    }
+
+    /// The xlsx edit vocabulary takes the shapes the sheet operations state, and a
+    /// merge or a name a workbook refuses is refused here, before a runtime is
+    /// spawned; a `null` side is absent, the way it is for every edit.
+    #[test]
+    fn the_xlsx_edit_vocabulary_takes_the_new_sheet_shapes() {
+        use crate::ooxml::Family;
+        let edits = validate_edits(
+            Family::Xlsx,
+            &json!({ "edits": [
+                { "op": "merge_cells", "sheet": "S", "range": "B2:C3" },
+                { "op": "unmerge_cells", "sheet": "S", "range": "C3:B2" },
+                { "op": "add_sheet", "name": "New" },
+                { "op": "rename_sheet", "sheet": "S", "name": "Renamed" },
+                { "op": "delete_sheet", "sheet": "S" },
+                { "op": "move_sheet", "sheet": "S", "to": 2 },
+                { "op": "add_image", "sheet": "S", "cell": "D4", "image": "a.png",
+                  "width": null, "height": 40 },
+            ] }),
+        )
+        .expect("every op the vocabulary names");
+        assert_eq!(
+            edits[6],
+            json!({ "op": "add_image", "sheet": "S", "cell": "D4", "image": "a.png",
+                    "height": 40 }),
+            "a null side is absent"
+        );
+        for (edit, expected) in [
+            (
+                json!({ "op": "merge_cells", "sheet": "S", "range": "A1" }),
+                "covers one cell",
+            ),
+            (
+                json!({ "op": "add_sheet", "name": "a:b" }),
+                "must not contain",
+            ),
+            (
+                json!({ "op": "move_sheet", "sheet": "S", "to": 0 }),
+                "at least 1",
+            ),
+            (
+                json!({ "op": "add_image", "sheet": "S", "cell": "nope", "image": "a.png" }),
+                "A1 address",
+            ),
+        ] {
+            let err = validate_edits(Family::Xlsx, &json!({ "edits": [edit] }))
+                .expect_err("a shape the writer cannot render");
+            assert!(err.to_string().contains(expected), "{expected}: {err}");
+        }
     }
 }
