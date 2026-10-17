@@ -118,16 +118,19 @@ pub(crate) fn ppt_marks() -> &'static PptMarks {
     })
 }
 
-/// The two headers a presentation reader prints a slide's own block and its
-/// speaker-notes block under, each with `{n}` for the slide's number. The
-/// editing side names the same headers in its refusals, so one statement of
-/// them lives in [`RULES_JSON`] rather than being spelled twice and drifting.
+/// The headers a presentation reader prints a slide's own block, its
+/// speaker-notes block and its comments under, each with `{n}` for the slide's
+/// number. The editing side names the same headers in its refusals, so one
+/// statement of them lives in [`RULES_JSON`] rather than being spelled twice and
+/// drifting.
 #[derive(serde::Deserialize)]
 pub(crate) struct PptSlideLabels {
     /// The header one slide's block is printed under.
     pub(crate) slide: String,
     /// The header a slide's speaker notes are printed under.
     pub(crate) notes: String,
+    /// The header the comments and replies on a slide print under.
+    pub(crate) comments: String,
 }
 
 /// [`PptSlideLabels`] out of [`rules`], as [`ppt_marks`] reads its own.

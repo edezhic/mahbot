@@ -1600,6 +1600,8 @@ const STRICT_RELATIONSHIPS = "http://purl.oclc.org/ooxml/officeDocument/relation
 // its content, a field marker and a merge annotation sit inside a line — and a
 // refusal names the longest mark a find carries (a find of the whole `[comment 1
 // starts]` names that rather than the shorter `[comment 1]` written inside it).
+// A link's mark runs to the line's last `)`, since the address it names may
+// itself hold one.
 // Built once and matched with `matchAll`, which clones a global pattern, so the
 // global flag carries no `lastIndex` from one `find` to the next.
 const DOCX_MARKS = RULES.docx_marks.map(({ pattern }) => new RegExp(pattern, "g"));
@@ -6248,19 +6250,20 @@ function mapSlideParagraphs(xml, change) {
   return out;
 }
 
-// The labels the reader prints for a slide — its number and its marks — which are
-// not the slide's own text. The two label templates are the reader's own
-// (`src/reader_output.rs` builds them from the same `rules.json` entries) and the
-// marks come from the kit's own list, so a refusal names the words the reader
-// really printed.
+// The labels the reader prints for a slide — its number, its notes, its comments
+// and its marks — which are not the slide's own text. The label templates are the
+// reader's own (`src/reader_output.rs` builds them from the same `rules.json`
+// entries) and the marks come from the kit's own list, so a refusal names the
+// words the reader really printed.
 const slideLabels = (slide) => [
   RULES.ppt_slide_labels.slide.replace("{n}", slide),
   RULES.ppt_slide_labels.notes.replace("{n}", slide),
+  RULES.ppt_slide_labels.comments.replace("{n}", slide),
   ...Object.values(RULES.ppt_marks),
 ];
 
-// The reader's two slide-label templates with any slide's number in them, so a
-// label naming a number other than the addressed slide's is recognised too.
+// The reader's slide-label templates with any slide's number in them, so a label
+// naming a number other than the addressed slide's is recognised too.
 const SLIDE_LABEL_PATTERNS = Object.values(RULES.ppt_slide_labels)
   .map((template) => new RegExp(`^${escapeRegExp(template).replace(escapeRegExp("{n}"), "\\d+")}`));
 

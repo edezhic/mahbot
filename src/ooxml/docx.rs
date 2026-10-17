@@ -15,6 +15,13 @@
 //!   continuation names the cell whose value it carries without repeating it.
 //!   A table inside a cell is read — the cell token carries its own `Table N:`
 //!   block — but the row-per-line shape has no room to indent it.
+//! - **Headings** by the level the paragraph states — its own outline level or
+//!   the one its style chain names — printed as `[heading N]` at the start of
+//!   the paragraph's own line, the line a block it holds opens included, and
+//!   never on a heading whose paragraph printed nothing.
+//! - **Hyperlinks** by their text with the address they point at appended as
+//!   `(link: …)`: an anchor inside the same document reads as `(link: internal)`,
+//!   and a link whose address cannot be established reads as its text alone.
 //! - **Tracked changes** as inline markers rather than as final-looking text:
 //!   a wrapper around the content it revises, a `¶`-suffixed marker for a
 //!   paragraph mark, an annotation on the table, the row or the cell whose own
@@ -76,13 +83,14 @@
 use super::chart;
 use super::{
     DocOutcome, Family, Relationship, SkippedImages, append_entity, attr, ensure_out_dir, part_dir,
-    read_relationships, read_zip_entry, relationship_targets, relationships, rels_part_of,
-    resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
+    read_relationships, read_zip_entry, related_part, relationship_targets, relationships,
+    rels_part_of, resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
 };
 use crate::reader_output::{
     TEXT_BOX, WORD_COMMENT, WORD_ENDNOTE, WORD_FOOTER, WORD_FOOTNOTE, WORD_HEADER, labeled_block,
     lines_of, text_lines,
 };
+use crate::util::{one_line, truncate};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use std::collections::{HashMap, HashSet};
@@ -123,12 +131,25 @@ const DOCX_EMBEDDINGS_PREFIX: &str = "word/embeddings/";
 /// parts are named there, never in the body itself.
 const DOCX_RELS_PART: &str = "word/_rels/document.xml.rels";
 
+/// The conventional part holding the package's styles, used when the body's
+/// relationships name none: a style id still names a heading through its own
+/// spelling.
+const DOCX_STYLES_PART: &str = "word/styles.xml";
+
 /// Base a Word relationship target resolves against.
 const DOCX_BASE: &str = "word/";
+
+/// The most styles a paragraph's `w:basedOn` chain is followed through: a
+/// document-controlled chain must not decide how long the walk looks.
+const MAX_STYLE_CHAIN: usize = 10;
 
 /// A field instruction is reported up to this many characters — a runaway
 /// instruction must not dominate the text.
 const MAX_FIELD_INSTRUCTION_CHARS: usize = 80;
+
+/// A link's address is reported up to this many characters — it is
+/// document-controlled, and must not dominate the line its text stands on.
+const MAX_LINK_TARGET_CHARS: usize = 300;
 
 // ── Events ──────────────────────────────────────────────────────
 
@@ -254,6 +275,18 @@ struct Sink {
     charts: Vec<String>,
 }
 
+/// One open `w:p`: the paragraph-mark markers printed at its end and the
+/// heading its own properties (or its style) give it.
+#[derive(Default)]
+struct Para {
+    marks: Vec<&'static str>,
+    /// The `w:outlineLvl` the paragraph states, clamped to 0..=9 — 9 is the
+    /// schema's body text, which overrides what the paragraph's style says.
+    outline: Option<usize>,
+    /// The `w:pStyle` id the paragraph names.
+    style: Option<String>,
+}
+
 /// The state of one package walk.
 struct Word {
     /// The relationships of the part being walked: relationship id -> the part it
@@ -267,12 +300,16 @@ struct Word {
     footnotes: Notes,
     endnotes: Notes,
     comments: Notes,
+    /// The package's styles part, read once: a paragraph's style id names a
+    /// heading through it.
+    styles: Styles,
     /// Text sinks; text always goes to the last one, and so do the chart parts
     /// whose content it shows, so a block that is dropped takes its charts with
     /// it.
     buffers: Vec<Sink>,
-    /// Paragraph-mark markers, one entry per open `w:p`.
-    paras: Vec<Vec<&'static str>>,
+    /// The open `w:p`s, innermost last, with the markers each paragraph prints at
+    /// its end and the heading its own properties or its style name.
+    paras: Vec<Para>,
     /// Open tables, innermost last, so a nested table works.
     tables: Vec<Table>,
     /// Open cells, innermost last.
@@ -332,6 +369,7 @@ impl Word {
             footnotes: Notes::load(NoteKind::Footnote, &footnotes_part, archive),
             endnotes: Notes::load(NoteKind::Endnote, &endnotes_part, archive),
             comments: Notes::load(NoteKind::Comment, &comments_part, archive),
+            styles: Styles::load(rels, archive),
             buffers: Vec::new(),
             paras: Vec::new(),
             tables: Vec::new(),
@@ -556,21 +594,45 @@ impl Word {
 
     // ── Body content ────────────────────────────────────────────
 
-    /// One `w:p`: its content, then its paragraph-mark markers, then the line
-    /// end. An empty element is already over — reading a matching `End` would
-    /// take the enclosing element's.
+    /// One `w:p`: its content, the heading its properties give it at the start
+    /// of the paragraph's own line, then its paragraph-mark markers, then the
+    /// line end. An empty element is already over — reading a matching `End`
+    /// would take the enclosing element's.
     fn paragraph(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         if empty {
             self.end_line();
             return Ok(());
         }
-        self.paras.push(Vec::new());
+        let start = self.buffers.last().map_or(0, |sink| sink.text.len());
+        self.paras.push(Para::default());
         let result = self.content(reader, level + 1, Ctx::Flow);
-        for mark in self.paras.pop().unwrap_or_default() {
+        let para = self.paras.pop().unwrap_or_default();
+        // The mark opens the first line the paragraph really printed — the line a
+        // block it holds opens, or the text after a leading break — and a heading
+        // that printed only whitespace gets none.
+        if let Some(heading) = self.heading_level(&para)
+            && let Some(sink) = self.buffers.last_mut().map(|sink| &mut sink.text)
+            && let Some(at) = sink[start..]
+                .find(|character: char| !character.is_whitespace())
+                .map(|offset| start + offset)
+        {
+            sink.insert_str(at, &format!("[heading {heading}] "));
+        }
+        for mark in para.marks {
             self.push_str(mark);
         }
         self.end_line();
         result
+    }
+
+    /// The heading level `para` states: its own `w:outlineLvl` — where the
+    /// schema's body-text value suppresses the style entirely — or else the
+    /// level its style chain names.
+    fn heading_level(&self, para: &Para) -> Option<usize> {
+        match para.outline {
+            Some(outline) => outline_heading(outline),
+            None => self.styles.level(para.style.as_deref()),
+        }
     }
 
     /// The character data of a `w:t`/`w:delText`. Both are ordinary text: a
@@ -653,14 +715,15 @@ impl Word {
                 self.ignored(reader, level, empty)
             }
             b"txbxContent" => self.text_box(reader, level, empty),
+            b"hyperlink" => self.hyperlink(reader, level, elem, empty),
             b"chart" => {
                 self.chart(elem);
                 self.ignored(reader, level, empty)
             }
             b"AlternateContent" => self.alternate_content(reader, level, empty),
             // Everything else is a plain container (`w:document`, `w:body`,
-            // `w:r`, `w:hyperlink`, `w:smartTag`, `w:sdt`, `w:drawing`,
-            // `w:pict`, the bookmarks, …): its children are body content too.
+            // `w:r`, `w:smartTag`, `w:sdt`, `w:drawing`, `w:pict`, the
+            // bookmarks, …): its children are body content too.
             _ => self.flow(reader, level, empty),
         }
     }
@@ -675,6 +738,70 @@ impl Word {
             b"noBreakHyphen" => self.push_str("-"),
             _ => {}
         }
+    }
+
+    /// `w:hyperlink`: the link's content as flow, with the address it points at
+    /// shown after the link's own text. A link whose content is a picture alone
+    /// still shows its address — the link is a way to reach something, and the
+    /// address is what the reading can say about it — and one whose address
+    /// cannot be established reads as its text alone.
+    fn hyperlink(
+        &mut self,
+        reader: &mut Xml<'_>,
+        level: usize,
+        elem: &Elem,
+        empty: bool,
+    ) -> Result<(), Fault> {
+        let address = self.link_address(elem);
+        let start = self.buffers.last().map_or(0, |sink| sink.text.len());
+        let result = self.flow(reader, level, empty);
+        if let (Some(address), Some(sink)) =
+            (address, self.buffers.last_mut().map(|sink| &mut sink.text))
+        {
+            // The mark opens the line after the link's content: a space after its
+            // text, and a line of its own after a block the link holds (a text box
+            // printed inside it, whose inner lines are not the link's own line). A
+            // link the flow printed nothing in front of — a picture-only link, one
+            // at the start of its paragraph — needs neither.
+            let spans_lines = sink.len() > start && sink[start..].contains('\n');
+            if !sink.is_empty() && !sink.ends_with('\n') {
+                sink.push(if spans_lines { '\n' } else { ' ' });
+            }
+            let _ = write!(sink, "(link: {address})");
+        }
+        result
+    }
+
+    /// The address a `w:hyperlink` points at. A relationship target is the
+    /// document's own string — never resolved against the part's directory,
+    /// which would mangle an external URL — with the anchor Word appends when a
+    /// link names both; an anchor alone, with no relationship at all, is a link
+    /// inside the document. A relationship id whose target the part's
+    /// relationships do not establish names no address at all — not one invented
+    /// from another part's relationships, and not `internal` either, which would
+    /// be a claim the link does not make.
+    ///
+    /// The relationships are the ones of the part being walked, rebound by
+    /// [`Self::enter_story_part`]: a link in a header, footer, footnote or
+    /// comment resolves through that part's own `.rels`.
+    fn link_address(&self, elem: &Elem) -> Option<String> {
+        let anchor = elem
+            .attr("anchor")
+            .map(str::trim)
+            .filter(|anchor| !anchor.is_empty())
+            .map(|anchor| one_line(anchor.to_owned()));
+        let Some(id) = elem.attr("id") else {
+            return anchor.map(|_| "internal".to_owned());
+        };
+        let target = self.rel(id).map(str::trim)?;
+        if target.is_empty() {
+            return None;
+        }
+        let mut address = one_line(target.to_owned());
+        if let Some(anchor) = anchor {
+            let _ = write!(address, "#{anchor}");
+        }
+        Some(truncate(&address, MAX_LINK_TARGET_CHARS))
     }
 
     /// The chart a `c:chart` reference names, printed where the drawing that holds
@@ -713,8 +840,8 @@ impl Word {
         }
     }
 
-    /// `w:pPr`: the paragraph mark's formatting, and the section properties a
-    /// paragraph can carry.
+    /// `w:pPr`: the paragraph mark's formatting, the heading the paragraph
+    /// states, and the section properties a paragraph can carry.
     fn paragraph_props(
         &mut self,
         reader: &mut Xml<'_>,
@@ -723,10 +850,25 @@ impl Word {
         empty: bool,
     ) -> Result<(), Fault> {
         match elem.name.as_slice() {
-            b"rPr" => self.props(reader, level, Ctx::MarkProps, empty),
-            b"sectPr" => self.props(reader, level, Ctx::SectionProps, empty),
-            _ => self.ignored(reader, level, empty),
+            b"pStyle" => {
+                if let Some(para) = self.paras.last_mut() {
+                    para.style = elem
+                        .attr("val")
+                        .map(str::trim)
+                        .filter(|style| !style.is_empty())
+                        .map(str::to_owned);
+                }
+            }
+            b"outlineLvl" => {
+                if let Some(para) = self.paras.last_mut() {
+                    para.outline = outline_level(elem);
+                }
+            }
+            b"rPr" => return self.props(reader, level, Ctx::MarkProps, empty),
+            b"sectPr" => return self.props(reader, level, Ctx::SectionProps, empty),
+            _ => {}
         }
+        self.ignored(reader, level, empty)
     }
 
     /// `w:pPr/w:rPr`: an insertion or deletion here is the paragraph mark's
@@ -894,8 +1036,8 @@ impl Word {
     /// The marker a paragraph mark carries, at the end of the paragraph being
     /// read.
     fn para_mark(&mut self, mark: &'static str) {
-        if let Some(marks) = self.paras.last_mut() {
-            marks.push(mark);
+        if let Some(para) = self.paras.last_mut() {
+            para.marks.push(mark);
         }
     }
 
@@ -1792,17 +1934,16 @@ impl NoteKind {
 /// type, or the conventional name the kind's shared entry carries.
 fn notes_part(rels: &[Relationship], kind: NoteKind) -> String {
     let entry = crate::docgen::docx_peripheral_part(kind.marker());
-    rels.iter()
-        .find(|rel| rel.kind.ends_with(&entry.rel))
-        .map_or_else(
-            || {
-                entry
-                    .part
-                    .clone()
-                    .expect("a note kind's shared entry names its conventional part")
-            },
-            |rel| resolve_part(DOCX_BASE, &rel.target),
-        )
+    let conventional = entry
+        .part
+        .as_deref()
+        .expect("a note kind's shared entry names its conventional part");
+    related_part(
+        rels,
+        DOCX_BASE,
+        |kind| kind.ends_with(&entry.rel),
+        conventional,
+    )
 }
 
 /// One notes part: the definitions it holds, the numbering its references
@@ -1927,6 +2068,201 @@ impl PartRefs {
             labels: vec![label],
         });
     }
+}
+
+// ── Styles ──────────────────────────────────────────────────────
+
+/// The package's styles part: what each style says about itself, read once so a
+/// paragraph's `w:pStyle` resolves to a heading through its `w:basedOn` chain.
+#[derive(Default)]
+struct Styles {
+    /// Style id -> the style's head: its outline level, its name and the style
+    /// it is based on.
+    defs: HashMap<String, StyleDef>,
+}
+
+/// The parts of one `w:style` that name a heading.
+#[derive(Default)]
+struct StyleDef {
+    /// The `w:pPr/w:outlineLvl` the style states, clamped to 0..=9.
+    outline: Option<usize>,
+    /// The `w:name` the style carries.
+    name: Option<String>,
+    /// The `w:basedOn` style id the chain continues through.
+    based_on: Option<String>,
+}
+
+impl Styles {
+    /// Read the styles part the body's relationships name, or the conventional
+    /// one when they name none. A part that is missing, or one that will not
+    /// parse, is empty by design: the level a style would have given a paragraph
+    /// is then lost unreported, and the paragraph reads as its own outline level
+    /// or style id says — the same silence the part's relationships get, so a
+    /// package that lost its styles reads as a document without headings rather
+    /// than as one that could not be read.
+    fn load<R: Read + Seek>(rels: &[Relationship], archive: &mut ZipArchive<R>) -> Self {
+        let part = related_part(
+            rels,
+            DOCX_BASE,
+            |kind| kind.ends_with("/styles"),
+            DOCX_STYLES_PART,
+        );
+        read_zip_entry(archive, &part)
+            .bytes()
+            .map_or_else(Self::default, |xml| Self::parse(&xml))
+    }
+
+    /// Parse a styles part: one scan that keeps the style it is inside and
+    /// collects each style as it closes. A part that cannot be read as XML is
+    /// empty.
+    fn parse(xml: &[u8]) -> Self {
+        let mut styles = Self::default();
+        let mut scan = StyleScan::default();
+        let mut reader = Reader::from_reader(xml);
+        let mut buffer = Vec::new();
+        loop {
+            let Ok(event) = reader.read_event_into(&mut buffer) else {
+                return Self::default();
+            };
+            if let Some(closed) = scan.note(&event) {
+                styles.defs.insert(closed.0, closed.1);
+            }
+            if matches!(event, Event::Eof) {
+                break;
+            }
+            buffer.clear();
+        }
+        styles
+    }
+
+    /// The heading level `style` names: what the style itself states — the
+    /// outline level it carries, its name, its own id — else what the style it is
+    /// based on states, up to [`MAX_STYLE_CHAIN`]. An id the package does not
+    /// define still names a heading through its own spelling, which is the shape
+    /// the document kit writes (`Heading1`, with no styles part at all).
+    fn level(&self, style: Option<&str>) -> Option<usize> {
+        let mut id = style?;
+        for _ in 0..MAX_STYLE_CHAIN {
+            let Some(style) = self.defs.get(id) else {
+                return heading_name_level(id);
+            };
+            if let Some(outline) = style.outline {
+                return outline_heading(outline);
+            }
+            if let Some(level) = style.name.as_deref().and_then(heading_name_level) {
+                return Some(level);
+            }
+            if let Some(level) = heading_name_level(id) {
+                return Some(level);
+            }
+            id = style.based_on.as_deref()?;
+        }
+        None
+    }
+}
+
+/// The state a styles-part scan is inside: the style it opened, its definition
+/// as the part states it, and whether the properties being read are the style's
+/// own (an outline level under a run's properties is no heading).
+#[derive(Default)]
+struct StyleScan {
+    current: Option<(String, StyleDef)>,
+    paragraph_props: bool,
+}
+
+impl StyleScan {
+    /// Note one event of the styles part, returning the style a close completed.
+    fn note(&mut self, event: &Event) -> Option<(String, StyleDef)> {
+        match event {
+            Event::Start(event) => self.element(&Elem::of(event), false),
+            Event::Empty(event) => self.element(&Elem::of(event), true),
+            Event::End(event) => match event.local_name().as_ref() {
+                b"pPr" => {
+                    self.paragraph_props = false;
+                    None
+                }
+                b"style" => self.current.take(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Note one element: what a style states about itself, and where its own
+    /// properties begin. `Some` when the element is a style that closed itself.
+    fn element(&mut self, elem: &Elem, empty: bool) -> Option<(String, StyleDef)> {
+        match elem.name.as_slice() {
+            b"style" => {
+                // A style whose type is present and is not a paragraph style is
+                // not one a paragraph can name.
+                let paragraph = elem
+                    .attr("type")
+                    .is_none_or(|kind| kind.trim() == "paragraph");
+                self.current = elem
+                    .attr("styleId")
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty() && paragraph)
+                    .map(|id| (id.to_owned(), StyleDef::default()));
+                if empty {
+                    return self.current.take();
+                }
+            }
+            b"pPr" if !empty => self.paragraph_props = self.current.is_some(),
+            // The two statements only count inside the style's own properties.
+            b"outlineLvl" if self.paragraph_props => {
+                if let Some((_, style)) = self.current.as_mut() {
+                    style.outline = outline_level(elem);
+                }
+            }
+            b"name" => {
+                if let Some((_, style)) = self.current.as_mut() {
+                    style.name = style_value(elem);
+                }
+            }
+            b"basedOn" => {
+                if let Some((_, style)) = self.current.as_mut() {
+                    style.based_on = style_value(elem);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// The level a `w:outlineLvl` states, clamped to the schema's 0..=9 — where 9 is
+/// body text. A value that is no number states nothing rather than reading as the
+/// first level.
+fn outline_level(elem: &Elem) -> Option<usize> {
+    elem.attr("val")
+        .and_then(|value| value.trim().parse().ok())
+        .map(|value: usize| value.min(9))
+}
+
+/// The heading level an outline value states, or `None` for the schema's
+/// body-text value (9): the paragraph is no heading, whatever its style says.
+fn outline_heading(outline: usize) -> Option<usize> {
+    (outline < 9).then_some(outline + 1)
+}
+
+/// The trimmed, non-empty `w:val` a `w:name`/`w:basedOn` carries.
+fn style_value(elem: &Elem) -> Option<String> {
+    elem.attr("val")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// The level a heading name states: `heading` (ASCII-case-insensitive), optional
+/// spaces, then the number 1..=9.
+fn heading_name_level(text: &str) -> Option<usize> {
+    let trimmed = text.trim();
+    let (head, tail) = trimmed.split_at_checked("heading".len())?;
+    if !head.eq_ignore_ascii_case("heading") {
+        return None;
+    }
+    let level = tail.trim_start_matches(' ').parse().ok()?;
+    (1..=9).contains(&level).then_some(level)
 }
 
 // ── Fields ──────────────────────────────────────────────────────
@@ -3102,6 +3438,167 @@ mod tests {
         );
     }
 
+    // ── Headings and links ──────────────────────────────────────
+
+    /// A heading's level comes from the paragraph's own `w:outlineLvl` — where
+    /// the body-text value suppresses the style — or from its style chain, and a
+    /// style id may name a heading even when the package states no styles at all.
+    #[test]
+    fn docx_marks_a_heading_from_its_own_level_or_its_style() {
+        let styles = concat!(
+            r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="H2"><w:name w:val="Heading 2"/></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="Mine"><w:basedOn w:val="H2"/></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="Q"><w:pPr><w:outlineLvl w:val="2"/></w:pPr></w:style>"#,
+            r#"</w:styles>"#,
+        );
+        let body = concat!(
+            // (a) a style id that names a heading on its own.
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>A</w:t></w:r></w:p>"#,
+            // (b) the paragraph's own outline level.
+            r#"<w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr><w:r><w:t>B</w:t></w:r></w:p>"#,
+            // (c) an ordinary style, and no style at all.
+            r#"<w:p><w:pPr><w:pStyle w:val="Normal"/></w:pPr><w:r><w:t>C</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>D</w:t></w:r></w:p>"#,
+            // (d) the body-text outline level overrides the heading style.
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/><w:outlineLvl w:val="9"/></w:pPr>"#,
+            r#"<w:r><w:t>E</w:t></w:r></w:p>"#,
+            // (e) a style whose name is a heading name.
+            r#"<w:p><w:pPr><w:pStyle w:val="H2"/></w:pPr><w:r><w:t>F</w:t></w:r></w:p>"#,
+            // (f) a style based on one that names a heading.
+            r#"<w:p><w:pPr><w:pStyle w:val="Mine"/></w:pPr><w:r><w:t>G</w:t></w:r></w:p>"#,
+            // (g) a style whose own properties carry an outline level.
+            r#"<w:p><w:pPr><w:pStyle w:val="Q"/></w:pPr><w:r><w:t>H</w:t></w:r></w:p>"#,
+            // (h) a style the part does not define and whose id is no heading.
+            r#"<w:p><w:pPr><w:pStyle w:val="Nope"/></w:pPr><w:r><w:t>I</w:t></w:r></w:p>"#,
+        );
+        let bytes = package(
+            body,
+            &[
+                (
+                    "word/_rels/document.xml.rels",
+                    &rels(&rel("rId9", "styles", "styles.xml")),
+                ),
+                ("word/styles.xml", styles),
+            ],
+        );
+        assert_eq!(
+            text_of(&bytes),
+            "[heading 1] A\n\
+             [heading 2] B\n\
+             C\n\
+             D\n\
+             E\n\
+             [heading 2] F\n\
+             [heading 2] G\n\
+             [heading 3] H\n\
+             I"
+        );
+    }
+
+    /// A heading whose paragraph holds no words follows the same rule: a heading
+    /// that printed nothing gets no mark, and one whose only content is a block
+    /// is marked on the line that block opens.
+    #[test]
+    fn docx_marks_a_heading_that_printed_only_a_block_or_nothing() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t>before</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr></w:p>"#,
+            // A leading break opens an empty first line: the mark goes with the
+            // heading's text, not on that empty line.
+            r#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:br/><w:t>broken</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><mc:AlternateContent>"#,
+            r#"<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>"#,
+            r#"<w:p><w:r><w:t>boxed</w:t></w:r></w:p>"#,
+            r#"</w:txbxContent></wps:txbx></w:drawing></mc:Choice>"#,
+            r#"</mc:AlternateContent></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>after</w:t></w:r></w:p>"#,
+        );
+        assert_eq!(
+            text_of(&package(body, &[])),
+            "before\n[heading 1] broken\n[heading 1] [text box]\n  boxed\nafter"
+        );
+    }
+
+    /// A link shows the address it points at after its own text, an anchor alone
+    /// reads as a link inside the document, a target the rels do not declare
+    /// leaves the text alone — an anchor beside it included, since `internal`
+    /// would be a claim the link does not make — and a part the link sits in
+    /// resolves through that part's own relationships.
+    #[test]
+    fn docx_shows_a_hyperlink_s_address_with_its_text() {
+        let body = concat!(
+            r#"<w:p><w:hyperlink r:id="rId1"><w:r><w:t>ext</w:t></w:r></w:hyperlink></w:p>"#,
+            r#"<w:p><w:hyperlink w:anchor="top"><w:r><w:t>here</w:t></w:r></w:hyperlink></w:p>"#,
+            r#"<w:p><w:hyperlink r:id="rId9"><w:r><w:t>lost</w:t></w:r></w:hyperlink></w:p>"#,
+            r#"<w:p><w:hyperlink r:id="rId9" w:anchor="top"><w:r><w:t>lost here</w:t></w:r></w:hyperlink></w:p>"#,
+            r#"<w:p><w:hyperlink r:id="rId1" w:anchor="frag"><w:r><w:t>both</w:t></w:r></w:hyperlink></w:p>"#,
+            r#"<w:p><w:hyperlink r:id="rId2"><w:r><w:t>body</w:t></w:r></w:hyperlink></w:p>"#,
+            // A link whose content is a picture alone: the reading prints no
+            // inline picture, so the address is what it can say about the link.
+            r#"<w:p><w:hyperlink r:id="rId1"><w:r><w:drawing/></w:r></w:hyperlink></w:p>"#,
+            // A link whose content is a block: the address opens the line after
+            // the block rather than the block's own inner line.
+            r#"<w:p><w:hyperlink r:id="rId1"><w:r><mc:AlternateContent>"#,
+            r#"<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>"#,
+            r#"<w:p><w:r><w:t>boxed</w:t></w:r></w:p>"#,
+            r#"</w:txbxContent></wps:txbx></w:drawing></mc:Choice>"#,
+            r#"</mc:AlternateContent></w:r></w:hyperlink></w:p>"#,
+            r#"<w:sectPr><w:headerReference w:type="default" r:id="rId3"/></w:sectPr>"#,
+        );
+        let body_rels = rels(&format!(
+            "{}{}{}",
+            rel("rId1", "hyperlink", "https://example.com/a"),
+            rel("rId2", "hyperlink", "https://body.example/b"),
+            rel("rId3", "header", "header1.xml"),
+        ));
+        let header = r#"<w:hdr><w:p><w:hyperlink r:id="rId2"><w:r><w:t>head</w:t></w:r></w:hyperlink></w:p></w:hdr>"#;
+        let header_rels = rels(&rel("rId2", "hyperlink", "https://header.example/c"));
+        let bytes = package(
+            body,
+            &[
+                ("word/_rels/document.xml.rels", &body_rels),
+                ("word/header1.xml", header),
+                ("word/_rels/header1.xml.rels", &header_rels),
+            ],
+        );
+        assert_eq!(
+            text_of(&bytes),
+            "ext (link: https://example.com/a)\n\
+             here (link: internal)\n\
+             lost\n\
+             lost here\n\
+             both (link: https://example.com/a#frag)\n\
+             body (link: https://body.example/b)\n\
+             (link: https://example.com/a)\n\
+             [text box]\n  boxed\n(link: https://example.com/a)\n\
+             Header (default):\n  head (link: https://header.example/c)"
+        );
+    }
+
+    /// A document-controlled address is bounded: the mark never lets a target's
+    /// length decide the shape of the line its text stands on.
+    #[test]
+    fn docx_bounds_a_link_address() {
+        let target = "x".repeat(400);
+        let body =
+            r#"<w:p><w:hyperlink r:id="rId1"><w:r><w:t>long</w:t></w:r></w:hyperlink></w:p>"#;
+        let bytes = package(
+            body,
+            &[(
+                "word/_rels/document.xml.rels",
+                &rels(&rel("rId1", "hyperlink", &target)),
+            )],
+        );
+        let text = text_of(&bytes);
+        let address = text
+            .strip_prefix("long (link: ")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .expect("a link mark");
+        assert_eq!(address, format!("{}…", "x".repeat(MAX_LINK_TARGET_CHARS)));
+    }
+
     // ── Text boxes ──────────────────────────────────────────────
 
     /// Word writes a text box twice — as an `mc:Choice` and as the
@@ -3433,6 +3930,10 @@ mod tests {
             r#"<w:r><w:fldSimple w:instr="PAGE \* MERGEFORMAT"><w:t>1</w:t></w:fldSimple></w:r>"#,
             r#"<w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>boxed</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"#,
             r#"</w:p>"#,
+            // A heading and an anchor-only link: their marks are entries of the
+            // shared list too.
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Title</w:t></w:r></w:p>"#,
+            r#"<w:p><w:hyperlink w:anchor="top"><w:r><w:t>jump</w:t></w:r></w:hyperlink></w:p>"#,
             r#"<w:sectPr><w:headerReference w:type="first" r:id="rId1"/><w:headerReference w:type="default" r:id="rId2"/></w:sectPr>"#,
         );
         let revised = package(

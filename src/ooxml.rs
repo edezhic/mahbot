@@ -8,12 +8,12 @@
 //! walk the format needs: Word's is the only one that carries tables, tracked
 //! changes and content beyond the body part, so its reader is the module
 //! [`docx`]; Excel's is the module [`xlsx`]; and PowerPoint's is a slide walk
-//! that reaches one part further for the two things a slide only points at —
-//! its layout, whose title placeholders it borrows, and the data model of each
-//! SmartArt diagram it shows — so it still lives in this module. The charts a
-//! package holds are read by [`chart`], whichever family draws them: a chart part
-//! carries its own cached values, so what a chart says reaches the answer where the
-//! chart sits.
+//! that reaches one part further for what a slide only points at — its layout,
+//! whose title placeholders it borrows, its comments and the registry that names
+//! their authors, and the data model of each SmartArt diagram it shows — so it
+//! still lives in this module. The charts a package holds are read by [`chart`],
+//! whichever family draws them: a chart part carries its own cached values, so
+//! what a chart says reaches the answer where the chart sits.
 //!
 //! # Invariants
 //!
@@ -31,8 +31,10 @@ use crate::document::{
     ensure_out_dir, write_picture,
 };
 use crate::reader_output::{
-    Unshown, UnshownKind, slide_header, slide_notes_header, text_block, text_lines,
+    Unshown, UnshownKind, slide_comments_header, slide_header, slide_notes_header, text_block,
+    text_lines,
 };
+use crate::util::one_line;
 use quick_xml::Reader;
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use std::collections::{HashMap, HashSet};
@@ -70,6 +72,12 @@ const PPT_MEDIA_PREFIX: &str = "ppt/media/";
 const PPT_CHARTS_PREFIX: &str = "ppt/charts/";
 /// The objects a PowerPoint package embeds (`ppt/embeddings/`).
 const PPT_EMBEDDINGS_PREFIX: &str = "ppt/embeddings/";
+/// The deck's legacy comment-author registry (`p:cmAuthorLst`): a slide's
+/// `p:cm` entries name their author by an `authorId` into it.
+const PPT_COMMENT_AUTHORS_PART: &str = "ppt/commentAuthors.xml";
+/// The deck's 2018 author registry (`p188:authorLst`): a threaded comment's
+/// `authorId` is a GUID into it.
+const PPT_MODERN_AUTHORS_PART: &str = "ppt/authors.xml";
 
 /// Extensions of the picture formats a package embeds that this pipeline does not
 /// convert and the product's own picture list ([`crate::util::IMAGE_EXTENSIONS`])
@@ -130,10 +138,14 @@ pub(crate) fn family_of(path: &Path) -> Option<Family> {
 
 // ── PowerPoint ──────────────────────────────────────────────────
 
-/// Extract slide text, speaker notes and embedded images from a `.pptx`/`.pptm`
-/// package.
+/// Extract slide text, comments, speaker notes and embedded images from a
+/// `.pptx`/`.pptm` package.
 ///
-/// A slide's layout and its master are not read — their text never enters the
+/// Comments and their replies are read in both the encodings a deck carries —
+/// the legacy ISO 29500 `ppt/comments/comment<N>.xml` part and the 2018 threaded
+/// one — and each entry's author is resolved through the deck's own author
+/// registry, so a comment prints under the name the file gives it. A slide's
+/// layout, its master and its theme are not read — their text never enters the
 /// answer — so a chart one of them draws is not described where it sits: the
 /// report counts it with every chart the reading did not show.
 #[must_use]
@@ -141,9 +153,11 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return unreadable(Family::Pptx);
     };
-    let Some(parts) = resolve_slide_parts(&mut archive) else {
+    let presentation_rels = presentation_relationships(&mut archive);
+    let Some(parts) = resolve_slide_parts(&mut archive, &presentation_rels) else {
         return unreadable(Family::Pptx);
     };
+    let authors = read_ppt_authors(&mut archive, &presentation_rels);
 
     ensure_out_dir(out_dir);
 
@@ -185,10 +199,17 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
             notes.push(format!("slide {number} could not be read"));
             continue;
         };
-        let rels = slide_rels(&mut archive, part);
+        // The relationships part may name the slide's notes, comments, layout,
+        // diagrams and charts: a part that could not be read loses all of them,
+        // which is the slide's own loss and said once here.
+        let rels = read_relationships(&mut archive, &rels_part_of(part));
+        if rels.is_none() {
+            notes.push(format!("slide {number} relationships could not be read"));
+        }
+        let rels = rels.as_deref();
         // The layout is consulted for its title placeholders — and for nothing
         // else: its text never enters the answer.
-        let layout_titles = layout_title_indices(&mut archive, base, &rels, &mut layouts);
+        let layout_titles = layout_title_indices(&mut archive, base, rels, &mut layouts);
         // A title placeholder names its type on the slide, or leaves it to the
         // layout; a placeholder that names neither takes the schema's defaults
         // (`obj` and idx 0), so the layout is consulted for those too.
@@ -207,16 +228,13 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         // counted: a chart whose content is printed here is no longer a loss. A
         // slide whose block is not printed marks nothing, so nothing it draws can
         // vanish from both the reading and the report.
-        let chart_lines = match &rels {
-            SlideRels::List(list) => {
-                let parts = chart::chart_parts(&xml, list, base);
-                let (lines, chart_described) = chart::lines(&charts, &parts);
-                described.extend(chart_described);
-                lines
-            }
-            _ => Vec::new(),
-        };
-        let shown = slide_diagrams(&mut archive, base, &xml, &rels, &mut diagrams);
+        let chart_lines = rels.map_or_else(Vec::new, |rels| {
+            let parts = chart::chart_parts(&xml, rels, base);
+            let (lines, chart_described) = chart::lines(&charts, &parts);
+            described.extend(chart_described);
+            lines
+        });
+        let shown = slide_diagrams(&mut archive, base, &xml, rels, &mut diagrams);
         blocks.push(slide_block(
             number,
             slide_hidden(&xml),
@@ -224,7 +242,10 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
             &shown,
             &chart_lines,
         ));
-        match slide_notes(&mut archive, base, &rels) {
+        // The comments block stands between the slide's own block and its notes.
+        let comments = slide_comments(&mut archive, base, rels, &authors);
+        comments.place(number, &mut blocks, &mut notes);
+        match slide_notes(&mut archive, base, rels) {
             SlideNotes::Text(lines) if !lines.is_empty() => {
                 blocks.push(text_lines(&slide_notes_header(number), &lines));
             }
@@ -274,7 +295,8 @@ pub(crate) fn pptx_diagram_text(bytes: &[u8]) -> HashMap<String, Vec<String>> {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return HashMap::new();
     };
-    let Some(parts) = resolve_slide_parts(&mut archive) else {
+    let presentation_rels = presentation_relationships(&mut archive);
+    let Some(parts) = resolve_slide_parts(&mut archive, &presentation_rels) else {
         return HashMap::new();
     };
     let mut cache = DiagramCache::default();
@@ -283,23 +305,36 @@ pub(crate) fn pptx_diagram_text(bytes: &[u8]) -> HashMap<String, Vec<String>> {
         let Some(xml) = read_zip_entry(&mut archive, &part).bytes() else {
             continue;
         };
-        let rels = slide_rels(&mut archive, &part);
-        let shown: Vec<String> =
-            slide_diagrams(&mut archive, part_dir(&part), &xml, &rels, &mut cache)
-                .into_iter()
-                .filter_map(|diagram| match diagram {
-                    // One entry per diagram that shows text: a diagram shows its
-                    // points' lines joined, the way a reading prints them, and a
-                    // diagram with nothing to show names nothing.
-                    DiagramRead::Text(lines) if !lines.is_empty() => Some(lines.join("\n")),
-                    _ => None,
-                })
-                .collect();
+        let rels = read_relationships(&mut archive, &rels_part_of(&part));
+        let shown: Vec<String> = slide_diagrams(
+            &mut archive,
+            part_dir(&part),
+            &xml,
+            rels.as_deref(),
+            &mut cache,
+        )
+        .into_iter()
+        .filter_map(|diagram| match diagram {
+            // One entry per diagram that shows text: a diagram shows its
+            // points' lines joined, the way a reading prints them, and a
+            // diagram with nothing to show names nothing.
+            DiagramRead::Text(lines) if !lines.is_empty() => Some(lines.join("\n")),
+            _ => None,
+        })
+        .collect();
         if !shown.is_empty() {
             text.insert(part, shown);
         }
     }
     text
+}
+
+/// The presentation part's relationships: they name the slide list and the
+/// comment-author registries, so both are read from one list — once per deck,
+/// never once per caller. A part that cannot be read names nothing, and each
+/// reader then falls back to the conventional part or slide names.
+fn presentation_relationships<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<Relationship> {
+    read_relationships(archive, PPT_PRESENTATION_RELS_PART).unwrap_or_default()
 }
 
 /// The slide parts in presentation order, one slot per slide the presentation
@@ -308,20 +343,19 @@ pub(crate) fn pptx_diagram_text(bytes: &[u8]) -> HashMap<String, Vec<String>> {
 /// renumbered into its place. `None` for the whole list when the package has
 /// neither a presentation part nor any conventionally named slide part — i.e. it
 /// is not a presentation at all.
-fn resolve_slide_parts<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Option<Vec<Option<String>>> {
+fn resolve_slide_parts<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    presentation_rels: &[Relationship],
+) -> Option<Vec<Option<String>>> {
     let presentation = read_zip_entry(archive, PPT_PRESENTATION_PART).bytes();
     let parts = match presentation.as_deref() {
         Some(xml) => {
-            let resolved = read_zip_entry(archive, PPT_PRESENTATION_RELS_PART)
-                .bytes()
-                .map(|rels| relationship_map(&rels))
-                .and_then(|rels| {
-                    scan_elements(xml, b"sldId", rel_id).map(|ids| {
-                        ids.iter()
-                            .map(|id| rels.get(id).map(|target| resolve_part(PPT_BASE, target)))
-                            .collect::<Vec<_>>()
-                    })
-                });
+            let rels = relationship_targets(presentation_rels);
+            let resolved = scan_elements(xml, b"sldId", rel_id).map(|ids| {
+                ids.iter()
+                    .map(|id| rels.get(id).map(|target| resolve_part(PPT_BASE, target)))
+                    .collect::<Vec<_>>()
+            });
             match resolved {
                 // One resolvable slide is enough to trust the declared order; a
                 // list with nothing resolvable at all falls back below.
@@ -359,33 +393,6 @@ fn fallback_slide_parts<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<Option<S
     slides.into_iter().map(|(_, name)| Some(name)).collect()
 }
 
-/// The relationships a slide part declares through the `.rels` part beside it.
-enum SlideRels {
-    /// The slide declares no relationships at all (no `.rels` part).
-    None,
-    /// The `.rels` part is there but could not be read.
-    Unreadable,
-    /// The relationships it declares, in document order.
-    List(Vec<Relationship>),
-}
-
-/// The relationships of the slide part `slide_part`, read from the `.rels` part
-/// beside it ([`rels_part_of`]). A slide with no relationships part declares
-/// none — but one that IS there and could not be read may name a title layout,
-/// diagrams or notes, and the two are kept apart rather than rescanned per
-/// caller.
-fn slide_rels<R: Read + Seek>(archive: &mut ZipArchive<R>, slide_part: &str) -> SlideRels {
-    match read_zip_entry(archive, &rels_part_of(slide_part)) {
-        ZipEntry::Missing => SlideRels::None,
-        ZipEntry::Unreadable => SlideRels::Unreadable,
-        // The part is there, but its XML could not be read: it may name parts.
-        ZipEntry::Bytes(rels) => match relationships(&rels) {
-            Some(list) => SlideRels::List(list),
-            None => SlideRels::Unreadable,
-        },
-    }
-}
-
 /// A slide's speaker notes, as resolved through the relationships beside the
 /// slide part.
 enum SlideNotes {
@@ -393,22 +400,25 @@ enum SlideNotes {
     None,
     /// The notes part's text lines.
     Text(Vec<String>),
-    /// The slide declares a notes part, but it could not be read.
+    /// The slide declares a notes part, but it could not be read. A relationships
+    /// part that could not be read names no notes part here: the caller states
+    /// that wider loss once.
     Unreadable,
 }
 
 /// The speaker notes a slide declares through `rels` — their targets resolved
 /// against the slide part's own directory (`base`) — as their non-empty text
-/// lines: never by slide index, and never a note of another slide's.
+/// lines: never by slide index, and never a note of another slide's. Only a
+/// notes part the slide declares and the reading could not show is
+/// [`SlideNotes::Unreadable`]; a relationships part that cannot be read names no
+/// part at all.
 fn slide_notes<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     base: &str,
-    rels: &SlideRels,
+    rels: Option<&[Relationship]>,
 ) -> SlideNotes {
-    let rels = match rels {
-        SlideRels::None => return SlideNotes::None,
-        SlideRels::Unreadable => return SlideNotes::Unreadable,
-        SlideRels::List(rels) => rels,
+    let Some(rels) = rels else {
+        return SlideNotes::None;
     };
     let Some(target) = rels
         .iter()
@@ -422,6 +432,232 @@ fn slide_notes<R: Read + Seek>(
             .map_or(SlideNotes::Unreadable, |text| SlideNotes::Text(text.lines)),
         ZipEntry::Missing | ZipEntry::Unreadable => SlideNotes::Unreadable,
     }
+}
+
+/// A slide's comments and their replies, as resolved through the relationships
+/// beside the slide part.
+#[derive(Default)]
+struct SlideComments {
+    /// One line per comment or reply, in document order: its author when the
+    /// deck's registry resolves the entry's id, then its text flattened to one
+    /// line.
+    lines: Vec<String>,
+    /// Whether a comments part the slide declares could not be read.
+    lost: bool,
+}
+
+impl SlideComments {
+    /// Put the slide's comments where they belong: its block of lines
+    /// ([`slide_comments_header`]) after the slide's own block, and the note
+    /// naming a part the reading could not show among the slide's losses. A slide
+    /// with neither prints neither.
+    fn place(&self, number: usize, blocks: &mut Vec<String>, notes: &mut Vec<String>) {
+        if !self.lines.is_empty() {
+            blocks.push(text_lines(&slide_comments_header(number), &self.lines));
+        }
+        if self.lost {
+            notes.push(format!("slide {number} comments could not be read"));
+        }
+    }
+}
+
+/// The comments and replies a slide declares through `rels` — of either encoding,
+/// in the order its relationships name them — with each entry's author resolved
+/// through the deck's registry (`authors`). A part the slide declares and the
+/// package does not hold, or one that cannot be read whole, sets
+/// [`SlideComments::lost`]: comments are content a reading shows, so losing one is
+/// said rather than passed off as a slide without any. A slide declaring both
+/// encodings (unusual) shows both: each part is a set of comments the file holds.
+fn slide_comments<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    base: &str,
+    rels: Option<&[Relationship]>,
+    authors: &HashMap<String, String>,
+) -> SlideComments {
+    let Some(rels) = rels else {
+        return SlideComments::default();
+    };
+    let mut comments = SlideComments::default();
+    // The legacy kind and the 2018 threaded one both end `/comments`; one walk
+    // reads either, so both are collected here in the order the slide names them.
+    for rel in rels.iter().filter(|rel| rel.kind.ends_with("/comments")) {
+        match read_zip_entry(archive, &resolve_part(base, &rel.target))
+            .bytes()
+            .and_then(|xml| comment_lines(&xml, authors))
+        {
+            Some(lines) => comments.lines.extend(lines),
+            None => comments.lost = true,
+        }
+    }
+    comments
+}
+
+/// One comment or reply a comments part holds: the id of the author the deck's
+/// registry names it by, its text as the part wrote it, and the position it opened
+/// in the part — a reply closes before the comment it answers, so the order it
+/// opened in is what puts it after.
+struct CommentEntry {
+    order: usize,
+    author_id: Option<String>,
+    text: String,
+}
+
+impl CommentEntry {
+    /// The entry's line: its author followed by `: ` when the deck's registry
+    /// resolves the id, then its text as one line ([`flatten`]). An entry the file
+    /// states is always shown — every comment and every reply the part holds — so
+    /// one with no words prints the no-text mark, with its author when the deck
+    /// names one, rather than passing for no comment at all. The text is
+    /// document-controlled and is never cut: a reading prints the text it found.
+    fn line(&self, authors: &HashMap<String, String>) -> String {
+        let text = flatten(&self.text);
+        let text = if text.is_empty() {
+            ppt_marks().no_text.clone()
+        } else {
+            text
+        };
+        match self.author_id.as_deref().and_then(|id| authors.get(id)) {
+            Some(author) => format!("{author}: {text}"),
+            None => text,
+        }
+    }
+}
+
+/// The comments and replies a comments part holds, one line each, in document
+/// order. One walk serves both encodings a deck carries: the legacy ISO 29500 part
+/// (`p:cmLst` / `p:cm` / `p:text`) and the 2018 threaded one (`p188:cmLst` /
+/// `p188:cm` with a nested `p188:replyLst` / `p188:reply`, whose text sits in a
+/// `p188:txBody`). A reply is never a `p188:cm`, so the two entry kinds are what
+/// the stack tracks; the runs themselves are read by [`TextRuns`].
+///
+/// `None` when the part cannot be read as XML, is cut short, or is no comments
+/// document at all: half a part must not be passed off as everything it held.
+fn comment_lines(xml: &[u8], authors: &HashMap<String, String>) -> Option<Vec<String>> {
+    let mut part = Part::new(xml);
+    let mut reader = Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut runs = TextRuns::default();
+    // The entries open right now, the innermost last: a reply is pushed onto the
+    // comment it answers, and its text belongs to the innermost entry.
+    let mut open: Vec<CommentEntry> = Vec::new();
+    let mut entries: Vec<CommentEntry> = Vec::new();
+    let mut order = 0usize;
+    loop {
+        let Ok(event) = reader.read_event_into(&mut buffer) else {
+            return None;
+        };
+        part.note(&event);
+        if runs.note(&event) {
+            flush_paragraph(&mut runs, &mut open);
+        }
+        match event {
+            Event::Start(event) => match event.local_name().as_ref() {
+                b"cmLst" => part.kind_seen(),
+                b"cm" | b"reply" => {
+                    // Text read before the entry opened belongs to no comment: it
+                    // is discarded here rather than leaking into this one.
+                    runs.discard();
+                    open.push(CommentEntry {
+                        order,
+                        author_id: attr(&event, b"authorId").map(|id| id.trim().to_owned()),
+                        text: String::new(),
+                    });
+                    order += 1;
+                }
+                _ => {}
+            },
+            Event::Empty(event) if event.local_name().as_ref() == b"cmLst" => {
+                part.kind_seen();
+            }
+            Event::End(event) => {
+                if matches!(event.local_name().as_ref(), b"cm" | b"reply") {
+                    flush_paragraph(&mut runs, &mut open);
+                    if let Some(entry) = open.pop() {
+                        entries.push(entry);
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if part.unreadable() {
+        return None;
+    }
+    entries.sort_by_key(|entry| entry.order);
+    Some(entries.iter().map(|entry| entry.line(authors)).collect())
+}
+
+/// Hand the paragraph `runs` has finished to the innermost open entry, separated
+/// from the paragraph before it, and clear it: text outside any entry belongs to
+/// no comment.
+fn flush_paragraph(runs: &mut TextRuns, open: &mut [CommentEntry]) {
+    if let Some(entry) = open.last_mut() {
+        entry.text.push_str(&runs.paragraph);
+        entry.text.push(' ');
+    }
+    runs.discard();
+}
+
+/// The names a deck's comments call their authors by, keyed by the ids those
+/// comments carry: the legacy registry the presentation's `/commentAuthors`
+/// relationship names (`ppt/commentAuthors.xml`, `p:cmAuthorLst`) and the 2018
+/// one its `2018/10/relationships/authors` relationship names (`ppt/authors.xml`,
+/// `p188:authorLst`), each falling back to its conventional part when no
+/// relationship declares it.
+///
+/// A registry the package does not hold, or one that cannot be read, resolves no
+/// author: the file offers no name, and the entry prints its text alone rather
+/// than losing it.
+fn read_ppt_authors<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    rels: &[Relationship],
+) -> HashMap<String, String> {
+    let legacy = related_part(
+        rels,
+        PPT_BASE,
+        |kind| kind.ends_with("/commentAuthors"),
+        PPT_COMMENT_AUTHORS_PART,
+    );
+    let modern = related_part(
+        rels,
+        PPT_BASE,
+        |kind| kind.contains("2018/10") && kind.ends_with("/authors"),
+        PPT_MODERN_AUTHORS_PART,
+    );
+    let mut authors = HashMap::new();
+    for part in [legacy, modern] {
+        if let Some(xml) = read_zip_entry(archive, &part).bytes() {
+            authors.extend(author_names(&xml));
+        }
+    }
+    authors
+}
+
+/// The ids and names an author registry part holds: its legacy `p:cmAuthor`
+/// entries or its 2018 `p188:author` ones, which differ in their element name
+/// alone — one pass reads whichever the part carries. A part that will not parse
+/// holds none.
+fn author_names(xml: &[u8]) -> HashMap<String, String> {
+    scan_names(xml, &[b"cmAuthor", b"author"], author_entry)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// One `<p:cmAuthor id name/>` or `<p188:author id name/>` entry: the id its
+/// comments carry and the name they are shown by. The name is one line by
+/// construction ([`one_line`]), and one a registry leaves empty names nobody, so
+/// the entry is left out and its comments print without an author.
+///
+/// The name is the file's own text, printed whole as the comment it prefixes is:
+/// only what a mark adds around a file's text is bounded here — a field
+/// instruction, a link's address — never the text itself.
+fn author_entry(event: &BytesStart<'_>) -> Option<(String, String)> {
+    let id = attr(event, b"id")?.trim().to_owned();
+    let name = one_line(attr(event, b"name")?);
+    (!name.is_empty()).then_some((id, name))
 }
 
 /// A part's `<a:t>` text, split by whether it belongs to the slide's title
@@ -438,14 +674,17 @@ struct SlideText {
 /// The text runs one OOXML part's walk accumulates: every `<a:t>`'s text
 /// joined into the paragraph being read, `<a:br/>` breaking it into lines, and
 /// the text of an `<a:fld>` (the slide-number/date field) left out. One
-/// implementation, so the slide walk and the diagram walk read a run alike.
+/// implementation, so the slide walk, the diagram walk and the comments walk read
+/// a run alike: a comment's legacy encoding writes its body as `<p:text>`
+/// character data rather than in runs, and that is a run's text too.
 #[derive(Default)]
 struct TextRuns {
-    /// The paragraph being read right now: the `<a:t>` text seen since its
-    /// `<a:p>` opened, until a paragraph end moves it out.
+    /// The paragraph being read right now: the run text seen since the last
+    /// paragraph end moved it out.
     paragraph: String,
-    /// Whether an `<a:t>` is open: its text is run text, and no other element's
-    /// is.
+    /// Whether a run's text element is open — `a:t`, or the `p:text` a legacy
+    /// comment writes its body in: its character data is run text, and no other
+    /// element's is.
     in_text: bool,
     /// How many `<a:fld>` elements are open: their text is the field's, not the
     /// run's.
@@ -459,7 +698,7 @@ impl TextRuns {
     fn note(&mut self, event: &Event<'_>) -> bool {
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"t" => self.in_text = true,
+                b"t" | b"text" => self.in_text = true,
                 b"br" => self.paragraph.push('\n'),
                 b"fld" => self.fields += 1,
                 _ => {}
@@ -478,7 +717,7 @@ impl TextRuns {
                 append_entity(&mut self.paragraph, event);
             }
             Event::End(event) => match event.local_name().as_ref() {
-                b"t" => self.in_text = false,
+                b"t" | b"text" => self.in_text = false,
                 b"fld" => self.fields = self.fields.saturating_sub(1),
                 b"p" => return true,
                 _ => {}
@@ -608,13 +847,10 @@ fn slide_hidden(xml: &[u8]) -> bool {
 fn layout_title_indices<'a, R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     base: &str,
-    rels: &SlideRels,
+    rels: Option<&[Relationship]>,
     cache: &'a mut HashMap<String, HashSet<String>>,
 ) -> Option<&'a HashSet<String>> {
-    let SlideRels::List(rels) = rels else {
-        return None;
-    };
-    let target = rels
+    let target = rels?
         .iter()
         .find(|rel| rel.kind.ends_with("/slideLayout"))
         .map(|rel| rel.target.as_str())?;
@@ -687,7 +923,7 @@ fn slide_diagrams<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     base: &str,
     xml: &[u8],
-    rels: &SlideRels,
+    rels: Option<&[Relationship]>,
     cache: &mut DiagramCache,
 ) -> Vec<DiagramRead> {
     // A `dgm:relIds` carries `r:dm`, `r:lo`, `r:qs` and `r:cs`; `attr` matches by
@@ -708,13 +944,11 @@ fn slide_diagrams<R: Read + Seek>(
             diagrams.push(DiagramRead::Lost);
             continue;
         };
-        let part = match rels {
-            SlideRels::List(rels) => rels
-                .iter()
+        let part = rels.and_then(|rels| {
+            rels.iter()
                 .find(|rel| rel.id == id)
-                .map(|rel| resolve_part(base, &rel.target)),
-            SlideRels::None | SlideRels::Unreadable => None,
-        };
+                .map(|rel| resolve_part(base, &rel.target))
+        });
         // Dedupe on the resolved part (never across slides, which read the same
         // diagram with their own block); an id nothing resolves keeps its own
         // section, so it is not merged with an unrelated lost diagram.
@@ -1157,6 +1391,12 @@ fn read_relationships<R: Read + Seek>(
     }
 }
 
+/// A text as one line: every run of whitespace becomes one space — what a
+/// comment prints, whichever family's reader found it.
+fn flatten(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// One `<Relationship Id Type Target/>` entry, or `None` when it names no id or no
 /// target.
 fn relationship_entry(event: &BytesStart<'_>) -> Option<Relationship> {
@@ -1170,14 +1410,9 @@ fn relationship_entry(event: &BytesStart<'_>) -> Option<Relationship> {
     })
 }
 
-/// Relationship id -> target, for the parts a rId alone names.
-fn relationship_map(xml: &[u8]) -> HashMap<String, String> {
-    relationship_targets(&relationships(xml).unwrap_or_default())
-}
-
-/// [`relationship_map`] over an already-read relationship list. The Word and
-/// Excel readers read the list themselves — the notes parts are named there by
-/// kind, before the list is turned into this lookup — and share the mapping.
+/// Relationship id -> target, for the parts a rId alone names. The readers read
+/// the list themselves — the notes parts are named there by kind, before the list
+/// is turned into this lookup — and share the mapping.
 fn relationship_targets(rels: &[Relationship]) -> HashMap<String, String> {
     rels.iter()
         .map(|rel| (rel.id.clone(), rel.target.clone()))
@@ -1205,6 +1440,21 @@ fn resolve_part(base: &str, target: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// The part the first relationship whose kind `matches` names, resolved against
+/// `base`, or `conventional` when the relationships declare none: a package may
+/// locate a part by relationship or leave it where its schema puts it.
+fn related_part(
+    rels: &[Relationship],
+    base: &str,
+    matches: impl Fn(&str) -> bool,
+    conventional: &str,
+) -> String {
+    rels.iter().find(|rel| matches(&rel.kind)).map_or_else(
+        || conventional.to_owned(),
+        |rel| resolve_part(base, &rel.target),
+    )
 }
 
 /// The directory a part's own relationship targets resolve against
@@ -1271,6 +1521,17 @@ fn attr(event: &BytesStart<'_>, name: &[u8]) -> Option<String> {
 fn scan_elements<T>(
     xml: &[u8],
     element: &[u8],
+    collect: impl FnMut(&BytesStart<'_>) -> Option<T>,
+) -> Option<Vec<T>> {
+    scan_names(xml, &[element], collect)
+}
+
+/// [`scan_elements`] over elements of more than one local name, in one pass: a
+/// part may state one kind of entry under the name its version of the schema
+/// gives it.
+fn scan_names<T>(
+    xml: &[u8],
+    names: &[&[u8]],
     mut collect: impl FnMut(&BytesStart<'_>) -> Option<T>,
 ) -> Option<Vec<T>> {
     let mut reader = Reader::from_reader(xml);
@@ -1279,7 +1540,7 @@ fn scan_elements<T>(
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(event) | Event::Empty(event))
-                if event.local_name().as_ref() == element =>
+                if names.contains(&event.local_name().as_ref()) =>
             {
                 if let Some(value) = collect(&event) {
                     found.push(value);
@@ -1730,22 +1991,35 @@ mod tests {
         assert!(notes.is_empty(), "no part may be reported lost: {notes:?}");
     }
 
-    /// A slide's notes are announced rather than dropped in silence, however
-    /// they are lost: a relationship that resolves to a part the package does
-    /// not have, and a slide whose relationships part cannot be read at all
-    /// (which is where a slide declares notes in the first place). Neither may
-    /// pass for a slide that declares none.
+    /// A slide's notes are announced rather than dropped in silence, however they
+    /// are lost: a relationship that resolves to a part the package does not have.
+    /// A slide whose relationships part cannot be read at all — or one cut at an
+    /// element boundary, which parses as a shorter list than the file meant —
+    /// names (or may name) every part it owns: notes, comments, layout, diagrams,
+    /// charts, so the loss is said once as the slide's relationships, and never
+    /// read as a slide that declares none of them.
     #[test]
     fn pptx_reports_notes_it_cannot_read() {
         let slide = br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide text</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
             .as_slice();
-        // The notes relationship resolves to a part the package does not have,
-        // and, second, a relationships part cut short before anything resolves.
-        let lost: [&[u8]; 2] = [
-            br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#,
-            br#"<Relationships><Relationship Id="rId"#,
+        // The notes relationship resolves to a part the package does not have;
+        // then a relationships part cut short mid-tag, and one cut at an element
+        // boundary — which parses, and so is caught only by its own wholeness.
+        let lost: [(&[u8], &str); 3] = [
+            (
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#,
+                "slide 1 notes could not be read",
+            ),
+            (
+                br#"<Relationships><Relationship Id="rId"#,
+                "slide 1 relationships could not be read",
+            ),
+            (
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>"#,
+                "slide 1 relationships could not be read",
+            ),
         ];
-        for rels in lost {
+        for (rels, expectation) in lost {
             let bytes = zip_fixture(&[
                 (
                     "ppt/presentation.xml",
@@ -1763,7 +2037,136 @@ mod tests {
                 panic!("expected Text outcome for a readable presentation");
             };
             assert_eq!(text, "Slide 1:\n  Slide text");
-            assert_eq!(notes, ["slide 1 notes could not be read"]);
+            assert_eq!(notes, [expectation]);
+        }
+    }
+
+    /// A slide's legacy comments are read through its own relationships and
+    /// printed under it: each entry's author resolves through the deck's author
+    /// registry, and an `authorId` the registry does not hold prints its text
+    /// alone rather than passing the comment off as one by nobody. An entry the
+    /// part states is always shown, so one with no words prints the no-text mark
+    /// instead of vanishing.
+    #[test]
+    fn pptx_reads_legacy_comments_with_their_authors() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/commentAuthors" Target="commentAuthors.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/commentAuthors.xml",
+                br#"<p:cmAuthorLst><p:cmAuthor id="0" name="Anna Petrova" initials="AP"/><p:cmAuthor id="1" name="Ivan Petrov" initials="IP"/></p:cmAuthorLst>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br"<p:sld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide text</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>",
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/comments/comment1.xml",
+                br#"<p:cmLst><p:cm authorId="0" idx="1" dt="2026-01-01T00:00:00"><p:pos x="1" y="2"/><p:text>needs a citation</p:text></p:cm><p:cm authorId="7" idx="2"><p:text>agreed</p:text></p:cm><p:cm authorId="1" idx="3"><p:text>  </p:text></p:cm><p:cm authorId="7" idx="4"><p:text/></p:cm></p:cmLst>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  Slide text\n\n\
+             Slide 1 comments:\n  Anna Petrova: needs a citation\n  agreed\n  \
+             Ivan Petrov: (no text)\n  (no text)"
+        );
+        assert!(notes.is_empty(), "the comments are shown: {notes:?}");
+    }
+
+    /// A slide's 2018 threaded comments are read through its own relationships
+    /// too: a reply is shown after the comment it answers (though the part closes
+    /// it first), each author resolves through the deck's 2018 registry, and a
+    /// multi-paragraph body is one line, as every comment's text is — with a line
+    /// break separating its runs and a field's text left out.
+    #[test]
+    fn pptx_reads_modern_threaded_comments_and_their_replies() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2018/10/relationships/authors" Target="authors.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/authors.xml",
+                br#"<p188:authorLst><p188:author id="{5C4A1C0A-0000-0000-0000-000000000001}" name="Anna Petrova" initials="AP" userId="anna@example.com" providerId="AD"/><p188:author id="{5C4A1C0A-0000-0000-0000-000000000002}" name="Ivan Petrov" initials="IP" userId="ivan@example.com" providerId="AD"/></p188:authorLst>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br"<p:sld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide text</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>",
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2018/10/relationships/comments" Target="../comments/modernComment_1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/comments/modernComment_1.xml",
+                br#"<p188:cmLst><p188:cm authorId="{5C4A1C0A-0000-0000-0000-000000000001}" idx="1"><p188:txBody><a:p><a:r><a:t>Needs</a:t></a:r><a:br/><a:r><a:t>a citation</a:t></a:r><a:fld id="1" type="slidenum"><a:t>7</a:t></a:fld></a:p><a:p><a:r><a:t>for the figure</a:t></a:r></a:p></p188:txBody><p188:replyLst><p188:reply authorId="{5C4A1C0A-0000-0000-0000-000000000002}"><p188:txBody><a:p><a:r><a:t>Agreed</a:t></a:r></a:p></p188:txBody></p188:reply></p188:replyLst></p188:cm></p188:cmLst>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  Slide text\n\n\
+             Slide 1 comments:\n  Anna Petrova: Needs a citation for the figure\n  Ivan Petrov: Agreed"
+        );
+        assert!(notes.is_empty(), "the comments are shown: {notes:?}");
+    }
+
+    /// A comments part a slide declares and the reading cannot show is said per
+    /// slide, whether the package does not hold the part or holds something else
+    /// in its place: comments are content, never a silent omission.
+    #[test]
+    fn pptx_reports_comments_it_cannot_read() {
+        let slide = br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide text</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
+            .as_slice();
+        let comments_rels = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/></Relationships>"#;
+        // The comments part is absent from the package, and, second, the package
+        // holds an error page in its place.
+        let lost: [Option<&[u8]>; 2] = [None, Some(b"<html>404</html>")];
+        for part in lost {
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                (
+                    "ppt/presentation.xml",
+                    br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+                ),
+                (
+                    "ppt/_rels/presentation.xml.rels",
+                    br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
+                ),
+                ("ppt/slides/slide1.xml", slide),
+                ("ppt/slides/_rels/slide1.xml.rels", comments_rels),
+            ];
+            if let Some(part) = part {
+                entries.push(("ppt/comments/comment1.xml", part));
+            }
+            let bytes = zip_fixture(&entries);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
+                panic!("expected Text outcome for a readable presentation");
+            };
+            assert_eq!(text, "Slide 1:\n  Slide text");
+            assert_eq!(notes, ["slide 1 comments could not be read"]);
         }
     }
 

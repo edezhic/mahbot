@@ -42,7 +42,7 @@
 
 use super::chart;
 use super::{
-    Family, Part, Relationship, ZipEntry, append_entity, attr, numfmt, part_dir,
+    Family, Part, Relationship, ZipEntry, append_entity, attr, flatten, numfmt, part_dir,
     read_relationships, read_zip_entry, rel_id, relationship_targets, rels_part_of, resolve_part,
     scan_elements, unopened_parts, unreadable, write_media_parts,
 };
@@ -1005,11 +1005,6 @@ impl Comment {
             }
         }
     }
-}
-
-/// A text as one line: every run of whitespace becomes one space.
-fn flatten(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The comments in a legacy `xl/comments<N>.xml` part: its `commentList` entries,

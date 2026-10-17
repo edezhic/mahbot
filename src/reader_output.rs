@@ -169,6 +169,15 @@ pub(crate) fn slide_notes_header(number: usize) -> String {
     )
 }
 
+/// The header of the block a slide's comments and their replies print under:
+/// `Slide <n> comments:`.
+pub(crate) fn slide_comments_header(number: usize) -> String {
+    slide_label(
+        &crate::docgen::ppt_slide_labels().comments,
+        &number.to_string(),
+    )
+}
+
 /// `template` with its `{n}` replaced by `number` — the one place a slide's own
 /// label is built from the shared template, for a reading and for the
 /// model-facing descriptions alike. A description passes `<n>`, the way the rest
@@ -354,12 +363,14 @@ impl UnshownKind {
 /// A reader counts only what its own pass met and only what it really left out: a
 /// kind at zero prints nothing, so the report never names content the file does
 /// not hold. What no reader looks at — a PDF text page's vector drawings, or the
-/// parts of a package that hold nothing a model reads (its themes, its styles,
-/// its document properties) — is deliberately absent, and belongs in the
-/// model-facing description of the reading instead: a kind here is a promise the
-/// reading keeps. A PDF's own description is the exception: it *is* read (see
+/// parts of a package that hold nothing a model reads (its themes, its document
+/// properties) — is deliberately absent, and belongs in the model-facing
+/// description of the reading instead: a kind here is a promise the reading
+/// keeps. A PDF's own description is the exception: it *is* read (see
 /// [`crate::pdf_marks`]), while a Word, Excel or PowerPoint package's document
-/// properties are not.
+/// properties are not. A package's styles part is read as far as a paragraph's
+/// heading follows from it (see [`crate::ooxml::docx`]), and the rest of what it
+/// states is formatting, not content a report could name.
 #[derive(Default)]
 pub(crate) struct Unshown {
     counts: [usize; UnshownKind::COUNT],

@@ -320,15 +320,14 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> String {
-        // The slide marks this description names are rendered from the same
-        // statement the reader prints them from, so renaming one cannot leave a
-        // model-facing sentence stale (see `crate::docgen::ppt_marks`); the two
-        // labels a reading prints a slide's own block and its notes under come
-        // from the same place, the legacy `.doc` story names, the text-box mark,
-        // the chart-sheet mark and the report of what a reading did not show from
-        // `crate::reader_output`, which states each once, and the chart block's
-        // header, its field labels and the marks standing in for values from the
-        // chart vocabulary beside them.
+        // The slide marks and labels this description names are rendered from the
+        // same statements the reader prints them from, so renaming one cannot
+        // leave a model-facing sentence stale (see `crate::docgen::ppt_marks` and
+        // `ppt_slide_labels`); the legacy `.doc` story names, the text-box mark,
+        // the chart-sheet mark and the report of what a reading did not show come
+        // from `crate::reader_output`, which states each once, and the chart
+        // block's header, its field labels and the marks standing in for values
+        // from the chart vocabulary beside them.
         let marks = crate::docgen::ppt_marks();
         // The reader prints a slide's number where these spell `<n>`, so the
         // description names the label the reader prints without reading like a
@@ -336,6 +335,7 @@ impl Tool for ReadTool {
         let labels = crate::docgen::ppt_slide_labels();
         let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
         let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
+        let comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
         // The chart block prints the kind it read where this spells `<kind>`, a
         // series its own name where this spells `<name>` — or its number — and a
         // bubble's size where this spells `<size>`.
@@ -367,6 +367,7 @@ impl Tool for ReadTool {
                 ("{{ppt_no_text_mark}}", &marks.no_text),
                 ("{{ppt_slide_label}}", &slide_label),
                 ("{{ppt_notes_label}}", &notes_label),
+                ("{{ppt_comments_label}}", &comments_label),
                 (
                     "{{doc_headers_footers}}",
                     crate::reader_output::DOC_HEADERS_FOOTERS,
@@ -1292,6 +1293,7 @@ mod tests {
         // states the label with `<n>` where a real number goes.
         let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
         let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
+        let comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
         // Two of the report's lines, as the reader that prints them spells them.
         let report = crate::reader_output::unshown_report_examples();
         // The chart block's own headers, series labels and size annotation, as the
@@ -1320,6 +1322,7 @@ mod tests {
                 &marks.no_text,
                 &slide_label,
                 &notes_label,
+                &comments_label,
                 crate::reader_output::DOC_HEADERS_FOOTERS,
                 crate::reader_output::DOC_FOOTNOTES,
                 crate::reader_output::DOC_ENDNOTES,

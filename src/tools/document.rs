@@ -489,6 +489,7 @@ impl Tool for DocumentTool {
         let labels = crate::docgen::ppt_slide_labels();
         let ppt_slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
         let ppt_notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
+        let ppt_comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
         let input_mb = megabytes(crate::util::FILE_MAX_BYTES).to_string();
         let edit_text_max = RULES.edit_text_max.to_string();
         let pdf_metadata_fields = crate::docgen::pdf_metadata_fields_spelled();
@@ -508,6 +509,7 @@ impl Tool for DocumentTool {
                 ("{{docx_label_marks}}", &spelled_docx_marks(false)),
                 ("{{ppt_slide_label}}", &ppt_slide_label),
                 ("{{ppt_notes_label}}", &ppt_notes_label),
+                ("{{ppt_comments_label}}", &ppt_comments_label),
                 ("{{ppt_title_mark}}", &marks.title),
                 ("{{ppt_hidden_slide_mark}}", &marks.hidden_slide),
                 ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
@@ -20721,6 +20723,7 @@ mod tests {
         let labels = crate::docgen::ppt_slide_labels();
         let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
         let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
+        let comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
         for mark in [
             &marks.title,
             &marks.hidden_slide,
@@ -20729,6 +20732,7 @@ mod tests {
             &marks.no_text,
             &slide_label,
             &notes_label,
+            &comments_label,
         ] {
             assert!(
                 description.contains(mark.as_str()),

@@ -58,7 +58,8 @@
   },
   "ppt_slide_labels": {
     "slide": "Slide {n}:",
-    "notes": "Slide {n} notes:"
+    "notes": "Slide {n} notes:",
+    "comments": "Slide {n} comments:"
   },
   "docx_peripheral_parts": [
     { "kind": "header", "rel": "/header", "phrase": "a header" },
@@ -84,6 +85,7 @@
     { "pattern": "\\[fmt\\]", "example": "[fmt]" },
     { "pattern": "\\[fmt ¶\\]", "example": "[fmt ¶]" },
     { "pattern": "\\[fmt section\\]", "example": "[fmt section]" },
+    { "pattern": "\\[heading \\d\\]", "example": "[heading 1]" },
     { "pattern": "\\[field[^\\]]*\\]", "example": "[field PAGE \\* MERGEFORMAT]" },
     { "pattern": "\\[(?:footnote|endnote|comment) (?:\\d+|\\?)(?: starts| ends)?\\]", "example": "[comment 1 starts]" },
     { "pattern": "Table \\d+(?: \\(formatting revised\\))?:", "example": "Table 1 (formatting revised):" },
@@ -91,6 +93,7 @@
     { "pattern": "\\(spans C\\d+-C\\d+\\)", "example": "(spans C2-C4)" },
     { "pattern": "\\(part of R\\d+C\\d+\\)", "example": "(part of R3C2)" },
     { "pattern": "\\((?:inserted|deleted|merge revised|formatting revised)\\)", "example": "(merge revised)" },
+    { "pattern": "\\(link: .*\\)", "example": "(link: internal)" },
     { "pattern": "(?:Footnote|Endnote|Comment) \\d+(?: \\([^)]*\\))?:", "example": "Footnote 1 (not referenced in the text):" },
     { "pattern": "(?:Header|Footer)(?: \\d+)? \\([^)]*\\):", "example": "Header 1 (first page):" },
     { "pattern": "Unaccepted tracked changes:", "example": "Unaccepted tracked changes: 1 insertion" },
