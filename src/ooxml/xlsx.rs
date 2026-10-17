@@ -40,15 +40,16 @@
 //! - **The notation the model reads is documented in
 //!   `src/prompt/tool/read.md`** — a mark this module adds belongs there too.
 
+use super::chart;
 use super::{
-    Family, Part, Relationship, ZipEntry, append_entity, attr, blank, part_dir, read_zip_entry,
-    rel_id, relationship_targets, relationships, relationships_and_whole, rels_part_of,
-    resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
+    Family, Part, Relationship, ZipEntry, append_entity, attr, numfmt, part_dir,
+    read_relationships, read_zip_entry, rel_id, relationship_targets, rels_part_of, resolve_part,
+    scan_elements, unopened_parts, unreadable, write_media_parts,
 };
 use crate::document::{DocOutcome, SkippedImages, ensure_out_dir};
 use crate::reader_output::{
-    CHART_SHEET, NO_VALUES, Unshown, UnshownKind, column_index, column_letters, sheet_header,
-    text_block, text_lines,
+    CHART_SHEET, MARK_STORED, NO_VALUES, Unshown, UnshownKind, column_index, column_letters,
+    sheet_header, text_block, text_lines,
 };
 use crate::util::one_line;
 use quick_xml::Reader;
@@ -58,8 +59,6 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
-
-mod numfmt;
 
 // ── Part names ──────────────────────────────────────────────────
 
@@ -183,7 +182,8 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         styles: &styles,
         date1904: workbook.date1904,
     };
-    let (mut blocks, lost, chart_sheets) = sheet_blocks(
+    let charts = chart::read_charts(&mut archive, XLSX_CHARTS_PREFIX, workbook.date1904);
+    let (mut blocks, lost, chart_sheets, described) = sheet_blocks(
         &mut archive,
         &workbook,
         &rels,
@@ -191,15 +191,18 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         &persons,
         &mut notes,
         &mut unshown,
+        &charts,
     );
     // The census of chart parts comes after the sheets are walked: a chart sheet
-    // draws one of them, and the sheet is what names it.
+    // draws one of them, and the sheet is what names it; a chart whose content a
+    // sheet printed where it sits is no longer a loss.
     unshown.merge(&unopened_parts(
         &mut archive,
         XLSX_CHARTS_PREFIX,
         Some(XLSX_DIAGRAMS_PREFIX),
         XLSX_EMBEDDINGS_PREFIX,
         Some(&chart_sheets),
+        &described,
     ));
     // Defined names are workbook-level, so they follow every sheet rather than
     // being repeated into the sheet whose cells they point at.
@@ -229,10 +232,12 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
 }
 
 /// Walk every sheet the workbook declares, in workbook order: their blocks, the
-/// shared-string cells they lose between them, and the chart parts the package's
-/// chart sheets draw — the caller's census excludes those, so the one chart such a
-/// sheet is is not named twice. Each sheet's own losses go into `notes` and each
-/// chart sheet into `unshown` as the walk meets them.
+/// shared-string cells they lose between them, the chart parts the package's chart
+/// sheets draw — which the caller's census excludes so a sheet's chart is not named
+/// twice — and the chart parts whose content was printed where the chart sits. Each
+/// sheet's own losses go into `notes` and each chart sheet into `unshown` as the
+/// walk meets them.
+#[expect(clippy::too_many_arguments)] // one parameter per part the walk threads through
 fn sheet_blocks<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     workbook: &Workbook,
@@ -241,25 +246,33 @@ fn sheet_blocks<R: Read + Seek>(
     persons: &HashMap<String, String>,
     notes: &mut Vec<String>,
     unshown: &mut Unshown,
-) -> (Vec<String>, usize, HashSet<String>) {
+    charts: &HashMap<String, chart::ChartRead>,
+) -> (Vec<String>, usize, HashSet<String>, HashSet<String>) {
     let mut blocks = Vec::new();
     let mut lost = 0usize;
     let mut chart_sheets: HashSet<String> = HashSet::new();
+    let mut described = HashSet::new();
     for (index, entry) in workbook.sheets.iter().enumerate() {
         let name = entry.name.as_str();
         let (part, chart_sheet) = resolve_sheet(rels, entry, index);
-        let mark = if chart_sheet { CHART_SHEET } else { NO_VALUES };
-        if chart_sheet {
-            unshown.add(UnshownKind::ChartSheet, 1);
-        }
         // The sheet's own relationships name its comments and its hyperlink
         // targets; the list is kept for the parts named by kind, and the link
         // targets resolve through the shared id -> target map.
         let sheet_rels = sheet_relationships(archive, &part, name, notes);
-        // The chart the sheet draws, so the package's census of chart parts can be
-        // told the sheet is what that chart belongs to.
-        if chart_sheet && let Some(chart) = chart_sheet_chart(archive, &part, &sheet_rels) {
-            chart_sheets.insert(chart);
+        let charts_here = sheet_charts(archive, &part, &sheet_rels);
+        let (mut chart_lines, chart_described) = chart::lines(charts, &charts_here);
+        // A chart sheet's chart belongs to the sheet, so the package's chart
+        // census leaves it out; the sheet's loss is said unless every chart it
+        // draws was described where it sits. The tab always says what it is, and
+        // its chart follows under that line.
+        if chart_sheet {
+            let all_described =
+                !charts_here.is_empty() && chart_described.len() == charts_here.len();
+            if !all_described {
+                unshown.add(UnshownKind::ChartSheet, 1);
+            }
+            chart_sheets.extend(charts_here);
+            chart_lines.insert(0, CHART_SHEET.to_owned());
         }
         let link_targets = relationship_targets(&sheet_rels);
         // A sheet part the package does not carry is as much of a loss as one
@@ -275,22 +288,29 @@ fn sheet_blocks<R: Read + Seek>(
                 let mut lines = read.lines;
                 let comments = cell_comments(archive, &sheet_rels, name, persons, notes);
                 lines.extend(comment_lines(comments, name, notes));
-                blocks.push(sheet_block(entry, mark, &lines));
+                lines.extend(chart_lines);
+                // A chart is no longer a loss only where its content was printed:
+                // a sheet whose own block is not delivered marks nothing.
+                described.extend(chart_described);
+                blocks.push(sheet_block(entry, &lines));
             }
-            None if chart_sheet => blocks.push(sheet_block(entry, mark, &[])),
+            None if chart_sheet => {
+                described.extend(chart_described);
+                blocks.push(sheet_block(entry, &chart_lines));
+            }
             None => notes.push(format!("sheet \"{name}\" could not be read")),
         }
     }
-    (blocks, lost, chart_sheets)
+    (blocks, lost, chart_sheets, described)
 }
 
-/// One sheet's block: the header its name and state print, over its lines, or the
-/// mark its empty unit carries — a chart sheet says `(chart sheet)` rather than
-/// standing empty.
-fn sheet_block(entry: &SheetEntry, mark: &str, lines: &[String]) -> String {
+/// One sheet's block: the header its name and state print, over its lines — or
+/// the mark a sheet with no valued cell carries in place of them. A chart sheet
+/// always has its own line, so its tab is never read as a sheet that held nothing.
+fn sheet_block(entry: &SheetEntry, lines: &[String]) -> String {
     text_block(
         &sheet_header(&entry.name, entry.state.as_deref()),
-        mark,
+        NO_VALUES,
         lines,
     )
 }
@@ -832,27 +852,6 @@ fn read_styles<R: Read + Seek>(
 
 // ── Sheet relationships, comments and links ─────────────────────
 
-/// The relationships the part at `name` declares, or `None` when the part is there
-/// and cannot be read. A part the package does not carry, and an entry it left empty,
-/// both declare no relationship at all — nothing is lost; a part that is no
-/// relationship list, or one the package cut short, names its remaining parts
-/// nowhere, so its list is not the document's own and is read like one that could
-/// not be read at all.
-fn read_relationships<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    name: &str,
-) -> Option<Vec<Relationship>> {
-    match read_zip_entry(archive, name) {
-        ZipEntry::Bytes(xml) if blank(&xml) => Some(Vec::new()),
-        ZipEntry::Bytes(xml) => match relationships_and_whole(&xml) {
-            (Some(rels), true) => Some(rels),
-            _ => None,
-        },
-        ZipEntry::Missing => Some(Vec::new()),
-        ZipEntry::Unreadable => None,
-    }
-}
-
 /// A sheet's own relationships, and the note a part that is there and cannot be
 /// read is said in rather than passed off as a sheet with none.
 fn sheet_relationships<R: Read + Seek>(
@@ -886,30 +885,39 @@ fn related_part(rels: &[Relationship], suffix: &str, base: &str) -> Option<Strin
     relationship_target(rels, suffix).map(|target| resolve_part(base, target))
 }
 
-/// The chart part a chart sheet draws, or `None` when the package does not say:
-/// the sheet's own relationships name it, and where they name a drawing instead —
-/// what Excel writes, a chartsheet part referencing a drawing part — the drawing's
-/// own relationships name the chart.
-fn chart_sheet_chart<R: Read + Seek>(
+/// The chart parts a sheet draws, in the order it draws them: a chart sheet's
+/// own chart, named by the sheet's own relationships or by the drawing part it
+/// references (what Excel writes), and a worksheet's charts, named by its
+/// drawing — which may hold several.
+fn sheet_charts<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     part: &str,
-    sheet_rels: &[Relationship],
-) -> Option<String> {
-    if let Some(chart) = chart_of(part_dir(part), sheet_rels) {
-        return Some(chart);
+    rels: &[Relationship],
+) -> Vec<String> {
+    let base = part_dir(part);
+    let mut charts: Vec<String> = Vec::new();
+    for rel in rels
+        .iter()
+        .filter(|rel| rel.kind.ends_with("/chart") || rel.kind.ends_with("/chartEx"))
+    {
+        let chart = resolve_part(base, &rel.target);
+        if !charts.contains(&chart) {
+            charts.push(chart);
+        }
     }
-    let drawing = related_part(sheet_rels, "/drawing", part_dir(part))?;
-    let rels = read_zip_entry(archive, &rels_part_of(&drawing))
-        .bytes()
-        .and_then(|xml| relationships(&xml))
-        .unwrap_or_default();
-    chart_of(part_dir(&drawing), &rels)
-}
-
-/// The chart part `rels` names against `base` — the classic `chart<N>.xml` or the
-/// modern `chartEx<N>.xml`, which is a relationship kind of its own.
-fn chart_of(base: &str, rels: &[Relationship]) -> Option<String> {
-    related_part(rels, "/chart", base).or_else(|| related_part(rels, "/chartEx", base))
+    for rel in rels.iter().filter(|rel| rel.kind.ends_with("/drawing")) {
+        let drawing = resolve_part(base, &rel.target);
+        let Some(xml) = read_zip_entry(archive, &drawing).bytes() else {
+            continue;
+        };
+        let drawing_rels = read_relationships(archive, &rels_part_of(&drawing)).unwrap_or_default();
+        for chart in chart::chart_parts(&xml, &drawing_rels, part_dir(&drawing)) {
+            if !charts.contains(&chart) {
+                charts.push(chart);
+            }
+        }
+    }
+    charts
 }
 
 /// The workbook's person names, read from the part the workbook's `/person`
@@ -1883,11 +1891,6 @@ impl Link {
     }
 }
 
-/// The mark a cell's line carries when its value is the number the cell stores
-/// rather than a display of it: the cell's number format was not read, is not one
-/// this reader reproduces for this value, or shows nothing at all for it.
-const MARK_STORED: &str = " (stored number, format not shown)";
-
 /// A cell's value as this reader shows it.
 struct Shown {
     /// The text the cell's line carries: always one line ([`one_line`]).
@@ -2440,7 +2443,7 @@ impl Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ooxml::test_fixtures::zip_fixture;
+    use crate::ooxml::test_fixtures::{COLUMN_CHART, zip_fixture};
     use std::fmt::Write as _;
 
     // ── Excel ───────────────────────────────────────────────────
@@ -2788,7 +2791,8 @@ mod tests {
     /// chart it draws is resolved through the sheet's own relationships — directly,
     /// or through the drawing part a chartsheet references, which is what Excel
     /// writes — so the sheet's chart is not named a second time as a chart of its
-    /// own.
+    /// own. The chart's content is printed under the tab's mark; a part the reading
+    /// cannot describe says so there.
     #[test]
     fn xlsx_names_a_chart_sheet_by_its_kind() {
         let bytes = zip_fixture(&[
@@ -2812,7 +2816,10 @@ mod tests {
                 "xl/chartsheets/_rels/sheet1.xml.rels",
                 br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#,
             ),
-            ("xl/drawings/drawing1.xml", b"<xdr:wsDr/>"),
+            (
+                "xl/drawings/drawing1.xml",
+                br#"<xdr:wsDr xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart r:id="rId1"/></xdr:wsDr>"#,
+            ),
             (
                 "xl/drawings/_rels/drawing1.xml.rels",
                 br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
@@ -2826,7 +2833,10 @@ mod tests {
                 "xl/chartsheets/_rels/sheet2.xml.rels",
                 br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartEx" Target="../charts/chartEx1.xml"/></Relationships>"#,
             ),
-            ("xl/charts/chartEx1.xml", b"<chartEx/>"),
+            (
+                "xl/charts/chartEx1.xml",
+                br#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData/></cx:chartSpace>"#,
+            ),
         ]);
         let dir = tempfile::tempdir().expect("tempdir");
         let DocOutcome::Text {
@@ -2840,7 +2850,9 @@ mod tests {
         };
         assert_eq!(
             text,
-            "Sheet \"Data\":\n  A1: 1\n\nSheet \"Chart1\": (chart sheet)\n\nSheet \"Chart2\": (chart sheet)"
+            "Sheet \"Data\":\n  A1: 1\n\n\
+             Sheet \"Chart1\":\n  (chart sheet)\n  Chart: (the chart part could not be read)\n\n\
+             Sheet \"Chart2\":\n  (chart sheet)\n  Chart: (an extended chart kind, not read)"
         );
         // Each sheet's chart is the sheet: the two losses are named once each, not
         // again as charts of their own.
@@ -2891,7 +2903,7 @@ mod tests {
             panic!("expected Text outcome for a well-formed xlsx");
         };
         assert_eq!(
-            text, "Sheet \"Data\":\n  A1: 1\n\nSheet \"Chart1\": (chart sheet)",
+            text, "Sheet \"Data\":\n  A1: 1\n\nSheet \"Chart1\":\n  (chart sheet)",
             "the tab is named for what it is without its part, not dropped"
         );
         assert_eq!(
@@ -2902,6 +2914,149 @@ mod tests {
             notes.is_empty(),
             "a chart sheet is named, not reported unread: {notes:?}"
         );
+    }
+
+    /// A workbook of one sheet — `name`, a chart sheet when `chart_sheet` — that
+    /// draws the `charts` given, each filed as `xl/charts/<part>` in the order the
+    /// drawing names them: the whole chain a sheet's charts are read through, so a
+    /// test names only the charts it is about.
+    fn charted_workbook(name: &str, chart_sheet: bool, charts: &[(&str, &[u8])]) -> Vec<u8> {
+        let (dir, kind) = if chart_sheet {
+            ("chartsheets", "chartsheet")
+        } else {
+            ("worksheets", "worksheet")
+        };
+        let content = if chart_sheet {
+            r#"<chartsheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><drawing r:id="rId1"/></chartsheet>"#
+        } else {
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><drawing r:id="rId1"/></worksheet>"#
+        };
+        let mut drawing = String::new();
+        let mut drawing_rels = String::new();
+        for (index, (part, _)) in charts.iter().enumerate() {
+            let _ = write!(drawing, r#"<c:chart r:id="rId{}"/>"#, index + 1);
+            let _ = write!(
+                drawing_rels,
+                r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/{part}"/>"#,
+                index + 1
+            );
+        }
+        let mut parts: Vec<(String, Vec<u8>)> = vec![
+            (
+                "xl/workbook.xml".to_owned(),
+                format!(
+                    r#"<workbook><sheets><sheet name="{name}" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels".to_owned(),
+                format!(
+                    r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}" Target="{dir}/sheet1.xml"/></Relationships>"#
+                )
+                .into_bytes(),
+            ),
+            (format!("xl/{dir}/sheet1.xml"), content.as_bytes().to_vec()),
+            (
+                format!("xl/{dir}/_rels/sheet1.xml.rels"),
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#
+                    .to_vec(),
+            ),
+            (
+                "xl/drawings/drawing1.xml".to_owned(),
+                format!(
+                    r#"<xdr:wsDr xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{drawing}</xdr:wsDr>"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "xl/drawings/_rels/drawing1.xml.rels".to_owned(),
+                format!("<Relationships>{drawing_rels}</Relationships>").into_bytes(),
+            ),
+        ];
+        parts.extend(
+            charts
+                .iter()
+                .map(|(part, bytes)| (format!("xl/charts/{part}"), bytes.to_vec())),
+        );
+        let entries: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(part, bytes)| (part.as_str(), bytes.as_slice()))
+            .collect();
+        zip_fixture(&entries)
+    }
+
+    /// A drawing's two charts are each read, in the order the drawing names them,
+    /// so one sheet holding several charts tells a model about every one of them.
+    #[test]
+    fn xlsx_describes_every_chart_a_drawing_holds() {
+        let pie = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:pieChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Share</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strCache><c:pt idx="0"><c:v>East</c:v></c:pt></c:strCache></c:cat><c:val><c:numCache><c:pt idx="0"><c:v>7</c:v></c:pt></c:numCache></c:val></c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let bytes = charted_workbook(
+            "S",
+            false,
+            &[("chart1.xml", COLUMN_CHART.as_bytes()), ("chart2.xml", pie)],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, unshown, .. } = convert_xlsx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed xlsx");
+        };
+        assert_eq!(
+            text,
+            "Sheet \"S\":\n  A1: 1\n  \
+             Chart (column chart):\n    \
+             Title: Sales\n    \
+             Series \"Revenue\": Jan: 10, Feb: 20\n  \
+             Chart (pie chart):\n    \
+             Series \"Share\": East: 7"
+        );
+        assert!(
+            unshown.lines().is_empty(),
+            "both charts were described: {:?}",
+            unshown.lines()
+        );
+    }
+
+    /// A chart sheet whose chart is described prints the chart under its
+    /// `(chart sheet)` line and counts no loss: the sheet's chart is the sheet,
+    /// and its content was shown.
+    #[test]
+    fn xlsx_describes_a_chart_sheet_s_chart() {
+        let bytes = charted_workbook("Chart1", true, &[("chart1.xml", COLUMN_CHART.as_bytes())]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, unshown, .. } = convert_xlsx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed xlsx");
+        };
+        assert_eq!(
+            text,
+            "Sheet \"Chart1\":\n  (chart sheet)\n  \
+             Chart (column chart):\n    \
+             Title: Sales\n    \
+             Series \"Revenue\": Jan: 10, Feb: 20"
+        );
+        assert!(
+            unshown.lines().is_empty(),
+            "a described chart sheet is no longer a loss: {:?}",
+            unshown.lines()
+        );
+    }
+
+    /// A chart whose numbers are only in its attached table has no cached values
+    /// to print: it says where they are, where the chart sits, and stays in the
+    /// report — the reading described no content.
+    #[test]
+    fn xlsx_keeps_an_undescribed_chart_in_the_report() {
+        let chart = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:externalData r:id="rId1"/><c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:tx><c:strRef><c:f>Sheet1!$B$1</c:f></c:strRef></c:tx><c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let bytes = charted_workbook("S", false, &[("chart1.xml", chart)]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, unshown, .. } = convert_xlsx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed xlsx");
+        };
+        assert_eq!(
+            text,
+            "Sheet \"S\":\n  A1: 1\n  \
+             Chart (column chart):\n    Series 1: (values only in the attached table)"
+        );
+        assert_eq!(unshown.lines(), ["1 chart(s) not shown"]);
     }
 
     /// A `t="s"` cell holds an index into the shared-string table, so one the

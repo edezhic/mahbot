@@ -70,7 +70,16 @@
     { "pattern": "(?:Footnote|Endnote|Comment) \\d+(?: \\([^)]*\\))?:", "example": "Footnote 1 (not referenced in the text):" },
     { "pattern": "(?:Header|Footer)(?: \\d+)? \\([^)]*\\):", "example": "Header 1 (first page):" },
     { "pattern": "Unaccepted tracked changes:", "example": "Unaccepted tracked changes: 1 insertion" },
-    { "pattern": "\\(authors: [^)]*\\)", "example": "(authors: Anna)" }
+    { "pattern": "\\(authors: [^)]*\\)", "example": "(authors: Anna)" },
+    { "pattern": "Chart \\([^)]*\\):", "example": "Chart (column chart):" },
+    { "pattern": "Series (?:\\d+|\"[^\"]*\"):", "example": "Series \"Revenue\":" },
+    { "pattern": "\\(no values in the chart part\\)", "example": "(no values in the chart part)" },
+    { "pattern": "\\(values only in the attached table\\)", "example": "(values only in the attached table)" },
+    { "pattern": "\\(the chart part could not be read\\)", "example": "(the chart part could not be read)" },
+    { "pattern": "\\(an extended chart kind[^)]*\\)", "example": "(an extended chart kind, not read)" },
+    { "pattern": "\\(size [^)]*\\)", "example": "(size 12)" },
+    { "pattern": "\\(stored number, format not shown\\)", "example": "(stored number, format not shown)" },
+    { "pattern": "\\d+ more (?:series|value\\(s\\)|text\\(s\\))", "example": "3 more value(s)" }
   ],
   "edit_text_max": 20000,
   "edits_max": 200,

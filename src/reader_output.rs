@@ -19,7 +19,11 @@
 //! reading share, and the block a text box prints as — sit beside them rather than
 //! inside one of the two files that print them: the marks the kit's refusals match
 //! are stated in `assets/docgen/rules.json`, and the Word reader's own tests pin
-//! the list to what a reading shows.
+//! the list to what a reading shows. The vocabulary a chart's content prints as —
+//! its block header, its field labels, the annotations a value carries and the
+//! marks standing in for values — is stated here as well, because all three OOXML
+//! readers print it through one module and the model-facing description of a
+//! reading names it.
 //!
 //! The PowerPoint marks — `(title)`, `(hidden slide)`, `(diagram text)`,
 //! `(diagram text could not be read)`, `(no text)` — are deliberately *not*
@@ -110,9 +114,16 @@ pub(crate) fn column_index(reference: &str) -> Option<u32> {
 /// The mark a sheet with no valued cell prints in place of its lines.
 pub(crate) const NO_VALUES: &str = "(no values)";
 
-/// The mark a workbook sheet that is a chart rather than a grid of cells prints
-/// in place of its lines: the tab is named for what it is, and the report names
-/// the chart it holds.
+/// The mark a value carries when it is the number the file stores rather than a
+/// display of it: the cell's or the chart cache's number format was not read, is
+/// not one this reader reproduces for this value, or shows nothing at all for it.
+/// A spreadsheet cell and a chart's cached value carry the same one, so one
+/// number is not spelled two ways in one answer.
+pub(crate) const MARK_STORED: &str = " (stored number, format not shown)";
+
+/// The line a chart sheet prints first — the tab is one chart over the whole
+/// sheet rather than a grid of cells — with the chart's own content under it,
+/// and the report naming the chart unless its content was described.
 pub(crate) const CHART_SHEET: &str = "(chart sheet)";
 
 /// A sheet's block header, marked when the workbook hides the sheet. The state a
@@ -171,6 +182,70 @@ pub(crate) fn slide_label(template: &str, number: &str) -> String {
 /// block in the enclosing flow.
 pub(crate) const TEXT_BOX: &str = "[text box]";
 
+// ── Chart marks ─────────────────────────────────────────────────
+//
+// The vocabulary a chart's content prints as, wherever a reading prints it: the
+// three OOXML readers all print it through [`crate::ooxml::chart`], and the
+// model-facing description of a reading names it from here (`src/tools/read.rs`),
+// so the two cannot spell one mark two ways. A chart's own field labels are
+// deliberately not patterns in the document kit's refusals (`docx_marks`):
+// `Title:`, `Text:` and `Label:` are ordinary words a document's own text can
+// hold. So is the bare `Chart:` of a part that names no kind, which would refuse
+// any document's own sentence opening with it. The header a named kind prints,
+// the series label (named or numbered), the annotation beside a value and the
+// marks standing in for values are patterns.
+
+/// The label a chart's own title prints under.
+pub(crate) const CHART_TITLE: &str = "Title:";
+
+/// The label an axis title prints under.
+pub(crate) const CHART_TEXT: &str = "Text:";
+
+/// The label a data label's own text prints under.
+pub(crate) const CHART_LABEL: &str = "Label:";
+
+/// The mark a series with no values in the chart part carries in place of them.
+pub(crate) const CHART_NO_VALUES: &str = "(no values in the chart part)";
+
+/// The mark a series whose values are only in the table the chart attaches
+/// carries in place of them: that table is not opened by a reading.
+pub(crate) const CHART_VALUES_ATTACHED: &str = "(values only in the attached table)";
+
+/// The mark a chart part that cannot be read prints.
+pub(crate) const CHART_UNREADABLE: &str = "(the chart part could not be read)";
+
+/// The mark an extended (`chartEx`) chart part prints: its own schema is not
+/// read here.
+pub(crate) const CHART_EXTENDED: &str = "(an extended chart kind, not read)";
+
+/// The header a chart's content prints under: `Chart (<kind>):`, or `Chart:` for
+/// a part that names no kind. A model-facing description passes `<kind>`, the way
+/// it passes `<n>` for a slide's number, so the header is stated once.
+pub(crate) fn chart_header(kind: Option<&str>) -> String {
+    kind.map_or_else(|| "Chart:".to_owned(), |kind| format!("Chart ({kind}):"))
+}
+
+/// The label a series' values print under: `Series "<name>":`, or the series'
+/// number when the part gives it no name. A model-facing description passes
+/// `<name>`, the way it passes `<n>` for a slide's number, so the label is
+/// stated once.
+pub(crate) fn chart_series(name: Option<&str>, index: usize) -> String {
+    name.map_or_else(
+        || format!("Series {}:", index + 1),
+        |name| format!("Series \"{name}\":"),
+    )
+}
+
+/// The annotation a bubble point's size prints beside its value.
+pub(crate) fn chart_size(size: &str) -> String {
+    format!("(size {size})")
+}
+
+/// How much of a bounded list a chart's lines leave out: `3 more value(s)`.
+pub(crate) fn chart_excess(count: usize, noun: &str) -> String {
+    format!("{count} more {noun}")
+}
+
 // ── Word story names ────────────────────────────────────────────
 //
 // The names of the Word stories a reader prints. The `.docx` reader numbers one
@@ -213,9 +288,13 @@ pub(crate) const DOC_COMMENTS: &str = "Comments";
 #[derive(Clone, Copy, EnumCount, EnumIter)]
 pub(crate) enum UnshownKind {
     /// A chart part the package holds (`charts/chart<N>.xml`, the modern
-    /// `chartEx<N>.xml` parts with it), which no reading draws.
+    /// `chartEx<N>.xml` parts with it), whose content a reading did not describe.
+    /// An ordinary chart's content is described where the chart sits; a chart
+    /// whose part carries no cached values, cannot be read, or is an extended
+    /// `chartEx` kind is what the report names.
     Chart,
-    /// A sheet that is one chart over a whole tab rather than a grid of cells.
+    /// A sheet that is one chart over a whole tab rather than a grid of cells,
+    /// whose chart the reading did not describe where it sits.
     ChartSheet,
     /// A SmartArt diagram, whose data parts no reading here reaches: the Word and
     /// Excel readers name them by count, and the PowerPoint one reads a slide's

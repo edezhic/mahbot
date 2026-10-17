@@ -10,7 +10,10 @@
 //! [`docx`]; Excel's is the module [`xlsx`]; and PowerPoint's is a slide walk
 //! that reaches one part further for the two things a slide only points at —
 //! its layout, whose title placeholders it borrows, and the data model of each
-//! SmartArt diagram it shows — so it still lives in this module.
+//! SmartArt diagram it shows — so it still lives in this module. The charts a
+//! package holds are read by [`chart`], whichever family draws them: a chart part
+//! carries its own cached values, so what a chart says reaches the answer where the
+//! chart sits.
 //!
 //! # Invariants
 //!
@@ -37,8 +40,12 @@ use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
+mod chart;
 mod docx;
 pub(crate) use docx::{DOCX_BODY_PART, convert_docx};
+/// Excel's number formats, shared by the sheet reader and the chart reader: a
+/// value a workbook stores is shown the way Excel displays it, in both.
+mod numfmt;
 mod xlsx;
 pub(crate) use xlsx::{WORKBOOK_PART, convert_xlsx};
 
@@ -125,6 +132,10 @@ pub(crate) fn family_of(path: &Path) -> Option<Family> {
 
 /// Extract slide text, speaker notes and embedded images from a `.pptx`/`.pptm`
 /// package.
+///
+/// A slide's layout and its master are not read — their text never enters the
+/// answer — so a chart one of them draws is not described where it sits: the
+/// report counts it with every chart the reading did not show.
 #[must_use]
 pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
@@ -136,14 +147,9 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
 
     ensure_out_dir(out_dir);
 
+    let charts = chart::read_charts(&mut archive, PPT_CHARTS_PREFIX, false);
     let mut notes = Vec::new();
-    let mut unshown = unopened_parts(
-        &mut archive,
-        PPT_CHARTS_PREFIX,
-        None, // a slide's diagrams are read: this arm prints their text
-        PPT_EMBEDDINGS_PREFIX,
-        None, // a PowerPoint package has no chart sheets
-    );
+    let mut unshown = Unshown::default();
     let mut skipped = SkippedImages::default();
     let images = write_media_parts(
         &mut archive,
@@ -160,6 +166,7 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     // reason.
     let mut layouts: HashMap<String, HashSet<String>> = HashMap::new();
     let mut diagrams = DiagramCache::default();
+    let mut described = HashSet::new();
     for (index, part) in parts.iter().enumerate() {
         let number = index + 1;
         // A slide the presentation declares but the package does not resolve
@@ -196,8 +203,27 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
             notes.push(format!("slide {number} could not be read"));
             continue;
         };
+        // The charts the slide draws, read where they sit rather than merely
+        // counted: a chart whose content is printed here is no longer a loss. A
+        // slide whose block is not printed marks nothing, so nothing it draws can
+        // vanish from both the reading and the report.
+        let chart_lines = match &rels {
+            SlideRels::List(list) => {
+                let parts = chart::chart_parts(&xml, list, base);
+                let (lines, chart_described) = chart::lines(&charts, &parts);
+                described.extend(chart_described);
+                lines
+            }
+            _ => Vec::new(),
+        };
         let shown = slide_diagrams(&mut archive, base, &xml, &rels, &mut diagrams);
-        blocks.push(slide_block(number, slide_hidden(&xml), &content, &shown));
+        blocks.push(slide_block(
+            number,
+            slide_hidden(&xml),
+            &content,
+            &shown,
+            &chart_lines,
+        ));
         match slide_notes(&mut archive, base, &rels) {
             SlideNotes::Text(lines) if !lines.is_empty() => {
                 blocks.push(text_lines(&slide_notes_header(number), &lines));
@@ -210,6 +236,14 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
             _ => {}
         }
     }
+    unshown.merge(&unopened_parts(
+        &mut archive,
+        PPT_CHARTS_PREFIX,
+        None, // a slide's diagrams are read: this arm prints their text
+        PPT_EMBEDDINGS_PREFIX,
+        None, // a PowerPoint package has no chart sheets
+        &described,
+    ));
     notes.extend(skipped.notes());
     DocOutcome::Text {
         text: blocks.join("\n\n").trim_end().to_string(),
@@ -792,17 +826,19 @@ fn mark_placeholder(points: &mut [DiagramPoint], event: &BytesStart<'_>) {
 }
 
 /// One slide block: `Slide {n}:`, ` (hidden slide)` when the presentation hides
-/// it, then the title lines, the body lines, and one section per diagram — a
+/// it, then the title lines, the body lines, one section per diagram — a
 /// diagram section being the `(diagram text)` heading over its indented node
 /// lines (none, for a diagram that shows no text), or the
-/// `(diagram text could not be read)` mark. A slide holding a diagram thus never
-/// reads `(no text)`, which [`text_block`] supplies only for a slide holding
-/// nothing at all.
+/// `(diagram text could not be read)` mark — and one section per chart the
+/// slide draws, printed where it sits. A slide holding a diagram or a chart thus
+/// never reads `(no text)`, which [`text_block`] supplies only for a slide
+/// holding nothing at all.
 fn slide_block(
     number: usize,
     hidden: bool,
     content: &SlideText,
     diagrams: &[DiagramRead],
+    charts: &[String],
 ) -> String {
     let marks = ppt_marks();
     let header = slide_header(number, hidden);
@@ -821,6 +857,7 @@ fn slide_block(
             }
         }
     }
+    lines.extend(charts.iter().cloned());
     text_block(&header, &marks.no_text, &lines)
 }
 
@@ -913,18 +950,23 @@ fn write_media_parts<R: Read + Seek>(
 }
 
 /// Count the chart parts under `prefix` (`chart<N>.xml` with the modern
-/// `chartEx<N>.xml`) less the ones a chart sheet draws: the sheet is what names
-/// those, and naming one loss twice would overstate what the file holds.
+/// `chartEx<N>.xml`) less the ones a chart sheet draws and the ones a reading
+/// described: the sheet is what names its chart, and a chart whose content was
+/// printed where it sits is no longer a loss. `described` names the parts the
+/// reading printed content for; an undescribed part (no cached values, unreadable,
+/// or an extended `chartEx` kind) is still counted.
 fn count_chart_parts<R: Read + Seek>(
     archive: &ZipArchive<R>,
     prefix: &str,
     chart_sheets: Option<&HashSet<String>>,
+    described: &HashSet<String>,
 ) -> usize {
     archive
         .file_names()
         .filter(|name| {
             is_chart_part(name, prefix)
                 && !chart_sheets.is_some_and(|sheets| sheets.contains(*name))
+                && !described.contains(*name)
         })
         .count()
 }
@@ -1007,24 +1049,28 @@ fn chart_data_parts<R: Read + Seek>(
 }
 
 /// The parts of one OOXML package that no reading of it opens, counted for the
-/// report: the charts under `charts/` that no chart sheet draws (`chart_sheets`
-/// names the ones a sheet is, which the sheet's own kind already reports, and is
-/// `None` for a family that has no chart sheets), the diagrams whose data parts sit
-/// under `diagrams/` (`None` for a family whose own reading reaches a diagram — the
-/// PowerPoint one prints a slide's diagram text), and the parts under `embeddings/`
-/// that are no other part's companion. Each family passes its own directories, so
-/// the three arms cannot count one kind two ways.
+/// report: the charts under `charts/` that no chart sheet draws and no reading
+/// described (`chart_sheets` names the charts a sheet is, which the sheet's own
+/// kind already reports, and is `None` for a family that has no chart sheets;
+/// `described` names the parts whose content a reading printed where the chart
+/// sits, so a chart it did not describe — no cached values, unreadable, or an
+/// extended kind — is still counted), the diagrams whose data parts sit under
+/// `diagrams/` (`None` for a family whose own reading reaches a diagram — the
+/// PowerPoint one prints a slide's diagram text), and the parts under
+/// `embeddings/` that are no other part's companion. Each family passes its own
+/// directories, so the three arms cannot count one kind two ways.
 fn unopened_parts<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     charts: &str,
     diagrams: Option<&str>,
     embeddings: &str,
     chart_sheets: Option<&HashSet<String>>,
+    described: &HashSet<String>,
 ) -> Unshown {
     let mut unshown = Unshown::default();
     unshown.add(
         UnshownKind::Chart,
-        count_chart_parts(archive, charts, chart_sheets),
+        count_chart_parts(archive, charts, chart_sheets, described),
     );
     if let Some(diagrams) = diagrams {
         unshown.add(
@@ -1086,6 +1132,27 @@ fn relationships_and_whole(xml: &[u8]) -> (Option<Vec<Relationship>>, bool) {
 /// names none of its parts.
 fn relationships(xml: &[u8]) -> Option<Vec<Relationship>> {
     relationships_and_whole(xml).0
+}
+
+/// The relationships the part at `name` declares, or `None` when the part is there
+/// and cannot be read. A part the package does not carry, and an entry it left empty,
+/// both declare no relationship at all — nothing is lost; a part that is no
+/// relationship list, or one the package cut short, names its remaining parts
+/// nowhere, so its list is not the document's own and is read like one that could
+/// not be read at all.
+fn read_relationships<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+) -> Option<Vec<Relationship>> {
+    match read_zip_entry(archive, name) {
+        ZipEntry::Bytes(xml) if blank(&xml) => Some(Vec::new()),
+        ZipEntry::Bytes(xml) => match relationships_and_whole(&xml) {
+            (Some(rels), true) => Some(rels),
+            _ => None,
+        },
+        ZipEntry::Missing => Some(Vec::new()),
+        ZipEntry::Unreadable => None,
+    }
 }
 
 /// One `<Relationship Id Type Target/>` entry, or `None` when it names no id or no
@@ -1399,6 +1466,12 @@ pub(crate) mod test_fixtures {
     pub(crate) const DOCX_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>First paragraph</w:t></w:r></w:p><w:p><w:r><w:t>Second paragraph</w:t></w:r></w:p></w:body></w:document>"#;
 
+    /// A classic chart part of the shape all three families cache beside the table
+    /// it draws from: a column chart titled `Sales` with one series named `Revenue`
+    /// over two category/value points. One spelling, so the fixtures of the three
+    /// readings' tests cannot drift.
+    pub(crate) const COLUMN_CHART: &str = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Revenue</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strCache><c:pt idx="0"><c:v>Jan</c:v></c:pt><c:pt idx="1"><c:v>Feb</c:v></c:pt></c:strCache></c:cat><c:val><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt></c:numCache></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+
     /// Build a ZIP archive in memory from `(entry path, contents)` pairs.
     pub(crate) fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -1512,6 +1585,48 @@ mod tests {
         assert_eq!(images, vec![dir.path().join("pic.png")]);
         assert_eq!(unshown.lines(), ["1 chart(s) not shown"]);
         assert!(notes.is_empty(), "the report carries the chart loss");
+    }
+
+    /// A chart a slide draws is read where it sits: its kind, title and one line
+    /// per series are printed under the slide's block, and the chart is no longer
+    /// reported as one the reading did not show.
+    #[test]
+    fn pptx_describes_a_slide_chart_where_it_sits() {
+        let bytes = zip_fixture(&[
+            (
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                br#"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Quarterly sales</a:t></a:r></a:p></p:txBody></p:sp><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
+            ),
+            ("ppt/charts/chart1.xml", COLUMN_CHART.as_bytes()),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, unshown, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed pptx");
+        };
+        assert_eq!(
+            text,
+            "Slide 1:\n  Quarterly sales\n  \
+             Chart (column chart):\n    \
+             Title: Sales\n    \
+             Series \"Revenue\": Jan: 10, Feb: 20"
+        );
+        assert!(
+            unshown.lines().is_empty(),
+            "a described chart is no longer a loss: {:?}",
+            unshown.lines()
+        );
     }
 
     /// A deck's media is named by what each part is: a vector drawing, a video and

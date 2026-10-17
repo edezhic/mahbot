@@ -29,14 +29,24 @@
 //!   pass for the note's own text.
 //! - **Text boxes** as an indented `[text box]` block, read once: Word writes
 //!   each one twice, as an `mc:Choice` and as the `mc:Fallback` beside it.
+//! - **A chart** a drawing shows as its content where the drawing sits — its kind,
+//!   its title and other text, one line per series and the annotations its values
+//!   carry ([`chart`]) — in the body and in every peripheral story alike, and no
+//!   longer counted as a loss once its content is printed.
 //!
 //! The notation the model reads, every marker spelled out, is documented in
-//! `src/prompt/tool/read.md`, and every marker this walk
-//! prints is listed once in `assets/docgen/rules.json` (`docx_marks`) — the list
-//! the document kit refuses a `find` carrying one by, and the list the test
-//! `every_docx_mark_the_shared_list_names_is_a_mark_the_reader_prints` checks
-//! this reader's own output against, so a marker renamed here cannot leave the
-//! kit naming one the reader no longer prints.
+//! `src/prompt/tool/read.md`, and every label and mark this walk prints — each
+//! bracket mark, block label and annotation above, and what the chart block a
+//! drawing adds prints: its header, its series label, the annotation beside a
+//! value and the marks standing in for a chart's missing values — is listed once
+//! in `assets/docgen/rules.json` (`docx_marks`), the list the document kit refuses
+//! a `find` carrying one by. The test
+//! `every_docx_mark_the_reader_writes_is_in_the_shared_list` checks this reader's
+//! own output against that list, and the chart module checks the chart vocabulary
+//! it contributes, so a marker renamed on either side cannot leave the kit naming
+//! one the reader no longer prints. A chart's field labels (`Title:`, `Text:`,
+//! `Label:`) and the bare `Chart:` of a part that names no kind are deliberately
+//! not refusal patterns: they are ordinary words a document's own text can carry.
 //!
 //! # Invariants
 //!
@@ -51,7 +61,9 @@
 //! - **One sink stack.** Text always lands in the innermost open sink, so a
 //!   table cell or a text box renders into its own buffer and is placed into
 //!   the enclosing flow as one block — nothing has to count what was written
-//!   where.
+//!   where. The chart parts a block shows travel with its text, so a block the
+//!   walk drops (a cell a merge does not repeat, a story it gives up on) takes
+//!   its charts with it and they stay in the report.
 //! - **The walk's own bookkeeping is bounded rather than document-decided.**
 //!   The geometry a table asks for is clamped to [`MAX_TABLE_COLUMNS`] columns
 //!   where its cells are placed — one cell's `w:gridSpan`, a row's
@@ -61,10 +73,11 @@
 //!   named before it; and an author a revision repeats is remembered rather than
 //!   searched for.
 
+use super::chart;
 use super::{
-    DocOutcome, Family, Relationship, SkippedImages, append_entity, attr, ensure_out_dir,
-    read_zip_entry, relationships, resolve_part, scan_elements, unopened_parts, unreadable,
-    write_media_parts,
+    DocOutcome, Family, Relationship, SkippedImages, append_entity, attr, ensure_out_dir, part_dir,
+    read_relationships, read_zip_entry, relationship_targets, relationships, rels_part_of,
+    resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
 };
 use crate::reader_output::{
     TEXT_BOX, WORD_COMMENT, WORD_ENDNOTE, WORD_FOOTER, WORD_FOOTNOTE, WORD_HEADER, labeled_block,
@@ -231,17 +244,33 @@ enum Ctx {
 
 // ── The walker ──────────────────────────────────────────────────
 
+/// One rendered block: its text, and the chart parts whose content that text
+/// shows. A block placed into another carries them along; one the walk drops —
+/// a cell a merge does not repeat, a part that renders nothing — takes them with
+/// it, so a chart never leaves both the reading and the report.
+#[derive(Default)]
+struct Sink {
+    text: String,
+    charts: Vec<String>,
+}
+
 /// The state of one package walk.
 struct Word {
-    /// The body's relationships as the walk looks them up: relationship id ->
-    /// the part it targets. A package may reference a part a million times, so
-    /// the lookup is one map, not a scan per reference.
+    /// The relationships of the part being walked: relationship id -> the part it
+    /// targets. A package may reference a part a million times, so the lookup is
+    /// one map, not a scan per reference, and each part the walk enters resets it
+    /// to that part's own list.
     rel_targets: HashMap<String, String>,
+    /// The directory the part being walked sits in: a relationship target and a
+    /// chart reference resolve against it, wherever the package put the part.
+    base: String,
     footnotes: Notes,
     endnotes: Notes,
     comments: Notes,
-    /// Text sinks; text always goes to the last one.
-    buffers: Vec<String>,
+    /// Text sinks; text always goes to the last one, and so do the chart parts
+    /// whose content it shows, so a block that is dropped takes its charts with
+    /// it.
+    buffers: Vec<Sink>,
     /// Paragraph-mark markers, one entry per open `w:p`.
     paras: Vec<Vec<&'static str>>,
     /// Open tables, innermost last, so a nested table works.
@@ -253,6 +282,12 @@ struct Word {
     /// Comment ids whose range was opened in the part being read, so a point
     /// reference does not repeat them; a range does not run between parts.
     comment_ranges: HashSet<String>,
+    /// The content of every chart part the package holds, read once so a chart
+    /// the body draws is printed where it sits.
+    charts: HashMap<String, chart::ChartRead>,
+    /// The chart parts whose content the walk printed where the chart sits: the
+    /// package's census leaves them out.
+    described: HashSet<String>,
     /// Whether the run's `w:rPr` being read carries an `rPrChange`.
     run_revised: bool,
     /// Header and footer parts the body's section properties reference, each
@@ -278,16 +313,22 @@ struct Word {
 }
 
 impl Word {
-    /// A walker over the package whose parts `rels` names, with the notes parts
-    /// already located and read.
-    fn new<R: Read + Seek>(rels: &[Relationship], archive: &mut ZipArchive<R>) -> Self {
+    /// A walker over the package whose parts `rels` names — the body's own
+    /// relationships, which also name the notes parts — with those parts already
+    /// located and read and the package's chart parts already read.
+    fn new<R: Read + Seek>(
+        rels: &[Relationship],
+        archive: &mut ZipArchive<R>,
+        charts: HashMap<String, chart::ChartRead>,
+    ) -> Self {
         // The notes parts are named by relationship kind, so each is resolved
         // from the list before the list becomes the id lookup the walk needs.
         let footnotes_part = notes_part(rels, NoteKind::Footnote);
         let endnotes_part = notes_part(rels, NoteKind::Endnote);
         let comments_part = notes_part(rels, NoteKind::Comment);
         Self {
-            rel_targets: super::relationship_targets(rels),
+            rel_targets: relationship_targets(rels),
+            base: DOCX_BASE.to_owned(),
             footnotes: Notes::load(NoteKind::Footnote, &footnotes_part, archive),
             endnotes: Notes::load(NoteKind::Endnote, &endnotes_part, archive),
             comments: Notes::load(NoteKind::Comment, &comments_part, archive),
@@ -297,6 +338,8 @@ impl Word {
             cells: Vec::new(),
             fields: Vec::new(),
             comment_ranges: HashSet::new(),
+            charts,
+            described: HashSet::new(),
             run_revised: false,
             headers: PartRefs::default(),
             footers: PartRefs::default(),
@@ -335,7 +378,7 @@ impl Word {
     /// Append `s` to the innermost open sink.
     fn push_str(&mut self, s: &str) {
         if let Some(sink) = self.buffers.last_mut() {
-            sink.push_str(s);
+            sink.text.push_str(s);
         }
     }
 
@@ -343,19 +386,23 @@ impl Word {
     /// with one, so layout alone never leaves a blank line behind.
     fn end_line(&mut self) {
         if let Some(sink) = self.buffers.last_mut()
-            && !sink.is_empty()
-            && !sink.ends_with('\n')
+            && !sink.text.is_empty()
+            && !sink.text.ends_with('\n')
         {
-            sink.push('\n');
+            sink.text.push('\n');
         }
     }
 
-    /// Append a nested rendered block (a table, a text box): on a line of its
-    /// own, with a line end after it.
-    fn block(&mut self, text: &str) {
+    /// Append a nested rendered block (a table, a text box, a chart): on a line
+    /// of its own, with a line end after it, carrying the chart parts it shows
+    /// into the enclosing sink.
+    fn block(&mut self, text: &str, charts: Vec<String>) {
         self.end_line();
         self.push_str(text);
         self.end_line();
+        if let Some(sink) = self.buffers.last_mut() {
+            sink.charts.extend(charts);
+        }
     }
 
     /// Append run text. Text between a field's `begin` and its `separate` is
@@ -382,13 +429,27 @@ impl Word {
 
     // ── Parts ───────────────────────────────────────────────────
 
-    /// Walk the body part.
+    /// Walk the body part, whose own content is the answer: the chart parts it
+    /// shows are described. The body's relationships are the package's, set when
+    /// the walker was built.
     fn body(&mut self, xml: &[u8]) -> Option<String> {
-        self.read_part(xml, true).ok()
+        let sink = self.read_part(xml, true).ok()?;
+        self.described.extend(sink.charts);
+        Some(sink.text)
     }
 
-    /// Walk a whole part as ordinary content and return its rendered text.
-    fn read_part(&mut self, xml: &[u8], collect_sections: bool) -> Result<String, Fault> {
+    /// Enter the story part `part` through the relationships it names: its
+    /// directory and its relationship lookup are set together, so a reference
+    /// written in the part resolves the way that part's own relationships spell
+    /// it.
+    fn enter_story_part<R: Read + Seek>(&mut self, archive: &mut ZipArchive<R>, part: &str) {
+        let rels = read_relationships(archive, &rels_part_of(part)).unwrap_or_default();
+        part_dir(part).clone_into(&mut self.base);
+        self.rel_targets = relationship_targets(&rels);
+    }
+
+    /// Walk a whole part as ordinary content and return its rendered block.
+    fn read_part(&mut self, xml: &[u8], collect_sections: bool) -> Result<Sink, Fault> {
         self.reset_part();
         self.collect_sections = collect_sections;
         let mut reader = Reader::from_reader(xml);
@@ -592,6 +653,10 @@ impl Word {
                 self.ignored(reader, level, empty)
             }
             b"txbxContent" => self.text_box(reader, level, empty),
+            b"chart" => {
+                self.chart(elem);
+                self.ignored(reader, level, empty)
+            }
             b"AlternateContent" => self.alternate_content(reader, level, empty),
             // Everything else is a plain container (`w:document`, `w:body`,
             // `w:r`, `w:hyperlink`, `w:smartTag`, `w:sdt`, `w:drawing`,
@@ -609,6 +674,25 @@ impl Word {
             b"br" | b"cr" => self.end_line(),
             b"noBreakHyphen" => self.push_str("-"),
             _ => {}
+        }
+    }
+
+    /// The chart a `c:chart` reference names, printed where the drawing that holds
+    /// it sits — in the body, in a header or a footer, or in a note. The reference
+    /// resolves through the relationships of the part being walked and against its
+    /// own directory, so a chart any of them shows is described rather than left to
+    /// the package's census.
+    fn chart(&mut self, elem: &Elem) {
+        let Some(part) = elem
+            .attr("id")
+            .and_then(|id| self.rel(id))
+            .map(|target| resolve_part(&self.base, target))
+        else {
+            return;
+        };
+        let (lines, described) = chart::lines(&self.charts, std::slice::from_ref(&part));
+        if !lines.is_empty() {
+            self.block(&lines.join("\n"), described);
         }
     }
 
@@ -849,8 +933,8 @@ impl Word {
     }
 
     /// Close the innermost table: render its label and rows, and append them to
-    /// the sink below. A table with no rows has nothing to say, and its number
-    /// passes to the next table.
+    /// the sink below with the chart parts they show. A table with no rows has
+    /// nothing to say, and its number passes to the next table.
     fn finish_table(&mut self) {
         let Some(table) = self.tables.pop() else {
             return;
@@ -874,7 +958,7 @@ impl Word {
             text.push('\n');
             text.push_str(row);
         }
-        self.block(&text);
+        self.block(&text, table.charts);
     }
 
     /// Count a `w:tblGrid`'s declared columns.
@@ -971,13 +1055,13 @@ impl Word {
             span: 1,
             ..Cell::default()
         });
-        let text = self.render_block(reader, level);
+        let rendered = self.render_block(reader, level);
         // The cell is popped whatever happened: a fault must not leave it on
         // the stack for the next cell to be read as.
         let cell = self.cells.pop().unwrap_or_default();
-        let text = text?;
+        let rendered = rendered?;
         if let Some(table) = self.tables.last_mut() {
-            table.place(cell, &text);
+            table.place(cell, &rendered);
         }
         Ok(())
     }
@@ -1003,9 +1087,9 @@ impl Word {
             b"moveTo" => ("[moved-here]", "[/moved-here]"),
             _ => ("[moved-away]", "[/moved-away]"),
         };
-        let before = self.buffers.last().map_or(0, String::len);
+        let before = self.buffers.last().map_or(0, |sink| sink.text.len());
         let result = self.content(reader, level + 1, Ctx::Flow);
-        if let Some(sink) = self.buffers.last_mut()
+        if let Some(sink) = self.buffers.last_mut().map(|sink| &mut sink.text)
             && sink.len() > before
         {
             sink.insert_str(before, open);
@@ -1150,11 +1234,12 @@ impl Word {
         self.text_boxes += 1;
         let inner = self.render_block(reader, level);
         self.text_boxes = self.text_boxes.saturating_sub(1);
-        let inner = inner?.trim_end().to_owned();
-        if inner.trim().is_empty() {
+        let inner = inner?;
+        let text = inner.text.trim_end();
+        if text.trim().is_empty() {
             return Ok(());
         }
-        self.block(&text_lines(TEXT_BOX, &lines_of(&inner)));
+        self.block(&text_lines(TEXT_BOX, &lines_of(text)), inner.charts);
         Ok(())
     }
 
@@ -1172,8 +1257,8 @@ impl Word {
             return Ok(());
         }
         let mut buffer = Vec::new();
-        let mut choice: Option<String> = None;
-        let mut fallback: Option<String> = None;
+        let mut choice: Option<Sink> = None;
+        let mut fallback: Option<Sink> = None;
         // Every copy holds the same content, so only the copy the walk keeps
         // counts its revisions: a copy that turned out to render nothing is
         // rolled back before the next one is read, and at the end when no copy
@@ -1186,7 +1271,7 @@ impl Word {
                 // none, and the fallback speaks only when no choice rendered
                 // anything: Word writes the same content in each copy.
                 Ev::Start(elem) if elem.name == b"Choice" => {
-                    if renders_nothing(choice.as_deref()) {
+                    if renders_nothing(choice.as_ref()) {
                         self.revisions.rollback(base);
                         choice = Some(self.render_block(reader, level + 1)?);
                     } else {
@@ -1194,7 +1279,7 @@ impl Word {
                     }
                 }
                 Ev::Start(elem) if elem.name == b"Fallback" => {
-                    if renders_nothing(fallback.as_deref()) && renders_nothing(choice.as_deref()) {
+                    if renders_nothing(fallback.as_ref()) && renders_nothing(choice.as_ref()) {
                         self.revisions.rollback(base);
                         fallback = Some(self.render_block(reader, level + 1)?);
                     } else {
@@ -1210,13 +1295,16 @@ impl Word {
         }
         // The copy that carries the text: the choice that rendered something, or
         // the fallback beside it.
-        let kept = if renders_nothing(choice.as_deref()) {
+        let kept = if renders_nothing(choice.as_ref()) {
             fallback
         } else {
             choice
         };
         match kept {
-            Some(text) if !renders_nothing(Some(text.as_str())) => self.block(text.trim()),
+            Some(sink) if !renders_nothing(Some(&sink)) => {
+                let Sink { text, charts } = sink;
+                self.block(text.trim(), charts);
+            }
             // Nothing is rendered at all, so no copy's revisions are part of the
             // document's text either.
             _ => self.revisions.rollback(base),
@@ -1228,14 +1316,14 @@ impl Word {
     /// cell, a text box, a note definition, or a whole part (whose top level
     /// sits below its document element). The block is a text flow of its own,
     /// so a field it left open is closed with it.
-    fn render_block(&mut self, reader: &mut Xml<'_>, level: usize) -> Result<String, Fault> {
-        self.buffers.push(String::new());
+    fn render_block(&mut self, reader: &mut Xml<'_>, level: usize) -> Result<Sink, Fault> {
+        self.buffers.push(Sink::default());
         let result = self.content(reader, level + 1, Ctx::Flow);
         self.close_fields();
         // The sink pushed above is the one popped: a nested block always pops
         // its own, fault or not, so the stack cannot grow past this block.
-        let text = self.buffers.pop().unwrap_or_default();
-        result.map(|()| text)
+        let sink = self.buffers.pop().unwrap_or_default();
+        result.map(|()| sink)
     }
 
     // ── Headers, footers and notes ──────────────────────────────
@@ -1261,7 +1349,7 @@ impl Word {
         else {
             return;
         };
-        let part = resolve_part(DOCX_BASE, &target);
+        let part = resolve_part(&self.base, &target);
         let list = if header {
             &mut self.headers
         } else {
@@ -1298,10 +1386,14 @@ impl Word {
             let Some(xml) = read_zip_entry(archive, &entry.part).bytes() else {
                 continue;
             };
+            self.enter_story_part(archive, &entry.part);
             // A part that shows nothing shows nothing of its revisions either.
             let mark = self.revisions.mark();
             match self.read_part(&xml, false) {
-                Ok(text) if !text.trim().is_empty() => rendered.push((&entry.labels, text)),
+                Ok(sink) if !sink.text.trim().is_empty() => {
+                    self.described.extend(sink.charts);
+                    rendered.push((&entry.labels, sink.text));
+                }
                 _ => self.revisions.rollback(mark),
             }
         }
@@ -1331,6 +1423,9 @@ impl Word {
         let Some(xml) = read_zip_entry(archive, &part).bytes() else {
             return;
         };
+        // A definition's drawing names its chart through the notes part's own
+        // relationships, against the part's own directory.
+        self.enter_story_part(archive, &part);
         self.reset_part();
         let mut reader = Reader::from_reader(xml.as_slice());
         let _ = self.definitions(&mut reader, 0, kind);
@@ -1381,11 +1476,11 @@ impl Word {
             return self.ignored(reader, level, empty);
         }
         let mark = self.revisions.mark();
-        let text = if empty {
-            String::new()
+        let rendered = if empty {
+            Sink::default()
         } else {
             match self.render_block(reader, level) {
-                Ok(text) => text.trim_end().to_owned(),
+                Ok(rendered) => rendered,
                 // The fault drops the definition with the rest of the part, so
                 // the revisions read out of it are not the document's either.
                 Err(fault) => {
@@ -1394,6 +1489,7 @@ impl Word {
                 }
             }
         };
+        let text = rendered.text.trim_end().to_owned();
         // A definition the flow never references is shown only when it has text:
         // an empty one would be a label with nothing under it, while a referenced
         // one must appear or its anchor would name a note with no block.
@@ -1402,6 +1498,7 @@ impl Word {
             self.revisions.rollback(mark);
             return Ok(());
         }
+        self.described.extend(rendered.charts);
         let notes = self.notes_mut(kind);
         let number = notes.number(&id);
         notes.defs.push(Definition {
@@ -1497,12 +1594,16 @@ struct Table {
     hmerge: Option<usize>,
     /// Whether `w:tblPrChange` was seen.
     format_revised: bool,
+    /// The chart parts a cell of this table shows: a chart a cell holds is
+    /// described where the table prints, unless the cell is a merge
+    /// continuation that does not carry its own value.
+    charts: Vec<String>,
 }
 
 impl Table {
     /// Place the cell that just closed: annotate it, advance the running
     /// column, and leave the vertical merge map ready for the row below.
-    fn place(&mut self, cell: Cell, text: &str) {
+    fn place(&mut self, cell: Cell, rendered: &Sink) {
         let row = self.rows.len() + 1;
         // One cell's span was clamped where it was read, but a row's cells add
         // up: the running column is document-controlled arithmetic too, so the
@@ -1554,9 +1655,12 @@ impl Table {
         marks.sort();
         marks.dedup();
         notes.extend(marks.iter().map(|mark| mark.text().to_owned()));
-        // A row is one line, so a cell's own line ends are spelled as spaces.
+        // A row is one line, so a cell's own line ends are spelled as spaces. A
+        // continuation shows no value, and so shows none of the charts that
+        // value's content names either.
         let value = if holds_value {
-            text.trim().replace('\n', " ")
+            self.charts.extend(rendered.charts.iter().cloned());
+            rendered.text.trim().replace('\n', " ")
         } else {
             String::new()
         };
@@ -2022,8 +2126,8 @@ fn plural(count: usize, noun: &str) -> String {
 
 /// Whether a rendered copy produced nothing at all: the walk then reads the copy
 /// beside it instead.
-fn renders_nothing(text: Option<&str>) -> bool {
-    text.is_none_or(|text| text.trim().is_empty())
+fn renders_nothing(sink: Option<&Sink>) -> bool {
+    sink.is_none_or(|sink| sink.text.trim().is_empty())
 }
 
 /// A property element's numeric attribute value, `0` when absent or unreadable
@@ -2055,7 +2159,8 @@ pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         .and_then(|xml| relationships(&xml))
         .unwrap_or_default();
 
-    let mut word = Word::new(&rels, &mut archive);
+    let charts = chart::read_charts(&mut archive, DOCX_CHARTS_PREFIX, false);
+    let mut word = Word::new(&rels, &mut archive, charts);
     let Some(body) = word.body(&body_xml) else {
         return unreadable(Family::Docx);
     };
@@ -2086,6 +2191,7 @@ pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         Some(DOCX_DIAGRAMS_PREFIX),
         DOCX_EMBEDDINGS_PREFIX,
         None, // a Word package has no chart sheets
+        &word.described,
     );
     let mut skipped = SkippedImages::default();
     let images = write_media_parts(
@@ -2107,7 +2213,7 @@ pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ooxml::test_fixtures::{DOCX_BODY, zip_fixture};
+    use crate::ooxml::test_fixtures::{COLUMN_CHART, DOCX_BODY, zip_fixture};
 
     /// The namespaces a Word part is written with: the body's own, the
     /// relationship one, and the two a text box needs.
@@ -2257,7 +2363,152 @@ mod tests {
         );
     }
 
-    // ── Tables ──────────────────────────────────────────────────
+    /// A chart a body draws is read where the drawing sits: its kind, title and
+    /// series are printed in the body, and the chart is no longer reported as one
+    /// the reading did not show.
+    #[test]
+    fn docx_describes_a_body_chart_where_it_sits() {
+        let body = r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p><w:p><w:r><w:t>After</w:t></w:r></w:p>"#;
+        let document_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
+        let bytes = package(
+            body,
+            &[
+                ("word/_rels/document.xml.rels", &document_rels),
+                ("word/charts/chart1.xml", COLUMN_CHART),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text {
+            text,
+            notes,
+            unshown,
+            ..
+        } = convert_docx(&bytes, dir.path())
+        else {
+            panic!("expected Text outcome for a well-formed docx");
+        };
+        assert_eq!(
+            text,
+            "Before\n\
+             Chart (column chart):\n  \
+             Title: Sales\n  \
+             Series \"Revenue\": Jan: 10, Feb: 20\n\
+             After"
+        );
+        assert!(
+            unshown.lines().is_empty(),
+            "a described chart is no longer a loss: {:?}",
+            unshown.lines()
+        );
+        assert!(notes.is_empty(), "the report carries no loss: {notes:?}");
+    }
+
+    /// A chart a header draws is described where that story prints it: the whole
+    /// package is what a reading shows, so a chart outside the body is not left to
+    /// the report as a count.
+    #[test]
+    fn docx_describes_a_header_chart_where_it_sits() {
+        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+        let header = r#"<w:hdr><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p></w:hdr>"#;
+        let document_rels = rels(&rel("rId1", "header", "header1.xml"));
+        let header_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
+        let bytes = package(
+            body,
+            &[
+                ("word/_rels/document.xml.rels", &document_rels),
+                ("word/header1.xml", header),
+                ("word/_rels/header1.xml.rels", &header_rels),
+                ("word/charts/chart1.xml", COLUMN_CHART),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text {
+            text,
+            notes,
+            unshown,
+            ..
+        } = convert_docx(&bytes, dir.path())
+        else {
+            panic!("expected Text outcome for a well-formed docx");
+        };
+        assert_eq!(
+            text,
+            "Body\n\
+             Header (default):\n  \
+             Chart (column chart):\n    \
+             Title: Sales\n    \
+             Series \"Revenue\": Jan: 10, Feb: 20"
+        );
+        assert!(
+            unshown.lines().is_empty(),
+            "a described chart is no longer a loss: {:?}",
+            unshown.lines()
+        );
+        assert!(notes.is_empty(), "the report carries no loss: {notes:?}");
+    }
+
+    /// A story the walk gives up on takes its charts with it: a chart whose
+    /// content the reading drops is not passed off as described, so the census
+    /// still names it.
+    #[test]
+    fn docx_a_dropped_story_keeps_its_chart_in_the_report() {
+        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+        // The chart is drawn, then the part nests past what the walk reads.
+        let header = format!(
+            r#"<w:hdr><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p>{}"#,
+            "<w:p>".repeat(MAX_ELEMENT_DEPTH),
+        );
+        let document_rels = rels(&rel("rId1", "header", "header1.xml"));
+        let header_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
+        let bytes = package(
+            body,
+            &[
+                ("word/_rels/document.xml.rels", &document_rels),
+                ("word/header1.xml", &header),
+                ("word/_rels/header1.xml.rels", &header_rels),
+                ("word/charts/chart1.xml", COLUMN_CHART),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, unshown, .. } = convert_docx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed docx");
+        };
+        assert_eq!(text, "Body", "the part is dropped whole: {text:?}");
+        assert_eq!(
+            unshown.lines(),
+            ["1 chart(s) not shown"],
+            "the chart of a dropped part is still a loss the report names"
+        );
+    }
+
+    /// A chart drawn in a merge continuation is not described: the cell shows no
+    /// value of its own, so the content that value carries is not printed either —
+    /// and the census keeps the chart rather than letting it vanish from both.
+    #[test]
+    fn docx_a_chart_in_a_merge_continuation_stays_a_loss() {
+        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol/></w:tblGrid><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Origin</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p></w:tc></w:tr></w:tbl>"#;
+        let document_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
+        let bytes = package(
+            body,
+            &[
+                ("word/_rels/document.xml.rels", &document_rels),
+                ("word/charts/chart1.xml", COLUMN_CHART),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, unshown, .. } = convert_docx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a well-formed docx");
+        };
+        assert_eq!(
+            text, "Body\nTable 1: 2 rows, 1 column\n  R1: C1: Origin\n  R2: C1 (part of R1C1):",
+            "the continuation shows no value: {text:?}"
+        );
+        assert_eq!(
+            unshown.lines(),
+            ["1 chart(s) not shown"],
+            "a chart the reading did not print stays in the report"
+        );
+    }
 
     /// A table is one block: a labelled header, one line per row, one token per
     /// cell — and a `vMerge` continuation names its origin instead of repeating
@@ -3067,6 +3318,96 @@ mod tests {
 
     // ── The shared mark list ────────────────────────────────────
 
+    /// A package whose body draws eight charts — one whose values are cached, one
+    /// whose values are only in the table it attaches, one with no values at all,
+    /// one whose part is no chart, one of the extended schema, one carrying a
+    /// bubble's sizes, one whose number format cannot be reproduced and one past
+    /// the reading's bounds — so that every chart mark the shared list names is a
+    /// spelling a real reading raises.
+    fn charts_package() -> Vec<u8> {
+        let drawing = |id: &str| {
+            format!(
+                r#"<w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="{id}"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p>"#
+            )
+        };
+        let charts_body: String = (1..=8).fold(String::new(), |body, id| {
+            format!("{body}{}", drawing(&format!("rId{id}")))
+        });
+        let uncached = concat!(
+            r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart><c:ser>"#,
+            r#"<c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:val>"#,
+            r#"</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#,
+        );
+        let attached = uncached.replace("<c:chart>", r#"<c:externalData r:id="rId9"/><c:chart>"#);
+        let bubble = concat!(
+            r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:bubbleChart><c:ser>"#,
+            r#"<c:val><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt></c:numCache></c:val>"#,
+            r#"<c:bubbleSize><c:numCache><c:pt idx="0"><c:v>12</c:v></c:pt></c:numCache></c:bubbleSize>"#,
+            r#"</c:ser></c:bubbleChart></c:plotArea></c:chart></c:chartSpace>"#,
+        );
+        let stored = concat!(
+            r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:pieChart><c:ser>"#,
+            r#"<c:val><c:numCache><c:formatCode># ?/?</c:formatCode><c:pt idx="0"><c:v>1.5</c:v></c:pt></c:numCache></c:val>"#,
+            r#"</c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#,
+        );
+        // Past the reading's bounds: more series, points and texts than it prints.
+        let mut sers = String::new();
+        for series in 0..9 {
+            let mut points = String::new();
+            for point in 0..if series == 0 { 28 } else { 1 } {
+                let _ = write!(points, r#"<c:pt idx="{point}"><c:v>{point}</c:v></c:pt>"#);
+            }
+            let _ = write!(
+                sers,
+                r#"<c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>S{series}</c:v></c:pt></c:strCache></c:strRef></c:tx><c:val><c:numCache>{points}</c:numCache></c:val></c:ser>"#
+            );
+        }
+        let mut axes = String::new();
+        for axis in 0..7 {
+            let _ = write!(
+                axes,
+                r"<c:catAx><c:title><c:tx><c:rich><a:p><a:r><a:t>Axis {axis}</a:t></a:r></a:p></c:rich></c:tx></c:title></c:catAx>"
+            );
+        }
+        let bounded = format!(
+            r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>{axes}<c:barChart><c:barDir val="col"/>{sers}</c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+        );
+        package(
+            &charts_body,
+            &[
+                (
+                    "word/_rels/document.xml.rels",
+                    &rels(&{
+                        let mut rels = String::new();
+                        for id in 1..=8 {
+                            let _ = write!(
+                                rels,
+                                "{}",
+                                rel(
+                                    &format!("rId{id}"),
+                                    "chart",
+                                    &format!("charts/chart{id}.xml")
+                                )
+                            );
+                        }
+                        rels
+                    }),
+                ),
+                ("word/charts/chart1.xml", COLUMN_CHART),
+                ("word/charts/chart2.xml", &attached),
+                ("word/charts/chart3.xml", uncached),
+                ("word/charts/chart4.xml", "<chart/>"),
+                (
+                    "word/charts/chart5.xml",
+                    r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData/></cx:chartSpace>"#,
+                ),
+                ("word/charts/chart6.xml", bubble),
+                ("word/charts/chart7.xml", stored),
+                ("word/charts/chart8.xml", &bounded),
+            ],
+        )
+    }
+
     /// Every mark the shared list names is a spelling this reader really prints:
     /// `assets/docgen/rules.json`'s `docx_marks` is the one statement the kit's
     /// refusals and this reader both read, so an entry whose spelling no reading
@@ -3149,10 +3490,11 @@ mod tests {
         );
 
         let corpus = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             text_of(&revised),
             text_of(&package(paragraph_marks, &[])),
             text_of(&package(tables, &[])),
+            text_of(&charts_package()),
         );
 
         let marks = crate::docgen::docx_marks();

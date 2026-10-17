@@ -1,6 +1,6 @@
-//! Excel number formats for `.xlsx` cells: a stored numeric value rendered the
-//! way Excel would display it, or `None` when this reader cannot reproduce the
-//! format.
+//! Excel number formats: a stored numeric value rendered the way Excel would
+//! display it, or `None` when the format cannot be reproduced — a sheet cell's
+//! value and a chart cache's value alike, so one number is shown one way.
 //!
 //! # Invariants
 //!

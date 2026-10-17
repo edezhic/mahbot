@@ -324,9 +324,11 @@ impl Tool for ReadTool {
         // statement the reader prints them from, so renaming one cannot leave a
         // model-facing sentence stale (see `crate::docgen::ppt_marks`); the two
         // labels a reading prints a slide's own block and its notes under come
-        // from the same place, and the legacy `.doc` story names, the text-box
-        // mark and the report of what a reading did not show from
-        // `crate::reader_output`, which states each once.
+        // from the same place, the legacy `.doc` story names, the text-box mark,
+        // the chart-sheet mark and the report of what a reading did not show from
+        // `crate::reader_output`, which states each once, and the chart block's
+        // header, its field labels and the marks standing in for values from the
+        // chart vocabulary beside them.
         let marks = crate::docgen::ppt_marks();
         // The reader prints a slide's number where these spell `<n>`, so the
         // description names the label the reader prints without reading like a
@@ -334,6 +336,14 @@ impl Tool for ReadTool {
         let labels = crate::docgen::ppt_slide_labels();
         let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
         let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
+        // The chart block prints the kind it read where this spells `<kind>`, a
+        // series its own name where this spells `<name>` — or its number — and a
+        // bubble's size where this spells `<size>`.
+        let chart_header = crate::reader_output::chart_header(Some("<kind>"));
+        let chart_none = crate::reader_output::chart_header(None);
+        let chart_series = crate::reader_output::chart_series(Some("<name>"), 0);
+        let chart_series_numbered = crate::reader_output::chart_series(None, 0);
+        let chart_size = crate::reader_output::chart_size("<size>");
         // The path boundary, in the wording of this read's own access level —
         // the skeleton is shared, so the three statements cannot drift from
         // each other's structure.
@@ -362,6 +372,25 @@ impl Tool for ReadTool {
                 ("{{doc_comments}}", crate::reader_output::DOC_COMMENTS),
                 ("{{text_box_mark}}", crate::reader_output::TEXT_BOX),
                 ("{{chart_sheet_mark}}", crate::reader_output::CHART_SHEET),
+                ("{{chart_header}}", &chart_header),
+                ("{{chart_none}}", &chart_none),
+                ("{{chart_series_numbered}}", &chart_series_numbered),
+                ("{{chart_title}}", crate::reader_output::CHART_TITLE),
+                ("{{chart_text}}", crate::reader_output::CHART_TEXT),
+                ("{{chart_label}}", crate::reader_output::CHART_LABEL),
+                ("{{chart_series}}", &chart_series),
+                ("{{chart_size}}", &chart_size),
+                ("{{mark_stored}}", crate::reader_output::MARK_STORED.trim()),
+                ("{{chart_no_values}}", crate::reader_output::CHART_NO_VALUES),
+                (
+                    "{{chart_attached}}",
+                    crate::reader_output::CHART_VALUES_ATTACHED,
+                ),
+                (
+                    "{{chart_unreadable}}",
+                    crate::reader_output::CHART_UNREADABLE,
+                ),
+                ("{{chart_extended}}", crate::reader_output::CHART_EXTENDED),
                 (
                     "{{unshown_report}}",
                     &crate::reader_output::unshown_report_examples(),
@@ -1257,6 +1286,14 @@ mod tests {
         let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
         // Two of the report's lines, as the reader that prints them spells them.
         let report = crate::reader_output::unshown_report_examples();
+        // The chart block's own headers, series labels and size annotation, as the
+        // chart reader prints them for a chart of a kind, one naming none, a named
+        // and an unnamed series, and a bubble point.
+        let chart_header = crate::reader_output::chart_header(Some("<kind>"));
+        let chart_none = crate::reader_output::chart_header(None);
+        let chart_series = crate::reader_output::chart_series(Some("<name>"), 0);
+        let chart_series_numbered = crate::reader_output::chart_series(None, 0);
+        let chart_size = crate::reader_output::chart_size("<size>");
         for tool in [
             ReadTool::general(),
             ReadTool::new(PathAccess::Workspace),
@@ -1281,6 +1318,19 @@ mod tests {
                 crate::reader_output::DOC_COMMENTS,
                 crate::reader_output::TEXT_BOX,
                 crate::reader_output::CHART_SHEET,
+                &chart_header,
+                &chart_none,
+                &chart_series,
+                &chart_series_numbered,
+                &chart_size,
+                crate::reader_output::MARK_STORED.trim(),
+                crate::reader_output::CHART_TITLE,
+                crate::reader_output::CHART_TEXT,
+                crate::reader_output::CHART_LABEL,
+                crate::reader_output::CHART_NO_VALUES,
+                crate::reader_output::CHART_VALUES_ATTACHED,
+                crate::reader_output::CHART_UNREADABLE,
+                crate::reader_output::CHART_EXTENDED,
                 &report,
             ] {
                 assert!(
