@@ -5,13 +5,14 @@
 //! of XML parts, read here with the shared `zip` + `quick_xml` plumbing. Word,
 //! Excel and PowerPoint differ only in which parts hold the text, how a cell
 //! address is written, and where the embedded media live — and in how much of a
-//! walk the format needs: Word's is the only one that carries tables, tracked
-//! changes and content beyond the body part, so its reader is the module
-//! [`docx`]; Excel's is the module [`xlsx`]; and PowerPoint's is a slide walk
-//! that reaches one part further for what a slide only points at — its layout,
-//! whose title placeholders it borrows, its comments and the registry that names
-//! their authors, and the data model of each SmartArt diagram it shows — so it
-//! still lives in this module. The charts a package holds are read by [`chart`],
+//! walk the format needs: Word's is the only one that reads a table as a table
+//! (a slide's table is read as the text it holds, a line per cell) and that
+//! carries tracked changes and content beyond the body part, so its reader is
+//! the module [`docx`]; Excel's is the module [`xlsx`]; and PowerPoint's is a
+//! slide walk that reaches one part further for what a slide only points at — its
+//! layout, whose title placeholders it borrows, its comments and the registry that
+//! names their authors, and the data model of each SmartArt diagram it shows — so
+//! it still lives in this module. The charts a package holds are read by [`chart`],
 //! whichever family draws them: a chart part carries its own cached values, so
 //! what a chart says reaches the answer where the chart sits.
 //!

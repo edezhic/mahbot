@@ -896,6 +896,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                     DOCUMENT_FORMAT_FLAG,
                     DOCUMENT_CONTENT_FLAG,
                     DOCUMENT_SHEETS_FLAG,
+                    DOCUMENT_SLIDE_SIZE_FLAG,
                     DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
@@ -1142,6 +1143,15 @@ const DOCUMENT_FORMAT_FLAG: Flag = Flag {
     kind: FlagKind::Value,
     secret: false,
     purpose: "The format to write: docx, pptx, xlsx or pdf",
+};
+
+/// The document tool's `size` argument — `create`'s slide size, a presentation's
+/// own (the one `size` a `pdf_text` states is the font size, its own flag).
+const DOCUMENT_SLIDE_SIZE_FLAG: Flag = Flag {
+    arg: "size",
+    kind: FlagKind::Value,
+    secret: false,
+    purpose: "A pptx slide size: widescreen, standard or portrait; unnamed is the tool's own default deck",
 };
 
 /// The document tool's `content` argument — `create`'s blocks, for every format

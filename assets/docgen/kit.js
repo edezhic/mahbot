@@ -24,6 +24,11 @@ import RULES from "./rules.json";
 
 const A4 = [595.28, 841.89];
 const MARGIN = 56;
+// The A4 page in twips — the page the `docx` library writes when the create path
+// states none, with the one-inch margins it gives it (see `TWIPS_PER_INCH`).
+// Stated here because a created Word document's own page is the library's, not the
+// file's, and a picture's own size is fitted into the column those margins leave.
+const A4_PAGE_TWIPS = { width: 11906, height: 16838 };
 const BODY_SIZE = 12;
 // A table's cells: ten-point text on a twelve-point leading, and a gap under
 // the row that makes a one-line row twenty points tall.
@@ -244,16 +249,22 @@ function webpSize(bytes) {
   return null;
 }
 // The size a content image is drawn at, in the pixels every writer measures an
-// image in. A request states its sides in points — the one unit a placed picture
-// is measured in (`RULES.dimension_points`) — and a request that gives one side
-// only scales the image's own proportions instead of stretching it, while one
-// that gives neither keeps the image's own size, capped to a default width a
-// page's text column comfortably holds: the same numbers for every arm, so one
-// block draws one picture whatever the format. `span` is the range the shared
-// rules allow a stated side (points) and `maxWidth` is that cap (pixels), while
-// `natural` and the answer are pixels — the points-to-pixels conversion lives
-// here alone, so no arm converts a measure the others do not.
+// image in. A request states its sides in points — the one unit a placed picture is
+// measured in (`RULES.dimension_points`) — and a request that gives one side only
+// scales the image's own proportions instead of stretching it, while one that gives
+// neither keeps the image's own size, fitted whole into `box`. `span` is the range
+// the shared rules allow a stated side (points), and `box` is the largest the
+// fallback may draw (pixels, both sides) — the arm's container, or a cap narrower
+// than it. Neither side the fallback decides may exceed it, so a picture taller or
+// wider than the page or slide it lands on is drawn whole and smaller rather than
+// cut off by an edge the call reported success past. `natural` and the answer are
+// pixels — the points-to-pixels conversion lives here alone, so no arm converts a
+// measure the others do not.
 const DEFAULT_IMAGE_WIDTH = 400;
+// The note both page-shaped arms owe when a picture they placed reaches past the
+// page it lands on: a size the caller named is drawn as named, and the answer says
+// what the page does not show rather than reporting a plain success.
+const PAST_PAGE_NOTE = "[the picture's box reaches past the page — the part beyond the page's edge is not shown on it]";
 // Whether `value` is a finite number inside `span`, a range from rules.json
 // (`min_exclusive` marks a low end the value must exceed rather than reach).
 function inSpan(value, span) {
@@ -269,7 +280,7 @@ function spanBounds(span) {
     ? `greater than ${span.min} and at most ${span.max}`
     : `between ${span.min} and ${span.max}`;
 }
-function imageSize(natural, width, height, span, maxWidth = DEFAULT_IMAGE_WIDTH) {
+function imageSize(natural, width, height, span, box) {
   // A side the block left out is no side at all: `null` counts as absent, since
   // a content block reaches the kit as the model wrote it.
   for (const side of [width, height]) {
@@ -300,9 +311,13 @@ function imageSize(natural, width, height, span, maxWidth = DEFAULT_IMAGE_WIDTH)
     size[implied] = Math.max(1, size[implied]);
     return size;
   }
-  // The fallback below reads the image's own size, which is pixels already.
+  // The fallback below reads the image's own size, which is pixels already. It
+  // fits the picture whole into the arm's container — never enlarged past the
+  // image's own size — so a picture the page or slide has no room for is drawn
+  // smaller rather than to an edge the writer would cut it at. Both sides of the
+  // box are stated, and neither side decided here may exceed it.
   const round = (side) => Math.max(1, Math.round(side));
-  const fit = Math.min(1, maxWidth / natural.width);
+  const fit = Math.min(1, box.width / natural.width, box.height / natural.height);
   return { width: round(natural.width * fit), height: round(natural.height * fit) };
 }
 // Embed `file` into a PDF document. A file the decoder rejects (truncated, or a
@@ -322,10 +337,16 @@ async function embedImage(pdf, file) {
 
 // ── create: docx ───────────────────────────────────────────────
 function docxImage(image, block) {
+  // The page the create path writes, in pixels: the library's own A4 with its
+  // one-inch margins (see `A4_PAGE_TWIPS`). Its height is the container a picture
+  // whose sides the block leaves out is fitted into so the page's bottom edge
+  // never cuts it off; the width is capped at the default width, which is already
+  // narrower than that column.
+  const height = (A4_PAGE_TWIPS.height - 2 * TWIPS_PER_INCH) / TWIPS_PER_PIXEL;
   return new ImageRun({
     type: image.kind,
     data: image.bytes,
-    transformation: imageSize(image, block.width, block.height, RULES.dimension_points),
+    transformation: imageSize(image, block.width, block.height, RULES.dimension_points, { width: DEFAULT_IMAGE_WIDTH, height }),
   });
 }
 function docxTableRow(cells, header) {
@@ -541,10 +562,13 @@ function createXlsx(req) {
 // was: its frame, size, weight, colour and vertical centring. The two sides that
 // write a title — the create arm's opening block and the slide `add_slide` adds —
 // state the same ones, and the frame is stated in inches here and in the EMU those
-// inches are, so the two cannot drift.
+// inches are (see `titleFrameEmu`), so the two cannot drift.
 const TITLE_SHAPE = "Title";
 const TITLE_INCHES = { x: 0.4, y: 0.3, w: 9.2, h: 0.8 };
 const TITLE_POINTS = 28;
+// The text a table's cells carry, in points — the size the created deck's own
+// table and a table a slide edit adds both state.
+const TABLE_TEXT_POINTS = 14;
 // The colour both sides draw the title in; the library's own text colour is the
 // same one, so the create arm states it only through the declaration.
 const TITLE_COLOR = "000000";
@@ -564,14 +588,88 @@ const TITLE_FONTS = `<a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs 
 const titledText = (text) => (text !== undefined && text.trim() !== "" ? text : undefined);
 const TITLE_PLACEHOLDER = `<p:ph type="title"/>`;
 
+// ── slide geometry ─────────────────────────────────────────────
+// Every measurement the tool places by itself was drawn on the 16:9 deck
+// pptxgenjs's `LAYOUT_16x9` writes — the size this tool created before a size
+// could be named, stated in `rules.json` so the model-facing text and this
+// reference geometry cannot drift — and is scaled with the slide from there, so a
+// deck of another size places it by its own proportions rather than the default
+// deck's, and the default deck is laid out exactly as it always was.
+const PPTX_REFERENCE_INCHES = {
+  width: RULES.pptx_default_size.width_emu / EMU_PER_INCH,
+  height: RULES.pptx_default_size.height_emu / EMU_PER_INCH,
+};
+// The flow a created deck's blocks take, in inches on that deck: the left edge
+// and width every block spans — the title's own, so the flow and the title stay
+// aligned — where the flow starts below the title, and the floor it may not pass
+// before the next slide starts.
+const BODY_INCHES = { x: TITLE_INCHES.x, w: TITLE_INCHES.w, start: 1.3, bottom: 5.2 };
+
+// The inches a slide of this size lays the tool's own content out in: the title's
+// frame and the flow's own left edge, width, start and floor, each scaled from
+// the reference deck. `down` reads a vertical measure of that deck in this one's.
+function slideBox(width, height) {
+  const sx = width / PPTX_REFERENCE_INCHES.width;
+  const sy = height / PPTX_REFERENCE_INCHES.height;
+  return {
+    title: { x: TITLE_INCHES.x * sx, y: TITLE_INCHES.y * sy, w: TITLE_INCHES.w * sx, h: TITLE_INCHES.h * sy },
+    left: BODY_INCHES.x * sx,
+    width: BODY_INCHES.w * sx,
+    start: BODY_INCHES.start * sy,
+    bottom: BODY_INCHES.bottom * sy,
+    down: (inches) => inches * sy,
+  };
+}
+
+// The title's frame in EMU on a slide of this size: the inches above are what the
+// create arm states to the library, and this is how the slide arm converts them,
+// so the two cannot drift.
+function titleFrameEmu(slide) {
+  const frame = slideBox(slide.width / EMU_PER_INCH, slide.height / EMU_PER_INCH).title;
+  const emu = (inches) => Math.round(inches * EMU_PER_INCH);
+  return { x: emu(frame.x), y: emu(frame.y), w: emu(frame.w), h: emu(frame.h) };
+}
+
+// The size a created deck gets: the one the request names from `RULES.pptx_sizes`
+// — its EMU read as inches, under a layout the library is taught — or `undefined`
+// for the deck this tool has always written, `LAYOUT_16x9` left as the library
+// spells it. An unknown name is refused rather than fallen back from.
+function deckSize(size) {
+  if (size === undefined || size === null) return undefined;
+  const named = RULES.pptx_sizes.find((entry) => entry.name === size);
+  if (!named) {
+    throw new UsageError(`unknown slide size ${JSON.stringify(size)} — hint: use ${listed(RULES.pptx_sizes.map((entry) => entry.name))}`);
+  }
+  return {
+    layout: `mahbot-${named.name}`,
+    width: named.width_emu / EMU_PER_INCH,
+    height: named.height_emu / EMU_PER_INCH,
+  };
+}
+
 // ── create: pptx ───────────────────────────────────────────────
 function createPptx(req) {
   const pptx = new PptxGenJS();
-  pptx.layout = "LAYOUT_16x9";
+  // The deck's own size in inches: the one the request names — a layout the
+  // library is taught — or the reference deck, whose layout it already knows.
+  const named = deckSize(req.size);
+  const deck = named ?? PPTX_REFERENCE_INCHES;
+  if (named) {
+    pptx.defineLayout({ name: named.layout, width: named.width, height: named.height });
+    pptx.layout = named.layout;
+  } else pptx.layout = "LAYOUT_16x9";
+  const box = slideBox(deck.width, deck.height);
+  // A picture the block states no sides for is fitted into the flow's own box, so
+  // even the tallest one stays inside the slide (see `imageSize`).
+  const imageMax = { width: DEFAULT_IMAGE_WIDTH, height: Math.round((box.bottom - box.start) * 96) };
   let slide = null;
-  let y = 1.3;
-  const fresh = () => { slide = pptx.addSlide(); y = 1.3; };
-  const room = (needed) => { if (y + needed > 5.2) fresh(); };
+  let y = box.start;
+  // Whether the current slide holds anything yet: a slide opened for a block that
+  // did not fit would be an empty leading slide, so a block always starts on the
+  // slide that is there and only later blocks open a new one.
+  let drawn = false;
+  const fresh = () => { slide = pptx.addSlide(); y = box.start; drawn = false; };
+  const room = (needed) => { if (drawn && y + needed > box.bottom) fresh(); };
   for (const block of req.content) {
     if (block.type === "heading") {
       if (headingLevelNumber(block.level) === 1 || !slide) {
@@ -580,27 +678,31 @@ function createPptx(req) {
         // A blank heading opens a slide without a title: the block is drawn as
         // the text box it always was and left undeclared (see `declarePptxTitles`).
         slide.addText(text, {
-          x: TITLE_INCHES.x, y: TITLE_INCHES.y, w: TITLE_INCHES.w, h: TITLE_INCHES.h, fontSize: TITLE_POINTS, bold: true,
+          x: box.title.x, y: box.title.y, w: box.title.w, h: box.title.h, fontSize: TITLE_POINTS, bold: true,
           objectName: titledText(text) === undefined ? undefined : TITLE_SHAPE,
         });
+        drawn = true;
       } else {
-        room(0.7);
-        slide.addText(textOf(block.text, "a heading's text"), { x: 0.4, y, w: 9.2, h: 0.5, fontSize: 20, bold: true });
-        y += 0.7;
+        room(box.down(0.7));
+        slide.addText(textOf(block.text, "a heading's text"), { x: box.left, y, w: box.width, h: box.down(0.5), fontSize: 20, bold: true });
+        y += box.down(0.7);
+        drawn = true;
       }
     } else if (block.type === "paragraph") {
       if (!slide) fresh();
-      room(1.1);
-      slide.addText(textOf(block.text, "a paragraph's text"), { x: 0.4, y, w: 9.2, h: 1, fontSize: 16 });
-      y += 1.1;
+      room(box.down(1.1));
+      slide.addText(textOf(block.text, "a paragraph's text"), { x: box.left, y, w: box.width, h: box.down(1), fontSize: 16 });
+      y += box.down(1.1);
+      drawn = true;
     } else if (block.type === "list") {
       if (!slide) fresh();
       const bullet = block.ordered ? { type: "number" } : true;
-      room(0.5 * block.items.length + 0.3);
+      room(box.down(0.5 * block.items.length + 0.3));
       // A bullet is text to the writer, so a number or a boolean is stringified
       // here rather than handed to a library that draws nothing for one.
-      slide.addText(block.items.map((item) => ({ text: String(scalarOf(item, "a bullet")), options: { bullet, breakLine: true } })), { x: 0.4, y, w: 9.2, h: Math.max(0.5, 0.5 * block.items.length), fontSize: 16 });
-      y += 0.5 * block.items.length + 0.3;
+      slide.addText(block.items.map((item) => ({ text: String(scalarOf(item, "a bullet")), options: { bullet, breakLine: true } })), { x: box.left, y, w: box.width, h: Math.max(box.down(0.5), box.down(0.5 * block.items.length)), fontSize: 16 });
+      y += box.down(0.5 * block.items.length + 0.3);
+      drawn = true;
     } else if (block.type === "table") {
       // A table row is an array of cells: a header row is one cell per heading,
       // each carrying its own bold option (one cell holding all the headings is
@@ -612,19 +714,21 @@ function createPptx(req) {
       // one.
       if (!header.length && !body.length) continue;
       if (!slide) fresh();
-      room(0.45 * (body.length + header.length) + 0.3);
-      slide.addTable([...header, ...body], { x: 0.4, y, w: 9.2, fontSize: 14 });
-      y += 0.45 * (body.length + header.length) + 0.3;
+      room(box.down(0.45 * (body.length + header.length) + 0.3));
+      slide.addTable([...header, ...body], { x: box.left, y, w: box.width, fontSize: TABLE_TEXT_POINTS });
+      y += box.down(0.45 * (body.length + header.length) + 0.3);
+      drawn = true;
     } else if (block.type === "image") {
       if (!slide) fresh();
       const image = readImage(block.image);
-      const size = imageSize(image, block.width, block.height, RULES.dimension_points);
+      const size = imageSize(image, block.width, block.height, RULES.dimension_points, imageMax);
       // A presentation is laid out in inches and `imageSize` answers in pixels.
       const w = size.width / 96;
       const h = size.height / 96;
-      room(h + 0.2);
-      slide.addImage({ data: `data:${image.contentType};base64,${image.bytes.toString("base64")}`, x: 0.4, y, w, h });
-      y += h + 0.2;
+      room(h + box.down(0.2));
+      slide.addImage({ data: `data:${image.contentType};base64,${image.bytes.toString("base64")}`, x: box.left, y, w, h });
+      y += h + box.down(0.2);
+      drawn = true;
     } else if (block.type === "notes") {
       if (!slide) fresh();
       slide.addNotes(textOf(block.text, "speaker notes"));
@@ -1034,8 +1138,13 @@ async function createPdf(req) {
       const image = await embedImage(pdf, block.image);
       // The block's sides are points, as the page is laid out: `imageSize` reads
       // them through the shared span and answers in pixels, which the page draws
-      // in points.
-      const size = imageSize(image, block.width, block.height, RULES.dimension_points);
+      // in points. A picture whose sides the block leaves out is fitted whole
+      // into the page's text column, so one no page holds is drawn smaller rather
+      // than past the page's edge.
+      const size = imageSize(image, block.width, block.height, RULES.dimension_points, {
+        width: DEFAULT_IMAGE_WIDTH,
+        height: Math.round((A4[1] - 2 * MARGIN) / PX_TO_POINTS),
+      });
       let targetWidth = size.width * PX_TO_POINTS;
       let targetHeight = size.height * PX_TO_POINTS;
       // The streaming layout keeps what it draws inside the text column.
@@ -3168,23 +3277,37 @@ function docxAnchor(xml, edit, editor) {
   return { span, at: table ? table.end : span.end, inTable: table !== undefined };
 }
 
-// The A4 page and 1in margins the create path writes, in twips: the section a
-// document stating none of its own is read at.
-const A4_WIDTH_TWIPS = 11906;
-
-// The width the body's own text column may use, in twips: the page's width less
-// its left and right margins, from the body's own section. The section in force
-// where a block lands may be another one; this is the measure a picture's own size
-// and a table's columns are capped against, not a fact the file records.
-function docxTextWidth(xml) {
+// The page a docx block lands on, in twips: the size and the margins the body's
+// own section states. The section in force where a block lands may be another one;
+// this is the measure a picture's own size, a table's columns and the note about a
+// picture past the page are read against, not a fact the file records. A document
+// stating no page of its own is read at the create path's A4 (see
+// `A4_PAGE_TWIPS`).
+function docxPage(xml) {
   const section = bodyLayout(xml)?.section;
-  const column = section === undefined ? "" : xml.slice(section.start, section.end);
-  const number = (name, attribute, fallback) => {
-    const tag = column.match(tagPattern(name))?.[0];
+  const page = section === undefined ? "" : xml.slice(section.start, section.end);
+  const measure = (name, attribute, fallback) => {
+    const tag = page.match(tagPattern(name))?.[0];
     const value = tag === undefined ? Number.NaN : Number(xmlAttribute(tag, attribute));
     return Number.isFinite(value) && value > 0 ? value : fallback;
   };
-  return Math.max(1, number("w:pgSz", "w:w", A4_WIDTH_TWIPS) - number("w:pgMar", "w:left", TWIPS_PER_INCH) - number("w:pgMar", "w:right", TWIPS_PER_INCH));
+  return {
+    width: measure("w:pgSz", "w:w", A4_PAGE_TWIPS.width),
+    height: measure("w:pgSz", "w:h", A4_PAGE_TWIPS.height),
+    left: measure("w:pgMar", "w:left", TWIPS_PER_INCH),
+    right: measure("w:pgMar", "w:right", TWIPS_PER_INCH),
+    top: measure("w:pgMar", "w:top", TWIPS_PER_INCH),
+    bottom: measure("w:pgMar", "w:bottom", TWIPS_PER_INCH),
+  };
+}
+
+// The body's own text column, in twips: that page less the margins on each side.
+function docxTextColumn(xml) {
+  const page = docxPage(xml);
+  return {
+    width: Math.max(1, page.width - page.left - page.right),
+    height: Math.max(1, page.height - page.top - page.bottom),
+  };
 }
 
 // The DrawingML namespaces a picture is written in, per dialect: a document
@@ -3210,7 +3333,7 @@ const DRAWING_NAMESPACES = {
 // with no content-type list cannot declare the part it gains and is refused the
 // way a presentation without one is. The size is the one every placement shares:
 // a stated side is points, one side alone keeps the picture's own proportions,
-// and neither keeps its natural size capped to the page's text column.
+// and neither keeps its natural size, fitted whole into the page's text column.
 function addImage(xml, edit, editor) {
   const { at } = docxAnchor(xml, edit, editor);
   const image = readImage(edit.image);
@@ -3220,7 +3343,21 @@ function addImage(xml, edit, editor) {
   editor.add(media, image.bytes);
   editor.part("[Content_Types].xml", (types) => withOverride(types, media, image.contentType));
   const relationship = addRelationship(editor, DOCX_DOCUMENT, `${RELATIONSHIP_NAMESPACES[dialect]}/image`, media);
-  const size = imageSize(image, edit.width, edit.height, RULES.dimension_points, Math.round(docxTextWidth(xml) / TWIPS_PER_PIXEL));
+  const column = docxTextColumn(xml);
+  const page = docxPage(xml);
+  const container = {
+    width: Math.round(column.width / TWIPS_PER_PIXEL),
+    height: Math.round(column.height / TWIPS_PER_PIXEL),
+  };
+  const size = imageSize(image, edit.width, edit.height, RULES.dimension_points, container);
+  // An inline picture starts at the page's left margin, so the room it has before
+  // the page's edge is the page less that one margin on each axis. Only a size that
+  // does not fit there reaches past the page — a picture wider than the text column
+  // still shows, into the margin — and the answer says so, as the slide and PDF arms
+  // do, rather than reporting a plain success for a size the caller named.
+  if (size.width * TWIPS_PER_PIXEL > page.width - page.left || size.height * TWIPS_PER_PIXEL > page.height - page.top) {
+    editor.note(PAST_PAGE_NOTE);
+  }
   const cx = Math.max(1, Math.round(size.width * PX_TO_EMU));
   const cy = Math.max(1, Math.round(size.height * PX_TO_EMU));
   // A document's drawing ids are unique: the next free one, so a picture this
@@ -3305,7 +3442,7 @@ function addTable(xml, edit, editor) {
   // tables with no paragraph between them draw as one and ECMA-376 forbids a body
   // ending with a table.
   const trailing = nextBlockKind(xml, at) !== "w:p";
-  return xml.slice(0, at) + (inTable ? "<w:p/>" : "") + docxTable(headers, rows, docxTextWidth(xml)) + (trailing ? "<w:p/>" : "") + xml.slice(at);
+  return xml.slice(0, at) + (inTable ? "<w:p/>" : "") + docxTable(headers, rows, docxTextColumn(xml).width) + (trailing ? "<w:p/>" : "") + xml.slice(at);
 }
 
 // `element` with every paragraph — itself or a nested one — whose joined text
@@ -5928,8 +6065,8 @@ const SLIDE_LANG = "en-US";
 const SLIDE_ALIGNMENTS = new Map(RULES.slide_alignments);
 // The slide size a presentation stating none is read at, in EMU: the
 // 10in × 7½in one MS-OI29500 Part 1 §19.2.1.39 states PowerPoint assumes — a
-// `<p:sldSz cx="9144000" cy="6858000"/>` — when the element is absent. An image
-// on such a slide is placed by fraction of this.
+// `<p:sldSz cx="9144000" cy="6858000"/>` — when the element is absent. A picture
+// or a table added to such a slide is placed by fraction of this.
 const SLIDE_SIZE_DEFAULT = { width: 9144000, height: 6858000 };
 
 // The value of the attribute `name` of an XML tag. A longer name never matches a
@@ -6517,10 +6654,10 @@ function removeSlideParagraphs(editor, edit) {
 // supplies the body's geometry. The title's is stated (see `titleShape`), and a
 // blank title is no title at all (`titledText`): the slide is built without a
 // title shape rather than with an empty title frame standing in for one.
-function newSlideXml(title, bullets) {
+function newSlideXml(title, bullets, slide) {
   const shapes = [];
   const titled = titledText(title);
-  if (titled !== undefined) shapes.push(titleShape(titled));
+  if (titled !== undefined) shapes.push(titleShape(titled, slide));
   if (bullets.length) shapes.push(placeholderShape(3, "Body", `<p:ph type="body" idx="1"/>`, bullets));
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
     `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${REL_NS}" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
@@ -6537,10 +6674,12 @@ function newSlideXml(title, bullets) {
 // block a created slide opens with gets them from the create arm; a slide named
 // into an existing deck has no layout of this kit's to inherit them from, and a
 // title that states neither its frame nor its formatting is drawn as a broken one.
-function titleShape(text) {
-  const emu = (inches) => Math.round(inches * EMU_PER_INCH);
+// `slide` is the deck's own size in EMU, so the frame is the one a slide of that
+// size holds (see `titleFrameEmu`) rather than a frame drawn for the default deck.
+function titleShape(text, slide) {
+  const frame = titleFrameEmu(slide);
   return `<p:sp><p:nvSpPr><p:cNvPr id="2" name="${TITLE_SHAPE}"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr>${TITLE_PLACEHOLDER}</p:nvPr></p:nvSpPr>` +
-    `<p:spPr><a:xfrm><a:off x="${emu(TITLE_INCHES.x)}" y="${emu(TITLE_INCHES.y)}"/><a:ext cx="${emu(TITLE_INCHES.w)}" cy="${emu(TITLE_INCHES.h)}"/></a:xfrm>` +
+    `<p:spPr><a:xfrm><a:off x="${frame.x}" y="${frame.y}"/><a:ext cx="${frame.w}" cy="${frame.h}"/></a:xfrm>` +
     `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln/></p:spPr>` +
     `<p:txBody><a:bodyPr wrap="square" rtlCol="0" anchor="ctr"/><a:lstStyle/>` +
     `<a:p><a:pPr algn="${TITLE_ALIGNMENT}" indent="0" marL="0"><a:buNone/></a:pPr>` +
@@ -6669,7 +6808,7 @@ function addSlide(editor, edit) {
     if (!numberedSlideList(zip)) throw new UsageError(`a slide cannot be placed after slide ${after}: the presentation's slide list does not number its slides the way the reader shows them`);
   }
   const part = `${PPT_SLIDES}slide${Math.max(0, ...slideFileNumbers(zip)) + 1}.xml`;
-  editor.add(part, newSlideXml(title, bullets));
+  editor.add(part, newSlideXml(title, bullets, slideSize(zip)));
   editor.add(relsPartFor(part), newSlideRelsXml(newSlideLayout(zip, slides, after)));
   // `openEdit` already proved the presentation part is the family's own, so it
   // is read here rather than re-checked.
@@ -7227,20 +7366,21 @@ function slideSize(zip) {
   return { width: side("cx", SLIDE_SIZE_DEFAULT.width), height: side("cy", SLIDE_SIZE_DEFAULT.height) };
 }
 
-// Where an added image goes, in EMU. `x_fraction` and `y_fraction` are fractions
-// of the slide's own width and height and so are `width_fraction` and
-// `height_fraction`, which is what lets a caller place an image without knowing
-// the deck's size; an absent place is the slide's middle and an absent size is
-// the largest that fits the slide with the image's own proportions. A size named
-// on one side only keeps those proportions.
-function imagePlacement(image, edit, slide) {
+// Where a shape the caller places goes, in EMU: `x_fraction` and `y_fraction`
+// are fractions of the slide's own width and height and so are `width_fraction`
+// and `height_fraction`, which is what lets a caller place a shape without
+// knowing the deck's size; an absent place is the slide's middle. An absent size
+// follows `grows`: a picture takes the largest that fits the slide with its own
+// proportions, while a table keeps its own size, shrunk only as far as the slide
+// forces so its text is not scaled up to a page's worth of cells. A size named on
+// one side only keeps those proportions. `natural` is the shape's own size in EMU.
+function placementBox(natural, edit, slide, grows) {
   for (const name of ["x_fraction", "y_fraction", "width_fraction", "height_fraction"]) {
     const value = edit[name];
     if (value == null) continue;
     const span = name === "width_fraction" || name === "height_fraction" ? RULES.slide_size_fraction : RULES.slide_position_fraction;
     if (!inSpan(value, span)) throw new UsageError(`${name} must be ${spanBounds(span)}, got: ${JSON.stringify(value)}`);
   }
-  const natural = { width: image.width * PX_TO_EMU, height: image.height * PX_TO_EMU };
   let width;
   let height;
   if (edit.width_fraction != null && edit.height_fraction != null) {
@@ -7253,7 +7393,8 @@ function imagePlacement(image, edit, slide) {
     height = edit.height_fraction * slide.height;
     width = height * natural.width / natural.height;
   } else {
-    const scale = Math.min(slide.width / natural.width, slide.height / natural.height);
+    const fits = Math.min(slide.width / natural.width, slide.height / natural.height);
+    const scale = grows ? fits : Math.min(1, fits);
     width = natural.width * scale;
     height = natural.height * scale;
   }
@@ -7264,6 +7405,12 @@ function imagePlacement(image, edit, slide) {
     cx: round(width),
     cy: round(height),
   };
+}
+
+// Where an added image goes, in EMU: the file's own size is the shape's, and an
+// absent size is the largest that fits the slide (see `placementBox`).
+function imagePlacement(image, edit, slide) {
+  return placementBox({ width: image.width * PX_TO_EMU, height: image.height * PX_TO_EMU }, edit, slide, true);
 }
 
 // Where a new shape goes in a slide: the end of the slide's shape tree's own
@@ -7303,7 +7450,9 @@ function withRelationshipNamespace(xml) {
 // fraction of the slide (see `imagePlacement`). The part's own content type is
 // declared as an Override: the deck's `<Default>` for the extension may carry
 // another spelling of it (a writer's `image/jpg`, say), and an Override is the
-// declaration that decides for a part.
+// declaration that decides for a part. A place the caller named verbatim can put
+// the picture partly outside the slide, which is the documented contract and
+// stays; the reply says so rather than reporting a plain success.
 function addSlideImage(editor, edit) {
   const zip = editor.zip;
   const part = addressedSlide(zip, edit.slide);
@@ -7316,12 +7465,122 @@ function addSlideImage(editor, edit) {
     const namespaced = withRelationshipNamespace(xml);
     const at = shapeTreeEnd(namespaced);
     if (at === null) throw new UsageError("the slide has no shape tree to place an image in");
-    const shapeId = Math.max(1, ...[...namespaced.matchAll(/<p:cNvPr\b[^>]*\bid="(\d+)"/g)].map((match) => Number(match[1]))) + 1;
-    const placement = imagePlacement(image, edit, slideSize(zip));
+    const shapeId = nextShapeId(namespaced);
+    const slide = slideSize(zip);
+    const placement = imagePlacement(image, edit, slide);
+    if (outsideSlide(placement, slide)) editor.note("[the picture's box reaches past the slide — the part beyond the slide's edge is not shown on it]");
     const picture = `<p:pic><p:nvPicPr><p:cNvPr id="${shapeId}" name="Image ${shapeId}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>` +
       `<p:blipFill><a:blip r:embed="${id}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>` +
       `<p:spPr><a:xfrm><a:off x="${placement.x}" y="${placement.y}"/><a:ext cx="${placement.cx}" cy="${placement.cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>`;
     return namespaced.slice(0, at) + picture + namespaced.slice(at);
+  });
+}
+
+// Whether a placement's own box reaches past the slide it is placed on.
+const outsideSlide = (placement, slide) => placement.x < 0 || placement.y < 0
+  || placement.x + placement.cx > slide.width || placement.y + placement.cy > slide.height;
+
+// The id a shape this call adds takes: one past the highest the slide already
+// numbers, so the shape is the slide's last and never renames one it holds.
+function nextShapeId(xml) {
+  return Math.max(1, ...[...xml.matchAll(/<p:cNvPr\b[^>]*\bid="(\d+)"/g)].map((match) => Number(match[1]))) + 1;
+}
+
+// One line of the table's own text (`TABLE_TEXT_POINTS`) at 1.2 leading, and
+// DrawingML's default cell insets (0.05in at the top and the bottom): the shortest
+// a row may be and still show its own line. A smaller row is one PowerPoint grows
+// back on open, which would push the table past the slide a frame inside it
+// reported.
+const TABLE_LINE_EMU = Math.round(TABLE_TEXT_POINTS * 1.2 * EMU_PER_INCH / 72);
+const TABLE_MIN_ROW_EMU = TABLE_LINE_EMU + 2 * Math.round(0.05 * EMU_PER_INCH);
+// The row height a table placed into a slide takes: a fifth taller than that
+// shortest row, so the text has room around it. A table's own size is one row per
+// line it holds, which is what an absent size is shrunk from — never grown, so
+// cells keep the size their text needs.
+const TABLE_ROW_EMU = Math.round(TABLE_MIN_ROW_EMU * 6 / 5);
+// The `graphicData` URI a DrawingML table is held under in a slide.
+const TABLE_GRAPHIC_URI = "http://schemas.openxmlformats.org/drawingml/2006/table";
+
+// The table's grid and rows, from what the caller gave: every column and every
+// row takes the same share of the frame, the last one taking the remainder so the
+// cells add up to it exactly. A row is padded to the widest one — a DrawingML
+// table states the same number of cells in every row, and the grid's own columns
+// say how many — and a heading cell is bold, which `firstRow` asks the style to
+// treat as a heading row.
+function tableRowsXml(headers, rows, placement) {
+  const columns = Math.max(headers.length, ...rows.map((row) => row.length));
+  const headingRows = headers.length ? 1 : 0;
+  const count = headingRows + rows.length;
+  const share = (total, parts, index) => (index === parts - 1 ? total - Math.floor(total / parts) * (parts - 1) : Math.floor(total / parts));
+  function cell(text, bold) {
+    const run = text === undefined || text === "" ? "" : `<a:r><a:rPr lang="${SLIDE_LANG}" sz="${TABLE_TEXT_POINTS * 100}"${bold ? ' b="1"' : ""}/>${textElement("a:", xmlEscape(String(text)))}</a:r>`;
+    const end = `<a:endParaRPr lang="${SLIDE_LANG}" sz="${TABLE_TEXT_POINTS * 100}"/>`;
+    return `<a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p>${run}${end}</a:p></a:txBody><a:tcPr/></a:tc>`;
+  }
+  function line(cells, bold, index) {
+    const texts = Array.from({ length: columns }, (_, at) => cell(cells[at], bold));
+    return `<a:tr h="${share(placement.cy, count, index)}">${texts.join("")}</a:tr>`;
+  }
+  const grid = Array.from({ length: columns }, (_, index) => `<a:gridCol w="${share(placement.cx, columns, index)}"/>`).join("");
+  const head = headers.length ? [line(headers, true, 0)] : [];
+  const body = rows.map((cells, index) => line(cells, false, index + headingRows));
+  return `<a:tblPr${headers.length ? ' firstRow="1"' : ""}/><a:tblGrid>${grid}</a:tblGrid>${[...head, ...body].join("")}`;
+}
+
+// `pptx_edit`'s `add_table`: a `<p:graphicFrame>` holding a DrawingML table,
+// appended to the slide's shape tree exactly as a picture is — the slide's last
+// shape, taking the next free shape id, so nothing already on the slide is
+// touched and nothing is replaced. The table is placed and sized by fraction of
+// the slide, the same contract an image is placed by (see `placementBox`); its
+// cell text is `<a:t>` inside the cell's paragraph, which is where a reading
+// finds a slide's text.
+function addSlideTable(editor, edit) {
+  const zip = editor.zip;
+  const part = addressedSlide(zip, edit.slide);
+  const headings = edit.headers ?? [];
+  const headers = headings.map((cell) => scalarOf(cell, "a table heading"));
+  const rows = (edit.rows ?? [])
+    .map((row) => {
+      if (!Array.isArray(row)) throw new UsageError("a table's rows must be arrays of cells");
+      return row.map((cell) => scalarOf(cell, "a table cell"));
+    })
+    .filter((row) => row.length);
+  if (!headers.length && !rows.length) throw new UsageError("the table states no rows and no headers — hint: give it at least one row or one header");
+  editor.part(part, (xml) => {
+    const at = shapeTreeEnd(xml);
+    if (at === null) throw new UsageError("the slide has no shape tree to place a table in");
+    const shapeId = nextShapeId(xml);
+    const slide = slideSize(zip);
+    const lines = (headers.length ? 1 : 0) + rows.length;
+    // An unnamed table spans the width a created deck lays its own content out
+    // in — the flow's own column, scaled with the deck — one row per line of its
+    // text. A row holds a line of the table's own text, so its height is stated
+    // in the text's own measure rather than scaled with the deck.
+    const flow = slideBox(slide.width / EMU_PER_INCH, slide.height / EMU_PER_INCH);
+    const natural = {
+      width: Math.max(1, Math.round(flow.width * EMU_PER_INCH)),
+      height: Math.max(1, lines * TABLE_ROW_EMU),
+    };
+    const placement = placementBox(natural, edit, slide, false);
+    // A size the call leaves entirely unnamed is shrunk to fit the slide, but
+    // never below a row that shows its own text: a table the slide cannot hold at
+    // that height is left taller than the slide, and the note below says so rather
+    // than the call reporting a table that PowerPoint would grow off the slide on
+    // open. The floor is a height alone, so the table keeps the width it has of
+    // its own rather than the narrower one the abandoned fit gave it, and every
+    // axis the call left unnamed is centred again. A size the call names on either
+    // side keeps the size its fractions state, as every placed shape does.
+    if (edit.width_fraction == null && edit.height_fraction == null && placement.cy < lines * TABLE_MIN_ROW_EMU) {
+      placement.cx = natural.width;
+      placement.cy = lines * TABLE_MIN_ROW_EMU;
+      if (edit.x_fraction == null) placement.x = Math.round((slide.width - placement.cx) / 2);
+      if (edit.y_fraction == null) placement.y = Math.max(0, Math.round((slide.height - placement.cy) / 2));
+    }
+    if (outsideSlide(placement, slide)) editor.note("[the table's box reaches past the slide — the part beyond the slide's edge is not shown on it]");
+    const frame = `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="${shapeId}" name="Table ${shapeId}"/><p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr><p:nvPr/></p:nvGraphicFramePr>` +
+      `<p:xfrm><a:off x="${placement.x}" y="${placement.y}"/><a:ext cx="${placement.cx}" cy="${placement.cy}"/></p:xfrm>` +
+      `<a:graphic><a:graphicData uri="${TABLE_GRAPHIC_URI}"><a:tbl>${tableRowsXml(headers, rows, placement)}</a:tbl></a:graphicData></a:graphic></p:graphicFrame>`;
+    return xml.slice(0, at) + frame + xml.slice(at);
   });
 }
 
@@ -7339,6 +7598,7 @@ function pptxEdit(req) {
     else if (op === "add_paragraph") addSlideParagraph(editor, edit);
     else if (op === "remove_paragraph") removeSlideParagraphs(editor, edit);
     else if (op === "add_image") addSlideImage(editor, edit);
+    else if (op === "add_table") addSlideTable(editor, edit);
     else if (op === "add_slide") addSlide(editor, edit);
     else if (op === "delete_slide") deleteSlide(editor, edit);
     else if (op === "move_slide") moveSlide(editor, edit);
@@ -7563,18 +7823,37 @@ async function pdfImage(req) {
   const pdf = await loadPdf(req.input);
   applyEditMetadata(pdf, req.metadata);
   const image = await embedImage(pdf, req.image);
-  // The action's own sides are points, as the page is laid out, and the image's
-  // natural size and the cap are the pixels `imageSize` measures in: it answers in
-  // pixels, which the page draws in points.
-  const size = imageSize(image, req.width, req.height, RULES.dimension_points);
+  // Whether the call names a side: a named size is drawn exactly as named, while
+  // an unnamed one is fitted whole into the page's own text column (see
+  // `imageSize`).
+  const sized = req.width != null || req.height != null;
+  // Whether a page cannot hold the picture whole. Only a place or size the call
+  // names can reach past a page — a fitted picture is inside it by construction —
+  // and the reply says so rather than reporting a plain success, the way the pptx
+  // arm's own note does.
+  let reachesPast = false;
   for (const index of pageIndices(pdf, req.pages)) {
     const page = pdf.getPage(index);
-    const { height } = page.getSize();
+    const { width, height } = page.getSize();
+    const size = imageSize(image, req.width, req.height, RULES.dimension_points, {
+      width: Math.round((width - 2 * MARGIN) / PX_TO_POINTS),
+      height: Math.round((height - 2 * MARGIN) / PX_TO_POINTS),
+    });
+    const drawn = { width: size.width * PX_TO_POINTS, height: size.height * PX_TO_POINTS };
+    // A place the call names is drawn where it names, even past the page — the
+    // documented contract. An unnamed one is the page's text column: its left edge,
+    // and, for a picture the call fitted itself, its top edge on the column's own
+    // top, so the picture hangs off neither edge. pdf-lib measures `y` to the
+    // picture's own bottom, hence the subtraction.
     const x = req.x === undefined ? MARGIN : pointNumber(req.x, "x");
-    const y = req.y === undefined ? height / 2 : pointNumber(req.y, "y");
-    page.drawImage(image, { x, y, width: size.width * PX_TO_POINTS, height: size.height * PX_TO_POINTS });
+    const y = req.y !== undefined ? pointNumber(req.y, "y") : sized ? height / 2 : height - MARGIN - drawn.height;
+    page.drawImage(image, { x, y, ...drawn });
+    if (x < 0 || y < 0 || x + drawn.width > width || y + drawn.height > height) reachesPast = true;
   }
-  return pdf.save();
+  return {
+    bytes: await pdf.save(),
+    notes: reachesPast ? [PAST_PAGE_NOTE] : [],
+  };
 }
 
 // The fields a request can fill, with the kind and the values each accepts.
@@ -7695,7 +7974,12 @@ const operations = {
     };
     await step("create_docx", async () => writeOut(`${scratch}/probe.docx`, await createDocx({ content: [{ type: "heading", level: 1, text: "Проверка" }, { type: "paragraph", text: "текст" }] })));
     await step("create_xlsx", () => writeOut(`${scratch}/probe.xlsx`, createXlsx({ sheets: [{ rows: [["Проверка {name}", 1, { formula: "B1" }]] }] })));
-    await step("create_pptx", async () => writeOut(`${scratch}/probe.pptx`, await createPptx({ content: [{ type: "heading", level: 1, text: "Проверка" }, { type: "list", items: ["раз", "два"] }] })));
+    await step("create_pptx", async () => {
+      writeOut(`${scratch}/probe.pptx`, await createPptx({ content: [{ type: "heading", level: 1, text: "Проверка" }, { type: "list", items: ["раз", "два"] }] }));
+      // The same blocks at a named size: the one arm whose geometry is not the
+      // default deck's.
+      writeOut(`${scratch}/probe_portrait.pptx`, await createPptx({ size: "portrait", content: [{ type: "heading", level: 1, text: "Проверка" }, { type: "paragraph", text: "Текст" }] }));
+    });
     await step("create_pdf", async () => writeOut(`${scratch}/probe.pdf`, await createPdf({ font: req.font, content: [{ type: "paragraph", text: "Проверка" }] })));
     await step("merge", async () => writeOut(`${scratch}/probe_merged.pdf`, await pdfMerge({ inputs: [`${scratch}/probe.pdf`, `${scratch}/probe.pdf`] })));
     await step("split", async () => {
@@ -7704,7 +7988,7 @@ const operations = {
     });
     await step("rotate", async () => writeOut(`${scratch}/probe_rotated.pdf`, await pdfRotate({ input: `${scratch}/probe.pdf`, pages: "all", degrees: RULES.degrees_step })));
     await step("text", async () => writeOut(`${scratch}/probe_text.pdf`, await pdfText({ input: `${scratch}/probe.pdf`, pages: "all", text: "Проверка", font: req.font })));
-    await step("image", async () => writeOut(`${scratch}/probe_image.pdf`, await pdfImage({ input: `${scratch}/probe.pdf`, pages: "all", image: `${scratch}/probe.png` })));
+    await step("image", async () => writeOut(`${scratch}/probe_image.pdf`, (await pdfImage({ input: `${scratch}/probe.pdf`, pages: "all", image: `${scratch}/probe.png` })).bytes));
     // A form to fill, authored here: the tool has no operation that writes one,
     // and a kit broken only in form filling must not stay advertised.
     await step("form_fill", async () => {
@@ -7788,6 +8072,7 @@ const operations = {
         { op: "replace_text", slide: 1, find: "слайда", replace: "правки" },
         { op: "format_text", slide: 1, find: "Текст", bold: true, strike: true, color: "#FF0000", align: "center" },
         { op: "add_image", slide: 1, image: `${scratch}/probe.png`, width_fraction: 0.3 },
+        { op: "add_table", slide: 1, headers: ["А", "Б"], rows: [["раз", "два"]], x_fraction: 0.2, y_fraction: 0.4 },
         { op: "add_paragraph", slide: 1, text: "Лишнее" },
         { op: "remove_paragraph", slide: 1, find: "Лишнее" },
         { op: "add_paragraph", slide: 1, text: "Добавлено" },
@@ -7844,7 +8129,11 @@ const operations = {
   },
   pdf_rotate: async (req) => { writeOut(req.output, await pdfRotate(req)); return { outputs: [req.output] }; },
   pdf_text: async (req) => { writeOut(req.output, await pdfText(req)); return { outputs: [req.output] }; },
-  pdf_image: async (req) => { writeOut(req.output, await pdfImage(req)); return { outputs: [req.output] }; },
+  pdf_image: async (req) => {
+    const drawn = await pdfImage(req);
+    writeOut(req.output, drawn.bytes);
+    return { outputs: [req.output], notes: drawn.notes };
+  },
   pdf_form_fill: async (req) => {
     checkValues(req.values);
     writeOut(req.output, await pdfFormFill(req));

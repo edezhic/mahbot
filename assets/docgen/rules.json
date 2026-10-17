@@ -49,6 +49,12 @@
   "sheet_name_forbidden": "[]:*?/\\",
   "slide_position_fraction": { "min": 0, "max": 1, "min_exclusive": false },
   "slide_size_fraction": { "min": 0, "max": 1, "min_exclusive": true },
+  "pptx_default_size": { "width_emu": 9144000, "height_emu": 5143500 },
+  "pptx_sizes": [
+    { "name": "widescreen", "width_emu": 12192000, "height_emu": 6858000 },
+    { "name": "standard", "width_emu": 9144000, "height_emu": 6858000 },
+    { "name": "portrait", "width_emu": 6858000, "height_emu": 9144000 }
+  ],
   "ppt_marks": {
     "title": "(title)",
     "hidden_slide": "(hidden slide)",

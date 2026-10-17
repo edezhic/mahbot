@@ -218,6 +218,18 @@ fn edit_op_fields(
                     "height_fraction",
                 ],
             ),
+            (
+                "add_table",
+                &[
+                    "slide",
+                    "headers",
+                    "rows",
+                    "x_fraction",
+                    "y_fraction",
+                    "width_fraction",
+                    "height_fraction",
+                ],
+            ),
             ("add_slide", &["after", "title", "bullets"]),
             ("delete_slide", &["slide"]),
             ("move_slide", &["slide", "to"]),
@@ -312,11 +324,11 @@ struct Rules {
     /// is stated; a picture side derived from the one the request names is held to
     /// it too.
     dimension_points: Span,
-    /// A pptx `add_image` placement: the fraction of the slide's width or
-    /// height the image is placed at.
+    /// A pptx `add_image` or `add_table` placement: the fraction of the slide's
+    /// width or height the shape is placed at.
     slide_position_fraction: Span,
-    /// A pptx `add_image` size: the fraction of the slide's width or height the
-    /// image is scaled to, where zero is not a size.
+    /// A pptx `add_image` or `add_table` size: the fraction of the slide's width
+    /// or height the shape is scaled to, where zero is not a size.
     slide_size_fraction: Span,
     /// A docx `format_text` size in points. Word's `<w:sz>` counts half-points
     /// and caps the value at 1638 — 819 points — so the kit writes the doubled
@@ -404,6 +416,51 @@ struct Rules {
     /// The longest xlsx `set_cell`/`format_cells` `number_format`: text inside
     /// the shared cap, an empty format not being one.
     number_format_max: usize,
+    /// The slide sizes a created presentation may name, in the order the prompt
+    /// states them. The kit reads the same list and defines the layout it writes
+    /// from the same EMU, so a name and the deck it produces cannot drift.
+    pptx_sizes: Vec<PptxSize>,
+    /// The deck this tool has written since before a size could be named — the
+    /// 10 × 5.625 in one (`LAYOUT_16x9`) every measurement the kit places itself is
+    /// drawn on, and the one an unnamed `create` still writes. Stated here because
+    /// the model-facing text names it and the kit's own reference geometry is read
+    /// from it.
+    pptx_default_size: DeckSize,
+}
+
+/// A slide size in EMU: the pair of lengths a deck's `<p:sldSz>` states, which
+/// every deck-geometry measurement is scaled from.
+#[derive(serde::Deserialize)]
+struct DeckSize {
+    width_emu: u64,
+    height_emu: u64,
+}
+
+impl DeckSize {
+    /// The size as the model reads it, in inches to a thousandth — the unit a
+    /// caller thinks of a slide in, while the file states EMU. Integer arithmetic
+    /// only, and no rounding: a thousandth of an inch is 914.4 EMU, so the sizes a
+    /// deck states are spelled exactly where a thousandth can (10 × 5.625 in), and
+    /// one that needs more digits — widescreen's 13.333… in — is truncated there.
+    fn inches(&self) -> String {
+        const EMU_PER_INCH: u64 = 914_400;
+        let side = |emu: u64| {
+            let fraction = format!("{:03}", emu % EMU_PER_INCH * 1000 / EMU_PER_INCH);
+            let fraction = fraction.trim_end_matches('0');
+            let dot = if fraction.is_empty() { "" } else { "." };
+            format!("{}{dot}{fraction}", emu / EMU_PER_INCH)
+        };
+        format!("{} × {} in", side(self.width_emu), side(self.height_emu))
+    }
+}
+
+/// One size [`Rules::pptx_sizes`] states: the word a `create` may name and the
+/// deck that word means, in EMU — the unit `<p:sldSz>` states a slide in.
+#[derive(serde::Deserialize)]
+struct PptxSize {
+    name: String,
+    #[serde(flatten)]
+    deck: DeckSize,
 }
 
 /// [`crate::docgen::rules`] parsed into this tool's own shape: the shared file's
@@ -515,6 +572,8 @@ impl Tool for DocumentTool {
                 ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
                 ("{{ppt_diagram_text_lost_mark}}", &marks.diagram_text_lost),
                 ("{{ppt_no_text_mark}}", &marks.no_text),
+                ("{{pptx_sizes}}", &pptx_size_list()),
+                ("{{pptx_default_size}}", &RULES.pptx_default_size.inches()),
             ],
         )
     }
@@ -868,12 +927,12 @@ fn placed_size_arg(what: &str) -> Value {
 
 /// A content-block image's or a docx `add_image`'s placed width: the shared
 /// placement rule, and the fallback only a laid-out block has — with neither side
-/// named the picture keeps its own size, capped to the width the page's text has
-/// room for.
+/// named the picture keeps its own size, fitted whole into the page's or slide's
+/// own text column so neither side of it runs past.
 fn content_image_width_arg(what: &str) -> Value {
     number_arg(&format!(
-        "{what} {}; with neither side named the picture keeps its own size, capped to the width \
-         the page's text has room for.",
+        "{what} {}; with neither side named the picture keeps its own size, fitted whole into the \
+         page's or slide's own text column.",
         picture_size_rule()
     ))
 }
@@ -1163,6 +1222,15 @@ fn action_schema(action: &str) -> Value {
                 "content": content_arg(),
                 "sheets": sheets_arg(),
                 "metadata": metadata_entry(),
+                "size": choice_arg(
+                    &pptx_size_words(),
+                    &format!(
+                        "A pptx slide size: {}. Unnamed is the {} deck this tool has always \
+                         written.",
+                        pptx_size_list(),
+                        RULES.pptx_default_size.inches()
+                    ),
+                ),
             }),
         ),
         "fill_template" => super::action_entry_schema(
@@ -1348,10 +1416,18 @@ fn action_schema(action: &str) -> Value {
                         "color": color_arg("Text colour"),
                         "align": choice_arg(&pair_words(&RULES.slide_alignments), "Alignment."),
                         "image": image_arg(),
+                        "headers": array_arg(
+                            &scalar_arg(),
+                            "add_table: the headings row; a presentation's table has no column bound.",
+                        ),
+                        "rows": array_arg(
+                            &array_arg(&scalar_arg(), "A row of cells."),
+                            "add_table: the table's rows, each an array of cells — a headings row alone makes a table.",
+                        ),
                         "x_fraction": number_arg(&format!(
                             "Across the slide, {} of its width; an unnamed place is the slide's \
-                             middle and an unnamed size the largest that fits, so a place named \
-                             without a size can push the picture past the slide's edge.",
+                             middle, an unnamed size a picture's largest fit or a table's own, and \
+                             a place named without a size can push either past the slide's edge.",
                             RULES.slide_position_fraction.bounds()
                         )),
                         "y_fraction": number_arg(&format!(
@@ -1532,6 +1608,26 @@ impl DocumentTool {
         }
         let mut request = json!({ "op": "create", "format": format });
         set_metadata(&mut request, metadata);
+        // A slide size is a presentation's own: the page a document or a PDF is
+        // laid out on is not choosable, so a `size` named for one is refused
+        // rather than silently dropped.
+        let size = opt_string(args, "size")?;
+        if let Some(size) = size {
+            if format != "pptx" {
+                anyhow::bail!(
+                    "usage: \"size\" is a slide size, and only format \"pptx\" has slides — \
+                     hint: pass \"size\" only for format \"pptx\""
+                );
+            }
+            let sizes = pptx_size_words();
+            if !sizes.contains(&size) {
+                anyhow::bail!(
+                    "usage: unknown slide size \"{size}\" — hint: use {}",
+                    listed(&sizes)
+                );
+            }
+            request["size"] = json!(size);
+        }
         if format == "xlsx" {
             // A workbook is built from `sheets`; content blocks passed beside it
             // would be dropped in silence, which is worse than being told they do
@@ -3374,7 +3470,13 @@ fn validate_pptx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
         "add_image" => {
             require_slide(object, at)?;
             edit_string_non_empty(object, "image", at)?;
-            require_image_geometry(object, at)?;
+            require_slide_geometry(object, at)?;
+        }
+        "add_table" => {
+            require_slide(object, at)?;
+            // A presentation's table has no column bound (see [`require_table`]).
+            require_table(object, at, None)?;
+            require_slide_geometry(object, at)?;
         }
         "add_slide" => {
             if edit_integer(object, "after", at)? == Some(0) {
@@ -3487,6 +3589,26 @@ fn pair_words(list: &[(String, String)]) -> Vec<&str> {
     list.iter().map(|(word, _)| word.as_str()).collect()
 }
 
+/// The slide sizes a `create` may name, as the words the model chooses from.
+fn pptx_size_words() -> Vec<&'static str> {
+    RULES
+        .pptx_sizes
+        .iter()
+        .map(|size| size.name.as_str())
+        .collect()
+}
+
+/// The same sizes as the model reads them: every word with the deck it means, so
+/// a size is a stated fact rather than a word the model has to guess at.
+fn pptx_size_list() -> String {
+    RULES
+        .pptx_sizes
+        .iter()
+        .map(|size| format!("{} ({})", size.name, size.deck.inches()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The examples of the shared Word marks a reading prints in brackets, and the
 /// labels and annotations it adds without them — quoted and comma-separated for
 /// the prompt, which names every one of them from this one statement (see
@@ -3527,13 +3649,13 @@ fn require_pptx_format(object: &serde_json::Map<String, Value>, at: &str) -> Res
     Ok(())
 }
 
-/// Require an `add_image`'s optional placement and size: `x_fraction` and
-/// `y_fraction` are fractions of the slide's own width and height and may sit on
-/// its edge, while `width_fraction` and `height_fraction` are fractions of that
-/// size and may not be zero.
-fn require_image_geometry(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
-    let place = "give the fraction of the slide the image is placed at";
-    let size = "give the fraction of the slide the image is scaled to";
+/// Require a shape's optional placement and size: `x_fraction` and `y_fraction`
+/// are fractions of the slide's own width and height and may sit on its edge,
+/// while `width_fraction` and `height_fraction` are fractions of that size and
+/// may not be zero. A picture and a table are both placed this way.
+fn require_slide_geometry(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
+    let place = "give the fraction of the slide the shape is placed at";
+    let size = "give the fraction of the slide the shape is scaled to";
     for (key, span, what) in [
         ("x_fraction", &RULES.slide_position_fraction, place),
         ("y_fraction", &RULES.slide_position_fraction, place),
@@ -6216,6 +6338,532 @@ mod tests {
         );
     }
 
+    /// Every placement in `xml` as `(x, y, cx, cy)` in EMU — a shape's, a
+    /// picture's and a table's frame alike: `<a:off>` and `<a:ext>` in the order
+    /// the format keeps them together.
+    fn shape_frames(xml: &str) -> Vec<(u64, u64, u64, u64)> {
+        let measure = |element: &str, name: &str| -> u64 {
+            attribute_of(element, name).parse().expect("an EMU measure")
+        };
+        xml.match_indices("<a:off ")
+            .map(|(at, _)| {
+                let body = &xml[at..];
+                let offset = &body[..=body.find('>').expect("a closed offset")];
+                let body = &body[offset.len()..];
+                let body = &body[body.find("<a:ext ").expect("an extent after an offset")..];
+                let extent = &body[..=body.find('>').expect("a closed extent")];
+                (
+                    measure(offset, "x"),
+                    measure(offset, "y"),
+                    measure(extent, "cx"),
+                    measure(extent, "cy"),
+                )
+            })
+            .collect()
+    }
+
+    /// The frame of the shape named `name`, one of the placements
+    /// [`shape_frames`] reads.
+    fn shape_frame(xml: &str, name: &str) -> (u64, u64, u64, u64) {
+        let frames = shape_frames(named_shape(xml, name));
+        assert_eq!(frames.len(), 1, "{name} states {} frames", frames.len());
+        frames[0]
+    }
+
+    /// Every shape the tool placed in `xml` is inside a slide of `width` ×
+    /// `height` EMU: the promise a deck of any size owes the content the tool
+    /// itself lays out.
+    fn assert_inside_slide(xml: &str, width: u64, height: u64) {
+        for (x, y, cx, cy) in shape_frames(xml) {
+            assert!(
+                x + cx <= width && y + cy <= height,
+                "a shape at ({x}, {y}) sized {cx}×{cy} runs off a {width}×{height} slide: {xml}"
+            );
+        }
+    }
+
+    /// The deck every placement in the created arm was drawn on, in EMU: the one
+    /// an unnamed `create` writes (see `rules.json`).
+    fn default_deck_emu() -> (u64, u64) {
+        (
+            RULES.pptx_default_size.width_emu,
+            RULES.pptx_default_size.height_emu,
+        )
+    }
+
+    /// Every deck size a created presentation may take, in EMU: the one an unnamed
+    /// call writes first, then each size the rules name — the pairs a test that
+    /// creates a deck per size reads.
+    fn deck_sizes() -> Vec<(Option<&'static str>, u64, u64)> {
+        let (width, height) = default_deck_emu();
+        let mut sizes = vec![(None, width, height)];
+        sizes.extend(RULES.pptx_sizes.iter().map(|size| {
+            (
+                Some(size.name.as_str()),
+                size.deck.width_emu,
+                size.deck.height_emu,
+            )
+        }));
+        sizes
+    }
+
+    /// A created deck is the size its call names — and the 16:9 deck it always was
+    /// when it names none — and whatever that size is, the content the tool lays
+    /// out by itself stays inside the slide. The default deck's own frames are the
+    /// ones it has always stated.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn created_deck_takes_the_slide_size_it_names() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let picture = write_fixture(&ws, "tall.png", &noisy_png(40, 1200));
+        let content = json!([
+            { "type": "heading", "level": 1, "text": "Заголовок" },
+            { "type": "paragraph", "text": "Тело" },
+            { "type": "list", "items": ["раз", "два"] },
+            { "type": "table", "headers": ["Колонка"], "rows": [["значение"]] },
+            { "type": "image", "image": picture.to_string_lossy() },
+            { "type": "heading", "level": 1, "text": "Второй" },
+            { "type": "notes", "text": "Заметка" },
+        ]);
+        let mut default = None;
+        for (index, (size, width, height)) in deck_sizes().into_iter().enumerate() {
+            let mut args = json!({
+                "action": "create", "format": "pptx", "file_name": format!("deck{index}"),
+                "content": content.clone(),
+            });
+            if let Some(size) = size {
+                args["size"] = json!(size);
+            }
+            let deck = single(&run(&ws, args).await);
+            let presentation = part_text(&deck, "ppt/presentation.xml");
+            let declared = format!(r#"<p:sldSz cx="{width}" cy="{height}"/>"#);
+            assert!(
+                presentation.contains(&declared),
+                "a deck named {size:?} does not state {declared}: {presentation}"
+            );
+            for part in zip_names(&deck)
+                .into_iter()
+                .filter(|name| name.starts_with("ppt/slides/slide"))
+            {
+                assert_inside_slide(&part_text(&deck, &part), width, height);
+            }
+            if size.is_none() {
+                default = Some(deck);
+            }
+        }
+        // The default deck places its title exactly where it always did: the
+        // reference frame, which every other size scales with the deck.
+        let default = default.expect("the default deck is created first");
+        assert_eq!(
+            (365_760, 274_320, 8_412_480, 731_520),
+            shape_frame(&part_text(&default, "ppt/slides/slide1.xml"), "Title"),
+            "the default deck's title frame moved"
+        );
+    }
+
+    /// A created deck never begins with an empty slide: a first block that cannot
+    /// fit the flow still starts on slide 1 rather than opening a slide it then
+    /// abandons.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_created_deck_never_opens_with_an_empty_slide() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        // Twelve bullets need 6.3in of a 3.9in flow: the block cannot fit a slide.
+        let items = (1..=12).map(|n| format!("пункт {n}")).collect::<Vec<_>>();
+        let deck = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "long",
+                    "content": [{ "type": "list", "items": items }],
+                }),
+            )
+            .await,
+        );
+        let slides = zip_names(&deck)
+            .into_iter()
+            .filter(|name| name.starts_with("ppt/slides/slide"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slides.len(),
+            1,
+            "the deck opens with a slide of its own: {slides:?}"
+        );
+        let text = part_text(&deck, "ppt/slides/slide1.xml");
+        assert!(
+            text.contains("пункт 12"),
+            "the block is not on the first slide: {text}"
+        );
+    }
+
+    /// A slide `add_slide` writes into a deck of any size keeps its title inside
+    /// that deck's slide — the frame is the reference one scaled with the deck —
+    /// while the default deck's frame is the one both writers have always stated.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_added_slide_title_fits_any_deck_size() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        for (index, (size, width, height)) in deck_sizes().into_iter().enumerate() {
+            let mut args = json!({
+                "action": "create", "format": "pptx", "file_name": format!("deck{index}"),
+                "content": [{ "type": "heading", "level": 1, "text": "Заголовок" }],
+            });
+            if let Some(size) = size {
+                args["size"] = json!(size);
+            }
+            let deck = single(&run(&ws, args).await);
+            let reply = run(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": format!("added{index}"),
+                    "path": deck.to_string_lossy(),
+                    "edits": [{ "op": "add_slide", "title": "Добавленный", "bullets": ["раз"] }],
+                }),
+            )
+            .await;
+            let edited = single(&reply);
+            let added = part_text(&edited, "ppt/slides/slide2.xml");
+            let (x, y, cx, cy) = shape_frame(&added, "Title");
+            assert!(
+                x + cx <= width && y + cy <= height,
+                "the added slide's title runs off a {width}×{height} slide: {x}, {y} is {cx}×{cy}"
+            );
+            // The reference frame is 0.4in in from a 10in slide's left and spans
+            // 9.2in of it, so a title's width and left edge are those shares of
+            // whatever slide it lands on.
+            assert_eq!(
+                width * 92 / 100,
+                cx,
+                "the title's width is not the slide's: {added}"
+            );
+            assert_eq!(
+                width * 4 / 100,
+                x,
+                "the title's left edge is not the slide's: {added}"
+            );
+            if size.is_none() {
+                assert_eq!(
+                    (365_760, 274_320, 8_412_480, 731_520),
+                    (x, y, cx, cy),
+                    "the default deck's added title frame moved"
+                );
+            }
+        }
+    }
+
+    /// A table `add_table` writes on a slide that already exists is additive, holds
+    /// the rows and columns the call gave, takes the place and size the call names,
+    /// and its text reads back like any other text on the slide.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_adds_a_table_that_reads_back() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let deck = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [
+                        { "type": "heading", "level": 1, "text": "Заголовок" },
+                        { "type": "paragraph", "text": "Тело" },
+                    ],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "tabled",
+                "path": deck.to_string_lossy(),
+                "edits": [
+                    { "op": "add_table", "slide": 1,
+                      "headers": ["Колонка", "Значение"],
+                      "rows": [["один", "1"], ["два", "2"]],
+                      "x_fraction": 0.1, "y_fraction": 0.5,
+                      "width_fraction": 0.5, "height_fraction": 0.25 },
+                ],
+            }),
+        )
+        .await;
+        let edited = single(&reply);
+        let slide = part_text(&edited, "ppt/slides/slide1.xml");
+        // Additive: what the slide held is still there, and the table is a shape of
+        // its own rather than a replacement.
+        for kept in ["Заголовок", "Тело", r#"name="Title""#] {
+            assert!(slide.contains(kept), "the edit dropped {kept}: {slide}");
+        }
+        let at = slide.find("<p:graphicFrame>").expect("the table's frame");
+        let table = &slide[at..slide.find("</p:graphicFrame>").expect("a frame close")];
+        assert_eq!(
+            table.matches("<a:gridCol ").count(),
+            2,
+            "the table states one column per heading: {table}"
+        );
+        assert_eq!(
+            table.matches("<a:tr ").count(),
+            3,
+            "the table states the headings row and both body rows: {table}"
+        );
+        for cell in ["Колонка", "Значение", "один", "1", "два", "2"] {
+            let run = format!("<a:t>{cell}</a:t>");
+            assert!(
+                table.contains(&run),
+                "the table does not hold the cell {cell:?}: {table}"
+            );
+        }
+        // The place and size are the fractions the call named, of the slide's own.
+        assert_eq!(
+            (914_400, 2_571_750, 4_572_000, 1_285_875),
+            shape_frames(table)[0]
+        );
+        // A reading shows the table's text the way it shows any text on a slide.
+        let text = converted_text(&ws, &edited).await;
+        for cell in ["Колонка", "Значение", "один", "два"] {
+            assert!(
+                text.contains(cell),
+                "the reading does not show the table's cell {cell:?}: {text}"
+            );
+        }
+    }
+
+    /// A table whose call names no place or size takes its own: the width a
+    /// created deck lays its own content out in, one row per line, centred on the
+    /// slide — and it stays inside a deck that is not the default size.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_places_an_unsized_table_inside_the_slide() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        for (index, (size, width, height)) in deck_sizes().into_iter().enumerate() {
+            let mut args = json!({
+                "action": "create", "format": "pptx", "file_name": format!("deck{index}"),
+                "content": [{ "type": "heading", "level": 1, "text": "Заголовок" }],
+            });
+            if let Some(size) = size {
+                args["size"] = json!(size);
+            }
+            let deck = single(&run(&ws, args).await);
+            let reply = run(
+                &ws,
+                json!({
+                    "action": "pptx_edit", "file_name": format!("tabled{index}"),
+                    "path": deck.to_string_lossy(),
+                    "edits": [{ "op": "add_table", "slide": 1,
+                                "rows": [["раз", "два"], ["три", "четыре"]] }],
+                }),
+            )
+            .await;
+            let edited = single(&reply);
+            let slide = part_text(&edited, "ppt/slides/slide1.xml");
+            let at = slide.find("<p:graphicFrame>").expect("the table's frame");
+            let table = &slide[at..slide.find("</p:graphicFrame>").expect("a frame close")];
+            let (x, y, cx, cy) = shape_frames(table)[0];
+            assert!(
+                x + cx <= width && y + cy <= height,
+                "the table runs off a {width}×{height} slide: {x}, {y} is {cx}×{cy}"
+            );
+            // The width a created deck lays its own content out in — 92% of a 10in
+            // reference deck's, scaled with the slide — and an unsized table takes
+            // exactly that width, centred.
+            assert_eq!(
+                width * 92 / 100,
+                cx,
+                "an unsized table does not span the content width: {table}"
+            );
+            assert_eq!(
+                (width - cx) / 2,
+                x,
+                "an unsized table is not centred: {table}"
+            );
+            assert_eq!(
+                (height - cy) / 2,
+                y,
+                "an unsized table is not centred: {table}"
+            );
+        }
+
+        // A table too tall for the slide is not squeezed into rows PowerPoint
+        // would grow back on open: a row is at least one line of 14pt text plus
+        // DrawingML's own 0.05in top and bottom insets — 24pt, 304,800 EMU — so
+        // 20 rows keep that height even though they reach past the slide, and the
+        // answer says so.
+        let deck = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "tall",
+                    "content": [{ "type": "heading", "level": 1, "text": "Заголовок" }],
+                }),
+            )
+            .await,
+        );
+        let rows = (1..=20)
+            .map(|n| vec![format!("строка {n}")])
+            .collect::<Vec<_>>();
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "too-tall",
+                "path": deck.to_string_lossy(),
+                "edits": [{ "op": "add_table", "slide": 1, "rows": rows }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("reaches past the slide"),
+            "a table taller than the slide is not named: {reply}"
+        );
+        let edited = single(&reply);
+        let slide = part_text(&edited, "ppt/slides/slide1.xml");
+        let at = slide.find("<p:graphicFrame>").expect("the table's frame");
+        let table = &slide[at..slide.find("</p:graphicFrame>").expect("a frame close")];
+        let (x, _, cx, cy) = shape_frames(table)[0];
+        assert_eq!(
+            20 * 304_800,
+            cy,
+            "a table too tall for the slide was squeezed below one line per row: {table}"
+        );
+        // The floor is a height alone: the table keeps the width it has of its own
+        // — the created flow's own column — and is centred again, rather than
+        // keeping the narrower width the abandoned fit gave it.
+        let width = default_deck_emu().0;
+        assert_eq!(
+            width * 92 / 100,
+            cx,
+            "the row floor gave away the table's own width: {table}"
+        );
+        assert_eq!(
+            (width - cx) / 2,
+            x,
+            "a table centred after the row floor is not centred: {table}"
+        );
+    }
+
+    /// A size the call names on one side keeps the table's own proportions: the
+    /// row floor an entirely unnamed size takes never overrides a named side.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_keeps_the_proportions_of_a_table_sized_on_one_side() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let deck = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [{ "type": "heading", "level": 1, "text": "Заголовок" }],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "narrow",
+                "path": deck.to_string_lossy(),
+                "edits": [{ "op": "add_table", "slide": 1,
+                            "rows": [["раз"], ["два"], ["три"]], "width_fraction": 0.3 }],
+            }),
+        )
+        .await;
+        let edited = single(&reply);
+        let slide = part_text(&edited, "ppt/slides/slide1.xml");
+        let at = slide.find("<p:graphicFrame>").expect("the table's frame");
+        let table = &slide[at..slide.find("</p:graphicFrame>").expect("a frame close")];
+        let (_, _, cx, cy) = shape_frames(table)[0];
+        assert_eq!(
+            cx,
+            default_deck_emu().0 * 30 / 100,
+            "a named width is not drawn: {table}"
+        );
+        assert!(
+            cy < 3 * 304_800,
+            "a named width was grown to a row floor instead of keeping the table's \
+             proportions: {table}"
+        );
+    }
+
+    /// A picture whose sides the call leaves unnamed is fitted whole into the
+    /// slide, so one much taller than the slide is drawn smaller instead of off its
+    /// edge; a picture placed by a named fraction with no size keeps that place,
+    /// and the answer says so when it reaches past the slide.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pptx_edit_fits_an_unsized_picture_and_names_one_placed_past_the_slide() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let tall = write_fixture(&ws, "tall.png", &noisy_png(40, 1200));
+        let wide = write_fixture(&ws, "wide.png", &noisy_png(1600, 200));
+        let deck = single(
+            &run(
+                &ws,
+                json!({
+                    "action": "create", "format": "pptx", "file_name": "deck",
+                    "content": [{ "type": "heading", "level": 1, "text": "Заголовок" }],
+                }),
+            )
+            .await,
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "placed",
+                "path": deck.to_string_lossy(),
+                "edits": [
+                    { "op": "add_image", "slide": 1, "image": tall.to_string_lossy() },
+                    { "op": "add_image", "slide": 1, "image": wide.to_string_lossy(),
+                      "width_fraction": 0.2 },
+                ],
+            }),
+        )
+        .await;
+        let edited = single(&reply);
+        assert!(
+            !reply.contains("reaches past the slide"),
+            "a picture placed inside the slide is reported as outside it: {reply}"
+        );
+        let slide = part_text(&edited, "ppt/slides/slide1.xml");
+        let (width, height) = default_deck_emu();
+        assert_inside_slide(&slide, width, height);
+
+        // A picture named only a place keeps the size the product decides — the
+        // largest that fits — so a place near the edge pushes it past the slide,
+        // and the answer says so rather than reporting a plain success.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "pptx_edit", "file_name": "past",
+                "path": deck.to_string_lossy(),
+                "edits": [{ "op": "add_image", "slide": 1, "image": wide.to_string_lossy(),
+                            "x_fraction": 0.5 }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("[the picture's box reaches past the slide"),
+            "a picture placed past the slide's edge is not named: {reply}"
+        );
+    }
+
     /// A slide `add_slide` writes declares the same title a created slide opens
     /// with: the same frame, centring, alignment and run formatting, written by
     /// the slide arm's own title builder rather than the create arm's. A title that
@@ -6832,6 +7480,54 @@ mod tests {
     fn parsed_pdf(path: &Path) -> hayro::hayro_syntax::Pdf {
         hayro::hayro_syntax::Pdf::new(std::fs::read(path).expect("read pdf"))
             .expect("the produced file parses as a PDF")
+    }
+
+    /// Every picture a PDF's page paints, as `(x, y, width, height)` in points:
+    /// the transform in force at each `Do`, composed through the graphics state's
+    /// `q`/`Q` stack and every `cm` the page draws with.
+    #[expect(clippy::many_single_char_names)] // a `cm` matrix is `[a b c d e f]` in the spec's own names
+    fn painted_pictures(page: &hayro::hayro_syntax::page::Page<'_>) -> Vec<(f64, f64, f64, f64)> {
+        use hayro::hayro_syntax::content::ops::TypedInstruction;
+        // `[a b c d e f]`, the six numbers a `cm` states.
+        let mut current = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let mut saved: Vec<[f64; 6]> = Vec::new();
+        let mut pictures = Vec::new();
+        let mut operations = page.typed_operations();
+        while let Some(operation) = operations.next() {
+            match operation {
+                TypedInstruction::SaveState(_) => saved.push(current),
+                TypedInstruction::RestoreState(_) => {
+                    current = saved.pop().unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+                }
+                TypedInstruction::Transform(matrix) => {
+                    let given = [
+                        matrix.0.as_f64(),
+                        matrix.1.as_f64(),
+                        matrix.2.as_f64(),
+                        matrix.3.as_f64(),
+                        matrix.4.as_f64(),
+                        matrix.5.as_f64(),
+                    ];
+                    let [a, b, c, d, e, f] = current;
+                    current = [
+                        a * given[0] + c * given[1],
+                        b * given[0] + d * given[1],
+                        a * given[2] + c * given[3],
+                        b * given[2] + d * given[3],
+                        a * given[4] + c * given[5] + e,
+                        b * given[4] + d * given[5] + f,
+                    ];
+                }
+                TypedInstruction::XObject(_) => pictures.push((
+                    current[4],
+                    current[5],
+                    current[0].hypot(current[2]),
+                    current[1].hypot(current[3]),
+                )),
+                _ => {}
+            }
+        }
+        pictures
     }
 
     /// Whether the catalog of `pdf` carries `key`.
@@ -8311,6 +9007,106 @@ mod tests {
             }
             other => panic!("unexpected conversion outcome: {other:?}"),
         }
+    }
+
+    /// A picture `pdf_image` sizes itself is fitted whole into the page it lands
+    /// on, so one much taller than the page is drawn smaller instead of off its
+    /// edge; a size the call names is drawn exactly as named, wherever it reaches.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_image_fits_an_unnamed_picture_into_the_page() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = pdf_with(&ws, "base", "Страница").await;
+        let tall = ws.as_path().join("tall.png");
+        std::fs::write(&tall, noisy_png(40, 1200)).expect("write png");
+        let fitted = run(
+            &ws,
+            json!({
+                "action": "pdf_image", "file_name": "fitted",
+                "path": source.to_string_lossy(), "image": tall.to_string_lossy(),
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&fitted));
+        let page = pdf.pages().first().expect("one page");
+        let page_box = page.media_box();
+        let pictures = painted_pictures(page);
+        assert_eq!(pictures.len(), 1, "the page paints one picture");
+        let (x, y, width, height) = pictures[0];
+        assert!(
+            x >= page_box.x0
+                && y >= page_box.y0
+                && x + width <= page_box.x1
+                && y + height <= page_box.y1,
+            "a fitted picture at ({x}, {y}) sized {width}×{height} runs off its {page_box:?} page"
+        );
+        // Fitted into the page's own text column: the tallest the page holds, not
+        // the picture's own height.
+        assert!(
+            height > (page_box.y1 - page_box.y0) * 0.8,
+            "the picture was not fitted to the page: {height}"
+        );
+
+        // A size the call names is the size drawn, even when it reaches past the
+        // page: a stated place and size are the caller's, and the answer says the
+        // picture reaches past the page rather than reporting a plain success.
+        let named = run(
+            &ws,
+            json!({
+                "action": "pdf_image", "file_name": "named",
+                "path": source.to_string_lossy(), "image": tall.to_string_lossy(),
+                "width": 200,
+            }),
+        )
+        .await;
+        assert!(
+            named.contains("reaches past the page"),
+            "a picture drawn past the page is not named: {named}"
+        );
+        let pdf = parsed_pdf(&single(&named));
+        let (_, _, width, height) = painted_pictures(pdf.pages().first().expect("one page"))[0];
+        assert!(
+            (width - 200.0).abs() < 0.5,
+            "a named width is not the width drawn: {width}"
+        );
+        assert!(
+            (height - 6000.0).abs() < 1.0,
+            "a named width did not keep the picture's proportions: {height}"
+        );
+
+        // An unnamed place is the page's text column: the picture's left edge on
+        // the column's left and its top on the column's top — the kit's 56pt
+        // margin — rather than the mid-page place a named size keeps. A small
+        // picture says so, since a fitted tall one fills the column to both edges.
+        let small = ws.as_path().join("small.png");
+        std::fs::write(&small, noisy_png(40, 40)).expect("write png");
+        let anchored = run(
+            &ws,
+            json!({
+                "action": "pdf_image", "file_name": "anchored",
+                "path": source.to_string_lossy(), "image": small.to_string_lossy(),
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&anchored));
+        let page = pdf.pages().first().expect("one page");
+        let (x, y, _, height) = painted_pictures(page)[0];
+        assert!(
+            (x - 56.0).abs() < 0.5,
+            "an unnamed place is not the column's left edge: {x}"
+        );
+        assert!(
+            (y + height - (page.media_box().y1 - 56.0)).abs() < 1.0,
+            "an unnamed place is not the column's top: the picture ends at {}",
+            y + height
+        );
+        assert!(
+            !anchored.contains("reaches past the page"),
+            "a picture inside the page is reported as past it: {anchored}"
+        );
     }
 
     /// An image whose bytes are not a whole PNG or JPEG is refused for every
@@ -9854,6 +10650,61 @@ mod tests {
         }
     }
 
+    /// A table added to a slide takes the fields its own op states and nothing
+    /// else, and it must hold something to lay out — the one table rule both
+    /// producers read.
+    #[test]
+    fn pptx_add_table_refuses_a_key_and_a_table_its_op_does_not_take() {
+        for (edits, expected) in [
+            (
+                json!([{ "op": "add_table", "slide": 1, "image": "x.png" }]),
+                "edits[0].image is not a field of pptx \"add_table\"",
+            ),
+            (
+                json!([{ "op": "add_table", "slide": 1, "headers": [], "rows": [] }]),
+                "states a table with no rows and no headers",
+            ),
+        ] {
+            let err = validate_edits(crate::ooxml::Family::Pptx, &json!({ "edits": edits }))
+                .expect_err("a table the op cannot write must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("usage:") && message.contains(expected),
+                "expected {expected:?}, got: {message}"
+            );
+        }
+    }
+
+    /// A slide size is a presentation's own: a document or a PDF naming one, and a
+    /// size the product does not recognise, are refused before anything is
+    /// written.
+    #[tokio::test]
+    async fn create_refuses_a_slide_size_another_format_cannot_have() {
+        let (_dir, ws) = workspace();
+        for (args, expected) in [
+            (
+                json!({ "action": "create", "format": "docx", "size": "widescreen",
+                        "content": [{ "type": "paragraph", "text": "x" }] }),
+                "only format \"pptx\" has slides",
+            ),
+            (
+                json!({ "action": "create", "format": "pptx", "size": "a4",
+                        "content": [{ "type": "paragraph", "text": "x" }] }),
+                "unknown slide size \"a4\"",
+            ),
+        ] {
+            let err = confined_document()
+                .execute(&ws, args)
+                .await
+                .expect_err("a size no create takes");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got: {err}"
+            );
+        }
+        assert_eq!(generated_count(&ws), 0, "a refused call left an output");
+    }
+
     /// A key whose value is `null` is not stated — the boundary reads a `null` as
     /// absent everywhere (see `edit_nulls_are_dropped_before_the_request_is_forwarded`)
     /// — so a `format_cells` naming `row: null` beside its `range` is the range edit
@@ -11384,6 +12235,87 @@ mod tests {
                 .iter()
                 .any(|path| std::fs::read(path).expect("read image") == picture),
             "the picture must read back as a picture: {images:?}"
+        );
+    }
+
+    /// A picture the caller sizes past the page's text column is drawn where it was
+    /// named and the answer says it reaches past the page, as the slide and PDF arms
+    /// do; a picture whose size the call leaves unnamed is fitted whole into that
+    /// column and owes no note.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn docx_edit_names_a_picture_placed_past_the_page() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = docx_body_fixture(&ws, "picture-page", ANCHORS_BODY).await;
+        std::fs::write(ws.as_path().join("tall.png"), noisy_png(40, 1200)).expect("write picture");
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "past-page",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_image", "after": "FIRST-ANCHOR", "image": "tall.png",
+                            "width": 600 }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("reaches past the page"),
+            "a picture drawn past the page is not named: {reply}"
+        );
+
+        // A picture wider than the text column but not than the page — 500pt reaches
+        // into the margin and stops short of the page's edge — is on the page, and
+        // the answer must not name it as past it.
+        let wide = ws.as_path().join("wide.png");
+        std::fs::write(&wide, noisy_png(1200, 600)).expect("write picture");
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "into-margin",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_image", "after": "FIRST-ANCHOR", "image": "wide.png",
+                            "width": 500 }],
+            }),
+        )
+        .await;
+        assert!(
+            !reply.contains("reaches past the page"),
+            "a picture that fits the page is named as past it: {reply}"
+        );
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert_eq!(
+            element_named(&body, "wp:extent"),
+            r#"<wp:extent cx="6350000" cy="3175000"/>"#,
+            "a named width is not the width drawn"
+        );
+
+        // An unnamed size is the picture's own, fitted into the text column: the
+        // 1200px-tall picture is drawn shorter than the page itself, and the answer
+        // owes no note for it.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "fitted",
+                "path": source.to_string_lossy(),
+                "edits": [{ "op": "add_image", "after": "FIRST-ANCHOR", "image": "tall.png" }],
+            }),
+        )
+        .await;
+        assert!(
+            !reply.contains("reaches past the page"),
+            "a picture fitted into the page is named as past it: {reply}"
+        );
+        let body = part_text(&single(&reply), "word/document.xml");
+        let extent = element_named(&body, "wp:extent");
+        let cy = attribute_of(extent, "cy")
+            .parse::<u64>()
+            .expect("an EMU side");
+        assert!(
+            cy < 9_144_000,
+            "an unsized picture is not fitted into the page: {extent}"
         );
     }
 
@@ -20696,6 +21628,13 @@ mod tests {
                  missing as a whole number from:\n{description}\n{schema}"
             );
         }
+        // The default deck's size is text the model reads rather than a number
+        // inside a sentence, so the whole-number guard above would not cover it.
+        let default_deck = RULES.pptx_default_size.inches();
+        assert!(
+            description.contains(&default_deck),
+            "the description does not state the default deck's size {default_deck:?}:\n{description}"
+        );
         // A slide mark is not a number, so the whole-number guard above would
         // assert nothing for it: what the description owes the model is to name
         // the mark the reader prints — every one of them, for either family, from
@@ -20713,6 +21652,7 @@ mod tests {
             .chain(RULES.cell_alignments.iter().map(String::as_str))
             .chain(RULES.cell_verticals.iter().map(String::as_str))
             .chain(RULES.cell_border_sides.iter().map(String::as_str))
+            .chain(RULES.pptx_sizes.iter().map(|size| size.name.as_str()))
         {
             assert!(
                 description.contains(word) || schema.contains(word),
@@ -20752,8 +21692,8 @@ mod tests {
     /// the path-access variant this test builds, and the description and the
     /// serialized schema together. Adding to the contract re-records both here, so
     /// growth is a decision made in this test rather than a drift.
-    const BASELINE_DESCRIPTION: usize = 7_218;
-    const BASELINE_TOTAL: usize = 28_915;
+    const BASELINE_DESCRIPTION: usize = 7_963;
+    const BASELINE_TOTAL: usize = 30_437;
 
     /// The whole per-action contract is one compact value: every action has an
     /// entry, each entry declares exactly the arguments that action takes (and the
