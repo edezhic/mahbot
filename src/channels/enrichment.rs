@@ -680,22 +680,8 @@ async fn extracted_text_annotation(
     if char_count <= INLINE_TEXT_MAX_CHARS {
         return format!("[File {name}: extracted text follows]\n\n{text}");
     }
-    let spilled = async {
-        let spill_name = format!("{}.extracted.txt", crate::util::name_stem(name));
-        let (mut file, path) = crate::util::create_unique_file(uploads_dir, &spill_name).await?;
-        match tokio::io::AsyncWriteExt::write_all(&mut file, text.as_bytes()).await {
-            Ok(()) => Ok::<_, std::io::Error>(path),
-            Err(e) => {
-                // The file was created before the write: a partial spill is not
-                // a workspace handle, so it goes rather than stay behind the
-                // note saying nothing was saved.
-                drop(file);
-                let _ = tokio::fs::remove_file(&path).await;
-                Err(e)
-            }
-        }
-    }
-    .await;
+    let spill_name = format!("{}.extracted.txt", crate::util::name_stem(name));
+    let spilled = crate::util::write_unique_file(uploads_dir, &spill_name, text.as_bytes()).await;
     let spill = match spilled {
         Ok(path) => path,
         Err(e) => {

@@ -68,9 +68,12 @@ use std::sync::OnceLock;
 /// a prompt asset (see the module docs).
 const KIT_SCRIPT: &[u8] = include_bytes!("../assets/docgen/document-kit.js");
 
-/// The Cyrillic-covering PDF text font the kit embeds into the PDFs it writes
-/// or annotates (see `assets/docgen/NotoSans-LICENSE.txt`).
-const KIT_PDF_FONT: &[u8] = include_bytes!("../assets/docgen/NotoSans-Regular.ttf");
+/// The Cyrillic-covering general-text font the product ships (see
+/// `assets/docgen/NotoSans-LICENSE.txt`): the kit embeds it into the PDFs it
+/// writes or annotates, and the vector rasterizer answers text that names no
+/// family — or one the machine cannot supply — with it
+/// (see [`crate::tools::vector_rasterize`]).
+pub(crate) const TEXT_FONT_DATA: &[u8] = include_bytes!("../assets/docgen/NotoSans-Regular.ttf");
 
 /// The shared statement of the input rules, the bounds and the marks the document
 /// readers print: one file rather than a copy per side, read by the document kit,
@@ -476,7 +479,7 @@ async fn kit_directory() -> Result<&'static Path> {
 fn content_version() -> String {
     let mut hasher = Sha256::new();
     hasher.update(KIT_SCRIPT);
-    hasher.update(KIT_PDF_FONT);
+    hasher.update(TEXT_FONT_DATA);
     let hex = crate::util::hex_string(&hasher.finalize());
     hex[..KIT_HASH_BYTES * 2].to_string()
 }
@@ -485,7 +488,7 @@ fn content_version() -> String {
 async fn materialize(dir: &Path) -> std::io::Result<()> {
     tokio::fs::create_dir_all(dir).await?;
     write_if_missing(&dir.join(KIT_SCRIPT_NAME), KIT_SCRIPT).await?;
-    write_if_missing(&dir.join(KIT_FONT_NAME), KIT_PDF_FONT).await
+    write_if_missing(&dir.join(KIT_FONT_NAME), TEXT_FONT_DATA).await
 }
 
 /// Drop what the kit directory should not keep: the scratch of a run that was

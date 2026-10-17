@@ -1406,6 +1406,13 @@ pub(crate) fn suffixed_name(name: &str, n: u32) -> String {
 /// The `create_new` open *is* the collision check: two concurrent callers must
 /// not pick the same free name, so a check-then-act probe would let them
 /// overwrite each other.
+///
+/// Whatever is written through the returned handle must be FLUSHED before the
+/// path is handed on ([`write_unique_file`] is this rule already obeyed): a
+/// `tokio::fs::File` reports a write complete once its last chunk has been handed
+/// to the blocking pool, so a caller that returns the path (to a delivery, a
+/// preview, a model, the next step of its own flow) can otherwise pass on a file
+/// that is still empty.
 pub(crate) async fn create_unique_file(
     dir: &Path,
     name: &str,
@@ -1424,6 +1431,29 @@ pub(crate) async fn create_unique_file(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Write `bytes` into a newly created unique file `dir`/`name` and answer its
+/// path — a complete file or nothing: a write that fails removes the reservation
+/// rather than leave a short file behind a path someone will be handed (see
+/// [`create_unique_file`] for why the flush is here).
+pub(crate) async fn write_unique_file(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> std::io::Result<PathBuf> {
+    let (mut file, path) = create_unique_file(dir, name).await?;
+    let written = async {
+        tokio::io::AsyncWriteExt::write_all(&mut file, bytes).await?;
+        tokio::io::AsyncWriteExt::flush(&mut file).await
+    }
+    .await;
+    if let Err(e) = written {
+        drop(file);
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(e);
+    }
+    Ok(path)
 }
 
 /// Strip ANSI escape sequences from a string.

@@ -471,6 +471,30 @@ pub(crate) async fn resolve_read_target(
     Ok(resolved_path)
 }
 
+/// Resolve a file a tool's own output refers to — a resource a drawing points
+/// at, a nested drawing — to a path that may be loaded, or `None` when it must
+/// not be loaded at all.
+///
+/// The same gate [`resolve_read_target`] puts in front of a read — on the
+/// spelling and on the canonical target — plus the two facts a read needs and a
+/// reference is held to just the same: a regular file (nothing else has a bounded
+/// read) and the caller's own size limit ([`super::MAX_FILE_SIZE_BYTES`]).
+///
+/// Synchronous, for a caller that resolves references while it renders rather
+/// than from an async task, and silent by design: a resource that fails any of
+/// this is refused by not being read, not by an error the caller has to handle.
+pub(crate) fn resolve_reference_target(
+    candidate: &Path,
+    workspace_root: &Path,
+    access: PathAccess,
+) -> Option<PathBuf> {
+    check_path_read_allowed(&candidate.to_string_lossy(), workspace_root, access).ok()?;
+    let resolved = crate::util::strip_verbatim_prefix(&std::fs::canonicalize(candidate).ok()?);
+    check_path_read_allowed(&resolved.to_string_lossy(), workspace_root, access).ok()?;
+    let meta = std::fs::metadata(&resolved).ok()?;
+    (meta.is_file() && meta.len() <= super::MAX_FILE_SIZE_BYTES).then_some(resolved)
+}
+
 /// Lexically normalize a path by resolving `.` and `..` components
 /// without filesystem access (no I/O).
 ///
@@ -2699,6 +2723,63 @@ mod tests {
         tokio::fs::create_dir(&ws_raw).await.unwrap();
         let ws = tokio::fs::canonicalize(&ws_raw).await.unwrap();
         (tmp, ws)
+    }
+
+    /// The reference gate a drawing's resources go through: the read boundary on
+    /// both spellings, and the two facts a read needs — a regular file, within the
+    /// caller's own size limit. Silent by design: a reference that fails any of it
+    /// is not read rather than refused.
+    #[tokio::test]
+    async fn resolve_reference_target_holds_the_read_rules() {
+        let (tmp, ws) = test_workspace().await;
+        let inside = ws.join("picture.png");
+        std::fs::write(&inside, b"a picture").unwrap();
+        let outside = tmp.path().join("outside.png");
+        std::fs::write(&outside, b"a picture").unwrap();
+        let directory = ws.join("nested");
+        std::fs::create_dir(&directory).unwrap();
+        let oversized = ws.join("huge.png");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(super::super::MAX_FILE_SIZE_BYTES + 1)
+            .unwrap();
+
+        let resolved = |candidate: &Path| {
+            resolve_reference_target(candidate, &ws, PathAccess::Workspace)
+                .and_then(|path| path.strip_prefix(&ws).ok().map(Path::to_path_buf))
+        };
+        assert_eq!(
+            resolved(&inside),
+            Some(Path::new("picture.png").to_path_buf()),
+            "a resource beside the caller's own workspace resolves"
+        );
+        assert!(
+            resolved(&outside).is_none(),
+            "a resource outside the boundary is not read"
+        );
+        // The platform's own links: a link out of the boundary is caught on the
+        // canonical target it was given up for.
+        #[cfg(unix)]
+        {
+            let escaped = ws.join("link.png");
+            std::os::unix::fs::symlink(&outside, &escaped).unwrap();
+            assert!(
+                resolved(&escaped).is_none(),
+                "a link out of the boundary is caught on its canonical target"
+            );
+        }
+        assert!(
+            resolved(&directory).is_none(),
+            "a directory is not a resource that can be read"
+        );
+        assert!(
+            resolved(&oversized).is_none(),
+            "a resource past the caller's size limit is not read"
+        );
+        assert!(
+            resolved(&ws.join("absent.png")).is_none(),
+            "a resource that is not there is not read"
+        );
     }
 
     #[tokio::test]

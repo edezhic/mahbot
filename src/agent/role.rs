@@ -279,8 +279,8 @@ use crate::tools::{
     CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, GetTicketTool,
     ImageGenTool, ListAlarmsTool, ListTicketsTool, MahbotConfigTool, MahbotDebugTool, ReadTool,
     RemoveAlarmTool, SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool,
-    SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
-    WorkspaceTool,
+    SleepTool, UpdateTicketTool, VectorRasterizeTool, VideoEditTool, VideoGenTool,
+    WebSearchBackend, WebSearchTool, WorkspaceTool,
 };
 
 impl Role {
@@ -365,6 +365,10 @@ impl Role {
             Box::new(ImageGenTool),
             Box::new(VideoGenTool),
             Box::new(VideoEditTool),
+            // Likewise, the vector-file action serves every account: it reads the
+            // drawing — and every resource the drawing refers to — under the
+            // caller's own access, and writes into that caller's workspace.
+            Box::new(VectorRasterizeTool::new(file_access)),
             // Likewise, the document tool serves every account: an agent's
             // own call keeps its outputs inside that agent's workspace, and
             // its input paths follow the caller's access.

@@ -3067,7 +3067,9 @@ fn inherited_env_value(name: &str) -> Option<String> {
 /// platform's own tools and temp variables are named only in the selected
 /// fragment, since one shared file would push one platform's spellings at the
 /// other's sessions (the same reason `crate::temp`'s temp-cleanup renderer
-/// selects its tool block).
+/// selects its tool block). The producing families are substituted too: the words
+/// come from the CLI registry ([`crate::cli::producing_families`]), so the banner
+/// cannot name a family the registry does not carry or miss one it does.
 fn render_readonly_banner() -> String {
     let platform_checks = crate::prompt::load_prompt(match SHELL_PLATFORM {
         ShellPlatform::Windows => "tool/shell_readonly_banner_windows.md",
@@ -3080,6 +3082,7 @@ fn render_readonly_banner() -> String {
         &[
             ("{{temp_root}}", &crate::temp::shell_tmpdir()),
             ("{{platform_checks}}", &platform_checks),
+            ("{{producing_families}}", &crate::cli::producing_families()),
         ],
     )
 }
@@ -7352,7 +7355,12 @@ mod tests {
         for (skeleton, keys, fragments) in [
             (
                 "tool/shell_readonly_banner.md",
-                ["{{temp_root}}", "{{platform_checks}}"].as_slice(),
+                [
+                    "{{temp_root}}",
+                    "{{platform_checks}}",
+                    "{{producing_families}}",
+                ]
+                .as_slice(),
                 [
                     "tool/shell_readonly_banner_unix.md",
                     "tool/shell_readonly_banner_windows.md",
@@ -7431,6 +7439,22 @@ mod tests {
             !leftover[1].contains("{{"),
             "the note lead carries an unrendered key: {}",
             leftover[1]
+        );
+    }
+
+    /// The banner names the producing families as the CLI registry derives them,
+    /// so it cannot go stale the way a hand-written list did: a family whose
+    /// operations make files is named, and refused, without an edit here.
+    #[test]
+    fn the_readonly_banner_names_the_producing_families_from_the_registry() {
+        let families = crate::cli::producing_families();
+        assert!(
+            families.contains("`vector`"),
+            "the banner's own case: {families}"
+        );
+        assert!(
+            render_readonly_banner().contains(&families),
+            "the banner names the producing families: {families}"
         );
     }
 

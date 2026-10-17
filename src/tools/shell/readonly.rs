@@ -907,16 +907,15 @@ const PRODUCT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
 /// `mahbot` means the product itself. Its other command lines change it, drive
 /// it or restart it: its `mahbot config …` / `mahbot workspace …` families carry
 /// the owner's own configuration and workspace authority, `mahbot send …`
-/// dispatches the very agents the owner's own dispatch tool reaches, and
-/// `mahbot document …` / `mahbot image …` / `mahbot video …` run the assistant's
-/// own document, picture and video tools, making files with the owner's own
-/// account (a picture or a video paid for through his provider account, a
-/// document written where the caller says) — the authority the roles holding
-/// those tools already have — so a read-only shell must not be a way around
-/// those roles' permissions. `second` is the word right
-/// after the verb (the only place a subcommand can stand; scanning the list
-/// instead would admit `mahbot foo debug`), `None` for a bare `mahbot`, which is
-/// a daemon launch and is refused with the rest.
+/// dispatches the very agents the owner's own dispatch tool reaches, and the
+/// producing families ([`crate::cli::producing_families`]) run the assistant's
+/// own tools for them, making files with the owner's own account (a picture or a
+/// video paid for through his provider account, a document written where the
+/// caller says) — the authority the roles holding those tools already have — so a
+/// read-only shell must not be a way around those roles' permissions. `second` is
+/// the word right after the verb (the only place a subcommand can stand; scanning
+/// the list instead would admit `mahbot foo debug`), `None` for a bare `mahbot`,
+/// which is a daemon launch and is refused with the rest.
 ///
 /// `mahbot chrome …` is refused with those, deliberately: the CLI drives and
 /// stops sessions in the LIVE daemon by name, while the chrome tool a role
@@ -942,6 +941,7 @@ fn check_product_segment(segment: &str, second: Option<&str>) -> Result<(), Stri
         || format!("`{PRODUCT_BINARY}`"),
         |word| format!("`{PRODUCT_BINARY} {word}`"),
     );
+    let producing = crate::cli::producing_families();
     reject(
         segment,
         &format!(
@@ -949,9 +949,9 @@ fn check_product_segment(segment: &str, second: Option<&str>) -> Result<(), Stri
              Its other command lines change the product, drive it or restart it: its \
              `config`/`workspace` families carry the owner's own configuration and workspace \
              authority, its `send` family dispatches the agents its dispatch tool reaches, and \
-             its `document`/`image`/`video` families run the assistant's own document, picture \
-             and video tools, making files with the owner's own account (a picture or a video \
-             paid for through his provider account, a document written where the caller says) — \
+             its {producing} families run the assistant's own producing tools, making files with \
+             the owner's own account (a picture or a video paid for through his provider account, \
+             a document written where the caller says) — \
              the same authority the roles holding those tools already have, so a read-only shell \
              must not be a way around them."
         ),
@@ -6767,12 +6767,12 @@ mod tests {
 
     /// The product's own binary is judged by its own rule: only its read-only
     /// second words run, everything else — a daemon launch, the chrome frontend,
-    /// the configuration/workspace/send/document/image/video families, a bench
-    /// binary — is refused. The second word is read POSITIONALLY, so `mahbot foo
-    /// debug` is a refusal too, and the comparison is case-sensitive on every
-    /// platform (the binary compares its own `argv[1]` the same way, so `mahbot
-    /// DEBUG` launches the daemon rather than querying). The path-spelled row is
-    /// the spelling this shell's own grep rewrite carries, so it must keep
+    /// the configuration, workspace and producing families, a
+    /// bench binary — is refused. The second word is read POSITIONALLY, so
+    /// `mahbot foo debug` is a refusal too, and the comparison is case-sensitive
+    /// on every platform (the binary compares its own `argv[1]` the same way, so
+    /// `mahbot DEBUG` launches the daemon rather than querying). The path-spelled
+    /// row is the spelling this shell's own grep rewrite carries, so it must keep
     /// working.
     #[cfg(unix)]
     #[test]
@@ -6794,9 +6794,9 @@ mod tests {
             // The speech command is refused with the rest: `speak` writes a file at
             // a path the caller names, and the whole family stays out of this mode.
             ("mahbot audio speak --text hi --output /tmp/x.wav", false),
-            // The document/picture/video families are refused with them: they run
-            // the assistant's own tools, making files with the owner's account and
-            // putting them where the caller names.
+            // The document/picture/video/vector families are refused with them:
+            // they run the assistant's own tools, making files with the owner's
+            // account and putting them where the caller names.
             (
                 "mahbot document create --format pdf --output-dir /tmp",
                 false,
@@ -6807,6 +6807,7 @@ mod tests {
                 "mahbot video edit --video-url /tmp/x.mp4 --instruction restyle it",
                 false,
             ),
+            ("mahbot vector rasterize --path /tmp/x.svg", false),
             ("mahbot DEBUG", false),     // a daemon launch, not `debug`
             ("mahbot foo debug", false), // the verb's own next word is the one read
             ("mahbot -V", true),

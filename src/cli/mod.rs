@@ -6,11 +6,12 @@
 //! agent's assistant calls — the same validation, and for the setting families
 //! the same immediate effect on the live product (a `send` hands its message to
 //! an agent, one-way, and the answer arrives in the owner's own assistant
-//! conversation). `mahbot document …`, `mahbot image …` and `mahbot video …` do
-//! the same for the product's producing tools — the document tool, the picture
-//! tool and the two video tools — so a script reaches a document or a PDF, a
-//! picture and a clip with the very operations the assistant has, the same
-//! values, limits and mutual exclusions, and the account's own model choice. The
+//! conversation). `mahbot document …`, `mahbot image …`, `mahbot video …` and
+//! `mahbot vector …` do the same for the product's producing tools — the
+//! document tool, the picture tool, the two video tools and the vector
+//! rasterizer — so a script reaches a document or a PDF, a picture, a clip and a
+//! rendered vector with the very operations the assistant has, the same values,
+//! limits and mutual exclusions, and the account's own model choice. The
 //! frontend never opens or writes a store itself, so there is no second writer
 //! and no second copy of any rule.
 //!
@@ -86,6 +87,9 @@ Usage:
   mahbot video <gen|edit> [flags]
                          Produce or edit a clip with the RUNNING product's video
                          tools
+  mahbot vector rasterize [flags]
+                         Render a vector file into an ordinary picture with the
+                         RUNNING product's rasterizer
 
 Options:
   -h, --help             Print this help and exit
@@ -491,10 +495,11 @@ impl FlagKind {
 }
 
 /// The command lines this file fronts: the admin Assistant's own toolset — the
-/// tools its `config`, `workspace`, `send`, `document`, `image_gen`, `video_gen`
-/// and `video_edit` command lines carry. Nothing else the owner holds is
-/// reachable through the channel (the instance serves a tool by name only when a
-/// family below fronts it).
+/// tools each family's `tools` names. Nothing else the owner holds is reachable
+/// through the channel (the instance serves a tool by name only when a family
+/// below fronts it). Where the words are named elsewhere they are derived from
+/// here — [`family_words`] for the whole set, [`producing_families`] for the
+/// families that make files — so no surface keeps a list of its own to go stale.
 pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "config",
@@ -865,9 +870,9 @@ pub(crate) const FAMILIES: &[Family] = &[
             },
         ]),
     },
-    // ── The producing families: documents, pictures and video ─────────
+    // ── The producing families: documents, pictures, video and vectors ─────
     //
-    // These three front the tools every Assistant holds regardless of its
+    // These families front the tools every Assistant holds regardless of its
     // account (the media models they use resolve per-user), so the command line
     // reaches exactly what the owner's own assistant can already produce — the
     // same operations, the same values, the same limits and the same mutual
@@ -1078,7 +1083,29 @@ pub(crate) const FAMILIES: &[Family] = &[
             },
         ]),
     },
+    Family {
+        word: "vector",
+        tools: &["vector_rasterize"],
+        protocol: crate::db::ipc::CALL_STORE,
+        purpose: "Turn a vector file into an ordinary picture with the running product's own \
+                  rasterizer",
+        surface: Surface::Operations(&[Operation {
+            tool: "vector_rasterize",
+            action: None,
+            purpose: "Render an SVG file into a PNG picture",
+            flags: &[VECTOR_PATH_FLAG, OUTPUT_DIR_FLAG],
+        }]),
+    },
 ];
+
+/// The rasterizer's `path` argument: the vector file to render.
+const VECTOR_PATH_FLAG: Flag = Flag {
+    arg: "path",
+    kind: FlagKind::Path,
+    secret: false,
+    purpose: "The vector file to render (an SVG today) — resolved where this command runs, and \
+              read with the owner's own authority",
+};
 
 /// The destination flag every producing family's operation carries: the command
 /// line's OWN operand, the one flag no tool reads (see
@@ -1499,6 +1526,19 @@ fn family_tools() -> impl Iterator<Item = &'static str> {
 /// The family words, in the order the top-level help lists them.
 pub(crate) fn family_words() -> impl Iterator<Item = &'static str> {
     FAMILIES.iter().map(|family| family.word)
+}
+
+/// The family words that make files ([`produces_files`]), as the read-only
+/// surfaces name them: backticked, joined by a slash (`document`/`image`/`video`/
+/// `vector`). Written here alone, so a family added to the registry is named — and
+/// refused — by every one of them without an edit, and none can go stale.
+pub(crate) fn producing_families() -> String {
+    FAMILIES
+        .iter()
+        .filter(|family| produces_files(family))
+        .map(|family| format!("`{}`", family.word))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // ── Parsing ───────────────────────────────────────────────────────
@@ -3202,7 +3242,7 @@ mod tests {
             .collect();
         assert_eq!(
             current,
-            vec!["send", "document", "image", "video"],
+            vec!["send", "document", "image", "video", "vector"],
             "the families this build adds"
         );
     }

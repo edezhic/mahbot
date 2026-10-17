@@ -634,8 +634,15 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
 /// document produces hundreds of near-identical records. The crate is held to ERROR
 /// for that reason — a genuine parse failure is still recorded, everything quieter is
 /// not.
+///
+/// `usvg`/`resvg` are the vector renderer behind the `vector_rasterize` tool. It
+/// complains per input — an unmatched font family, a reference it could not
+/// resolve, a span it had to fall back for — which is library noise about one
+/// caller's file rather than anything the product did or the owner must see. The
+/// quieter library levels are off entirely; a real refusal reaches the caller as
+/// that tool's own answer.
 pub(crate) const DEFAULT_LOG_FILTER: &str =
-    "info,turso_core=warn,tantivy=warn,fff=off,pdf_extract=error";
+    "info,turso_core=warn,tantivy=warn,fff=off,pdf_extract=error,usvg=off,resvg=off";
 
 /// The production layer stack: the JSON log layer, with the log filter applied
 /// PER LAYER, plus the engine-cause capture layer (see

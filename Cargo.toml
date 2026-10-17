@@ -184,7 +184,9 @@ candle-core = "0.11.0"
 # Image decode/re-encode for reference-image compression (already compiled via
 # iced's image-without-codecs feature; promoted to a direct dependency for the
 # loader). Codec support is deliberately trimmed to PNG/JPEG/WebP only — gif
-# and bmp are NOT supported anywhere (routing, MIME mapping, decode).
+# and bmp are NOT supported anywhere in the product's own routing, MIME mapping
+# or decode (the vector rasterizer decodes what a drawing embeds, through its own
+# renderer's codecs, and produces none of them).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # Tree-sitter for code navigation
@@ -210,6 +212,27 @@ tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 # Promoted from candle's transitive dep (the exact major is already in the lock).
 # Also the container format for `.docx` ingestion.
 zip = { version = "8", default-features = false, features = ["deflate"] }
+
+# Vector rendering: a vector file in, an ordinary picture out
+# (src/tools/vector_rasterize.rs). Pure Rust and in-process — no browser, no
+# rendering service, nothing to configure or download — so the single
+# self-contained binary holds.
+#   text           — draw `<text>` instead of dropping it: the engine lays it out
+#                    with the faces the machine has (`system-fonts` finds them,
+#                    `memmap-fonts` maps rather than reads them) and the product's
+#                    own bundled font answers what they cannot (see the tool).
+#   raster-images  — decode the rasters a drawing refers to. It brings the `gif`,
+#                    `image-webp` and `zune-jpeg` decoders along, inside the
+#                    renderer only: the product's own decode path (`image`) still
+#                    accepts PNG/JPEG/WebP alone.
+# The engine's `svgz` feature is deliberately NOT enabled: the tool unwraps a
+# compressed input itself, bounded by the same limit as any other input, where
+# the engine's own path reads a whole stream into memory with no bound.
+# The engine carries its own rasterizer and font database, so the graph holds a
+# second copy of each next to the ones iced already links (`tiny-skia` 0.12 /
+# `tiny-skia-path` 0.12 alongside 0.11, `fontdb` 0.24 alongside 0.23): both
+# small, both self-contained, neither shared with the dashboard's own stack.
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 
 # Document ingestion (inbound [FILE:...] markers and documents opened with the
 # read tool): pure-Rust text extraction and page rasterization for .pdf, plus a

@@ -39,6 +39,7 @@ pub(crate) mod send;
 pub(crate) mod shell;
 pub(crate) mod sleep;
 pub(crate) mod ticket;
+pub(crate) mod vector_rasterize;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;
@@ -207,6 +208,7 @@ pub(crate) use sleep::SleepTool;
 pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };
+pub(crate) use vector_rasterize::VectorRasterizeTool;
 pub(crate) use video_edit::VideoEditTool;
 pub(crate) use video_gen::VideoGenTool;
 pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
@@ -1815,13 +1817,13 @@ pub(crate) async fn resolve_local_media_path(
 /// ([`output_directory`]: the workspace's `generated/` for every caller but a
 /// command-line call, which names its destination), naming the file
 /// `{prefix}_{timestamp}.{ext}` and reserving a free name so a file already
-/// there is never overwritten (see [`crate::util::create_unique_file`]).
+/// there is never overwritten (see [`crate::util::write_unique_file`]).
 ///
 /// Creates the directory if needed, writes the file, and returns the full
-/// `PathBuf`. The bytes are content-sniffed and stripped (`util::provenance`) on
-/// the way out, so the single written file is what the GUI preview, the Telegram
-/// delivery and the model-context payload all consume; non-image outputs pass
-/// through untouched.
+/// `PathBuf` naming a COMPLETE file. The bytes are content-sniffed and stripped
+/// (`util::provenance`) on the way out, so the single written file is what the GUI
+/// preview, the Telegram delivery and the model-context payload all consume;
+/// non-image outputs pass through untouched.
 ///
 /// # Security note
 /// This function deliberately bypasses path security (no `resolve_write_target`
@@ -1846,27 +1848,19 @@ async fn save_generated_file(
         })?;
 
     let timestamp = crate::util::unix_millis();
-    let (mut file, output_path) =
-        crate::util::create_unique_file(&generated_dir, &format!("{prefix}_{timestamp}.{ext}"))
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to reserve a generated file in {}",
-                    generated_dir.display()
-                )
-            })?;
-
     let stripped = crate::util::provenance::strip_image_provenance(bytes);
-    // Write through the handle the reservation returned: the `create_new` open
-    // that picked the name is the only collision check there is.
-    tokio::io::AsyncWriteExt::write_all(&mut file, stripped.as_ref())
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to write generated file to {}",
-                output_path.display()
-            )
-        })?;
+    let output_path = crate::util::write_unique_file(
+        &generated_dir,
+        &format!("{prefix}_{timestamp}.{ext}"),
+        stripped.as_ref(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to write a generated file into {}",
+            generated_dir.display()
+        )
+    })?;
 
     if matches!(stripped, Cow::Owned(_)) {
         // Debug: one record per generated image — the strip running is the normal
@@ -2297,13 +2291,17 @@ mod tests {
     // ── media_marker coverage ────────────────────────────────────────
     fn all_media_tools_implement_media_marker() {
         // Each media-generation tool must return Some from media_marker()
-        let tools: [(&str, Box<dyn Tool>); 4] = [
+        let tools: [(&str, Box<dyn Tool>); 5] = [
             ("ImageGenTool", Box::new(ImageGenTool)),
             ("VideoGenTool", Box::new(VideoGenTool)),
             ("VideoEditTool", Box::new(VideoEditTool)),
             (
                 "DocumentTool",
                 Box::new(DocumentTool::new(path::PathAccess::Workspace)),
+            ),
+            (
+                "VectorRasterizeTool",
+                Box::new(VectorRasterizeTool::new(path::PathAccess::Workspace)),
             ),
         ];
         for (name, tool) in &tools {

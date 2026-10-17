@@ -594,4 +594,64 @@ mod tests {
             filled.answer
         );
     }
+
+    /// The rasterizer's own command line, end to end through the instance: the
+    /// family's tool is the one served by name, the file the caller named is the
+    /// one rendered, and the picture lands in the DESTINATION the caller chose —
+    /// never in the agent's own generated tree.
+    #[tokio::test]
+    async fn execute_renders_a_vector_file_into_the_destination_the_caller_chose() {
+        crate::util::test::init_test_stores().await;
+        crate::cli::mark_ready();
+
+        let destination = crate::util::test::test_root().join("cli-vector");
+        let _ = tokio::fs::remove_dir_all(&destination).await;
+        tokio::fs::create_dir_all(&destination)
+            .await
+            .expect("a destination of the caller's own");
+        let drawing = destination.join("drawing.svg");
+        tokio::fs::write(
+            &drawing,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8">
+               <rect width="12" height="8" fill="#ff0000"/></svg>"##,
+        )
+        .await
+        .expect("a drawing at hand");
+
+        let reply = execute(CallRequest {
+            tool: "vector_rasterize".to_string(),
+            args: serde_json::json!({ "path": drawing.to_string_lossy() }),
+            secrets: Vec::new(),
+            output_dir: Some(destination.to_string_lossy().into_owned()),
+        })
+        .await;
+        assert_eq!(reply.outcome, CallOutcome::Done, "answer: {}", reply.answer);
+
+        let picture = std::path::PathBuf::from(
+            reply
+                .answer
+                .strip_prefix("[IMAGE:")
+                .and_then(|marker| marker.split(']').next())
+                .unwrap_or_else(|| panic!("the answer carries the marker: {}", reply.answer)),
+        );
+        assert!(picture.is_absolute(), "{}", picture.display());
+        assert_eq!(picture.parent(), Some(destination.as_path()));
+        // A picture, not merely a file: the magic PNG carries.
+        assert_eq!(
+            tokio::fs::read(&picture)
+                .await
+                .expect("the picture is there")[..8],
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+        assert!(
+            tokio::fs::metadata(
+                crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME)
+                    .join("generated")
+                    .join(picture.file_name().expect("the picture has a name"))
+            )
+            .await
+            .is_err(),
+            "a command-line call must not write into the agent's own generated directory"
+        );
+    }
 }

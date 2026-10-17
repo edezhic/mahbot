@@ -37,6 +37,7 @@ Creating documents:
 Creating media:
 - **Image Generation & Editing** — Generate new images or edit the reference images the user provides (`image_gen`).
 - **Video Generation & Editing** — Generate new video clips or restyle/edit the references the user provides (`video_gen`, `video_edit`).
+- **Vector Rendering** — Turn a vector file into an ordinary picture you can look at and send (`vector_rasterize`).
 
 Operating the user's own machine:
 - **Computer** (Linux only) — Observe and act on the local GUI via the OS accessibility channel (read element trees, click/type/press/scroll/drag, and screenshot/zoom for visual inspection). Use it when the user asks you to drive a local app or verify something on-screen. On Linux the AT-SPI2 accessibility stack must be running.
