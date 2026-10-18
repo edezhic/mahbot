@@ -1772,10 +1772,12 @@ pub(crate) fn unquote_c_style(raw: &str) -> Option<String> {
 /// - `\4`–`\7` followed by a digit (git rejects these as invalid octal prefixes)
 ///
 /// Non-UTF-8 bytes produced by octal escapes are handled via
-/// `String::from_utf8_lossy` — pragmatic for macOS where non-UTF-8 paths
-/// are filesystem-impossible.
+/// `String::from_utf8_lossy` on the assembled byte sequence — pragmatic for
+/// macOS where non-UTF-8 paths are filesystem-impossible. Decoding the whole
+/// sequence (not each escaped byte) keeps multi-byte characters intact, e.g.
+/// `caf\303\251.txt` → `café.txt`.
 fn unescape_c_style(input: &str) -> Option<String> {
-    let mut result = String::with_capacity(input.len());
+    let mut result = Vec::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i: usize = 0;
 
@@ -1790,15 +1792,15 @@ fn unescape_c_style(input: &str) -> Option<String> {
                 return None;
             }
             match bytes[i] {
-                b'"' => result.push('"'),
-                b'\\' => result.push('\\'),
-                b't' => result.push('\t'),
-                b'n' => result.push('\n'),
-                b'a' => result.push('\x07'),
-                b'b' => result.push('\x08'),
-                b'f' => result.push('\x0c'),
-                b'r' => result.push('\r'),
-                b'v' => result.push('\x0b'),
+                b'"' => result.push(b'"'),
+                b'\\' => result.push(b'\\'),
+                b't' => result.push(b'\t'),
+                b'n' => result.push(b'\n'),
+                b'a' => result.push(0x07),
+                b'b' => result.push(0x08),
+                b'f' => result.push(0x0c),
+                b'r' => result.push(b'\r'),
+                b'v' => result.push(0x0b),
                 b'0'..=b'3' => {
                     // Octal escape: 1–3 octal digits. The 0–7 range check
                     // leaves '8'/'9' unconsumed so they emit as literal digits
@@ -1818,7 +1820,7 @@ fn unescape_c_style(input: &str) -> Option<String> {
                         );
                         return None;
                     };
-                    result.push_str(&String::from_utf8_lossy(&[byte_val]));
+                    result.push(byte_val);
                     continue; // skip the i += 1 at end of loop
                 }
                 b'4'..=b'7' => {
@@ -1833,7 +1835,7 @@ fn unescape_c_style(input: &str) -> Option<String> {
                         return None;
                     }
                     // Otherwise: literal digit (backslash consumed, no special meaning).
-                    result.push(bytes[i] as char);
+                    result.push(bytes[i]);
                 }
                 _ => {
                     tracing::warn!(
@@ -1845,12 +1847,12 @@ fn unescape_c_style(input: &str) -> Option<String> {
                 }
             }
         } else {
-            result.push(bytes[i] as char);
+            result.push(bytes[i]);
         }
         i += 1;
     }
 
-    Some(result)
+    Some(String::from_utf8_lossy(&result).into_owned())
 }
 
 #[cfg(test)]
@@ -2330,6 +2332,9 @@ mod unescape_c_style_tests {
             (r"\12\37", Some("\n\x1f")),
             // \101 → 'A' (0x41), \377 → 0xff → U+FFFD (from_utf8_lossy replacement)
             (r"\101\377", Some("A\u{FFFD}")),
+            // A multi-byte UTF-8 sequence is reassembled, not lossied per byte:
+            // git quotes non-ASCII paths this way by default.
+            (r"caf\303\251.txt", Some("café.txt")),
             // Octal stops at non-octal-digit: \12x → newline + 'x'
             (r"\12x", Some("\nx")),
             // \18 → \1 (SOH, 0x01) then '8' (8 is not an octal digit)

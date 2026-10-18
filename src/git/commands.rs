@@ -45,11 +45,9 @@ impl CommitInfo {
 /// placeholder instead of reading them.
 pub(crate) const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
 
-/// Cap on the number of collapsed untracked directories enumerated per
-/// [`run_git_worktree_snapshot`] refresh.
-const MAX_UNTRACKED_DIRS_ENUMERATED: usize = 10;
 /// Cap on the total number of untracked files classified (line-counted or
 /// oversized/binary-detected) per [`run_git_worktree_snapshot`] refresh.
+/// Files beyond the cap are counted in [`DiffStats::omitted_file_count`].
 const MAX_UNTRACKED_FILES_COUNTED: usize = 500;
 /// Cap on the total bytes read from untracked files per
 /// [`run_git_worktree_snapshot`] refresh.
@@ -67,11 +65,10 @@ pub(crate) enum UntrackedFileRead {
     Skip,
 }
 
-/// Classify an in-memory untracked-file buffer (size already confirmed ≤ the
-/// caller's limit). Returns `None` for binary (a null byte, or invalid UTF-8
-/// without a null byte), or the UTF-8 text otherwise. Shared by
-/// [`read_untracked_file`] and [`count_untracked_file`] so the
-/// null-byte/UTF-8 binary rule lives in one place.
+/// Classify an in-memory untracked-file buffer whose size already passed the
+/// [`MAX_UNTRACKED_SIZE`] gate. Returns `None` for binary (a null byte, or
+/// invalid UTF-8 without a null byte), or the UTF-8 text otherwise. The binary
+/// rule lives here so the snapshot and the diff window cannot disagree about it.
 fn classify_untracked_content(content: Vec<u8>) -> Option<String> {
     if content.contains(&0) {
         return None;
@@ -79,14 +76,14 @@ fn classify_untracked_content(content: Vec<u8>) -> Option<String> {
     String::from_utf8(content).ok()
 }
 
-pub(crate) async fn read_untracked_file(path: &Path, max_size: u64) -> UntrackedFileRead {
-    if !path.is_file() {
+/// Read and classify an untracked file whose metadata the caller already holds.
+/// [`read_untracked_file`] fetches it; the snapshot passes the one it already
+/// read for its byte budget, so neither stats twice.
+async fn read_untracked_file_with_meta(path: &Path, meta: &std::fs::Metadata) -> UntrackedFileRead {
+    if !meta.is_file() {
         return UntrackedFileRead::Skip;
     }
-    let Ok(meta) = tokio::fs::metadata(path).await else {
-        return UntrackedFileRead::Skip;
-    };
-    if meta.len() > max_size {
+    if meta.len() > MAX_UNTRACKED_SIZE {
         return UntrackedFileRead::TooLarge(meta.len());
     }
     let Ok(content) = tokio::fs::read(path).await else {
@@ -95,6 +92,17 @@ pub(crate) async fn read_untracked_file(path: &Path, max_size: u64) -> Untracked
     // Invalid UTF-8 without a null byte is still binary — never Skip, or the
     // GUI would silently drop the file instead of showing a placeholder.
     classify_untracked_content(content).map_or(UntrackedFileRead::Binary, UntrackedFileRead::Text)
+}
+
+/// Read and classify one untracked file for the diff window: fetch its
+/// metadata, then delegate to [`read_untracked_file_with_meta`] — the shared
+/// regular-file, size-gate, read and classification core that the snapshot's
+/// line counting also uses.
+pub(crate) async fn read_untracked_file(path: &Path) -> UntrackedFileRead {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return UntrackedFileRead::Skip;
+    };
+    read_untracked_file_with_meta(path, &meta).await
 }
 
 /// Whether to discard changes in a single file or an entire directory tree.
@@ -111,36 +119,67 @@ pub fn is_git_repo(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
-/// Run `git diff HEAD --no-color --find-renames` (when `commit_ref` is `None`)
-/// or `git show -m <commit_ref> --no-color --find-renames --format=""` (when `Some`).
+/// Run `git show -m <hash> --no-color --find-renames --format=` — the diff a
+/// historical commit introduced.
 ///
-/// `-m` splits merge commits into per-parent diffs, producing standard unified diff
-/// blocks that `parse_git_diff` can handle. This may produce duplicate file paths in the
-/// tree sidebar (one `diff --git` block per parent), which is expected — each parent
-/// comparison is a different diff.
-/// `--format=""` suppresses the commit log header.
-pub async fn run_git_diff(repo_path: &Path, commit_ref: Option<&str>) -> anyhow::Result<String> {
-    if let Some(hash) = commit_ref {
-        run_git_command(
-            repo_path,
-            &[
-                "show",
-                "-m",
-                hash,
-                "--no-color",
-                "--find-renames",
-                "--format=",
-            ],
-        )
-        .await
+/// `-m` splits merge commits into per-parent diffs, producing standard unified
+/// diff blocks that `parse_git_diff` can handle. This may produce duplicate file
+/// paths in the tree sidebar (one `diff --git` block per parent), which is
+/// expected — each parent comparison is a different diff. `--format=`
+/// suppresses the commit log header.
+pub(crate) async fn run_git_show_diff(repo_path: &Path, hash: &str) -> anyhow::Result<String> {
+    run_git_command(
+        repo_path,
+        &[
+            "show",
+            "-m",
+            hash,
+            "--no-color",
+            "--find-renames",
+            "--format=",
+        ],
+    )
+    .await
+}
+
+/// Run `git diff <base> --no-color --find-renames` against the working tree.
+///
+/// `base` is `HEAD`, or this repository's empty tree on an unborn HEAD (see
+/// [`run_git_empty_tree`]). `--find-renames` is explicit so rename detection
+/// matches [`run_git_worktree_numstat`] regardless of repository config.
+pub(crate) async fn run_git_worktree_diff(
+    repo_path: &Path,
+    unborn_head: bool,
+) -> anyhow::Result<String> {
+    let base = if unborn_head {
+        run_git_empty_tree(repo_path).await?
     } else {
-        run_git_command(repo_path, &["diff", "HEAD", "--no-color", "--find-renames"]).await
-    }
+        "HEAD".to_string()
+    };
+    run_git_command(repo_path, &["diff", &base, "--no-color", "--find-renames"]).await
 }
 
 /// Run `git status --porcelain` and return the output.
 pub async fn run_git_status(repo_path: &Path) -> anyhow::Result<String> {
     run_git_command(repo_path, &["status", "--porcelain"]).await
+}
+
+/// Run `git status --porcelain --untracked-files=all`.
+///
+/// `-uall` lists individual files inside untracked directories instead of the
+/// collapsed `dir/` entry, so one status reading names every untracked file the
+/// footer counts and the diff window displays. Paths are repo-root-relative.
+///
+/// This is the snapshot's one unbounded read: git walks every untracked
+/// directory, and every returned path is kept. The complete file set is the
+/// contract — a collapsed directory cannot be expanded without losing files —
+/// while the per-file content reads are capped by the `MAX_UNTRACKED_*` limits.
+async fn run_git_status_all(repo_path: &Path) -> anyhow::Result<String> {
+    run_git_command(
+        repo_path,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await
 }
 
 /// Run `git show HEAD:<path>` (when `commit_ref` is `None`)
@@ -269,6 +308,10 @@ async fn run_git_output_env(
         cmd.env(name, value);
     }
     cmd.args(args).current_dir(repo_path);
+    // Tokio's `output()` inherits stdin (unlike std's, which nulls it), and no
+    // git command here reads stdin; `hash-object --stdin` needs EOF, not a
+    // terminal. Null it so a command can never wait on the parent's input.
+    cmd.stdin(Stdio::null());
     cmd.output()
         .await
         .with_context(|| format!("Failed to run git {}", args.join(" ")))
@@ -450,14 +493,14 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<C
     let (lines_added, lines_removed) =
         if let Ok(stats) = parse_numstat(repo_path, &["HEAD~1..HEAD"]).await {
             stats
+        } else if let Ok(base) = run_git_empty_tree(repo_path).await {
+            // HEAD~1 doesn't exist (first commit) — diff against this
+            // repository's own empty tree.
+            parse_numstat(repo_path, &[&base, "HEAD"])
+                .await
+                .unwrap_or((0, 0))
         } else {
-            // HEAD~1 doesn't exist (first commit) — fall back to the empty tree hash.
-            parse_numstat(
-                repo_path,
-                &["4b825dc642cb6eb9a060e54bf8d69288fbee4904", "HEAD"],
-            )
-            .await
-            .unwrap_or((0, 0))
+            (0, 0)
         };
     Ok(CommitInfo {
         hash,
@@ -554,7 +597,7 @@ pub fn parse_numstat_lines(stdout: &str) -> Vec<NumstatEntry> {
 }
 
 /// Run `git diff --numstat <range...>` and return the per-file entries.
-/// Callers pass only the range (e.g. `&["HEAD"]` or `&["4b825d…", "HEAD"]`).
+/// Callers pass only the range (e.g. `&["HEAD"]` or `&["<empty-tree>", "HEAD"]`).
 async fn run_git_diff_numstat(
     repo_path: &Path,
     range: &[&str],
@@ -596,8 +639,18 @@ pub async fn git_is_installed() -> bool {
 }
 
 /// Check if a git repo has any commits (spawn/git failures count as `false`).
-pub async fn git_has_commits(repo_path: &Path) -> bool {
+async fn git_has_commits(repo_path: &Path) -> bool {
     run_git_head(repo_path).await.is_ok()
+}
+
+/// Print this repository's empty tree hash.
+///
+/// `git hash-object -t tree --stdin` reads EOF (the subprocess wrapper closes
+/// stdin) and prints the empty tree's hash, so the value follows the
+/// repository's object format (SHA-1 or SHA-256) instead of hardcoding SHA-1's
+/// `4b825d…`. Used as the base for an unborn HEAD.
+async fn run_git_empty_tree(repo_path: &Path) -> anyhow::Result<String> {
+    run_git_trimmed(repo_path, &["hash-object", "-t", "tree", "--stdin"]).await
 }
 
 /// Get the current branch name (e.g. `main`, `feature/xyz`).
@@ -1197,9 +1250,9 @@ async fn run_git_network(
 /// Aggregate working-tree diff statistics for the GUI footer.
 ///
 /// `added`/`removed` are the exact line counts used by the footer (+X / -Y)
-/// and by reviewer churn calibration. `huge_binary_file_count` counts
-/// oversized (> [`MAX_UNTRACKED_SIZE`]) and binary *untracked* files
-/// (top-level or inside a collapsed untracked directory). It is a separate
+/// and by reviewer churn calibration, summed from every file in
+/// [`GitWorktreeSnapshot::changes`]. `huge_binary_file_count` counts oversized
+/// (> [`MAX_UNTRACKED_SIZE`]) and binary *untracked* files. It is a separate
 /// indicator and is deliberately NOT folded into `added`/`removed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffStats {
@@ -1210,6 +1263,51 @@ pub struct DiffStats {
     /// Count of oversized/binary untracked files surfaced as a separate
     /// "N files" indicator, not line counts.
     pub huge_binary_file_count: usize,
+    /// Untracked files the bounded worktree read left out (both surfaces
+    /// render [`Self::omitted_note`] for this).
+    pub omitted_file_count: usize,
+}
+
+impl DiffStats {
+    /// The one description of what the bounded untracked read left out; both the
+    /// footer and the diff window render this exact note.
+    pub(crate) fn omitted_note(&self) -> Option<String> {
+        (self.omitted_file_count > 0).then(|| {
+            format!(
+                "{} uncommitted file{} left out (worktree read cap)",
+                self.omitted_file_count,
+                if self.omitted_file_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        })
+    }
+}
+
+/// How an untracked file was classified for display / line counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntrackedKind {
+    Text,
+    Binary,
+    TooLarge(u64),
+}
+
+/// One file in the settled uncommitted change set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeChange {
+    /// Path relative to the repository root (git reports root-relative paths,
+    /// even from a subdirectory workspace).
+    pub path: String,
+    /// Rename/copy source, when git detected one.
+    pub old_path: Option<String>,
+    /// Lines added; 0 when the content has no lines (binary, oversized).
+    pub added: i64,
+    /// Lines removed; 0 likewise.
+    pub removed: i64,
+    /// `Some` exactly when the file is untracked.
+    pub untracked: Option<UntrackedKind>,
 }
 
 /// Git file status for coloring the file tree.
@@ -1221,172 +1319,231 @@ pub enum GitFileStatus {
     Added,
 }
 
-/// Accumulator for untracked-file classification during a single
-/// [`run_git_worktree_snapshot`] refresh. Enforces the per-refresh work caps.
-#[derive(Default)]
-struct UntrackedAccumulator {
-    added: i64,
-    huge_binary_file_count: usize,
-    files_processed: usize,
-    bytes_read: u64,
-}
-
-impl UntrackedAccumulator {
-    /// Whether another untracked file may still be inspected this refresh.
-    fn can_process(&self) -> bool {
-        self.files_processed < MAX_UNTRACKED_FILES_COUNTED
-            && self.bytes_read < MAX_UNTRACKED_BYTES_READ
-    }
-}
-
-/// Count a single untracked file (or file enumerated inside a collapsed
-/// directory) toward the diff-stats accumulation.
+/// Run `git diff --numstat -z --find-renames <base>` and parse it into the
+/// tracked part of the change manifest.
 ///
-/// Oversized files are surfaced via `huge_binary_file_count` (metadata-only
-/// check, no bytes read). Normal-size files are read (bounded by
-/// [`MAX_UNTRACKED_BYTES_READ`]) and their line count added; binary /
-/// invalid-UTF-8 files increment `huge_binary_file_count` instead.
-/// Files beyond the per-refresh caps are skipped entirely (not line-counted
-/// and NOT added to the file-count) — a bounded limitation for a pathological
-/// very-large untracked tree.
-async fn count_untracked_file(repo_path: &Path, path: &str, accum: &mut UntrackedAccumulator) {
-    if !accum.can_process() {
-        return;
-    }
-    let full_path = repo_path.join(path);
-    if !full_path.is_file() {
-        return;
-    }
-    let Ok(meta) = tokio::fs::metadata(&full_path).await else {
-        return;
-    };
-    accum.files_processed += 1;
-    if meta.len() > MAX_UNTRACKED_SIZE {
-        accum.huge_binary_file_count += 1;
-        return;
-    }
-    if accum.bytes_read + meta.len() > MAX_UNTRACKED_BYTES_READ {
-        return;
-    }
-    let Ok(content) = tokio::fs::read(&full_path).await else {
-        return;
-    };
-    accum.bytes_read += content.len() as u64;
-    match classify_untracked_content(content) {
-        Some(text) => {
-            #[expect(clippy::cast_possible_wrap)]
-            let line_count = text.lines().count() as i64;
-            accum.added += line_count;
-        }
-        None => accum.huge_binary_file_count += 1,
-    }
-}
-
-/// Enumerate the (untracked) files inside a collapsed `?? dir/` porcelain
-/// entry with a git-scoped, gitignore-respecting listing.
-///
-/// Uses `git status --porcelain --untracked-files=all` scoped by a
-/// `:(literal)` pathspec so the directory path is never interpreted as a glob
-/// (names containing `*`/`?`/`:` match literally). `git` handles nesting,
-/// ignores, and symlinks — no manual filesystem walk.
-async fn enumerate_untracked_dir(repo_path: &Path, dir: &str) -> anyhow::Result<Vec<String>> {
-    let pathspec = format!(":(literal){dir}");
-    let out = run_git_command(
+/// `-z` keeps paths NUL-delimited and unquoted, so the returned paths are the
+/// raw repo-root-relative names.
+async fn run_git_worktree_numstat(
+    repo_path: &Path,
+    base: &str,
+) -> anyhow::Result<Vec<WorktreeChange>> {
+    let stdout = run_git_command(
         repo_path,
-        &[
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--",
-            &pathspec,
-        ],
+        &["diff", "--numstat", "-z", "--find-renames", base],
     )
     .await?;
-    Ok(parse_untracked_from_porcelain(&out))
+    Ok(parse_numstat_z(&stdout))
 }
 
-/// Working-tree snapshot: aggregate diff stats plus per-file porcelain
-/// statuses, from a single `git status --porcelain` + one numstat pass.
+/// Parse `git diff --numstat -z` output.
+///
+/// A normal record is `added\tremoved\t<path>\0`; a rename/copy record leaves
+/// the path field empty and follows it with `<old>\0<new>\0`. `-` (binary) counts
+/// as 0 lines. The trailing empty field after the final NUL is ignored.
+fn parse_numstat_z(stdout: &str) -> Vec<WorktreeChange> {
+    let mut fields = stdout.split('\0');
+    let mut result = Vec::new();
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let mut parts = field.splitn(3, '\t');
+        let added = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let removed = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let Some(path) = parts.next() else {
+            continue;
+        };
+        let (path, old_path) = if path.is_empty() {
+            let (Some(old), Some(new)) = (fields.next(), fields.next()) else {
+                break;
+            };
+            (new.to_string(), Some(old.to_string()))
+        } else {
+            (path.to_string(), None)
+        };
+        result.push(WorktreeChange {
+            path,
+            old_path,
+            added,
+            removed,
+            untracked: None,
+        });
+    }
+    result
+}
+
+/// Working-tree snapshot: aggregate diff stats, per-file porcelain statuses,
+/// and the settled change set, from one `git status --porcelain
+/// --untracked-files=all` reading plus one numstat pass.
 ///
 /// The statuses are the same map the editor's file-tree coloring uses (once
-/// forwarded by `GitState`), and the stats drive the footer (+N / -M) and
+/// forwarded by `GitState`); `changes` is what both the footer line counter and
+/// the diff window draw from; and the stats drive the footer (+N / -M) and
 /// reviewer churn calibration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitWorktreeSnapshot {
-    /// Aggregate line stats (tracked diff + line-counted untracked text).
+    /// Aggregate line stats, summed from [`Self::changes`].
     pub stats: DiffStats,
-    /// Per-file porcelain status, keyed by workspace-relative path.
+    /// Per-file porcelain status, keyed by the path exactly as git reports it
+    /// (repo-root-relative).
     pub file_statuses: HashMap<String, GitFileStatus>,
-    /// The repo has no commits (unborn HEAD): tracked stats are `(0, 0)` but
-    /// per-file statuses still flow. Consumers that predate the unborn-HEAD
+    /// The repo has no commits (unborn HEAD): tracked changes are measured
+    /// against the empty tree but `unborn_head` still tells churn consumers
+    /// there is no valid baseline. Consumers that predate the unborn-HEAD
     /// tolerance and must keep their old error semantics (reviewer churn)
     /// check this instead of treating the snapshot as a valid diff baseline.
     pub unborn_head: bool,
+    /// Every uncommitted file: tracked entries in numstat order, then untracked
+    /// files in status order.
+    pub changes: Vec<WorktreeChange>,
+    /// Repository top level; untracked status paths resolve against this.
+    pub repo_root: PathBuf,
+}
+
+/// A manifest entry for an untracked file. `added` is its line count (0 for
+/// content with no lines); an untracked file never removes lines.
+fn untracked_change(path: &str, kind: UntrackedKind, added: i64) -> WorktreeChange {
+    WorktreeChange {
+        path: path.to_owned(),
+        old_path: None,
+        added,
+        removed: 0,
+        untracked: Some(kind),
+    }
+}
+
+/// Classify each `??` status path into a [`WorktreeChange`], returning the
+/// changes and how many files the per-refresh caps left out.
+///
+/// `repo_root` resolves the root-relative status paths. Only regular files are
+/// classified; collapsed nested repositories (`dir/`) are already excluded by
+/// [`parse_untracked_from_porcelain`], so they never inflate the omitted tally.
+/// The metadata read here gates the byte budget *before* the content read; the
+/// read and its binary/text verdict are shared with the diff window through
+/// [`read_untracked_file_with_meta`], so the two cannot drift on what a file is.
+async fn classify_untracked_changes(
+    repo_root: &Path,
+    untracked: &[String],
+) -> (Vec<WorktreeChange>, usize) {
+    let mut changes = Vec::new();
+    let mut files_processed = 0usize;
+    let mut bytes_read = 0u64;
+    let mut omitted = 0usize;
+    for path in untracked {
+        if files_processed >= MAX_UNTRACKED_FILES_COUNTED || bytes_read >= MAX_UNTRACKED_BYTES_READ
+        {
+            omitted += 1;
+            continue;
+        }
+        let full_path = repo_root.join(path);
+        let Ok(meta) = tokio::fs::metadata(&full_path).await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        files_processed += 1;
+        if meta.len() > MAX_UNTRACKED_SIZE {
+            changes.push(untracked_change(
+                path,
+                UntrackedKind::TooLarge(meta.len()),
+                0,
+            ));
+            continue;
+        }
+        if bytes_read + meta.len() > MAX_UNTRACKED_BYTES_READ {
+            omitted += 1;
+            continue;
+        }
+        match read_untracked_file_with_meta(&full_path, &meta).await {
+            UntrackedFileRead::Text(text) => {
+                bytes_read += meta.len();
+                #[expect(clippy::cast_possible_wrap)] // line count fits i64
+                let added = text.lines().count() as i64;
+                changes.push(untracked_change(path, UntrackedKind::Text, added));
+            }
+            UntrackedFileRead::Binary => {
+                bytes_read += meta.len();
+                changes.push(untracked_change(path, UntrackedKind::Binary, 0));
+            }
+            // A file that grew between the metadata read and the content read.
+            UntrackedFileRead::TooLarge(size) => {
+                changes.push(untracked_change(path, UntrackedKind::TooLarge(size), 0));
+            }
+            UntrackedFileRead::Skip => {}
+        }
+    }
+    (changes, omitted)
 }
 
 /// Capture the working-tree snapshot for a repository path.
 ///
-/// Runs `git status --porcelain` first — the single source for both the
-/// untracked-file list and the per-file status map. A failure here is fatal:
-/// broken or missing git never yields a snapshot, so callers keep their
-/// last-known-good state (or default churn).
+/// A `git status --porcelain --untracked-files=all` failure is fatal: broken or
+/// missing git never yields a snapshot, so callers keep their last-known-good
+/// state (or default churn).
 ///
-/// Untracked files are line-counted (since `git diff HEAD` only considers
-/// tracked files). Untracked files larger than [`MAX_UNTRACKED_SIZE`] or
-/// detected as binary are surfaced via `huge_binary_file_count`. Collapsed
-/// `?? dir/` entries are enumerated with a scoped `git status
-/// --untracked-files=all` listing (gitignore-respecting), and each file
-/// inside contributes exact line counts (or the file-count if
-/// oversized/binary). Per-refresh work is bounded by the `MAX_UNTRACKED_*`
-/// caps. A missing HEAD (unborn repo) yields `(0, 0)` stats so per-file
-/// statuses still flow; any other numstat failure is fatal.
+/// Tracked changes come from one numstat pass against `HEAD`; a missing HEAD
+/// (unborn repo) measures them against this repository's empty tree instead.
+/// Untracked files (`??` entries) are classified here — line-counted text,
+/// binary, or oversized — from `repo_root`, because git reports status paths
+/// relative to the repository root even when the workspace is a subdirectory.
+/// Status enumeration itself is unbounded (the complete file set is the
+/// point); the per-file content reads are bounded by the `MAX_UNTRACKED_*`
+/// caps, and files those caps leave out are reported through
+/// `omitted_file_count`.
 pub async fn run_git_worktree_snapshot(repo_path: &Path) -> anyhow::Result<GitWorktreeSnapshot> {
-    let porcelain = run_git_status(repo_path).await?;
+    let repo_root =
+        resolve_git_top_level(repo_path).context("Failed to resolve the repository top-level")?;
+    let porcelain = run_git_status_all(&repo_root).await?;
     let file_statuses = parse_git_status_porcelain(&porcelain);
     let untracked = parse_untracked_from_porcelain(&porcelain);
 
-    let (added, removed, unborn_head) = match parse_numstat(repo_path, &["HEAD"]).await {
-        Ok(stats) => (stats.0, stats.1, false),
+    let (tracked, unborn_head) = match run_git_worktree_numstat(&repo_root, "HEAD").await {
+        Ok(entries) => (entries, false),
         // `git_has_commits` distinguishes an unborn HEAD (a freshly
-        // `git init`ed repo with no commits) from other numstat failures —
-        // an unborn repo should still yield a snapshot with empty stats and
-        // full per-file statuses.
-        Err(_) if !git_has_commits(repo_path).await => (0, 0, true),
+        // `git init`ed repo with no commits) from other numstat failures — an
+        // unborn repo still yields the full change set, measured against the
+        // empty tree.
+        Err(_) if !git_has_commits(&repo_root).await => {
+            let base = run_git_empty_tree(&repo_root).await?;
+            (
+                run_git_worktree_numstat(&repo_root, &base)
+                    .await
+                    .context("Failed to compute working-tree diff stats")?,
+                true,
+            )
+        }
         Err(e) => return Err(e.context("Failed to compute working-tree diff stats")),
     };
-    let mut accum = UntrackedAccumulator {
-        added,
-        ..Default::default()
-    };
 
-    let mut dirs_enumerated = 0;
-    for path in &untracked {
-        if path.ends_with('/') {
-            if dirs_enumerated >= MAX_UNTRACKED_DIRS_ENUMERATED {
-                continue;
-            }
-            dirs_enumerated += 1;
-            match enumerate_untracked_dir(repo_path, path).await {
-                Ok(files) => {
-                    for file in &files {
-                        count_untracked_file(repo_path, file, &mut accum).await;
-                    }
-                }
-                Err(e) => warn!(error = %e, dir = %path, "Failed to enumerate untracked directory"),
-            }
-        } else {
-            count_untracked_file(repo_path, path, &mut accum).await;
+    let mut changes = tracked;
+    let (untracked_changes, omitted) = classify_untracked_changes(&repo_root, &untracked).await;
+    changes.extend(untracked_changes);
+
+    let mut stats = DiffStats {
+        added: 0,
+        removed: 0,
+        huge_binary_file_count: 0,
+        omitted_file_count: omitted,
+    };
+    for change in &changes {
+        stats.added += change.added;
+        stats.removed += change.removed;
+        if matches!(
+            change.untracked,
+            Some(UntrackedKind::Binary | UntrackedKind::TooLarge(_))
+        ) {
+            stats.huge_binary_file_count += 1;
         }
     }
 
     Ok(GitWorktreeSnapshot {
-        stats: DiffStats {
-            added: accum.added,
-            removed,
-            huge_binary_file_count: accum.huge_binary_file_count,
-        },
+        stats,
         file_statuses,
         unborn_head,
+        changes,
+        repo_root,
     })
 }
 
@@ -1489,6 +1646,13 @@ pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
 ///    into subdirectories). Errors (file already tracked, already removed by
 ///    checkout) are absorbed.
 ///
+/// `path` is repo-root-relative (as git reports it), which is exactly what the
+/// diff window lists. Every pathspec uses `:(top,literal)`: `top` resolves it
+/// against the repository root whatever the caller's working directory — a
+/// subdirectory workspace would otherwise rewrite or delete a same-named path
+/// beneath itself — and `literal` keeps glob characters in file names from
+/// matching other files.
+///
 /// All errors from all three steps are absorbed. After the sequence, the working
 /// tree is verified via `git status --porcelain -- <path>`: if the output is
 /// empty the operation succeeded; otherwise the remaining changes are reported.
@@ -1500,18 +1664,19 @@ pub async fn run_git_discard(
     path: &str,
     target: DiscardTarget,
 ) -> anyhow::Result<()> {
-    let _ = run_git_command(repo_path, &["checkout", "HEAD", "--", path]).await;
+    let path = format!(":(top,literal){path}");
+    let _ = run_git_command(repo_path, &["checkout", "HEAD", "--", &path]).await;
 
-    let _ = run_git_command(repo_path, &["reset", "HEAD", "--", path]).await;
+    let _ = run_git_command(repo_path, &["reset", "HEAD", "--", &path]).await;
 
     let clean_args: &[&str] = match target {
-        DiscardTarget::Directory => &["clean", "-fd", "--", path],
-        DiscardTarget::File => &["clean", "-f", "--", path],
+        DiscardTarget::Directory => &["clean", "-fd", "--", &path],
+        DiscardTarget::File => &["clean", "-f", "--", &path],
     };
     let _ = run_git_command(repo_path, clean_args).await;
 
     // Verify: check if any changes remain.
-    match run_git_command(repo_path, &["status", "--porcelain", "--", path]).await {
+    match run_git_command(repo_path, &["status", "--porcelain", "--", &path]).await {
         Ok(status) if status.trim().is_empty() => Ok(()),
         Ok(status) => anyhow::bail!("Changes remain after discard:\n{}", status.trim()),
         Err(e) => anyhow::bail!("Discard ran but verification failed: {e}"),
@@ -1598,12 +1763,20 @@ fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
 /// *not* include staged-as-new (`A `) files — it only catches entries starting
 /// with `?? `.
 ///
+/// A trailing slash marks a collapsed nested repository: `--untracked-files=all`
+/// still reports it as one `dir/` entry because git does not descend into it.
+/// Such an entry is not a file and is excluded, so a capped read never counts it
+/// as an omitted file.
+///
 /// Use this when you only want files that are truly untracked and do not want
 /// overlap with staged-as-new files that might already be present from a
 /// `git diff HEAD` parse.
 #[must_use]
-pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
+fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
     parse_porcelain_paths(porcelain, |line| line.starts_with("?? "))
+        .into_iter()
+        .filter(|path| !path.ends_with('/'))
+        .collect()
 }
 
 /// Parse `git status --porcelain` output into a map of file path → `GitFileStatus`.
@@ -1616,9 +1789,9 @@ pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
 /// the new path after ` -> `. Deleted files (`D`) are ignored. Handles
 /// git's C-style quoting for paths with special characters.
 ///
-/// Keys are the paths as emitted by `git status --porcelain`. When the
-/// command runs with cwd = the workspace root, these are workspace-relative
-/// paths (the same key space as the editor's file tree).
+/// Keys are the paths as emitted by `git status --porcelain` — repo-root-relative.
+/// When the workspace is the repository root, this is the same key space as the
+/// editor's file tree.
 #[must_use]
 pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
     let mut map: HashMap<String, GitFileStatus> = HashMap::new();
@@ -1965,7 +2138,14 @@ mod tests {
         assert_eq!(snap.stats.added, 0);
         assert_eq!(snap.stats.removed, 0);
         assert_eq!(snap.stats.huge_binary_file_count, 0);
+        assert_eq!(snap.stats.omitted_file_count, 0);
+        assert!(snap.changes.is_empty(), "clean tree has no changes");
         assert!(snap.file_statuses.is_empty(), "clean tree has no statuses");
+        assert_eq!(
+            snap.repo_root,
+            std::fs::canonicalize(&repo_path).unwrap(),
+            "the snapshot resolves the repository root"
+        );
     }
 
     #[tokio::test]
@@ -1984,8 +2164,49 @@ mod tests {
         assert_eq!(snap.stats.removed, 1, "one line removed (line2)");
         assert_eq!(snap.stats.huge_binary_file_count, 0);
         assert_eq!(
+            snap.changes,
+            vec![WorktreeChange {
+                path: "test.txt".into(),
+                old_path: None,
+                added: 2,
+                removed: 1,
+                untracked: None,
+            }]
+        );
+        assert_eq!(
             snap.file_statuses.get("test.txt"),
             Some(&GitFileStatus::Modified)
+        );
+    }
+
+    /// A mode-only tracked change has no hunks and `0\t0` numstat; it is still
+    /// one listed change, with no line counts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_git_worktree_snapshot_lists_mode_only_change_without_counts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, repo_path) = init_temp_repo();
+        let path = repo_path.join("test.txt");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("test file metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("make test file executable");
+
+        let snap = run_git_worktree_snapshot(&repo_path)
+            .await
+            .expect("worktree snapshot");
+        assert_eq!((snap.stats.added, snap.stats.removed), (0, 0));
+        assert_eq!(
+            snap.changes,
+            vec![WorktreeChange {
+                path: "test.txt".into(),
+                old_path: None,
+                added: 0,
+                removed: 0,
+                untracked: None,
+            }]
         );
     }
 
@@ -2010,6 +2231,16 @@ mod tests {
         );
         assert_eq!(snap.stats.removed, 0, "no removed lines");
         assert_eq!(snap.stats.huge_binary_file_count, 0);
+        assert_eq!(
+            snap.changes,
+            vec![WorktreeChange {
+                path: "new_file.rs".into(),
+                old_path: None,
+                added: 3,
+                removed: 0,
+                untracked: Some(UntrackedKind::Text),
+            }]
+        );
         assert_eq!(
             snap.file_statuses.get("new_file.rs"),
             Some(&GitFileStatus::Added)
@@ -2036,6 +2267,16 @@ mod tests {
             snap.stats.huge_binary_file_count, 1,
             "binary untracked file should be surfaced as huge/binary"
         );
+        assert_eq!(
+            snap.changes,
+            vec![WorktreeChange {
+                path: "binary.bin".into(),
+                old_path: None,
+                added: 0,
+                removed: 0,
+                untracked: Some(UntrackedKind::Binary),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2060,6 +2301,16 @@ mod tests {
             snap.stats.huge_binary_file_count, 1,
             "large untracked file should be surfaced as huge/binary"
         );
+        assert_eq!(
+            snap.changes,
+            vec![WorktreeChange {
+                path: "large.bin".into(),
+                old_path: None,
+                added: 0,
+                removed: 0,
+                untracked: Some(UntrackedKind::TooLarge(u64::try_from(size).unwrap())),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2067,8 +2318,7 @@ mod tests {
         let (_dir, repo_path) = init_temp_repo();
 
         // Create an untracked directory with a normal file (3 lines) and a
-        // binary file. The collapsed `?? new_dir/` entry is enumerated and both
-        // files contribute (the binary one via the huge/binary count).
+        // binary file. `--untracked-files=all` lists both files individually.
         std::fs::create_dir_all(repo_path.join("new_dir")).expect("create directory");
         std::fs::write(
             repo_path.join("new_dir/a.rs"),
@@ -2090,6 +2340,29 @@ mod tests {
             snap.stats.huge_binary_file_count, 1,
             "binary file inside the directory surfaces as huge/binary"
         );
+        assert_eq!(
+            snap.changes,
+            vec![
+                WorktreeChange {
+                    path: "new_dir/a.rs".into(),
+                    old_path: None,
+                    added: 3,
+                    removed: 0,
+                    untracked: Some(UntrackedKind::Text),
+                },
+                WorktreeChange {
+                    path: "new_dir/binary.bin".into(),
+                    old_path: None,
+                    added: 0,
+                    removed: 0,
+                    untracked: Some(UntrackedKind::Binary),
+                },
+            ]
+        );
+        assert!(
+            !snap.changes.iter().any(|c| c.path == "new_dir/"),
+            "the directory itself is never a change"
+        );
     }
 
     #[expect(clippy::cast_possible_wrap)] // MAX_UNTRACKED_FILES_COUNTED is a small compile-time cap
@@ -2097,8 +2370,9 @@ mod tests {
     async fn test_run_git_worktree_snapshot_bounded_file_count_cap() {
         let (_dir, repo_path) = init_temp_repo();
 
-        // A collapsed untracked directory with more files than the per-refresh
-        // cap — only the first `MAX_UNTRACKED_FILES_COUNTED` files are counted.
+        // An untracked directory with more files than the per-refresh cap —
+        // only the first `MAX_UNTRACKED_FILES_COUNTED` files are counted, the
+        // rest are reported as omitted.
         std::fs::create_dir_all(repo_path.join("big_dir")).expect("create directory");
         for i in 0..(MAX_UNTRACKED_FILES_COUNTED + 50) {
             std::fs::write(
@@ -2117,6 +2391,16 @@ mod tests {
         );
         assert_eq!(snap.stats.removed, 0);
         assert_eq!(snap.stats.huge_binary_file_count, 0);
+        assert_eq!(
+            snap.changes.len(),
+            MAX_UNTRACKED_FILES_COUNTED,
+            "the manifest only carries files inside the cap"
+        );
+        assert_eq!(
+            snap.stats.omitted_file_count,
+            MAX_UNTRACKED_FILES_COUNTED + 50 - MAX_UNTRACKED_FILES_COUNTED,
+            "files beyond the cap are reported as omitted"
+        );
     }
 
     #[tokio::test]
@@ -2147,32 +2431,14 @@ mod tests {
         );
         assert_eq!(snap.stats.removed, 0);
         assert_eq!(snap.stats.huge_binary_file_count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_run_git_worktree_snapshot_glob_chars_in_directory_path() {
-        let (_dir, repo_path) = init_temp_repo();
-
-        // A directory whose name contains glob metacharacters — the
-        // `:(literal)` pathspec must match it literally.
-        std::fs::create_dir_all(repo_path.join("we*ird?dir")).expect("create directory");
-        std::fs::write(repo_path.join("we*ird?dir/x.rs"), b"xx\n").expect("write glob-dir file");
-
-        let snap = run_git_worktree_snapshot(&repo_path)
-            .await
-            .expect("worktree snapshot");
-        assert_eq!(
-            snap.stats.added, 1,
-            "glob chars in the directory path are literal"
-        );
-        assert_eq!(snap.stats.removed, 0);
-        assert_eq!(snap.stats.huge_binary_file_count, 0);
+        assert_eq!(snap.changes.len(), 1, "only the kept file is a change");
+        assert_eq!(snap.changes[0].path, "new_dir/keep.rs");
     }
 
     #[tokio::test]
     async fn test_run_git_worktree_snapshot_unborn_head() {
         // A freshly `git init`ed repo with no commits has no HEAD; numstat
-        // fails, but the per-file statuses must still flow with (0, 0) stats.
+        // against the empty tree still carries staged and untracked files.
         let dir = tempfile::tempdir().expect("create temp dir");
         let repo_path = dir.path().to_path_buf();
         let status = std::process::Command::new("git")
@@ -2184,13 +2450,17 @@ mod tests {
 
         std::fs::write(repo_path.join("first.rs"), b"fn main() {}\n")
             .expect("write untracked file");
+        std::fs::write(repo_path.join("staged.rs"), b"a\nb\n").expect("write staged file");
+        run_git_command(&repo_path, &["add", "staged.rs"])
+            .await
+            .expect("git add staged file");
 
         let snap = run_git_worktree_snapshot(&repo_path)
             .await
             .expect("worktree snapshot");
         assert_eq!(
-            snap.stats.added, 1,
-            "untracked line counted despite unborn HEAD"
+            snap.stats.added, 3,
+            "staged and untracked lines both counted despite unborn HEAD"
         );
         assert_eq!(snap.stats.removed, 0);
         assert_eq!(snap.stats.huge_binary_file_count, 0);
@@ -2200,6 +2470,64 @@ mod tests {
             Some(&GitFileStatus::Added),
             "untracked file status flows on an unborn repo"
         );
+        let staged = snap
+            .changes
+            .iter()
+            .find(|c| c.path == "staged.rs")
+            .expect("staged file is in the change set");
+        assert_eq!((staged.added, staged.removed), (2, 0));
+        assert!(staged.untracked.is_none(), "a staged file is tracked");
+        assert_eq!(
+            snap.changes
+                .iter()
+                .find(|c| c.path == "first.rs")
+                .and_then(|c| c.untracked),
+            Some(UntrackedKind::Text)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_git_worktree_snapshot_resolves_root_relative_paths_from_subdir() {
+        let (_dir, repo_path) = init_temp_repo();
+        let sub = repo_path.join("sub");
+        std::fs::create_dir(&sub).expect("create subdir");
+        std::fs::write(sub.join("inside.txt"), b"one\ntwo\n").expect("write inside file");
+        std::fs::write(repo_path.join("at-root.txt"), b"root\n").expect("write root file");
+
+        let snap = run_git_worktree_snapshot(&sub)
+            .await
+            .expect("worktree snapshot");
+        let paths: Vec<&str> = snap.changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            paths.contains(&"sub/inside.txt"),
+            "a subdirectory workspace still reports repo-root-relative paths: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"at-root.txt"),
+            "the reading is repo-wide: {paths:?}"
+        );
+        assert_eq!(snap.stats.added, 3, "both files are counted");
+        assert_eq!(snap.repo_root, std::fs::canonicalize(&repo_path).unwrap());
+    }
+
+    #[test]
+    fn parse_numstat_z_handles_normal_binary_and_rename_records() {
+        let stdout = "3\t1\tfile.txt\0-\t-\timage.bin\0\
+                      2\t0\t\0old.txt\0new.txt\0";
+        let entries = parse_numstat_z(stdout);
+        assert_eq!(
+            entries.len(),
+            3,
+            "trailing NUL and empty fields are ignored"
+        );
+        assert_eq!(entries[0].path, "file.txt");
+        assert_eq!((entries[0].added, entries[0].removed), (3, 1));
+        assert_eq!(entries[0].old_path, None);
+        assert_eq!(entries[1].path, "image.bin");
+        assert_eq!((entries[1].added, entries[1].removed), (0, 0));
+        assert_eq!(entries[2].path, "new.txt");
+        assert_eq!(entries[2].old_path.as_deref(), Some("old.txt"));
+        assert_eq!((entries[2].added, entries[2].removed), (2, 0));
     }
 
     #[tokio::test]
@@ -3160,6 +3488,14 @@ AM staged_then_modified.js
         );
     }
 
+    /// A collapsed nested repository is one `dir/` entry, not a file; it must
+    /// not reach the manifest (or be counted as an omitted file).
+    #[test]
+    fn parse_untracked_from_porcelain_skips_collapsed_directories() {
+        let files = parse_untracked_from_porcelain("?? nested/\n?? real.rs\n");
+        assert_eq!(files, vec!["real.rs"]);
+    }
+
     // ── parse_git_status_porcelain — per-file status map ─────────
 
     #[expect(clippy::too_many_lines)]
@@ -3437,6 +3773,32 @@ AM staged_then_modified.js
         assert!(
             !new_path.exists(),
             "new file should be removed after discard"
+        );
+    }
+
+    /// Diff-window paths are repo-root-relative. Discarding from a subdirectory
+    /// workspace must target the root file, never a same-named file beneath it.
+    #[tokio::test]
+    async fn test_run_git_discard_from_subdirectory_targets_the_root_path() {
+        let (_dir, repo_path) = init_temp_repo();
+        let sub = repo_path.join("sub");
+        std::fs::create_dir(&sub).expect("create subdir");
+        let nested = sub.join("test.txt");
+        std::fs::write(&nested, b"nested\n").expect("write nested file");
+        std::fs::write(repo_path.join("test.txt"), b"modified\n").expect("modify root file");
+
+        run_git_discard(&sub, "test.txt", DiscardTarget::File)
+            .await
+            .expect("run_git_discard should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(repo_path.join("test.txt")).expect("read root file"),
+            "line1\nline2\nline3\n",
+            "the root file is restored"
+        );
+        assert!(
+            nested.exists(),
+            "the same-named file under the workspace is untouched"
         );
     }
 

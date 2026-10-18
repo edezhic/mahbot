@@ -93,7 +93,8 @@ pub struct GitState {
     /// Cached diff stats (+N / -M) from periodic refresh.
     diff_stats: Option<DiffStats>,
     /// Cached per-file porcelain statuses for the current workspace. Keyed by
-    /// workspace-relative path; forwarded to the editor's file tree.
+    /// the path git reports (repo-root-relative); forwarded to the editor's
+    /// file tree.
     file_statuses: HashMap<String, GitFileStatus>,
     /// Cached current branch name from periodic refresh.
     current_branch: Option<String>,
@@ -919,8 +920,8 @@ impl GitState {
     /// last-known-good values untouched.
     fn refresh_local(path: PathBuf, generation: u64) -> Task<GitMessage> {
         // Repo check walks UP so a workspace that is a subdirectory of a repo
-        // still refreshes (git commands run at the workspace path; porcelain
-        // paths stay workspace-relative). Without a repo, skip the subprocesses.
+        // still refreshes; the snapshot itself resolves and reports paths
+        // relative to the repository root. Without a repo, skip the subprocesses.
         if crate::git::commands::resolve_git_top_level(&path).is_none() {
             return Task::none();
         }
@@ -1105,16 +1106,20 @@ mod tests {
         s
     }
 
-    /// A snapshot with the given line stats and no per-file statuses.
+    /// A snapshot with the given line stats, no per-file statuses, and no
+    /// change manifest entries.
     fn snapshot(added: i64, removed: i64) -> GitWorktreeSnapshot {
         GitWorktreeSnapshot {
             stats: DiffStats {
                 added,
                 removed,
                 huge_binary_file_count: 0,
+                omitted_file_count: 0,
             },
             file_statuses: HashMap::new(),
             unborn_head: false,
+            changes: Vec::new(),
+            repo_root: PathBuf::new(),
         }
     }
 
@@ -1146,6 +1151,7 @@ mod tests {
                 added: 3,
                 removed: 1,
                 huge_binary_file_count: 0,
+                omitted_file_count: 0,
             })
         );
         assert_eq!(s.current_branch(), Some("main"));
@@ -1173,6 +1179,7 @@ mod tests {
                 added: 3,
                 removed: 1,
                 huge_binary_file_count: 0,
+                omitted_file_count: 0,
             })
         );
         assert_eq!(s.current_branch(), Some("main"));
@@ -1277,12 +1284,15 @@ mod tests {
                     added: 3,
                     removed: 1,
                     huge_binary_file_count: 0,
+                    omitted_file_count: 0,
                 },
                 file_statuses: HashMap::from([(
                     "src/main.rs".to_string(),
                     GitFileStatus::Modified,
                 )]),
                 unborn_head: false,
+                changes: Vec::new(),
+                repo_root: PathBuf::new(),
             }),
         ));
         // Statuses are stored and the forward is dirty.

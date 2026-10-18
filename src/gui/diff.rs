@@ -1,10 +1,11 @@
 //! Diff dashboard page — view git diff against HEAD with syntax highlighting.
 //!
-//! Shows staged + unstaged changes via `git diff HEAD`, untracked files
-//! via `git status --porcelain`, with per-file tree-sitter syntax highlighting.
-//! Files are parsed in their entirety for correct multi-line token coloring;
-//! working-tree diffs read the old version from HEAD and the new version from
-//! disk, while commit views read both sides via git (`run_git_show`).
+//! Shows staged + unstaged changes and untracked files from the worktree
+//! snapshot both the footer and this window draw from, with per-file tree-sitter
+//! syntax highlighting. Files are parsed in their entirety for correct
+//! multi-line token coloring; working-tree diffs read the old version from HEAD
+//! and the new version from disk, while commit views read both sides via git
+//! (`run_git_show`).
 //!
 //! The page layout splits into an auto-sizing directory tree sidebar (left)
 //! and a scrollable diff panel (right, filling the remaining width). Click a
@@ -16,9 +17,9 @@ use super::diff_widget::{self, DiffBufferWidget, DiffFileBuffer};
 use super::highlight::{FileHighlights, HighlightLanguage, parse_highlights};
 
 use crate::git::commands::{
-    CommitInfo, DiscardTarget, MAX_UNTRACKED_SIZE, UntrackedFileRead, git_has_commits,
-    git_is_installed, is_git_repo, parse_untracked_from_porcelain, read_untracked_file,
-    run_git_commit, run_git_diff, run_git_discard, run_git_show, run_git_status,
+    CommitInfo, DiscardTarget, UntrackedFileRead, UntrackedKind, git_is_installed,
+    read_untracked_file, resolve_git_top_level, run_git_commit, run_git_discard, run_git_show,
+    run_git_show_diff, run_git_worktree_diff, run_git_worktree_snapshot,
 };
 use crate::git::diff_parse::{
     DiffContent, DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff,
@@ -117,7 +118,7 @@ pub enum DiffMessage {
     WorkspaceSelected(String),
     /// Nothing is resolved: drop the workspace this view was showing.
     WorkspaceUnresolved,
-    DiffLoaded(u64, Result<Vec<DiffFile>, String>),
+    DiffLoaded(u64, Result<LoadedDiff, String>),
     Tick,
     ToggleDir(String),
     SelectFile(String),
@@ -169,6 +170,14 @@ pub enum DiffMessage {
     DiscardResult(Result<(), String>),
 }
 
+/// Everything one diff load produced: the files to display and, for the
+/// working tree, the note describing what the bounded read left out.
+#[derive(Debug, Clone)]
+pub struct LoadedDiff {
+    pub files: Vec<DiffFile>,
+    pub omitted_note: Option<String>,
+}
+
 /// A single changed file, enhanced with highlight data and line counts.
 #[derive(Debug, Clone)]
 pub struct DiffFile {
@@ -177,9 +186,10 @@ pub struct DiffFile {
     pub old_highlights: Option<FileHighlights>,
     /// Per-line highlight spans for added/context lines (from new version).
     pub new_highlights: Option<FileHighlights>,
-    /// Count of added lines across all hunks.
+    /// Added lines for display. Worktree entries carry the manifest's count;
+    /// only commit views derive it from the hunks.
     pub add_count: usize,
-    /// Count of removed lines across all hunks.
+    /// Removed lines for display; same source as [`Self::add_count`].
     pub remove_count: usize,
 }
 
@@ -193,14 +203,26 @@ impl std::ops::Deref for DiffFile {
 
 impl DiffFile {
     /// Construct a `DiffFile` from a parsed diff file, computing
-    /// `add_count` and `remove_count` automatically from hunks.
+    /// `add_count` and `remove_count` from its hunks.
     #[must_use]
     pub fn from_parsed(
         dfile: crate::git::diff_parse::DiffFile,
         old_highlights: Option<FileHighlights>,
         new_highlights: Option<FileHighlights>,
     ) -> Self {
-        let (add_count, remove_count) = count_lines(&dfile);
+        let counts = count_lines(&dfile);
+        Self::with_counts(dfile, old_highlights, new_highlights, counts)
+    }
+
+    /// Construct with explicit per-file counts. The worktree manifest supplies
+    /// them so the tree's numbers sum to the footer's totals exactly, including
+    /// entries whose patch is absent (unmerged/`AD`).
+    fn with_counts(
+        dfile: crate::git::diff_parse::DiffFile,
+        old_highlights: Option<FileHighlights>,
+        new_highlights: Option<FileHighlights>,
+        (add_count, remove_count): (usize, usize),
+    ) -> Self {
         Self {
             dfile,
             old_highlights,
@@ -254,6 +276,8 @@ pub struct DiffState {
     /// (prevents "Loading diff…" flicker on auto-poll Ticks).
     diff_has_loaded: bool,
     status_message: Option<String>,
+    /// What the bounded worktree read left out, when it left out anything.
+    omitted_note: Option<String>,
     /// Directory tree nodes (built from diff_files).
     file_tree: FileTree,
     /// Currently selected file (full path), or None to show all.
@@ -287,6 +311,7 @@ impl DiffState {
             diff_loading: false,
             diff_has_loaded: false,
             status_message: None,
+            omitted_note: None,
             file_tree: FileTree::new(Id::new("diff_tree_panel")),
             selected_file: None,
             file_buffers: Vec::new(),
@@ -313,6 +338,7 @@ impl DiffState {
     fn clear_diff_state(&mut self) {
         self.error = None;
         self.status_message = None;
+        self.omitted_note = None;
         self.file_tree.nodes.clear();
         self.file_tree.expanded_dirs.clear();
         self.selected_file = None;
@@ -456,8 +482,10 @@ impl DiffState {
                 self.error = None;
                 self.status_message = None;
                 match result {
-                    Ok(files) => {
-                        if files.is_empty() {
+                    Ok(loaded) => {
+                        self.omitted_note = loaded.omitted_note;
+                        let files = loaded.files;
+                        if files.is_empty() && self.omitted_note.is_none() {
                             self.status_message = if self.current_commit_ref.is_some() {
                                 Some("No files changed in this commit.".to_string())
                             } else {
@@ -485,6 +513,7 @@ impl DiffState {
                         self.file_tree.rebuild_visible();
                     }
                     Err(e) => {
+                        self.omitted_note = None;
                         self.error = Some(e);
                         self.diff_files = Vec::new();
                         self.file_tree.nodes = Vec::new();
@@ -825,7 +854,30 @@ impl DiffState {
             container(Space::new().width(Length::Fill).height(0))
         };
 
-        let status: Element<'_, DiffMessage> = if let Some(ref err) = self.error {
+        let status = self.status_pane();
+
+        let omitted_note: Option<Element<'_, DiffMessage>> =
+            self.omitted_note.as_ref().map(|note| {
+                container(text(note).size(theme::TEXT_12).color(theme::STATUS_WARNING))
+                    .width(Length::Fill)
+                    .padding([theme::PAD_8, theme::PAD_12])
+                    .into()
+            });
+
+        let mut content = column![header]
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill);
+        if let Some(note) = omitted_note {
+            content = content.push(note);
+        }
+        content.push(status).into()
+    }
+
+    /// The pane below the header: an error, a status line, loading, or the
+    /// split view.
+    fn status_pane(&self) -> Element<'_, DiffMessage> {
+        if let Some(ref err) = self.error {
             widgets::error_banner(err)
         } else if let Some(ref s) = self.status_message {
             diff_pane_container(text(s).size(theme::TEXT_13).color(theme::TEXT_SECONDARY))
@@ -840,7 +892,7 @@ impl DiffState {
                     .size(theme::TEXT_13)
                     .color(theme::TEXT_MUTED),
             )
-        } else if self.diff_files.is_empty() {
+        } else if self.diff_files.is_empty() && self.omitted_note.is_none() {
             container(
                 column![
                     lucide::check::<iced::Theme, iced::Renderer>()
@@ -860,15 +912,17 @@ impl DiffState {
             .center_y(Length::Fill)
             .style(theme::base_container_style)
             .into()
+        } else if self.diff_files.is_empty() {
+            // Every uncommitted file was left out by the read cap; the note
+            // strip above says so, and this must not claim a clean tree.
+            diff_pane_container(
+                text("Nothing to display.")
+                    .size(theme::TEXT_13)
+                    .color(theme::TEXT_MUTED),
+            )
         } else {
             self.build_split_view()
-        };
-
-        column![header, status]
-            .spacing(0)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        }
     }
 
     /// Build the two-panel layout: tree sidebar (left) + diff content (right).
@@ -1264,12 +1318,13 @@ impl DiffState {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Load the diff, compute per-file highlights, and return enhanced DiffFiles.
-/// `ws_path` is the path the dashboard resolved for the selected workspace.
+/// Load the diff, compute per-file highlights, and return the files plus the
+/// worktree-omission note. `ws_path` is the path the dashboard resolved for the
+/// selected workspace; every git call and disk read uses the resolved repo root.
 async fn load_diff(
     ws_path: Option<PathBuf>,
     commit_ref: Option<String>,
-) -> Result<Vec<DiffFile>, String> {
+) -> Result<LoadedDiff, String> {
     let Some(ws_path) = ws_path else {
         return Err("No workspace resolved.".to_string());
     };
@@ -1277,70 +1332,149 @@ async fn load_diff(
     if !git_is_installed().await {
         return Err("Git is not installed.".to_string());
     }
-    if !is_git_repo(&ws_path) {
+    let Some(root) = resolve_git_top_level(&ws_path) else {
         return Err("This workspace is not a git repository.".to_string());
-    }
-    if !git_has_commits(&ws_path).await {
-        return Err("No commits yet \u{2014} nothing to diff against.".to_string());
-    }
+    };
 
-    let diff_output = run_git_diff(&ws_path, commit_ref.as_deref())
+    // Historical commits don't have untracked files: a commit view is the pure
+    // patch from `git show`.
+    if let Some(hash) = commit_ref.as_deref() {
+        let files = load_commit_diff(&root, hash).await?;
+        return Ok(LoadedDiff {
+            files,
+            omitted_note: None,
+        });
+    }
+    load_worktree_diff(&root).await
+}
+
+/// Load a historical commit's diff and highlights.
+async fn load_commit_diff(root: &Path, hash: &str) -> Result<Vec<DiffFile>, String> {
+    let diff_output = run_git_show_diff(root, hash)
         .await
         .map_err(|e| format!("Failed to run git diff: {e}"))?;
-    let mut parsed = parse_git_diff(&diff_output);
-
-    // Untracked files — only relevant for working-tree diffs.
-    // Historical commits don't have untracked files.
-    if commit_ref.is_none() {
-        add_untracked_files(&mut parsed, &ws_path).await?;
-    }
-
-    // Compute highlights for each file off the UI thread.
-    let mut enhanced: Vec<DiffFile> = Vec::with_capacity(parsed.len());
+    let parsed = parse_git_diff(&diff_output);
+    let mut files: Vec<DiffFile> = Vec::with_capacity(parsed.len());
     for dfile in parsed {
         let (old_hl, new_hl) = if dfile.has_parseable_content() {
-            compute_highlights(&dfile, &ws_path, commit_ref.as_deref()).await
+            compute_highlights(&dfile, root, Some(hash)).await
         } else {
             (None, None)
         };
-        enhanced.push(DiffFile::from_parsed(dfile, old_hl, new_hl));
+        files.push(DiffFile::from_parsed(dfile, old_hl, new_hl));
     }
-
-    Ok(enhanced)
+    Ok(files)
 }
 
-/// Add untracked/new files from `git status --porcelain` to the parsed diff list.
-/// Only called for working-tree diffs (commit_ref is None).
-async fn add_untracked_files(
-    parsed: &mut Vec<crate::git::diff_parse::DiffFile>,
-    ws_path: &Path,
-) -> Result<(), String> {
-    let status_output = run_git_status(ws_path)
+/// Load the working-tree diff from the snapshot manifest: same files, same
+/// order, and same line totals as the footer.
+async fn load_worktree_diff(repo_path: &Path) -> Result<LoadedDiff, String> {
+    let snapshot = run_git_worktree_snapshot(repo_path)
         .await
-        .map_err(|e| format!("Failed to run git status: {e}"))?;
-    let untracked = parse_untracked_from_porcelain(&status_output);
-
-    for path in &untracked {
-        match read_untracked_file(&ws_path.join(path), MAX_UNTRACKED_SIZE).await {
-            UntrackedFileRead::Text(text) => parsed.push(make_untracked_diff_file(path, &text)),
-            UntrackedFileRead::TooLarge(size) => {
-                parsed.push(crate::git::diff_parse::DiffFile::placeholder(
-                    path.clone(),
-                    DiffContent::TooLarge(size),
-                ));
-            }
-            UntrackedFileRead::Binary => {
-                parsed.push(crate::git::diff_parse::DiffFile::placeholder(
-                    path.clone(),
-                    DiffContent::Binary,
-                ));
-            }
-            // Unreadable / non-file paths produce no placeholder.
-            UntrackedFileRead::Skip => {}
-        }
+        .map_err(|e| format!("Failed to read the working tree: {e}"))?;
+    // Every manifest path is relative to the root the snapshot resolved.
+    let root = snapshot.repo_root.as_path();
+    let omitted_note = snapshot.stats.omitted_note();
+    if snapshot.changes.is_empty() {
+        return Ok(LoadedDiff {
+            files: Vec::new(),
+            omitted_note,
+        });
     }
 
-    Ok(())
+    let mut parsed = if snapshot.changes.iter().any(|c| c.untracked.is_none()) {
+        let diff_output = run_git_worktree_diff(root, snapshot.unborn_head)
+            .await
+            .map_err(|e| format!("Failed to run git diff: {e}"))?;
+        parse_git_diff(&diff_output)
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+
+    let mut files: Vec<DiffFile> = Vec::with_capacity(snapshot.changes.len());
+    for change in &snapshot.changes {
+        let mut dfile = if let Some(kind) = change.untracked {
+            untracked_diff_file(root, &change.path, kind).await
+        } else {
+            // The patch omits some tracked entries (unmerged/AD); the manifest
+            // still lists them.
+            parsed.remove(&change.path).unwrap_or_else(|| {
+                crate::git::diff_parse::DiffFile::new(
+                    change.path.clone(),
+                    Vec::new(),
+                    DiffFileStatus::Modified,
+                )
+            })
+        };
+        // The manifest is the rename authority, so the entry keeps the old path
+        // the patch would have carried and is rendered as one renamed file.
+        if let Some(old_path) = &change.old_path {
+            dfile.old_path = Some(old_path.clone());
+            dfile.status = DiffFileStatus::Renamed;
+        }
+        let (old_hl, new_hl) = if dfile.has_parseable_content() {
+            compute_highlights(&dfile, root, None).await
+        } else {
+            (None, None)
+        };
+        let counts = (
+            usize::try_from(change.added).unwrap_or(0),
+            usize::try_from(change.removed).unwrap_or(0),
+        );
+        files.push(DiffFile::with_counts(dfile, old_hl, new_hl, counts));
+    }
+    if !parsed.is_empty() {
+        tracing::debug!(
+            count = parsed.len(),
+            "diff entries outside the worktree manifest were ignored"
+        );
+    }
+
+    Ok(LoadedDiff {
+        files,
+        omitted_note,
+    })
+}
+
+/// Build the displayed file for an untracked manifest entry from its kind.
+async fn untracked_diff_file(
+    root: &Path,
+    path: &str,
+    kind: UntrackedKind,
+) -> crate::git::diff_parse::DiffFile {
+    match kind {
+        UntrackedKind::TooLarge(size) => crate::git::diff_parse::DiffFile::placeholder(
+            path.to_owned(),
+            DiffContent::TooLarge(size),
+        ),
+        UntrackedKind::Binary => {
+            crate::git::diff_parse::DiffFile::placeholder(path.to_owned(), DiffContent::Binary)
+        }
+        UntrackedKind::Text => {
+            // The snapshot already confirmed this file is text; this read only
+            // fetches the content the manifest does not retain.
+            match read_untracked_file(&root.join(path)).await {
+                UntrackedFileRead::Text(text) => make_untracked_diff_file(path, &text),
+                UntrackedFileRead::TooLarge(size) => crate::git::diff_parse::DiffFile::placeholder(
+                    path.to_owned(),
+                    DiffContent::TooLarge(size),
+                ),
+                UntrackedFileRead::Binary => crate::git::diff_parse::DiffFile::placeholder(
+                    path.to_owned(),
+                    DiffContent::Binary,
+                ),
+                // Unreadable / non-file paths have no content to show.
+                UntrackedFileRead::Skip => crate::git::diff_parse::DiffFile::new(
+                    path.to_owned(),
+                    Vec::new(),
+                    DiffFileStatus::Untracked,
+                ),
+            }
+        }
+    }
 }
 
 /// Count added and removed lines in a diff file.
@@ -1362,7 +1496,7 @@ fn count_lines(dfile: &crate::git::diff_parse::DiffFile) -> (usize, usize) {
 /// Compute highlight spans for both old and new versions of a file.
 async fn compute_highlights(
     dfile: &crate::git::diff_parse::DiffFile,
-    ws_path: &Path,
+    repo_root: &Path,
     commit_ref: Option<&str>,
 ) -> (Option<FileHighlights>, Option<FileHighlights>) {
     let lang = HighlightLanguage::from_path(&dfile.path);
@@ -1374,8 +1508,8 @@ async fn compute_highlights(
     // Run old and new highlight computation concurrently to overlap I/O
     // (git subprocess for old version, git/disk read for new version).
     let (old_hl, new_hl) = tokio::join!(
-        compute_old_highlights(dfile, ws_path, lang, commit_ref),
-        compute_new_highlights(dfile, ws_path, lang, commit_ref),
+        compute_old_highlights(dfile, repo_root, lang, commit_ref),
+        compute_new_highlights(dfile, repo_root, lang, commit_ref),
     );
 
     (old_hl, new_hl)
@@ -1383,7 +1517,7 @@ async fn compute_highlights(
 
 async fn compute_old_highlights(
     dfile: &crate::git::diff_parse::DiffFile,
-    ws_path: &Path,
+    repo_root: &Path,
     lang: HighlightLanguage,
     commit_ref: Option<&str>,
 ) -> Option<FileHighlights> {
@@ -1399,14 +1533,14 @@ async fn compute_old_highlights(
     // For historical commits, read the parent version (~1).
     // For working-tree diffs, read HEAD.
     let show_ref = commit_ref.map(|hash| format!("{hash}~1"));
-    let content = run_git_show(ws_path, old_path, show_ref.as_deref()).await?;
+    let content = run_git_show(repo_root, old_path, show_ref.as_deref()).await?;
 
     parse_highlights(&content, lang)
 }
 
 async fn compute_new_highlights(
     dfile: &crate::git::diff_parse::DiffFile,
-    ws_path: &Path,
+    repo_root: &Path,
     lang: HighlightLanguage,
     commit_ref: Option<&str>,
 ) -> Option<FileHighlights> {
@@ -1418,10 +1552,10 @@ async fn compute_new_highlights(
     let content = if let Some(hash) = commit_ref {
         // Historical commit: read file content from git, NOT from disk.
         // The working-tree path may not match the commit version.
-        run_git_show(ws_path, &dfile.path, Some(hash)).await?
+        run_git_show(repo_root, &dfile.path, Some(hash)).await?
     } else {
         // Working-tree diff: read from disk (existing behavior).
-        let full_path = ws_path.join(&dfile.path);
+        let full_path = repo_root.join(&dfile.path);
         tokio::fs::read_to_string(&full_path).await.ok()?
     };
 
@@ -2027,7 +2161,13 @@ mod tests {
     fn make_diff_loaded(files: Vec<DiffFile>) -> DiffState {
         let mut state = DiffState::new();
         state.tree_auto_expand_pending = true;
-        let _ = state.update(DiffMessage::DiffLoaded(state.generation, Ok(files)));
+        let _ = state.update(DiffMessage::DiffLoaded(
+            state.generation,
+            Ok(LoadedDiff {
+                files,
+                omitted_note: None,
+            }),
+        ));
         state
     }
 
@@ -2052,7 +2192,10 @@ mod tests {
 
         let _ = state.update(DiffMessage::DiffLoaded(
             state.generation,
-            Ok(vec![make_test_file("src/main.rs", 2, 0)]),
+            Ok(LoadedDiff {
+                files: vec![make_test_file("src/main.rs", 2, 0)],
+                omitted_note: None,
+            }),
         ));
 
         assert!(state.file_tree.expanded_dirs.is_empty());
@@ -2376,42 +2519,147 @@ mod tests {
         );
     }
 
-    // ── add_untracked_files — classifier + placeholder emission ──
+    // ── load_diff — the modal draws the snapshot manifest ───────────
 
-    /// Verify the untracked-file classifier mapping: text files become parseable
-    /// entries, null-byte and invalid-UTF-8 files become Binary placeholders
-    /// (the latter must NOT be dropped), oversized files become TooLarge with
-    /// their real size, and directories are skipped entirely.
+    /// The diff window's file set and line totals must be exactly the
+    /// snapshot's change manifest: modified + staged + untracked (including
+    /// files inside a new folder), binary placeholders, and empty files.
     #[tokio::test]
-    async fn test_add_untracked_files_classification() {
+    async fn load_diff_working_tree_matches_snapshot_manifest() {
         let (_dir, repo_path) = crate::util::test::init_temp_repo();
-        std::fs::write(repo_path.join("new.txt"), b"line1\nline2\n").unwrap();
-        std::fs::write(repo_path.join("binary.bin"), b"a\x00b").unwrap();
-        // Invalid UTF-8 without a null byte — Binary, not skipped.
-        std::fs::write(repo_path.join("invalid.bin"), [0xC3, 0x28]).unwrap();
-        // Oversized — gated before read, placeholder carries the real size.
-        let big_size = usize::try_from(MAX_UNTRACKED_SIZE).unwrap() + 1;
-        let mut big = vec![b'a'; big_size];
-        big[big_size - 1] = b'\n';
-        std::fs::write(repo_path.join("big.txt"), &big).unwrap();
-        // Directory (with contents, so porcelain emits `?? new_dir/`) — the
-        // classifier's is_file() gate skips it, no placeholder.
+        std::fs::write(repo_path.join("test.txt"), b"line1\nline2 changed\nline3\n").unwrap();
+        std::fs::write(repo_path.join("staged.txt"), b"staged\n").unwrap();
+        crate::git::commands::run_git_command(&repo_path, &["add", "staged.txt"])
+            .await
+            .unwrap();
+        std::fs::write(repo_path.join("top.txt"), b"top\n").unwrap();
         std::fs::create_dir(repo_path.join("new_dir")).unwrap();
-        std::fs::write(repo_path.join("new_dir/inner.txt"), b"x").unwrap();
+        std::fs::write(repo_path.join("new_dir/nested.txt"), b"nested\n").unwrap();
+        std::fs::write(repo_path.join("binary.bin"), b"a\x00b").unwrap();
+        std::fs::write(repo_path.join("empty.txt"), b"").unwrap();
 
-        let mut parsed = Vec::new();
-        add_untracked_files(&mut parsed, &repo_path).await.unwrap();
+        let snapshot = crate::git::commands::run_git_worktree_snapshot(&repo_path)
+            .await
+            .unwrap();
+        let loaded = load_diff(Some(repo_path.clone()), None).await.unwrap();
 
-        let find = |path: &str| parsed.iter().find(|f| f.path == path);
-        assert_eq!(find("new.txt").unwrap().content, DiffContent::Parseable);
-        assert_eq!(find("binary.bin").unwrap().content, DiffContent::Binary);
-        assert_eq!(find("invalid.bin").unwrap().content, DiffContent::Binary);
-        assert_eq!(
-            find("big.txt").unwrap().content,
-            DiffContent::TooLarge(big_size as u64)
+        let mut expected: Vec<String> = snapshot.changes.iter().map(|c| c.path.clone()).collect();
+        let mut actual: Vec<String> = loaded.files.iter().map(|f| f.path.clone()).collect();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected, "modal files must match the manifest");
+        assert!(
+            loaded.files.iter().any(|f| f.path == "new_dir/nested.txt"),
+            "a file inside a newly created folder is listed individually"
         );
-        // Porcelain lists non-empty untracked dirs as `?? new_dir/` — the
-        // parsed entry is skipped, so no placeholder with that path exists.
-        assert!(find("new_dir/").is_none(), "directories must be skipped");
+        let find = |path: &str| {
+            loaded
+                .files
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("{path} must be listed: {actual:?}"))
+        };
+        assert_eq!(
+            (
+                find("new_dir/nested.txt").add_count,
+                find("new_dir/nested.txt").remove_count
+            ),
+            (1, 0),
+            "a file inside a newly created folder opens its own diff"
+        );
+        // No-line content is listed, but contributes no counts.
+        for path in ["binary.bin", "empty.txt"] {
+            let file = find(path);
+            assert_eq!((file.add_count, file.remove_count), (0, 0), "{path}");
+        }
+        assert_eq!(find("binary.bin").content, DiffContent::Binary);
+        assert_eq!(find("empty.txt").content, DiffContent::Parseable);
+        let modal_total: usize = loaded
+            .files
+            .iter()
+            .map(|f| f.add_count + f.remove_count)
+            .sum();
+        let footer_total = usize::try_from(snapshot.stats.added + snapshot.stats.removed).unwrap();
+        assert_eq!(
+            modal_total, footer_total,
+            "tree counts must add up to the footer totals"
+        );
+        assert!(loaded.omitted_note.is_none());
+    }
+
+    /// A rename is one file on both surfaces: the manifest and the modal agree
+    /// on the new path and on the line totals.
+    #[tokio::test]
+    async fn load_diff_rename_matches_the_footer_totals() {
+        let (_dir, repo_path) = crate::util::test::init_temp_repo();
+        crate::git::commands::run_git_command(&repo_path, &["mv", "test.txt", "renamed.txt"])
+            .await
+            .unwrap();
+        std::fs::write(
+            repo_path.join("renamed.txt"),
+            b"line1\nline2\nline3\nline4\n",
+        )
+        .unwrap();
+
+        let snapshot = crate::git::commands::run_git_worktree_snapshot(&repo_path)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.changes.len(), 1, "{:?}", snapshot.changes);
+        let change = &snapshot.changes[0];
+        assert_eq!(change.path, "renamed.txt");
+        assert_eq!(change.old_path.as_deref(), Some("test.txt"));
+        assert_eq!((change.added, change.removed), (1, 0));
+        assert_eq!((snapshot.stats.added, snapshot.stats.removed), (1, 0));
+
+        let loaded = load_diff(Some(repo_path), None).await.unwrap();
+        assert_eq!(loaded.files.len(), 1, "a rename is one file");
+        let file = &loaded.files[0];
+        assert_eq!(file.path, "renamed.txt");
+        assert_eq!(file.status, DiffFileStatus::Renamed);
+        assert_eq!((file.add_count, file.remove_count), (1, 0));
+    }
+
+    /// Git C-quotes non-ASCII path names in the patch; the decoded name must
+    /// match the raw manifest path so the file opens its own diff.
+    #[tokio::test]
+    async fn load_diff_non_ascii_path_keeps_its_patch() {
+        let (_dir, repo_path) = crate::util::test::init_temp_repo();
+        let path = repo_path.join("café.txt");
+        std::fs::write(&path, b"one\ntwo\n").expect("write non-ascii file");
+        crate::git::commands::run_git_command(&repo_path, &["add", "café.txt"])
+            .await
+            .expect("stage non-ascii file");
+        std::fs::write(&path, b"one\nchanged\n").expect("modify non-ascii file");
+
+        let loaded = load_diff(Some(repo_path), None).await.unwrap();
+        let file = loaded
+            .files
+            .iter()
+            .find(|f| f.path == "café.txt")
+            .unwrap_or_else(|| panic!("non-ASCII path is listed: {:?}", loaded.files));
+        assert_eq!((file.add_count, file.remove_count), (2, 0));
+        assert!(
+            !file.hunks.is_empty(),
+            "the patch is attached, not a bare synthetic entry"
+        );
+    }
+
+    /// A workspace that is a subdirectory of a repo still shows the
+    /// repo-root-relative path, and the content read resolves against the root.
+    #[tokio::test]
+    async fn load_diff_subdirectory_workspace_reads_root_relative_path() {
+        let (_dir, repo_path) = crate::util::test::init_temp_repo();
+        let sub = repo_path.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inside.txt"), b"one\ntwo\n").unwrap();
+
+        let loaded = load_diff(Some(sub), None).await.unwrap();
+        let file = loaded
+            .files
+            .iter()
+            .find(|f| f.path == "sub/inside.txt")
+            .expect("root-relative path is listed");
+        assert_eq!((file.add_count, file.remove_count), (2, 0));
+        assert_eq!(file.content, DiffContent::Parseable);
     }
 }

@@ -63,6 +63,7 @@ use iced_fonts::lucide;
 
 pub use theme::JETBRAINS_MONO;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3468,17 +3469,22 @@ impl Dashboard {
 
     /// Render the git diff stats button (+X/−Y, clickable -> diff modal).
     /// Returns `None` when there are no non-zero changes (including no
-    /// oversized/binary untracked files to report).
+    /// oversized/binary untracked files or cap omissions to report).
     fn render_git_diff_stats(&self) -> Option<Element<'_, Message>> {
         let stats = self.git_state.diff_stats()?;
+        let tooltip_text: Cow<'static, str> = stats.omitted_note().map_or_else(
+            || Cow::Borrowed("uncommitted changes"),
+            |note| Cow::Owned(format!("uncommitted changes \u{2014} {note}")),
+        );
         Some(widgets::icon_tooltip_button(
             widgets::git_footer_stats::<Message>(
                 stats.added,
                 stats.removed,
                 stats.huge_binary_file_count,
+                stats.omitted_file_count,
                 15.0,
             )?,
-            "uncommitted changes",
+            tooltip_text,
             Some(Message::OpenDiffModal(None)),
             theme::PAD_3,
             theme::button_text,

@@ -821,20 +821,22 @@ pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> R
         .align_y(Alignment::Center)
 }
 
-/// Build the git footer diff-stats content: `+X/−Y` (non-zero sides) plus
-/// an optional "N files" indicator for oversized/binary untracked files.
+/// Build the git footer diff-stats content: `+X/−Y` (non-zero sides), an
+/// optional "N files" indicator for oversized/binary untracked files, and an
+/// optional "N left out" warning for files the worktree read cap skipped.
 ///
 /// Returns `None` when there is nothing to show (all stats zero). The
-/// file-count is shown even when both line counts are zero so oversized/binary
-/// untracked files are never silently dropped from the footer.
+/// file-count and omission warning are shown even when both line counts are
+/// zero so those files are never silently dropped from the footer.
 #[must_use]
 pub fn git_footer_stats<'a, Message: 'a>(
     added: i64,
     removed: i64,
     huge_binary_file_count: usize,
+    omitted_file_count: usize,
     size: f32,
 ) -> Option<Row<'a, Message>> {
-    if added == 0 && removed == 0 && huge_binary_file_count == 0 {
+    if added == 0 && removed == 0 && huge_binary_file_count == 0 && omitted_file_count == 0 {
         return None;
     }
     let mut parts: Vec<Element<'a, Message>> = Vec::new();
@@ -852,6 +854,20 @@ pub fn git_footer_stats<'a, Message: 'a>(
             text(format!("{huge_binary_file_count} files"))
                 .size(size)
                 .color(theme::TEXT_SECONDARY)
+                .into(),
+        );
+    }
+    if omitted_file_count > 0 {
+        parts.push(
+            lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+                .size(size)
+                .color(theme::STATUS_WARNING)
+                .into(),
+        );
+        parts.push(
+            text(format!("{omitted_file_count} left out"))
+                .size(size)
+                .color(theme::STATUS_WARNING)
                 .into(),
         );
     }
@@ -2092,12 +2108,14 @@ mod tests {
     #[test]
     fn git_footer_stats_gating() {
         // Nothing to show when all stats are zero.
-        assert!(git_footer_stats::<()>(0, 0, 0, 15.0).is_none());
+        assert!(git_footer_stats::<()>(0, 0, 0, 0, 15.0).is_none());
         // A binary/huge untracked count alone still shows (not silently dropped).
-        assert!(git_footer_stats::<()>(0, 0, 3, 15.0).is_some());
-        // Non-zero line counts show regardless of the file-count.
-        assert!(git_footer_stats::<()>(1, 0, 0, 15.0).is_some());
-        assert!(git_footer_stats::<()>(0, 1, 2, 15.0).is_some());
+        assert!(git_footer_stats::<()>(0, 0, 3, 0, 15.0).is_some());
+        // Non-zero line counts show regardless of the file-counts.
+        assert!(git_footer_stats::<()>(1, 0, 0, 0, 15.0).is_some());
+        assert!(git_footer_stats::<()>(0, 1, 2, 0, 15.0).is_some());
+        // Files left out by the worktree read cap alone still show.
+        assert!(git_footer_stats::<()>(0, 0, 0, 5, 15.0).is_some());
     }
 
     /// Helper to create a FileTree with known visible_tree_nodes for testing.
