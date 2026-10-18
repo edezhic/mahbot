@@ -2157,13 +2157,10 @@ fn album_members_merge_into_one_message() {
 #[test]
 fn is_control_message_covers_commands_and_callbacks() {
     assert!(is_control_message(&test_msg(
-        "alice", "/pause", "telegram", "chat"
+        "alice", "/board", "telegram", "chat"
     )));
     assert!(is_control_message(&test_msg(
-        "alice",
-        "/maintenance on",
-        "telegram",
-        "chat"
+        "alice", "/clear", "telegram", "chat"
     )));
     assert!(is_control_message(&test_msg(
         "alice",
@@ -2173,13 +2170,31 @@ fn is_control_message_covers_commands_and_callbacks() {
     )));
     // The dispatch loop decodes `__act__` payloads from the text alone, so the
     // collector must too — otherwise a burst would fuse the payload into an
-    // agent turn while the same text sent alone would be an action.
+    // agent turn while the same text sent alone would be an action. The payload
+    // comes from a keyboard a previous build delivered; it must stay a control
+    // input even though its action is no longer handled.
     assert!(is_control_message(&test_msg(
         "alice",
         "__act__set_workspace|ws",
         "telegram",
         "chat"
     )));
+    // The retired workspace, pause and maintenance commands are ordinary chat
+    // now — in every spelling — so the collector must not hold them back.
+    for text in [
+        "/workspace",
+        "/pause",
+        "/unpause",
+        "/maintenance",
+        "/maintenance on",
+        "/maintenance_on",
+        "/MAINTENANCE_OFF",
+    ] {
+        assert!(
+            control_input(&test_msg("alice", text, "telegram", "chat")).is_none(),
+            "{text} is no longer a command"
+        );
+    }
 
     let mut callback = test_msg("alice", "anything", "telegram", "chat");
     callback.callback_query_id = Some("1".to_string());
@@ -2190,7 +2205,7 @@ fn is_control_message_covers_commands_and_callbacks() {
 
     // Only Telegram routes commands; elsewhere a slash is ordinary text.
     assert!(!is_control_message(&test_msg(
-        "alice", "/pause", "gui", "chat"
+        "alice", "/board", "gui", "chat"
     )));
     // Plain text, and text that merely looks like a command, is not control.
     assert!(!is_control_message(&test_msg(
@@ -3208,217 +3223,83 @@ async fn mirrors_media_only_with_reply_reference() {
 #[tokio::test]
 #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
 async fn user_command_entries_reflect_admin_state() {
-    // Serialized with the sibling mirror tests: this test mutates the
-    // shared user/workspace stores (the admin's workspace + the menu
-    // fixtures), so it must not run concurrently with other store users.
+    // Serialized with the sibling mirror tests: this test initialises the
+    // shared user store, so it must not run concurrently with other store users.
     let _lock = acquire_mirror_lock().await;
     crate::users::test_util::init_test_store().await;
-    let store = crate::users::store();
     let admin = crate::users::ADMIN_USER_NAME;
 
-    // Two shared workspace fixtures: the admin's selected one, and a second so
-    // the switcher — which needs something to switch between — is offered at
-    // all. The guard seeds both and removes them even when an assertion below
-    // panics; the inner one restores the shared seeded admin row.
-    crate::users::test_util::with_test_workspaces(
-        &[
-            ("/tmp/mahbot_test_ws_menu", "menu_ws"),
-            ("/tmp/mahbot_test_ws_menu2", "menu_ws2"),
-        ],
-        crate::users::test_util::with_admin_workspace_restored(async {
-            store
-                .set_selected_workspace(admin, Some("menu_ws"))
-                .await
-                .unwrap();
-
-            // The admin: single Assistant role →
-            // no role-switch entry, just unconditional model commands and
-            // state-aware admin commands. In the (SourceTree) test environment the
-            // shared availability cache seeds `available = true`, so `/update` is
-            // present for the admin.
-            let admin_entries = user_command_entries(admin).await;
-            let cmds: Vec<&str> = admin_entries.iter().map(|(c, _)| c.as_str()).collect();
-            assert!(cmds.contains(&"board"));
-            assert!(cmds.contains(&"update"));
-            // State-aware pairs reflect the workspace state: not paused →
-            // /pause, maintenance disabled → /maintenance_on.
-            assert!(cmds.contains(&"pause"));
-            assert!(!cmds.contains(&"unpause"));
-            assert!(cmds.contains(&"maintenance_on"));
-            assert!(!cmds.contains(&"maintenance_off"));
-            // Per-role switch commands are removed entirely — the Assistant is every
-            // account's only role, so nothing to switch.
-            for cmd in ["manager", "assistant", "engineer"] {
-                assert!(!cmds.contains(&cmd));
-            }
-            // Model commands are unconditional (every user has the Assistant role).
-            assert!(cmds.contains(&"image_models"));
-            assert!(cmds.contains(&"video_models"));
-            // Menu order: the switcher heads the admin menu — the active
-            // workspace is chosen before the other admin commands act on it —
-            // then board/admin (+ /update), then the workspace-state pairs,
-            // then the model commands, with /clear last. The role-switch entry
-            // (/agents) is removed entirely.
-            assert!(cmds.contains(&"workspace"));
-            assert_eq!(cmds.last(), Some(&"clear"));
-            let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
-            assert!(pos("workspace") < pos("board"));
-            assert!(pos("board") < pos("update"));
-            assert!(pos("update") < pos("image_models"));
-            assert!(pos("image_models") < pos("clear"));
-
-            // Flipping the workspace state reverses the pairs (the ticket's
-            // headline criterion): paused → /unpause, maintenance on →
-            // /maintenance_off.
-            crate::workspace::store()
-                .set_paused("menu_ws", true)
-                .await
-                .unwrap();
-            crate::workspace::store()
-                .set_maintenance_enabled("menu_ws", true)
-                .await
-                .unwrap();
-            let flipped = user_command_entries(admin).await;
-            let flipped_cmds: Vec<&str> = flipped.iter().map(|(c, _)| c.as_str()).collect();
-            assert!(flipped_cmds.contains(&"unpause"));
-            assert!(!flipped_cmds.contains(&"pause"));
-            assert!(flipped_cmds.contains(&"maintenance_off"));
-            assert!(!flipped_cmds.contains(&"maintenance_on"));
-
-            // Hidden branch: no available update → `/update` is absent even for the
-            // admin (the cache is a process-local single source of truth). The RAII
-            // guard restores the SourceTree default on drop.
-            {
-                let _guard = crate::self_update::set_update_cache_for_test(false, false);
-                let hidden = user_command_entries(admin).await;
-                let hidden_cmds: Vec<&str> = hidden.iter().map(|(c, _)| c.as_str()).collect();
-                assert!(!hidden_cmds.contains(&"update"));
-            }
-
-            // bob: a guest — no admin commands and, with the Assistant as the only
-            // role, no role-switch entry either. Model commands remain available.
-            let bob = user_command_entries("bob").await;
-            let cmds: Vec<&str> = bob.iter().map(|(c, _)| c.as_str()).collect();
-            assert!(!cmds.contains(&"agents"));
-            assert!(!cmds.contains(&"board"));
-            assert!(!cmds.contains(&"workspace"));
-            assert!(!cmds.contains(&"update"));
-            assert!(!cmds.contains(&"pause"));
-            assert!(!cmds.contains(&"unpause"));
-            assert!(!cmds.contains(&"assistant"));
-            assert!(!cmds.contains(&"manager"));
-            assert!(cmds.contains(&"image_models"));
-            assert!(cmds.contains(&"video_models"));
-            assert_eq!(cmds[0], "image_models");
-        }),
-    )
-    .await;
-}
-
-// ── Workspace picker keyboard ──────────────────────────────────────────────
-
-/// The picker labels one button per workspace and marks the active one — and
-/// only it — with the ✓, showing the desktop's own name and status word. The
-/// paths deliberately end in something other than the registered name, so the
-/// label can only come from the displayed name the desktop uses.
-#[test]
-fn workspace_picker_marks_only_the_active_workspace() {
-    let workspaces = vec![
-        crate::Workspace {
-            name: "ws1".to_string(),
-            path: "/src/alpha_repo".to_string(),
-            status: crate::WorkspaceStatus::Ready,
-            ..Default::default()
-        },
-        crate::Workspace {
-            name: "ws2".to_string(),
-            path: "/src/beta_repo".to_string(),
-            status: crate::WorkspaceStatus::Ready,
-            paused: true,
-            ..Default::default()
-        },
-        crate::Workspace {
-            name: "ws3".to_string(),
-            path: "/src/gamma".to_string(),
-            status: crate::WorkspaceStatus::Failed,
-            ..Default::default()
-        },
-    ];
-
-    let keyboard = workspace_picker_keyboard(&workspaces, Some("ws2"));
-    let rows = keyboard["inline_keyboard"].as_array().expect("rows");
-    assert_eq!(rows.len(), 3, "one row per workspace");
-    let buttons: Vec<&serde_json::Value> = rows
-        .iter()
-        .map(|row| {
-            let row = row.as_array().expect("a row is a list of buttons");
-            assert_eq!(row.len(), 1, "one button per row");
-            &row[0]
-        })
-        .collect();
-
-    // The payload is the registered workspace name — the stable key the
-    // callback sets, whatever the display name reads.
-    let payloads: Vec<&str> = buttons
-        .iter()
-        .map(|b| b["callback_data"].as_str().expect("callback_data"))
-        .collect();
-    assert_eq!(
-        payloads,
-        vec![
-            "__act__set_workspace|ws1",
-            "__act__set_workspace|ws2",
-            "__act__set_workspace|ws3",
-        ]
-    );
-
-    // The label is the display name (the path's last component), the status
-    // word, and `paused` — with the ✓ on the active workspace only.
-    let labels: Vec<&str> = buttons
-        .iter()
-        .map(|b| b["text"].as_str().expect("text"))
-        .collect();
-    assert_eq!(labels[0], "alpha_repo — ready");
-    assert_eq!(labels[1], "\u{2713} beta_repo — ready, paused");
-    assert_eq!(labels[2], "gamma — failed");
-    assert!(!labels[0].contains('\u{2713}'), "inactive: {}", labels[0]);
-    assert!(!labels[2].contains('\u{2713}'), "inactive: {}", labels[2]);
-
-    // Nothing is marked while no workspace is active.
-    let unmarked = workspace_picker_keyboard(&workspaces, None);
-    for row in unmarked["inline_keyboard"].as_array().expect("rows") {
-        let label = row[0]["text"].as_str().expect("text");
-        assert!(
-            !label.contains('\u{2713}'),
-            "no workspace is active, so nothing is marked: {label}"
-        );
+    // The admin: no role-switch entry (the Assistant is every account's only
+    // role), the two workspace-independent admin commands, and the model
+    // commands. In the (SourceTree) test environment the shared availability
+    // cache seeds `available = true`, so `/update` is present for the admin.
+    let admin_entries = user_command_entries(admin).await;
+    let cmds: Vec<&str> = admin_entries.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(cmds.contains(&"board"));
+    assert!(cmds.contains(&"archive"));
+    assert!(cmds.contains(&"update"));
+    // The workspace switcher, the pipeline freeze pair and the maintenance
+    // toggle are gone — from the menu and from the grammar.
+    for cmd in [
+        "workspace",
+        "pause",
+        "unpause",
+        "maintenance",
+        "maintenance_on",
+        "maintenance_off",
+        "agents",
+        "manager",
+        "assistant",
+        "engineer",
+    ] {
+        assert!(!cmds.contains(&cmd), "{cmd} must be gone from the menu");
     }
-}
+    // Model commands are unconditional (every user has the Assistant role).
+    assert!(cmds.contains(&"image_models"));
+    assert!(cmds.contains(&"video_models"));
+    // Menu order: board, archive, update, then the model commands, with
+    // /clear last.
+    assert_eq!(cmds.last(), Some(&"clear"));
+    let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
+    assert!(pos("board") < pos("archive"));
+    assert!(pos("archive") < pos("update"));
+    assert!(pos("update") < pos("image_models"));
+    assert!(pos("image_models") < pos("video_models"));
+    assert!(pos("video_models") < pos("clear"));
 
-/// The longest name the store admits still leaves `callback_data` inside
-/// Telegram's 64-byte cap, so a workspace can never become unselectable.
-#[test]
-fn workspace_picker_button_payload_fits_telegram_limit() {
-    /// Telegram's documented `callback_data` bound, in bytes.
-    const CALLBACK_DATA_MAX: usize = 64;
+    // Hidden branch: no available update → `/update` is absent even for the
+    // admin (the cache is a process-local single source of truth). The RAII
+    // guard restores the SourceTree default on drop.
+    {
+        let _guard = crate::self_update::set_update_cache_for_test(false, false);
+        let hidden = user_command_entries(admin).await;
+        let hidden_cmds: Vec<&str> = hidden.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(!hidden_cmds.contains(&"update"));
+    }
 
-    let name = "a".repeat(crate::workspace::MAX_NAME_LEN);
-    let ws = crate::Workspace {
-        name: name.clone(),
-        path: format!("/tmp/{name}"),
-        ..Default::default()
-    };
-
-    let keyboard = workspace_picker_keyboard(&[ws], None);
-    let payload = keyboard["inline_keyboard"][0][0]["callback_data"]
-        .as_str()
-        .expect("callback_data");
-    assert_eq!(payload, format!("__act__set_workspace|{name}"));
-    assert!(
-        payload.len() <= CALLBACK_DATA_MAX,
-        "Telegram caps callback_data at 64 bytes, got {}",
-        payload.len()
-    );
+    // bob: a guest — no admin commands and, with the Assistant as the only
+    // role, no role-switch entry either. Model commands remain available.
+    let bob = user_command_entries("bob").await;
+    let cmds: Vec<&str> = bob.iter().map(|(c, _)| c.as_str()).collect();
+    for cmd in [
+        "agents",
+        "board",
+        "archive",
+        "update",
+        "workspace",
+        "pause",
+        "unpause",
+        "maintenance",
+        "maintenance_on",
+        "maintenance_off",
+        "assistant",
+        "manager",
+    ] {
+        assert!(!cmds.contains(&cmd), "{cmd} must not reach a guest's menu");
+    }
+    assert!(cmds.contains(&"image_models"));
+    assert!(cmds.contains(&"video_models"));
+    assert_eq!(cmds[0], "image_models");
 }
 
 // ── Self-update notification texts ─────────────────────────────────────────
@@ -5579,7 +5460,7 @@ async fn a_command_in_a_burst_leaves_the_group_ahead_of_itself() {
         "token-a",
         vec![
             test_text_update(1, "the group"),
-            test_text_update(2, "/pause"),
+            test_text_update(2, "/clear"),
         ],
     );
     let (store, _dir) = test_store().await;
@@ -5594,7 +5475,7 @@ async fn a_command_in_a_burst_leaves_the_group_ahead_of_itself() {
     assert_eq!(group.content, "the group");
     let command = next_message(&mut rx, "the command, as its own turn").await;
     assert!(command.parts.is_empty());
-    assert_eq!(command.content, "/pause");
+    assert_eq!(command.content, "/clear");
 
     assert!(
         tokio::time::timeout(Duration::from_millis(300), rx.recv())

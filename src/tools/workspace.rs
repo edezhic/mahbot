@@ -2,9 +2,9 @@
 //! (which activates it), freeze/unfreeze their pipelines, read a board and a
 //! single ticket, and leave a clarification note on a ticket.
 //!
-//! It manages no board and never switches the desktop's active workspace. The
-//! only writes that can change it are the `add` action here, the desktop's own
-//! project list, and the Telegram `/workspace` command.
+//! It manages no board. Registering a project is the only write here that can
+//! change the desktop's active workspace; the desktop's own project list is the
+//! other surface that selects one.
 use anyhow::anyhow;
 use async_trait::async_trait;
 use serde_json::json;

@@ -444,22 +444,10 @@ pub enum BotCommand {
     ImageModels,
     /// `/video_models` — show video model selection keyboard.
     VideoModels,
-    /// `/workspace` — switch the admin's active shared workspace (admin).
-    Workspace,
     /// `/board` — list every workspace's tickets (admin).
     Board,
     /// `/archive` — archive done & cancelled tickets from every workspace (admin).
     Archive,
-    /// `/pause` — pause the active workspace's pipeline (admin).
-    Pause,
-    /// `/unpause` — resume the active workspace's pipeline (admin).
-    Unpause,
-    /// `/maintenance on|off` — toggle the active workspace's maintainer (admin).
-    Maintenance,
-    /// `/maintenance_on` — enable the workspace maintainer (admin, menu form).
-    MaintenanceOn,
-    /// `/maintenance_off` — disable the workspace maintainer (admin, menu form).
-    MaintenanceOff,
     /// `/update` — run a self-update and restart the daemon (admin, shown only
     /// when the shared availability cache confirms an update is available).
     Update,
@@ -482,14 +470,8 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
         "/clear" => Some(BotCommand::Clear),
         "/image_models" => Some(BotCommand::ImageModels),
         "/video_models" => Some(BotCommand::VideoModels),
-        "/workspace" => Some(BotCommand::Workspace),
         "/board" => Some(BotCommand::Board),
         "/archive" => Some(BotCommand::Archive),
-        "/pause" => Some(BotCommand::Pause),
-        "/unpause" => Some(BotCommand::Unpause),
-        "/maintenance" => Some(BotCommand::Maintenance),
-        "/maintenance_on" => Some(BotCommand::MaintenanceOn),
-        "/maintenance_off" => Some(BotCommand::MaintenanceOff),
         "/update" => Some(BotCommand::Update),
         "/agents" => Some(BotCommand::Agents),
         _ => None,
@@ -1922,30 +1904,12 @@ mod tests {
             ("/video_models", Some(VideoModels)),
             ("/Video_Models", Some(VideoModels)),
             ("/video_models foo", Some(VideoModels)),
-            // /workspace
-            ("/workspace", Some(Workspace)),
-            ("/WORKSPACE", Some(Workspace)),
-            ("/workspace foo", Some(Workspace)),
             // admin commands
             ("/board", Some(Board)),
             ("/BOARD", Some(Board)),
             ("/board foo", Some(Board)),
             ("/archive", Some(Archive)),
             ("/archive foo", Some(Archive)),
-            ("/pause", Some(Pause)),
-            ("/pause foo", Some(Pause)),
-            ("/unpause", Some(Unpause)),
-            ("/unpause foo", Some(Unpause)),
-            ("/maintenance", Some(Maintenance)),
-            ("/maintenance on", Some(Maintenance)),
-            ("/maintenance off", Some(Maintenance)),
-            // Menu-form maintenance commands (distinct from the typed form)
-            ("/maintenance_on", Some(MaintenanceOn)),
-            ("/MAINTENANCE_ON", Some(MaintenanceOn)),
-            ("/maintenance_on ", Some(MaintenanceOn)),
-            ("/maintenance_off", Some(MaintenanceOff)),
-            ("/Maintenance_Off", Some(MaintenanceOff)),
-            ("/maintenance_off foo", Some(MaintenanceOff)),
             // /update
             ("/update", Some(Update)),
             ("/UPDATE", Some(Update)),
@@ -1967,6 +1931,23 @@ mod tests {
             ("/image", None),
             ("/video", None),
             ("/boardx", None),
+            // The workspace switcher, pipeline freeze and maintenance toggle are
+            // no longer commands in any spelling — they route as ordinary chat.
+            ("/workspace", None),
+            ("/WORKSPACE", None),
+            ("/workspace foo", None),
+            ("/pause", None),
+            ("/PAUSE", None),
+            ("/pause foo", None),
+            ("/unpause", None),
+            ("/Unpause foo", None),
+            ("/maintenance", None),
+            ("/maintenance on", None),
+            ("/maintenance off", None),
+            ("/maintenance_on", None),
+            ("/MAINTENANCE_ON", None),
+            ("/maintenance_off", None),
+            ("/Maintenance_Off foo", None),
             ("/maintenance_onn", None),
             ("/maintenance_o", None),
             ("/updatex", None),

@@ -1270,9 +1270,9 @@ impl WorkspaceStore {
             //
             // The store→registry call mirrors `set_maintenance_enabled` above (which
             // cancels Maintainer agents): this method is the choke point for every
-            // pause entry point (GUI, Telegram, the `mahbot paused` startup mode,
-            // and the failure freeze), so the cancel is guaranteed rather than left
-            // to each caller. The one caller that signals the registry itself is
+            // pause entry point (GUI, the `mahbot paused` startup mode, and the
+            // failure freeze), so the cancel is guaranteed rather than left to
+            // each caller. The one caller that signals the registry itself is
             // `pause_workspace_on_failure` finding the flag already set — it has no
             // write to piggyback on.
             crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(name);

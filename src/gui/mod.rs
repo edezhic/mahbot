@@ -311,13 +311,13 @@ pub enum Message {
     WorkspacesCdcChanged,
     /// A users-table or user_channels-table row changed (or the CDC stream
     /// lagged) — triggers a full users re-list on the Settings page and a
-    /// read-back of the admin's active workspace (the phone-side switcher
+    /// read-back of the admin's active workspace (the `workspace` tool's `add`
     /// writes that same column).
     UsersCdcChanged,
     /// The admin's DB-stored active workspace read back after a users-table
-    /// change — the desktop and Telegram are one and the same choice, so a
-    /// switch made on the phone applies here without a restart. `generation` is
-    /// the `active_workspace_gen` guard value captured at dispatch, so a read a
+    /// change — the desktop and the DB are one and the same choice, so a
+    /// switch made by another surface applies here without a restart. `generation`
+    /// is the `active_workspace_gen` guard value captured at dispatch, so a read a
     /// newer pick or read superseded cannot apply.
     ActiveWorkspaceSynced {
         generation: u64,
@@ -1660,10 +1660,10 @@ impl Dashboard {
                 // "Personal": the map can lag the stored choice (a workspace
                 // registered and selected in one go is missing from a read that
                 // started before its insert), and resolving here would leave the
-                // desktop on the personal space while Telegram and the DB keep
-                // the project active. The DB owns the choice and its read-back
-                // applies it (see `active_workspace_gen`), so only the
-                // now-unresolved surfaces are re-pushed.
+                // desktop on the personal space while the DB keeps the project
+                // active. The DB owns the choice and its read-back applies it
+                // (see `active_workspace_gen`), so only the now-unresolved
+                // surfaces are re-pushed.
                 let unknown = self.selected_workspace_name.as_deref().is_some_and(|name| {
                     !self.workspaces.contains_key(name)
                         && !crate::users::is_personal_workspace(name)
@@ -2923,7 +2923,7 @@ fn workspaces_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
 /// Subscription that emits [`Message::UsersCdcChanged`] when a users-table row
 /// changes or the stream lags. Both map to the same message: the full users
 /// re-list and the DB read-back of the active workspace (the same single choice
-/// Telegram's `/workspace` writes) that follow are each their own recovery.
+/// the footer picker writes) that follow are each their own recovery.
 ///
 /// The stream opens with one synthetic BASELINE event, like
 /// [`workspaces_cdc_subscription`]: a switch written between the boot selection
@@ -3899,7 +3899,7 @@ async fn read_active_workspace() -> Option<String> {
 /// Build the footer workspace picker options from the shared workspace map:
 /// values sorted by name, labeled by each workspace's display name. A personal
 /// workspace is never an option — a lingering `personal:{user}` row is filtered
-/// out, so this picker and Telegram's `/workspace` offer the same set.
+/// out.
 #[must_use]
 fn shared_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
     let mut values: Vec<&Workspace> = map
@@ -4120,10 +4120,11 @@ mod tests {
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws3"));
     }
 
-    /// A phone-side switch reaches a running dashboard: the read-back applies
-    /// the stored choice in memory, an unchanged value is a no-op, and a read
-    /// superseded by a local pick or by a newer read is dropped — the two
-    /// surfaces are one choice, and the running app follows it.
+    /// A switch made elsewhere (the `workspace` tool's `add`) reaches a running
+    /// dashboard: the read-back applies the stored choice in memory, an
+    /// unchanged value is a no-op, and a read superseded by a local pick or by a
+    /// newer read is dropped — the two surfaces are one choice, and the running
+    /// app follows it.
     #[test]
     fn active_workspace_sync_follows_an_external_switch_and_drops_a_superseded_read() {
         let mut dash = ready_dashboard();
@@ -4133,8 +4134,8 @@ mod tests {
         ]);
         dash.selected_workspace_name = Some("ws1".to_string());
 
-        // A switch made elsewhere — Telegram — is adopted as soon as it is read
-        // back.
+        // A switch made elsewhere — the `workspace` tool's `add` — is adopted
+        // as soon as it is read back.
         let _ = dash.update(Message::ActiveWorkspaceSynced {
             generation: 0,
             name: Some("ws2".to_string()),
@@ -4514,8 +4515,7 @@ mod tests {
     }
 
     /// A personal workspace is never a picker option — a lingering
-    /// `personal:{user}` row in the map is filtered out — so the footer picker
-    /// and Telegram's `/workspace` offer the same set.
+    /// `personal:{user}` row in the map is filtered out.
     #[test]
     fn shared_workspace_options_never_offer_a_personal_workspace() {
         let map = HashMap::from([

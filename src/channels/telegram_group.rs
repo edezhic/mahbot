@@ -831,13 +831,13 @@ mod tests {
 
         input.send(part("alice", "chat", "one")).await.unwrap();
         input.send(part("alice", "chat", "two")).await.unwrap();
-        input.send(part("alice", "chat", "/pause")).await.unwrap();
+        input.send(part("alice", "chat", "/clear")).await.unwrap();
 
         let group = released(&mut output_rx).await;
         assert_eq!(group.parts.len(), 2);
         assert!(group.content.is_empty());
         let command = released(&mut output_rx).await;
-        assert_eq!(command.content, "/pause");
+        assert_eq!(command.content, "/clear");
     }
 
     #[tokio::test]
