@@ -544,6 +544,34 @@ mod tests {
         );
     }
 
+    /// The read tool's own resolution and delivery do not bypass the page's visible
+    /// area: what the tool hands back is what a cropped page shows. The crop filter
+    /// itself is covered by the converter's tests; this one is the wiring.
+    #[tokio::test]
+    async fn a_cropped_pdf_page_delivers_only_what_it_shows() {
+        // "Visible line of text" ends before x=320 and the second word starts at
+        // x=372, so the crop box keeps the first and covers the second.
+        let bytes = multi_page_pdf(&[(
+            "/MediaBox [0 0 612 792] /CropBox [0 0 320 792]",
+            b"BT /F1 24 Tf 72 700 Td (Visible line of text) Tj 300 0 Td (Hidden marker) Tj ET",
+        )]);
+        let owner = SpillOwner::new();
+        let (_dir, ws) = temp_workspace(&[("cropped.pdf", &bytes)]);
+        let out = convert(&owner, &ws, "cropped.pdf", PathAccess::Allowlisted)
+            .await
+            .expect("a .pdf is a document");
+        assert!(
+            out.text.contains("Visible line of text"),
+            "the text inside the crop box is delivered: {:?}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("Hidden"),
+            "the text the crop box hides is not delivered: {:?}",
+            out.text
+        );
+    }
+
     #[tokio::test]
     async fn image_only_pdf_pages_come_back_as_images() {
         let owner = SpillOwner::new();

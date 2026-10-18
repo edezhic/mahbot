@@ -61,7 +61,7 @@ use hayro::hayro_syntax::content::TypedIter;
 use hayro::hayro_syntax::content::ops::TypedInstruction;
 use hayro::hayro_syntax::object::dict::Dict;
 use hayro::hayro_syntax::object::stream::{ImageColorSpace, ImageDecodeParams, Stream};
-use hayro::hayro_syntax::object::{Array, Name, Object, ObjectIdentifier};
+use hayro::hayro_syntax::object::{Array, Name, Object, ObjectIdentifier, Rect};
 use hayro::hayro_syntax::page::Page;
 use hayro::hayro_syntax::{DecryptionError, LoadPdfError, Pdf};
 use hayro::vello_cpu::color::Rgba8;
@@ -70,7 +70,9 @@ use hayro::{RenderCache, RenderSettings};
 use image::codecs::jpeg::JpegEncoder;
 use image::{RgbImage, RgbaImage};
 use office_oxide::cfb::CfbReader;
-use pdf_extract::{Document, PlainTextOutput, output_doc_page};
+use pdf_extract::{
+    Document, MediaBox, OutputDev, OutputError, PlainTextOutput, Transform, output_doc_page,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -84,6 +86,11 @@ pub(crate) const INLINE_TEXT_MAX_CHARS: usize = 5000;
 /// whitespace, so such a page is rasterized as well — its text is delivered
 /// either way (see [`is_usable_page_text`]).
 const MIN_PAGE_TEXT_CHARS: usize = 16;
+
+/// Slack, in points, on a page's crop box when deciding whether a character is
+/// visible: a character whose origin sits on the edge is text the page shows,
+/// and the box is compared after the reader's own rounding.
+const CROP_EDGE_SLACK: f64 = 0.5;
 
 /// Target pixel size of the long side of a rasterized page.
 const RASTER_LONG_SIDE_PX: f32 = 1600.0;
@@ -549,7 +556,9 @@ pub(crate) async fn read_pptx_diagram_text(path: &Path) -> HashMap<String, Vec<S
 ///
 /// The text pass is per page ([`PdfTextReader`]), so a page the reader cannot
 /// read costs that page and nothing else: the pages around it keep their text,
-/// the pages it costs are rasterized, and [`UnreadablePages`] names them.
+/// the pages it costs are rasterized, and [`UnreadablePages`] names them. A
+/// page's text is limited to what its `/CropBox` shows — text the page crops
+/// out is not page content.
 fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     // The structure parse also settles encryption: it decrypts with the empty
     // user password, so an owner-password-only document opens and is readable,
@@ -667,10 +676,14 @@ fn read_pdf_pages(
     for index in 0..page_count {
         let page_number = index + 1;
         let page = pdf.and_then(|pdf| pdf.pages().get(index));
+        // What the page shows is what it reads as: a crop box that hides part of
+        // the page hides its text too. A page with no crop of its own reads
+        // exactly as it did before, which `None` keeps it doing.
+        let visible = page.and_then(VisibleArea::of);
         // `None` for a page outside the reader's page list — nothing to read for
         // it, and nothing lost; a reader that could not be opened is a failure
         // for every page of the document.
-        let read = reader.read_page(page_number);
+        let read = reader.read_page(page_number, visible);
         if read.is_some() {
             // The reader was asked for this page, so it is one whose text the
             // reader could have produced: what [`UnreadablePages`] counts to tell
@@ -806,10 +819,14 @@ impl PdfTextReader {
     /// The reader numbers its pages by tree order, the order hayro's page list
     /// indexes them in, which is what pairs one page's text with its raster.
     ///
+    /// `visible` limits the text to the part of the page its crop box leaves
+    /// visible; `None` is a page that shows all of itself and reads exactly as
+    /// the reader's plain text output always did.
+    ///
     /// A panic is contained like an error: the reader panics on some malformed
     /// structures, and one page's panic must cost that page alone. Either way the
     /// text produced before the failure is kept in [`PageText::Failed`].
-    fn read_page(&self, page_number: usize) -> Option<PageText> {
+    fn read_page(&self, page_number: usize, visible: Option<VisibleArea>) -> Option<PageText> {
         let Self::Open { doc, pages } = self else {
             // The reader never opened: nothing was produced and the read failed.
             return Some(PageText::Failed(String::new()));
@@ -827,13 +844,138 @@ impl PdfTextReader {
         let number = page_number as u32;
         let mut text = String::new();
         let outcome = crate::shutdown::contain_panics(|| {
-            let mut output = PlainTextOutput::new(&mut text);
-            output_doc_page(doc, &mut output, number)
+            if let Some(visible) = visible {
+                let mut output = CropTextOutput::new(&mut text, visible);
+                output_doc_page(doc, &mut output, number)
+            } else {
+                // The page shows all of itself: the plain output, unchanged.
+                let mut output = PlainTextOutput::new(&mut text);
+                output_doc_page(doc, &mut output, number)
+            }
         });
         Some(match outcome {
             Ok(Ok(())) => PageText::Read(text),
             Ok(Err(_)) | Err(_) => PageText::Failed(text),
         })
+    }
+}
+
+/// The part of a page's media box its crop box leaves visible, in the page space
+/// hayro reports both boxes in.
+///
+/// A page reads as it is drawn: text a crop box hides is not page content, and a
+/// page that prints two variants of a line and crops one out must not deliver
+/// both as its text.
+#[derive(Clone, Copy)]
+struct VisibleArea {
+    /// The crop box, already intersected with the media box.
+    crop: Rect,
+}
+
+impl VisibleArea {
+    /// The visible area of `page`, or `None` when its crop box leaves the whole
+    /// media box visible — the ordinary page, which then reads through the plain
+    /// text output untouched. The boxes are equal up to a tolerance: a producer
+    /// that writes both need not spell the same number identically. A crop box
+    /// the media box does not intersect at all leaves no area, and a page whose
+    /// crop leaves nothing visible is read as having no crop rather than as
+    /// having lost its text.
+    fn of(page: &Page<'_>) -> Option<Self> {
+        /// Difference below which two box edges are the same edge, in points.
+        const TOLERANCE: f64 = 1e-6;
+        let crop = page.intersected_crop_box();
+        let media = page.media_box();
+        if crop.width() <= 0.0 || crop.height() <= 0.0 {
+            return None;
+        }
+        let whole_page = (crop.x0 - media.x0).abs() <= TOLERANCE
+            && (crop.y0 - media.y0).abs() <= TOLERANCE
+            && (crop.x1 - media.x1).abs() <= TOLERANCE
+            && (crop.y1 - media.y1).abs() <= TOLERANCE;
+        (!whole_page).then_some(Self { crop })
+    }
+
+    /// Whether a character drawn at `trm`'s origin, whose glyph runs `width`
+    /// character-widths at `font_size`, is inside the visible area. Both points are
+    /// user-space ones — the frame the crop box itself is stated in, so no flip is
+    /// involved. A character on the edge is shown, within the reader's own
+    /// rounding, and so is one the crop cuts through: a glyph the box only half
+    /// hides is not text it hides.
+    fn shows(&self, trm: &Transform, width: f64, font_size: f64) -> bool {
+        // The far end of the glyph's advance, in the same frame: the origin alone
+        // would drop a glyph that starts just outside the box but reaches into it.
+        let advance = width * font_size;
+        self.contains(trm.m31, trm.m32)
+            || self.contains(trm.m11 * advance + trm.m31, trm.m12 * advance + trm.m32)
+    }
+
+    /// Whether a user-space point is inside the visible area.
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.crop.x0 - CROP_EDGE_SLACK
+            && x <= self.crop.x1 + CROP_EDGE_SLACK
+            && y >= self.crop.y0 - CROP_EDGE_SLACK
+            && y <= self.crop.y1 + CROP_EDGE_SLACK
+    }
+}
+
+/// [`PlainTextOutput`] with the page's visible area applied: a character the crop
+/// box hides never reaches it, so hidden text can neither appear nor leave a gap
+/// or a line break behind, while everything the page does show is laid out by the
+/// reader's own word and line detection.
+struct CropTextOutput<'a> {
+    inner: PlainTextOutput<&'a mut String>,
+    visible: VisibleArea,
+}
+
+impl<'a> CropTextOutput<'a> {
+    /// A reader over `text` that keeps only what `visible` shows.
+    fn new(text: &'a mut String, visible: VisibleArea) -> Self {
+        Self {
+            inner: PlainTextOutput::new(text),
+            visible,
+        }
+    }
+}
+
+impl OutputDev for CropTextOutput<'_> {
+    fn begin_page(
+        &mut self,
+        page_num: u32,
+        media_box: &MediaBox,
+        art_box: Option<(f64, f64, f64, f64)>,
+    ) -> Result<(), OutputError> {
+        self.inner.begin_page(page_num, media_box, art_box)
+    }
+
+    fn end_page(&mut self) -> Result<(), OutputError> {
+        self.inner.end_page()
+    }
+
+    fn output_character(
+        &mut self,
+        trm: &Transform,
+        width: f64,
+        spacing: f64,
+        font_size: f64,
+        char: &str,
+    ) -> Result<(), OutputError> {
+        if !self.visible.shows(trm, width, font_size) {
+            return Ok(());
+        }
+        self.inner
+            .output_character(trm, width, spacing, font_size, char)
+    }
+
+    fn begin_word(&mut self) -> Result<(), OutputError> {
+        self.inner.begin_word()
+    }
+
+    fn end_word(&mut self) -> Result<(), OutputError> {
+        self.inner.end_word()
+    }
+
+    fn end_line(&mut self) -> Result<(), OutputError> {
+        self.inner.end_line()
     }
 }
 
@@ -883,8 +1025,15 @@ impl UnreadablePages {
 }
 
 /// How many ranges a lost-text note names before it stops: the note shares the
-/// tool output budget with the delivered text.
-const MAX_NOTE_RANGES: usize = 8;
+/// tool output budget with the delivered text. The number lives in the shared
+/// rules, so the kit's own placement notes name as many ranges as this reading
+/// does.
+fn max_note_ranges() -> usize {
+    crate::docgen::rules()["note_page_ranges_max"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .expect("assets/docgen/rules.json states how many page ranges a note names")
+}
 
 /// `pages 3, 7-9` for the 1-based `pages`, which are ascending.
 fn page_list(pages: &[usize]) -> String {
@@ -893,8 +1042,9 @@ fn page_list(pages: &[usize]) -> String {
 }
 
 /// `3, 7-9, 12` for the ascending `pages`: a run of three or more collapses to
-/// `first-last`, and at most [`MAX_NOTE_RANGES`] ranges are named.
+/// `first-last`, and at most [`max_note_ranges`] ranges are named.
 fn page_ranges(pages: &[usize]) -> String {
+    let max = max_note_ranges();
     let mut ranges: Vec<String> = Vec::new();
     let mut remaining = pages.iter().copied().peekable();
     while let Some(first) = remaining.next() {
@@ -902,7 +1052,7 @@ fn page_ranges(pages: &[usize]) -> String {
         while remaining.peek() == Some(&(last + 1)) {
             last = remaining.next().unwrap_or(last);
         }
-        if ranges.len() == MAX_NOTE_RANGES {
+        if ranges.len() == max {
             ranges.push("…".to_string());
             break;
         }
@@ -1623,25 +1773,20 @@ fn encode_jpeg(image: &RgbImage) -> Result<Vec<u8>, ()> {
     Ok(jpeg)
 }
 
-/// Rasterize `page` (1-based `page_number`) to `<out_dir>/page_<n>.jpg` and push
-/// the path onto `images`, saying whether the page ended up among them: `false`
-/// for a page the page tree has no entry for, and for one whose raster could not
-/// be built or written. A page that could not be delivered is one the report
-/// names, so it is never silently absent from the answer.
-fn rasterize_page(
-    page: Option<&Page<'_>>,
-    page_number: usize,
-    out_dir: &Path,
-    images: &mut Vec<PathBuf>,
-) -> bool {
-    let Some(page) = page else {
-        return false;
-    };
-    // `render_dimensions` clamps zero-area pages, so `long_side >= 1.0` and the
-    // scale stays finite; the cap keeps a tiny page from being blown up.
+/// Rasterize `page` into the pixels of its picture: its visible area on a white
+/// background, scaled so the long side is at most `long_side` pixels and never
+/// blown up past `max_scale`. `None` for a page whose pixels could not be laid
+/// out. The one page-to-pixels render the document readers and the `rasterize`
+/// tool share; the cap and the encoding each of them brings are their own.
+pub(crate) fn render_page_image(
+    page: &Page<'_>,
+    long_side: f32,
+    max_scale: f32,
+) -> Option<RgbaImage> {
+    // `render_dimensions` clamps zero-area pages, so the page's long side is at
+    // least one and the scale stays finite.
     let (width, height) = page.render_dimensions();
-    let long_side = width.max(height);
-    let scale = (RASTER_LONG_SIDE_PX / long_side).min(RASTER_MAX_SCALE);
+    let scale = (long_side / width.max(height)).min(max_scale);
     let settings = RenderSettings {
         x_scale: scale,
         y_scale: scale,
@@ -1660,8 +1805,24 @@ fn rasterize_page(
         .into_iter()
         .flat_map(Rgba8::to_u8_array)
         .collect();
-    let Some(image) = RgbaImage::from_raw(u32::from(pixel_width), u32::from(pixel_height), raw)
-    else {
+    RgbaImage::from_raw(u32::from(pixel_width), u32::from(pixel_height), raw)
+}
+
+/// Rasterize `page` (1-based `page_number`) to `<out_dir>/page_<n>.jpg` and push
+/// the path onto `images`, saying whether the page ended up among them: `false`
+/// for a page the page tree has no entry for, and for one whose raster could not
+/// be built or written. A page that could not be delivered is one the report
+/// names, so it is never silently absent from the answer.
+fn rasterize_page(
+    page: Option<&Page<'_>>,
+    page_number: usize,
+    out_dir: &Path,
+    images: &mut Vec<PathBuf>,
+) -> bool {
+    let Some(page) = page else {
+        return false;
+    };
+    let Some(image) = render_page_image(page, RASTER_LONG_SIDE_PX, RASTER_MAX_SCALE) else {
         tracing::warn!(
             page = page_number,
             "document: rasterized page has no pixels"
@@ -2693,6 +2854,81 @@ mod tests {
             ]
         );
         assert!(!all_page_text_lost);
+    }
+
+    /// The text of 1-based `page_number` as the reader's plain output produces
+    /// it: what every page was read as before crop handling, and what a page with
+    /// no crop box must still read as.
+    fn plain_page_text(bytes: &[u8], page_number: u32) -> String {
+        let doc = Document::load_mem(bytes).expect("load the PDF");
+        let mut text = String::new();
+        {
+            let mut output = PlainTextOutput::new(&mut text);
+            output_doc_page(&doc, &mut output, page_number).expect("read the page");
+        }
+        text
+    }
+
+    /// What the reading derives as 1-based `page_number`'s visible area.
+    fn visible_area(bytes: &[u8], page_number: usize) -> Option<VisibleArea> {
+        let pdf = Pdf::new(bytes.to_vec()).expect("load the PDF structure");
+        VisibleArea::of(pdf.pages().get(page_number - 1)?)
+    }
+
+    /// The text a page's crop box hides is not page content: the word the crop
+    /// cuts off is not delivered and leaves no gap in the text the page shows,
+    /// while a page beside it with no crop box still reads exactly as the plain
+    /// output reads it, and a glyph the crop cuts through is kept.
+    #[test]
+    fn pdf_page_text_is_limited_to_its_crop_box() {
+        // "Visible line of text" ends before x=320 and the second word starts at
+        // x=372, so the crop box keeps the first and covers the second. The third
+        // page's crop starts at x=100 while its text starts at x=90, so the first
+        // glyph straddles the edge.
+        const CONTENT: &[u8] =
+            b"BT /F1 24 Tf 72 700 Td (Visible line of text) Tj 300 0 Td (Hidden marker) Tj ET";
+        let bytes = multi_page_pdf(&[
+            ("/MediaBox [0 0 612 792] /CropBox [0 0 320 792]", CONTENT),
+            (
+                "/MediaBox [0 0 612 792]",
+                b"BT /F1 24 Tf 72 700 Td (Page two text long enough) Tj ET",
+            ),
+            (
+                "/MediaBox [0 0 612 792] /CropBox [100 0 512 792]",
+                b"BT /F1 24 Tf 90 700 Td (Straddling edge) Tj ET",
+            ),
+        ]);
+        assert!(
+            visible_area(&bytes, 1).is_some(),
+            "a crop box that hides part of the page is a visible area"
+        );
+        assert!(visible_area(&bytes, 2).is_none(), "page 2 has no crop");
+        assert!(
+            plain_page_text(&bytes, 1).contains("Hidden marker"),
+            "the fixture must set the hidden word inside the page but outside the crop"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "cropped.pdf", dir.path());
+        let DocOutcome::Text { text, notes, .. } = outcome else {
+            panic!("expected Text outcome for a PDF with cropped pages");
+        };
+        assert!(
+            text.contains("Page 1:\nVisible line of text"),
+            "the text inside the crop box is delivered: {text:?}"
+        );
+        assert!(
+            text.contains("Straddling edge"),
+            "a glyph the crop cuts through is not text it hides: {text:?}"
+        );
+        assert!(
+            !text.contains("Hidden"),
+            "the text the crop box hides is not delivered: {text:?}"
+        );
+        assert!(
+            text.contains(&page_block(2, plain_page_text(&bytes, 2).trim())),
+            "the uncropped page reads exactly as the plain output reads it: {text:?}"
+        );
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     /// A page that could not be delivered at all is not silently absent from the

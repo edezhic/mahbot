@@ -635,7 +635,7 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
 /// for that reason — a genuine parse failure is still recorded, everything quieter is
 /// not.
 ///
-/// `usvg`/`resvg` are the vector renderer behind the `vector_rasterize` tool. It
+/// `usvg`/`resvg` are the vector renderer behind the `rasterize` tool. It
 /// complains per input — an unmatched font family, a reference it could not
 /// resolve, a span it had to fall back for — which is library noise about one
 /// caller's file rather than anything the product did or the owner must see. The

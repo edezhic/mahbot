@@ -517,6 +517,33 @@ mod tests {
         .await;
         assert_eq!(parts.len(), 2, "one file per page entry: {parts:?}");
 
+        // The page geometry the command line names: one page cropped to its left
+        // half, and that cropped page resized to both sides at once — each
+        // answered with a file in the same destination.
+        let cropped = drive(
+            &destination,
+            serde_json::json!({
+                "action": "pdf_crop",
+                "path": parts[0].to_string_lossy(),
+                "area": { "x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0 },
+                "file_name": "cropped",
+            }),
+        )
+        .await;
+        assert_eq!(cropped, [destination.join("cropped.pdf")]);
+        let resized = drive(
+            &destination,
+            serde_json::json!({
+                "action": "pdf_resize",
+                "path": cropped[0].to_string_lossy(),
+                "width": 300.0,
+                "height": 200.0,
+                "file_name": "resized",
+            }),
+        )
+        .await;
+        assert_eq!(resized, [destination.join("resized.pdf")]);
+
         // The agents' own generated directory is untouched: the destination
         // replaced it for these calls alone.
         let agents = crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME)
@@ -600,11 +627,11 @@ mod tests {
     /// one rendered, and the picture lands in the DESTINATION the caller chose —
     /// never in the agent's own generated tree.
     #[tokio::test]
-    async fn execute_renders_a_vector_file_into_the_destination_the_caller_chose() {
+    async fn execute_renders_a_file_into_the_destination_the_caller_chose() {
         crate::util::test::init_test_stores().await;
         crate::cli::mark_ready();
 
-        let destination = crate::util::test::test_root().join("cli-vector");
+        let destination = crate::util::test::test_root().join("cli-rasterize");
         let _ = tokio::fs::remove_dir_all(&destination).await;
         tokio::fs::create_dir_all(&destination)
             .await
@@ -619,7 +646,7 @@ mod tests {
         .expect("a drawing at hand");
 
         let reply = execute(CallRequest {
-            tool: "vector_rasterize".to_string(),
+            tool: "rasterize".to_string(),
             args: serde_json::json!({ "path": drawing.to_string_lossy() }),
             secrets: Vec::new(),
             output_dir: Some(destination.to_string_lossy().into_owned()),
@@ -627,13 +654,7 @@ mod tests {
         .await;
         assert_eq!(reply.outcome, CallOutcome::Done, "answer: {}", reply.answer);
 
-        let picture = std::path::PathBuf::from(
-            reply
-                .answer
-                .strip_prefix("[IMAGE:")
-                .and_then(|marker| marker.split(']').next())
-                .unwrap_or_else(|| panic!("the answer carries the marker: {}", reply.answer)),
-        );
+        let picture = marked_picture(&reply.answer);
         assert!(picture.is_absolute(), "{}", picture.display());
         assert_eq!(picture.parent(), Some(destination.as_path()));
         // A picture, not merely a file: the magic PNG carries.
@@ -653,5 +674,57 @@ mod tests {
             .is_err(),
             "a command-line call must not write into the agent's own generated directory"
         );
+
+        // One page of a PDF is the same action with the page named: the document
+        // tool writes the input (its own runtime does), and the picture comes back
+        // through the same marker as any other.
+        if crate::tools::bun::bun_binary_path().is_none() {
+            return;
+        }
+        let created = execute(CallRequest {
+            tool: "document".to_string(),
+            args: serde_json::json!({
+                "action": "create",
+                "format": "pdf",
+                "file_name": "page-source",
+                "content": [{ "type": "paragraph", "text": "a page to render" }],
+            }),
+            secrets: Vec::new(),
+            output_dir: Some(destination.to_string_lossy().into_owned()),
+        })
+        .await;
+        let source = created
+            .answer
+            .split("[FILE:")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| panic!("the PDF is named: {}", created.answer));
+        let page = execute(CallRequest {
+            tool: "rasterize".to_string(),
+            args: serde_json::json!({ "path": source.to_string_lossy(), "page": 1 }),
+            secrets: Vec::new(),
+            output_dir: Some(destination.to_string_lossy().into_owned()),
+        })
+        .await;
+        assert_eq!(page.outcome, CallOutcome::Done, "answer: {}", page.answer);
+        let page_picture = marked_picture(&page.answer);
+        assert_eq!(page_picture.parent(), Some(destination.as_path()));
+        assert_eq!(
+            tokio::fs::read(&page_picture)
+                .await
+                .expect("the page's picture is there")[..8],
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+    }
+
+    /// The picture a `rasterize` answer names by its `[IMAGE:…]` marker.
+    fn marked_picture(answer: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            answer
+                .strip_prefix("[IMAGE:")
+                .and_then(|marker| marker.split(']').next())
+                .unwrap_or_else(|| panic!("the answer carries the marker: {answer}")),
+        )
     }
 }

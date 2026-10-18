@@ -24,13 +24,13 @@
 //! "unsupported": [...], "notes": [...], "losses": [...], "class": "...",
 //! "error": "..."}`, where `placeholders` is a `fill_template` result only,
 //! `unsupported` lists the distinct characters the embedded PDF font could not
-//! draw for a PDF-writing operation, `notes` are the caveats an editing operation
+//! draw for a PDF-writing operation, `notes` are the caveats an operation
 //! discovered at run time — already-bracketed, user-facing sentences the reply
 //! appends verbatim — `losses` are the subset of those that say part of what the
-//! call asked for is NOT in the produced file (the three edit operations only;
-//! every other operation reports none): what the edit could not carry over, a
-//! reference it left naming the old cell, or something it removed beyond what was
-//! named. A note about the input's own properties — a signature that no longer
+//! call asked for is NOT in the produced file (the three Office edit operations
+//! only; every other operation reports none): what the edit could not carry over,
+//! a reference it left naming the old cell, or something it removed beyond what
+//! was named. A note about the input's own properties — a signature that no longer
 //! matches, a chart or pivot cache nothing recomputes — is not a loss. `class` is
 //! present only on a failure the kit blamed on the request ("usage": the caller
 //! can fix it, see [`read_result`]). A failure of the run itself (a timeout, a
@@ -70,9 +70,9 @@ const KIT_SCRIPT: &[u8] = include_bytes!("../assets/docgen/document-kit.js");
 
 /// The Cyrillic-covering general-text font the product ships (see
 /// `assets/docgen/NotoSans-LICENSE.txt`): the kit embeds it into the PDFs it
-/// writes or annotates, and the vector rasterizer answers text that names no
+/// writes or annotates, and the rasterizer answers text that names no
 /// family — or one the machine cannot supply — with it
-/// (see [`crate::tools::vector_rasterize`]).
+/// (see [`crate::tools::rasterize`]).
 pub(crate) const TEXT_FONT_DATA: &[u8] = include_bytes!("../assets/docgen/NotoSans-Regular.ttf");
 
 /// The shared statement of the input rules, the bounds and the marks the document
@@ -352,12 +352,12 @@ pub(crate) struct KitOutcome {
     /// empty for every operation that draws no text. Each entry is one
     /// character, missing from the produced file rather than present in it.
     pub unsupported: Vec<String>,
-    /// The caveats an editing operation discovered at run time — already
-    /// bracketed, user-facing sentences the reply appends verbatim: references or
-    /// anchors a row or column shift left naming the old cells, text that lost
-    /// several runs' formatting, a chart or pivot that keeps the values it cached,
-    /// a signature that no longer matches the edited package. Empty for every
-    /// operation that reports none.
+    /// The caveats an operation discovered at run time — already bracketed,
+    /// user-facing sentences the reply appends verbatim: references or anchors a
+    /// row or column shift left naming the old cells, text that lost several runs'
+    /// formatting, a chart or pivot that keeps the values it cached, a signature
+    /// that no longer matches the edited package, a stamp or picture a PDF page
+    /// shows only in part. Empty for every operation that reports none.
     pub notes: Vec<String>,
     /// Whether the kit itself raised at least one caveat that means part of what
     /// the call asked for is NOT in the produced file — as opposed to a note that

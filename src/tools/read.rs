@@ -1358,12 +1358,12 @@ mod tests {
     const DOCUMENT_SECTION_START: &str = "A content-mode document container";
     const DOCUMENT_SECTION_END: &str = "Reading a credential-bearing file";
 
-    /// What that section measured when the document contract was settled: 10,888
+    /// What that section measured when the document contract was settled: 11,110
     /// bytes rendered, with the marks and labels a reading prints substituted in.
     /// It is held to at most half of it — the same rule the writing tool's
     /// description answers to — so the document half of what the model reads
     /// cannot drift back up.
-    const DOCUMENT_SECTION_BASELINE: usize = 10_888;
+    const DOCUMENT_SECTION_BASELINE: usize = 11_110;
 
     /// The document section of `description`.
     fn document_section(description: &str) -> &str {

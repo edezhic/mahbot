@@ -7449,7 +7449,7 @@ mod tests {
     fn the_readonly_banner_names_the_producing_families_from_the_registry() {
         let families = crate::cli::producing_families();
         assert!(
-            families.contains("`vector`"),
+            families.contains("`rasterize`"),
             "the banner's own case: {families}"
         );
         assert!(

@@ -4,6 +4,7 @@
 // request was chosen by the caller (the Rust tool).
 import fs from "node:fs";
 import nodePath from "node:path";
+import zlib from "node:zlib";
 import PizZip from "pizzip";
 import Docxtemplater from "docxtemplater";
 import PptxGenJS from "pptxgenjs";
@@ -12,7 +13,7 @@ import {
   Table, TableRow, TableCell, WidthType, AlignmentType, NumberFormat,
 } from "docx";
 import {
-  PDFDocument, rgb, degrees, PDFDict, PDFHexString, PDFName, PDFString,
+  PDFDocument, rgb, degrees, PDFArray, PDFDict, PDFHexString, PDFName, PDFNumber, PDFString,
   PDFTextField, PDFCheckBox, PDFRadioGroup, PDFDropdown, PDFOptionList,
 } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
@@ -262,10 +263,6 @@ function webpSize(bytes) {
 // are pixels — the points-to-pixels conversion lives here alone, so no arm converts
 // a measure the others do not.
 const DEFAULT_IMAGE_WIDTH = 400;
-// The note both page-shaped arms owe when a picture they placed reaches past the
-// page it lands on: a size the caller named is drawn as named, and the answer says
-// what the page does not show rather than reporting a plain success.
-const PAST_PAGE_NOTE = "[the picture's box reaches past the page — the part beyond the page's edge is not shown on it]";
 // Whether `value` is a finite number inside `span`, a range from rules.json
 // (`min_exclusive` marks a low end the value must exceed rather than reach).
 function inSpan(value, span) {
@@ -336,6 +333,40 @@ async function embedImage(pdf, file) {
   } catch (error) {
     throw new UsageError(`cannot read ${nodePath.basename(file)} as an image: ${(error && error.message) || error}`);
   }
+}
+// What a page's or slide's own edge does not show of a box that reaches past it:
+// one sentence for the call, so a caller learns what was lost instead of the call
+// reporting a plain success. `where` is the thing it reached past — a document's
+// one page, or a slide.
+function pastEdgeNote(what, where) {
+  return `[the ${what}'s box reaches past ${where} — the part beyond ${where}'s edge is not shown on it]`;
+}
+// The same for a PDF placement, which names the pages whose visible area it
+// reached past instead.
+function pastAreaNote(what, pages) {
+  return `[the ${what}'s box reaches past the visible area of ${pagesPhrase(pages)} — the part beyond is not shown on it]`;
+}
+// The pages a request reached past, as one phrase to name them by: a run of three
+// or more collapses to `first-last` and at most the shared `note_page_ranges_max`
+// are named, so a request on a long document cannot turn one note into a
+// page-by-page listing — the reading's own notes are bounded by the same rule.
+function pagesPhrase(pages) {
+  const ordered = [...pages].sort((a, b) => a - b);
+  const ranges = [];
+  for (let i = 0; i < ordered.length; i += 1) {
+    const first = ordered[i];
+    let last = first;
+    while (i + 1 < ordered.length && ordered[i + 1] === last + 1) {
+      i += 1;
+      last = ordered[i];
+    }
+    if (ranges.length === RULES.note_page_ranges_max) {
+      ranges.push("…");
+      break;
+    }
+    ranges.push(first === last ? `${first}` : last === first + 1 ? `${first}, ${last}` : `${first}-${last}`);
+  }
+  return `${ordered.length === 1 ? "page" : "pages"} ${ranges.join(", ")}`;
 }
 
 // ── create: docx ───────────────────────────────────────────────
@@ -1126,8 +1157,34 @@ function wrapText(font, text, size, indent, maxWidth) {
 }
 
 async function createPdf(req) {
-  const { pdf, font, glyphs } = await pdfWithFont(req);
   const width = A4[0] - 2 * MARGIN;
+  // Pictures alone are one per page, fitted whole and centred: the streaming
+  // layout below would stack them down one column and let a page break cut a
+  // tall picture in two.
+  if (req.content.length && req.content.every((block) => block.type === "image")) {
+    const pdf = await freshPdf(req.metadata);
+    const height = A4[1] - 2 * MARGIN;
+    for (const block of req.content) {
+      const page = pdf.addPage(A4);
+      const image = await embedImage(pdf, block.image);
+      // The picture keeps its own proportions on its page. A block that names
+      // both sides names a box it is fitted inside whole — never a ratio to
+      // stretch to — one named side scales the other with it, and none keeps the
+      // picture's own size; the page's text area bounds whatever that is, so
+      // nothing is drawn past the page.
+      const size = imageSize(image, block.width, block.height, RULES.dimension_points, null);
+      const scale = Math.min(
+        size.width / image.width,
+        size.height / image.height,
+        width / PX_TO_POINTS / image.width,
+        height / PX_TO_POINTS / image.height,
+      );
+      const drawn = { width: image.width * scale * PX_TO_POINTS, height: image.height * scale * PX_TO_POINTS };
+      page.drawImage(image, { x: (A4[0] - drawn.width) / 2, y: (A4[1] - drawn.height) / 2, ...drawn });
+    }
+    return pdf.save();
+  }
+  const { pdf, font, glyphs } = await pdfWithFont(req);
   let page = pdf.addPage(A4);
   let y = A4[1] - MARGIN;
   const fresh = () => { page = pdf.addPage(A4); y = A4[1] - MARGIN; };
@@ -3406,7 +3463,7 @@ function addImage(xml, edit, editor) {
   // still shows, into the margin — and the answer says so, as the slide and PDF arms
   // do, rather than reporting a plain success for a size the caller named.
   if (size.width * TWIPS_PER_PIXEL > page.width - page.left || size.height * TWIPS_PER_PIXEL > page.height - page.top) {
-    editor.note(PAST_PAGE_NOTE);
+    editor.note(pastEdgeNote("picture", "the page"));
   }
   const cx = Math.max(1, Math.round(size.width * PX_TO_EMU));
   const cy = Math.max(1, Math.round(size.height * PX_TO_EMU));
@@ -7942,7 +7999,7 @@ function addSlideImage(editor, edit) {
     const shapeId = nextShapeId(namespaced);
     const slide = slideSize(zip);
     const placement = imagePlacement(image, edit, slide);
-    if (outsideSlide(placement, slide)) editor.note("[the picture's box reaches past the slide — the part beyond the slide's edge is not shown on it]");
+    if (outsideSlide(placement, slide)) editor.note(pastEdgeNote("picture", "the slide"));
     const picture = `<p:pic><p:nvPicPr><p:cNvPr id="${shapeId}" name="Image ${shapeId}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>` +
       `<p:blipFill><a:blip r:embed="${id}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>` +
       `<p:spPr><a:xfrm><a:off x="${placement.x}" y="${placement.y}"/><a:ext cx="${placement.cx}" cy="${placement.cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>`;
@@ -8050,7 +8107,7 @@ function addSlideTable(editor, edit) {
       if (edit.x_fraction == null) placement.x = Math.round((slide.width - placement.cx) / 2);
       if (edit.y_fraction == null) placement.y = Math.max(0, Math.round((slide.height - placement.cy) / 2));
     }
-    if (outsideSlide(placement, slide)) editor.note("[the table's box reaches past the slide — the part beyond the slide's edge is not shown on it]");
+    if (outsideSlide(placement, slide)) editor.note(pastEdgeNote("table", "the slide"));
     const frame = `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="${shapeId}" name="Table ${shapeId}"/><p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr><p:nvPr/></p:nvGraphicFramePr>` +
       `<p:xfrm><a:off x="${placement.x}" y="${placement.y}"/><a:ext cx="${placement.cx}" cy="${placement.cy}"/></p:xfrm>` +
       `<a:graphic><a:graphicData uri="${TABLE_GRAPHIC_URI}"><a:tbl>${tableRowsXml(headers, rows, placement)}</a:tbl></a:graphicData></a:graphic></p:graphicFrame>`;
@@ -8204,6 +8261,82 @@ function pointNumber(value, name) {
   }
   return value;
 }
+// The area a page currently shows and how it is displayed. The page's own boxes
+// may lie outside one another — the format clips nothing — so the visible area is
+// the intersection of the media and crop boxes, a degenerate one falling back to
+// the media box. Display coordinates are measured from the displayed page's
+// top-left, x right and y down, whatever the page's own rotation — the format's
+// quarter turns, of which anything else, which the format does not allow, is read
+// as the nearest — and `toUser` maps one back into PDF user space: every
+// operation that places something reads its numbers in that one frame.
+function visibleFrame(page) {
+  const media = page.getMediaBox();
+  const crop = page.getCropBox();
+  let x0 = Math.max(media.x, crop.x);
+  let y0 = Math.max(media.y, crop.y);
+  let x1 = Math.min(media.x + media.width, crop.x + crop.width);
+  let y1 = Math.min(media.y + media.height, crop.y + crop.height);
+  if (x1 <= x0 || y1 <= y0) {
+    x0 = media.x;
+    y0 = media.y;
+    x1 = media.x + media.width;
+    y1 = media.y + media.height;
+  }
+  const rotation = ((Math.round(page.getRotation().angle / 90) * 90) % 360 + 360) % 360;
+  const toUser = (dx, dy) => {
+    if (rotation === 90) return { x: x0 + dy, y: y0 + dx };
+    if (rotation === 180) return { x: x1 - dx, y: y0 + dy };
+    if (rotation === 270) return { x: x1 - dy, y: y1 - dx };
+    return { x: x0 + dx, y: y1 - dy };
+  };
+  // The inverse of `toUser`: where a user-space point falls on the displayed page.
+  const fromUser = (x, y) => {
+    if (rotation === 90) return { x: y - y0, y: x - x0 };
+    if (rotation === 180) return { x: x1 - x, y: y - y0 };
+    if (rotation === 270) return { x: y1 - y, y: x1 - x };
+    return { x: x - x0, y: y1 - y };
+  };
+  const origin = toUser(0, 0);
+  const right = toUser(1, 0);
+  const down = toUser(0, 1);
+  const sideways = rotation === 90 || rotation === 270;
+  return {
+    width: sideways ? y1 - y0 : x1 - x0,
+    height: sideways ? x1 - x0 : y1 - y0,
+    rotation,
+    origin,
+    right: { x: right.x - origin.x, y: right.y - origin.y },
+    down: { x: down.x - origin.x, y: down.y - origin.y },
+    toUser,
+    fromUser,
+  };
+}
+// The axis-aligned rectangle a set of corners encloses, in whatever space they
+// were mapped into: PDF user space for `toUser`'s corners, the displayed page's
+// for `fromUser`'s.
+function userRect(corners) {
+  const xs = corners.map((point) => point.x);
+  const ys = corners.map((point) => point.y);
+  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+}
+// The user-space box a rectangle on the displayed page covers: a rotated page
+// turns the box, and the extremes of its four mapped corners are the box pdf-lib
+// can be handed.
+function frameRect(frame, x, y, width, height) {
+  return userRect([
+    frame.toUser(x, y),
+    frame.toUser(x + width, y),
+    frame.toUser(x, y + height),
+    frame.toUser(x + width, y + height),
+  ]);
+}
+// The margins a placement gets by default: the page's own breathing room, kept to
+// a quarter of itself on each side where the visible area is too small for both
+// margins, so a fitted picture always has a box and a default placement never
+// starts outside the page.
+function insetOf(frame) {
+  return Math.min(MARGIN, frame.width / 4, frame.height / 4);
+}
 // The digits a colour must have, taken once from the shared rules.
 const HEX_COLOR = new RegExp(`^[0-9a-fA-F]{${RULES.color_digits}}$`);
 // The digits of a colour the tool accepts: `color_digits` hex digits with an
@@ -8221,11 +8354,33 @@ const hexColor = (hex) => {
   return rgb(channel(0), channel(1), channel(2));
 };
 
+// `copyPages` copies a page's own dictionary, so a MediaBox or CropBox inherited
+// from the page tree is dropped: the copy states the area its source showed. A
+// CropBox is written only where it says something its MediaBox does not, so an
+// uncropped page keeps no explicit one.
+function keepVisibleArea(copied, source) {
+  const media = source.getMediaBox();
+  const crop = source.getCropBox();
+  copied.setMediaBox(media.x, media.y, media.width, media.height);
+  if (["x", "y", "width", "height"].some((side) => Math.abs(crop[side] - media[side]) > 1e-6)) {
+    copied.setCropBox(crop.x, crop.y, crop.width, crop.height);
+  }
+}
+// Copy `indices` of `source` into `out`, in that order, each with the area it
+// showed. Both merging and splitting copy pages, so both go through here.
+async function copyPagesInto(out, source, indices) {
+  const copies = await out.copyPages(source, indices);
+  copies.forEach((page, i) => {
+    out.addPage(page);
+    keepVisibleArea(page, source.getPage(indices[i]));
+  });
+}
+
 async function pdfMerge(req) {
   const out = await freshPdf(req.metadata);
   for (const input of req.inputs) {
     const source = await loadPdf(input);
-    for (const page of await out.copyPages(source, source.getPageIndices())) out.addPage(page);
+    await copyPagesInto(out, source, source.getPageIndices());
   }
   return out.save();
 }
@@ -8240,7 +8395,7 @@ async function pdfSplit(req) {
   const outputs = [];
   for (const indices of groups) {
     const out = await freshPdf(req.metadata);
-    for (const page of await out.copyPages(source, indices)) out.addPage(page);
+    await copyPagesInto(out, source, indices);
     outputs.push(await out.save());
   }
   return outputs;
@@ -8261,6 +8416,149 @@ async function pdfRotate(req) {
   return pdf.save();
 }
 
+// The fractional area a crop names, refused unless it lies inside the page and
+// has a size: the format itself silently clips an area outside the page, so the
+// product must refuse it rather than answer a smaller crop than it asked for.
+function cropArea(area) {
+  if (typeof area !== "object" || area === null) {
+    throw new UsageError(`"area" must be an object of x, y, width and height, as fractions of the page`);
+  }
+  for (const side of ["x", "y", "width", "height"]) {
+    if (!inSpan(area[side], RULES.pdf_page_fraction)) {
+      throw new UsageError(`"area.${side}" must be ${spanBounds(RULES.pdf_page_fraction)} of the page, got: ${area[side]}`);
+    }
+  }
+  // A tolerance, so a fraction a caller computed (1/3 with 2/3) is not refused
+  // for the last bit a double cannot hold. The tool's own boundary check reads
+  // the same slack, so the two cannot disagree about an area.
+  const slack = RULES.pdf_fraction_slack;
+  if (area.width <= 0 || area.height <= 0 || area.x + area.width > 1 + slack || area.y + area.height > 1 + slack) {
+    throw new UsageError(`"area" must lie inside the page and be non-degenerate: its x and y must leave room for its width and height, and both must be positive`);
+  }
+  return area;
+}
+
+async function pdfCrop(req) {
+  const area = cropArea(req.area);
+  const pdf = await loadPdf(req.input);
+  applyEditMetadata(pdf, req.metadata);
+  // A fraction is of what the page currently SHOWS — a page cropped before is
+  // cropped again inside its own visible area — and it is measured from the
+  // displayed top-left, so a rotated page is cropped where the caller sees it.
+  // Only the visible area changes: nothing is moved or removed.
+  for (const index of pageIndices(pdf, req.pages)) {
+    const page = pdf.getPage(index);
+    const frame = visibleFrame(page);
+    if (!(frame.width > 0 && frame.height > 0)) throw new UsageError(`page ${index + 1} has no visible area to crop`);
+    const box = frameRect(frame, area.x * frame.width, area.y * frame.height, area.width * frame.width, area.height * frame.height);
+    page.setCropBox(box.x0, box.y0, box.x1 - box.x0, box.y1 - box.y0);
+  }
+  return pdf.save();
+}
+
+// Move every annotation's geometry with the content it marks, and answer how many
+// could not follow. A link's or a widget's coordinates are user-space ones, so they
+// take the transform the page's own content did: the keys the library scales
+// itself, less `/RD`, which is an inset relative to `/Rect` and so only scales.
+// A stored appearance stream is deliberately left alone: the format maps the
+// appearance's transformed bounding box into `/Rect`, so moving the rectangle is
+// what carries the drawing, and rewriting the stream would apply the move twice.
+function moveAnnotations(pdf, page, scale, tx, ty) {
+  const moved = (numbers, shift) => {
+    const points = [];
+    for (let i = 0; i + 1 < numbers.length; i += 2) points.push(scale * numbers[i] + (shift ? tx : 0), scale * numbers[i + 1] + (shift ? ty : 0));
+    return points;
+  };
+  const numbersOf = (array) => {
+    const numbers = [];
+    for (let i = 0; i < array.size(); i += 1) {
+      const value = array.lookup(i);
+      if (!(value instanceof PDFNumber)) return undefined;
+      numbers.push(value.asNumber());
+    }
+    return numbers;
+  };
+  const annots = page.node.Annots();
+  let stuck = 0;
+  for (let i = 0; i < (annots ? annots.size() : 0); i += 1) {
+    const annot = pdf.context.lookup(annots.get(i));
+    if (!(annot instanceof PDFDict)) {
+      stuck += 1;
+      continue;
+    }
+    let follows = false;
+    // `/Rect` is a pair of corners like the rest, so the same point transform
+    // keeps its order; `/CL` is the callout line a free-text note draws back to
+    // what it marks, which moves with it.
+    for (const [key, shift] of [["Rect", true], ["CL", true], ["QuadPoints", true], ["Vertices", true], ["L", true], ["RD", false]]) {
+      const list = annot.lookup(PDFName.of(key));
+      const numbers = list instanceof PDFArray ? numbersOf(list) : undefined;
+      if (numbers === undefined) continue;
+      annot.set(PDFName.of(key), pdf.context.obj(moved(numbers, shift)));
+      follows = true;
+    }
+    // An ink annotation holds one number array per stroke.
+    const inkLists = annot.lookup(PDFName.of("InkList"));
+    if (inkLists instanceof PDFArray) {
+      for (let j = 0; j < inkLists.size(); j += 1) {
+        const stroke = inkLists.lookup(j);
+        const numbers = stroke instanceof PDFArray ? numbersOf(stroke) : undefined;
+        if (numbers === undefined) continue;
+        inkLists.set(j, pdf.context.obj(moved(numbers, true)));
+        follows = true;
+      }
+    }
+    if (!follows) stuck += 1;
+  }
+  return stuck;
+}
+
+async function pdfResize(req) {
+  // Both sides are named: a side left out is not "keep the page's own".
+  for (const side of ["width", "height"]) {
+    if (!inSpan(req[side], RULES.dimension_points)) {
+      throw new UsageError(`"${side}" must be ${spanBounds(RULES.dimension_points)} points, and a resize names both sides, got: ${req[side]}`);
+    }
+  }
+  const pdf = await loadPdf(req.input);
+  applyEditMetadata(pdf, req.metadata);
+  // The pages whose annotations could not follow their content, with how many on
+  // each, so the answer carries one sentence however many pages the call names.
+  const stuck = new Map();
+  for (const index of pageIndices(pdf, req.pages)) {
+    const page = pdf.getPage(index);
+    const frame = visibleFrame(page);
+    if (!(frame.width > 0 && frame.height > 0)) throw new UsageError(`page ${index + 1} has no visible area to resize`);
+    // A resize never stretches: the page keeps its proportions and is scaled to
+    // the larger size both asked sides allow, then centred in what was asked.
+    const scale = Math.min(req.width / frame.width, req.height / frame.height);
+    const tdx = (req.width - frame.width * scale) / 2;
+    const tdy = (req.height - frame.height * scale) / 2;
+    // The display-space move in user space: `right` and `down` are where the
+    // displayed axes point, and the origin is the corner the scale keeps fixed.
+    const tx = frame.right.x * tdx + frame.down.x * tdy + (1 - scale) * frame.origin.x;
+    const ty = frame.right.y * tdx + frame.down.y * tdy + (1 - scale) * frame.origin.y;
+    // The page's own content is scaled about its origin and then moved where the
+    // fitted picture sits, through the library's own content-stream wrappers: a
+    // page with no content, an array of streams and an unnormalized dictionary
+    // are each handled the way every other pdf-lib edit handles them.
+    page.scaleContent(scale, scale);
+    page.translateContent(tx, ty);
+    // The visible area reads exactly the asked size afterwards. Both boxes are
+    // written, since a page cropped before would keep its old CropBox otherwise.
+    const box = frameRect(frame, 0, 0, req.width, req.height);
+    page.setMediaBox(box.x0, box.y0, box.x1 - box.x0, box.y1 - box.y0);
+    page.setCropBox(box.x0, box.y0, box.x1 - box.x0, box.y1 - box.y0);
+    const couldNot = moveAnnotations(pdf, page, scale, tx, ty);
+    if (couldNot) stuck.set(index + 1, couldNot);
+  }
+  const total = [...stuck.values()].reduce((sum, count) => sum + count, 0);
+  return {
+    bytes: await pdf.save(),
+    notes: stuck.size ? [`[${total} annotation(s) could not follow the resized content on ${pagesPhrase(stuck.keys())}]`] : [],
+  };
+}
+
 async function pdfText(req) {
   const pdf = await loadPdf(req.input);
   applyEditMetadata(pdf, req.metadata);
@@ -8278,19 +8576,59 @@ async function pdfText(req) {
   // `null`) is refused by `hexColor`; only an absent one takes the default.
   const color = hexColor(req.color === undefined ? "#000000" : req.color);
   const rotate = req.rotate === undefined ? 0 : pointNumber(req.rotate, "rotate");
+  // An absent opacity draws solid, exactly as before; a stated one must leave the
+  // mark visible at all, so a zero is refused rather than read as "absent".
+  const opacity = req.opacity;
+  if (opacity !== undefined && !inSpan(opacity, RULES.pdf_opacity)) {
+    throw new UsageError(`"opacity" must be ${spanBounds(RULES.pdf_opacity)}, got: ${opacity}`);
+  }
+  const alpha = opacity === undefined ? {} : { opacity };
+  const edgeAlpha = opacity === undefined ? {} : { borderOpacity: opacity };
+  // The pages a mark reached past, and whether it was the stamp's own box.
+  const past = new Set();
+  let boxCut = false;
   for (const index of pageIndices(pdf, req.pages)) {
     const page = pdf.getPage(index);
-    const { height } = page.getSize();
-    const x = req.x === undefined ? MARGIN : pointNumber(req.x, "x");
-    const y = req.y === undefined ? height / 2 : pointNumber(req.y, "y");
+    const frame = visibleFrame(page);
+    // `x` and `y` are display coordinates: `x` from the displayed left edge and
+    // `y` from its bottom edge, so a rotated page takes them where the caller
+    // sees it. The text is drawn at the user-space point they name, and a call
+    // that names no position takes the same margin a picture does.
+    const x = req.x === undefined ? insetOf(frame) : pointNumber(req.x, "x");
+    const y = req.y === undefined ? frame.height / 2 : pointNumber(req.y, "y");
+    const anchor = frame.toUser(x, frame.height - y);
+    const textWidth = font.widthOfTextAtSize(req.text, size);
+    // What the call draws, in user space: the text's own line from the anchor it
+    // is drawn at, and the stamp's border around it when one is asked for. The
+    // rotation is the caller's, about the anchor, exactly as both are drawn.
+    const marks = [{ what: "text", x: anchor.x, y: anchor.y, width: textWidth, height: font.heightAtSize(size) }];
     if (req.stamp) {
-      const textWidth = font.widthOfTextAtSize(req.text, size);
-      page.drawRectangle({ x: x - 8, y: y - 8, width: textWidth + 16, height: size + 16, borderWidth: 1.5, borderColor: rgb(0.7, 0, 0), rotate: degrees(rotate) });
+      const box = { x: anchor.x - 8, y: anchor.y - 8, width: textWidth + 16, height: size + 16 };
+      page.drawRectangle({ ...box, borderWidth: 1.5, borderColor: rgb(0.7, 0, 0), rotate: degrees(rotate), ...alpha, ...edgeAlpha });
+      marks.push({ what: "stamp", ...box });
     }
-    page.drawText(req.text, { x, y, size, font, color, rotate: degrees(rotate) });
+    page.drawText(req.text, { x: anchor.x, y: anchor.y, size, font, color, rotate: degrees(rotate), ...alpha });
     noteGlyphs(glyphs, req.text);
+    // What the page shows of each mark, mapped back to its displayed area: both
+    // the caller's rotation and the page's are the placement, so only a mark that
+    // fits the visible area is shown whole. Each mark names itself, so the note
+    // says which of them was cut rather than assuming the box encloses the text.
+    const radians = (rotate * Math.PI) / 180;
+    const cos = Math.cos(radians);
+    const sin = Math.sin(radians);
+    for (const mark of marks) {
+      const shown = userRect([[0, 0], [mark.width, 0], [0, mark.height], [mark.width, mark.height]].map(([dx, dy]) => frame.fromUser(
+        mark.x + dx * cos - dy * sin,
+        mark.y + dx * sin + dy * cos,
+      )));
+      if (shown.x0 >= 0 && shown.y0 >= 0 && shown.x1 <= frame.width && shown.y1 <= frame.height) continue;
+      if (mark.what === "stamp") boxCut = true;
+      past.add(index + 1);
+    }
   }
-  return pdf.save();
+  // A stamp is its box, so a cut box names the stamp; the text is named when the
+  // text itself is what pokes past — a size larger than the box a stamp draws.
+  return { bytes: await pdf.save(), notes: past.size ? [pastAreaNote(boxCut ? "stamp" : "text", past)] : [] };
 }
 
 async function pdfImage(req) {
@@ -8298,35 +8636,50 @@ async function pdfImage(req) {
   applyEditMetadata(pdf, req.metadata);
   const image = await embedImage(pdf, req.image);
   // Whether the call names a side: a named size is drawn exactly as named, while
-  // an unnamed one is fitted whole into the page's own text column (see
-  // `imageSize`).
+  // an unnamed one is fitted whole into the page's visible area (see `imageSize`).
   const sized = req.width != null || req.height != null;
-  // Whether a page cannot hold the picture whole. Only a place or size the call
-  // names can reach past a page — a fitted picture is inside it by construction —
-  // and the reply says so rather than reporting a plain success, the way the pptx
-  // arm's own note does.
-  let reachesPast = false;
+  // Whether a page cannot show the picture whole. Only a place or size the call
+  // names can reach past the visible area — a fitted picture is inside it by
+  // construction — and the reply says so rather than reporting a plain success,
+  // the way the pptx arm's own note does.
+  const past = new Set();
   for (const index of pageIndices(pdf, req.pages)) {
     const page = pdf.getPage(index);
-    const { width, height } = page.getSize();
+    const frame = visibleFrame(page);
+    // The page's own breathing room, so a fitted picture always has a box to fit
+    // into rather than collapsing to a dot.
+    const inset = insetOf(frame);
     const size = imageSize(image, req.width, req.height, RULES.dimension_points, {
-      width: Math.round((width - 2 * MARGIN) / PX_TO_POINTS),
-      height: Math.round((height - 2 * MARGIN) / PX_TO_POINTS),
+      width: Math.round((frame.width - 2 * inset) / PX_TO_POINTS),
+      height: Math.round((frame.height - 2 * inset) / PX_TO_POINTS),
     });
     const drawn = { width: size.width * PX_TO_POINTS, height: size.height * PX_TO_POINTS };
     // A place the call names is drawn where it names, even past the page — the
-    // documented contract. An unnamed one is the page's text column: its left edge,
-    // and, for a picture the call fitted itself, its top edge on the column's own
-    // top, so the picture hangs off neither edge. pdf-lib measures `y` to the
-    // picture's own bottom, hence the subtraction.
-    const x = req.x === undefined ? MARGIN : pointNumber(req.x, "x");
-    const y = req.y !== undefined ? pointNumber(req.y, "y") : sized ? height / 2 : height - MARGIN - drawn.height;
-    page.drawImage(image, { x, y, ...drawn });
-    if (x < 0 || y < 0 || x + drawn.width > width || y + drawn.height > height) reachesPast = true;
+    // documented contract. An unnamed one is the visible area's column: its left
+    // edge, and, for a picture the call fitted itself, its top edge on the
+    // column's own top, so the picture hangs off neither edge. `x` and `y` are
+    // display coordinates, `y` measured to the picture's own bottom.
+    const x = req.x === undefined ? inset : pointNumber(req.x, "x");
+    const y = req.y !== undefined ? pointNumber(req.y, "y") : sized ? frame.height / 2 : frame.height - inset - drawn.height;
+    const top = frame.height - y - drawn.height;
+    // The picture is turned with the page, so the displayed box is the picture's
+    // own extents and it reads upright on the page the caller sees — a rotated
+    // page would otherwise stretch it to the swapped ratio. Drawn text and a
+    // stamp are not turned this way: they keep the page's own rotation and read
+    // sideways on a rotated page, as they always have.
+    const anchor = frame.toUser(x, top + drawn.height);
+    page.drawImage(image, {
+      x: anchor.x,
+      y: anchor.y,
+      width: drawn.width,
+      height: drawn.height,
+      rotate: degrees(frame.rotation),
+    });
+    if (x < 0 || top < 0 || x + drawn.width > frame.width || top + drawn.height > frame.height) past.add(index + 1);
   }
   return {
     bytes: await pdf.save(),
-    notes: reachesPast ? [PAST_PAGE_NOTE] : [],
+    notes: past.size ? [pastAreaNote("picture", past)] : [],
   };
 }
 
@@ -8455,14 +8808,62 @@ const operations = {
       writeOut(`${scratch}/probe_portrait.pptx`, await createPptx({ size: "portrait", content: [{ type: "heading", level: 1, text: "Проверка" }, { type: "paragraph", text: "Текст" }] }));
     });
     await step("create_pdf", async () => writeOut(`${scratch}/probe.pdf`, await createPdf({ font: req.font, content: [{ type: "paragraph", text: "Проверка" }] })));
+    await step("create_pdf_pictures", async () => writeOut(`${scratch}/probe_pictures.pdf`, await createPdf({ content: [{ type: "image", image: `${scratch}/probe.png` }, { type: "image", image: `${scratch}/probe.png` }] })));
     await step("merge", async () => writeOut(`${scratch}/probe_merged.pdf`, await pdfMerge({ inputs: [`${scratch}/probe.pdf`, `${scratch}/probe.pdf`] })));
     await step("split", async () => {
       const parts = await pdfSplit({ input: `${scratch}/probe_merged.pdf`, groups: [[1], [2]] });
       parts.forEach((bytes, i) => writeOut(`${scratch}/probe_part${i + 1}.pdf`, bytes));
     });
     await step("rotate", async () => writeOut(`${scratch}/probe_rotated.pdf`, await pdfRotate({ input: `${scratch}/probe.pdf`, pages: "all", degrees: RULES.degrees_step })));
-    await step("text", async () => writeOut(`${scratch}/probe_text.pdf`, await pdfText({ input: `${scratch}/probe.pdf`, pages: "all", text: "Проверка", font: req.font })));
+    await step("crop", async () => writeOut(`${scratch}/probe_cropped.pdf`, await pdfCrop({ input: `${scratch}/probe.pdf`, pages: "all", area: { x: 0.1, y: 0.1, width: 0.8, height: 0.8 } })));
+    await step("resize", async () => writeOut(`${scratch}/probe_resized.pdf`, (await pdfResize({ input: `${scratch}/probe.pdf`, pages: "all", width: 300, height: 400 })).bytes));
+    await step("text", async () => writeOut(`${scratch}/probe_text.pdf`, (await pdfText({ input: `${scratch}/probe.pdf`, pages: "all", text: "Проверка", font: req.font, opacity: 0.5 })).bytes));
     await step("image", async () => writeOut(`${scratch}/probe_image.pdf`, (await pdfImage({ input: `${scratch}/probe.pdf`, pages: "all", image: `${scratch}/probe.png` })).bytes));
+    // A picture on a ROTATED page, read back from the page's own content stream:
+    // it must be turned with the page and read at the extents it was fitted to,
+    // rather than stretched to the swapped ones. The picture is deliberately not
+    // square (8 by 2), so a page-rotation-blind placement shows as 1:4 here.
+    await step("rotated_picture", async () => {
+      writeOut(`${scratch}/probe_wide.png`, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAgAAAACCAIAAADq9gq6AAAAEUlEQVR42mM4oaGBFTHgkgAAv8ERgdwl/oEAAAAASUVORK5CYII=", "base64"));
+      const source = await PDFDocument.create();
+      source.addPage(A4).setRotation(degrees(90));
+      writeOut(`${scratch}/probe_turned.pdf`, await source.save());
+      const drawn = await pdfImage({ input: `${scratch}/probe_turned.pdf`, pages: "all", image: `${scratch}/probe_wide.png` });
+      const produced = await PDFDocument.load(drawn.bytes);
+      const page = produced.getPage(0);
+      const contents = page.node.Contents();
+      const stream = contents instanceof PDFArray ? contents.lookup(0) : contents;
+      const operators = zlib
+        .inflateSync(stream.getContents())
+        .toString("latin1")
+        .split("\n")
+        .map((line) => line.trim());
+      // The picture's placement is the matrices the library writes just before it
+      // paints it — as many as it takes to state one transform, so the probe reads
+      // whatever it finds rather than pinning a count.
+      const painted = operators.findLastIndex((line) => line.endsWith(" Do"));
+      const matrices = [];
+      for (let i = painted - 1; i >= 0 && operators[i].endsWith(" cm"); i -= 1) {
+        const [a, b, c, d, e, f] = operators[i].split(/\s+/).map(Number);
+        matrices.unshift({ a, b, c, d, e, f });
+      }
+      if (matrices.length === 0) throw new UsageError("a placed picture writes no placement matrix");
+      // The drawing is the translate, the turn and the scale, composed in the
+      // order the stream writes them; the unit square it covers is the picture.
+      const compose = (m, n) => ({
+        a: m.a * n.a + m.c * n.b, b: m.b * n.a + m.d * n.b,
+        c: m.a * n.c + m.c * n.d, d: m.b * n.c + m.d * n.d,
+        e: m.a * n.e + m.c * n.f + m.e, f: m.b * n.e + m.d * n.f + m.f,
+      });
+      const placement = matrices.slice(1).reduce(compose, matrices[0]);
+      const frame = visibleFrame(page);
+      const shown = userRect([[0, 0], [1, 0], [0, 1], [1, 1]].map(([u, v]) => frame.fromUser(
+        placement.a * u + placement.c * v + placement.e,
+        placement.b * u + placement.d * v + placement.f,
+      )));
+      const ratio = (shown.x1 - shown.x0) / (shown.y1 - shown.y0);
+      if (Math.abs(ratio - 4) > 0.01) throw new UsageError(`a picture on a rotated page reads ${ratio.toFixed(2)}:1 where it is 4:1`);
+    });
     // A form to fill, authored here: the tool has no operation that writes one,
     // and a kit broken only in form filling must not stay advertised.
     await step("form_fill", async () => {
@@ -8609,7 +9010,17 @@ const operations = {
     return { outputs: req.outputs };
   },
   pdf_rotate: async (req) => { writeOut(req.output, await pdfRotate(req)); return { outputs: [req.output] }; },
-  pdf_text: async (req) => { writeOut(req.output, await pdfText(req)); return { outputs: [req.output] }; },
+  pdf_crop: async (req) => { writeOut(req.output, await pdfCrop(req)); return { outputs: [req.output] }; },
+  pdf_resize: async (req) => {
+    const resized = await pdfResize(req);
+    writeOut(req.output, resized.bytes);
+    return { outputs: [req.output], notes: resized.notes };
+  },
+  pdf_text: async (req) => {
+    const stamped = await pdfText(req);
+    writeOut(req.output, stamped.bytes);
+    return { outputs: [req.output], notes: stamped.notes };
+  },
   pdf_image: async (req) => {
     const drawn = await pdfImage(req);
     writeOut(req.output, drawn.bytes);

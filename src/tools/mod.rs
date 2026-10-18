@@ -30,6 +30,7 @@ pub(crate) mod mahbot_config;
 pub(crate) mod mahbot_debug;
 pub mod media_catalog;
 pub(crate) mod path;
+pub(crate) mod rasterize;
 pub(crate) mod read;
 pub(crate) mod read_document;
 pub(crate) mod research;
@@ -39,7 +40,6 @@ pub(crate) mod send;
 pub(crate) mod shell;
 pub(crate) mod sleep;
 pub(crate) mod ticket;
-pub(crate) mod vector_rasterize;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;
@@ -199,6 +199,7 @@ pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use mahbot_config::MahbotConfigTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
+pub(crate) use rasterize::RasterizeTool;
 pub(crate) use read::ReadTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
@@ -208,7 +209,6 @@ pub(crate) use sleep::SleepTool;
 pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };
-pub(crate) use vector_rasterize::VectorRasterizeTool;
 pub(crate) use video_edit::VideoEditTool;
 pub(crate) use video_gen::VideoGenTool;
 pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
@@ -2300,8 +2300,8 @@ mod tests {
                 Box::new(DocumentTool::new(path::PathAccess::Workspace)),
             ),
             (
-                "VectorRasterizeTool",
-                Box::new(VectorRasterizeTool::new(path::PathAccess::Workspace)),
+                "RasterizeTool",
+                Box::new(RasterizeTool::new(path::PathAccess::Workspace)),
             ),
         ];
         for (name, tool) in &tools {

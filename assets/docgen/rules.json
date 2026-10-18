@@ -16,6 +16,10 @@
   "column_width_chars": { "min": 0, "max": 255, "min_exclusive": false },
   "row_height_points": { "min": 0, "max": 409, "min_exclusive": false },
   "pdf_point_abs_max": 20000,
+  "pdf_page_fraction": { "min": 0, "max": 1, "min_exclusive": false },
+  "pdf_fraction_slack": 1e-9,
+  "pdf_opacity": { "min": 0, "max": 1, "min_exclusive": true },
+  "note_page_ranges_max": 8,
   "pdf_field_kinds": {
     "text": "text",
     "checkbox": "checkbox",

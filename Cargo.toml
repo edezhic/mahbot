@@ -185,7 +185,7 @@ candle-core = "0.11.0"
 # iced's image-without-codecs feature; promoted to a direct dependency for the
 # loader). Codec support is deliberately trimmed to PNG/JPEG/WebP only — gif
 # and bmp are NOT supported anywhere in the product's own routing, MIME mapping
-# or decode (the vector rasterizer decodes what a drawing embeds, through its own
+# or decode (the rasterizer decodes what a drawing embeds, through its own
 # renderer's codecs, and produces none of them).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
@@ -213,8 +213,8 @@ tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 # Also the container format for `.docx` ingestion.
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
-# Vector rendering: a vector file in, an ordinary picture out
-# (src/tools/vector_rasterize.rs). Pure Rust and in-process — no browser, no
+# Rasterizing: a vector file or a PDF page in, an ordinary picture out
+# (src/tools/rasterize.rs). Pure Rust and in-process — no browser, no
 # rendering service, nothing to configure or download — so the single
 # self-contained binary holds.
 #   text           — draw `<text>` instead of dropping it: the engine lays it out

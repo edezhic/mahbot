@@ -1,7 +1,0 @@
-Turn a vector file into an ordinary picture. The drawing is rendered and saved as a PNG in the workspace, and the picture is automatically attached to your conversation context as a native image — so you see the drawing in the same step, and you do not need to read the file separately. The tool's output still carries an [IMAGE:path] marker, which is what sends the picture to the user, exactly like a generated image.
-
-SVG is the vector format accepted today: one you wrote, one a user brought, or one authored elsewhere. What the drawing asks for is honoured — its own transparency, the images it refers to (looked up beside it, and only where you may read files yourself, so nothing outside your own reach is ever read), and its text, drawn with the fonts this machine has where the file names a family, and with the product's own font where the file names none or names a family the machine cannot supply. A script neither can draw may be missing: that approximation is accepted. The picture therefore looks slightly different on different machines.
-
-The picture keeps the drawing's aspect ratio, its long side capped at a fixed size and never enlarged, so a small drawing stays small.
-
-Refused, with a message naming the reason: a file that cannot be read, one larger than the read limit the read tool applies, an empty file, and anything that is not SVG markup — a gzip-compressed drawing that cannot be unwrapped included.

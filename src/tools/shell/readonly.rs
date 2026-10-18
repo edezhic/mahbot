@@ -6794,7 +6794,7 @@ mod tests {
             // The speech command is refused with the rest: `speak` writes a file at
             // a path the caller names, and the whole family stays out of this mode.
             ("mahbot audio speak --text hi --output /tmp/x.wav", false),
-            // The document/picture/video/vector families are refused with them:
+            // The document/picture/video/rasterize families are refused with them:
             // they run the assistant's own tools, making files with the owner's
             // account and putting them where the caller names.
             (
@@ -6807,7 +6807,7 @@ mod tests {
                 "mahbot video edit --video-url /tmp/x.mp4 --instruction restyle it",
                 false,
             ),
-            ("mahbot vector rasterize --path /tmp/x.svg", false),
+            ("mahbot rasterize --path /tmp/x.svg", false),
             ("mahbot DEBUG", false),     // a daemon launch, not `debug`
             ("mahbot foo debug", false), // the verb's own next word is the one read
             ("mahbot -V", true),

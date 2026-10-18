@@ -7,13 +7,13 @@
 //! the same immediate effect on the live product (a `send` hands its message to
 //! an agent, one-way, and the answer arrives in the owner's own assistant
 //! conversation). `mahbot document …`, `mahbot image …`, `mahbot video …` and
-//! `mahbot vector …` do the same for the product's producing tools — the
-//! document tool, the picture tool, the two video tools and the vector
-//! rasterizer — so a script reaches a document or a PDF, a picture, a clip and a
-//! rendered vector with the very operations the assistant has, the same values,
-//! limits and mutual exclusions, and the account's own model choice. The
-//! frontend never opens or writes a store itself, so there is no second writer
-//! and no second copy of any rule.
+//! `mahbot rasterize …` do the same for the product's producing tools — the
+//! document tool, the picture tool, the two video tools and the rasterizer — so a
+//! script reaches a document or a PDF, a picture, a clip and a rendered picture
+//! with the very operations the assistant has, the same values, limits and mutual
+//! exclusions, and the account's own model choice. The frontend never opens or
+//! writes a store itself, so there is no second writer and no second copy of any
+//! rule.
 //!
 //! What the producing families add is a destination: where the produced files
 //! go is the COMMAND LINE's own operand, carried beside the operation's own
@@ -87,9 +87,9 @@ Usage:
   mahbot video <gen|edit> [flags]
                          Produce or edit a clip with the RUNNING product's video
                          tools
-  mahbot vector rasterize [flags]
-                         Render a vector file into an ordinary picture with the
-                         RUNNING product's rasterizer
+  mahbot rasterize [flags]
+                         Turn a file into an ordinary picture with the RUNNING
+                         product's rasterizer
 
 Options:
   -h, --help             Print this help and exit
@@ -870,7 +870,7 @@ pub(crate) const FAMILIES: &[Family] = &[
             },
         ]),
     },
-    // ── The producing families: documents, pictures, video and vectors ─────
+    // ── The producing families: documents, pictures, video and rasterizing ──
     //
     // These families front the tools every Assistant holds regardless of its
     // account (the media models they use resolve per-user), so the command line
@@ -984,6 +984,33 @@ pub(crate) const FAMILIES: &[Family] = &[
             },
             Operation {
                 tool: "document",
+                action: Some("pdf_crop"),
+                purpose: "Crop a PDF page's visible area",
+                flags: &[
+                    DOCUMENT_PATH_FLAG,
+                    DOCUMENT_AREA_FLAG,
+                    DOCUMENT_PAGES_FLAG,
+                    DOCUMENT_METADATA_FLAG,
+                    DOCUMENT_FILE_NAME_FLAG,
+                    OUTPUT_DIR_FLAG,
+                ],
+            },
+            Operation {
+                tool: "document",
+                action: Some("pdf_resize"),
+                purpose: "Resize a PDF page, scaling its content to fit",
+                flags: &[
+                    DOCUMENT_PATH_FLAG,
+                    DOCUMENT_WIDTH_FLAG,
+                    DOCUMENT_HEIGHT_FLAG,
+                    DOCUMENT_PAGES_FLAG,
+                    DOCUMENT_METADATA_FLAG,
+                    DOCUMENT_FILE_NAME_FLAG,
+                    OUTPUT_DIR_FLAG,
+                ],
+            },
+            Operation {
+                tool: "document",
                 action: Some("pdf_text"),
                 purpose: "Draw text on a PDF's pages, as page content rather than an annotation",
                 flags: &[
@@ -995,6 +1022,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                     DOCUMENT_SIZE_FLAG,
                     DOCUMENT_COLOR_FLAG,
                     DOCUMENT_STAMP_FLAG,
+                    DOCUMENT_OPACITY_FLAG,
                     DOCUMENT_ROTATE_FLAG,
                     DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
@@ -1092,27 +1120,29 @@ pub(crate) const FAMILIES: &[Family] = &[
         ]),
     },
     Family {
-        word: "vector",
-        tools: &["vector_rasterize"],
+        word: "rasterize",
+        tools: &["rasterize"],
         protocol: crate::db::ipc::CALL_STORE,
-        purpose: "Turn a vector file into an ordinary picture with the running product's own \
-                  rasterizer",
-        surface: Surface::Operations(&[Operation {
-            tool: "vector_rasterize",
-            action: None,
-            purpose: "Render an SVG file into a PNG picture",
-            flags: &[VECTOR_PATH_FLAG, OUTPUT_DIR_FLAG],
-        }]),
+        purpose: "Turn a file into an ordinary picture with the running product's own rasterizer",
+        surface: Surface::Standalone(&[RASTER_PATH_FLAG, RASTER_PAGE_FLAG, OUTPUT_DIR_FLAG]),
     },
 ];
 
-/// The rasterizer's `path` argument: the vector file to render.
-const VECTOR_PATH_FLAG: Flag = Flag {
+/// The rasterizer's `path` argument: the file to render.
+const RASTER_PATH_FLAG: Flag = Flag {
     arg: "path",
     kind: FlagKind::Path,
     secret: false,
-    purpose: "The vector file to render (an SVG today) — resolved where this command runs, and \
-              read with the owner's own authority",
+    purpose: "The file to render — an SVG, or one page of a PDF — resolved where this command \
+              runs, and read with the owner's own authority",
+};
+
+/// The rasterizer's `page` argument: which page of a PDF to render.
+const RASTER_PAGE_FLAG: Flag = Flag {
+    arg: "page",
+    kind: FlagKind::Number,
+    secret: false,
+    purpose: "The 1-based page to render, for a PDF of several pages",
 };
 
 /// The destination flag every producing family's operation carries: the command
@@ -1244,6 +1274,15 @@ const DOCUMENT_DEGREES_FLAG: Flag = Flag {
     purpose: "The rotation to add, in degrees (a multiple of the tool's own step)",
 };
 
+/// The document tool's `area` argument — `pdf_crop`'s visible area.
+const DOCUMENT_AREA_FLAG: Flag = Flag {
+    arg: "area",
+    kind: FlagKind::Structured(&[]),
+    secret: false,
+    purpose: "The area to keep, as a JSON object of x, y, width and height — fractions of the \
+              page's visible area, from the displayed top-left",
+};
+
 /// The document tool's `text` argument — `pdf_text`.
 const DOCUMENT_TEXT_FLAG: Flag = Flag {
     arg: "text",
@@ -1300,6 +1339,14 @@ const DOCUMENT_STAMP_FLAG: Flag = Flag {
     purpose: "Draw a box around the text",
 };
 
+/// The document tool's `opacity` argument — `pdf_text`'s ink.
+const DOCUMENT_OPACITY_FLAG: Flag = Flag {
+    arg: "opacity",
+    kind: FlagKind::Number,
+    secret: false,
+    purpose: "Opacity from just above zero to one; unnamed is fully opaque",
+};
+
 /// The document tool's `rotate` argument — `pdf_text`.
 const DOCUMENT_ROTATE_FLAG: Flag = Flag {
     arg: "rotate",
@@ -1308,20 +1355,22 @@ const DOCUMENT_ROTATE_FLAG: Flag = Flag {
     purpose: "The text's own rotation, in degrees",
 };
 
-/// The document tool's `width` argument — `pdf_image`'s placed width.
+/// The document tool's `width` argument — a `pdf_image`'s placed width and a
+/// `pdf_resize`'s new page width.
 const DOCUMENT_WIDTH_FLAG: Flag = Flag {
     arg: "width",
     kind: FlagKind::Number,
     secret: false,
-    purpose: "The placed width, in points",
+    purpose: "The width, in points: a picture's placed width, or the page width a resize makes",
 };
 
-/// The document tool's `height` argument — `pdf_image`'s placed height.
+/// The document tool's `height` argument — a `pdf_image`'s placed height and a
+/// `pdf_resize`'s new page height.
 const DOCUMENT_HEIGHT_FLAG: Flag = Flag {
     arg: "height",
     kind: FlagKind::Number,
     secret: false,
-    purpose: "The placed height, in points",
+    purpose: "The height, in points: a picture's placed height, or the page height a resize makes",
 };
 
 /// The document tool's `flatten` argument — `pdf_form_fill`.
@@ -1548,8 +1597,8 @@ pub(crate) fn family_words() -> impl Iterator<Item = &'static str> {
 
 /// The family words that make files ([`produces_files`]), as the read-only
 /// surfaces name them: backticked, joined by a slash (`document`/`image`/`video`/
-/// `vector`). Written here alone, so a family added to the registry is named — and
-/// refused — by every one of them without an edit, and none can go stale.
+/// `rasterize`). Written here alone, so a family added to the registry is named —
+/// and refused — by every one of them without an edit, and none can go stale.
 pub(crate) fn producing_families() -> String {
     FAMILIES
         .iter()
@@ -2135,8 +2184,11 @@ fn family_help(family: &Family) -> String {
         // and nothing to say about how one of them is run.
         Surface::Standalone(flags) => {
             let _ = write!(out, "\nUsage: {}\n", family_syntax(family));
+            if produces_files(family) {
+                out.push_str(&producing_help());
+            }
             out.push_str("\nFlags:\n");
-            out.push_str(&flag_rows(flags.iter()));
+            out.push_str(&flag_table(flags));
             out.push_str("\n  -h, --help  Print this help and exit\n");
         }
     }
@@ -2200,6 +2252,20 @@ fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
     out
 }
 
+/// A help's flag table: the destination is stated once, in the block above, since
+/// it is the command line's own operand rather than one of the tool's arguments —
+/// and a table with nothing else in it says so.
+fn flag_table(flags: &[Flag]) -> String {
+    let flags: Vec<&Flag> = flags
+        .iter()
+        .filter(|flag| !matches!(flag.kind, FlagKind::Destination))
+        .collect();
+    if flags.is_empty() {
+        return "  none\n".to_string();
+    }
+    flag_rows(flags)
+}
+
 /// `mahbot <word> <operation> -h`: what one operation does and the flags it
 /// takes — plus the same contract the family help states, because a script
 /// author may enter here first.
@@ -2216,18 +2282,7 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
         out.push_str(&producing_help());
     }
     out.push_str("\nFlags:\n");
-    // The destination is stated once, in the block above: it is this command
-    // line's own operand rather than one of the tool's arguments, so it takes no
-    // row of the flag table.
-    let flags: Vec<&Flag> = operation
-        .flags
-        .iter()
-        .filter(|flag| !matches!(flag.kind, FlagKind::Destination))
-        .collect();
-    if flags.is_empty() {
-        out.push_str("  none\n");
-    }
-    out.push_str(&flag_rows(flags));
+    out.push_str(&flag_table(operation.flags));
     out.push_str(RUNNING_CONTRACT_HELP);
     out.push_str(EXIT_CLASS_HELP);
     out.push_str(OUTPUT_HELP);
@@ -3292,7 +3347,7 @@ mod tests {
             .collect();
         assert_eq!(
             current,
-            vec!["send", "document", "image", "video", "vector"],
+            vec!["send", "document", "image", "video", "rasterize"],
             "the families this build adds"
         );
     }

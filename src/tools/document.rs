@@ -94,7 +94,7 @@ const UNSUPPORTED_NOTE_MAX: usize = 10;
 /// `oneOf` entries and the hint for an unknown action both come from here; the
 /// dispatch `match` and [`action_schema`] spell the names again, one arm per
 /// action.
-const ACTIONS: [&str; 11] = [
+const ACTIONS: [&str; 13] = [
     "create",
     "fill_template",
     "docx_edit",
@@ -103,6 +103,8 @@ const ACTIONS: [&str; 11] = [
     "pdf_merge",
     "pdf_split",
     "pdf_rotate",
+    "pdf_crop",
+    "pdf_resize",
     "pdf_text",
     "pdf_image",
     "pdf_form_fill",
@@ -397,6 +399,19 @@ struct Rules {
     /// own length resolves.
     max_pages_per_request: usize,
     pdf_point_abs_max: f64,
+    /// The fraction of a page's visible area a `pdf_crop` names for one side of
+    /// its `area`, measured from the displayed top-left. Zero is a legal edge —
+    /// the left or top of the area — while the width and height the area states
+    /// must be above zero, which the boundary checks on the area as a whole.
+    pdf_page_fraction: Span,
+    /// The slack a `pdf_crop` area's sides may reach past [`Self::pdf_page_fraction`]'s
+    /// top end, so an area a caller computed (`1/3` wide, starting two thirds
+    /// across) is not refused for the last bit a double cannot hold. The kit's
+    /// own boundary check reads the same number, so the two cannot disagree.
+    pdf_fraction_slack: f64,
+    /// A `pdf_text` `opacity`: the ink the text and its stamp box are drawn with,
+    /// where zero would draw nothing at all.
+    pdf_opacity: Span,
     color_digits: usize,
     /// A pptx `format_text` alignment: the word a caller names, and the `algn`
     /// value ECMA-376 writes for it. The kit's writer reads the same pairs, so
@@ -1505,6 +1520,31 @@ fn action_schema(action: &str) -> Value {
             &json!({ "path": path_arg(), "degrees": degrees_arg(), "pages": pages_arg(false),
                      "metadata": metadata_entry() }),
         ),
+        "pdf_crop" => super::action_entry_schema(
+            "pdf_crop",
+            "Crop a PDF page's visible area.",
+            &["path", "area"],
+            &json!({ "path": path_arg(), "area": page_area_arg(), "pages": pages_arg(false),
+                     "metadata": metadata_entry() }),
+        ),
+        "pdf_resize" => super::action_entry_schema(
+            "pdf_resize",
+            "Resize a PDF page, scaling its content to fit.",
+            &["path", "width", "height"],
+            &json!({
+                "path": path_arg(),
+                "width": number_arg(&format!(
+                    "Page width, {} points.",
+                    RULES.dimension_points.bounds()
+                )),
+                "height": number_arg(&format!(
+                    "Page height, {} points.",
+                    RULES.dimension_points.bounds()
+                )),
+                "pages": pages_arg(false),
+                "metadata": metadata_entry(),
+            }),
+        ),
         "pdf_text" => super::action_entry_schema(
             "pdf_text",
             "Draw text on a PDF's pages, as page content rather than an annotation.",
@@ -1513,14 +1553,18 @@ fn action_schema(action: &str) -> Value {
                 "path": path_arg(),
                 "text": text_arg("The text to draw."),
                 "pages": pages_arg(false),
-                "x": point_arg("X position"),
-                "y": point_arg("Y position"),
+                "x": point_arg("X position on the page as it reads, from its left edge"),
+                "y": point_arg("Y position on the page as it reads, from its bottom edge"),
                 "size": number_arg(&format!(
                     "Font size, {} points.",
                     RULES.dimension_points.bounds()
                 )),
                 "color": color_arg("Text colour"),
                 "stamp": bool_arg("Draw a box around the text."),
+                "opacity": number_arg(&format!(
+                    "Opacity of the drawn text and its stamp box, {}; unstated draws them solid.",
+                    RULES.pdf_opacity.bounds()
+                )),
                 "rotate": number_arg(&format!(
                     "Rotation in degrees, within ±{}.",
                     RULES.pdf_point_abs_max
@@ -1536,8 +1580,8 @@ fn action_schema(action: &str) -> Value {
                 "path": path_arg(),
                 "image": pdf_image_arg(),
                 "pages": pages_arg(false),
-                "x": point_arg("X position"),
-                "y": point_arg("Y position"),
+                "x": point_arg("X position on the page as it reads, from its left edge"),
+                "y": point_arg("Y position on the page as it reads, from its bottom edge"),
                 "width": placed_size_arg("Placed width"),
                 "height": placed_size_arg("Placed height"),
                 "metadata": metadata_entry(),
@@ -1574,6 +1618,29 @@ fn degrees_arg() -> Value {
     ))
 }
 
+/// `area`: the fraction of what a page currently shows a `pdf_crop` keeps.
+fn page_area_arg() -> Value {
+    let side = |what: &str| {
+        number_arg(&format!(
+            "{what}, as a fraction of the page ({}).",
+            RULES.pdf_page_fraction.bounds()
+        ))
+    };
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["x", "y", "width", "height"],
+        "properties": {
+            "x": side("The left edge"),
+            "y": side("The top edge"),
+            "width": side("The width"),
+            "height": side("The height"),
+        },
+        "description": "The area to keep, in fractions of the page's current visible area, \
+                        measured from the displayed top-left and reaching down and right.",
+    })
+}
+
 impl DocumentTool {
     /// The one action dispatch both faces of the tool go through: `execute`
     /// renders it to its text (so an agent's view is unchanged) and
@@ -1608,6 +1675,8 @@ impl DocumentTool {
             "pdf_merge" => self.pdf_merge(ws, &args, &output).await,
             "pdf_split" => self.pdf_split(ws, &args, &output).await,
             "pdf_rotate" => self.pdf_rotate(ws, &args, &output).await,
+            "pdf_crop" => self.pdf_crop(ws, &args, &output).await,
+            "pdf_resize" => self.pdf_resize(ws, &args, &output).await,
             "pdf_text" => self.pdf_text(ws, &args, &output).await,
             "pdf_image" => self.pdf_image(ws, &args, &output).await,
             "pdf_form_fill" => self.pdf_form_fill(ws, &args, &output).await,
@@ -1916,6 +1985,69 @@ impl DocumentTool {
         self.deliver(request, &outputs, "rotated").await
     }
 
+    /// `pdf_crop` — narrow the visible area of the selected pages.
+    async fn pdf_crop(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
+        let area = require_page_area(args)?;
+        let mut request = json!({
+            "op": "pdf_crop",
+            "input": input.to_string_lossy(),
+            "area": area,
+        });
+        request["pages"] = opt_pages(args)?.kit_value();
+        set_metadata(&mut request, opt_metadata(args)?);
+        require_pdf(&input).await?;
+        let base = sanitize_base(
+            opt_string(args, "file_name")?,
+            &input_base(&input, "cropped"),
+        );
+        let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
+        request["output"] = json!(outputs[0].to_string_lossy());
+        self.deliver(request, &outputs, "cropped").await
+    }
+
+    /// `pdf_resize` — scale the selected pages to a named size.
+    async fn pdf_resize(
+        &self,
+        ws: &Workspace,
+        args: &Value,
+        output: &Path,
+    ) -> Result<super::ToolAnswer> {
+        let (input, _) = resolve_input(ws, super::get_str(args, "path")?, self.access).await?;
+        let mut request = json!({
+            "op": "pdf_resize",
+            "input": input.to_string_lossy(),
+        });
+        set_positive_number(&mut request, args, "width", &RULES.dimension_points)?;
+        set_positive_number(&mut request, args, "height", &RULES.dimension_points)?;
+        // A side left out is not "keep the page's own": the kit has no such
+        // reading of the request, and a resize always names the page it makes.
+        if let Some(missing) = ["width", "height"]
+            .into_iter()
+            .find(|side| request.get(*side).is_none())
+        {
+            anyhow::bail!(
+                "usage: missing required argument \"{missing}\" — a resize names both sides — \
+                 hint: give both \"width\" and \"height\" in points"
+            );
+        }
+        request["pages"] = opt_pages(args)?.kit_value();
+        set_metadata(&mut request, opt_metadata(args)?);
+        require_pdf(&input).await?;
+        let base = sanitize_base(
+            opt_string(args, "file_name")?,
+            &input_base(&input, "resized"),
+        );
+        let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
+        request["output"] = json!(outputs[0].to_string_lossy());
+        self.deliver(request, &outputs, "resized").await
+    }
+
     /// `pdf_text` — draw text (optionally stamped and rotated) on the pages.
     async fn pdf_text(
         &self,
@@ -1934,6 +2066,13 @@ impl DocumentTool {
         set_number(&mut request, args, "x")?;
         set_number(&mut request, args, "y")?;
         set_positive_number(&mut request, args, "size", &RULES.dimension_points)?;
+        set_bounded_number(
+            &mut request,
+            args,
+            "opacity",
+            &RULES.pdf_opacity,
+            "give a fraction just above zero",
+        )?;
         set_number(&mut request, args, "rotate")?;
         if let Some(color) = opt_string(args, "color")? {
             // A pdf argument is named quoted, as the neighbouring refusals do.
@@ -2377,8 +2516,8 @@ impl Wanted {
         match self {
             Self::Sample => "a PDF's form fields are filled with pdf_form_fill",
             Self::Package | Self::Pdf => {
-                "a PDF's own actions are pdf_merge, pdf_split, pdf_rotate, pdf_text, pdf_image and \
-                 pdf_form_fill"
+                "a PDF's own actions are pdf_merge, pdf_split, pdf_rotate, pdf_crop, pdf_resize, \
+                 pdf_text, pdf_image and pdf_form_fill"
             }
         }
     }
@@ -4849,16 +4988,94 @@ fn set_number(request: &mut Value, args: &Value, key: &str) -> Result<()> {
 /// caller passes the span that governs the measure, so what a size may be is
 /// stated by the rule rather than here.
 fn set_positive_number(request: &mut Value, args: &Value, key: &str, span: &Span) -> Result<()> {
+    set_bounded_number(request, args, key, span, "give a size in points")
+}
+
+/// [`set_number`] for a value the shared rules bound, with the hint a refusal
+/// gives: the bound is the rule's, and what a caller should do instead belongs to
+/// the measure.
+fn set_bounded_number(
+    request: &mut Value,
+    args: &Value,
+    key: &str,
+    span: &Span,
+    hint: &str,
+) -> Result<()> {
     set_number(request, args, key)?;
     if let Some(number) = request.get(key).and_then(Value::as_f64)
         && !span.contains(number)
     {
         anyhow::bail!(
-            "usage: \"{key}\" must be {}, got {number} — hint: give a size in points",
+            "usage: \"{key}\" must be {}, got {number} — hint: {hint}",
             span.bounds()
         );
     }
     Ok(())
+}
+
+/// The `area` a `pdf_crop` names: exactly `x`, `y`, `width` and `height`, each a
+/// fraction of the page's current visible area, and the four together inside it.
+/// The format silently clips an area past the page, so such an area is refused
+/// here rather than answered with a smaller crop than the caller asked for.
+fn require_page_area(args: &Value) -> Result<Value> {
+    let Some(area) = args.get("area").filter(|value| !value.is_null()) else {
+        anyhow::bail!(
+            "usage: missing required argument \"area\" — hint: name x, y, width and height as \
+             fractions of the page's visible area"
+        );
+    };
+    let Some(object) = area.as_object() else {
+        return Err(super::wrong_type(
+            "area",
+            "an object of x, y, width and height",
+            area,
+        ));
+    };
+    let names = ["x", "y", "width", "height"];
+    if let Some(unknown) = object.keys().find(|key| !names.contains(&key.as_str())) {
+        anyhow::bail!(
+            "usage: unknown area key \"{unknown}\" — hint: an area names exactly {}",
+            listed(&names)
+        );
+    }
+    let mut sides = [0f64; 4];
+    for (side, slot) in names.iter().zip(&mut sides) {
+        let Some(value) = object.get(*side) else {
+            anyhow::bail!(
+                "usage: \"area\" has no \"{side}\" — hint: name all four of {}",
+                listed(&names)
+            );
+        };
+        *slot = value
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .ok_or_else(|| super::wrong_type(&format!("area.{side}"), "a number", value))?;
+        if !RULES.pdf_page_fraction.contains(*slot) {
+            anyhow::bail!(
+                "usage: \"area.{side}\" must be {}, got {} — hint: give a fraction of the page",
+                RULES.pdf_page_fraction.bounds(),
+                *slot
+            );
+        }
+    }
+    let [x, y, width, height] = sides;
+    if width <= 0.0 || height <= 0.0 {
+        anyhow::bail!(
+            "usage: \"area\" must have a size, got {width}×{height} — hint: give a width and a \
+             height above zero"
+        );
+    }
+    // A tolerance, so an area a caller computed (1/3 wide and 2/3 across) is not
+    // refused for the last bit a double cannot hold — the kit applies the same
+    // slack, from the same rule.
+    let slack = RULES.pdf_fraction_slack;
+    if x + width > 1.0 + slack || y + height > 1.0 + slack {
+        anyhow::bail!(
+            "usage: \"area\" reaches past the page (x {x} + width {width}, y {y} + height \
+             {height}) — hint: the format would silently clip it; name an area inside the page"
+        );
+    }
+    Ok(area.clone())
 }
 
 /// Refuse an output directory that is a symlink: the reservations below name a
@@ -7014,7 +7231,10 @@ mod tests {
         )
         .await;
         assert!(
-            reply.contains("[the picture's box reaches past the slide"),
+            reply.contains(
+                "[the picture's box reaches past the slide — the part beyond the slide's edge is \
+                 not shown on it]"
+            ),
             "a picture placed past the slide's edge is not named: {reply}"
         );
     }
@@ -7826,6 +8046,79 @@ mod tests {
             ),
             "the saved page carries no 90° rotation"
         );
+    }
+
+    /// A crop's area is the caller's own fraction of the page, checked at the
+    /// boundary: an area past the page, one with no size, an unknown side, a
+    /// missing side and an absent area are refused before the kit is reached, so
+    /// the format never answers with a smaller crop than was asked for.
+    #[tokio::test]
+    async fn pdf_crop_refuses_an_area_it_cannot_crop() {
+        let (_dir, ws) = workspace();
+        // The check runs before the file is opened as a PDF, so a stub is enough.
+        let source = ws.as_path().join("stub.pdf");
+        std::fs::write(&source, b"%PDF-1.4\n").expect("write stub pdf");
+        for (area, expected) in [
+            (
+                json!({ "x": 0.5, "y": 0.0, "width": 0.6, "height": 1.0 }),
+                "reaches past the page",
+            ),
+            (
+                json!({ "x": 0.0, "y": 0.0, "width": 0.0, "height": 1.0 }),
+                "must have a size",
+            ),
+            (
+                json!({ "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0, "top": 0.0 }),
+                "unknown area key \"top\"",
+            ),
+            (
+                json!({ "x": 0.0, "y": 0.0, "width": 1.0 }),
+                "\"area\" has no \"height\"",
+            ),
+            (Value::Null, "missing required argument \"area\""),
+        ] {
+            let mut args = json!({
+                "action": "pdf_crop", "path": source.to_string_lossy(),
+            });
+            if !area.is_null() {
+                args["area"] = area;
+            }
+            let err = confined_document()
+                .execute(&ws, args)
+                .await
+                .expect_err("an area the tool cannot crop must be refused");
+            let message = err.to_string();
+            assert!(message.starts_with("usage:"), "got: {message}");
+            assert!(
+                message.contains(expected),
+                "expected {expected:?}, got: {message}"
+            );
+        }
+    }
+
+    /// A resize names both sides: one side alone is not "keep the page's own",
+    /// and the refusal says so before the kit is reached.
+    #[tokio::test]
+    async fn pdf_resize_refuses_a_single_side() {
+        let (_dir, ws) = workspace();
+        let source = ws.as_path().join("stub.pdf");
+        std::fs::write(&source, b"%PDF-1.4\n").expect("write stub pdf");
+        for side in ["width", "height"] {
+            let mut args = json!({
+                "action": "pdf_resize", "path": source.to_string_lossy(),
+            });
+            args[side] = json!(300);
+            let err = confined_document()
+                .execute(&ws, args)
+                .await
+                .expect_err("a resize with one side must be refused");
+            let message = err.to_string();
+            assert!(message.starts_with("usage:"), "got: {message}");
+            assert!(
+                message.contains("a resize names both sides"),
+                "got: {message}"
+            );
+        }
     }
 
     /// A page past the document's end is refused with a message that names the
@@ -9241,7 +9534,8 @@ mod tests {
 
         // A size the call names is the size drawn, even when it reaches past the
         // page: a stated place and size are the caller's, and the answer says the
-        // picture reaches past the page rather than reporting a plain success.
+        // picture reaches past the page's visible area rather than reporting a
+        // plain success.
         let named = run(
             &ws,
             json!({
@@ -9252,7 +9546,7 @@ mod tests {
         )
         .await;
         assert!(
-            named.contains("reaches past the page"),
+            named.contains("reaches past the visible area"),
             "a picture drawn past the page is not named: {named}"
         );
         let pdf = parsed_pdf(&single(&named));
@@ -9293,9 +9587,253 @@ mod tests {
             y + height
         );
         assert!(
-            !anchored.contains("reaches past the page"),
+            !anchored.contains("reaches past the visible area"),
             "a picture inside the page is reported as past it: {anchored}"
         );
+    }
+
+    /// A crop narrows the visible area and nothing else: the saved page's boxes
+    /// read the fractions asked, as a strict part of the boxes it started with.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_crop_narrows_the_visible_area() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = pdf_with(&ws, "whole", "Страница целиком").await;
+        let before = parsed_pdf(&source);
+        let before = before.pages().first().expect("one page").crop_box();
+        let cropped = run(
+            &ws,
+            json!({
+                "action": "pdf_crop", "file_name": "narrowed",
+                "path": source.to_string_lossy(),
+                "area": { "x": 0.25, "y": 0.25, "width": 0.5, "height": 0.5 },
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&cropped));
+        let page = pdf.pages().first().expect("one page");
+        let crop = page.crop_box();
+        let media = page.media_box();
+        assert!(
+            crop.x0 > media.x0 && crop.y0 > media.y0 && crop.x1 < media.x1 && crop.y1 < media.y1,
+            "the cropped page is not a strict part of its {media:?} page: {crop:?}"
+        );
+        assert!(
+            (crop.width() - before.width() * 0.5).abs() < 0.5
+                && (crop.height() - before.height() * 0.5).abs() < 0.5,
+            "the crop does not read the fractions asked: {crop:?} of {before:?}"
+        );
+    }
+
+    /// A crop is honest on both ends: the page's text that the new visible area
+    /// hides is not delivered by a reading of the produced file.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_crop_hides_the_text_it_crops_away() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = pdf_with(&ws, "whole", "Начало страницы").await;
+        assert!(
+            converted_text(&ws, &source)
+                .await
+                .contains("Начало страницы"),
+            "the whole page does not read its own text"
+        );
+        // The text is laid out at the page's left margin, so keeping only the
+        // right half of the page hides every line of it.
+        let cropped = run(
+            &ws,
+            json!({
+                "action": "pdf_crop", "file_name": "right-half",
+                "path": source.to_string_lossy(),
+                "area": { "x": 0.5, "y": 0.0, "width": 0.5, "height": 1.0 },
+            }),
+        )
+        .await;
+        let text = converted_text(&ws, &single(&cropped)).await;
+        assert!(
+            !text.contains("Начало страницы"),
+            "the reading delivered text the crop hides: {text}"
+        );
+    }
+
+    /// A page's visible area is stated on the page by a crop and survives the
+    /// merge and split paths, which copy a page's own dictionary and would
+    /// otherwise drop an area inherited from the source's page tree.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_merge_and_split_keep_a_cropped_pages_visible_area() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = pdf_with(&ws, "whole", "Страница целиком").await;
+        let cropped = run(
+            &ws,
+            json!({
+                "action": "pdf_crop", "file_name": "narrowed",
+                "path": source.to_string_lossy(),
+                "area": { "x": 0.2, "y": 0.2, "width": 0.6, "height": 0.6 },
+            }),
+        )
+        .await;
+        let cropped_path = single(&cropped);
+        let expected = parsed_pdf(&cropped_path)
+            .pages()
+            .first()
+            .expect("one page")
+            .crop_box();
+
+        let merged = run(
+            &ws,
+            json!({
+                "action": "pdf_merge", "file_name": "merged",
+                "paths": [cropped_path.to_string_lossy(), cropped_path.to_string_lossy()],
+            }),
+        )
+        .await;
+        let merged_path = single(&merged);
+        let pdf = parsed_pdf(&merged_path);
+        for index in 0..2 {
+            let crop = pdf.pages().get(index).expect("a carried page").crop_box();
+            assert!(
+                (crop.width() - expected.width()).abs() < 0.5
+                    && (crop.height() - expected.height()).abs() < 0.5,
+                "page {index} lost the visible area it carried: {crop:?} of {expected:?}"
+            );
+        }
+
+        let split = run(
+            &ws,
+            json!({
+                "action": "pdf_split", "file_name": "split",
+                "path": merged_path.to_string_lossy(), "pages": ["1"],
+            }),
+        )
+        .await;
+        let crop = parsed_pdf(&single(&split))
+            .pages()
+            .first()
+            .expect("one page")
+            .crop_box();
+        assert!(
+            (crop.width() - expected.width()).abs() < 0.5
+                && (crop.height() - expected.height()).abs() < 0.5,
+            "the split lost the visible area it carried: {crop:?} of {expected:?}"
+        );
+    }
+
+    /// A resize writes the size it names to both boxes of the page — on a page
+    /// that started at another size and on one already cropped, whose smaller
+    /// visible area must not survive as the new page's.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_resize_writes_the_asked_size() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let source = pdf_with(&ws, "original", "Страница").await;
+        let resized = run(
+            &ws,
+            json!({
+                "action": "pdf_resize", "file_name": "resized",
+                "path": source.to_string_lossy(), "width": 300, "height": 200,
+            }),
+        )
+        .await;
+        let assert_size = |path: &Path| {
+            let pdf = parsed_pdf(path);
+            let page = pdf.pages().first().expect("one page");
+            for (kind, rect) in [("media", page.media_box()), ("crop", page.crop_box())] {
+                assert!(
+                    (rect.width() - 300.0).abs() < 0.5 && (rect.height() - 200.0).abs() < 0.5,
+                    "the {kind} box does not read the size asked: {rect:?}"
+                );
+            }
+        };
+        assert_size(&single(&resized));
+
+        let cropped = run(
+            &ws,
+            json!({
+                "action": "pdf_crop", "file_name": "narrowed",
+                "path": source.to_string_lossy(),
+                "area": { "x": 0.25, "y": 0.25, "width": 0.5, "height": 0.5 },
+            }),
+        )
+        .await;
+        let resized_again = run(
+            &ws,
+            json!({
+                "action": "pdf_resize", "file_name": "resized-again",
+                "path": single(&cropped).to_string_lossy(), "width": 120, "height": 80,
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&resized_again));
+        let page = pdf.pages().first().expect("one page");
+        for (kind, rect) in [("media", page.media_box()), ("crop", page.crop_box())] {
+            assert!(
+                (rect.width() - 120.0).abs() < 0.5 && (rect.height() - 80.0).abs() < 0.5,
+                "a resize of a cropped page does not read the size asked: the {kind} box is \
+                 {rect:?}"
+            );
+        }
+    }
+
+    /// A PDF whose content is pictures only gives each picture its own page,
+    /// fitted whole, with no page before the first and no two on one page.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn pdf_creation_gives_each_picture_its_own_page() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let wide = ws.as_path().join("wide.png");
+        std::fs::write(&wide, noisy_png(80, 20)).expect("write png");
+        let tall = ws.as_path().join("tall.png");
+        std::fs::write(&tall, noisy_png(20, 90)).expect("write png");
+        let created = run(
+            &ws,
+            json!({
+                "action": "create", "format": "pdf", "file_name": "pictures",
+                "content": [
+                    { "type": "image", "image": wide.to_string_lossy() },
+                    { "type": "image", "image": tall.to_string_lossy() },
+                ],
+            }),
+        )
+        .await;
+        let pdf = parsed_pdf(&single(&created));
+        let pages = pdf.pages();
+        assert_eq!(pages.len(), 2, "one page per picture");
+        for (index, page) in pages.iter().enumerate() {
+            let pictures = painted_pictures(page);
+            assert_eq!(
+                pictures.len(),
+                1,
+                "page {} paints {} pictures rather than one",
+                index + 1,
+                pictures.len()
+            );
+            let (x, y, width, height) = pictures[0];
+            let page_box = page.media_box();
+            assert!(
+                x >= page_box.x0
+                    && y >= page_box.y0
+                    && x + width <= page_box.x1
+                    && y + height <= page_box.y1,
+                "the picture on page {} runs off its {page_box:?} page",
+                index + 1
+            );
+        }
     }
 
     /// An image whose bytes are not a whole PNG or JPEG is refused for every
@@ -21881,8 +22419,8 @@ mod tests {
     /// the path-access variant this test builds, and the description and the
     /// serialized schema together. Adding to the contract re-records both here, so
     /// growth is a decision made in this test rather than a drift.
-    const BASELINE_DESCRIPTION: usize = 9_010;
-    const BASELINE_TOTAL: usize = 32_984;
+    const BASELINE_DESCRIPTION: usize = 10_168;
+    const BASELINE_TOTAL: usize = 36_516;
 
     /// The whole per-action contract is one compact value: every action has an
     /// entry, each entry declares exactly the arguments that action takes (and the

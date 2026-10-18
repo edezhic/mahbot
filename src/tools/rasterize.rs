@@ -1,19 +1,20 @@
-//! The `vector_rasterize` tool: a vector file in, an ordinary picture out.
+//! The `rasterize` tool: a file in, an ordinary picture out.
 //!
-//! A vector file is markup, and the product could only read one as text. This
-//! renders it with the engine's own rasterizer ([`resvg`] — pure Rust, in
-//! process, nothing to configure) into a PNG, the product's usual picture format:
-//! the assistant sees it through the ordinary tool-result payload, sends it to the
+//! A vector file is markup, and a PDF is a container: the product could only read
+//! either as text or as extracted pages. This renders it with the engine's own
+//! rasterizer ([`resvg`] for SVG — pure Rust, in process, nothing to configure;
+//! hayro for a PDF page) into a PNG, the product's usual picture format: the
+//! assistant sees it through the ordinary tool-result payload, sends it to the
 //! user through the ordinary `[IMAGE:path]` marker, and the file itself is a
 //! picture like any other. Nothing about the way pictures are shown or delivered
 //! changes, and neither does the document pipeline this action deliberately sits
 //! outside of.
 //!
-//! SVG is the vector format accepted today. The tool is named and described by the
-//! action rather than by that format, so a further one is a further input rather
-//! than a new tool.
+//! SVG and one page of a PDF are the inputs accepted today. The tool is named and
+//! described by the action rather than by those formats, so a further one is a
+//! further input rather than a new tool.
 //!
-//! Three rules the implementation exists to hold:
+//! Four rules the implementation exists to hold:
 //!
 //! * **The caller's boundary.** The drawing, and every resource it refers to, are
 //!   resolved through the same gate an ordinary read goes through — on both the
@@ -30,13 +31,20 @@
 //! * **A bounded, contained render.** The picture's long side is capped, the work
 //!   runs on a blocking thread with a panic that becomes an ordinary refusal, and
 //!   a compressed input is unwrapped here, bounded by the limit any input obeys.
+//! * **One page of a PDF.** A PDF of several pages is rendered one named page at a
+//!   time: the page's visible area (a crop honoured), a refusal that says how many
+//!   pages there are when `page` is missing or past the end, and nothing
+//!   interactive — form values, comments, links — in the picture.
 
 use std::borrow::Cow;
+use std::io::Cursor;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use hayro::hayro_syntax::{DecryptionError, LoadPdfError, Pdf};
+use image::ImageFormat;
 use resvg::tiny_skia;
 use resvg::usvg;
 use resvg::usvg::fontdb;
@@ -46,32 +54,36 @@ use tokio::sync::Semaphore;
 use super::path::PathAccess;
 use crate::{Tool, Workspace};
 
-/// The longest side of a produced picture, in pixels: a larger drawing is scaled
-/// down to it with its aspect ratio kept, and one already smaller is left at its
-/// own size — never enlarged. 2048 is the same order as the page rasters the
-/// document readers produce, and bounds one render at 16 MB of pixels.
+/// The longest side of a produced picture, in pixels: a larger drawing or page is
+/// scaled down to it with its aspect ratio kept, and one already smaller is left
+/// at its own size — never enlarged. 2048 is the same order as the page rasters
+/// the document readers produce, and bounds one render at 16 MB of pixels.
 const MAX_LONG_SIDE_PX: u32 = 2048;
 
 /// The first two bytes of a gzip stream — how a compressed drawing is told from
 /// markup without parsing it.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
+/// The first five bytes of a PDF — how a PDF is told from SVG markup without
+/// parsing it.
+const PDF_MAGIC: &[u8; 5] = b"%PDF-";
+
 /// How many renders may run at once, process-wide. The engine is synchronous and
 /// one render holds a whole picture's worth of pixels for as long as it runs, so
 /// this bounds the work the action can put on the machine at once.
 static RENDERS: Semaphore = Semaphore::const_new(2);
 
-/// The `vector_rasterize` tool. `access` is the caller's [`PathAccess`], fixed
-/// when the role's toolset is built: the drawing and the resources it refers to
-/// are read under it exactly as a `read` of them would be.
-pub(crate) struct VectorRasterizeTool {
+/// The `rasterize` tool. `access` is the caller's [`PathAccess`], fixed when the
+/// role's toolset is built: the drawing and the resources it refers to are read
+/// under it exactly as a `read` of them would be.
+pub(crate) struct RasterizeTool {
     access: PathAccess,
 }
 
-impl VectorRasterizeTool {
+impl RasterizeTool {
     /// The tool's own name: what [`Tool::name`] reports, the prompt asset that
     /// describes it, and the tool a command-line family fronts.
-    const NAME: &'static str = "vector_rasterize";
+    const NAME: &'static str = "rasterize";
 
     #[must_use]
     pub(crate) const fn new(access: PathAccess) -> Self {
@@ -80,7 +92,7 @@ impl VectorRasterizeTool {
 }
 
 #[async_trait]
-impl Tool for VectorRasterizeTool {
+impl Tool for RasterizeTool {
     fn name(&self) -> &'static str {
         Self::NAME
     }
@@ -94,7 +106,12 @@ impl Tool for VectorRasterizeTool {
             &json!({
                 "path": {
                     "type": "string",
-                    "description": "Path to the vector file to render (an SVG today) — anywhere you may read files"
+                    "description": "Path to the file to render — an SVG, or one page of a PDF — anywhere you may read files"
+                },
+                "page": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The 1-based page to render, for a PDF of several pages; a PDF's one page needs none, and naming a page for any other file is refused."
                 }
             }),
             &["path"],
@@ -110,13 +127,13 @@ impl Tool for VectorRasterizeTool {
     }
 }
 
-impl VectorRasterizeTool {
+impl RasterizeTool {
     /// Render the file one call names, and answer the picture the product wrote.
     async fn rasterize(&self, ws: &Workspace, args: &serde_json::Value) -> anyhow::Result<PathBuf> {
         let requested = super::get_str(args, "path")?;
-        // The drawing is resolved through the read gate before anything else, so a
+        // The input is resolved through the read gate before anything else, so a
         // path the caller may not read is never even stat'ed — and the boundary
-        // every resource it refers to is held to is this same one.
+        // every resource a drawing refers to is held to is this same one.
         let drawing =
             super::path::resolve_read_target(ws.as_path(), requested, self.access).await?;
         let unreadable = |error: std::io::Error| {
@@ -125,19 +142,19 @@ impl VectorRasterizeTool {
         let meta = tokio::fs::metadata(&drawing).await.map_err(unreadable)?;
         if !meta.is_file() {
             anyhow::bail!(
-                "cannot render {requested}: it is not a regular file — hint: name the vector file \
-                 itself, not a directory"
+                "cannot render {requested}: it is not a regular file — hint: name the file itself, \
+                 not a directory"
             );
         }
         super::check_size_within(
             &meta,
             super::MAX_FILE_SIZE_BYTES,
-            "Vector file is too large to render",
+            "File is too large to render",
         )?;
         let data = tokio::fs::read(&drawing).await.map_err(unreadable)?;
         if data.is_empty() {
             anyhow::bail!(
-                "cannot render {requested}: the file is empty — hint: write or fetch the drawing \
+                "cannot render {requested}: the file is empty — hint: write or fetch the file \
                  before rendering it"
             );
         }
@@ -146,13 +163,25 @@ impl VectorRasterizeTool {
         let root = ws.as_path().to_path_buf();
         let access = self.access;
         let name = requested.to_string();
+        let page = super::get_opt_u64(args, "page")?;
+        let is_pdf = data.starts_with(PDF_MAGIC);
+        // A page names one page of a PDF; any other file is a single picture with
+        // no pages to choose from, so naming one there is refused rather than
+        // silently ignored.
+        if page.is_some() && !is_pdf {
+            anyhow::bail!(
+                "cannot render {requested}: naming a page is for a PDF, and this file has no pages"
+            );
+        }
         let _permit = RENDERS
             .acquire()
             .await
             .expect("the render semaphore is never closed");
-        let rendered =
-            tokio::task::spawn_blocking(move || render_png(&data, &dir, &root, access, &name))
-                .await;
+        let rendered = if is_pdf {
+            tokio::task::spawn_blocking(move || render_pdf_page_png(&data, &name, page)).await
+        } else {
+            tokio::task::spawn_blocking(move || render_png(&data, &dir, &root, access, &name)).await
+        };
         let picture = match rendered {
             Ok(rendered) => rendered?,
             // A contained render: whatever killed the render on this file — a
@@ -167,9 +196,78 @@ impl VectorRasterizeTool {
     }
 }
 
+/// Render one page of a PDF into a PNG picture: parse it, choose the page, size
+/// the render, rasterize it, encode it. Synchronous, and run on a blocking
+/// thread (see [`RasterizeTool::rasterize`]). `name` is the caller's own spelling
+/// of the input, which every refusal quotes back, and `page_arg` is the page the
+/// call named, if any.
+#[expect(clippy::cast_precision_loss)] // the cap is 2048, exactly an f32
+fn render_pdf_page_png(data: &[u8], name: &str, page_arg: Option<u64>) -> anyhow::Result<Vec<u8>> {
+    // The structure parse also settles encryption: hayro decrypts with the empty
+    // user password, so an owner-password-only document opens, while one that
+    // needs a password is refused. A panic in the parse is this tool's own
+    // unreadable-input refusal rather than the process's end.
+    let pdf = match std::panic::catch_unwind(|| Pdf::new(data.to_vec())) {
+        Ok(Ok(pdf)) => pdf,
+        Ok(Err(LoadPdfError::Decryption(DecryptionError::PasswordProtected))) => anyhow::bail!(
+            "cannot render {name}: it is password-protected — the tool cannot open an encrypted PDF"
+        ),
+        Ok(Err(_)) | Err(_) => {
+            anyhow::bail!("cannot render {name}: its bytes do not form a PDF this tool can read")
+        }
+    };
+    let count = pdf.pages().len();
+    // No page is named or chosen in a document that has none.
+    if count == 0 {
+        anyhow::bail!("cannot render {name}: this PDF has no pages");
+    }
+    let page_number = match page_arg {
+        Some(page) => {
+            // A page argument the platform cannot index is past any document's
+            // end, and is refused the same way.
+            let page = usize::try_from(page).unwrap_or(usize::MAX);
+            if page == 0 || page > count {
+                anyhow::bail!(
+                    "cannot render {name}: no page {page}: this document has {count} page(s)"
+                );
+            }
+            page
+        }
+        None => match count {
+            1 => 1,
+            count => anyhow::bail!(
+                "cannot render {name}: this PDF has {count} pages — name the page to render with \
+                 \"page\""
+            ),
+        },
+    };
+    // The number was checked against the length of this same page tree, so the
+    // lookup cannot miss.
+    let page = pdf
+        .pages()
+        .get(page_number - 1)
+        .expect("the page number was checked against this page tree");
+    // A page is never enlarged past its own size — the cap only brings a large
+    // one down — and its pixels come from the one page-to-pixels render the
+    // document readings share; the cap and the PNG encoding are this tool's own.
+    let Some(image) = crate::document::render_page_image(page, MAX_LONG_SIDE_PX as f32, 1.0) else {
+        anyhow::bail!(
+            "cannot render {name}: the page produced no pixels — hint: try a different page or \
+             file"
+        );
+    };
+    let mut png = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(|error| {
+            anyhow::anyhow!("cannot render {name}: the picture could not be encoded ({error})")
+        })?;
+    Ok(png)
+}
+
 /// Render one drawing into a PNG picture: parse it, size it, rasterize it, encode
 /// it. Synchronous, and run on a blocking thread (see
-/// [`VectorRasterizeTool::rasterize`]). `dir` is the drawing's own directory, so a
+/// [`RasterizeTool::rasterize`]). `dir` is the drawing's own directory, so a
 /// relative reference resolves beside it, and `name` is the caller's own spelling
 /// of the input, which every refusal quotes back.
 fn render_png(
@@ -202,7 +300,7 @@ fn render_png(
                 else {
                     tracing::debug!(
                         href = %href,
-                        "vector rasterize: a referenced resource is not readable, skipped"
+                        "rasterize: a referenced resource is not readable, skipped"
                     );
                     return None;
                 };
@@ -295,7 +393,8 @@ fn refusal(name: &str, error: &usvg::Error) -> anyhow::Error {
         usvg::Error::SvgzFeatureNotEnabled => "its compressed form could not be unwrapped",
     };
     anyhow::anyhow!(
-        "cannot render {name}: {reason} — hint: SVG is the vector format this renders today"
+        "cannot render {name}: {reason} — hint: this input is read as SVG, and a PDF starts with \
+         its own marker"
     )
 }
 
@@ -360,18 +459,41 @@ mod tests {
         (dir, ws)
     }
 
-    /// Render `name` out of `ws` and answer the picture the tool produced.
-    async fn rendered(access: PathAccess, ws: &Workspace, name: &str) -> RgbaImage {
-        let answer = VectorRasterizeTool::new(access)
-            .execute(ws, json!({ "path": name }))
+    /// The bytes of the picture one call produces.
+    async fn rendered_png(access: PathAccess, ws: &Workspace, args: serde_json::Value) -> Vec<u8> {
+        let answer = RasterizeTool::new(access)
+            .execute(ws, args)
             .await
-            .expect("the drawing renders");
+            .expect("the input renders");
         let produced = answer
             .strip_prefix("[IMAGE:")
             .and_then(|marker| marker.strip_suffix(']'))
             .unwrap_or_else(|| panic!("the answer carries the delivery marker: {answer}"));
-        let bytes = std::fs::read(produced).expect("the produced picture is on disk");
+        std::fs::read(produced).expect("the produced picture is on disk")
+    }
+
+    /// Render `name` out of `ws` and answer the picture the tool produced.
+    async fn rendered(access: PathAccess, ws: &Workspace, name: &str) -> RgbaImage {
+        let bytes = rendered_png(access, ws, json!({ "path": name })).await;
         image::load_from_memory(&bytes).unwrap().to_rgba8()
+    }
+
+    /// A PDF of `pages` pages, each a red rectangle of its `(width, height)`.
+    fn pdf_with_pages(pages: &[(u32, u32)]) -> Vec<u8> {
+        let entries: Vec<String> = pages
+            .iter()
+            .map(|(width, height)| format!("/MediaBox [0 0 {width} {height}]"))
+            .collect();
+        let contents: Vec<String> = pages
+            .iter()
+            .map(|(width, height)| format!("1 0 0 rg 0 0 {width} {height} re f"))
+            .collect();
+        let fixtures: Vec<(&str, &[u8])> = entries
+            .iter()
+            .zip(&contents)
+            .map(|(entries, content)| (entries.as_str(), content.as_bytes()))
+            .collect();
+        crate::document::test_fixtures::multi_page_pdf(&fixtures)
     }
 
     /// A solid 20x20 red PNG, for a drawing that refers to a picture.
@@ -541,12 +663,106 @@ mod tests {
             ("huge.svg", "too large"),
             ("absent.svg", "File not found"),
         ] {
-            let error = VectorRasterizeTool::new(PathAccess::Unrestricted)
+            let error = RasterizeTool::new(PathAccess::Unrestricted)
                 .execute(&ws, json!({ "path": name }))
                 .await
                 .expect_err("the file is unusable");
             let text = refused(error);
             assert!(text.contains(reason), "{name}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pdf_page_becomes_a_picture_of_the_page() {
+        // One small landscape page and one tall page past the cap: the first
+        // keeps its own size and aspect ratio, the second is scaled down with its
+        // long side capped and its portrait orientation kept.
+        let small = pdf_with_pages(&[(200, 100)]);
+        let large = pdf_with_pages(&[(100, 4000)]);
+        let (_dir, ws) = workspace(&[("small.pdf", &small), ("large.pdf", &large)]);
+
+        let bytes = rendered_png(
+            PathAccess::Unrestricted,
+            &ws,
+            json!({ "path": "small.pdf" }),
+        )
+        .await;
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            "a PDF page becomes an ordinary PNG"
+        );
+        let picture = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        assert_eq!(
+            picture.dimensions(),
+            (200, 100),
+            "a page inside the cap keeps its own size and landscape orientation"
+        );
+
+        let tall = rendered(PathAccess::Unrestricted, &ws, "large.pdf").await;
+        assert_eq!(
+            tall.height(),
+            MAX_LONG_SIDE_PX,
+            "a page past the cap is scaled down to its long side"
+        );
+        assert!(
+            tall.width() < tall.height(),
+            "the page's portrait orientation is kept"
+        );
+    }
+
+    /// The page picture shows the page's visible area: a CropBox narrower than
+    /// the page is what the picture measures, not the whole MediaBox.
+    #[tokio::test]
+    async fn a_pdf_pages_picture_honours_its_crop_box() {
+        let cropped = crate::document::test_fixtures::multi_page_pdf(&[(
+            "/MediaBox [0 0 400 200] /CropBox [100 50 300 150]",
+            b"1 0 0 rg 0 0 400 200 re f",
+        )]);
+        let (_dir, ws) = workspace(&[("cropped.pdf", cropped.as_slice())]);
+        let picture = rendered(PathAccess::Unrestricted, &ws, "cropped.pdf").await;
+        assert_eq!(
+            picture.dimensions(),
+            (200, 100),
+            "the picture measures the visible area, not the media box"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pdf_page_that_cannot_be_chosen_is_refused_with_the_count() {
+        let two_pages = pdf_with_pages(&[(200, 100), (300, 150)]);
+        let no_pages = pdf_with_pages(&[]);
+        let (_dir, ws) = workspace(&[
+            ("two.pdf", two_pages.as_slice()),
+            ("none.pdf", no_pages.as_slice()),
+            ("drawing.svg", RED_HALF.as_bytes()),
+        ]);
+
+        let refused = |error: anyhow::Error| format!("{error:#}");
+        for (args, reason) in [
+            (
+                json!({ "path": "two.pdf" }),
+                "this PDF has 2 pages — name the page to render",
+            ),
+            (
+                json!({ "path": "two.pdf", "page": 5 }),
+                "no page 5: this document has 2 page(s)",
+            ),
+            (
+                json!({ "path": "none.pdf", "page": 1 }),
+                "this PDF has no pages",
+            ),
+            (
+                json!({ "path": "drawing.svg", "page": 1 }),
+                "naming a page is for a PDF, and this file has no pages",
+            ),
+        ] {
+            let error = RasterizeTool::new(PathAccess::Unrestricted)
+                .execute(&ws, args)
+                .await
+                .expect_err("the page cannot be chosen");
+            let text = refused(error);
+            assert!(text.contains(reason), "{text}");
         }
     }
 }
