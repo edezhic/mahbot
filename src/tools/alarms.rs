@@ -71,7 +71,7 @@ impl Tool for AddAlarmTool {
             "trigger".to_string(),
             json!({
                 "type": "object",
-                "description": "Optional check to run at fire time: a custom tool available to you and the arguments it receives. Wakes you only when the check reports something, and removes the alarm when the check cannot run cleanly.",
+                "description": crate::prompt::load_prompt("tool/add_alarm_trigger.md").trim(),
                 "properties": {
                     "tool": { "type": "string", "description": "Name of the custom tool, as listed in the <custom-tools> block" },
                     "args": { "type": "object", "description": "The tool's arguments, keyed by parameter name; only the parameters it declares are accepted" }

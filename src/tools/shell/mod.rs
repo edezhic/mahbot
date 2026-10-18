@@ -1655,6 +1655,9 @@ pub(crate) struct ProgramOutcome {
     pub output: String,
     /// Whether the program emitted anything at all.
     pub has_output: bool,
+    /// The run was stopped by its wall-clock ceiling rather than finishing: a
+    /// verdict about the machine, not about the check.
+    pub timed_out: bool,
 }
 
 /// Build the outcome for a run that produced (possibly partial) raw streams.
@@ -1667,6 +1670,7 @@ fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) 
         // The raw streams decide: only a run that emitted nothing at all
         // reported nothing.
         has_output: !stdout.is_empty() || !stderr.is_empty(),
+        timed_out: false,
     }
 }
 
@@ -1687,18 +1691,28 @@ async fn run_program(
 }
 
 /// Perform one [`run_command_with_timeout`] call with the bounds every direct
-/// run is held to: [`DEFAULT_SHELL_TIMEOUT_SECS`], the per-pipe output cap and
-/// the post-exit drain bound. `owner` decides the run's containment.
-async fn run_bounded(mut cmd: tokio::process::Command, owner: RunOwner) -> ShellRunResult {
+/// run is held to: `timeout` as the whole-run ceiling, the per-pipe output cap
+/// and the post-exit drain bound. `owner` decides the run's containment.
+async fn run_bounded_within(
+    mut cmd: tokio::process::Command,
+    owner: RunOwner,
+    timeout: Duration,
+) -> ShellRunResult {
     run_command_with_timeout(
         &mut cmd,
-        Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
+        timeout,
         output_drain_timeout(),
         mem::default_limit(),
         owner,
         LeftoverPolicy::End,
     )
     .await
+}
+
+/// [`run_bounded_within`] under the default ceiling every direct run is held to
+/// ([`DEFAULT_SHELL_TIMEOUT_SECS`]).
+async fn run_bounded(cmd: tokio::process::Command, owner: RunOwner) -> ShellRunResult {
+    run_bounded_within(cmd, owner, Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS)).await
 }
 
 /// Run `program` with `args` in `cwd` and report the run as an outcome instead
@@ -1713,7 +1727,32 @@ pub(crate) async fn run_program_outcome(
     program: &Path,
     args: &[String],
 ) -> ProgramOutcome {
-    match run_program(cwd, program, args, RunOwner::Service).await {
+    run_program_outcome_within(
+        cwd,
+        program,
+        args,
+        Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// [`run_program_outcome`] under an explicit wall-clock ceiling. A run stopped
+/// by it is marked [`ProgramOutcome::timed_out`], which is a stop rather than a
+/// verdict about the program — the alarm layer retries such a check instead of
+/// treating it as broken.
+pub(crate) async fn run_program_outcome_within(
+    cwd: &Path,
+    program: &Path,
+    args: &[String],
+    timeout: Duration,
+) -> ProgramOutcome {
+    let result = run_bounded_within(
+        build_program_command(program, args, cwd),
+        RunOwner::Service,
+        timeout,
+    )
+    .await;
+    match result {
         ShellRunResult::Completed {
             stdout,
             stderr,
@@ -1731,16 +1770,19 @@ pub(crate) async fn run_program_outcome(
                 &stderr,
             )
         }
-        ShellRunResult::TimedOut { stdout, stderr, .. } => program_outcome(
-            false,
-            format!("timed out after {DEFAULT_SHELL_TIMEOUT_SECS}s"),
-            &stdout,
-            &stderr,
-        ),
-        // `ExitedWithLeftovers` cannot come out of `run_program` — a direct run
-        // is always ENDED, never kept ([`LeftoverPolicy::End`]) — but both
-        // outcomes say the same thing here: the run's own exit was observed
-        // while a process it left behind held its output pipes.
+        ShellRunResult::TimedOut { stdout, stderr, .. } => ProgramOutcome {
+            timed_out: true,
+            ..program_outcome(
+                false,
+                format!("timed out after {}s", timeout.as_secs()),
+                &stdout,
+                &stderr,
+            )
+        },
+        // `ExitedWithLeftovers` cannot come out of a direct run — it is always
+        // ENDED, never kept ([`LeftoverPolicy::End`]) — but both outcomes say
+        // the same thing here: the run's own exit was observed while a process
+        // it left behind held its output pipes.
         ShellRunResult::ExitedWithLeftovers { stdout, stderr, .. }
         | ShellRunResult::EndedWithLeftovers { stdout, stderr, .. } => program_outcome(
             false,
@@ -5599,6 +5641,32 @@ mod tests {
             out.output.trim(),
             raw,
             "the check's output must reach the alarm unredacted"
+        );
+    }
+
+    /// A run stopped by its ceiling is marked as such — the alarm's verdict on
+    /// an unfinished check, as opposed to every other way a run can fail. The
+    /// ceiling is passed in, so the stop is reachable in milliseconds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_program_outcome_marks_a_run_stopped_by_its_ceiling() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = crate::workspace::test_ws(tmp.path());
+
+        let out = run_program_outcome_within(
+            ws.as_path(),
+            Path::new("/bin/sh"),
+            &sh_args("echo started; sleep 30"),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(out.timed_out, "the stop must be visible to the alarm");
+        assert!(!out.success);
+        assert_eq!(out.detail, "timed out after 1s");
+        assert!(
+            out.output.contains("started"),
+            "partial output is still carried: {}",
+            out.output
         );
     }
 

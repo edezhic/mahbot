@@ -1,1 +1,1 @@
-The check did not run cleanly, but the attempt to delete this alarm FAILED — it may still re-fire. Delete it manually once the underlying problem is resolved.
+The check is broken — it failed (a non-zero exit, the memory ceiling, or output that could not be drained) or could not run at all — but the attempt to delete this alarm FAILED: it may still re-fire. Delete it manually once the underlying problem is resolved.

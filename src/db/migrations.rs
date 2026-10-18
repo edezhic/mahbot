@@ -74,9 +74,11 @@
 //! [`DROP_UNUSED_LOGS_INDEXES`]), and `65` does the same for the core store
 //! (see [`DROP_UNUSED_CORE_INDEXES`]). `66` restates the composite index the
 //! chat window's read and its conversation cap are both served by (see
-//! [`ENSURE_CHAT_HISTORY_CONVERSATION_INDEX`]).
+//! [`ENSURE_CHAT_HISTORY_CONVERSATION_INDEX`]). `67` adds the trigger-retry
+//! state on `alarms` — when a retried occurrence may run again and how many
+//! attempts in a row did not finish in time.
 //!
-//! Future schema changes resume the chain at id `67` with monotonically
+//! Future schema changes resume the chain at id `68` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -352,20 +354,22 @@ CREATE TABLE IF NOT EXISTS ticket_chronicle (
     actor          TEXT
 );
 CREATE TABLE IF NOT EXISTS alarms (
-    id               TEXT PRIMARY KEY,
-    session_id       TEXT NOT NULL,
-    user_name        TEXT NOT NULL,
-    kind             TEXT NOT NULL,
-    text             TEXT NOT NULL,
-    fire_at          TEXT,
-    interval_seconds INTEGER,
-    next_fire_at     TEXT NOT NULL,
-    status           TEXT NOT NULL DEFAULT 'active',
-    created_at       TEXT NOT NULL,
-    trigger          TEXT,
-    role             TEXT,
-    identifier       TEXT,
-    workspace        TEXT
+    id                  TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL,
+    user_name           TEXT NOT NULL,
+    kind                TEXT NOT NULL,
+    text                TEXT NOT NULL,
+    fire_at             TEXT,
+    interval_seconds    INTEGER,
+    next_fire_at        TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'active',
+    created_at          TEXT NOT NULL,
+    trigger             TEXT,
+    role                TEXT,
+    identifier          TEXT,
+    workspace           TEXT,
+    retry_at            TEXT,
+    unfinished_attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS custom_roles (
     name       TEXT PRIMARY KEY,
@@ -1212,6 +1216,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Sql(ENSURE_CHAT_HISTORY_CONVERSATION_INDEX),
     },
+    Migration {
+        id: "67",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_alarms_retry_state),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -1539,6 +1548,29 @@ async fn run_add_alarms_custom_target(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "alarms", "role", "TEXT").await?;
     add_column_if_missing(conn, "alarms", "identifier", "TEXT").await?;
     add_column_if_missing(conn, "alarms", "workspace", "TEXT").await
+}
+
+fn add_alarms_retry_state(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_alarms_retry_state(conn))
+}
+
+/// Upfill the trigger-retry state on `alarms` for databases created before delta
+/// `67`: `retry_at`, the earliest moment an occurrence deferred by an attempt
+/// that did not finish in time may run again (read only on active alarms), and
+/// `unfinished_attempts`, how many attempts in a row did not finish in time.
+/// Fresh installs get both columns from entry `24`'s `CREATE TABLE`, so the
+/// probe makes this a no-op there. Guarded by [`add_column_if_missing`], so this
+/// body is idempotent (non-transactional like every Rust body, re-runnable until
+/// recorded).
+async fn run_add_alarms_retry_state(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "alarms", "retry_at", "TEXT").await?;
+    add_column_if_missing(
+        conn,
+        "alarms",
+        "unfinished_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await
 }
 
 fn add_jobs_custom_launch(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -2225,6 +2257,8 @@ mod tests {
                 "role",
                 "identifier",
                 "workspace",
+                "retry_at",
+                "unfinished_attempts",
             ],
         ),
         (
@@ -3430,7 +3464,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63`/`65`/`66` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63`/`65`–`67` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -3458,10 +3492,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66"
+                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65/66 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–67 tail exactly"
         );
     }
 
@@ -4099,7 +4133,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4108,7 +4142,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65/66"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–67"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -4217,10 +4251,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_alarms_cols.push("role".to_string());
         expected_alarms_cols.push("identifier".to_string());
         expected_alarms_cols.push("workspace".to_string());
+        expected_alarms_cols.push("retry_at".to_string());
+        expected_alarms_cols.push("unfinished_attempts".to_string());
         assert_eq!(
             after_alarms_cols["alarms"], expected_alarms_cols,
-            "reopen must trade command (delta 32) for trigger (deltas 42/43) and add the \
-             custom-role target columns (delta 53) on alarms columns"
+            "reopen must trade command (delta 32) for trigger (deltas 42/43), add the \
+             custom-role target columns (delta 53) and the trigger-retry state (delta 67) \
+             on alarms columns"
         );
         let after_chat_cols = column_sets(&conn, &["chat_history"]).await;
         let mut expected_chat_cols = before.cols["chat_history"].clone();
@@ -4372,7 +4409,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// table of delta `59` (its `claimed_by` column guaranteed by `60`), and the
     /// `telegram_bursts` table of delta `61`, and deltas `62`/`63`, which move
     /// the personal-changes baseline into `session_personal_changes`, and `65`,
-    /// which drops the indexes no production query's plan reaches.
+    /// which drops the indexes no production query's plan reaches, and `67`,
+    /// which adds the trigger-retry state on `alarms`.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -4483,7 +4521,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4492,7 +4530,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65/66"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–67"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

@@ -2018,6 +2018,7 @@ mod tests {
             workspace: None,
             interval_seconds: None,
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+            unfinished_attempts: 0,
         };
         let workspaces = vec![(
             crate::workspace::test_ws_named("/tmp/proj", "proj"),
@@ -2170,6 +2171,7 @@ mod tests {
             workspace: None,
             interval_seconds: None,
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+            unfinished_attempts: 0,
         };
         let periodic = Alarm {
             id: "a2".to_string(),
@@ -2192,6 +2194,7 @@ mod tests {
             workspace: None,
             interval_seconds: Some(3600),
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+            unfinished_attempts: 0,
         };
         let role = Alarm {
             id: "a3".to_string(),
@@ -2205,6 +2208,7 @@ mod tests {
             workspace: Some("my-workspace".to_string()),
             interval_seconds: None,
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+            unfinished_attempts: 0,
         };
 
         let lines = render_alarm_lines(&[one_shot, periodic, role]).expect("alarms render");

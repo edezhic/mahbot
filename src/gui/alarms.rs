@@ -300,6 +300,7 @@ mod tests {
             workspace: None,
             interval_seconds: None,
             next_fire_at: String::new(),
+            unfinished_attempts: 0,
         }
     }
 

@@ -7,8 +7,14 @@
 //! An alarm optionally carries a [`StoredTrigger`] — one custom tool plus its
 //! arguments, stored in the `trigger` column. At fire time the tool runs as the
 //! alarm's owner in the owner's personal workspace, and only what the check
-//! reported decides whether the Assistant is woken at all. A stored check that
-//! cannot be read is a check that cannot run, and is treated as one.
+//! reported decides whether the Assistant is woken at all.
+//!
+//! A check stopped by its time limit is not a verdict about the alarm: nothing
+//! is delivered for that attempt, the occurrence stays pending and is retried
+//! after a short cool-down. Every other non-clean outcome — a non-zero exit, the
+//! memory ceiling, an output drain overrun, a check that could not run at all —
+//! is a broken check and takes the alarm with it. A stored check that cannot be
+//! read is a check that cannot run, and is treated as one.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -34,17 +40,18 @@ crate::define_store! {
 
 crate::columns! {
     ALARM_COLUMNS [ALARM] {
-        ID               => "id",
-        SESSION_ID       => "session_id",
-        USER_NAME        => "user_name",
-        KIND             => "kind",
-        TEXT             => "text",
-        TRIGGER          => "trigger",
-        ROLE             => "role",
-        IDENTIFIER       => "identifier",
-        WORKSPACE        => "workspace",
-        INTERVAL_SECONDS => "interval_seconds",
-        NEXT_FIRE_AT     => "next_fire_at",
+        ID                  => "id",
+        SESSION_ID          => "session_id",
+        USER_NAME           => "user_name",
+        KIND                => "kind",
+        TEXT                => "text",
+        TRIGGER             => "trigger",
+        ROLE                => "role",
+        IDENTIFIER          => "identifier",
+        WORKSPACE           => "workspace",
+        INTERVAL_SECONDS    => "interval_seconds",
+        NEXT_FIRE_AT        => "next_fire_at",
+        UNFINISHED_ATTEMPTS => "unfinished_attempts",
     }
 }
 
@@ -70,8 +77,13 @@ pub(crate) struct Alarm {
     pub workspace: Option<String>,
     /// Periodic interval in seconds.
     pub interval_seconds: Option<i64>,
-    /// RFC3339 UTC next fire time.
+    /// RFC3339 UTC next fire time: the moment the pending occurrence is due for.
+    /// A retry of an attempt that did not finish in time never moves it.
     pub next_fire_at: String,
+    /// Attempts in a row that did not finish in time since the last completed
+    /// attempt; drives the one-time "not producing a result" notice and the
+    /// LATE note of the report that finally arrives.
+    pub unfinished_attempts: i64,
 }
 
 impl Alarm {
@@ -195,6 +207,7 @@ fn alarm_from_row(row: &db::Row) -> Result<Alarm, ::turso::Error> {
         workspace: row.get(COL_ALARM_WORKSPACE)?,
         interval_seconds: row.get(COL_ALARM_INTERVAL_SECONDS)?,
         next_fire_at: row.get(COL_ALARM_NEXT_FIRE_AT)?,
+        unfinished_attempts: row.get(COL_ALARM_UNFINISHED_ATTEMPTS)?,
     })
 }
 
@@ -237,6 +250,16 @@ const SWEEP_TICK: Duration = Duration::from_secs(1);
 const MISSED_FIRING_TOLERANCE: ChronoDuration =
     ChronoDuration::seconds(30 * SWEEP_TICK.as_secs() as i64);
 
+/// Cool-down before an occurrence whose attempt did not finish in time is tried
+/// again: short enough that a starved machine gets the check back quickly, long
+/// enough that retries cannot pile up into a burst.
+const RETRY_COOLDOWN_SECS: i64 = 60;
+
+/// Consecutive attempts that did not finish in time before the assistant is told
+/// — once — that the check is not producing a result: about half an hour with
+/// the attempt ceiling and the cool-down.
+const UNFINISHED_NOTICE_ATTEMPTS: i64 = 3;
+
 /// Whether a firing at `now` was MISSED — the alarm's scheduled time had
 /// already passed by more than [`MISSED_FIRING_TOLERANCE`] when it fired.
 /// `scheduled` is the time the firing belongs to: the value as it stood before
@@ -255,15 +278,28 @@ fn is_missed_firing(now: &str, scheduled: &str) -> bool {
     now.signed_duration_since(scheduled) > MISSED_FIRING_TOLERANCE
 }
 
+/// How the firing a notice belongs to was timed, as the notice says it.
+enum Timing {
+    /// On time: the occurrence fired when it was scheduled to.
+    Due,
+    /// Fired long after the alarm was due — the product was not running then.
+    Missed,
+    /// Earlier attempts at this occurrence did not finish and the report that
+    /// finally arrived is late for it.
+    Late,
+}
+
 /// The opening line of the notices that carry the reminder's own text — the
 /// plain reminder and the triggered check's: what the reminder is, and how the
-/// firing it belongs to was timed — due now when it happened on time, an
-/// explicit MISSED naming the scheduled time when it was late.
-fn reminder_line(alarm: &Alarm, missed: bool) -> String {
-    let asset = if missed {
-        "alarm_reminder_missed.md"
-    } else {
-        "alarm_reminder_due.md"
+/// firing it belongs to was timed. Exactly one timing statement, so a report
+/// that arrives after retries is announced as late instead of stacking a second
+/// lateness note on top of the missed-firing one. Every timing names the
+/// occurrence's own due moment, which no retry moves.
+fn reminder_line(alarm: &Alarm, timing: &Timing) -> String {
+    let asset = match timing {
+        Timing::Due => "alarm_reminder_due.md",
+        Timing::Missed => "alarm_reminder_missed.md",
+        Timing::Late => "alarm_reminder_late.md",
     };
     crate::prompt::substitute(
         &crate::prompt::load_prompt(asset),
@@ -272,6 +308,19 @@ fn reminder_line(alarm: &Alarm, missed: bool) -> String {
             ("{{fire_at}}", &alarm.next_fire_at),
         ],
     )
+}
+
+/// The timing a notice states. Only a report can be late: a report that settles
+/// an occurrence whose earlier attempts did not finish says so instead of the
+/// missed-firing note, and a broken check's notice reads as it always has.
+fn trigger_timing(alarm: &Alarm, missed: bool, reported: bool) -> Timing {
+    if reported && alarm.unfinished_attempts > 0 {
+        Timing::Late
+    } else if missed {
+        Timing::Missed
+    } else {
+        Timing::Due
+    }
 }
 
 /// Format an RFC3339 timestamp for display as `"{local} local time ({utc} UTC)"`.
@@ -485,6 +534,7 @@ pub(crate) async fn add_alarm(
         workspace,
         interval_seconds: interval_secs,
         next_fire_at,
+        unfinished_attempts: 0,
     })
 }
 
@@ -572,9 +622,9 @@ pub(crate) async fn delete_alarms_for_role(role_name: &str) -> Result<usize> {
 /// Soft-delete an alarm regardless of its current status (idempotent).
 ///
 /// Unlike [`remove_alarm`] this has no `status = 'active'` gate, so it also
-/// deletes an already-fired one-shot. Used whenever a trigger run did not come
-/// back clean — a failed check and a check that could not run alike — so a
-/// broken alarm can never re-fire.
+/// deletes an already-fired one-shot. Used whenever a check is broken — a run
+/// that failed and one that could not run alike, never one that merely ran past
+/// its time limit — so a broken alarm can never re-fire.
 async fn delete_alarm_after_run(alarm: &Alarm) -> Result<()> {
     store()
         .conn
@@ -586,16 +636,21 @@ async fn delete_alarm_after_run(alarm: &Alarm) -> Result<()> {
     Ok(())
 }
 
-/// The due alarms at `now` (RFC3339 UTC), ordered by next fire time.
+/// The due alarms at `now` (RFC3339 UTC), ordered by next fire time: every
+/// occurrence that is due and whose retry cool-down, if it is waiting for one,
+/// has passed. A waiting alarm is not due before its `retry_at` — and no other
+/// alarm's wait holds it back.
 ///
-/// The read here and each alarm's later [`advance_alarm_state`] are separate
-/// statements, so a second sweep overlapping this one can fire the same alarm
-/// twice; the sweep runs in one background loop and [`claim_in_flight`] already
-/// guards a triggered alarm's overlapping run.
+/// The read here and each alarm's later state advance are separate statements,
+/// so a second sweep overlapping this one can fire the same alarm twice; the
+/// sweep runs in one background loop, and a triggered alarm's attempt slot
+/// ([`claim_attempt_slot`]) makes a repeated firing of the same occurrence a
+/// no-op.
 async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
     let sql = format!(
         "SELECT {ALARM_COLUMNS} FROM alarms \
          WHERE status = 'active' AND next_fire_at <= ?1 \
+         AND (retry_at IS NULL OR retry_at <= ?1) \
          ORDER BY next_fire_at ASC"
     );
     let rows = store().conn.query(&sql, db::params![now]).await?;
@@ -604,28 +659,33 @@ async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
 
 // ── Fire / sweep ────────────────────────────────────────────────────────
 
-/// Route a due alarm into the Assistant's own session and update its state.
+/// Route a due alarm into the Assistant's own session and settle it.
 ///
 /// A role-addressed alarm (`role` set) wakes that custom role instead; the
-/// Assistant wakes otherwise — a triggered alarm (`trigger` set) runs its custom
-/// tool and delivers the check's result; a plain alarm delivers the reminder
-/// text. The notification is delivered as a user-role message into the calling
-/// assistant's own session (`alarm.session_id`, resolved directly — never
-/// re-derived from the id, which would double-escape colliding user names).
-/// One-shot alarms are terminalized (`status='fired'`); periodic alarms advance
-/// `next_fire_at` past every missed whole period. A firing later than its
-/// scheduled time by more than [`MISSED_FIRING_TOLERANCE`] says so in its notice
-/// (see [`reminder_line`]).
+/// Assistant wakes otherwise — a triggered alarm (`trigger` set) takes its
+/// attempt slot and runs its custom tool (see [`fire_trigger_alarm`]); a plain
+/// alarm delivers the reminder text. The notification is delivered as a
+/// user-role message into the calling assistant's own session
+/// (`alarm.session_id`, resolved directly — never re-derived from the id, which
+/// would double-escape colliding user names). A plain or role-addressed one-shot
+/// is terminalized (`status='fired'`) and a periodic one advances `next_fire_at`
+/// past every missed whole period; a triggered one settles the same way once its
+/// check completes. A firing later than its scheduled time by more than
+/// [`MISSED_FIRING_TOLERANCE`] says so in its notice (see [`reminder_line`]).
 async fn fire_alarm(alarm: &Alarm) -> Result<()> {
     if alarm.role.is_some() {
         return fire_custom_role_alarm(alarm).await;
     }
     // Judged at the firing instant — the scheduled time as it stands before the
-    // advance — never when the notice is composed: a slow check, or a notice
-    // delivered late although the firing happened on time, is not a missed firing.
+    // firing moves anything — never when the notice is composed: a slow check, or
+    // a notice delivered late although the firing happened on time, is not a
+    // missed firing.
     let missed = is_missed_firing(&db::now(), &alarm.next_fire_at);
     match &alarm.trigger {
-        Some(trigger) => fire_trigger_alarm(alarm, trigger, missed).await,
+        Some(trigger) => {
+            fire_trigger_alarm(alarm, trigger, missed);
+            Ok(())
+        }
         None => fire_plain_alarm(alarm, missed).await,
     }
 }
@@ -734,7 +794,10 @@ async fn fire_plain_alarm(alarm: &Alarm, missed: bool) -> Result<()> {
     let now = db::now();
     let content = crate::prompt::substitute(
         &crate::prompt::load_prompt("alarm_notification.md"),
-        &[("{{reminder_line}}", &reminder_line(alarm, missed))],
+        &[(
+            "{{reminder_line}}",
+            &reminder_line(alarm, &trigger_timing(alarm, missed, false)),
+        )],
     );
     deliver_alarm_notification(alarm, content).await;
     advance_alarm_state(alarm, &now).await?;
@@ -764,28 +827,28 @@ async fn deliver_alarm_notification(alarm: &Alarm, content: String) {
 }
 
 /// Advance an alarm's stored state past `now`: one-shot → `status='fired'`;
-/// periodic → `next_fire_at` past every missed whole period.
+/// periodic → `next_fire_at` past every missed whole period, so a schedule that
+/// waited out retries resumes on its own grid instead of replaying them. The
+/// retry state goes with it: the attempt that got here completed. Both writes
+/// take an active row only, so a reminder removed while its check ran stays
+/// removed.
 async fn advance_alarm_state(alarm: &Alarm, now: &str) -> Result<()> {
     if alarm.kind == "one-shot" {
         store()
             .conn
             .execute(
-                "UPDATE alarms SET status = 'fired' WHERE id = ?1",
+                "UPDATE alarms SET status = 'fired', retry_at = NULL, unfinished_attempts = 0 \
+                 WHERE id = ?1 AND status = 'active'",
                 db::params![alarm.id.as_str()],
             )
             .await?;
     } else {
-        let interval = alarm.interval_seconds.unwrap_or(0);
-        anyhow::ensure!(
-            interval > 0,
-            "Periodic alarm {} has no valid interval",
-            alarm.id
-        );
-        let next = next_periodic_fire(now, &alarm.next_fire_at, interval)?;
+        let next = next_periodic_fire(now, &alarm.next_fire_at, periodic_interval(alarm)?)?;
         store()
             .conn
             .execute(
-                "UPDATE alarms SET next_fire_at = ?1 WHERE id = ?2",
+                "UPDATE alarms SET next_fire_at = ?1, retry_at = NULL, unfinished_attempts = 0 \
+                 WHERE id = ?2 AND status = 'active'",
                 db::params![next, alarm.id.as_str()],
             )
             .await?;
@@ -793,61 +856,75 @@ async fn advance_alarm_state(alarm: &Alarm, now: &str) -> Result<()> {
     Ok(())
 }
 
-/// Alarms whose trigger check is currently in flight, keyed by alarm id — the
-/// periodic-overlap guard that prevents a slow check from piling up one spawn
-/// per sweep.
-static TRIGGERS_IN_FLIGHT: LazyLock<std::sync::Mutex<HashSet<String>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
-
-/// Try to mark an alarm id's check run as in flight: `true` claims it (the
-/// spawned task's [`InFlightGuard`] releases it), `false` means a previous run
-/// of the same alarm's check is still active.
-fn claim_in_flight(alarm_id: &str) -> bool {
-    TRIGGERS_IN_FLIGHT
-        .lock()
-        .unwrap_poison()
-        .insert(alarm_id.to_string())
+/// The interval a periodic alarm advances by, refusing a stored row that has no
+/// valid one instead of looping on it forever.
+fn periodic_interval(alarm: &Alarm) -> Result<i64> {
+    let interval = alarm.interval_seconds.unwrap_or(0);
+    anyhow::ensure!(
+        interval > 0,
+        "Periodic alarm {} has no valid interval",
+        alarm.id
+    );
+    Ok(interval)
 }
 
-/// RAII guard that removes an alarm id from [`TRIGGERS_IN_FLIGHT`] on drop, so
-/// every exit path (including a panic/abort of the spawned check task) clears
-/// the in-flight marker and lets the next firing run.
-struct InFlightGuard(String);
+/// Alarms whose check is running in this process, keyed by alarm id — the guard
+/// that keeps an alarm to one attempt at a time.
+static ATTEMPTS_IN_FLIGHT: LazyLock<std::sync::Mutex<HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
-impl Drop for InFlightGuard {
+/// Take the alarm's one in-process attempt slot. `None` while a previous attempt
+/// of the same alarm is still running; the returned slot frees it on drop —
+/// including when a spawned task is dropped without ever having been polled,
+/// because the slot is taken before the spawn. Nothing about it is durable: a
+/// restarted process has no attempt in flight, so the alarm is simply due again.
+fn claim_attempt_slot(alarm_id: &str) -> Option<AttemptSlot> {
+    let inserted = ATTEMPTS_IN_FLIGHT
+        .lock()
+        .unwrap_poison()
+        .insert(alarm_id.to_string());
+    inserted.then(|| AttemptSlot(alarm_id.to_string()))
+}
+
+/// Whether the alarm's check is running in this process.
+fn attempt_in_flight(alarm_id: &str) -> bool {
+    ATTEMPTS_IN_FLIGHT.lock().unwrap_poison().contains(alarm_id)
+}
+
+/// RAII guard for an alarm's in-process attempt slot.
+struct AttemptSlot(String);
+
+impl Drop for AttemptSlot {
     fn drop(&mut self) {
-        TRIGGERS_IN_FLIGHT.lock().unwrap_poison().remove(&self.0);
+        ATTEMPTS_IN_FLIGHT.lock().unwrap_poison().remove(&self.0);
     }
 }
 
-/// Fire a triggered alarm: advance state, then spawn a detached task that runs
-/// the stored check and delivers its result. Every non-clean outcome also
-/// soft-deletes the alarm (see [`run_alarm_trigger_task`]); a stored check that
-/// cannot be read never runs at all and takes that same path.
+/// Fire a triggered alarm: take the alarm's attempt slot and spawn a detached
+/// task that runs the stored check and settles the attempt.
+///
+/// The slot is taken before the spawn, so however slow the check is — and
+/// whether or not the task ever gets polled — the sweep cannot start a second
+/// attempt for the same alarm. The rest of the sweep is unaffected: a waiting
+/// alarm holds back nothing but itself.
 ///
 /// `missed` is the firing's lateness, decided before the check starts and
 /// carried into the notice the finished run produces: how long the check itself
 /// takes is not lateness.
-async fn fire_trigger_alarm(alarm: &Alarm, trigger: &StoredTrigger, missed: bool) -> Result<()> {
-    // Advance state FIRST — independent of the check's outcome — so a slow or
-    // failing check cannot keep the alarm due and re-fire it on every sweep.
-    advance_alarm_state(alarm, &db::now()).await?;
-
-    // Periodic-overlap guard: if a previous run of this alarm is still in
-    // flight, skip this firing entirely (advanced but no spawn, no notification).
-    if !claim_in_flight(&alarm.id) {
-        return Ok(());
-    }
-
+fn fire_trigger_alarm(alarm: &Alarm, trigger: &StoredTrigger, missed: bool) {
+    let Some(slot) = claim_attempt_slot(&alarm.id) else {
+        return;
+    };
     tokio::spawn(run_alarm_trigger_task(
+        slot,
         alarm.clone(),
         trigger.clone(),
         missed,
     ));
-    Ok(())
 }
 
-/// What one trigger evaluation produced, as the notification sees it.
+/// What one trigger evaluation produced, as the notification and the alarm's
+/// state see it.
 enum TriggerOutcome {
     /// The check ran and reported nothing at all — the alarm stays armed and
     /// nothing is delivered.
@@ -857,26 +934,25 @@ enum TriggerOutcome {
     /// The check could not run at all: the reason the assistant is shown. The
     /// alarm goes either way.
     CouldNotRun(String),
+    /// The check was still running when its own time limit stopped it. That is
+    /// not a verdict about the check: nothing is delivered for the attempt, and
+    /// the occurrence stays pending to be retried.
+    Unfinished,
 }
 
 impl TriggerOutcome {
     /// The wake decision over one finished run: only a clean run that reported
     /// nothing at all stays silent. Everything else wakes the assistant — a run
-    /// that failed, and output of any kind, whatever it looks like.
+    /// that failed, and output of any kind, whatever it looks like — except a run
+    /// the ceiling stopped, which is settled by the retry rule instead.
     fn from_run(outcome: ProgramOutcome) -> Self {
+        if outcome.timed_out {
+            return Self::Unfinished;
+        }
         if outcome.success && !outcome.has_output {
             Self::Silent
         } else {
             Self::Ran(outcome)
-        }
-    }
-
-    /// Whether the alarm stays armed: the check ran and exited cleanly.
-    fn clean(&self) -> bool {
-        match self {
-            Self::Silent => true,
-            Self::Ran(outcome) => outcome.success,
-            Self::CouldNotRun(_) => false,
         }
     }
 }
@@ -888,7 +964,8 @@ impl TriggerOutcome {
 /// personal workspace through the managed runtime.
 ///
 /// Nothing is credential-scrubbed here: what the check produced is what the
-/// assistant is shown, and the run's raw streams alone drive the wake decision
+/// assistant is shown, and the run's own outcome — what it reported, and whether
+/// the ceiling stopped it — alone drives the verdict
 /// ([`TriggerOutcome::from_run`]).
 async fn run_trigger(ws: &Workspace, user: &str, trigger: &Trigger) -> TriggerOutcome {
     let call =
@@ -930,14 +1007,14 @@ async fn run_trigger(ws: &Workspace, user: &str, trigger: &Trigger) -> TriggerOu
 }
 
 /// Run a triggered alarm's stored check in the owner's personal workspace and
-/// deliver its result — or stay silent when the check reported nothing at all.
-///
-/// Every non-clean outcome soft-deletes the alarm before the notification is
-/// delivered, so a broken check can never keep the alarm armed and re-firing.
-async fn run_alarm_trigger_task(alarm: Alarm, trigger: StoredTrigger, missed: bool) {
-    // The in-flight marker is removed unconditionally on drop.
-    let _in_flight = InFlightGuard(alarm.id.clone());
-
+/// settle the attempt (see [`settle_trigger_attempt`]). The attempt's slot is
+/// held until this task finishes, however it finishes.
+async fn run_alarm_trigger_task(
+    _slot: AttemptSlot,
+    alarm: Alarm,
+    trigger: StoredTrigger,
+    missed: bool,
+) {
     let outcome = match &trigger {
         StoredTrigger::Tool(check) => {
             let ws = crate::users::personal_workspace_struct(&alarm.user_name);
@@ -950,29 +1027,110 @@ async fn run_alarm_trigger_task(alarm: Alarm, trigger: StoredTrigger, missed: bo
         }
     };
 
-    // Track whether the delete actually committed — the notification must not
-    // claim a deletion that didn't happen.
-    let deletion = if outcome.clean() {
-        None
-    } else {
-        Some(delete_alarm_after_run(&alarm).await)
-    };
-
-    match trigger_notification(&alarm, &trigger, &outcome, deletion.as_ref(), missed) {
-        Some(content) => deliver_alarm_notification(&alarm, content).await,
-        None => {
-            tracing::debug!(alarm = %alarm.id, "alarm check reported nothing — staying silent");
-        }
+    if let Err(e) = settle_trigger_attempt(&alarm, &trigger, outcome, missed).await {
+        // The occurrence is untouched: its due time still stands and no retry
+        // cool-down was set, so the next sweep runs the check again.
+        tracing::warn!(alarm = %alarm.id, error = %e, "Failed to settle an alarm check");
     }
 }
 
+/// Settle one finished attempt against its alarm.
+///
+/// A check that reported — or ran cleanly and said nothing — delivers what it
+/// produced and lets the alarm resume its normal schedule. A broken check
+/// soft-deletes the alarm and delivers why. An attempt that did not finish in
+/// time delivers nothing and keeps the occurrence pending for a retry.
+async fn settle_trigger_attempt(
+    alarm: &Alarm,
+    trigger: &StoredTrigger,
+    outcome: TriggerOutcome,
+    missed: bool,
+) -> Result<()> {
+    match &outcome {
+        TriggerOutcome::Unfinished => return defer_trigger_attempt(alarm, trigger).await,
+        TriggerOutcome::Silent | TriggerOutcome::Ran(ProgramOutcome { success: true, .. }) => {}
+        TriggerOutcome::Ran(_) | TriggerOutcome::CouldNotRun(_) => {
+            // Track whether the delete actually committed — the notification
+            // must not claim a deletion that didn't happen.
+            let deletion = delete_alarm_after_run(alarm).await;
+            if let Some(content) =
+                trigger_notification(alarm, trigger, &outcome, Some(&deletion), missed)
+            {
+                deliver_alarm_notification(alarm, content).await;
+            }
+            // A deletion that did not commit leaves the alarm due: the broken
+            // check would run and notify again on every sweep. Advancing bounds
+            // it to one more firing per scheduled occurrence, as every fire was
+            // bounded before.
+            if deletion.is_err() {
+                advance_alarm_state(alarm, &db::now()).await?;
+            }
+            return Ok(());
+        }
+    }
+    // Delivered before the state advance, so a crash in between replays the
+    // report rather than losing it.
+    if let Some(content) = trigger_notification(alarm, trigger, &outcome, None, missed) {
+        deliver_alarm_notification(alarm, content).await;
+    }
+    advance_alarm_state(alarm, &db::now()).await
+}
+
+/// Keep the occurrence pending after an attempt that did not finish in time:
+/// nothing is delivered for the attempt, the check is retried after the
+/// cool-down, and the third attempt in a row says once that the check is not
+/// producing a result.
+///
+/// `next_fire_at` is left alone — it is the occurrence's own due moment, which a
+/// late report is announced with — so the wait lives in the row's `retry_at`. The
+/// write is guarded on the occurrence the attempt ran for, so a concurrent
+/// reschedule is never overwritten; the count is written as this attempt's own
+/// value, which is the row's because an alarm has only one attempt in flight.
+async fn defer_trigger_attempt(alarm: &Alarm, trigger: &StoredTrigger) -> Result<()> {
+    let attempt = alarm.unfinished_attempts + 1;
+    let retry_at = (db::parse_utc_timestamp(&db::now())?
+        + ChronoDuration::seconds(RETRY_COOLDOWN_SECS))
+    .to_rfc3339();
+    let changed = store()
+        .conn
+        .execute(
+            "UPDATE alarms SET retry_at = ?1, unfinished_attempts = ?2 \
+             WHERE id = ?3 AND session_id = ?4 AND status = 'active' AND next_fire_at = ?5",
+            db::params![
+                retry_at,
+                attempt,
+                alarm.id.as_str(),
+                alarm.session_id.as_str(),
+                alarm.next_fire_at.as_str(),
+            ],
+        )
+        .await?;
+    if changed == 0 {
+        return Ok(());
+    }
+    // The counter is what makes the notice one-time, so it is written before the
+    // notice goes out: a crash in the gap loses one notice rather than repeating
+    // it on every later unfinished attempt.
+    if attempt == UNFINISHED_NOTICE_ATTEMPTS {
+        let content = crate::prompt::substitute(
+            &crate::prompt::load_prompt("alarm_trigger_unfinished.md"),
+            &[
+                ("{{text}}", &alarm.text),
+                ("{{trigger}}", &trigger.render()),
+            ],
+        );
+        deliver_alarm_notification(alarm, content).await;
+    }
+    Ok(())
+}
+
 /// Decide the delivery for a finished trigger evaluation: `None` stays silent
-/// (the check ran and reported nothing at all); `Some` is the rendered
-/// `<alarm-notification>` with the reminder, the trigger, the status line, the
-/// deletion note (on every non-clean outcome) and the check's output.
-/// `deletion` carries the result of [`delete_alarm_after_run`], `None` on
-/// the clean path; `missed` is the firing's lateness, decided when the firing
-/// happened.
+/// (the check reported nothing at all, or did not finish in time); `Some` is the
+/// rendered `<alarm-notification>` with the reminder, the trigger, the status
+/// line, the deletion note (on a broken check) and the check's output.
+/// `deletion` carries the result of [`delete_alarm_after_run`], `None` when no
+/// deletion was attempted; `missed` is the firing's lateness, decided when the
+/// firing happened.
 fn trigger_notification(
     alarm: &Alarm,
     trigger: &StoredTrigger,
@@ -981,7 +1139,7 @@ fn trigger_notification(
     missed: bool,
 ) -> Option<String> {
     let (status, output) = match outcome {
-        TriggerOutcome::Silent => return None,
+        TriggerOutcome::Silent | TriggerOutcome::Unfinished => return None,
         TriggerOutcome::Ran(outcome) => {
             let status = if outcome.success {
                 format!("The check exited successfully ({}).", outcome.detail)
@@ -1013,10 +1171,14 @@ fn trigger_notification(
         Some(Ok(())) => crate::prompt::load_prompt("alarm_trigger_deletion.md"),
         Some(Err(_)) => crate::prompt::load_prompt("alarm_trigger_deletion_failed.md"),
     };
+    // Only a delivered result can be late for its occurrence — a broken check's
+    // notice reads as it always has.
+    let reported = matches!(outcome, TriggerOutcome::Ran(run) if run.success);
+    let timing = trigger_timing(alarm, missed, reported);
     Some(crate::prompt::substitute(
         &crate::prompt::load_prompt("alarm_trigger_notification.md"),
         &[
-            ("{{reminder_line}}", &reminder_line(alarm, missed)),
+            ("{{reminder_line}}", &reminder_line(alarm, &timing)),
             ("{{trigger}}", &trigger.render()),
             ("{{trigger_status}}", &status),
             ("{{trigger_deletion}}", &deletion_line),
@@ -1042,13 +1204,24 @@ fn next_periodic_fire(now: &str, next_fire: &str, interval_secs: i64) -> Result<
     Ok(next.to_rfc3339())
 }
 
+/// The alarms a sweep pass may start, up to `batch_limit`: those due and not
+/// already running here. A running check is skipped before the batch is cut, so
+/// a long check never takes a slot from a waiting alarm; the alarm's own slot
+/// ([`claim_attempt_slot`]) stays the authority on never starting twice.
+fn startable(due: Vec<Alarm>, batch_limit: usize) -> Vec<Alarm> {
+    due.into_iter()
+        .filter(|alarm| !attempt_in_flight(&alarm.id))
+        .take(batch_limit)
+        .collect()
+}
+
 /// Fire up to `batch_limit` due alarms, continuing past individual failures so
 /// one bad alarm cannot block the rest of the sweep.
 async fn run_alarm_sweep(batch_limit: usize) -> Result<()> {
-    let due = due_alarms(&db::now()).await?;
+    let due = startable(due_alarms(&db::now()).await?, batch_limit);
     let mut fired = 0usize;
     let mut failed = 0usize;
-    for alarm in due.into_iter().take(batch_limit) {
+    for alarm in due {
         match fire_alarm(&alarm).await {
             Ok(()) => fired += 1,
             Err(e) => {
@@ -1119,17 +1292,19 @@ mod tests {
     }
 
     /// The opening line is what the notice says about its own timing: today's
-    /// wording when the firing happened on time, and the missed statement with
-    /// the scheduled time when it did not.
+    /// wording when the firing happened on time, the missed statement with the
+    /// scheduled time when it fired late, and the late statement — one of the
+    /// two, never both — naming the occurrence when a retried check finally
+    /// reported.
     #[test]
-    fn reminder_line_says_missed_with_the_scheduled_time() {
+    fn reminder_line_states_exactly_one_timing() {
         let alarm = trigger_alarm();
         assert_eq!(
-            reminder_line(&alarm, false),
+            reminder_line(&alarm, &Timing::Due),
             "Your reminder \"check the thing\" is due now \
              (scheduled for 2026-09-04T12:00:00+00:00)."
         );
-        let missed = reminder_line(&alarm, true);
+        let missed = reminder_line(&alarm, &Timing::Missed);
         assert!(missed.contains("was MISSED"), "got: {missed}");
         assert!(
             missed.contains("2026-09-04T12:00:00+00:00"),
@@ -1142,6 +1317,18 @@ mod tests {
         assert!(
             !missed.contains("due now"),
             "a missed firing must not read as current: {missed}"
+        );
+
+        let due_at = "2026-09-04T12:00:00+00:00";
+        let late = reminder_line(&alarm, &Timing::Late);
+        assert!(late.contains("LATE"), "got: {late}");
+        assert!(
+            late.contains(due_at),
+            "the moment it was due for must be named: {late}"
+        );
+        assert!(
+            !late.contains("MISSED") && !late.contains("due now"),
+            "a late report is one statement, not a stack of lateness: {late}"
         );
     }
 
@@ -1354,6 +1541,7 @@ mod tests {
             workspace: None,
             interval_seconds: Some(60),
             next_fire_at: "2026-09-04T12:00:00+00:00".to_string(),
+            unfinished_attempts: 0,
         }
     }
 
@@ -1365,6 +1553,7 @@ mod tests {
             detail: detail.to_string(),
             output: output.to_string(),
             has_output,
+            timed_out: false,
         }
     }
 
@@ -1473,6 +1662,31 @@ mod tests {
         assert!(!content.contains("(no output)"), "got: {content}");
     }
 
+    /// A broken check's notice reads as it always has, even when it settles an
+    /// occurrence that waited through retries: no lateness note — only a report
+    /// can be late — and the moment it names is the occurrence's own scheduled
+    /// time, never the retry instant the notice is composed at.
+    #[test]
+    fn a_broken_check_after_retries_is_not_late_and_names_its_scheduled_time() {
+        let alarm = Alarm {
+            unfinished_attempts: 3,
+            ..trigger_alarm()
+        };
+        let trigger = StoredTrigger::Tool(weather_trigger());
+        for outcome in [
+            TriggerOutcome::Ran(ran(false, "exit status 2", "boom", true)),
+            TriggerOutcome::CouldNotRun("the managed bun runtime is unavailable".to_string()),
+        ] {
+            let content = trigger_notification(&alarm, &trigger, &outcome, Some(&Ok(())), true)
+                .expect("a broken check always notifies");
+            assert!(!content.contains("LATE"), "got: {content}");
+            assert!(
+                content.contains("was MISSED — it was scheduled for 2026-09-04T12:00:00+00:00"),
+                "the occurrence's own scheduled time must be named: {content}"
+            );
+        }
+    }
+
     /// A failed check always wakes, empty output included, and the notice
     /// reports whether the alarm was actually removed.
     #[test]
@@ -1523,17 +1737,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn in_flight_claim_guards_periodic_overlap() {
-        assert!(claim_in_flight("alarm-overlap"));
-        // A second claim while the first run is in flight is rejected...
-        assert!(!claim_in_flight("alarm-overlap"));
-        // ...and released once the run's guard drops.
-        drop(InFlightGuard("alarm-overlap".to_string()));
-        assert!(claim_in_flight("alarm-overlap"));
-        drop(InFlightGuard("alarm-overlap".to_string()));
-    }
-
     /// An alarms row's status, for the fire-time assertions that a non-clean
     /// check took the alarm out of service.
     async fn alarm_status(id: &str) -> String {
@@ -1547,6 +1750,435 @@ mod tests {
             .transpose()
             .unwrap()
             .expect("alarm row must exist")
+    }
+
+    /// The moment the alarm's retried occurrence may run, `None` when nothing
+    /// is waiting — read straight from the row, as the sweep's own filter is.
+    async fn alarm_retry_at(id: &str) -> Option<String> {
+        store()
+            .conn
+            .query("SELECT retry_at FROM alarms WHERE id = ?1", db::params![id])
+            .await
+            .unwrap()
+            .first()
+            .map(|row| row.get::<Option<String>>(0))
+            .transpose()
+            .unwrap()
+            .flatten()
+    }
+
+    /// The row as the next sweep would read it.
+    async fn active_alarm(session_id: &str, id: &str) -> Alarm {
+        list_alarms(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|alarm| alarm.id == id)
+            .expect("an active alarm row")
+    }
+
+    /// Whether the sweep would pick the alarm up right now.
+    async fn is_due(id: &str) -> bool {
+        due_alarms(&db::now())
+            .await
+            .unwrap()
+            .iter()
+            .any(|alarm| alarm.id == id)
+    }
+
+    /// How far `timestamp` is from now, in seconds.
+    fn seconds_from_now(timestamp: &str) -> i64 {
+        db::parse_utc_timestamp(timestamp)
+            .unwrap()
+            .signed_duration_since(db::parse_utc_timestamp(&db::now()).unwrap())
+            .num_seconds()
+    }
+
+    /// Make the alarm's occurrence overdue, as a sweep's read would find it.
+    async fn make_overdue(id: &str) {
+        store()
+            .conn
+            .execute(
+                "UPDATE alarms SET next_fire_at = ?1 WHERE id = ?2",
+                db::params!["2020-01-01T00:00:00+00:00", id],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// One attempt at a time, and a waiting alarm holds back nothing but itself:
+    /// an alarm whose check is running has no second attempt, a deferred
+    /// occurrence is not due before its cool-down, and every other alarm keeps
+    /// firing at its own due time meanwhile.
+    #[tokio::test]
+    async fn one_attempt_at_a_time_and_a_waiting_alarm_waits_only_for_itself() {
+        let session = "assistant:alarm-one-attempt-it";
+        let (waiting, _rx) = arm_trigger_alarm(
+            session,
+            "alarm-waiting",
+            "no_such_alarm_tool",
+            serde_json::Map::new(),
+        )
+        .await;
+        let neighbour = add_alarm(
+            session,
+            "alarm-neighbour",
+            "the other check",
+            None,
+            Some(3600),
+            Some(weather_trigger()),
+            None,
+        )
+        .await
+        .expect("arm a second triggered alarm");
+        make_overdue(&waiting.id).await;
+        make_overdue(&neighbour.id).await;
+        assert!(
+            is_due(&waiting.id).await && is_due(&neighbour.id).await,
+            "both occurrences are due"
+        );
+
+        // The attempt in flight holds the alarm's only slot: a second one never
+        // starts, however long the check runs.
+        let slot = claim_attempt_slot(&waiting.id).expect("the attempt takes the alarm's slot");
+        assert!(
+            claim_attempt_slot(&waiting.id).is_none(),
+            "a second attempt of the same alarm must not start"
+        );
+        drop(slot);
+
+        let due = active_alarm(session, &waiting.id).await;
+        settle_trigger_attempt(
+            &due,
+            &StoredTrigger::Tool(weather_trigger()),
+            TriggerOutcome::Unfinished,
+            false,
+        )
+        .await
+        .unwrap();
+        let deferred = active_alarm(session, &waiting.id).await;
+        let retry_at = alarm_retry_at(&waiting.id)
+            .await
+            .expect("a wait is recorded");
+        let retry_in = seconds_from_now(&retry_at);
+        assert!(
+            (50..=70).contains(&retry_in),
+            "the retry must be about a minute out, got {retry_in}s"
+        );
+        assert_eq!(
+            deferred.next_fire_at, due.next_fire_at,
+            "the wait never moves the occurrence's own due moment"
+        );
+        assert!(
+            !is_due(&waiting.id).await,
+            "a waiting alarm is not due before its retry"
+        );
+        assert!(
+            is_due(&neighbour.id).await,
+            "a waiting alarm must not hold back the others"
+        );
+
+        // Once the cool-down has passed the occurrence is due again — with no
+        // state but the row's, so a restart in between changes nothing.
+        store()
+            .conn
+            .execute(
+                "UPDATE alarms SET retry_at = ?1 WHERE id = ?2",
+                db::params!["2020-01-01T00:00:00+00:00", waiting.id.as_str()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            is_due(&waiting.id).await,
+            "the retry becomes due when its cool-down passes"
+        );
+        crate::agent::message_router::unregister_agent(session);
+    }
+
+    /// The whole chain, from a program the ceiling really stops to the notice
+    /// the retry finally produces: the stop keeps the alarm (nothing delivered,
+    /// a retry about a minute out, the occurrence's own due moment intact) and
+    /// the report of the later attempt arrives late, naming that moment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_stopped_by_its_ceiling_keeps_the_alarm_and_its_report_is_late() {
+        let session = "assistant:alarm-ceiling-it";
+        let (alarm, mut rx) = arm_trigger_alarm(
+            session,
+            "alarm-ceiling",
+            "no_such_alarm_tool",
+            serde_json::Map::new(),
+        )
+        .await;
+        let due_at = alarm.next_fire_at.clone();
+        let trigger = StoredTrigger::Tool(weather_trigger());
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let ws = crate::workspace::test_ws(tmp.path());
+
+        let stopped = crate::tools::shell::run_program_outcome_within(
+            ws.as_path(),
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), "echo started; sleep 30".to_string()],
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            stopped.timed_out,
+            "the one-second ceiling must stop the run"
+        );
+        settle_trigger_attempt(&alarm, &trigger, TriggerOutcome::from_run(stopped), false)
+            .await
+            .unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is delivered for an attempt that did not finish"
+        );
+        // A restart between the two attempts keeps everything the report needs:
+        // the wait lives in the row read back here, and a fresh process has no
+        // attempt in flight.
+        assert!(
+            !attempt_in_flight(&alarm.id),
+            "a restarted process has no attempt in flight"
+        );
+        let waiting = active_alarm(session, &alarm.id).await;
+        assert_eq!(
+            alarm_status(&alarm.id).await,
+            "active",
+            "a one-shot whose check did not finish is not consumed"
+        );
+        assert_eq!(waiting.unfinished_attempts, 1);
+        assert_eq!(waiting.next_fire_at, due_at);
+        assert!(
+            seconds_from_now(&alarm_retry_at(&alarm.id).await.expect("a wait is recorded")) > 0,
+            "the occurrence is kept and its retry is scheduled"
+        );
+
+        // The retry reports: one notification, late, for the occurrence's own
+        // due moment. A retried firing is past the missed-firing tolerance too,
+        // so the two lateness statements must not stack.
+        settle_trigger_attempt(
+            &waiting,
+            &trigger,
+            TriggerOutcome::Ran(ran(true, "exit status 0", "found it", true)),
+            true,
+        )
+        .await
+        .unwrap();
+        let job = rx.try_recv().expect("the late report must be delivered");
+        assert!(job.content.contains("LATE"), "got: {}", job.content);
+        assert!(
+            !job.content.contains("MISSED"),
+            "one lateness statement, not two: {}",
+            job.content
+        );
+        assert!(
+            job.content.contains(&due_at),
+            "the moment it was due for must be named: {}",
+            job.content
+        );
+        assert!(job.content.contains("found it"));
+        crate::agent::message_router::unregister_agent(session);
+    }
+
+    /// A failed run is a broken check, not a check that did not finish: it
+    /// removes the alarm, says FAILED, and leaves nothing due to re-fire.
+    #[tokio::test]
+    async fn a_failed_check_removes_the_alarm_and_never_refires() {
+        let session = "assistant:alarm-failed-it";
+        let (alarm, mut rx) = arm_trigger_alarm(
+            session,
+            "alarm-failed",
+            "no_such_alarm_tool",
+            serde_json::Map::new(),
+        )
+        .await;
+        make_overdue(&alarm.id).await;
+        let due = active_alarm(session, &alarm.id).await;
+
+        settle_trigger_attempt(
+            &due,
+            &StoredTrigger::Tool(weather_trigger()),
+            TriggerOutcome::Ran(ran(false, "exit status 2", "boom", true)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let job = rx.try_recv().expect("a broken check must notify");
+        assert!(
+            job.content.contains("FAILED (exit status 2)"),
+            "got: {}",
+            job.content
+        );
+        assert!(job.content.contains("DELETED"), "got: {}", job.content);
+        assert_eq!(alarm_status(&alarm.id).await, "removed");
+        assert!(
+            !is_due(&alarm.id).await,
+            "a broken check must never re-fire"
+        );
+        crate::agent::message_router::unregister_agent(session);
+    }
+
+    /// A sweep pass skips an alarm whose check is already running before it cuts
+    /// its batch, so a long check never takes a slot from a waiting alarm; the
+    /// alarm's own slot stays the authority on not starting twice.
+    #[test]
+    fn a_running_check_does_not_take_a_sweep_slot() {
+        let running = Alarm {
+            id: "alarm-slot-running".to_string(),
+            ..trigger_alarm()
+        };
+        let waiting = Alarm {
+            id: "alarm-slot-waiting".to_string(),
+            ..trigger_alarm()
+        };
+        let slot = claim_attempt_slot(&running.id).expect("the running check holds its slot");
+
+        let picked = startable(vec![running.clone(), waiting.clone()], 1);
+        assert_eq!(picked.len(), 1, "the batch keeps its full size");
+        assert_eq!(
+            picked[0].id, waiting.id,
+            "the running check is skipped, not counted"
+        );
+        assert!(
+            !attempt_in_flight(&waiting.id),
+            "picking an alarm takes no slot; its firing does"
+        );
+        drop(slot);
+    }
+
+    /// Three attempts in a row that did not finish wake the assistant once, with
+    /// a notice that says the check is not producing a result — and the alarm
+    /// keeps being retried without repeating the notice until an attempt
+    /// completes, which starts the count over.
+    #[tokio::test]
+    async fn three_unfinished_attempts_notify_once_and_the_alarm_keeps_retrying() {
+        let session = "assistant:alarm-stuck-it";
+        let trigger = StoredTrigger::Tool(weather_trigger());
+        let mut alarm = arm_periodic_trigger_alarm(session, "alarm-stuck", 3600).await;
+        let mut rx = crate::agent::message_router::register_agent(session);
+
+        for attempt in 1..=4 {
+            settle_trigger_attempt(&alarm, &trigger, TriggerOutcome::Unfinished, false)
+                .await
+                .unwrap();
+            alarm = active_alarm(session, &alarm.id).await;
+            assert_eq!(alarm.unfinished_attempts, attempt);
+            if attempt == UNFINISHED_NOTICE_ATTEMPTS {
+                let job = rx
+                    .try_recv()
+                    .expect("the third unfinished attempt must notify");
+                assert!(
+                    job.content.contains("not producing a result"),
+                    "got: {}",
+                    job.content
+                );
+                assert!(
+                    !job.content.contains("DELETED"),
+                    "this is not the deletion notice: {}",
+                    job.content
+                );
+            } else {
+                assert!(rx.try_recv().is_err(), "attempt {attempt} must stay silent");
+            }
+        }
+        assert_eq!(
+            alarm_status(&alarm.id).await,
+            "active",
+            "a check that never finishes never removes its alarm"
+        );
+
+        // A completing attempt clears the count, so the notice needs three more
+        // unfinished attempts in a row and does not fire again before that.
+        settle_trigger_attempt(&alarm, &trigger, TriggerOutcome::Silent, false)
+            .await
+            .unwrap();
+        alarm = active_alarm(session, &alarm.id).await;
+        assert_eq!(alarm.unfinished_attempts, 0);
+        assert!(
+            alarm_retry_at(&alarm.id).await.is_none(),
+            "a completed check leaves no wait"
+        );
+        for attempt in 1..UNFINISHED_NOTICE_ATTEMPTS {
+            settle_trigger_attempt(&alarm, &trigger, TriggerOutcome::Unfinished, false)
+                .await
+                .unwrap();
+            alarm = active_alarm(session, &alarm.id).await;
+            assert_eq!(alarm.unfinished_attempts, attempt, "the count restarted");
+            assert!(
+                rx.try_recv().is_err(),
+                "the count restarted, so no notice arrives yet"
+            );
+        }
+        crate::agent::message_router::unregister_agent(session);
+    }
+
+    /// A periodic alarm whose check completes resumes its normal schedule from
+    /// the occurrence the retries settled: no burst of the occurrences missed
+    /// while it waited, and no stale retry state left behind.
+    #[tokio::test]
+    async fn a_completed_check_resumes_the_periodic_schedule() {
+        let session = "assistant:alarm-resume-it";
+        let alarm = arm_periodic_trigger_alarm(session, "alarm-resume", 60).await;
+        let mut rx = crate::agent::message_router::register_agent(session);
+        let trigger = StoredTrigger::Tool(weather_trigger());
+        // Long overdue, as an occurrence that waited out retries is: the resume
+        // has to advance past every period missed meanwhile in one step.
+        make_overdue(&alarm.id).await;
+        let due = active_alarm(session, &alarm.id).await;
+        let due_at = due.next_fire_at.clone();
+
+        settle_trigger_attempt(&due, &trigger, TriggerOutcome::Unfinished, false)
+            .await
+            .unwrap();
+        let retry = active_alarm(session, &alarm.id).await;
+        assert!(
+            alarm_retry_at(&alarm.id).await.is_some(),
+            "a waiting alarm records the retry it owes"
+        );
+        settle_trigger_attempt(&retry, &trigger, TriggerOutcome::Silent, false)
+            .await
+            .unwrap();
+
+        let resumed = active_alarm(session, &alarm.id).await;
+        assert!(alarm_retry_at(&alarm.id).await.is_none());
+        assert_eq!(resumed.unfinished_attempts, 0);
+        let next_in = seconds_from_now(&resumed.next_fire_at);
+        assert!(
+            (0..=60).contains(&next_in),
+            "the next occurrence is one period out at most, got {next_in}s"
+        );
+        let due = db::parse_utc_timestamp(&due_at).unwrap();
+        let next = db::parse_utc_timestamp(&resumed.next_fire_at).unwrap();
+        assert_eq!(
+            next.signed_duration_since(due).num_seconds() % 60,
+            0,
+            "the schedule resumes on its own grid: {} from {due_at}",
+            resumed.next_fire_at
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a silent check must not wake the assistant"
+        );
+        crate::agent::message_router::unregister_agent(session);
+    }
+
+    /// Arm a periodic trigger alarm for `owner`, firing every `period_secs`,
+    /// under the agent `session_id`.
+    async fn arm_periodic_trigger_alarm(session_id: &str, owner: &str, period_secs: u64) -> Alarm {
+        seed_owner(owner).await;
+        add_alarm(
+            session_id,
+            owner,
+            "poll the thing",
+            None,
+            Some(period_secs),
+            Some(weather_trigger()),
+            None,
+        )
+        .await
+        .expect("arm a periodic trigger alarm")
     }
 
     /// Arm one one-shot trigger alarm for `owner` under the agent `session_id`
