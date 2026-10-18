@@ -843,15 +843,7 @@ async fn reset_analysis_round(ticket: &Ticket, job_id: &str) {
         ticket = %ticket.id,
         "Backlog analysis produced no usable output — resetting for a fresh attempt",
     );
-    let comment = "Backlog analysis produced no usable output.";
-    reset_phase_attempt(
-        ticket,
-        TicketPhase::Analysis,
-        job_id,
-        "analysis failure",
-        comment,
-    )
-    .await;
+    reset_phase_attempt(ticket, TicketPhase::Analysis, job_id, "analysis failure").await;
 }
 
 /// Process the analyst verdicts and transition the ticket to Planning

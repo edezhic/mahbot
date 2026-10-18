@@ -123,9 +123,9 @@ async fn finish_or_stop(ticket: &Ticket, ws: &Workspace, job_id: &str) {
 }
 
 /// Stop a sanitation round that could not finish: the full cause in the log and
-/// in a ticket comment, the workspace frozen, the phase job deleted. The ticket
-/// stays in `InSanitation` and the round is replayed from scratch once the
-/// workspace is unpaused — the uncommitted changes are preserved.
+/// in the Manager notice, the workspace frozen, the phase job deleted. The
+/// ticket stays in `InSanitation` and the round is replayed from scratch once
+/// the workspace is unpaused — the uncommitted changes are preserved.
 async fn stop_sanitation_round(ticket: &Ticket, ws: &Workspace, job_id: &str, cause: &str) {
     error!(
         ticket = %ticket.id,
@@ -133,10 +133,6 @@ async fn stop_sanitation_round(ticket: &Ticket, ws: &Workspace, job_id: &str, ca
         "Sanitation round could not finish — stopping the round and freezing the workspace"
     );
     let detail = crate::util::failure_detail(cause, "sanitation failure");
-    let comment = substitute(
-        &load_prompt("pipeline/sanitation_stop_comment.md"),
-        &[("{{failure_details}}", &detail)],
-    );
 
     // Read before the freeze lands: `reset_phase_attempt` reports whether THIS
     // stop paused the workspace, so an already-set flag means the freeze is not
@@ -155,7 +151,6 @@ async fn stop_sanitation_round(ticket: &Ticket, ws: &Workspace, job_id: &str, ca
         TicketPhase::InSanitation,
         job_id,
         "sanitation failure",
-        &comment,
     )
     .await;
 
@@ -252,6 +247,7 @@ pub(crate) async fn finalize_sanitation_stage(
     if response.is_none() {
         warn!(
             ticket = %ticket.id,
+            agent_id = %agent.agent_id,
             "Sanitation agent returned no output — resetting for a fresh attempt"
         );
         reset_phase_attempt(
@@ -259,7 +255,6 @@ pub(crate) async fn finalize_sanitation_stage(
             TicketPhase::InSanitation,
             job_id,
             "sanitation failure",
-            "Sanitation could not complete the round (the agent did not respond).",
         )
         .await;
         return;
@@ -276,6 +271,7 @@ pub(crate) async fn finalize_sanitation_stage(
         Err(failure) => {
             warn!(
                 ticket = %ticket.id,
+                agent_id = %agent.agent_id,
                 error = %failure,
                 "Failed to extract sanitation verdict — resetting for a fresh attempt"
             );
@@ -284,7 +280,6 @@ pub(crate) async fn finalize_sanitation_stage(
                 TicketPhase::InSanitation,
                 job_id,
                 "sanitation failure",
-                "Sanitation could not complete the round (the verdict could not be extracted).",
             )
             .await;
         }

@@ -967,6 +967,16 @@ pub(crate) struct TurnState {
     pub(crate) settled_tool_results: bool,
 }
 
+/// How a failed agent run was classified when it failed — the snapshot kept on
+/// [`Agent::run_failure`] so later process-global stops cannot reclassify it.
+#[derive(Clone, Copy)]
+pub(crate) enum RunFailure {
+    /// A genuine technical failure (the pipeline reset/discard path).
+    Technical,
+    /// A cooperative stop (drain, shutdown, pause-freeze, deliberate cancel).
+    CooperativeStop,
+}
+
 /// Running context for an agent turn.
 pub struct Agent {
     /// Session persistence key; also serves as the registry agent ID.
@@ -1058,6 +1068,11 @@ pub struct Agent {
     /// to distinguish provider-class failures (workspace returns to Pending)
     /// from genuine failures (workspace goes Failed).
     pub(crate) failure_class: Option<crate::retry::FailureClass>,
+    /// The classification captured by [`crate::agent::run_agent`] in its `Err`
+    /// arm from `failure_classification`; `None` on success. Captured at failure
+    /// time (not re-derived), so a later process-global stop cannot reclassify
+    /// the run.
+    pub(crate) run_failure: Option<RunFailure>,
     /// Whether the turn ended via a successful `sleep` call.
     pub(crate) sleep_ended: bool,
     /// Whether this turn's user message was recorded (a non-empty message whose

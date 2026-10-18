@@ -217,7 +217,7 @@ tokio::task_local! {
 const MAX_TOOL_ROUNDS: usize = 1000;
 
 /// Retry-exhaustion marker shared by the producer contexts
-/// (`llm_call`/`summarize`) and the `engineer_failure_comment` match; drift is
+/// (`llm_call`/`summarize`) and the `engineer_failure_notice` match; drift is
 /// cosmetic-only (typed classification uses `RetryExhausted`).
 pub(crate) const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
 
@@ -701,6 +701,7 @@ impl Agent {
             first_call_notify: None,
             failure: None,
             failure_class: None,
+            run_failure: None,
             sleep_ended: false,
             turn_recorded: false,
             turn_state: crate::TurnState::default(),
@@ -864,6 +865,14 @@ impl Agent {
         } else {
             self.failure.clone().unwrap_or_else(|| fallback.to_string())
         }
+    }
+
+    /// True when the last run was classified as a technical failure at failure
+    /// time (see [`crate::RunFailure`]) — the gate for the destructive pipeline
+    /// reset/discard path.
+    #[must_use]
+    pub(crate) fn failed_technically(&self) -> bool {
+        matches!(self.run_failure, Some(crate::RunFailure::Technical))
     }
 
     /// Single-sourced shutdown/drain bail guard: the session is durable, so
@@ -3005,27 +3014,24 @@ pub(crate) async fn run_agent(
     match result {
         Ok(response) => (agent, Some(response)),
         Err(e) => {
-            // Capture the real cause (full chain) so ticket dispatchers can
-            // persist it in failure comments instead of a generic placeholder.
+            // Capture the real cause (full chain) so dispatchers can report it
+            // in failure logs and Manager notices instead of a generic
+            // placeholder.
             agent.failure = Some(format!("{e:#}"));
             agent.failure_class = failure_class_from_error(&e);
             let classification = failure_classification(&agent, Some(&e));
+            agent.run_failure = Some(if is_cooperative_stop(classification) {
+                crate::RunFailure::CooperativeStop
+            } else {
+                crate::RunFailure::Technical
+            });
             // The chrome release's hold (`holds_run_end`'s rule).
             run_end.ended(classification);
             let error_chain = crate::util::failure_detail(&format!("{e:#}"), "agent failure log");
-            // During global (SIGTERM/SIGINT) shutdown, in-flight agents return
-            // errors from work() — expected, not real failures. The drain check
-            // runs first, so a run force-cancelled once the drain cap is hit
-            // also classifies as "drain"; both are non-failures. Log at debug
-            // level to avoid misleading ERROR noise on clean shutdown. The
-            // cooperative ends (drain, shutdown, pause) and a deliberate
+            // The cooperative ends (drain, shutdown, pause) and a deliberate
             // cancellation (internal_cancel — user/GUI cancel or a re-dispatch)
             // get the same treatment; this log's own classification decides that.
-            let non_failure = matches!(
-                classification,
-                "drain" | "shutdown" | "pause" | "internal_cancel"
-            );
-            if non_failure {
+            if is_cooperative_stop(classification) {
                 tracing::debug!(
                     agent_id = %agent.agent_id,
                     workspace = %ws.name,
@@ -3106,6 +3112,15 @@ pub(crate) fn failure_class_from_error(
         .map(|exhausted| exhausted.final_class)
 }
 
+/// Classification labels that mean the run stopped cooperatively — drain,
+/// shutdown, a workspace pause-freeze, or a deliberate cancel — rather than
+/// failing technically.
+const COOPERATIVE_STOP_CLASSES: [&str; 4] = ["drain", "shutdown", "pause", "internal_cancel"];
+
+fn is_cooperative_stop(classification: &str) -> bool {
+    COOPERATIVE_STOP_CLASSES.contains(&classification)
+}
+
 /// Stable failure classification for the agent-failure log.
 ///
 /// Order matters: the global shutdown token fires on any stop request — SIGTERM/SIGINT, the
@@ -3114,12 +3129,14 @@ pub(crate) fn failure_class_from_error(
 /// check the global token first so shutdown isn't mislabeled as an internal cancel. The global
 /// token also cancels every per-agent token via
 /// [`crate::agent::registry::AgentRegistry::shutdown_all`]. `error` is the raw
-/// error source when one is present at the call site (the `run_agent` `Err`
-/// arm); `None` only in tests, where the classifier falls through to the token
-/// checks. [`RetryExhausted`] (kept as an error source by
+/// error source when one is present (the `run_agent` `Err` arm); `None` only in
+/// tests, where the classifier falls through to the token checks.
+/// [`RetryExhausted`] (kept as an error source by
 /// [`llm_call`]/[`summarize`]) carries the granular
 /// [`crate::retry::FailureClass`]; everything else (I/O, tool errors, panics)
-/// falls back to `runtime`.
+/// falls back to `runtime`. The cooperative labels are listed once in
+/// [`COOPERATIVE_STOP_CLASSES`], consumed by both the `run_agent` exit log and
+/// [`Agent::failed_technically`] (through the snapshot captured on the agent).
 fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'static str {
     if crate::shutdown::is_draining() {
         // The graceful drain cut the round short — not a failure. Checked
@@ -3219,6 +3236,7 @@ mod tests {
             first_call_notify: None,
             failure: None,
             failure_class: None,
+            run_failure: None,
             sleep_ended: false,
             turn_recorded: false,
             turn_state: crate::TurnState::default(),
@@ -3257,7 +3275,7 @@ mod tests {
             None,
         );
         let err = anyhow::Error::new(exhausted).context("LLM call exhausted retry budget");
-        // The {:#} chain must keep the marker engineer_failure_comment matches.
+        // The {:#} chain must keep the marker engineer_failure_notice matches.
         assert!(format!("{err:#}").contains("exhausted retry budget"));
 
         let agent = make_agent(vec![]);

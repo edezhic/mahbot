@@ -53,7 +53,7 @@ use crate::pipeline::board::{BoardStore, PIPELINE_ACTOR, Ticket, TicketPhase};
 use crate::prompt::{load_prompt, substitute};
 use crate::session::manager_agent_id;
 use crate::util::UnwrapPoison;
-use crate::{Role, Workspace, WorkspaceStatus};
+use crate::{Agent, Role, Workspace, WorkspaceStatus};
 
 pub(crate) use verdict::{
     AgentSlot, ExtractionMode, JointRound, ParallelVerdict, build_round_grouping,
@@ -499,16 +499,13 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
         {
             return;
         }
-        error!(phase = %phase, job = %log_job_id, "Phase body panicked — resetting for a fresh attempt");
-        let comment = format!("Pipeline phase {phase} crashed: the phase body panicked.");
-        reset_phase_attempt(
-            &panic_ticket,
-            phase,
-            &log_job_id,
-            "pipeline phase panic",
-            &comment,
-        )
-        .await;
+        error!(
+            ticket = %panic_ticket.id,
+            phase = %phase,
+            job = %log_job_id,
+            "Phase body panicked — resetting for a fresh attempt",
+        );
+        reset_phase_attempt(&panic_ticket, phase, &log_job_id, "pipeline phase panic").await;
     });
 }
 
@@ -953,28 +950,72 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
 
 /// Hard technical failure at a phase: destroy the CURRENT attempt (its phase
 /// job) so the puller creates a FRESH one from scratch. Cancels any orphaned
-/// ticket agents, leaves an explanatory comment, pauses the workspace only for
-/// the implementation phases, and deletes the phase job. Consumes no bounce
-/// budget. Returns whether THIS call paused the workspace: `false` for a phase
-/// that does not pause (a non-pipeline-occupied one) and when this call did not
-/// perform the pause — it was already paused, or the pause was skipped (a
-/// shutdown, or a workspace that could not be resolved).
+/// ticket agents, pauses the workspace only for the implementation phases, and
+/// deletes the phase job. Leaves no ticket comment — ticket history carries
+/// stage conclusions only. Consumes no bounce budget. Returns whether THIS call
+/// paused the workspace: `false` for a phase that does not pause (a
+/// non-pipeline-occupied one) and when this call did not perform the pause — it
+/// was already paused, or the pause was skipped (a shutdown, or a workspace
+/// that could not be resolved).
 async fn reset_phase_attempt(
     ticket: &Ticket,
     phase: TicketPhase,
     job_id: &str,
     reason: &str,
-    comment: &str,
 ) -> bool {
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
-    // The workspace pause still happens for implementation phases, but it is
-    // silent in ticket history (the caller's substantive reason is the comment).
     let paused = phase.is_pipeline_occupied() && pause_workspace_on_failure(ticket, reason).await;
-    if let Err(e) = board().add_comment(&ticket.id, SYSTEM_ROLE, comment).await {
-        warn!(ticket = %ticket.id, error = %e, "Failed to comment phase reset");
-    }
     let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
     paused
+}
+
+/// Discard a parallel round member's per-attempt session when its run died on
+/// the very first request. The slot id (`ticket_{ticket_id}_{idx}_{suffix}_{role}`,
+/// see [`agent_id`]) is attempt-scoped — never an engineer/sanitation pin or a
+/// maintainer/analyze/user session — and a session with no assistant row never
+/// became resumable, so keeping it would only list an empty dead session.
+///
+/// A session that already holds an assistant row is kept, and so is one whose
+/// rows cannot be read (nothing is deleted on an unproven-empty session).
+async fn discard_failed_first_request_session(ticket_id: &str, agent: &Agent) {
+    if !agent.failed_technically() {
+        return;
+    }
+    let store = crate::session::store();
+    let produced_output = match store.last_assistant_created_at(&agent.agent_id).await {
+        Ok(last) => last.is_some(),
+        Err(e) => {
+            warn!(
+                ticket = %ticket_id,
+                agent = %agent.agent_id,
+                error = %e,
+                "Failed to check whether the failed round member's session ever produced output — keeping it",
+            );
+            return;
+        }
+    };
+    if produced_output {
+        return;
+    }
+    let deleted = match store.delete(&agent.agent_id).await {
+        Ok(deleted) => deleted,
+        Err(e) => {
+            warn!(
+                ticket = %ticket_id,
+                agent = %agent.agent_id,
+                error = %e,
+                "Failed to discard the session of a round member whose first request failed",
+            );
+            return;
+        }
+    };
+    if deleted {
+        info!(
+            ticket = %ticket_id,
+            agent = %agent.agent_id,
+            "Discarded the empty session of a round member whose first request failed",
+        );
+    }
 }
 
 /// Fetch the last ticket comment (any role) as failure details for a Manager
@@ -1294,6 +1335,8 @@ fn assemble_parallel_results(
 /// session-continuation semantics (their stored tasks were already seeded), so
 /// the message is suppressed when the persisted session already holds the task,
 /// and the leader-stagger is skipped (the sessions have already diverged).
+///
+/// Session cleanup for a failed member: [`discard_failed_first_request_session`].
 #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_parallel_agents(
     ticket: &Arc<Ticket>,
@@ -1375,13 +1418,11 @@ async fn run_parallel_agents(
                                 true,
                             )
                         } else {
-                            let reason = agent.failure_reason("agent produced no response");
-                            (
-                                ParallelVerdict::NoResponse(crate::util::scrub_credentials(
-                                    &reason,
-                                )),
-                                false,
-                            )
+                            let reason = crate::util::scrub_credentials(
+                                &agent.failure_reason("agent produced no response"),
+                            );
+                            discard_failed_first_request_session(&ticket.id, &agent).await;
+                            (ParallelVerdict::NoResponse(reason), false)
                         }
                     } else {
                         let verdict = match &extract_mode {
@@ -1418,7 +1459,18 @@ async fn run_parallel_agents(
                         };
                         match verdict {
                             Ok(v) => (v, false),
-                            Err(e) => (ParallelVerdict::ParseFailed(e), false),
+                            Err(e) => {
+                                warn!(
+                                    ticket = %ticket.id,
+                                    agent = %agent_id,
+                                    error = %crate::util::failure_detail(
+                                        &format!("{e:#}"),
+                                        "round member extraction",
+                                    ),
+                                    "Round member produced a response but its verdict could not be extracted",
+                                );
+                                (ParallelVerdict::ParseFailed(e), false)
+                            }
                         }
                     }
                 }
@@ -1442,7 +1494,8 @@ async fn run_parallel_agents(
     }
 }
 
-/// Build the raw-response dump section for a verdict-extraction failure comment.
+/// Build the raw-response dump section for a verdict-extraction failure
+/// diagnostic.
 fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     match failure.last_raw.as_deref() {
         Some(text) if !text.trim().is_empty() => format!(
@@ -1499,7 +1552,7 @@ async fn run_single_agent(
     message: &str,
     incoming_rx: tokio::sync::mpsc::UnboundedReceiver<message_router::AgentJob>,
     resume: bool,
-) -> (crate::Agent, Option<String>) {
+) -> (Agent, Option<String>) {
     run_agent(
         agent_id,
         role,

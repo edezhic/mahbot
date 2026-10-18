@@ -8,7 +8,7 @@ use crate::prompt::{load_prompt, substitute};
 use crate::{Agent, Role, Workspace};
 
 use super::{
-    RETRY_EXHAUSTION_MARKER, SYSTEM_ROLE, StageRunKind, TicketPhase, TransitionCtx, board,
+    RETRY_EXHAUSTION_MARKER, StageRunKind, TicketPhase, TransitionCtx,
     comment_and_transition_or_bail, guard_job_phase, guard_stage, info, notify_manager_system,
     pause_freezing, pause_status_sentence, pause_workspace_on_failure, run_stage_agent,
     sync_phase_job_task, warn,
@@ -105,8 +105,8 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     crate::util::failure_detail(&out, "engineer summary comment")
 }
 
-/// Build the failure comment for a failed Engineer run.
-fn engineer_failure_comment(shutdown: bool, error: Option<&str>) -> String {
+/// Build the failure text for a failed Engineer run (the Manager pause notice).
+fn engineer_failure_notice(shutdown: bool, error: Option<&str>) -> String {
     if shutdown {
         return "Engineer failed: service shutting down — the run was interrupted \
                 by process shutdown."
@@ -219,24 +219,17 @@ async fn handle_engineer_failure(
         return;
     }
 
-    let failure_comment = engineer_failure_comment(
+    let failure_notice = engineer_failure_notice(
         crate::shutdown::shutdown_token().is_cancelled(),
         agent.failure.as_deref(),
     );
     let conn = &crate::session::store().conn;
 
-    // Hard failure: pause is already committed. Leave an explanatory
-    // comment and delete the phase job; the puller creates a FRESH
-    // InDevelopment attempt on unpause. The pause is silent in the ticket
-    // comment — notify_engineer_pause reports it separately.
-    if let Err(e) = board()
-        .add_comment(&ticket.id, SYSTEM_ROLE, &failure_comment)
-        .await
-    {
-        warn!(ticket = %ticket.id, error = %e, "Failed to comment engineer hard failure");
-    }
+    // Hard failure: pause is already committed. The ticket itself gets no
+    // comment — ticket history carries stage conclusions only; the Manager
+    // notice below reports the pause and the cause.
     let workspace_paused = ws.paused || pause_occurred;
-    notify_engineer_pause(ws, &failure_comment, workspace_paused);
+    notify_engineer_pause(ws, &failure_notice, workspace_paused);
     info!(
         ticket = %ticket.id,
         "Engineer hard failure — workspace paused, ticket reset for a fresh development attempt"

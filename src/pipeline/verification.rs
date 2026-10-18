@@ -148,9 +148,6 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
                 ACTIVE_PHASE,
                 &job_id,
                 "project commands load failure",
-                &format!(
-                    "Could not load the workspace's project commands due to a database error: {e}"
-                ),
             )
             .await;
             return;
@@ -568,7 +565,7 @@ async fn process_round_verdicts(
 ) -> bool {
     // Distinguish the two failure classes: a participant that did NOT complete
     // (NoResponse/ParseFailed) is a HARD TECHNICAL failure — reset the attempt
-    // (comment + delete job + pause; no bounce budget). A participant that DID
+    // (delete job + pause; no bounce budget). A participant that DID
     // complete but found issues (a Verdict below threshold) is a rework verdict
     // — bounce to development, consuming bounce budget.
     let technical_failure = results.iter().any(ParallelVerdict::is_technical_failure);
@@ -592,16 +589,12 @@ async fn process_round_verdicts(
     if technical_failure {
         // Hard technical failure: the whole merged round is destroyed and
         // re-driven as a unit (never resumed participant by participant).
-        let comment =
-            format!("{STAGE} could not complete the round (a participant did not respond).");
-        reset_phase_attempt(
-            ticket,
-            ACTIVE_PHASE,
-            job_id,
-            "verification failure",
-            &comment,
-        )
-        .await;
+        warn!(
+            ticket = %ticket.id,
+            stage = STAGE,
+            "Verification round hit a technical participant failure — resetting for a fresh attempt",
+        );
+        reset_phase_attempt(ticket, ACTIVE_PHASE, job_id, "verification failure").await;
         return false;
     }
 

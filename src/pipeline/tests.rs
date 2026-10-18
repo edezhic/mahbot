@@ -764,9 +764,9 @@ async fn bounce_breaker_trips_to_failed() {
     );
 }
 
-/// `reset_phase_attempt` destroys the current attempt: it comments, cancels
-/// orphaned agents, pauses the workspace for an implementation phase, and
-/// deletes the phase job so the puller creates a fresh one.
+/// `reset_phase_attempt` destroys the current attempt: it cancels orphaned
+/// agents, pauses the workspace for an implementation phase, and deletes the
+/// phase job so the puller creates a fresh one — with no ticket comment.
 ///
 /// Serialized on `drain`: the auto-pause goes through
 /// `pause_workspace_on_failure`, which short-circuits while the process-global
@@ -810,7 +810,6 @@ async fn reset_phase_attempt_destroys_attempt_and_pauses() {
         TicketPhase::InDevelopment,
         &job_id,
         "test hard failure",
-        "attempt reset",
     )
     .await;
 
@@ -837,8 +836,8 @@ async fn reset_phase_attempt_destroys_attempt_and_pauses() {
     );
     let comments = store.get_comments(&id).await.unwrap();
     assert!(
-        comments.iter().any(|c| c.content.contains("attempt reset")),
-        "reset must leave an explanatory comment",
+        comments.is_empty(),
+        "a technical reset must leave no ticket comment",
     );
 }
 
@@ -881,7 +880,6 @@ async fn reset_phase_attempt_analysis_does_not_pause() {
         TicketPhase::Analysis,
         &job_id,
         "analysis failure",
-        "analysis reset",
     )
     .await;
 
@@ -899,6 +897,201 @@ async fn reset_phase_attempt_analysis_does_not_pause() {
     assert!(
         !ws_row.paused,
         "analysis reset must NOT pause the workspace",
+    );
+}
+
+/// A parallel round member that died on its very first request never became a
+/// resumable session: its empty per-attempt session is discarded. A slot whose
+/// session already holds an assistant row keeps it — the discard is only for a
+/// session that never got past its first request.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn first_request_failure_discards_only_empty_round_sessions() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/first_request_ws", "first_request_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "FirstRequest", TicketPhase::Analysis).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+
+    let fresh_id = format!("ticket_{id}_0_nano_analyst");
+    let resumed_id = format!("ticket_{id}_1_nano_analyst");
+    let slots = vec![
+        super::AgentSlot {
+            idx: 0,
+            agent_id: fresh_id.clone(),
+            task: "analyse the ticket".to_string(),
+            status: crate::jobs::RowStatus::Launched,
+            outcome: None,
+        },
+        super::AgentSlot {
+            idx: 1,
+            agent_id: resumed_id.clone(),
+            task: "analyse the ticket".to_string(),
+            status: crate::jobs::RowStatus::Launched,
+            outcome: None,
+        },
+    ];
+    super::insert_round_slots(&job_id, &[(crate::jobs::AgentKind::Analyst, &slots[..])])
+        .await
+        .unwrap();
+
+    // The resumed slot's session already holds an assistant row (resumable work).
+    let conn = &crate::session::store().conn;
+    crate::util::test::seed_session_row(conn, &resumed_id, "assistant", "earlier work").await;
+
+    // Three identical errors per member cover the whole retry budget.
+    let mut fake = crate::util::test::FakeProvider::new();
+    for _ in 0..6 {
+        fake = fake.err(
+            crate::retry::FailureClass::NonRetryable,
+            "provider balance exhausted",
+        );
+    }
+    let _seam = crate::util::test::install_retry_seam(fake);
+
+    let (results, paused) = super::run_parallel_agents(
+        &std::sync::Arc::new(expect_ticket(store, &id).await),
+        &ws,
+        crate::Role::Analyst,
+        "extract the verdict",
+        super::ExtractionMode::ScorelessVerdict,
+        &job_id,
+        &slots,
+        TicketPhase::Analysis,
+        true,
+    )
+    .await;
+
+    assert!(
+        results
+            .iter()
+            .all(super::ParallelVerdict::is_technical_failure),
+        "both members must report a technical failure",
+    );
+    assert!(!paused, "a provider failure is not a cooperative pause");
+
+    for table in ["sessions", "session_metadata"] {
+        let row = conn
+            .query_optional(
+                &format!("SELECT 1 FROM {table} WHERE agent_id = ?1 LIMIT 1"),
+                crate::db::params![fresh_id.clone()],
+                |_| Ok::<_, std::convert::Infallible>(()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            row.is_none(),
+            "a first-request failure must drop the slot's {table} row",
+        );
+    }
+    let kept = conn
+        .query_optional(
+            "SELECT 1 FROM sessions WHERE agent_id = ?1 LIMIT 1",
+            crate::db::params![resumed_id.clone()],
+            |_| Ok::<_, std::convert::Infallible>(()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        kept.is_some(),
+        "a session that already held an assistant row must be kept",
+    );
+}
+
+/// An engineer provider failure pauses the workspace and leaves no ticket
+/// comment, while its reusable session pin keeps the accumulated session for
+/// the next attempt.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn engineer_provider_failure_leaves_no_comment_and_keeps_the_session() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/engineer_failure_ws", "engineer_failure_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    crate::workspace::store()
+        .set_paused(&ws.name, false)
+        .await
+        .unwrap();
+    // Registered up front so the pause notice lands in a local inbox instead of
+    // spawning a real Manager turn.
+    let mut manager_inbox =
+        crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
+
+    let id = make_ticket(store, &ws, "EngineerFailure", TicketPhase::InDevelopment).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InDevelopment,
+        crate::Role::Engineer,
+        "implement",
+    )
+    .await;
+    let pin = crate::jobs::session_pin_id(&id, crate::Role::Engineer);
+
+    {
+        let mut fake = crate::util::test::FakeProvider::new();
+        for _ in 0..3 {
+            fake = fake.err(
+                crate::retry::FailureClass::NonRetryable,
+                "provider balance exhausted",
+            );
+        }
+        let _seam = crate::util::test::install_retry_seam(fake);
+        super::development::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::InDevelopment,
+        "a technical engineer failure must leave the ticket in InDevelopment",
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::InDevelopment)
+            .await
+            .is_none(),
+        "a technical engineer failure must destroy the phase job",
+    );
+    assert_workspace_paused(&ws, true).await;
+    assert!(
+        store.get_comments(&id).await.unwrap().is_empty(),
+        "a technical engineer failure must leave no ticket comment",
+    );
+    assert!(
+        crate::session::store().has_content(&pin).await,
+        "the engineer session pin must keep its session for the next attempt",
+    );
+    let notice = manager_inbox
+        .try_recv()
+        .expect("the pause must notify the Manager");
+    assert!(
+        notice.content.contains("provider balance exhausted"),
+        "the Manager notice must carry the real cause:\n{}",
+        notice.content,
     );
 }
 
@@ -2455,10 +2648,8 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     {
         let comments = store.get_comments(&aid).await.unwrap();
         assert!(
-            comments.iter().any(|c| c
-                .content
-                .contains("Backlog analysis produced no usable output")),
-            "the reset must leave an explanatory comment",
+            comments.is_empty(),
+            "a hard analysis failure must leave no ticket comment",
         );
     }
 
@@ -2519,7 +2710,6 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         TicketPhase::InDevelopment,
         &ejob,
         "test hard failure",
-        "engineer attempt reset",
     )
     .await;
     assert_eq!(
@@ -2581,6 +2771,57 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         .await
         .expect("the re-created development body must re-drive to Verification");
     }
+}
+
+// ── 5b. Verification technical participant failure ───────────────────────
+
+/// A verification round whose participant requests fail technically resets the
+/// attempt: the phase job is destroyed, the workspace is frozen, and the ticket
+/// carries no comment — the failure is logged, not commented.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn verification_provider_failure_leaves_no_comment_and_resets() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "verification_failure_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "VerificationFailure", TicketPhase::Verification).await;
+
+    // Every participant request fails with an exhausted-balance error; the
+    // script covers the reviewer cohort, the tester and any retry.
+    let mut fake = crate::util::test::FakeProvider::new();
+    for _ in 0..20 {
+        fake = fake.err(
+            crate::retry::FailureClass::NonRetryable,
+            "provider balance exhausted",
+        );
+    }
+    run_verification_round(store, &ws, &id, std::sync::Arc::new(fake)).await;
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Verification,
+        "a technical participant failure must not move the ticket",
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::Verification)
+            .await
+            .is_none(),
+        "a technical participant failure must destroy the phase job",
+    );
+    assert_workspace_paused(&ws, true).await;
+    let comments = store.get_comments(&id).await.unwrap();
+    assert!(
+        comments.is_empty(),
+        "a technical participant failure must leave no ticket comment",
+    );
+
+    drop(repo_dir);
 }
 
 // ── 6. Analysis hard-failure cleanup stays in phase, no pause ────────────
@@ -2652,10 +2893,8 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
     );
     let comments = store.get_comments(&id).await.unwrap();
     assert!(
-        comments.iter().any(|c| c
-            .content
-            .contains("Backlog analysis produced no usable output")),
-        "the reset must leave an explanatory comment",
+        comments.is_empty(),
+        "a hard analysis failure must leave no ticket comment",
     );
 }
 
@@ -3060,8 +3299,9 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
 /// A persistent commit failure (a rejecting hook, a broken index, a missing git
 /// identity, an unreadable repository) must STOP the sanitation round instead of
 /// leaving its job behind for the puller to re-drive every poll tick: the full
-/// cause reaches the ticket, the workspace is frozen, the phase job is deleted,
-/// and the ticket stays in sanitation with its changes uncommitted.
+/// cause reaches the Manager notice and the log, the workspace is frozen, the
+/// phase job is deleted, and the ticket stays in sanitation with its changes
+/// uncommitted — with no failure comment on the ticket.
 #[cfg(unix)]
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -3146,14 +3386,12 @@ async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
         "the stopped round's phase job must be deleted",
     );
     let comments = store.get_comments(&id).await.unwrap();
-    let stop = comments
-        .iter()
-        .find(|c| c.content.contains("rejected by test hook"))
-        .expect("the ticket must carry the git process message");
     assert!(
-        stop.content.contains("Failed to commit changes"),
-        "the stop comment must keep the full error chain: {}",
-        stop.content,
+        comments
+            .iter()
+            .all(|c| !c.content.contains("rejected by test hook")
+                && !c.content.contains("Failed to commit changes")),
+        "a stopped sanitation round must not write a failure comment",
     );
     assert_eq!(
         crate::git::commands::run_git_head(repo_path.as_path())
