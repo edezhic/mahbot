@@ -275,7 +275,7 @@ use crate::config::CONFIG;
 use crate::tools::ComputerTool;
 use crate::tools::path::PathAccess;
 use crate::tools::{
-    AddAlarmTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ChromeTool,
+    AddAlarmTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ArchiveTool, ChromeTool,
     CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, GetTicketTool,
     ImageGenTool, ListAlarmsTool, ListTicketsTool, MahbotConfigTool, MahbotDebugTool,
     RasterizeTool, ReadTool, RemoveAlarmTool, SearchArchivedTicketsTool, SearchTool, SendTool,
@@ -328,12 +328,15 @@ impl Role {
         ]
     }
 
-    /// The Assistant's static core tool set — everything the admin's Assistant
-    /// gets except `web_search`, which [`Role::tools`] appends afterwards.
+    /// The Assistant's static core tool set: the admin's own set minus
+    /// `web_search` ([`Role::tools`] appends that afterwards), plus the
+    /// guest-only `archive`.
     ///
     /// `is_admin` widens the set exactly as it does for the Assistant: the
     /// admin-only shell / send / computer / config
     /// / pipeline tools, whose access level and `analyze` flavour also follow it.
+    /// It narrows it in one place — `archive`, which exists only because a guest
+    /// has no shell.
     fn assistant_core_tools(is_admin: bool) -> Vec<Box<dyn Tool>> {
         // The optional `place` argument belongs to the admin's Assistant: a
         // guest's round always runs in its own workspace, and a custom role's
@@ -374,6 +377,11 @@ impl Role {
             // its input paths follow the caller's access.
             Box::new(DocumentTool::new(file_access)),
         ];
+        // A guest's Assistant has no shell, so moving a stale file out of the
+        // way needs a tool of its own; the admin's has a shell and gets none.
+        if !is_admin {
+            t.push(Box::new(ArchiveTool));
+        }
         // The grant-gated forwarding tool: every Assistant can call
         // admin-authored scripts; the grant (or admin rights) decides
         // what each call may reach.
@@ -417,10 +425,10 @@ impl Role {
     /// search spans the installation and `get_ticket` opens a prefixed ID
     /// from any workspace.
     ///
-    /// `is_admin` says whether the triggering account is the admin. It only
-    /// widens the Assistant's toolset: `shell`, `send`,
+    /// `is_admin` says whether the triggering account is the admin. It widens
+    /// the Assistant's toolset with `shell`, `send`,
     /// `computer`, `mahbot_config`, `mahbot_debug` and
-    /// `workspace` are added.
+    /// `workspace`, and removes the guest-only `archive`.
     /// Every other role's toolset is byte-identical regardless of its value.
     /// `computer` exists only where the capability does: on macOS it is
     /// withdrawn, so the admin's toolset there has no such tool (see
@@ -978,6 +986,16 @@ mod tests {
                 "the admin's Assistant toolset must contain '{name}'"
             );
         }
+        // `archive` is the guest's alone: the admin's Assistant moves files with
+        // its shell, so a tool for it would be redundant.
+        assert!(
+            guest.iter().any(|t| t.name() == "archive"),
+            "a guest's Assistant needs `archive`: it has no shell to move a file out of the way"
+        );
+        assert!(
+            !admin.iter().any(|t| t.name() == "archive"),
+            "the admin's Assistant must not advertise `archive` — its shell already moves files"
+        );
         if cfg!(target_os = "macos") {
             assert!(
                 !admin.iter().any(|t| t.name() == "computer"),

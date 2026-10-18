@@ -4,6 +4,7 @@ use anyhow::Context;
 pub(crate) mod active_models;
 pub(crate) mod alarms;
 pub(crate) mod analyze;
+pub(crate) mod archive;
 pub mod bun;
 pub mod chrome;
 pub mod chrome_daemon;
@@ -190,6 +191,7 @@ pub(crate) fn fit_request_body_budget(
 
 pub(crate) use alarms::{AddAlarmTool, ListAlarmsTool, RemoveAlarmTool};
 pub(crate) use analyze::{AnalyzeDepth, AnalyzeTool, DispatchMode};
+pub(crate) use archive::ArchiveTool;
 pub(crate) use chrome::ChromeTool;
 #[cfg(not(target_os = "macos"))]
 pub(crate) use computer::ComputerTool;

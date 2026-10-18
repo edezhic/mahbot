@@ -106,7 +106,11 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 /// and macOS's `.DS_Store`. A user's own dotfile — `.env`, `.gitignore`,
 /// `.config/` — is the user's material and a hand edit to it must be reported;
 /// the product's own things at the workspace root (`MEMORY.md` and the
-/// `generated/`, `uploads/` and `notes/` directories) are never watched either.
+/// `generated/`, `uploads/`, `notes/` and `archive/` directories) are never
+/// watched either. `archive/` holds only what the assistant retired with its
+/// `archive` tool, so a move into it is the assistant's own bookkeeping rather
+/// than a change to the user's material — and the picture stays a sketch of what
+/// the user has, not of what was put aside.
 ///
 /// This predicate is the single definition of the user's file material inside a
 /// personal folder — the report ([`scan`]) and the session-start picture
@@ -134,7 +138,7 @@ fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
             return true;
         }
         if entry.file_type().is_some_and(|t| t.is_dir()) {
-            if matches!(name, "generated" | "uploads" | "notes") {
+            if matches!(name, "generated" | "uploads" | "notes" | "archive") {
                 return true;
             }
             // The product's custom-tool catalogue lives in the owner's own
@@ -1113,6 +1117,8 @@ mod tests {
             "uploads",
             "shared",
             "notes",
+            "archive/2026-01-01",
+            "archive",
             ".config",
         ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
@@ -1123,6 +1129,7 @@ mod tests {
             "generated/g.txt",
             "uploads/u.txt",
             "notes/n.txt",
+            "archive/2026-01-01/old.txt",
             ".DS_Store",
             "MEMORY.md",
         ];
@@ -1617,6 +1624,8 @@ mod tests {
             "generated",
             "uploads",
             "notes",
+            "archive/2026-01-01",
+            "archive",
             "album/deep",
             "album",
             ".config",
@@ -1632,6 +1641,7 @@ mod tests {
             "generated/big.bin",
             "uploads/u.png",
             "notes/topic.md",
+            "archive/2026-01-01/old.md",
             "MEMORY.md",
             ".DS_Store",
             "album/.DS_Store",
@@ -1702,6 +1712,7 @@ mod tests {
             "generated",
             "uploads",
             "notes",
+            "archive",
             ".git",
             ".compaction",
             "MEMORY.md",
