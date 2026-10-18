@@ -248,7 +248,7 @@ fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
 /// shell command is handed the owner's environment (see
 /// [`crate::shell_env`]), while this internal work keeps the reduced one. Use
 /// SSH config (`~/.ssh/config`) for SSH-based git remotes rather than
-/// environment variables. ([`run_git_fetch`] is the one exception: it
+/// environment variables. ([`run_git_network`] is the one exception: it
 /// restores `SSH_AUTH_SOCK` so SSH-agent remotes still work.)
 pub(crate) async fn run_git_output(
     repo_path: &Path,
@@ -605,49 +605,452 @@ pub async fn run_git_current_branch(repo_path: &Path) -> anyhow::Result<String> 
     run_git_trimmed(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]).await
 }
 
-/// Get behind/ahead counts against the upstream branch.
-///
-/// Returns `(behind, ahead)`. If there is no upstream configured, returns
-/// `(0, 0)` without error.
-pub async fn run_git_behind_ahead(repo_path: &Path) -> anyhow::Result<(usize, usize)> {
-    match run_git_command(
+/// What the branch and its upstream each carry without the other.
+#[derive(Debug, Clone, Copy)]
+struct UpstreamCounts {
+    /// Commits the upstream has that `HEAD` does not: what a pull would take.
+    behind: usize,
+    /// Commits `HEAD` has that the upstream does not: what a push to it owes.
+    ahead: usize,
+}
+
+/// Measure the branch against `upstream`.
+async fn ahead_behind(repo_path: &Path, upstream: &str) -> anyhow::Result<UpstreamCounts> {
+    let counts = run_git_trimmed(
         repo_path,
-        &["rev-list", "--count", "--left-right", "HEAD...@{upstream}"],
+        &[
+            "rev-list",
+            "--count",
+            "--left-right",
+            &format!("{upstream}...HEAD"),
+        ],
     )
-    .await
-    {
-        Ok(out) => {
-            let parts: Vec<&str> = out.trim().split('\t').collect();
-            if parts.len() == 2 {
-                let ahead = parts[0].parse::<usize>().unwrap_or(0);
-                let behind = parts[1].parse::<usize>().unwrap_or(0);
-                Ok((behind, ahead))
-            } else {
-                Ok((0, 0))
-            }
-        }
-        Err(e) => {
-            // Only git's own "no upstream" verdicts are genuine empty results.
-            // The error string embeds the command args (`@{upstream}`), so a
-            // naive "contains upstream" match also swallows spawn/runtime
-            // failures — anchor on git's stderr wording instead.
-            let msg = e.to_string();
-            if msg.contains("fatal: no upstream") || msg.contains("HEAD does not point to a branch")
-            {
-                Ok((0, 0))
-            } else {
-                Err(e)
-            }
+    .await?;
+    let (behind, ahead) = counts
+        .split_once('\t')
+        .with_context(|| format!("git rev-list printed {counts:?}"))?;
+    Ok(UpstreamCounts {
+        behind: behind.trim().parse()?,
+        ahead: ahead.trim().parse()?,
+    })
+}
+
+/// Where the sync control pushes the checked-out branch, and what it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPushTarget {
+    /// The remote that accepts pushes and receives the branch.
+    pub remote: String,
+    /// Commits a press carries: what `remote` lacks of the branch as the update
+    /// step leaves it, or every commit the branch carries when it is published or
+    /// when `remote` could not be asked.
+    pub commits: usize,
+    /// Whether `remote` has a branch of this name: `Some(true)` it does not, so
+    /// the push publishes it and the update step is skipped; `Some(false)` it
+    /// does; `None` when `remote` could not be asked, so neither is claimed.
+    pub publish: Option<bool>,
+}
+
+/// Where the checked-out branch can be pushed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitPushDestination {
+    /// A remote accepts pushes: the one a plain `git push` reaches, the branch's
+    /// tracked remote, or the only push-capable remote.
+    Target(GitPushTarget),
+    /// No remote accepts pushes, or several do: nothing is guessed, and the
+    /// control says why instead of staying hidden.
+    Nowhere {
+        /// Why no destination was chosen.
+        reason: String,
+    },
+}
+
+/// The checked-out branch's remote state, as the footer's sync control shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRemoteState {
+    /// The branch this state describes: the footer caches it across refreshes,
+    /// and a branch switched since then makes it stale rather than wrong.
+    pub branch: String,
+    /// Commits the branch would pull from its own update source.
+    pub behind: usize,
+    /// Where a push would go.
+    pub push: GitPushDestination,
+}
+
+impl GitRemoteState {
+    /// Whether the sync control has anything to offer: commits to pull, commits
+    /// to push, or a branch no reachable remote can take (which the control says
+    /// plainly rather than hiding).
+    #[must_use]
+    pub fn has_sync_work(&self) -> bool {
+        match &self.push {
+            GitPushDestination::Nowhere { .. } => true,
+            GitPushDestination::Target(target) => self.behind > 0 || target.commits > 0,
         }
     }
 }
 
-/// Hard timeout for a single `git fetch` — an unreachable/slow remote must not
-/// hang the periodic remote sync indefinitely.
+/// Resolve the checked-out branch's remote state for the footer's sync control.
+///
+/// `behind` is measured against the branch's own upstream (what a pull would
+/// take), while the push destination is a separate question: a branch may track a
+/// fetch-only remote, or nothing at all, and still be pushable. `None` when
+/// `HEAD` names no branch — the control concerns the checked-out branch.
+pub async fn run_git_remote_state(repo_path: &Path) -> anyhow::Result<Option<GitRemoteState>> {
+    let Some(lane) = resolve_push_lane(repo_path).await? else {
+        return Ok(None);
+    };
+    Ok(Some(GitRemoteState {
+        branch: lane.branch,
+        behind: lane.upstream_counts.map_or(0, |counts| counts.behind),
+        push: lane.destination,
+    }))
+}
+
+/// The remotes git resolves for a branch: the one it tracks for updates and the
+/// one a plain `git push` sends to.
+struct BranchRemotes {
+    /// The remote the branch tracks, even when its remote-tracking ref is gone;
+    /// `None` when it tracks nothing.
+    upstream: Option<String>,
+    /// The remote-tracking ref the upstream names, when that ref exists — the
+    /// exact local measure of what a pull would take and of what a push to the
+    /// upstream still owes.
+    upstream_ref: Option<String>,
+    /// The remote a plain `git push` sends to, which honours
+    /// `branch.<name>.pushRemote` and `remote.pushDefault`.
+    push: Option<String>,
+}
+
+/// The checked-out branch's push lane: the branch, git's own view of its
+/// remotes, and where a push of it would go.
+struct PushLane {
+    branch: String,
+    remotes: BranchRemotes,
+    /// The branch's distance from its upstream ref, when it has one.
+    upstream_counts: Option<UpstreamCounts>,
+    destination: GitPushDestination,
+}
+
+/// Resolve where the checked-out branch can be pushed; `None` when `HEAD` names
+/// no branch (detached or unborn).
+///
+/// Where a push goes is decided by which remote accepts pushes, not by what the
+/// branch tracks: a tracked remote that is fetch-only is the branch's update
+/// source, never a push destination. The remote git itself would push to comes
+/// first, so the destination the control names is the one a plain `git push`
+/// reaches.
+async fn resolve_push_lane(repo_path: &Path) -> anyhow::Result<Option<PushLane>> {
+    let Some(branch) = checked_out_branch(repo_path).await else {
+        return Ok(None);
+    };
+    let pushable: Vec<String> = remotes(repo_path)
+        .await?
+        .into_iter()
+        .filter_map(|(name, accepts_pushes)| accepts_pushes.then_some(name))
+        .collect();
+    let own = branch_remotes(repo_path, &branch).await?;
+    let upstream_counts = match &own.upstream_ref {
+        Some(upstream) => Some(ahead_behind(repo_path, upstream).await?),
+        None => None,
+    };
+    // A press fast-forwards the branch from its own update source before pushing,
+    // so the count belongs to the tip it carries then: the upstream it can
+    // fast-forward to, or the branch itself when the update cannot move it there
+    // (no upstream ref, already level, or diverged).
+    let push_tip = match (&own.upstream_ref, upstream_counts) {
+        (Some(upstream), Some(counts)) if counts.behind > 0 && counts.ahead == 0 => {
+            upstream.as_str()
+        }
+        _ => "HEAD",
+    };
+    // Prefer the remote git itself would push to, then the tracked one, then the
+    // only push-capable remote; a fetch-only remote is never chosen.
+    let accepts = |name: Option<&str>| {
+        name.filter(|name| pushable.iter().any(|remote| remote == name))
+            .map(str::to_string)
+    };
+    let destination_remote = accepts(own.push.as_deref())
+        .or_else(|| accepts(own.upstream.as_deref()))
+        .or_else(|| match pushable.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        });
+    let destination = match destination_remote.as_deref() {
+        Some(remote) => {
+            // The upstream ref the fetch keeps current is exact, so a push to
+            // the branch's own upstream needs no network round trip.
+            let tracked_destination = own.upstream.as_deref() == Some(remote);
+            let position = match upstream_counts {
+                Some(counts) if tracked_destination => DestinationPosition {
+                    publish: Some(false),
+                    commits: counts.ahead,
+                },
+                _ => destination_position(repo_path, remote, &branch, push_tip).await?,
+            };
+            GitPushDestination::Target(GitPushTarget {
+                remote: remote.to_string(),
+                commits: position.commits,
+                publish: position.publish,
+            })
+        }
+        None => GitPushDestination::Nowhere {
+            reason: match pushable.as_slice() {
+                [] => "no remote accepts pushes".to_string(),
+                several => format!("several remotes accept pushes ({})", several.join(", ")),
+            },
+        },
+    };
+    Ok(Some(PushLane {
+        branch,
+        remotes: own,
+        upstream_counts,
+        destination,
+    }))
+}
+
+/// The branch `HEAD` names, if it names one (a detached or unborn `HEAD` does
+/// not: `rev-parse --abbrev-ref` prints `HEAD`, or fails).
+async fn checked_out_branch(repo_path: &Path) -> Option<String> {
+    run_git_current_branch(repo_path)
+        .await
+        .ok()
+        .filter(|branch| branch != "HEAD")
+}
+
+/// What the destination answered for a branch: what it would take, and whether it
+/// already carries it at all.
+struct DestinationPosition {
+    /// Whether the destination has no branch of this name: `None` when it could
+    /// not be asked.
+    publish: Option<bool>,
+    /// Commits a press carries.
+    commits: usize,
+}
+
+/// Ask `remote` what it carries for `branch`, and measure the push against it.
+///
+/// The destination is asked directly (`ls-remote`) rather than trusting the
+/// local `refs/remotes/<remote>/<branch>`: a narrowed `remote.<remote>.fetch`
+/// refspec never creates that ref, and the refresh's fetch follows the branch's
+/// own upstream, so that ref is stale in exactly the cases the control exists
+/// for. The destination's tip may not be in this repository at all, so its copy
+/// of the branch is fetched — into the remote-tracking ref, so the count holds
+/// whatever refspecs are configured — when the tip's commit is unknown.
+///
+/// A destination that cannot be reached, or whose objects cannot be fetched, does
+/// not fail the state and does not claim a publish: the branch is reported with
+/// the commits it carries, so it stays visible, and a press reports git's own
+/// reason.
+async fn destination_position(
+    repo_path: &Path,
+    remote: &str,
+    branch: &str,
+    push_tip: &str,
+) -> anyhow::Result<DestinationPosition> {
+    // The full ref, not the short name: `ls-remote` also matches a short name
+    // against the tail of other refs (`main` finds `feature/main` too).
+    let wanted = format!("refs/heads/{branch}");
+    let listing = match run_git_network(
+        repo_path,
+        &["ls-remote", "--branches", remote, &wanted],
+        FETCH_TIMEOUT,
+    )
+    .await
+    {
+        Ok(output) => output.stdout,
+        Err(e) => {
+            tracing::debug!(error = %e, %remote, %branch, "git ls-remote failed");
+            return unreported_position(repo_path).await;
+        }
+    };
+    let tip = listing.lines().find_map(|line| {
+        let (tip, refname) = line.split_once('\t')?;
+        (refname.trim() == wanted).then(|| tip.trim().to_string())
+    });
+    let Some(tip) = tip else {
+        // The destination has no such branch: the push publishes it, so the count
+        // is everything the branch carries (nothing is pulled first).
+        return Ok(DestinationPosition {
+            publish: Some(true),
+            commits: count_commits(repo_path, "HEAD").await?,
+        });
+    };
+    if !rev_exists(repo_path, &tip).await? && !fetch_destination(repo_path, remote, branch).await {
+        return unreported_position(repo_path).await;
+    }
+    Ok(DestinationPosition {
+        publish: Some(false),
+        commits: count_commits(repo_path, &format!("{tip}..{push_tip}")).await?,
+    })
+}
+
+/// The position to report when the destination's copy of the branch is unknown —
+/// it could not be reached, or its tip could not be fetched: every commit the
+/// branch carries, so a pushable branch is never hidden behind a zero, and no
+/// publish claim that the destination was never asked about.
+async fn unreported_position(repo_path: &Path) -> anyhow::Result<DestinationPosition> {
+    Ok(DestinationPosition {
+        publish: None,
+        commits: count_commits(repo_path, "HEAD").await?,
+    })
+}
+
+/// Fetch `remote`'s copy of `branch` into its remote-tracking ref. `false` when
+/// another fetch is already running or this one failed — the caller then reports
+/// what the local refs say.
+async fn fetch_destination(repo_path: &Path, remote: &str, branch: &str) -> bool {
+    if FETCH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        tracing::debug!(%remote, %branch, "skipping the destination fetch: another fetch is running");
+        return false;
+    }
+    let _guard = FetchInFlightGuard;
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    match run_git_network(
+        // `--no-write-fetch-head` keeps the fetch from clobbering a concurrent
+        // pull's merge source; `--no-tags` keeps a probe from following tags.
+        repo_path,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "--no-tags",
+            remote,
+            &refspec,
+        ],
+        FETCH_TIMEOUT,
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::debug!(error = %e, %remote, %branch, "git fetch of the push destination failed");
+            false
+        }
+    }
+}
+
+/// Remotes configured in `repo_path` and whether a push can reach each, in
+/// `git remote -v` order.
+///
+/// A remote is push-capable only when every push URL it lists is usable — git
+/// prints one `(push)` line per push URL, and a fetch-only remote disables
+/// pushing by giving it a dummy push URL.
+async fn remotes(repo_path: &Path) -> anyhow::Result<Vec<(String, bool)>> {
+    let output = run_git_command(repo_path, &["remote", "-v"]).await?;
+    let mut remotes: Vec<(String, bool)> = Vec::new();
+    for line in output.lines() {
+        let Some((name, target)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(url) = target.strip_suffix(" (push)") else {
+            continue;
+        };
+        let usable = push_destination_accepts_pushes(repo_path, url);
+        match remotes.iter_mut().find(|(remote, _)| remote == name) {
+            Some((_, all_usable)) => *all_usable &= usable,
+            None => remotes.push((name.to_string(), usable)),
+        }
+    }
+    Ok(remotes)
+}
+
+/// Whether a push URL can actually receive a push.
+///
+/// Git has no "read-only remote" flag: the convention is a dummy push URL
+/// (`remote.<name>.pushurl = no-push`, `DISABLED`, …), which makes a remote
+/// fetch-only by sending pushes nowhere. Such a URL is a bare word naming no
+/// filesystem path — the convention's own caveat is "as long as you don't have
+/// a folder of the same name", so the existence probe mirrors exactly that.
+/// Everything else is a real transport (a `scheme://` URL, including `git+ssh://`
+/// and custom `git-remote-*` helpers, an scp-like `host:path`, or a path).
+fn push_destination_accepts_pushes(repo_path: &Path, url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() {
+        return false;
+    }
+    if url.contains([':', '/', '\\']) || url.starts_with(['.', '~']) {
+        return true;
+    }
+    repo_path.join(url).exists()
+}
+
+/// The remotes git resolves for `branch`: the one it tracks for updates, that
+/// upstream's remote-tracking ref when it exists, and the one a plain
+/// `git push` sends to.
+///
+/// Git is asked for its own resolution (`%(upstream…)`, `%(push…)`) rather than
+/// re-reading the branch's config, so a local `.` upstream, a defaulted remote
+/// and a configured `pushRemote`/`pushDefault` are all handled by the same truth
+/// the push itself uses.
+async fn branch_remotes(repo_path: &Path, branch: &str) -> anyhow::Result<BranchRemotes> {
+    let listing = run_git_command(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--format=%(upstream)%09%(upstream:remotename)%09%(push:remotename)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await?;
+    let mut fields = listing.trim_end().split('\t');
+    let upstream_ref = fields.next().unwrap_or_default();
+    let upstream = fields.next().unwrap_or_default();
+    let push = fields.next().unwrap_or_default();
+    // `%(upstream)` names what the config points at, not proof the ref exists: a
+    // pruned or never-fetched tracking ref leaves the name behind while
+    // `@{upstream}` stays unresolvable.
+    let upstream_ref = if !upstream_ref.is_empty() && rev_exists(repo_path, upstream_ref).await? {
+        Some(upstream_ref.to_string())
+    } else {
+        None
+    };
+    Ok(BranchRemotes {
+        upstream: Some(upstream)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+        upstream_ref,
+        push: Some(push)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+    })
+}
+
+/// Number of commits `rev` reaches.
+async fn count_commits(repo_path: &Path, rev: &str) -> anyhow::Result<usize> {
+    let count = run_git_trimmed(repo_path, &["rev-list", "--count", rev]).await?;
+    count
+        .parse()
+        .with_context(|| format!("git rev-list --count {rev} printed {count:?}"))
+}
+
+/// Whether `rev` resolves to a commit in this repository.
+/// Whether `rev` resolves to a commit in this repository.
+///
+/// `--verify` alone accepts any well-formed object id as a revision without the
+/// object existing, so the peeled `^{commit}` form is what actually proves it.
+async fn rev_exists(repo_path: &Path, rev: &str) -> anyhow::Result<bool> {
+    Ok(run_git_output(
+        repo_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .await?
+    .status
+    .success())
+}
+
+/// Hard timeout for a single network round trip — a `git fetch`, or the
+/// destination probe that asks a remote what it carries. An unreachable/slow
+/// remote must not hang the remote sync indefinitely.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Single-flight guard for [`run_git_fetch`]: at most one fetch runs at a time
-/// so concurrent fetches cannot overlap/contend on the same ref locks.
+/// Single-flight guard for network fetches ([`run_git_fetch`] and the
+/// destination probe): at most one fetch runs at a time so concurrent fetches
+/// cannot overlap/contend on the same ref locks.
 static FETCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// RAII guard that clears [`FETCH_IN_FLIGHT`] when the fetch task finishes
@@ -659,24 +1062,15 @@ impl Drop for FetchInFlightGuard {
     }
 }
 
-/// Run `git fetch` so upstream refs are refreshed before behind/ahead is
-/// computed (a fetch-free comparison only sees the last-fetched remote state).
+/// Run `git fetch` so remote refs are refreshed before the branch's remote state
+/// is computed (a fetch-free comparison only sees the last-fetched remote state).
 ///
-/// The subprocess environment is the product's own internal one (see
-/// [`git_command`]), then `GIT_TERMINAL_PROMPT=0` prevents git/credential
-/// helpers from popping an interactive (osxkeychain) prompt for a
-/// credential-less remote, and `SSH_AUTH_SOCK` is restored (if present) so
-/// SSH-agent remotes still work — the reduced base drops it, and with it
-/// dropped behind/ahead would be limited to the locally-available remote ref.
-/// The fetch is time-boxed by [`FETCH_TIMEOUT`] and single-flight guarded.
+/// The subprocess hardening (including restoring `SSH_AUTH_SOCK` for SSH-agent
+/// remotes) lives in [`run_git_network`]; the fetch is time-boxed by
+/// [`FETCH_TIMEOUT`] and single-flight guarded.
 ///
-/// On timeout the direct `git` child is killed and reaped; a remote helper it
-/// spawned (e.g. `git-remote-https`) is not signalled directly but terminates
-/// when its communication pipe closes, so it cannot hold the fetch open past
-/// the timeout.
-///
-/// Returns the fetch stdout; callers most often discard it and only log a
-/// failure (the subsequent behind/ahead read still works against local refs).
+/// Callers most often discard the report and only log a failure (the subsequent
+/// remote-state read still works against local refs).
 pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
     // Single-flight: if a fetch is already running, skip this one rather than
     // queueing it (it would only contend on the same ref locks).
@@ -684,9 +1078,56 @@ pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
         return Ok(String::new());
     }
     let _guard = FetchInFlightGuard;
+    run_git_network(repo_path, &["fetch", "--quiet"], FETCH_TIMEOUT)
+        .await
+        .map(GitNetworkOutput::report)
+}
 
+/// What a [`run_git_network`] step printed, both streams trimmed.
+struct GitNetworkOutput {
+    /// git's progress and report lines — a push reports its ref updates and
+    /// "Everything up-to-date" here.
+    stderr: String,
+    /// The command's own answer, e.g. `ls-remote`'s ref list.
+    stdout: String,
+}
+
+impl GitNetworkOutput {
+    /// The human report, stderr first: a push prints its ref report before its
+    /// trailing upstream notice on stdout, so reading stdout alone would show a
+    /// real push as nothing to do.
+    fn report(self) -> String {
+        [self.stderr, self.stdout]
+            .into_iter()
+            .filter(|stream| !stream.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Run a network git command (fetch/pull/push/ls-remote) with a hard timeout.
+///
+/// The subprocess environment is the product's own internal one (see
+/// [`git_command`]), then `GIT_TERMINAL_PROMPT=0` prevents git/credential
+/// helpers from popping an interactive (osxkeychain) prompt for a
+/// credential-less remote, and `SSH_AUTH_SOCK` is restored (if present) so
+/// SSH-agent remotes still work — the reduced base drops it.
+///
+/// On timeout the direct `git` child is killed and reaped; a remote helper it
+/// spawned (e.g. `git-remote-https`) is not signalled directly but terminates
+/// when its communication pipe closes, so it cannot hold the command open past
+/// the timeout. A non-zero exit reports git's own stderr, so a refused push
+/// carries git's reason.
+///
+/// The two streams stay apart: a command's answer (`ls-remote`) is parsed from
+/// stdout, while [`GitNetworkOutput::report`] joins both for the human report.
+async fn run_git_network(
+    repo_path: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> anyhow::Result<GitNetworkOutput> {
     let mut cmd = git_command(Some(repo_path));
-    cmd.arg("fetch").arg("--quiet").current_dir(repo_path);
+    cmd.args(args).current_dir(repo_path);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     // Restore the SSH agent socket for SSH remotes (dropped by the internal environment).
     if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
@@ -696,10 +1137,12 @@ pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // Kill the child if this task is cancelled (e.g. on shutdown) so a running
-    // fetch cannot outlive the runtime and orphan.
+    // network operation cannot outlive the runtime and orphan.
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().context("Failed to spawn git fetch")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to spawn git {}", args.join(" ")))?;
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let mut stdout_buf = Vec::new();
@@ -707,8 +1150,8 @@ pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
 
     // Wait for the child while draining its pipes concurrently, all inside the
     // timeout — a slow/unreachable remote (or a subprocess that outlives git
-    // holding the pipes) cannot hang the periodic sync. On timeout, kill and
-    // reap so the process does not linger as a zombie.
+    // holding the pipes) cannot hang the caller. On timeout, kill and reap so
+    // the process does not linger as a zombie.
     let wait = child.wait();
     let read_stdout = async {
         if let Some(out) = &mut stdout {
@@ -721,23 +1164,34 @@ pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
         }
     };
 
-    let status = if let Ok(res) = tokio::time::timeout(FETCH_TIMEOUT, async {
+    let status = if let Ok(res) = tokio::time::timeout(timeout, async {
         tokio::join!(wait, read_stdout, read_stderr).0
     })
     .await
     {
-        res.context("git fetch wait failed")?
+        res.with_context(|| format!("git {} wait failed", args.join(" ")))?
     } else {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        anyhow::bail!("git fetch timed out after {}s", FETCH_TIMEOUT.as_secs());
+        anyhow::bail!(
+            "git {} timed out after {}s",
+            args.join(" "),
+            timeout.as_secs()
+        );
     };
 
     if !status.success() {
-        anyhow::bail!("git fetch failed: {}", String::from_utf8_lossy(&stderr_buf));
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&stderr_buf)
+        );
     }
 
-    Ok(String::from_utf8_lossy(&stdout_buf).to_string())
+    Ok(GitNetworkOutput {
+        stderr: String::from_utf8_lossy(&stderr_buf).trim().to_string(),
+        stdout: String::from_utf8_lossy(&stdout_buf).trim().to_string(),
+    })
 }
 
 /// Aggregate working-tree diff statistics for the GUI footer.
@@ -936,20 +1390,83 @@ pub async fn run_git_worktree_snapshot(repo_path: &Path) -> anyhow::Result<GitWo
     })
 }
 
-/// Sync with remote: `git pull --ff-only` then `git push`.
+/// Hard timeout for a `git pull`/`git push` from the sync control.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// What a sync did, and — when nothing could take a push — why not.
+#[derive(Debug, Clone)]
+pub struct GitSyncReport {
+    /// git's own report from the steps that ran (empty when none did).
+    pub output: String,
+    /// Why nothing was pushed, when no remote could take the branch.
+    pub not_pushed: Option<String>,
+}
+
+/// Sync the checked-out branch: update it from its own update source, then push
+/// it wherever a push can actually go.
 ///
-/// Returns the combined output of both commands.
-pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<String> {
-    let pull_out = run_git_command(repo_path, &["pull", "--ff-only"]).await?;
-    let push_out = run_git_command(repo_path, &["push"]).await?;
-    let combined = if pull_out.trim().is_empty() {
-        push_out
-    } else if push_out.trim().is_empty() {
-        pull_out
+/// The destination is resolved here rather than taken from the footer's cached
+/// state, so a branch switched since the last refresh is pushed where *it* can
+/// go, not where the previous branch could. The branch is updated from its own
+/// tracking ref first — unless it has none, or the push publishes a new branch,
+/// which the destination has no copy of to update from. A branch that tracks
+/// nothing records its upstream on the remote that received the push; an existing
+/// tracking — of a fetch-only remote, say — is left alone, because it is the
+/// branch's update source, not a push destination. Returns what git reported,
+/// from both streams.
+pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
+    let lane = resolve_push_lane(repo_path)
+        .await?
+        .context("no branch is checked out")?;
+    let publish = matches!(&lane.destination, GitPushDestination::Target(target) if target.publish == Some(true));
+    let update = if lane.remotes.upstream_ref.is_some() && !publish {
+        Some(
+            run_git_network(repo_path, &["pull", "--ff-only"], SYNC_TIMEOUT)
+                .await?
+                .report(),
+        )
     } else {
-        format!("{pull_out}\n{push_out}")
+        None
     };
-    Ok(combined)
+    let (not_pushed, push) = match &lane.destination {
+        GitPushDestination::Nowhere { reason } => (Some(reason.clone()), None),
+        GitPushDestination::Target(target) => {
+            // A plain `git push` reaches the branch's own push destination — the
+            // one the control names whenever it accepts pushes — so it keeps
+            // honouring the configured push remote, push refspecs and
+            // `push.default`. Everywhere else the destination is named
+            // explicitly, and a branch that tracks nothing records its upstream
+            // on the remote that received the push.
+            let record_upstream = lane.remotes.upstream.is_none();
+            let plain =
+                !record_upstream && lane.remotes.push.as_deref() == Some(target.remote.as_str());
+            let report = if plain {
+                run_git_network(repo_path, &["push"], SYNC_TIMEOUT)
+                    .await?
+                    .report()
+            } else {
+                let mut args = vec!["push"];
+                if record_upstream {
+                    args.push("--set-upstream");
+                }
+                args.push(target.remote.as_str());
+                args.push(lane.branch.as_str());
+                run_git_network(repo_path, &args, SYNC_TIMEOUT)
+                    .await?
+                    .report()
+            };
+            (None, Some(report))
+        }
+    };
+    Ok(GitSyncReport {
+        output: update
+            .into_iter()
+            .chain(push)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        not_pushed,
+    })
 }
 
 /// Discard all changes to a path — restores tracked files from HEAD, unstages
@@ -1440,16 +1957,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_git_behind_ahead_no_upstream() {
-        let (_dir, repo_path) = init_temp_repo();
-        let (behind, ahead) = run_git_behind_ahead(&repo_path)
-            .await
-            .expect("behind/ahead");
-        assert_eq!(behind, 0);
-        assert_eq!(ahead, 0);
-    }
-
-    #[tokio::test]
     async fn test_run_git_worktree_snapshot_clean_tree() {
         let (_dir, repo_path) = init_temp_repo();
         let snap = run_git_worktree_snapshot(&repo_path)
@@ -1784,19 +2291,740 @@ mod tests {
         assert_eq!(msg, "Second commit");
     }
 
-    #[tokio::test]
-    async fn test_run_git_sync_no_remote() {
-        let (_dir, repo_path) = init_temp_repo();
-        // No remote configured — run_git_sync should return an error
-        // from git pull --ff-only (no remote) rather than panicking.
-        let result = run_git_sync(&repo_path).await;
-        assert!(result.is_err(), "sync without remote should fail");
-        let err = result.unwrap_err();
+    // ── Push destination resolution and sync ─────────────────────
+
+    /// Create a bare repository under `root` and register it as remote `name`
+    /// of `repo_path`; returns the bare repo's path.
+    fn add_bare_remote(root: &Path, repo_path: &Path, name: &str) -> std::path::PathBuf {
+        let bare = root.join(format!("{name}.git"));
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .status()
+            .expect("git init --bare");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["remote", "add", name])
+            .arg(&bare)
+            .current_dir(repo_path)
+            .status()
+            .expect("git remote add");
+        assert!(status.success());
+        bare
+    }
+
+    /// Run a plain git command in `repo_path`, asserting it succeeded.
+    fn git_ok(repo_path: &Path, args: &[&str]) -> std::process::Output {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .expect("run git");
         assert!(
-            err.to_string().contains("remote")
-                || err.to_string().contains("push")
-                || err.to_string().contains("pull"),
-            "error should mention remote/push/pull: {err}"
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn rev_parse(repo_path: &Path, rev: &str) -> String {
+        String::from_utf8_lossy(&git_ok(repo_path, &["rev-parse", rev]).stdout)
+            .trim()
+            .to_string()
+    }
+
+    /// Write `name` and commit it, so the checked-out branch gains a commit.
+    fn commit_file(repo_path: &Path, name: &str, message: &str) {
+        std::fs::write(repo_path.join(name), b"new\n").expect("write");
+        git_ok(repo_path, &["add", "-A"]);
+        git_ok(repo_path, &["commit", "-m", message]);
+    }
+
+    /// The remote git resolves `branch`'s upstream to, if it tracks one.
+    async fn tracked(repo_path: &Path, branch: &str) -> Option<String> {
+        branch_remotes(repo_path, branch)
+            .await
+            .expect("branch remotes")
+            .upstream
+    }
+
+    /// The remote state of the branch checked out in `repo_path`.
+    async fn remote_state(repo_path: &Path) -> GitRemoteState {
+        run_git_remote_state(repo_path)
+            .await
+            .expect("remote state")
+            .expect("a branch is checked out")
+    }
+
+    /// An upstream-less branch on a repo with one pushable remote publishes to
+    /// it: the push carries every commit, records the upstream, and the report
+    /// is a real push (never reported as nothing to do).
+    #[tokio::test]
+    async fn publish_untracked_branch_to_single_pushable_remote() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        let carried = count_commits(&repo_path, "HEAD").await.expect("count");
+
+        let state = remote_state(&repo_path).await;
+        assert_eq!(state.behind, 0);
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(target.commits, carried, "publish carries every commit");
+        assert_eq!(target.publish, Some(true), "origin has no such branch yet");
+        assert!(state.has_sync_work());
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert!(
+            !report.output.trim().is_empty(),
+            "a real push must report something"
+        );
+        assert!(
+            report.output.contains(&branch),
+            "the report names the branch: {}",
+            report.output
+        );
+        git_ok(
+            &origin,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        );
+        assert_eq!(
+            tracked(&repo_path, &branch).await.as_deref(),
+            Some("origin"),
+            "the publish records the upstream"
+        );
+        assert!(
+            !remote_state(&repo_path).await.has_sync_work(),
+            "in sync again: nothing left to offer"
+        );
+
+        // Once the branch tracks its new remote, a later commit is an ordinary
+        // update-and-push to the same destination.
+        commit_file(&repo_path, "after.txt", "after the publish");
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(target.publish, Some(false));
+        assert_eq!(target.commits, 1);
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert_eq!(
+            rev_parse(&origin, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD")
+        );
+    }
+
+    /// A branch tracking a fetch-only upstream still pushes to the push-capable
+    /// remote and keeps its fetch-only tracking.
+    #[tokio::test]
+    async fn fetch_only_upstream_stays_tracked_while_pushing_to_origin() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        add_bare_remote(remotes.path(), &repo_path, "upstream");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
+        // Git's own way of making a remote fetch-only.
+        git_ok(
+            &repo_path,
+            &["remote", "set-url", "--push", "upstream", "no-push"],
+        );
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        git_ok(&repo_path, &["push", "origin", &branch]);
+        commit_file(&repo_path, "pushed.txt", "Only origin lacks this");
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(
+            target.publish,
+            Some(false),
+            "origin already carries the branch"
+        );
+        assert_eq!(target.commits, 1);
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none(), "origin accepts pushes");
+        assert_eq!(
+            tracked(&repo_path, &branch).await.as_deref(),
+            Some("upstream"),
+            "a fetch-only tracking is left alone"
+        );
+        assert_eq!(
+            rev_parse(&origin, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD"),
+            "origin received the commit"
+        );
+    }
+
+    /// The count is what a press pushes: an update-and-push fast-forwards from the
+    /// branch's own update source first, and the commits the fast-forward brings
+    /// go to the destination too.
+    #[tokio::test]
+    async fn update_and_push_counts_the_commits_a_press_pushes() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        add_bare_remote(remotes.path(), &repo_path, "upstream");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        git_ok(&repo_path, &["push", "origin", &branch]);
+        // The update source moves on, so a press fast-forwards the branch and then
+        // pushes what it carries.
+        git_ok(&repo_path, &["switch", "-c", "upstream-side"]);
+        commit_file(&repo_path, "moved.txt", "upstream moved on");
+        commit_file(&repo_path, "moved-again.txt", "upstream moved on again");
+        git_ok(&repo_path, &["push", "upstream", &format!("HEAD:{branch}")]);
+        git_ok(&repo_path, &["switch", &branch]);
+        git_ok(
+            &repo_path,
+            &["remote", "set-url", "--push", "upstream", "no-push"],
+        );
+        git_ok(&repo_path, &["fetch", "upstream"]);
+
+        let state = remote_state(&repo_path).await;
+        assert_eq!(state.behind, 2);
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(target.publish, Some(false));
+        assert_eq!(
+            target.commits, 2,
+            "the commits the fast-forward brings are pushed too"
+        );
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert_eq!(
+            rev_parse(&origin, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD"),
+            "origin received the fast-forwarded branch"
+        );
+    }
+
+    /// The destination's copy is fetched when its tip is unknown here, so the count
+    /// is exact even though no local ref has seen that tip.
+    #[tokio::test]
+    async fn destination_advanced_elsewhere_is_fetched_before_counting() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "origin", &branch]);
+        // Another clone moves the destination on, so its tip is not in this
+        // repository's object store.
+        let elsewhere = remotes.path().join("elsewhere");
+        git_ok(
+            remotes.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin.to_str().expect("origin path"),
+                elsewhere.to_str().expect("elsewhere path"),
+            ],
+        );
+        for (key, value) in [("user.name", "Elsewhere"), ("user.email", "e@test.com")] {
+            git_ok(&elsewhere, &["config", key, value]);
+        }
+        git_ok(
+            &elsewhere,
+            &["checkout", "-B", &branch, &format!("origin/{branch}")],
+        );
+        commit_file(&elsewhere, "elsewhere.txt", "origin moved on");
+        git_ok(&elsewhere, &["push", "origin", &format!("HEAD:{branch}")]);
+        let elsewhere_head = rev_parse(&elsewhere, "HEAD");
+        commit_file(&repo_path, "local.txt", "only the local branch has this");
+        assert!(
+            !rev_exists(&repo_path, &elsewhere_head)
+                .await
+                .expect("rev exists"),
+            "the destination's new tip starts out unknown here"
+        );
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(target.publish, Some(false));
+        assert_eq!(target.commits, 1, "only the local commit is not on origin");
+        assert_eq!(
+            rev_parse(&repo_path, &format!("refs/remotes/origin/{branch}")),
+            elsewhere_head,
+            "the probe fetched the destination's copy"
+        );
+    }
+
+    /// The destination is asked directly: a branch it already carries is never
+    /// announced as a publish just because this repository has no local ref for
+    /// it (a narrowed `remote.<name>.fetch` refspec never creates one).
+    #[tokio::test]
+    async fn destination_branch_is_detected_without_a_local_ref() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "origin", &branch]);
+        git_ok(
+            &repo_path,
+            &["update-ref", "-d", &format!("refs/remotes/origin/{branch}")],
+        );
+        commit_file(&repo_path, "later.txt", "only the local branch has this");
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(
+            target.publish,
+            Some(false),
+            "origin carries the branch even though no local ref says so"
+        );
+        assert_eq!(target.commits, 1);
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert_eq!(
+            tracked(&repo_path, &branch).await.as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            rev_parse(&origin, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD")
+        );
+    }
+
+    /// The probe matches the branch's own ref: a nested ref on the destination
+    /// (`feature/<branch>`) is not mistaken for the branch itself.
+    #[tokio::test]
+    async fn nested_destination_branch_is_not_mistaken_for_ours() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        add_bare_remote(remotes.path(), &repo_path, "origin");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(
+            &repo_path,
+            &[
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/feature/{branch}"),
+            ],
+        );
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(
+            target.publish,
+            Some(true),
+            "origin has no branch named {branch}"
+        );
+        assert_eq!(
+            target.commits,
+            count_commits(&repo_path, "HEAD").await.expect("count")
+        );
+    }
+
+    /// A publish skips the update step: the destination has no such branch to
+    /// update from, so the branch's commits go out as they are.
+    #[tokio::test]
+    async fn publish_skips_the_update_step() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        add_bare_remote(remotes.path(), &repo_path, "upstream");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
+        // The upstream moves on, so a pull would change the branch.
+        git_ok(&repo_path, &["switch", "-c", "upstream-side"]);
+        commit_file(&repo_path, "remote.txt", "upstream moved on");
+        git_ok(&repo_path, &["push", "upstream", &format!("HEAD:{branch}")]);
+        git_ok(&repo_path, &["switch", &branch]);
+        git_ok(
+            &repo_path,
+            &["remote", "set-url", "--push", "upstream", "no-push"],
+        );
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        git_ok(&repo_path, &["fetch", "upstream"]);
+        let published_head = rev_parse(&repo_path, "HEAD");
+
+        let state = remote_state(&repo_path).await;
+        assert_eq!(state.behind, 1);
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.publish, Some(true), "origin has no such branch yet");
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert_eq!(
+            rev_parse(&repo_path, "HEAD"),
+            published_head,
+            "a publish does not update the branch"
+        );
+        assert_eq!(
+            rev_parse(&origin, &format!("refs/heads/{branch}")),
+            published_head,
+            "origin received exactly what the branch carried"
+        );
+        assert_eq!(
+            tracked(&repo_path, &branch).await.as_deref(),
+            Some("upstream"),
+            "the fetch-only tracking is left alone"
+        );
+    }
+
+    /// A branch tracking a push-capable remote keeps that remote as its
+    /// destination, and has nothing to offer once in sync.
+    #[tokio::test]
+    async fn tracked_push_capable_remote_stays_the_destination() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        let upstream = add_bare_remote(remotes.path(), &repo_path, "upstream");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
+        commit_file(&repo_path, "pushed.txt", "second");
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "upstream");
+        assert_eq!(target.publish, Some(false));
+        assert_eq!(target.commits, 1);
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert!(
+            report.output.contains(&branch),
+            "a real push reports itself: {}",
+            report.output
+        );
+        assert_eq!(
+            rev_parse(&upstream, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD"),
+            "the tracked remote received the commit"
+        );
+        assert!(
+            !remote_state(&repo_path).await.has_sync_work(),
+            "in sync: the control hides, as before"
+        );
+    }
+
+    /// An unreachable destination does not hide the branch and does not claim a
+    /// publish: the branch is reported with the commits it carries, its reachability
+    /// is not asserted, and a press reports git's own reason.
+    #[tokio::test]
+    async fn unreachable_destination_still_offers_a_push() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        std::fs::remove_dir_all(&origin).expect("remove the remote");
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(target.publish, None, "the destination was never asked");
+        assert_eq!(
+            target.commits,
+            count_commits(&repo_path, "HEAD").await.expect("count"),
+            "the branch is reported with the commits it carries"
+        );
+        assert!(state.has_sync_work());
+    }
+
+    /// The destination the control names is the one a plain `git push` reaches:
+    /// a configured `branch.<name>.pushRemote` wins over the tracked remote.
+    #[tokio::test]
+    async fn configured_push_remote_is_the_named_destination() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        add_bare_remote(remotes.path(), &repo_path, "origin");
+        let backup = add_bare_remote(remotes.path(), &repo_path, "backup");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "origin", &branch]);
+        git_ok(&repo_path, &["push", "backup", &branch]);
+        git_ok(
+            &repo_path,
+            &["config", &format!("branch.{branch}.pushRemote"), "backup"],
+        );
+        commit_file(&repo_path, "pushed.txt", "only the push remote lacks this");
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "backup", "the control names the push remote");
+        assert_eq!(target.publish, Some(false));
+        assert_eq!(target.commits, 1);
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert_eq!(
+            rev_parse(&backup, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD"),
+            "the named destination received the commit"
+        );
+        assert_eq!(
+            tracked(&repo_path, &branch).await.as_deref(),
+            Some("origin"),
+            "the tracking is left alone"
+        );
+    }
+
+    /// A push remote whose push destination is disabled is never used: the push
+    /// goes to the tracked remote that accepts pushes.
+    #[tokio::test]
+    async fn fetch_only_push_remote_falls_back_to_the_tracked_remote() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        let upstream = add_bare_remote(remotes.path(), &repo_path, "upstream");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "origin", &branch]);
+        // Git's own way of making a remote fetch-only, this time as the branch's
+        // configured push remote.
+        git_ok(
+            &repo_path,
+            &["remote", "set-url", "--push", "upstream", "no-push"],
+        );
+        git_ok(
+            &repo_path,
+            &["config", &format!("branch.{branch}.pushRemote"), "upstream"],
+        );
+        commit_file(
+            &repo_path,
+            "pushed.txt",
+            "only the tracked remote lacks this",
+        );
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(target.commits, 1);
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert_eq!(
+            rev_parse(&origin, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD")
+        );
+        let upstream_refs =
+            String::from_utf8_lossy(&git_ok(&upstream, &["for-each-ref"]).stdout).to_string();
+        assert!(
+            upstream_refs.trim().is_empty(),
+            "the fetch-only remote received nothing: {upstream_refs}"
+        );
+    }
+
+    /// A branch whose tracking ref is gone (deleted remote branch, pruned or
+    /// narrowed fetch) still resolves: the destination is asked directly, and the
+    /// press republishes without overwriting the branch's tracking config.
+    #[tokio::test]
+    async fn missing_tracking_ref_still_resolves_and_publishes() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "origin", &branch]);
+        git_ok(&origin, &["config", "receive.denyDeleteCurrent", "ignore"]);
+        git_ok(&repo_path, &["push", "origin", "--delete", &branch]);
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(
+            target.publish,
+            Some(true),
+            "origin no longer carries the branch"
+        );
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none());
+        assert_eq!(
+            rev_parse(&origin, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD")
+        );
+        assert_eq!(
+            tracked(&repo_path, &branch).await.as_deref(),
+            Some("origin"),
+            "the existing tracking config is left alone"
+        );
+    }
+
+    /// A branch that tracks a fetch-only upstream is still updated from it when
+    /// no remote can take a push: the update step is not a guess.
+    #[tokio::test]
+    async fn behind_branch_still_fast_forwards_when_nowhere_to_push() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        add_bare_remote(remotes.path(), &repo_path, "upstream");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
+        // Two pushable remotes make the destination ambiguous.
+        add_bare_remote(remotes.path(), &repo_path, "origin");
+        add_bare_remote(remotes.path(), &repo_path, "backup");
+
+        // Advance the upstream from a side branch, so the checked-out branch is
+        // behind its own update source; only then make the remote fetch-only.
+        git_ok(&repo_path, &["switch", "-c", "upstream-side"]);
+        commit_file(&repo_path, "remote.txt", "upstream moved on");
+        git_ok(&repo_path, &["push", "upstream", &format!("HEAD:{branch}")]);
+        git_ok(&repo_path, &["switch", &branch]);
+        git_ok(
+            &repo_path,
+            &["remote", "set-url", "--push", "upstream", "no-push"],
+        );
+        git_ok(&repo_path, &["fetch", "upstream"]);
+        let behind_head = rev_parse(&repo_path, "HEAD");
+
+        let state = remote_state(&repo_path).await;
+        assert_eq!(state.behind, 1);
+        assert!(matches!(state.push, GitPushDestination::Nowhere { .. }));
+        assert!(state.has_sync_work());
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(
+            report.not_pushed.is_some(),
+            "nothing can take a push, and the report says so"
+        );
+        assert_ne!(
+            rev_parse(&repo_path, "HEAD"),
+            behind_head,
+            "the branch was fast-forwarded from its own update source"
+        );
+        assert_eq!(
+            rev_parse(&repo_path, "HEAD"),
+            rev_parse(&repo_path, &format!("upstream/{branch}"))
+        );
+    }
+
+    /// With no remote at all, nothing is guessed and the control says so.
+    #[tokio::test]
+    async fn no_pushable_remote_reports_nowhere() {
+        let (_dir, repo_path) = init_temp_repo();
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Nowhere { reason } = &state.push else {
+            panic!("expected nowhere, got {:?}", state.push);
+        };
+        assert!(reason.contains("push"), "reason mentions pushes: {reason}");
+        assert!(
+            state.has_sync_work(),
+            "the control says why rather than hiding"
+        );
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert_eq!(report.not_pushed.as_deref(), Some(reason.as_str()));
+        assert!(report.output.is_empty(), "nothing ran: {}", report.output);
+    }
+
+    /// Two pushable remotes are ambiguous — neither is picked, nothing is
+    /// pushed, and the control still says why.
+    #[tokio::test]
+    async fn several_pushable_remotes_are_not_guessed() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        let backup = add_bare_remote(remotes.path(), &repo_path, "backup");
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Nowhere { reason } = &state.push else {
+            panic!("expected nowhere, got {:?}", state.push);
+        };
+        assert!(
+            reason.contains("origin") && reason.contains("backup"),
+            "the reason names both remotes: {reason}"
+        );
+        assert!(
+            state.has_sync_work(),
+            "a branch with no single destination still shows the control"
+        );
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert_eq!(report.not_pushed.as_deref(), Some(reason.as_str()));
+        assert!(report.output.is_empty(), "nothing ran: {}", report.output);
+        for remote in [&origin, &backup] {
+            let refs =
+                String::from_utf8_lossy(&git_ok(remote, &["for-each-ref"]).stdout).to_string();
+            assert!(refs.trim().is_empty(), "nothing was pushed: {refs}");
+        }
+    }
+
+    /// Dummy push URLs (git's fetch-only convention) are unusable; every real
+    /// transport and existing local path is usable.
+    #[test]
+    fn push_destination_accepts_pushes_distinguishes_dummy_urls() {
+        let (_dir, repo_path) = init_temp_repo();
+        for url in ["no-push", "no_push", "DISABLED", "", "  "] {
+            assert!(
+                !push_destination_accepts_pushes(&repo_path, url),
+                "{url:?} must not accept pushes"
+            );
+        }
+        for url in [
+            "../remote.git",
+            "/abs/x.git",
+            "https://example.com/x.git",
+            "git@example.com:x.git",
+            "ssh://example.com/x.git",
+            "ssh+git://example.com/x.git",
+            "git+ssh://example.com/x.git",
+            "codecommit://example/repo",
+            "file:///tmp/x.git",
+        ] {
+            assert!(
+                push_destination_accepts_pushes(&repo_path, url),
+                "{url} must accept pushes"
+            );
+        }
+        // A bare word only counts when it names an existing local path.
+        std::fs::create_dir(repo_path.join("local-remote.git")).expect("create dir");
+        assert!(push_destination_accepts_pushes(
+            &repo_path,
+            "local-remote.git"
+        ));
+    }
+
+    /// A refused push surfaces git's own reason, not a generic failure.
+    #[tokio::test]
+    async fn refused_push_reports_git_reason() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        add_bare_remote(remotes.path(), &repo_path, "origin");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "origin", &branch]);
+
+        // A commit only the remote gets, then a different one locally — the
+        // branches diverge and a plain push is refused.
+        git_ok(&repo_path, &["switch", "-c", "remote-only"]);
+        commit_file(&repo_path, "remote.txt", "remote only");
+        git_ok(&repo_path, &["push", "origin", &format!("HEAD:{branch}")]);
+        git_ok(&repo_path, &["switch", &branch]);
+        commit_file(&repo_path, "local.txt", "local only");
+
+        let err = run_git_sync(&repo_path)
+            .await
+            .expect_err("a diverged push must be refused")
+            .to_string();
+        assert!(
+            err.contains("rejected") || err.contains("non-fast-forward"),
+            "git's own refusal reason must survive: {err}"
         );
     }
 

@@ -11,7 +11,9 @@
 use super::theme;
 use super::widgets;
 
-use crate::git::commands::{DiffStats, GitFileStatus, GitWorktreeSnapshot};
+use crate::git::commands::{
+    DiffStats, GitFileStatus, GitRemoteState, GitSyncReport, GitWorktreeSnapshot,
+};
 
 use iced::widget::{Column, Space, button, column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
@@ -47,7 +49,7 @@ fn file_change_tx() -> &'static tokio::sync::broadcast::Sender<()> {
 /// subprocess batch per interval.
 const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(300);
 
-/// Interval between periodic remote syncs (behind/ahead + `git fetch`). The
+/// Interval between periodic remote syncs (remote state + `git fetch`). The
 /// standalone remote-sync subscription fires [`GitMessage::PeriodicSyncTick`]
 /// at this cadence.
 pub(crate) const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -56,6 +58,28 @@ pub(crate) const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// ready before registering the file-change watch. Registration happens once per
 /// workspace selection — there is no retry loop.
 const WATCH_READY_WAIT: Duration = Duration::from_secs(30);
+
+/// The sync control's wording when no remote can take the branch's commits. The
+/// footer's tooltip and the sync's warning toast use this one phrasing.
+pub(super) fn nowhere_message(reason: &str) -> String {
+    format!("Nowhere to push: {reason}")
+}
+
+/// The toast for a finished sync: git's own report, or — when nothing could be
+/// pushed — the reason, so a push that did not happen is never reported as one
+/// that did.
+fn sync_toast(report: GitSyncReport) -> super::ToastMessage {
+    let output = report.output.trim();
+    match report.not_pushed {
+        Some(reason) => super::ToastMessage::Warning(if output.is_empty() {
+            nowhere_message(&reason)
+        } else {
+            format!("Sync completed:\n{output}\n{}", nowhere_message(&reason))
+        }),
+        None if output.is_empty() => super::ToastMessage::SuccessMsg("Sync completed".to_string()),
+        None => super::ToastMessage::SuccessMsg(format!("Sync completed:\n{output}")),
+    }
+}
 
 /// Git state owned by the Dashboard.
 ///
@@ -73,8 +97,8 @@ pub struct GitState {
     file_statuses: HashMap<String, GitFileStatus>,
     /// Cached current branch name from periodic refresh.
     current_branch: Option<String>,
-    /// Cached behind/ahead counts from periodic refresh.
-    behind_ahead: Option<(usize, usize)>,
+    /// Cached remote state (behind + push destination) from periodic refresh.
+    remote: Option<GitRemoteState>,
 
     // ── Branch management modal ──────────────────────────────────
     /// Whether the branch management modal is open.
@@ -106,7 +130,7 @@ pub struct GitState {
     /// local refresh captures the current value and only applies while it is
     /// current, so stale/out-of-order results never overwrite newer state.
     local_generation: u64,
-    /// Generation for remote refreshes (behind/ahead + fetch). Independent of
+    /// Generation for remote refreshes (remote state + fetch). Independent of
     /// [`Self::local_generation`] so a long-running fetch is not invalidated by
     /// a concurrent event-driven local refresh.
     remote_generation: u64,
@@ -117,7 +141,7 @@ pub struct GitState {
     /// refresh is still owed; fired by the scoped deferred-refresh timer once
     /// the window elapses.
     local_refresh_pending: bool,
-    /// When the last remote sync (behind/ahead + fetch) ran. Only updated by an
+    /// When the last remote sync (remote state + fetch) ran. Only updated by an
     /// actual remote sync — a workspace switch alone does not defer the periodic
     /// timer.
     last_remote_refresh: Option<Instant>,
@@ -143,11 +167,13 @@ pub enum GitMessage {
     /// Result of `run_git_current_branch`. Same generation/staleness
     /// semantics as [`GitMessage::WorktreeSnapshot`].
     CurrentBranch(u64, Result<String, String>),
-    /// Result of `run_git_behind_ahead`. `Ok((0, 0))` is a genuine
-    /// clean/no-upstream state (hides the sync button); `Err` keeps the
-    /// last-known-good counts. Same generation semantics as
-    /// [`GitMessage::WorktreeSnapshot`] but against [`GitState::remote_generation`].
-    BehindAhead(u64, Result<(usize, usize), String>),
+    /// Result of `run_git_remote_state`. Carries behind (against the branch's
+    /// own update source) plus where a push would go; an in-sync state is a
+    /// genuine result and is stored, and `Ok(None)` means `HEAD` names no branch
+    /// (nothing to sync). `Err` keeps the last-known-good state. Same generation
+    /// semantics as [`GitMessage::WorktreeSnapshot`] but against
+    /// [`GitState::remote_generation`].
+    RemoteState(u64, Result<Option<GitRemoteState>, String>),
 
     // ── Event-driven refresh ────────────────────────────────────
     /// A workspace file-change event arrived from the fff-search watcher. The
@@ -164,7 +190,7 @@ pub enum GitMessage {
 
     // ── Self-driven timers ──────────────────────────────────────
     /// Periodic 60s tick from the standalone remote-sync subscription. Runs the
-    /// behind/ahead + `git fetch` sync and also refreshes the local footer — the
+    /// remote-state + `git fetch` sync and also refreshes the local footer — the
     /// recovery path for ref-only/commit-only changes (bare commit, fetch, push,
     /// `checkout -c`) that produce no file-change event. Runs for every
     /// workspace, watched or not.
@@ -194,10 +220,13 @@ pub enum GitMessage {
     BranchQueryChanged(super::editor_widget::EditorAction),
 
     // ── Sync ────────────────────────────────────────────────────
-    /// Trigger a git sync (pull --ff-only + push).
+    /// Trigger a git sync: the sync resolves where the checked-out branch can be
+    /// pushed, updates it from its own source when it tracks one and the push is
+    /// not a publish, then pushes (publishing when the destination lacks the
+    /// branch).
     Sync,
     /// Result of `run_git_sync`.
-    SyncResult(Result<String, String>),
+    SyncResult(Result<GitSyncReport, String>),
 
     // ── Switch branch ──────────────────────────────────────────
     /// Switch to a branch.
@@ -227,7 +256,7 @@ impl GitState {
             diff_stats: None,
             file_statuses: HashMap::new(),
             current_branch: None,
-            behind_ahead: None,
+            remote: None,
             show_branch_modal: false,
             branch_search_query: super::common::SingleLineEditorState::new(""),
             local_branches: Vec::new(),
@@ -259,10 +288,13 @@ impl GitState {
         self.current_branch.as_deref()
     }
 
-    /// Cached behind/ahead counts, if available and non-zero.
+    /// Cached remote state, when it describes the branch that is checked out
+    /// now. A remote refresh and the branch's own refresh run concurrently, so
+    /// either can land first; the state carries the branch it was resolved for.
     #[must_use]
-    pub fn behind_ahead(&self) -> Option<(usize, usize)> {
-        self.behind_ahead
+    pub fn remote_state(&self) -> Option<&GitRemoteState> {
+        let state = self.remote.as_ref()?;
+        (self.current_branch.as_deref() == Some(state.branch.as_str())).then_some(state)
     }
 
     /// Whether a git sync/switch/create operation is in-flight.
@@ -289,7 +321,7 @@ impl GitState {
     // ── State mutators (called from Dashboard during workspace switch) ──
 
     /// Clear all cached git info (diff stats, per-file statuses, branch,
-    /// behind/ahead, modal).
+    /// remote state, modal).
     /// Does **not** clear `workspace_path`, `workspace_name`, the watch state,
     /// or the refresh throttle/timer state — those are managed explicitly by
     /// [`Self::set_workspace_path`] and the periodic/deferred timers. Bumps both
@@ -300,7 +332,7 @@ impl GitState {
         self.file_statuses.clear();
         self.statuses_dirty = false;
         self.current_branch = None;
-        self.behind_ahead = None;
+        self.remote = None;
         self.local_branches.clear();
         self.branch_search_query.clear();
         self.branch_error = None;
@@ -312,7 +344,7 @@ impl GitState {
     }
 
     /// Set the workspace name and filesystem path, and trigger an eager refresh
-    /// of git info (diff stats, per-file statuses, branch, behind/ahead for the
+    /// of git info (diff stats, per-file statuses, branch, remote state for the
     /// new workspace).
     /// Clears all cached state first and re-registers the file-change watch for
     /// the new workspace (one deferred attempt when the engine's watcher is
@@ -414,12 +446,14 @@ impl GitState {
                 }
                 Task::none()
             }
-            GitMessage::BehindAhead(generation, result) => {
+            GitMessage::RemoteState(generation, result) => {
+                // `Ok(None)`: HEAD names no branch, so there is nothing to sync
+                // and the control has nothing to show.
                 if generation == self.remote_generation
-                    && let Ok(ba) = result
+                    && let Ok(state) = result
                 {
-                    // Genuine clean/no-upstream state hides the sync button.
-                    self.behind_ahead = (ba.0 > 0 || ba.1 > 0).then_some(ba);
+                    // Store even an in-sync state: visibility is `has_sync_work`.
+                    self.remote = state;
                 }
                 Task::none()
             }
@@ -442,7 +476,7 @@ impl GitState {
 
             // ── Self-driven timers (replacing the dashboard tick) ───
             GitMessage::PeriodicSyncTick => {
-                // Periodic remote sync (behind/ahead + fetch). The timer also
+                // Periodic remote sync (remote state + fetch). The timer also
                 // refreshes the local footer (diff stats + branch) so
                 // ref-only/commit-only changes that never reach the file
                 // watcher still surface here, for every workspace. Clearing an
@@ -591,8 +625,11 @@ impl GitState {
                 if self.syncing {
                     return Task::none();
                 }
-                self.syncing = true;
+                // The destination is resolved by the sync itself, not taken
+                // from the cached state: a branch switched since the last
+                // refresh is pushed where *it* can go.
                 let ws_path = self.workspace_path.clone();
+                self.syncing = true;
                 Task::perform(
                     with_ws_path(ws_path, |path: PathBuf| async move {
                         crate::git::commands::run_git_sync(&path)
@@ -605,21 +642,13 @@ impl GitState {
             GitMessage::SyncResult(result) => {
                 self.syncing = false;
                 match result {
-                    Ok(output) => {
+                    Ok(report) => Task::batch([
+                        Task::done(GitMessage::Toast(sync_toast(report))),
                         // A sync (pull/push) moved refs and possibly files, so
                         // refresh promptly — the watcher is silent to ref-only
                         // changes.
-                        let refresh = self.refresh_after_git_op();
-                        let msg = if output.trim().is_empty() {
-                            "Already up-to-date".to_string()
-                        } else {
-                            format!("Sync completed:\n{output}")
-                        };
-                        Task::batch([
-                            Task::done(GitMessage::Toast(super::ToastMessage::SuccessMsg(msg))),
-                            refresh,
-                        ])
-                    }
+                        self.refresh_after_git_op(),
+                    ]),
                     Err(e) => Task::done(GitMessage::Toast(super::ToastMessage::Error(format!(
                         "Sync failed: {e}"
                     )))),
@@ -922,11 +951,12 @@ impl GitState {
     }
 
     /// Spawn a remote refresh: best-effort `git fetch` (when `fetch` is set)
-    /// followed by behind/ahead. `fetch=false` compares against the locally
-    /// available remote ref; `fetch=true` first updates them so behind/ahead
-    /// reflects upstream state. A fetch failure (offline/timeout/no remote) is
-    /// logged at debug level and behind/ahead is still computed against local
-    /// refs.
+    /// followed by the branch's remote state. `fetch=true` first updates the
+    /// remote-tracking refs so the state reflects upstream. A fetch failure
+    /// (offline/timeout/no remote) is logged at debug level and the state is
+    /// still computed. Resolving a push destination that is not the branch's
+    /// tracked remote asks that remote directly, so its count never depends on
+    /// what happens to be fetched.
     fn refresh_remote(path: PathBuf, generation: u64, fetch: bool) -> Task<GitMessage> {
         // Same repo check as the local refresh — a subdirectory of a repo
         // still refreshes.
@@ -940,11 +970,11 @@ impl GitState {
                         tracing::debug!(error = %e, path = %path.display(), "git fetch failed");
                     }
                 }
-                crate::git::commands::run_git_behind_ahead(&path)
+                crate::git::commands::run_git_remote_state(&path)
                     .await
                     .map_err(|e| e.to_string())
             },
-            move |res| GitMessage::BehindAhead(generation, res),
+            move |res| GitMessage::RemoteState(generation, res),
         )
     }
 
@@ -1066,6 +1096,7 @@ impl GitState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::commands::{GitPushDestination, GitPushTarget};
 
     fn state_with_gen(generation: u64) -> GitState {
         let mut s = GitState::new();
@@ -1087,14 +1118,28 @@ mod tests {
         }
     }
 
+    /// A push destination on `origin` with the given commit count.
+    fn origin_target(commits: usize) -> GitPushDestination {
+        GitPushDestination::Target(GitPushTarget {
+            remote: "origin".into(),
+            commits,
+            publish: Some(false),
+        })
+    }
+
     // ── Refresh results: last-known-good + generation guard ───────
 
     #[test]
     fn test_refresh_success_applies_current_generation() {
         let mut s = state_with_gen(7);
+        let state = GitRemoteState {
+            branch: "main".into(),
+            behind: 2,
+            push: origin_target(5),
+        };
         let _ = s.update(GitMessage::WorktreeSnapshot(7, Ok(snapshot(3, 1))));
         let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
-        let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
+        let _ = s.update(GitMessage::RemoteState(7, Ok(Some(state.clone()))));
         assert_eq!(
             s.diff_stats(),
             Some(DiffStats {
@@ -1104,19 +1149,24 @@ mod tests {
             })
         );
         assert_eq!(s.current_branch(), Some("main"));
-        assert_eq!(s.behind_ahead(), Some((2, 5)));
+        assert_eq!(s.remote_state(), Some(&state));
     }
 
     #[test]
     fn test_refresh_error_keeps_last_known_good() {
         let mut s = state_with_gen(7);
+        let state = GitRemoteState {
+            branch: "main".into(),
+            behind: 2,
+            push: origin_target(5),
+        };
         let _ = s.update(GitMessage::WorktreeSnapshot(7, Ok(snapshot(3, 1))));
         let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
-        let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
+        let _ = s.update(GitMessage::RemoteState(7, Ok(Some(state.clone()))));
         // Transient failures — cached values must survive (no flicker).
         let _ = s.update(GitMessage::WorktreeSnapshot(7, Err("spawn failed".into())));
         let _ = s.update(GitMessage::CurrentBranch(7, Err("spawn failed".into())));
-        let _ = s.update(GitMessage::BehindAhead(7, Err("spawn failed".into())));
+        let _ = s.update(GitMessage::RemoteState(7, Err("spawn failed".into())));
         assert_eq!(
             s.diff_stats(),
             Some(DiffStats {
@@ -1126,16 +1176,46 @@ mod tests {
             })
         );
         assert_eq!(s.current_branch(), Some("main"));
-        assert_eq!(s.behind_ahead(), Some((2, 5)));
+        assert_eq!(s.remote_state(), Some(&state));
     }
 
     #[test]
-    fn test_genuine_clean_state_hides_sync() {
+    fn test_no_branch_checked_out_clears_remote_state() {
         let mut s = state_with_gen(7);
-        let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
-        // Genuine clean/no-upstream — sync button must hide.
-        let _ = s.update(GitMessage::BehindAhead(7, Ok((0, 0))));
-        assert_eq!(s.behind_ahead(), None);
+        let _ = s.update(GitMessage::RemoteState(
+            7,
+            Ok(Some(GitRemoteState {
+                branch: "main".into(),
+                behind: 2,
+                push: origin_target(5),
+            })),
+        ));
+        // Detached/unborn HEAD: there is no branch to sync, so the control goes.
+        let _ = s.update(GitMessage::RemoteState(7, Ok(None)));
+        assert_eq!(s.remote_state(), None);
+    }
+
+    #[test]
+    fn test_remote_state_is_gated_by_the_branch_it_describes() {
+        let mut s = state_with_gen(7);
+        let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
+        // A remote refresh for the branch just switched to can land before the
+        // local one; the newer state must not be discarded, and the older
+        // branch's state must not be shown as if it were the current one.
+        let _ = s.update(GitMessage::RemoteState(
+            7,
+            Ok(Some(GitRemoteState {
+                branch: "next".into(),
+                behind: 1,
+                push: origin_target(2),
+            })),
+        ));
+        assert_eq!(s.remote_state(), None, "the cached branch is still main");
+        let _ = s.update(GitMessage::CurrentBranch(7, Ok("next".into())));
+        assert_eq!(
+            s.remote_state().map(|state| state.branch.as_str()),
+            Some("next")
+        );
     }
 
     #[test]
@@ -1144,10 +1224,17 @@ mod tests {
         // Results from a superseded generation must not overwrite newer state.
         let _ = s.update(GitMessage::WorktreeSnapshot(8, Ok(snapshot(99, 99))));
         let _ = s.update(GitMessage::CurrentBranch(8, Ok("old-branch".into())));
-        let _ = s.update(GitMessage::BehindAhead(8, Ok((99, 99))));
+        let _ = s.update(GitMessage::RemoteState(
+            8,
+            Ok(Some(GitRemoteState {
+                branch: "main".into(),
+                behind: 99,
+                push: origin_target(99),
+            })),
+        ));
         assert_eq!(s.diff_stats(), None);
         assert_eq!(s.current_branch(), None);
-        assert_eq!(s.behind_ahead(), None);
+        assert_eq!(s.remote_state(), None);
     }
 
     #[test]
@@ -1155,9 +1242,26 @@ mod tests {
         let mut s = state_with_gen(3);
         let _ = s.update(GitMessage::WorktreeSnapshot(3, Ok(snapshot(3, 1))));
         let _ = s.update(GitMessage::CurrentBranch(3, Ok("main".into())));
+        let _ = s.update(GitMessage::RemoteState(
+            3,
+            Ok(Some(GitRemoteState {
+                branch: "main".into(),
+                behind: 2,
+                push: origin_target(5),
+            })),
+        ));
         s.clear(); // bumps both generations — in-flight results become stale
         let _ = s.update(GitMessage::WorktreeSnapshot(3, Ok(snapshot(7, 7))));
+        let _ = s.update(GitMessage::RemoteState(
+            3,
+            Ok(Some(GitRemoteState {
+                branch: "main".into(),
+                behind: 9,
+                push: origin_target(9),
+            })),
+        ));
         assert_eq!(s.diff_stats(), None);
+        assert_eq!(s.remote_state(), None);
     }
 
     // ── Status forwarding to the editor ──────────────────────────
@@ -1285,7 +1389,7 @@ mod tests {
         let _ = s.update(GitMessage::PeriodicSyncTick);
         // The periodic timer is the recovery path for ref-only/commit-only
         // changes (which produce no file-change event), so it refreshes local
-        // (diff stats + branch) and remote (behind/ahead + fetch) even for a
+        // (diff stats + branch) and remote (remote state + fetch) even for a
         // watched workspace. The generation bumps prove both the local and
         // remote refresh paths were entered — a regression that ran only remote
         // for a watched workspace would leave `local_generation` untouched.
@@ -1389,7 +1493,7 @@ mod tests {
         let before_remote = s.remote_generation;
         let _ = s.update(GitMessage::RefreshAfterCommit);
         // A commit is a ref-only change — the footer refreshes promptly (local +
-        // behind/ahead) and the owed file-change refresh is superseded.
+        // remote state) and the owed file-change refresh is superseded.
         assert!(s.last_local_refresh.is_some());
         assert!(!s.local_refresh_pending);
         assert_eq!(s.local_generation, before_local + 1);
@@ -1406,7 +1510,7 @@ mod tests {
         let before_remote = s.remote_generation;
         let _ = s.update(GitMessage::PipelineCommit(ws));
         // A pipeline commit on the displayed workspace is a ref-only change — the
-        // footer refreshes promptly (local + behind/ahead) and any owed
+        // footer refreshes promptly (local + remote state) and any owed
         // file-change refresh is superseded.
         assert!(s.last_local_refresh.is_some());
         assert!(!s.local_refresh_pending);

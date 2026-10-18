@@ -41,6 +41,7 @@ pub(crate) mod workspaces;
 
 pub(crate) use self::spinner::spinner;
 
+use crate::git::commands::GitPushDestination;
 use crate::logs::LogStore;
 use crate::pipeline::board::Ticket;
 
@@ -74,6 +75,9 @@ use futures_util::StreamExt;
 /// for per-message / per-tool-call broadcasts while keeping the Running Agents
 /// cards and footer responsive.
 const RUNTIME_REFRESH_COALESCE: Duration = Duration::from_millis(250);
+
+/// Longest remote name the footer's sync control shows before eliding it.
+const SYNC_REMOTE_NAME_MAX_CHARS: usize = 16;
 
 /// How long an exit requested before boot finished waits for the boot task to
 /// deliver its result before the exit path runs anyway. The boot is the only
@@ -1473,8 +1477,8 @@ impl Dashboard {
             Message::DiffModal(msg) => {
                 // A manual commit is a ref-only change (HEAD + `.git/index`)
                 // that the file watcher never reports, so refresh the git footer
-                // promptly — otherwise diff_stats/behind_ahead stay stale until
-                // the periodic timer.
+                // promptly — otherwise diff stats and remote state stay stale
+                // until the periodic timer.
                 let commit_succeeded = matches!(&msg, diff::DiffMessage::CommitResult(Ok(_)));
                 // Every `Message::DiffModal` belongs to the picked workspace's
                 // view — its subscription, its rendered controls, the
@@ -3327,58 +3331,127 @@ impl Dashboard {
         ))
     }
 
-    /// Render the git sync indicator (behind/ahead counts, clickable).
-    /// Uses lucide arrow_up/arrow_down at 16px (same as the number text) so
-    /// all elements share the same vertical baseline.
-    /// Returns `None` when there are no behind/ahead counts or both are zero.
+    /// One icon+count cell of the footer's sync control.
+    fn sync_metric(
+        icon: iced::widget::text::Text<'_, iced::Theme, iced::Renderer>,
+        count: usize,
+    ) -> Element<'_, Message> {
+        Row::with_children(vec![
+            icon.size(theme::TEXT_16)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+            text(count.to_string())
+                .size(theme::TEXT_16)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+        ])
+        .spacing(theme::SPACE_2)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    /// Render the git sync control: the push destination, the commits a push
+    /// would carry, and the commits a pull would take from the branch's own
+    /// update source.
+    ///
+    /// Visible whenever there is anything to push or pull — a branch that can be
+    /// pushed is never hidden because its tracked upstream is fetch-only or
+    /// absent, and a destination that could not be asked is reported with the
+    /// commits the branch carries rather than as nothing to do — and whenever no
+    /// remote can take the branch at all, so it can say why. A branch with
+    /// somewhere to push and nothing to push or pull hides it, as before. The pull
+    /// metric is shown only when pressing would actually pull: a publish skips the
+    /// update step. Icons are lucide (not Unicode arrows) at 16px, the number
+    /// text's size, so all elements share the same vertical baseline.
     fn render_git_sync(&self) -> Option<Element<'_, Message>> {
-        let (behind, ahead) = self.git_state.behind_ahead()?;
-        if behind == 0 && ahead == 0 {
+        let state = self.git_state.remote_state()?;
+        if !state.has_sync_work() {
             return None;
         }
-        // Build arrow+number text using lucide icons (not Unicode arrows)
-        // so all elements share the same vertical baseline.
-        let sync_text_label: Element<'_, Message> = {
-            let mut parts: Vec<Element<'_, Message>> = Vec::new();
-            if ahead > 0 {
-                parts.push(
+        let publish = matches!(
+            &state.push,
+            GitPushDestination::Target(target) if target.publish == Some(true)
+        );
+        let mut parts: Vec<Element<'_, Message>> = Vec::new();
+        let tooltip_text = match &state.push {
+            GitPushDestination::Target(target) => {
+                let icon = if publish {
+                    lucide::git_branch_plus::<iced::Theme, iced::Renderer>()
+                } else {
                     lucide::arrow_up::<iced::Theme, iced::Renderer>()
-                        .size(theme::TEXT_16)
-                        .color(theme::TEXT_SECONDARY)
-                        .into(),
-                );
-                parts.push(
-                    text(format!("{ahead}"))
-                        .size(theme::TEXT_16)
-                        .color(theme::TEXT_SECONDARY)
-                        .into(),
-                );
-            }
-            if behind > 0 {
-                if ahead > 0 {
-                    parts.push(Space::new().width(theme::SPACE_8).into());
+                };
+                if target.commits > 0 {
+                    parts.push(Self::sync_metric(icon, target.commits));
                 }
+                // Name the destination the count belongs to.
                 parts.push(
-                    lucide::arrow_down::<iced::Theme, iced::Renderer>()
-                        .size(theme::TEXT_16)
-                        .color(theme::TEXT_SECONDARY)
-                        .into(),
+                    text(crate::util::truncate(
+                        &target.remote,
+                        SYNC_REMOTE_NAME_MAX_CHARS,
+                    ))
+                    .size(theme::TEXT_16)
+                    .color(theme::TEXT_SECONDARY)
+                    .into(),
                 );
-                parts.push(
-                    text(format!("{behind}"))
-                        .size(theme::TEXT_16)
-                        .color(theme::TEXT_SECONDARY)
-                        .into(),
-                );
+                if publish {
+                    format!(
+                        "Publish a new branch to {} ({} commits): it has no such branch yet, \
+                         so nothing is pulled",
+                        target.remote, target.commits
+                    )
+                } else if target.publish.is_none() {
+                    format!(
+                        "Push {} commits to {}: it could not be reached, so whether it already \
+                         carries this branch is unknown",
+                        target.commits, target.remote
+                    )
+                } else if target.commits == 0 {
+                    format!(
+                        "Pull {} from its upstream; nothing to push to {}",
+                        state.behind, target.remote
+                    )
+                } else if state.behind == 0 {
+                    format!("Push {} to {}", target.commits, target.remote)
+                } else {
+                    format!(
+                        "Push {} to {} and pull {} from its upstream",
+                        target.commits, target.remote, state.behind
+                    )
+                }
             }
+            GitPushDestination::Nowhere { reason } => {
+                parts.push(
+                    lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+                        .size(theme::TEXT_16)
+                        .color(theme::STATUS_WARNING)
+                        .into(),
+                );
+                parts.push(
+                    text("nowhere to push")
+                        .size(theme::TEXT_16)
+                        .color(theme::TEXT_SECONDARY)
+                        .into(),
+                );
+                let why = git::nowhere_message(reason);
+                if state.behind > 0 {
+                    format!("{why}. Pull {} from its upstream", state.behind)
+                } else {
+                    why
+                }
+            }
+        };
+        if state.behind > 0 && !publish {
+            parts.push(Space::new().width(theme::SPACE_8).into());
+            parts.push(Self::sync_metric(
+                lucide::arrow_down::<iced::Theme, iced::Renderer>(),
+                state.behind,
+            ));
+        }
+        Some(widgets::icon_tooltip_button(
             Row::with_children(parts)
                 .spacing(theme::SPACE_2)
-                .align_y(Alignment::Center)
-                .into()
-        };
-        Some(widgets::icon_tooltip_button(
-            sync_text_label,
-            "sync commits pull and push",
+                .align_y(Alignment::Center),
+            tooltip_text,
             if self.git_state.is_syncing() {
                 None
             } else {
