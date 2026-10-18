@@ -119,14 +119,29 @@ use tokio::fs;
 
 pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 
-pub(crate) const DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4.1-flash";
-pub(crate) const DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4.1-flash";
+/// The default chat model for both slots. Pinned by
+/// `default_model_identifier_is_pinned` so a typo fails the suite instead of
+/// reaching a provider request.
+const DEFAULT_CHAT_MODEL: &str = "deepseek/deepseek-v4.1-flash-1017";
+pub(crate) const DEFAULT_MANAGER_MODEL: &str = DEFAULT_CHAT_MODEL;
+pub(crate) const DEFAULT_WORKER_MODEL: &str = DEFAULT_CHAT_MODEL;
 
-// The previous compiled defaults for the manager/worker slots, kept only for
-// the per-row migration in `migrate_old_default_models` (idempotent, run on
-// every boot).
-const OLD_DEFAULT_MANAGER_MODEL: &str = "z-ai/glm-5.3-flash";
-const OLD_DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
+// Every value a release ever compiled as a slot default, newest first. A
+// stored value equal to one of these was never chosen by the user (a
+// deliberate pick of the same id is indistinguishable and moves too), so
+// `migrate_old_default_models` rewrites it on boot. Per-slot lists keep a
+// genuine pick of the other slot's old default intact.
+const OLD_DEFAULT_MANAGER_MODELS: &[&str] = &[
+    "deepseek/deepseek-v4.1-flash",
+    "z-ai/glm-5.3-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
+    "deepseek/deepseek-v4-pro-0813",
+];
+const OLD_DEFAULT_WORKER_MODELS: &[&str] = &[
+    "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
+    "deepseek/deepseek-v4-flash-0731",
+];
 // Video-transcription model is fixed (not user-configurable) and always
 // targets OpenRouter.
 pub(crate) const VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.8-flash";
@@ -1101,29 +1116,29 @@ async fn seed_fresh_install_defaults_from_flag(
     seed_fresh_install_defaults(fresh, store).await
 }
 
-/// Idempotent migration: rewrite persisted
-/// `config_kv` rows that still hold the *previous* manager/worker default
-/// model to the current default. Matching is exact on the full
-/// provider-prefixed string, so only rows the user never overrode are
-/// touched; every other key is untouched. A slot rewrite also seeds the
+/// Idempotent migration: rewrite persisted manager/worker rows that still
+/// hold any historical compiled default to the current default. Every value a
+/// release ever shipped is listed, so an installation that skipped releases
+/// migrates too. Matching is exact on the full provider-prefixed string, so
+/// only rows the user never overrode are touched — with the accepted
+/// exception that a deliberate pick of an id which was also a historical
+/// default is indistinguishable and moves. A slot rewrite also seeds the
 /// routing row for the new default — the same order `default_model_routing`
 /// resolves for an empty field, written so the Settings routing field renders
 /// it. Safe to run on every boot — a no-op once no row matches.
 async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Result<()> {
-    let changed_manager = store
-        .migrate_kv_if_equals(
-            CONFIG_KEY_MANAGER_MODEL,
-            OLD_DEFAULT_MANAGER_MODEL,
-            DEFAULT_MANAGER_MODEL,
-        )
-        .await?;
-    let changed_worker = store
-        .migrate_kv_if_equals(
-            CONFIG_KEY_WORKER_MODEL,
-            OLD_DEFAULT_WORKER_MODEL,
-            DEFAULT_WORKER_MODEL,
-        )
-        .await?;
+    let mut changed_manager = 0;
+    for old in OLD_DEFAULT_MANAGER_MODELS {
+        changed_manager += store
+            .migrate_kv_if_equals(CONFIG_KEY_MANAGER_MODEL, old, DEFAULT_MANAGER_MODEL)
+            .await?;
+    }
+    let mut changed_worker = 0;
+    for old in OLD_DEFAULT_WORKER_MODELS {
+        changed_worker += store
+            .migrate_kv_if_equals(CONFIG_KEY_WORKER_MODEL, old, DEFAULT_WORKER_MODEL)
+            .await?;
+    }
     for (changed, model) in [
         (changed_manager, DEFAULT_MANAGER_MODEL),
         (changed_worker, DEFAULT_WORKER_MODEL),
@@ -2167,26 +2182,37 @@ mod tests {
         );
     }
 
-    /// One-time migration: persisted `config_kv` rows holding the previous
-    /// manager/worker default model are rewritten to the current default, and
-    /// only those rows (and only when they match the exact old default) are
-    /// touched; each rewritten slot also seeds the new default's routing row.
-    /// Re-running is a no-op.
+    /// The default model id is pinned as a compile-time constant: a typo fails
+    /// here, before any provider request is built.
+    #[test]
+    fn default_model_identifier_is_pinned() {
+        let reload = ConfigReload::const_new();
+        assert_eq!(
+            reload.manager_model(),
+            "deepseek/deepseek-v4.1-flash-1017",
+            "a fresh manager slot must resolve to the pinned default"
+        );
+        assert_eq!(
+            reload.worker_model(),
+            "deepseek/deepseek-v4.1-flash-1017",
+            "a fresh worker slot must resolve to the pinned default"
+        );
+        assert_eq!(
+            default_model_routing(DEFAULT_CHAT_MODEL),
+            Some("deepseek"),
+            "the default must keep the DeepSeek provider pin"
+        );
+    }
+
+    /// One-time migration: persisted `config_kv` rows holding any historical
+    /// manager/worker default are rewritten to the current default, and only
+    /// those rows (exact full-string match) are touched; each rewritten slot
+    /// also seeds the new default's routing row. Re-running is a no-op.
     #[tokio::test]
-    async fn migrate_old_default_models_rewrites_only_stale_slot_rows() {
+    async fn migrate_old_default_models_rewrites_every_previous_default() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
 
-        // Existing-install snapshot at the time of the default swap: both slots
-        // still hold the previous defaults; a stale video-transcription row and
-        // an unrelated key remain untouched.
-        store
-            .set_kv(CONFIG_KEY_MANAGER_MODEL, OLD_DEFAULT_MANAGER_MODEL)
-            .await
-            .unwrap();
-        store
-            .set_kv(CONFIG_KEY_WORKER_MODEL, OLD_DEFAULT_WORKER_MODEL)
-            .await
-            .unwrap();
+        // A stale video-transcription row and an unrelated key remain untouched.
         store
             .set_kv("video_transcription_model", "qwen/qwen3.7-flash")
             .await
@@ -2196,26 +2222,44 @@ mod tests {
             .await
             .unwrap();
 
-        migrate_old_default_models(&store).await.unwrap();
+        // Every manager default of every earlier release, including ones older
+        // than the immediately previous release.
+        for old in [
+            "deepseek/deepseek-v4.1-flash",
+            "z-ai/glm-5.3-flash",
+            "deepseek/deepseek-v4-flash-vision-exp",
+            "deepseek/deepseek-v4-pro-0813",
+        ] {
+            store.set_kv(CONFIG_KEY_MANAGER_MODEL, old).await.unwrap();
+            migrate_old_default_models(&store).await.unwrap();
+            assert_eq!(
+                store
+                    .get_kv(CONFIG_KEY_MANAGER_MODEL)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(DEFAULT_MANAGER_MODEL),
+                "manager slot holding the retired default {old} must be migrated"
+            );
+        }
+        for old in [
+            "deepseek/deepseek-v4.1-flash",
+            "deepseek/deepseek-v4-flash-vision-exp",
+            "deepseek/deepseek-v4-flash-0731",
+        ] {
+            store.set_kv(CONFIG_KEY_WORKER_MODEL, old).await.unwrap();
+            migrate_old_default_models(&store).await.unwrap();
+            assert_eq!(
+                store
+                    .get_kv(CONFIG_KEY_WORKER_MODEL)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(DEFAULT_WORKER_MODEL),
+                "worker slot holding the retired default {old} must be migrated"
+            );
+        }
 
-        assert_eq!(
-            store
-                .get_kv(CONFIG_KEY_MANAGER_MODEL)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(DEFAULT_MANAGER_MODEL),
-            "manager slot holding the old default must be migrated"
-        );
-        assert_eq!(
-            store
-                .get_kv(CONFIG_KEY_WORKER_MODEL)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(DEFAULT_WORKER_MODEL),
-            "worker slot holding the old default must be migrated"
-        );
         assert_eq!(
             store
                 .get_kv("video_transcription_model")
@@ -2265,6 +2309,36 @@ mod tests {
             store.get_all_model_routings().await.unwrap(),
             vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
             "re-running the migration must not add or drop the migrated routing row"
+        );
+    }
+
+    /// A custom-endpoint installation keeps its endpoint, key and chosen
+    /// models: the migration only rewrites exact historical slot defaults.
+    #[tokio::test]
+    async fn migrate_old_default_models_leaves_custom_endpoint_installation_untouched() {
+        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        let installation = [
+            (CONFIG_KEY_PROVIDER_ENDPOINT, "https://llm.example/v1"),
+            (CONFIG_KEY_PROVIDER_ENDPOINT_KEY, "sk-local"),
+            (CONFIG_KEY_MANAGER_MODEL, "my-stack/manager"),
+            (CONFIG_KEY_WORKER_MODEL, "my-stack/worker"),
+        ];
+        for (key, value) in installation {
+            store.set_kv(key, value).await.unwrap();
+        }
+
+        migrate_old_default_models(&store).await.unwrap();
+
+        for (key, value) in installation {
+            assert_eq!(
+                store.get_kv(key).await.unwrap().as_deref(),
+                Some(value),
+                "{key} must survive the default-model migration"
+            );
+        }
+        assert!(
+            store.get_all_model_routings().await.unwrap().is_empty(),
+            "nothing was migrated, so no routing row may be written"
         );
     }
 
@@ -2385,6 +2459,42 @@ mod tests {
                 .as_deref(),
             Some("user/private-model"),
             "a genuine user override must be preserved"
+        );
+        assert!(
+            store.get_all_model_routings().await.unwrap().is_empty(),
+            "no routing writes may happen when nothing was migrated"
+        );
+
+        // A historical default of the *other* slot is not this slot's default:
+        // a genuine pick of it must survive.
+        store
+            .set_kv(CONFIG_KEY_MANAGER_MODEL, "deepseek/deepseek-v4-flash-0731")
+            .await
+            .unwrap();
+        store
+            .set_kv(CONFIG_KEY_WORKER_MODEL, "z-ai/glm-5.3-flash")
+            .await
+            .unwrap();
+
+        migrate_old_default_models(&store).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_MANAGER_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("deepseek/deepseek-v4-flash-0731"),
+            "a manager pick equal to a worker-only old default must be preserved"
+        );
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_WORKER_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("z-ai/glm-5.3-flash"),
+            "a worker pick equal to a manager-only old default must be preserved"
         );
         assert!(
             store.get_all_model_routings().await.unwrap().is_empty(),
