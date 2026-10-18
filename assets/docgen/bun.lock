@@ -6,7 +6,7 @@
       "name": "mahbot-document-kit",
       "dependencies": {
         "@pdf-lib/fontkit": "1.1.1",
-        "docx": "9.8.1",
+        "docx": "9.12.0",
         "docxtemplater": "3.71.0",
         "pdf-lib": "1.17.1",
         "pizzip": "3.3.0",
@@ -27,7 +27,7 @@
 
     "core-util-is": ["core-util-is@1.0.3", "", {}, "sha512-ZQBvi1DcpJ4GDqanjucZ2Hj3wEO5pZDS89BWbkcrvdxksJorwUDDZamX9ldFkp9aw2lmBDLgkObEA4DWNJ9FYQ=="],
 
-    "docx": ["docx@9.8.1", "", { "dependencies": { "@types/node": "^26.6.2", "hash.js": "^1.1.7", "jszip": "^3.10.1", "nanoid": "^6.0.1", "xml": "^1.0.1", "xml-js": "^1.6.8" } }, "sha512-bv4yDxgiV9aRyh327HG+V36wG0f23wk32SDhXGQpUhnykVtIPaR1K4ISi8E+DYJ7OcRQRkR8Y70QYlSS08V1cA=="],
+    "docx": ["docx@9.12.0", "", { "dependencies": { "@types/node": "^26.6.2", "hash.js": "^1.1.7", "jszip": "^3.10.1", "nanoid": "^6.0.1", "xml": "^1.0.1", "xml-js": "^1.6.8" } }, "sha512-pRxdJP7cJpqhSxzfhlB01RToOFMAY7+QJ59zT2LowpXjS2q5fAnrvAuQIyGgkuBxTcXii0LFqM96GFjhQcTicQ=="],
 
     "docxtemplater": ["docxtemplater@3.71.0", "", { "dependencies": { "@xmldom/xmldom": "^0.9.12" } }, "sha512-4SyQzPVDrhsPb9vHNstxJpJWMLJvrbKEcXDRNBlb5Bnbjqm1T51PVt5r+iLVe1yAkmIvakk8M3KywO5m5LsUSA=="],
 

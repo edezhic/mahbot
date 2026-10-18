@@ -11,7 +11,13 @@ import PptxGenJS from "pptxgenjs";
 import {
   Document as DocxDocument, Packer, Paragraph, TextRun, HeadingLevel, ImageRun,
   Table, TableRow, TableCell, WidthType, AlignmentType, NumberFormat,
+  Header, Footer, PageNumber, PageBreak, ExternalHyperlink, FootnoteReferenceRun,
+  TableOfContents,
 } from "docx";
+// The layout entry point lays a document out as Word does, which is what writes
+// a table of contents' page numbers — and the total a footer's page count states —
+// into the document as fixed text instead of leaving Word to ask for an update.
+import { estimatePageNumbers } from "docx/layout";
 import {
   PDFDocument, rgb, degrees, PDFArray, PDFDict, PDFHexString, PDFName, PDFNumber, PDFString,
   PDFTextField, PDFCheckBox, PDFRadioGroup, PDFDropdown, PDFOptionList,
@@ -25,11 +31,6 @@ import RULES from "./rules.json";
 
 const A4 = [595.28, 841.89];
 const MARGIN = 56;
-// The A4 page in twips — the page the `docx` library writes when the create path
-// states none, with the one-inch margins it gives it (see `TWIPS_PER_INCH`).
-// Stated here because a created Word document's own page is the library's, not the
-// file's, and a picture's own size is fitted into the column those margins leave.
-const A4_PAGE_TWIPS = { width: 11906, height: 16838 };
 const BODY_SIZE = 12;
 // A table's cells: ten-point text on a twelve-point leading, and a gap under
 // the row that makes a one-line row twenty points tall.
@@ -370,18 +371,69 @@ function pagesPhrase(pages) {
 }
 
 // ── create: docx ───────────────────────────────────────────────
+// The page a created document is written on, in the record `docxPage` answers with
+// for one: the library's own A4 in twips, with the one-inch margins it gives it (see
+// `TWIPS_PER_INCH`). Stated here because a created Word document's own page is the
+// library's, not the file's, and a picture's own size is fitted into the column those
+// margins leave.
+const CREATED_PAGE = { width: 11906, height: 16838, left: TWIPS_PER_INCH, right: TWIPS_PER_INCH, top: TWIPS_PER_INCH, bottom: TWIPS_PER_INCH };
+// What a created picture's paragraph costs the page below the picture: the spacing
+// after the paragraph that holds it, and a line's descent under the inline picture —
+// pagination counts both, so a picture scaled to the column's exact height leaves the
+// page's last line too tall, and Word clips it at the page's edge or pushes it onto
+// the next one, a document that begins with an empty page. The descent is about 46
+// twips at the 11 pt body; four whole pixels, so the whole-pixel sides `imageSize`
+// derives can never reach the page's edge either. Only a created document's pictures
+// are sized here; an edit places into a column its own file's page states.
+const FIT_SLACK_TWIPS = 60;
+const IMAGE_PARAGRAPH_SPACING = 200;
+// The page number a header or a footer states where the caller wrote `{page}`,
+// and the document's page count where it wrote `{pages}`.
+const PAGE_TOKEN = /\{(page|pages)\}/g;
+// One line of a header or a footer: its text as the caller wrote it and its page
+// numbers as the field values a run places where they stand, in order — and whether
+// the line states the document's own page count, which is what asks for a layout
+// pass. Text travels as text and only a token as a field: the library reads a run's
+// children by their own spelling, so a caller whose line happens to say `CURRENT`
+// gets their words rather than a field.
+function pageNumberLine(text) {
+  const runs = [];
+  let counted = false;
+  let last = 0;
+  for (const match of text.matchAll(PAGE_TOKEN)) {
+    if (match.index > last) runs.push(new TextRun({ text: text.slice(last, match.index) }));
+    if (match[1] === "pages") counted = true;
+    runs.push(new TextRun({ children: [match[1] === "page" ? PageNumber.CURRENT : PageNumber.TOTAL_PAGES] }));
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) runs.push(new TextRun({ text: text.slice(last) }));
+  return { runs, counted };
+}
+// A header's or a footer's lines: one per line of the caller's own text, a line break
+// being either spelling and the one empty line a final newline adds dropped.
+const headerFooterLines = (text, what) => {
+  const lines = textOf(text, what).split(/\r?\n/);
+  if (lines.length > 1 && lines.at(-1) === "") lines.pop();
+  return lines.map(pageNumberLine);
+};
+const headerFooterParagraphs = (lines) => lines.map((line) => new Paragraph({ children: line.runs }));
 function docxImage(image, block) {
-  // The page the create path writes, in pixels: the library's own A4 with its
-  // one-inch margins (see `A4_PAGE_TWIPS`). Its height is the container a picture
-  // whose sides the block leaves out is fitted into so the page's bottom edge
-  // never cuts it off; the width is capped at the default width, which is already
-  // narrower than that column.
-  const height = (A4_PAGE_TWIPS.height - 2 * TWIPS_PER_INCH) / TWIPS_PER_PIXEL;
-  return new ImageRun({
-    type: image.kind,
-    data: image.bytes,
-    transformation: imageSize(image, block.width, block.height, RULES.dimension_points, { width: DEFAULT_IMAGE_WIDTH, height }),
-  });
+  // A picture whose sides the block leaves out is fitted into the text column the
+  // created page leaves, short of the bottom by what its paragraph takes below it —
+  // the paragraph's spacing and a line's descent (see `FIT_SLACK_TWIPS` and
+  // `IMAGE_PARAGRAPH_SPACING`). The box is whole, and the sides derived from it are
+  // rounded to whole pixels (see `imageSize`), a rounding the slack above absorbs; the
+  // width is capped at the default width, already narrower than the column.
+  const room = pageColumn(CREATED_PAGE);
+  const box = {
+    width: DEFAULT_IMAGE_WIDTH,
+    height: Math.floor((room.height - IMAGE_PARAGRAPH_SPACING - FIT_SLACK_TWIPS) / TWIPS_PER_PIXEL),
+  };
+  const transformation = imageSize(image, block.width, block.height, RULES.dimension_points, box);
+  return {
+    run: new ImageRun({ type: image.kind, data: image.bytes, transformation }),
+    transformation,
+  };
 }
 function docxTableRow(cells, header) {
   const what = header ? "a table heading" : "a table cell";
@@ -391,16 +443,88 @@ function docxTableRow(cells, header) {
     })),
   });
 }
+// What createDocx says about a page break it leaves out, once per edge however many
+// breaks name it: a break at either edge of the document has nothing to break away
+// from, so it is left out and said.
+const edgeBreakNotes = {
+  before: "[a page break before the first block was left out — a document does not begin with an empty page]",
+  after: "[a page break after the last block was left out — it would leave the document with an empty last page]",
+};
+// Whether a block puts anything on the page: a page break does not, and neither does a
+// list with no bullets — nor a table with no row, a shape the tool's own boundary
+// refuses before it reaches this kit and this reads anyway, so a direct call is covered
+// too. The one rule both edges of the document are read by, so a break with nothing on
+// one side of it is an edge break however it is spelled.
+function draws(block) {
+  if (block.type === "list") return Boolean(block.items && block.items.length);
+  if (block.type === "table") return Boolean(block.headers && block.headers.length) || (block.rows ?? []).some((row) => row.length);
+  return block.type !== "page_break";
+}
+// The schemes a link may name: an office application follows a target only when it can
+// open one, and an allowlist is the whole rule — a scheme nobody here thought of cannot
+// be written either. The tool's own `url` field states it and its boundary refuses
+// first; this is the same rule at the writer's last line, so a direct call to this kit
+// cannot write a link nothing can follow.
+const FOLLOWABLE_SCHEMES = ["http:", "https:", "mailto:", "tel:"];
+// A link's address, checked where it is written. The address the parse produced is the
+// one written: parsing trims the space around it and drops an embedded tab or newline,
+// so the raw string can name an address that is not the one given — and one an
+// application would not follow.
+function linkAddress(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new UsageError(`a link's address must be an absolute URL, e.g. https://example.com, got: ${JSON.stringify(url)}`);
+  }
+  if (!FOLLOWABLE_SCHEMES.includes(parsed.protocol)) {
+    throw new UsageError(`a link's address must be an http, https, mailto or tel address, got: ${JSON.stringify(url)}`);
+  }
+  return parsed.href;
+}
+// What a Word document alone holds — a running header or footer, the three blocks only
+// its writer knows, a paragraph's footnote. The tool's boundary refuses every one of them
+// for another format first, and names the one the request carries; the same refusal is
+// stated here, beside the writers that would otherwise drop them from a file they report
+// written.
+function refuseWordOnly(req) {
+  const block = (req.content ?? []).find((block) => ["link", "page_break", "contents"].includes(block.type) || block.footnote != null);
+  const feature = req.header != null ? "a running header"
+    : req.footer != null ? "a running footer"
+    : block === undefined ? undefined
+    : block.type === "paragraph" ? "a paragraph's footnote"
+    : `a ${block.type} block`;
+  if (feature === undefined) return;
+  throw new UsageError(`${feature} is a Word document's own, and ${req.format} holds none`);
+}
 function createDocx(req) {
   const children = [];
+  // The answer's own notes and losses: a picture the caller sized past the page, a
+  // page break left out at either end, an empty table of contents, one whose page
+  // numbers the layout could not work out, and a page count it could not work out.
+  // A loss is always a note too, and each is said once — the contract `editor.note`
+  // states for an edit.
+  const notes = [];
+  const losses = [];
+  const note = (message, loss = false) => {
+    if (!notes.includes(message)) notes.push(message);
+    if (loss && !losses.includes(message)) losses.push(message);
+  };
   // Whether any block places a WebP: the library writes the part and declares no
   // type for it, so the list is completed after packing (`declareWebpMedia`).
   let webp = false;
-  for (const block of req.content) {
+  let contents = false;
+  for (const [index, block] of req.content.entries()) {
     if (block.type === "heading") {
       children.push(new Paragraph({ text: textOf(block.text, "a heading's text"), heading: headingLevel(block.level) }));
     } else if (block.type === "paragraph") {
-      children.push(new Paragraph({ children: [new TextRun(textOf(block.text, "a paragraph's text"))] }));
+      const runs = [new TextRun(textOf(block.text, "a paragraph's text"))];
+      // A footnote is the note text the paragraph's own reference points at; an
+      // explicit null is no footnote, the way every optional field reads it.
+      if (block.footnote != null) {
+        runs.push(new FootnoteReferenceRun({ children: [new Paragraph(textOf(block.footnote, "a footnote's text"))] }));
+      }
+      children.push(new Paragraph({ children: runs }));
     } else if (block.type === "list") {
       for (const item of block.items) {
         // A bullet is text as far as the writer is concerned: a number or a
@@ -411,6 +535,10 @@ function createDocx(req) {
           : { text, bullet: { level: 0 } }));
       }
     } else if (block.type === "table") {
+      // A created table states no cell margins: the library's default table style is
+      // Word's own Normal Table — 108 twips at the sides, the margins a produced
+      // table always had — and a stated margin would only override the table style
+      // of a document `add_table` edits.
       const rows = [];
       // A row with no cells is a `<w:tr/>`, which Word refuses to open, so an
       // empty header or an empty row is never written.
@@ -423,8 +551,69 @@ function createDocx(req) {
     } else if (block.type === "image") {
       const image = readImage(block.image);
       if (image.kind === "webp") webp = true;
-      children.push(new Paragraph({ children: [docxImage(image, block)], spacing: { after: 200 } }));
+      const { run, transformation } = docxImage(image, block);
+      // A size the caller named is placed exactly as named, so the answer says
+      // when the picture it makes reaches past the page, as an edit's does.
+      if ((block.width != null || block.height != null) && reachesPastPage(transformation, CREATED_PAGE)) {
+        note(pastEdgeNote("picture", "the page"));
+      }
+      children.push(new Paragraph({ children: [run], spacing: { after: IMAGE_PARAGRAPH_SPACING } }));
+    } else if (block.type === "page_break") {
+      // A break with nothing before it would leave the document's first page empty
+      // and one with nothing after it a last page that holds no content: either way
+      // there is nothing to break away from, so it is left out and said. Both edges
+      // are read by `draws` — the blocks on either side that put something on the
+      // page — so a run of breaks at an edge is left out as one, `note` saying it
+      // once however many breaks name it.
+      if (!req.content.slice(0, index).some(draws)) note(edgeBreakNotes.before);
+      else if (!req.content.slice(index + 1).some(draws)) note(edgeBreakNotes.after);
+      else children.push(new Paragraph({ children: [new PageBreak()] }));
+    } else if (block.type === "link") {
+      // The address is the package's external target; a `#fragment` in it is
+      // written as the hyperlink's own anchor, which Word appends to the target —
+      // the way Word writes one.
+      children.push(new Paragraph({
+        children: [new ExternalHyperlink({
+          link: linkAddress(textOf(block.url, "a link's address")),
+          children: [new TextRun({ text: textOf(block.text, "a link's text"), color: "0563C1", underline: {} })],
+        })],
+      }));
+    } else if (block.type === "contents") {
+      // One table per document: a second is a second field over the same headings,
+      // which no caller could tell apart — refused, as the tool's own boundary
+      // refuses it.
+      if (contents) throw new UsageError("a document holds one table of contents");
+      contents = true;
+      // The levels the product's own headings use, stated once in the shared
+      // rules, so a table of contents cannot list a level no heading has.
+      const range = `${RULES.heading_levels[0]}-${RULES.heading_levels.at(-1)}`;
+      // Untitled on purpose: the alias names the content control in Word's own
+      // panel and is never printed in the table, and Word's field-based table
+      // carries none.
+      children.push(new TableOfContents("", { hyperlink: true, headingStyleRange: range }));
+    } else {
+      // A kind this writer does not know is refused rather than dropped: the tool's
+      // own vocabulary says which kinds exist, and a block nothing wrote must never
+      // reach the file as nothing.
+      throw new UsageError(`a content block of unknown type ${JSON.stringify(block.type)} — a document takes a heading, a paragraph, a list, a table, an image, a link, a page break or a table of contents`);
     }
+  }
+  // A header's and a footer's own runs, built once: the fields they hold — and the
+  // table of contents — are what decide whether the document is given an estimate of
+  // its own pages. Only such a document has its page numbers written in; one with
+  // neither is packed exactly as before, with no layout pass at all.
+  const header = req.header == null ? undefined : headerFooterLines(req.header, "a header");
+  const footer = req.footer == null ? undefined : headerFooterLines(req.footer, "a footer");
+  // The page count a caller's `{pages}` states is the layout's to work out, and the
+  // line that carries its field is what says the document needs that pass.
+  const counted = [header ?? [], footer ?? []].flat().some((line) => line.counted);
+  const numbered = contents || counted;
+  const section = { children };
+  if (header) {
+    section.headers = { default: new Header({ children: headerFooterParagraphs(header) }) };
+  }
+  if (footer) {
+    section.footers = { default: new Footer({ children: headerFooterParagraphs(footer) }) };
   }
   const numbering = {
     config: [{
@@ -432,7 +621,120 @@ function createDocx(req) {
       levels: [{ level: 0, format: NumberFormat.DECIMAL, text: "%1.", alignment: AlignmentType.START }],
     }],
   };
-  return Packer.toBuffer(new DocxDocument({ numbering, sections: [{ children }] })).then((buffer) => declareWebpMedia(buffer, webp));
+  // A document that states a table of contents or a `{pages}` is packed once with the
+  // library's page-number estimate. A layout it cannot work out at all is packed again
+  // without the estimate rather than failing the call: every number is then left as the
+  // writer wrote it — blank — and the checks below report each one, which is what a
+  // number the writer could not work out is owed, in a document the caller can open.
+  const pack = (estimate) => Packer.toBuffer(new DocxDocument({
+    numbering,
+    sections: [section],
+    ...(estimate ? { pageNumbers: estimatePageNumbers } : {}),
+  }));
+  const packing = numbered ? pack(true).catch(() => pack(false)) : pack(false);
+  return packing.then((buffer) => {
+    const packed = declareWebpMedia(buffer, webp);
+    if (!numbered) return { bytes: packed, notes, losses };
+    const zip = new PizZip(packed);
+    if (contents) {
+      if (!req.content.some((block) => block.type === "heading")) {
+        note("[the table of contents is empty — the document has no headings]");
+      }
+      // A number the layout could not work out is written clean and blank, so Word
+      // never fills it in either; the caller learns that rather than receiving an
+      // empty column the call called a success.
+      const gaps = blankFieldCount(zip.file(DOCX_DOCUMENT).asText(), /^PAGEREF\b/);
+      if (gaps) {
+        const sentence = gaps === 1
+          ? "[the table of contents has one entry with no page number — the writer could not work out the page it starts on]"
+          : `[the table of contents has ${gaps} entries with no page number — the writer could not work out the pages they start on]`;
+        note(sentence, true);
+      }
+    }
+    // The page count `{pages}` states is the same pass's own, and one it did not
+    // settle leaves blank rather than asking the reader to update a field: the same
+    // loss as a table-of-contents entry, said the same way.
+    if (counted && docxPageCountGaps(zip)) {
+      note("[the page count a header or a footer states could not be worked out — {pages} is left blank rather than filled with a number that may be wrong]", true);
+    }
+    return { bytes: packed, notes, losses };
+  });
+}
+
+// A field's own instruction as its elements spell it — `TOC \h \o "1-3"`, a
+// `PAGEREF _Toc1 \h`, or "" for a field stating none. A field with a begin/end pair
+// carries it in `w:instrText` elements, which are joined because a writer may split one
+// instruction across several; a simple field states it as `w:instr` on its own element,
+// which the shared field walk (see `fieldRegions`) finds just the same.
+const fieldInstruction = (field) => {
+  const spelled = [...field.matchAll(/<w:instrText[^>]*>([\s\S]*?)<\/w:instrText>/g)]
+    .map((part) => part[1]).join("").trim();
+  if (spelled) return spelled;
+  const simple = /^<w:fldSimple\b[^>]*\bw:instr="([^"]*)"/.exec(field);
+  return simple ? xmlUnescape(simple[1]).trim() : "";
+};
+// Whether a field carries no cached result — the text a reader shows without updating
+// anything. The writer caches it from the layout, and the cache has a different shape
+// per field: a begin/separate/end field holds it between its `separate` and its end, and
+// one written clean with nothing there, or with no `separate` at all, cached nothing.
+// A simple field's own content is its result — a shape the create path's writer never
+// emits, so that branch guards a direct kit call.
+function fieldResultBlank(field) {
+  if (field.startsWith("<w:fldSimple")) {
+    const open = field.indexOf(">");
+    return open < 0 || spelledText(field.slice(open + 1)) === "";
+  }
+  const separate = field.search(/<w:fldChar[^>]*w:fldCharType="separate"/);
+  return separate < 0 || spelledText(field.slice(separate)) === "";
+}
+// Every field of a part whose instruction starts with `instruction`, as the field's own
+// span — one walk, read by `blankFieldCount` below and by the table-of-contents checks.
+const fieldsStarting = (xml, instruction) => fieldRegions(xml)
+  .map(([start, end]) => xml.slice(start, end))
+  .filter((field) => instruction.test(fieldInstruction(field)));
+// How many fields of a part start with `instruction` and cached no result — the ones the
+// layout could not work out.
+const blankFieldCount = (xml, instruction) =>
+  fieldsStarting(xml, instruction).filter(fieldResultBlank).length;
+// The fields stating a document's table of contents, each as its own span. Two readers
+// of what such a field cached: `docxHasContents` asks whether there is one at all, and
+// `docxContentsHolds` reads the entries and the page numbers beside them.
+const contentsFields = (xml) => fieldsStarting(xml, /^TOC\b/);
+// Whether the part carries a table of contents at all.
+const docxHasContents = (xml) => contentsFields(xml).length > 0;
+// Whether a table of contents' own field holds `needle` — its entries' text and the page
+// numbers beside them, which the writer wrote as that field's result rather than as runs
+// of the body.
+const docxContentsHolds = (xml, needle) =>
+  contentsFields(xml).some((field) => spelledText(field).includes(needle));
+// The page counts a package's headers and footers state, counted over the NUMPAGES
+// fields whose cached result is blank — the ones the layout did not settle, so the
+// caller's `{pages}` would read as nothing. The parts are the ones the package names
+// for its headers and footers (`word/header1.xml`, `word/footer1.xml`).
+function docxPageCountGaps(zip) {
+  return Object.keys(zip.files)
+    .filter((name) => /^word\/(?:header|footer)\d*\.xml$/.test(name))
+    .reduce((gaps, name) => gaps + blankFieldCount(zip.file(name).asText(), /^NUMPAGES\b/), 0);
+}
+// Whether a paragraph style id states a heading level the table of contents covers:
+// the built-in `Heading1`..`HeadingN` ids, with or without the space, at the levels
+// the shared rule states.
+const headingStyleId = (id) => {
+  const level = /^heading\s*(\d+)$/i.exec(id ?? "")?.[1];
+  return level !== undefined && RULES.heading_levels.includes(Number(level));
+};
+// Whether a paragraph's own markup is one the table of contents lists: the writer
+// wraps each heading it writes an entry for in a `_Toc` bookmark, so a paragraph
+// holding one is a heading the table shows.
+const tocListed = (paragraph) => /w:bookmarkStart[^>]*w:name="_Toc\d+"/.test(paragraph);
+// The refusal a text op, a paragraph formatting op that names a style or a list, or
+// a paragraph removal gets when it addresses a paragraph the table lists: the entries
+// were written from those headings and an edit cannot rewrite them, so the heading's
+// text or the level stated for it would leave the table disagreeing with the
+// document. Raised where the paragraph is matched, so an edit of the body's own text
+// still goes through.
+function refuseListedHeading(find) {
+  throw new UsageError(`the text ${JSON.stringify(find)} is in a heading this document's table of contents lists — an edit cannot rewrite the table's own entries, so changing the heading would leave the table disagreeing with it; leave that heading as it is, and have a document this tool creates write the table from the headings you want`);
 }
 
 // A created document's content-type list, completed with the one media type the
@@ -1896,9 +2198,10 @@ function docxPeripheralHolds(editor, needle) {
 // named rather than passed over as "not in the body": a fragment that reaches
 // across a paragraph boundary, text a part a docx edit does not change holds
 // (whether the part's addressed text holds it or a tracked revision of the part's
-// own does), text the body's own tracked revision holds, one carrying leading
-// whitespace the file does not hold, one carrying the reader's own label, and one
-// holding a tab or a line break. Each check VERIFIES the reason it states — a
+// own does), a fragment a table of contents' own field holds, text the body's own
+// tracked revision holds, one carrying leading whitespace the file does not hold,
+// one carrying the reader's own label, and one holding a tab or a line break. Each
+// check VERIFIES the reason it states — a
 // boundary against the paragraphs really joined, an indentation and a label
 // against the paragraph that really holds the trimmed fragment, a peripheral part
 // read for the text an edit addresses and for the text a revision of its own
@@ -1935,6 +2238,10 @@ function docxFindRefusal(editor, xml, find, block = false) {
     // a reading prints as deleted rather than as live text: the part is named
     // with that, so the miss is not passed off as text the document lacks.
     if (peripheral.length) return `the text ${JSON.stringify(find)} is not in the document's body: it is text a tracked revision holds in ${conjoined(peripheral.map(({ phrase }) => phrase))} of this document, which the reading prints as revised rather than as live text, and an edit addresses the text the body's runs hold today`;
+    // A table of contents' own entries — their text and the page numbers beside them —
+    // are that field's result, which no edit addresses: named as the table's rather than
+    // passed off as text the document lacks.
+    if (docxContentsHolds(xml, trimmed)) return `the text ${JSON.stringify(find)} is in this document's table of contents, which an edit does not change — its entries and their page numbers are the table's own field result, and an edit addresses ${edited}`;
   }
   // A tracked revision of the body holds text of its own: a deletion's runs are
   // `w:delText`, which a reading prints as deleted rather than as live text, and an
@@ -3206,7 +3513,7 @@ function formattedParagraph(paragraphXml, props, styleId, list, dialect) {
 // the list definition are resolved on the first match only, so a fragment that
 // matches nothing refuses before it can write a definition, and one definition
 // serves every paragraph the call reaches.
-function formatParagraph(xml, edit, find, editor) {
+function formatParagraph(xml, edit, find, editor, listed) {
   const props = paragraphFormat(edit);
   // The dialect every part and attribute this call writes has to state (see
   // `dialectOf`), read from the body it edits.
@@ -3229,7 +3536,20 @@ function formatParagraph(xml, edit, find, editor) {
   const out = mapParagraphs(xml, (element, excluded) => {
     if (!addressedText(element, excluded).includes(find)) return null;
     if (props.style !== undefined && styleId === undefined) styleId = resolveParagraphStyle(editor, props.style);
-    if (props.list !== undefined && props.list !== false && numId === undefined) numId = listNumId(editor, props.list.kind, props.list.level, dialect);
+    if (Boolean(props.list) && numId === undefined) numId = listNumId(editor, props.list.kind, props.list.level, dialect);
+    // A heading the table lists cannot take another level or another numbering: the
+    // entry was written from it and an edit cannot rewrite the entry (see
+    // `refuseListedHeading`). A style naming the level the paragraph already states
+    // changes nothing, so it goes through. A paragraph given a heading level the table
+    // covers, and that the table does not list, becomes a heading the static table does
+    // not show — the mirror of a paragraph added after a heading, said the same way,
+    // and true whether the paragraph was body text or already a heading.
+    const styleChanged = props.style !== undefined && styleId !== paragraphStyleId(element);
+    const levelChanged = styleChanged || Boolean(props.list);
+    if (listed && levelChanged && tocListed(element)) refuseListedHeading(find);
+    if (listed && styleChanged && !tocListed(element) && headingStyleId(styleId)) {
+      editor.note("[the paragraph is a heading this document's table of contents does not list]");
+    }
     matched += 1;
     // Whether the paragraph draws a list item marker at all — what its own properties
     // state (the state that decides on its own, a paragraph cancelling the numbering
@@ -3294,8 +3614,9 @@ function bodyEnd(xml) {
 // markers that must not be fabricated in new content — see `inheritedParagraph`)
 // and the run formatting of its first run, so a line added to a list stays a list
 // item and one added after a heading is a heading. With no `after`, a bare
-// paragraph goes at the end of the body, exactly as before.
-function addParagraph(xml, edit, editor) {
+// paragraph goes at the end of the body, exactly as before. `listed` is the
+// table-of-contents reading the caller already paid for (see `applyDocxEdit`).
+function addParagraph(xml, edit, editor, listed) {
   const note = editor.note;
   const text = editText(edit.text, "text");
   if (edit.after === undefined) {
@@ -3303,7 +3624,14 @@ function addParagraph(xml, edit, editor) {
     return xml.slice(0, at) + addedParagraph(undefined, undefined, text) + xml.slice(at);
   }
   const { span } = docxAnchor(xml, edit, editor);
-  return xml.slice(0, span.end) + inheritedParagraph(xml.slice(span.start, span.end), text, note) + xml.slice(span.end);
+  const anchor = xml.slice(span.start, span.end);
+  // A paragraph added after a heading takes the heading's style, so it becomes one
+  // of its own — which a table of contents written with this document does not
+  // list, since its entries cannot be rewritten. Said rather than left silent.
+  if (listed && tocListed(anchor)) {
+    note("[the paragraph added after a heading is a heading of its own, and this document's table of contents does not list it]");
+  }
+  return xml.slice(0, span.end) + inheritedParagraph(anchor, text, note) + xml.slice(span.end);
 }
 
 // A `<w:p>` holding one run and `text`: the shape every `add_paragraph` writes,
@@ -3388,8 +3716,8 @@ function docxAnchor(xml, edit, editor) {
 // own section states. The section in force where a block lands may be another one;
 // this is the measure a picture's own size, a table's columns and the note about a
 // picture past the page are read against, not a fact the file records. A document
-// stating no page of its own is read at the create path's A4 (see
-// `A4_PAGE_TWIPS`).
+// stating no page of its own is read at the page `create` lays down (see
+// `CREATED_PAGE`), so the default is stated once.
 function docxPage(xml) {
   const section = bodyLayout(xml)?.section;
   const page = section === undefined ? "" : xml.slice(section.start, section.end);
@@ -3399,23 +3727,30 @@ function docxPage(xml) {
     return Number.isFinite(value) && value > 0 ? value : fallback;
   };
   return {
-    width: measure("w:pgSz", "w:w", A4_PAGE_TWIPS.width),
-    height: measure("w:pgSz", "w:h", A4_PAGE_TWIPS.height),
-    left: measure("w:pgMar", "w:left", TWIPS_PER_INCH),
-    right: measure("w:pgMar", "w:right", TWIPS_PER_INCH),
-    top: measure("w:pgMar", "w:top", TWIPS_PER_INCH),
-    bottom: measure("w:pgMar", "w:bottom", TWIPS_PER_INCH),
+    width: measure("w:pgSz", "w:w", CREATED_PAGE.width),
+    height: measure("w:pgSz", "w:h", CREATED_PAGE.height),
+    left: measure("w:pgMar", "w:left", CREATED_PAGE.left),
+    right: measure("w:pgMar", "w:right", CREATED_PAGE.right),
+    top: measure("w:pgMar", "w:top", CREATED_PAGE.top),
+    bottom: measure("w:pgMar", "w:bottom", CREATED_PAGE.bottom),
   };
 }
 
-// The body's own text column, in twips: that page less the margins on each side.
-function docxTextColumn(xml) {
-  const page = docxPage(xml);
-  return {
-    width: Math.max(1, page.width - page.left - page.right),
-    height: Math.max(1, page.height - page.top - page.bottom),
-  };
-}
+// A page's own text column, in twips: that page less the margins on each side.
+const pageColumn = (page) => ({
+  width: Math.max(1, page.width - page.left - page.right),
+  height: Math.max(1, page.height - page.top - page.bottom),
+});
+
+// The body's own text column, in twips.
+const docxTextColumn = (xml) => pageColumn(docxPage(xml));
+
+// Whether a picture's box reaches past the page it is placed on: an inline picture
+// starts at the page's left margin, so the room it has before the page's edge is
+// the page less that one margin on each axis. The one statement of the rule, for
+// the picture a create lays down and the one an edit adds.
+const reachesPastPage = (size, page) => size.width * TWIPS_PER_PIXEL > page.width - page.left
+  || size.height * TWIPS_PER_PIXEL > page.height - page.top;
 
 // The DrawingML namespaces a picture is written in, per dialect: a document
 // resolves the spellings its own dialect states, and the picture declares them
@@ -3457,12 +3792,10 @@ function addImage(xml, edit, editor) {
     height: Math.round(column.height / TWIPS_PER_PIXEL),
   };
   const size = imageSize(image, edit.width, edit.height, RULES.dimension_points, container);
-  // An inline picture starts at the page's left margin, so the room it has before
-  // the page's edge is the page less that one margin on each axis. Only a size that
-  // does not fit there reaches past the page — a picture wider than the text column
-  // still shows, into the margin — and the answer says so, as the slide and PDF arms
-  // do, rather than reporting a plain success for a size the caller named.
-  if (size.width * TWIPS_PER_PIXEL > page.width - page.left || size.height * TWIPS_PER_PIXEL > page.height - page.top) {
+  // A picture wider than the text column still shows, into the margin, so a size
+  // that does not fit there is said to reach past the page — as the slide and PDF
+  // arms say it — rather than reported as a plain success.
+  if (reachesPastPage(size, page)) {
     editor.note(pastEdgeNote("picture", "the page"));
   }
   const cx = Math.max(1, Math.round(size.width * PX_TO_EMU));
@@ -3494,11 +3827,11 @@ function docxTableCell(value, header) {
   return `<w:tc><w:p><w:r>${bold}<w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r></w:p></w:tc>`;
 }
 
-// The `<w:tbl>` a `create` table block would have written: the same 100 % width
-// and six single borders, and a grid of equal columns over the body's own text
-// width. `CT_Tbl` requires both the `<w:tblPr>` and the `<w:tblGrid>`, and the
-// grid is stated rather than left to a reader's autofit — its count the widest
-// row's, the count the reading prints and Word draws.
+// The `<w:tbl>` a `create` table block would have written: the same 100 % width,
+// six single borders, and a grid of equal columns over the body's own text width.
+// `CT_Tbl` requires both the `<w:tblPr>` and the `<w:tblGrid>`, and the grid is
+// stated rather than left to a reader's autofit — its count the widest row's, the
+// count the reading prints and Word draws.
 function docxTable(headers, rows, usable) {
   const columns = rows.reduce((widest, row) => Math.max(widest, row.length), headers.length);
   if (columns > RULES.table_columns_max) throw new UsageError(`a table may hold at most ${RULES.table_columns_max} columns, got: ${columns}`);
@@ -3559,20 +3892,23 @@ function addTable(xml, edit, editor) {
 // that reach into the element, relative to it. A nested edit rewrites bytes, so
 // the field regions and the element's own runs are located only after it —
 // exactly as `editParagraph` does.
-function removeParagraph(element, excluded, find, found, note) {
+function removeParagraph(element, excluded, find, found, note, listed) {
   const children = childParagraphSpans(element);
   let out = element;
   let regions = excluded;
   for (let i = children.length - 1; i >= 0; i -= 1) {
     const [start, end] = children[i];
     const before = out.slice(start, end);
-    const removed = removeParagraph(before, clipSpans(regions, start, end), find, found, note);
+    const removed = removeParagraph(before, clipSpans(regions, start, end), find, found, note, listed);
     if (removed === null) out = out.slice(0, start) + out.slice(end);
     else if (removed !== before) out = out.slice(0, start) + removed + out.slice(end);
     const delta = (removed === null ? 0 : removed.length) - before.length;
     if (delta) regions = regions.map(([from, to]) => (from >= end ? [from + delta, to + delta] : [from, to]));
   }
   if (!addressedText(out, regions).includes(find)) return out;
+  // A heading a table of contents lists is not removed: the entry it was written
+  // with would stay behind, naming a heading the document no longer has.
+  if (listed && tocListed(out)) refuseListedHeading(find);
   // A paragraph that ends a section or holds a page break carries a break the
   // removal would take with it, and no note would bring the break back: the call
   // is refused with the way that removes the text and keeps the break. Checked
@@ -3593,7 +3929,7 @@ function removeParagraph(element, excluded, find, found, note) {
 // last to the first so an earlier one's byte positions stay valid. The result is
 // assembled as the pieces of the part around the removed paragraphs and joined
 // once, the way `mapParagraphs` does.
-function removeParagraphs(xml, find, found, note) {
+function removeParagraphs(xml, find, found, note, listed) {
   // A container a paragraph is removed from must keep a paragraph — ECMA-376
   // requires one in a `<w:tc>` and in a `<w:txbxContent>` — and the removal is
   // refused rather than written out as a part no reader may hold. The check runs
@@ -3606,7 +3942,7 @@ function removeParagraphs(xml, find, found, note) {
   for (let i = tops.length - 1; i >= 0; i -= 1) {
     const top = tops[i];
     const element = xml.slice(top.start, top.end);
-    const removed = removeParagraph(element, clipSpans(regions, top.start, top.end), find, found, note);
+    const removed = removeParagraph(element, clipSpans(regions, top.start, top.end), find, found, note, listed);
     pieces.push(xml.slice(top.end, end));
     if (removed !== null) pieces.push(removed);
     end = top.start;
@@ -3721,18 +4057,23 @@ function noteUnnamed(fragment, spans, note) {
 // media part and its declaration a picture adds — and withholds its notes.
 function applyDocxEdit(xml, edit, editor) {
   const op = edit && edit.op;
-  if (op === "add_paragraph") return addParagraph(xml, edit, editor);
   if (op === "add_image") return addImage(xml, edit, editor);
   if (op === "add_table") return addTable(xml, edit, editor);
+  // The table of contents, read once for the ops that refuse or report against it — a
+  // paragraph added after a heading (see `addParagraph`), a removal, a paragraph
+  // formatting, and the ops that rewrite a fragment below. `format_text` changes no
+  // text and no level, so it never pays for the scan.
+  const listed = op !== "format_text" && docxHasContents(xml);
+  if (op === "add_paragraph") return addParagraph(xml, edit, editor, listed);
   const find = editText(edit && edit.find, "find");
   if (!find) throw new UsageError("find must not be empty");
   if (op === "remove_paragraph") {
     const found = { value: false };
-    const out = removeParagraphs(xml, find, found, editor.note);
+    const out = removeParagraphs(xml, find, found, editor.note, listed);
     if (!found.value) throw new UsageError(docxFindRefusal(editor, xml, find));
     return out;
   }
-  if (op === "format_paragraph") return formatParagraph(xml, edit, find, editor);
+  if (op === "format_paragraph") return formatParagraph(xml, edit, find, editor, listed);
   if (!["replace_text", "insert_text", "remove_text", "format_text"].includes(op)) throw new UsageError(`unknown docx edit: ${JSON.stringify(op)}`);
   const format = { bold: edit.bold, italic: edit.italic, underline: edit.underline, strike: edit.strike };
   if (op === "format_text") {
@@ -3755,6 +4096,9 @@ function applyDocxEdit(xml, edit, editor) {
     if (position !== "after" && position !== "before") throw new UsageError(`position must be "after" or "before", got: ${JSON.stringify(position)}`);
     replacement = position === "before" ? insert + find : find + insert;
   }
+  // The three ops that rewrite a fragment's text are the ones that would leave the table
+  // of contents disagreeing with a heading it lists. The refusal is raised where such a
+  // paragraph is matched (see `refuseListedHeading`), while `listed` was read above.
   let inserted = false;
   let matched = 0;
   let spilled = false;
@@ -3763,6 +4107,7 @@ function applyDocxEdit(xml, edit, editor) {
     const text = slots.map((slot) => xmlUnescape(slot.raw)).join("");
     const offsets = occurrences(text, find);
     if (!offsets.length) return null;
+    if (listed && tocListed(element)) refuseListedHeading(find);
     inserted = true;
     matched += offsets.length;
     if (op === "format_text") {
@@ -8799,7 +9144,18 @@ const operations = {
     const step = async (name, task) => {
       try { await task(); } catch (error) { throw new Error(`${name}: ${(error && error.message) || error}`); }
     };
-    await step("create_docx", async () => writeOut(`${scratch}/probe.docx`, await createDocx({ content: [{ type: "heading", level: 1, text: "Проверка" }, { type: "paragraph", text: "текст" }] })));
+    await step("create_docx", async () => writeOut(`${scratch}/probe.docx`, (await createDocx({
+      header: "Проверка {page} of {pages}",
+      footer: "Страница {page}",
+      content: [
+        { type: "heading", level: 1, text: "Проверка" },
+        { type: "paragraph", text: "текст", footnote: "сноска" },
+        { type: "link", text: "ссылка", url: "https://example.com" },
+        { type: "contents" },
+        { type: "page_break" },
+        { type: "heading", level: 2, text: "Второй" },
+      ],
+    })).bytes));
     await step("create_xlsx", () => writeOut(`${scratch}/probe.xlsx`, createXlsx({ sheets: [{ rows: [["Проверка {name}", 1, { formula: "B1" }]] }] })));
     await step("create_pptx", async () => {
       writeOut(`${scratch}/probe.pptx`, await createPptx({ content: [{ type: "heading", level: 1, text: "Проверка" }, { type: "list", items: ["раз", "два"] }] }));
@@ -8877,7 +9233,7 @@ const operations = {
     // substitution runs rather than finding nothing to do; the presentation's
     // notes slide exercises the part the library does not render itself.
     await step("template_docx", async () => {
-      writeOut(`${scratch}/probe_template.docx`, await createDocx({ content: [{ type: "paragraph", text: "Проверка {name}" }] }));
+      writeOut(`${scratch}/probe_template.docx`, (await createDocx({ content: [{ type: "paragraph", text: "Проверка {name}" }] })).bytes);
       const filled = fillDocxOrPptx({ template: `${scratch}/probe_template.docx`, format: "docx", values: { name: "Проверка" } });
       writeOut(`${scratch}/probe_filled.docx`, filled.buffer);
     });
@@ -8896,10 +9252,10 @@ const operations = {
     // smallest input really runs rather than being probed on a package that
     // skips it.
     await step("edit_docx", async () => {
-      writeOut(`${scratch}/probe_edit.docx`, await createDocx({ content: [
+      writeOut(`${scratch}/probe_edit.docx`, (await createDocx({ content: [
         { type: "heading", level: 1, text: "Заголовок" },
         { type: "paragraph", text: "Проверка текста" }, { type: "paragraph", text: "Лишний абзац" },
-      ] }));
+      ] })).bytes);
       const edited = docxEdit({ input: `${scratch}/probe_edit.docx`, edits: [
         { op: "replace_text", find: "текста", replace: "правки" },
         { op: "insert_text", find: "Проверка", insert: " новая", position: "after" },
@@ -8972,8 +9328,13 @@ const operations = {
     return {};
   },
   create: async (req) => {
-    if (req.format === "docx") writeOut(req.output, await createDocx(req));
-    else if (req.format === "xlsx") writeOut(req.output, createXlsx(req));
+    if (req.format === "docx") {
+      const made = await createDocx(req);
+      writeOut(req.output, made.bytes);
+      return { outputs: [req.output], notes: made.notes, losses: made.losses };
+    }
+    refuseWordOnly(req);
+    if (req.format === "xlsx") writeOut(req.output, createXlsx(req));
     else if (req.format === "pptx") writeOut(req.output, await createPptx(req));
     else if (req.format === "pdf") writeOut(req.output, await createPdf(req));
     else throw new UsageError(`unknown format: ${req.format}`);

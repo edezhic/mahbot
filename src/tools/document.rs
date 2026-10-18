@@ -1026,12 +1026,31 @@ fn fill_arg() -> Value {
 const CONTENT_BLOCKS: &[(&str, &[&str], &[&str])] = &[
     // kind, its fields, the fields it requires
     ("heading", &["text", "level"], &["text"]),
-    ("paragraph", &["text"], &["text"]),
+    ("paragraph", &["text", "footnote"], &["text"]),
     ("notes", &["text"], &["text"]),
     ("list", &["items", "ordered"], &["items"]),
     ("table", &["headers", "rows"], &[]),
     ("image", &["image", "width", "height"], &["image"]),
+    ("link", &["text", "url"], &["text", "url"]),
+    ("page_break", &[], &[]),
+    ("contents", &[], &[]),
 ];
+
+/// What a block kind's own `type` declaration says about it, for the kinds whose
+/// name alone does not carry the meaning: a break, a link and a table of contents
+/// are words this vocabulary did not have, so each says what it writes.
+fn block_kind_note(kind: &str) -> Option<String> {
+    match kind {
+        "page_break" => Some("A page break: the next block starts a new page.".to_owned()),
+        "link" => Some("A paragraph holding a link: its text and the address it opens.".to_owned()),
+        "contents" => Some(format!(
+            "A table of contents over the document's headings (levels {}), with the page numbers \
+             already written in; one per document.",
+            listed(&RULES.heading_levels)
+        )),
+        _ => None,
+    }
+}
 
 /// How `create` declares one block field: the single statement of what that field
 /// is, whichever kind carries it.
@@ -1058,6 +1077,14 @@ fn block_field(name: &str) -> Value {
         "image" => content_image_arg(),
         "width" => picture_width_arg("Placed width", BLOCK_IMAGE_FIT),
         "height" => placed_size_arg("Placed height"),
+        "footnote" => text_arg(
+            "A footnote attached to this paragraph: its text is printed at the foot of the \
+             page the paragraph lands on.",
+        ),
+        "url" => text_arg(
+            "The address the link opens: an http, https, mailto or tel address, e.g. \
+             https://example.com; another scheme is refused.",
+        ),
         other => unreachable!("every block field has a declaration: {other}"),
     }
 }
@@ -1071,7 +1098,13 @@ fn content_arg() -> Value {
         .iter()
         .map(|(kind, fields, required)| {
             let mut properties = serde_json::Map::new();
-            properties.insert("type".to_owned(), json!({ "enum": [kind] }));
+            properties.insert(
+                "type".to_owned(),
+                match block_kind_note(kind) {
+                    Some(note) => json!({ "enum": [kind], "description": note }),
+                    None => json!({ "enum": [kind] }),
+                },
+            );
             properties.extend(
                 fields
                     .iter()
@@ -1090,7 +1123,8 @@ fn content_arg() -> Value {
         "minItems": 1,
         "items": { "oneOf": variants },
         "description": "The blocks, in order, each with its own \"type\"; \"notes\" is pptx speaker \
-                        notes, and a table needs a row or a header.",
+                        notes, a table needs a row or a header, and a link, a page break, a \
+                        footnote and a table of contents are a .docx's own.",
     })
 }
 
@@ -1245,7 +1279,9 @@ fn action_schema(action: &str) -> Value {
             "create",
             "Write a new file: blocks for docx/pptx/pdf, sheets for xlsx. A PDF is laid out as a \
              simple stream: blocks follow one another down the page, and columns, floating objects \
-             and exact page placement are not attempted.",
+             and exact page placement are not attempted. A .docx may carry a running header and \
+             footer, page numbers, a table of contents over its headings, links, footnotes and \
+             explicit page breaks.",
             &["format"],
             &json!({
                 "format": choice_arg(&SUPPORTED_FORMATS, "The format to write."),
@@ -1260,6 +1296,14 @@ fn action_schema(action: &str) -> Value {
                         pptx_size_list(),
                         RULES.pptx_default_size.inches()
                     ),
+                ),
+                "header": text_arg(
+                    "A running header, one paragraph per line: {page} is the page number and \
+                     {pages} the document's page count.",
+                ),
+                "footer": text_arg(
+                    "A running footer, one paragraph per line: {page} is the page number and \
+                     {pages} the document's page count.",
                 ),
             }),
         ),
@@ -1710,6 +1754,32 @@ impl DocumentTool {
         }
         let mut request = json!({ "op": "create", "format": format });
         set_metadata(&mut request, metadata);
+        // A running header or footer is a document's own, and the page numbers it
+        // composes are written as fields: a presentation, a workbook and this
+        // tool's PDF have none, so one named there is refused rather than dropped.
+        for (key, what) in [
+            ("header", "a running header"),
+            ("footer", "a running footer"),
+        ] {
+            let Some(text) = opt_string(args, key)? else {
+                continue;
+            };
+            if format != "docx" {
+                anyhow::bail!(
+                    "usage: \"{key}\" is {what}, and only a .docx has one — hint: leave it out \
+                     for format \"{format}\""
+                );
+            }
+            // A blank one is a header the reader never sees, written as an empty
+            // part of a call that reports success — the same rule a blank link text
+            // and a blank footnote are refused by.
+            require_visible(
+                &format!("\"{key}\""),
+                text,
+                &format!("give its text, or leave \"{key}\" out"),
+            )?;
+            request[key] = json!(text);
+        }
         // A slide size is a presentation's own: the page a document or a PDF is
         // laid out on is not choosable, so a `size` named for one is refused
         // rather than silently dropped.
@@ -3425,6 +3495,46 @@ fn require_block_keys(object: &serde_json::Map<String, Value>, at: &str, kind: &
     require_taken_keys(object, at, &format!("the {kind} block"), fields, &["type"])
 }
 
+/// Content only a Word document can carry — a link, a page break, a table of
+/// contents or a paragraph's footnote: a presentation and the PDF this tool writes
+/// as a simple stream have no part that holds one, so it is refused rather than
+/// handed to a writer that would drop it — the one thing a caller must never be
+/// told is that their content was written when it was not.
+fn require_docx_block(format: &str, at: &str, kind: &str) -> Result<()> {
+    if format == "docx" {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "usage: {at} ({kind}) is content only a .docx holds — hint: leave it out of a {format} \
+         create"
+    )
+}
+
+/// A link's address must be one an office application can follow, and the schemes it
+/// follows are named rather than refused one by one: `http`, `https`, `mailto` and
+/// `tel`. Anything else — a target with no scheme, which a document writes and no
+/// application opens, or a scheme that is not an address a document should hand a
+/// reader — is refused with the reason and the address it got. The address the parse
+/// produced is the one the document carries: parsing trims the space around it and
+/// skips an embedded tab or newline, so writing the raw string could state an address
+/// that is not the one given — and one no application follows. The `url` field states
+/// the rule to the caller, and the kit restates it where the address is written.
+fn link_address(raw: &str, index: usize) -> Result<String> {
+    let Ok(url) = url::Url::parse(raw) else {
+        anyhow::bail!(
+            "usage: content[{index}].url must be an absolute URL, e.g. https://example.com — \
+             got: {raw:?}"
+        );
+    };
+    if !matches!(url.scheme(), "http" | "https" | "mailto" | "tel") {
+        anyhow::bail!(
+            "usage: content[{index}].url must be an http, https, mailto or tel address — got: \
+             {raw:?}"
+        );
+    }
+    Ok(url.to_string())
+}
+
 /// The xlsx edit vocabulary and the shapes its writer knows: a sheet is named by
 /// every op but `add_sheet`, a cell is an A1 address, a row and a column are the
 /// 1-based units the reader shows, a merge is a range of at least two cells, and
@@ -3941,6 +4051,12 @@ async fn resolve_content(
         ),
     };
     let mut out = Vec::with_capacity(blocks.len());
+    // The kinds a block may name, from the one table that states them.
+    let kinds = CONTENT_BLOCKS
+        .iter()
+        .map(|(kind, _, _)| *kind)
+        .collect::<Vec<_>>();
+    let mut contents = false;
     for (index, block) in blocks.iter().enumerate() {
         let Some(object) = block.as_object() else {
             anyhow::bail!(
@@ -3949,8 +4065,8 @@ async fn resolve_content(
         };
         let Some(kind) = object.get("type").and_then(Value::as_str) else {
             anyhow::bail!(
-                "usage: content[{index}] has no \"type\" — hint: use heading, paragraph, list, \
-                 table, image or notes"
+                "usage: content[{index}] has no \"type\" — hint: use {}",
+                listed(&kinds)
             );
         };
         let at = format!("content[{index}]");
@@ -3967,6 +4083,14 @@ async fn resolve_content(
             "paragraph" => {
                 require_block_keys(object, &at, "paragraph")?;
                 require_string(object, "text", index)?;
+                // A footnote is a Word document's own: a presentation and a PDF
+                // have nowhere to print one, so it is refused rather than lost. An
+                // explicit null is an absent footnote, the way every optional block
+                // field reads one.
+                if object.get("footnote").is_some_and(|value| !value.is_null()) {
+                    require_docx_block(format, &at, "footnote")?;
+                    require_text(object, "footnote", index)?;
+                }
                 block.clone()
             }
             // Speaker notes exist only on a presentation: dropping the block
@@ -4003,19 +4127,47 @@ async fn resolve_content(
                 Value::Object(table)
             }
             "image" => resolve_image_block(ws, block, object, index, format, access).await?,
+            "link" | "page_break" | "contents" => {
+                docx_only_block(block, object, kind, index, format, &mut contents)?
+            }
             other => anyhow::bail!(
                 "usage: content[{index}] has unknown type \"{other}\" — hint: use {}",
-                listed(
-                    &CONTENT_BLOCKS
-                        .iter()
-                        .map(|(kind, _, _)| *kind)
-                        .collect::<Vec<_>>()
-                )
+                listed(&kinds)
             ),
         };
         out.push(resolved);
     }
     Ok(Value::Array(out))
+}
+
+/// A block only a Word document holds — a link, a page break or a table of
+/// contents — checked in the shape its kind declares, and handed back as the request
+/// carries it: a link's address is the one its own parse produced. `contents` is the
+/// document's one table of contents: a second is refused rather than written beside it.
+fn docx_only_block(
+    block: &Value,
+    object: &serde_json::Map<String, Value>,
+    kind: &str,
+    index: usize,
+    format: &str,
+    contents: &mut bool,
+) -> Result<Value> {
+    let at = format!("content[{index}]");
+    require_block_keys(object, &at, kind)?;
+    require_docx_block(format, &at, kind)?;
+    let mut resolved = block.clone();
+    match kind {
+        "link" => {
+            require_text(object, "text", index)?;
+            resolved["url"] = json!(link_address(require_string(object, "url", index)?, index)?);
+        }
+        "contents" if *contents => anyhow::bail!(
+            "usage: content[{index}] is a second table of contents — a document has one"
+        ),
+        "contents" => *contents = true,
+        _ => {}
+    }
+    Ok(resolved)
 }
 
 /// One `image` content block resolved: the picture's path under the caller's own
@@ -4729,10 +4881,15 @@ fn require_hex_color(at: &str, color: &str) -> Result<()> {
     )
 }
 
-/// Require `object[key]` to be a string, naming the block position in the error.
-fn require_string(object: &serde_json::Map<String, Value>, key: &str, index: usize) -> Result<()> {
+/// Require `object[key]` to be a string, naming the block position in the error, and
+/// give its text — the shape a rule about the string's own content reads next.
+fn require_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    index: usize,
+) -> Result<&'a str> {
     match object.get(key) {
-        Some(Value::String(_)) => Ok(()),
+        Some(Value::String(text)) => Ok(text),
         Some(v) => Err(super::wrong_type(
             &format!("content[{index}].{key}"),
             "a string",
@@ -4740,6 +4897,27 @@ fn require_string(object: &serde_json::Map<String, Value>, key: &str, index: usi
         )),
         None => anyhow::bail!("usage: content[{index}] has no \"{key}\""),
     }
+}
+
+/// Require a piece of text to hold something: an empty or whitespace-only link text,
+/// footnote, running header or footer is content no reader shows, so it is refused
+/// rather than written as an invisible part of an answer that reports success. `at`
+/// names the field and `hint` the way out, so one rule serves every field that holds
+/// text and each refusal still names its own.
+fn require_visible(at: &str, text: &str, hint: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        anyhow::bail!("usage: {at} is empty — hint: {hint}");
+    }
+    Ok(())
+}
+
+/// Require `object[key]` to be a string holding something (see [`require_visible`]).
+fn require_text(object: &serde_json::Map<String, Value>, key: &str, index: usize) -> Result<()> {
+    require_visible(
+        &format!("content[{index}].{key}"),
+        require_string(object, key, index)?,
+        "give the text it shows",
+    )
 }
 
 /// The picture formats one placement takes: the extensions a picture's path is
@@ -6063,6 +6241,814 @@ mod tests {
             element_named(&body, "wp:extent"),
             r#"<wp:extent cx="1270000" cy="635000"/>"#,
             "a 100 pt × 50 pt image is not placed at its own size in EMU: {body}"
+        );
+    }
+
+    /// A created document carries the header and the footer it was asked for, the
+    /// page numbers composed in them are the two fields the text names, and a
+    /// reading of the produced file shows both — and neither the package nor the
+    /// settings ask the reader to update a field.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_created_docx_carries_a_header_and_a_footer_with_their_page_numbers() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "headed",
+                // A line spelling one of the writer's own field sentinels is the
+                // caller's text, a CRLF line ends like any other, and the final
+                // newline adds no empty paragraph of its own.
+                "header": "Report\r\nTOTAL_PAGES\nPage {page} of {pages}\n",
+                "footer": "{page}",
+                "content": [
+                    { "type": "heading", "level": 1, "text": "Title" },
+                    { "type": "paragraph", "text": "Body" },
+                ],
+            }),
+        )
+        .await;
+        let path = single(&reply);
+        let body = part_text(&path, "word/document.xml");
+        assert!(
+            body.contains("<w:headerReference") && body.contains("<w:footerReference"),
+            "the section references no header and no footer: {body}"
+        );
+        assert!(
+            !body.contains("w:dirty"),
+            "the document asks the reader to update a field: {body}"
+        );
+        assert!(
+            !part_text(&path, "word/settings.xml").contains("updateFields"),
+            "the settings ask the reader to update fields"
+        );
+        let parts = zip_names(&path);
+        let header = parts
+            .iter()
+            .find(|name| name.starts_with("word/header"))
+            .map(|name| part_text(&path, name))
+            .expect("a header part");
+        assert!(
+            header.contains(">PAGE<") && header.contains(">NUMPAGES<"),
+            "the header states no page number and no page count: {header}"
+        );
+        assert!(
+            header.contains("Report") && header.contains("Page ") && header.contains(" of "),
+            "the header lost the caller's own text: {header}"
+        );
+        // One paragraph per line, the empty line a final newline adds dropped; the
+        // second line spells a field's own name and stays the caller's text, while the
+        // page number and the page count are exactly two fields.
+        assert_eq!(
+            header.matches("<w:p>").count(),
+            3,
+            "the header's lines are not one paragraph each: {header}"
+        );
+        assert!(
+            header.contains("<w:t xml:space=\"preserve\">TOTAL_PAGES</w:t>"),
+            "a header line spelling a field's own name is not the caller's text: {header}"
+        );
+        assert_eq!(
+            header
+                .matches(r#"<w:fldChar w:fldCharType="begin"/>"#)
+                .count(),
+            2,
+            "the header holds a field it was not asked for: {header}"
+        );
+        assert!(
+            !header.contains('\r'),
+            "a carriage return reached the header: {header}"
+        );
+        assert!(
+            !header.contains("w:dirty"),
+            "the header asks the reader to update a field: {header}"
+        );
+        let footer = parts
+            .iter()
+            .find(|name| name.starts_with("word/footer"))
+            .map(|name| part_text(&path, name))
+            .expect("a footer part");
+        assert!(
+            footer.contains(">PAGE<"),
+            "the footer states no page number: {footer}"
+        );
+        // The reading prints a labeled block for each part and the field marker
+        // where the file's own field sits.
+        let text = converted_text(&ws, &path).await;
+        assert!(text.contains("Header (default):"), "no header read: {text}");
+        assert!(text.contains("Footer (default):"), "no footer read: {text}");
+        assert!(
+            text.contains("[field PAGE") && text.contains("[field NUMPAGES"),
+            "the reading shows no page-number field: {text}"
+        );
+        assert!(
+            text.contains("Page [field PAGE"),
+            "the header's composed text is not read: {text}"
+        );
+    }
+
+    /// A page break is written between the blocks on either side of it, and a break
+    /// at either edge of the document writes no break at all — a created document
+    /// begins on content and ends on it — with the answer saying it was left out once
+    /// per edge, however many breaks name it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_created_docx_page_break_lands_where_it_was_asked() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "broken",
+                "content": [
+                    { "type": "heading", "level": 1, "text": "First" },
+                    { "type": "paragraph", "text": "before" },
+                    { "type": "page_break" },
+                    { "type": "heading", "level": 1, "text": "Second" },
+                ],
+            }),
+        )
+        .await;
+        let body = part_text(&single(&reply), "word/document.xml");
+        let page_break = r#"<w:br w:type="page"/>"#;
+        assert_eq!(
+            body.matches(page_break).count(),
+            1,
+            "an explicit page break is not written exactly once: {body}"
+        );
+        let at = body.find(page_break).expect("the break");
+        assert!(
+            body.find("First").expect("the first heading") < at
+                && at < body.find("Second").expect("the second heading"),
+            "the break is not between the blocks that surround it: {body}"
+        );
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "leading",
+                "content": [
+                    { "type": "page_break" },
+                    { "type": "paragraph", "text": "only" },
+                ],
+            }),
+        )
+        .await;
+        assert!(
+            !part_text(&single(&reply), "word/document.xml").contains(page_break),
+            "a leading page break begins the document with an empty page"
+        );
+        assert!(
+            reply.contains("does not begin with an empty page"),
+            "the left-out break is not reported: {reply}"
+        );
+        // A break at the other edge would end the document on a page holding
+        // nothing: every one of them is left out, and the answer says so once.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "trailing",
+                "content": [
+                    { "type": "paragraph", "text": "only" },
+                    { "type": "page_break" },
+                    { "type": "page_break" },
+                ],
+            }),
+        )
+        .await;
+        assert!(
+            !part_text(&single(&reply), "word/document.xml").contains(page_break),
+            "a trailing page break leaves the document with an empty last page"
+        );
+        assert_eq!(
+            reply.matches("empty last page").count(),
+            1,
+            "the left-out breaks are not reported once: {reply}"
+        );
+    }
+
+    /// A link block is a paragraph holding the address it names: the text is a
+    /// hyperlink run, and the package's relationships carry the address as an
+    /// external target, so an office application follows it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_created_docx_link_carries_its_text_and_address() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "linked",
+                "content": [
+                    { "type": "paragraph", "text": "See" },
+                    { "type": "link", "text": "example", "url": "https://example.com/a?b=c" },
+                ],
+            }),
+        )
+        .await;
+        let path = single(&reply);
+        let body = part_text(&path, "word/document.xml");
+        let hyperlink = element_named(&body, "w:hyperlink");
+        assert!(
+            hyperlink.contains("r:id=\""),
+            "the hyperlink names no relationship: {hyperlink}"
+        );
+        assert!(
+            hyperlink.contains(">example<"),
+            "the hyperlink lost its text: {hyperlink}"
+        );
+        let rels = part_text(&path, "word/_rels/document.xml.rels");
+        assert!(
+            rels.contains(r#"Target="https://example.com/a?b=c""#)
+                && rels.contains(r#"TargetMode="External""#),
+            "the package does not carry the address as an external target: {rels}"
+        );
+        let text = converted_text(&ws, &path).await;
+        assert!(
+            text.contains("(link: https://example.com/a?b=c)"),
+            "the address is not read: {text}"
+        );
+    }
+
+    /// A paragraph's footnote is a reference in the paragraph and the note's own
+    /// text in the footnotes part, where a reading shows it.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_created_docx_footnote_is_attached_to_its_paragraph() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "noted",
+                "content": [
+                    { "type": "paragraph", "text": "Body text", "footnote": "The note's own text." },
+                ],
+            }),
+        )
+        .await;
+        let path = single(&reply);
+        let body = part_text(&path, "word/document.xml");
+        let reference = element_named(&body, "w:footnoteReference");
+        assert!(
+            reference.contains("w:id="),
+            "the paragraph holds no footnote reference: {body}"
+        );
+        let footnotes = part_text(&path, "word/footnotes.xml");
+        assert!(
+            footnotes.contains("The note&apos;s own text.")
+                || footnotes.contains("The note's own text."),
+            "the footnotes part lost the note's text: {footnotes}"
+        );
+        let text = converted_text(&ws, &path).await;
+        assert!(text.contains("Footnote 1"), "the note is not read: {text}");
+        assert!(
+            text.contains("The note's own text."),
+            "the note's text is not read: {text}"
+        );
+    }
+
+    /// A table of contents lists the document's Heading 1–3 paragraphs, every
+    /// entry already carries the page number the layout worked out, and neither
+    /// the document nor its settings asks the reader to update a field.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_created_docx_contents_lists_its_headings_with_page_numbers() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let mut content = vec![
+            json!({ "type": "contents" }),
+            json!({ "type": "heading", "level": 1, "text": "First" }),
+            json!({ "type": "heading", "level": 2, "text": "Second" }),
+            json!({ "type": "heading", "level": 3, "text": "Third" }),
+        ];
+        // Enough body to push the last heading onto a second page: the entries then
+        // hold two different numbers, which a constant — or a number the writer
+        // never worked out — cannot pass as.
+        for line in 0..60 {
+            content.push(json!({ "type": "paragraph", "text": format!("filler {line} ") }));
+        }
+        content.push(json!({ "type": "heading", "level": 1, "text": "Last" }));
+        let reply = run(
+            &ws,
+            json!({ "action": "create", "format": "docx", "file_name": "toc", "content": content }),
+        )
+        .await;
+        let path = single(&reply);
+        let body = part_text(&path, "word/document.xml");
+        assert!(
+            body.contains("TOC \\h \\o &quot;1-3&quot;") || body.contains("TOC \\h \\o \"1-3\""),
+            "the table of contents does not cover the three heading levels: {body}"
+        );
+        for style in ["TOC1", "TOC2", "TOC3"] {
+            assert!(
+                body.contains(&format!("<w:pStyle w:val=\"{style}\"/>")),
+                "no {style} entry in the table of contents: {body}"
+            );
+        }
+        // Every PAGEREF field's cached result is the page number the layout
+        // wrote, never a blank left for Word to fill in.
+        let results = pageref_results(&body);
+        assert_eq!(results.len(), 4, "one entry per heading: {results:?}");
+        let numbers = results
+            .iter()
+            .map(|result| run_text(result))
+            .collect::<Vec<_>>();
+        assert!(
+            numbers
+                .iter()
+                .all(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())),
+            "a table-of-contents entry has no page number: {results:?}"
+        );
+        // The last heading is on a later page than the first, so each number is the
+        // writer's own computation for its heading rather than one value repeated.
+        let pages = numbers
+            .iter()
+            .map(|number| number.parse::<u32>().expect("a page number"))
+            .collect::<Vec<_>>();
+        assert!(
+            pages.first() < pages.last(),
+            "every entry states the same page: {numbers:?}"
+        );
+        assert!(
+            !body.contains("w:dirty"),
+            "the table of contents asks the reader to update it: {body}"
+        );
+        assert!(
+            !part_text(&path, "word/settings.xml").contains("updateFields"),
+            "the settings ask the reader to update fields"
+        );
+        // Each heading is both its own paragraph and an entry in the table.
+        for heading in ["First", "Second", "Third", "Last"] {
+            assert!(
+                body.matches(heading).count() >= 2,
+                "{heading} is not listed in the table of contents: {body}"
+            );
+        }
+        // The field and its entries do not stop a reading of the produced file.
+        let text = converted_text(&ws, &path).await;
+        assert!(
+            text.contains("First") && text.contains("Last"),
+            "the produced document does not read back: {text}"
+        );
+    }
+
+    /// Every `PAGEREF` field's cached result, as the XML between the field's
+    /// `separate` and its `end` — the text Word shows without updating anything.
+    fn pageref_results(body: &str) -> Vec<String> {
+        let mut results = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find("PAGEREF ") {
+            let field = &rest[at..];
+            let Some((_, after)) = field.split_once(r#"<w:fldChar w:fldCharType="separate"/>"#)
+            else {
+                break;
+            };
+            let Some((result, tail)) = after.split_once(r#"<w:fldChar w:fldCharType="end"/>"#)
+            else {
+                break;
+            };
+            results.push(result.to_owned());
+            rest = tail;
+        }
+        results
+    }
+
+    /// The text of every `<w:t>` run in `xml`, joined.
+    fn run_text(xml: &str) -> String {
+        xml.split("<w:t")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('>').map(|(_, tail)| tail))
+            .filter_map(|tail| tail.split('<').next())
+            .collect()
+    }
+
+    /// A picture whose size the product decides is fitted inside the text column
+    /// together with the space its own paragraph takes below it, so the page's bottom
+    /// edge never cuts it off and the line it sits on never spills onto the next page.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_created_docx_unsized_picture_fits_inside_the_text_column() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let image = write_fixture(&ws, "tall.png", &noisy_png(100, 2000));
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "tall",
+                "content": [{ "type": "image", "image": image.to_string_lossy() }],
+            }),
+        )
+        .await;
+        assert!(
+            !reply.contains("reaches past the page"),
+            "a picture the product sized is reported past the page: {reply}"
+        );
+        let body = part_text(&single(&reply), "word/document.xml");
+        let extent = element_named(&body, "wp:extent");
+        let side = |name: &str| -> u64 { attribute_of(extent, name).parse().expect("an EMU side") };
+        // The picture's own paragraph states the room it takes below the picture, and
+        // pagination counts it with the line's descent under the inline picture
+        // (about 46 twips at the 11 pt body). The writer keeps four whole pixels — 60
+        // twips — of slack under that paragraph for the descent and its own pixel
+        // rounding (see `FIT_SLACK_TWIPS`), and the box it fits the picture into is the
+        // column less that paragraph and that slack: the picture fills the box, and the
+        // box fits the column. A4 less its one-inch margins is 13958 twips of text, and
+        // an EMU is 1/635 of a twip.
+        let after: u64 = attribute_of(element_named(&body, "w:spacing"), "w:after")
+            .parse()
+            .expect("the picture paragraph's spacing after it");
+        let room = (13_958 - after - 60) * 635;
+        assert!(
+            room >= side("cy") && side("cy") > room - 15 * 635,
+            "the picture does not fill the box its paragraph leaves it: {extent}"
+        );
+        assert!(
+            side("cy") + (after + 60) * 635 <= 13_958 * 635,
+            "the picture's paragraph is taller than the page's text column: {extent}"
+        );
+        assert!(
+            side("cx") <= 400 * 9525,
+            "the picture is wider than the width the product gives it: {extent}"
+        );
+    }
+
+    /// A size the caller names is placed exactly as named, and an answer that
+    /// lands outside the page says so instead of reporting a plain success.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_named_picture_past_the_page_is_reported() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let image = write_fixture(&ws, "wide.png", &noisy_png(4000, 100));
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "wide",
+                "content": [{ "type": "image", "image": image.to_string_lossy(), "width": 700 }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("reaches past the page"),
+            "a named size past the page is reported as a plain success: {reply}"
+        );
+    }
+
+    /// A block only a Word document can hold is refused for every other format,
+    /// before an output is reserved.
+    #[tokio::test]
+    async fn a_docx_only_block_is_refused_for_another_format() {
+        let (_dir, ws) = workspace();
+        for (format, block) in [
+            ("pptx", json!({ "type": "page_break" })),
+            ("pdf", json!({ "type": "contents" })),
+            (
+                "pptx",
+                json!({ "type": "link", "text": "x", "url": "https://example.com" }),
+            ),
+            (
+                "pdf",
+                json!({ "type": "paragraph", "text": "x", "footnote": "note" }),
+            ),
+        ] {
+            let err = resolve_content(
+                &ws,
+                &json!({ "content": [block.clone()] }),
+                format,
+                PathAccess::Workspace,
+            )
+            .await
+            .expect_err("a block only a .docx holds must be refused");
+            assert!(
+                err.to_string().contains(".docx"),
+                "the refusal must name the format it belongs to: {err}"
+            );
+        }
+    }
+
+    /// A document holds one table of contents: a second is a second field over the
+    /// same headings, refused rather than written beside the first.
+    #[tokio::test]
+    async fn a_second_table_of_contents_is_refused() {
+        let (_dir, ws) = workspace();
+        let err = resolve_content(
+            &ws,
+            &json!({ "content": [{ "type": "contents" }, { "type": "contents" }] }),
+            "docx",
+            PathAccess::Workspace,
+        )
+        .await
+        .expect_err("a document has one table of contents");
+        assert!(
+            err.to_string().contains("second table of contents"),
+            "the refusal must name the second table: {err}"
+        );
+    }
+
+    /// A running header or footer is a Word document's own, refused for a format that
+    /// has none before an output is reserved.
+    #[tokio::test]
+    async fn a_running_header_is_refused_for_another_format() {
+        let (_dir, ws) = workspace();
+        for (format, key) in [("pptx", "header"), ("pdf", "footer")] {
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "create", "format": format, "file_name": "made",
+                        key: "Report", "content": [{ "type": "paragraph", "text": "x" }],
+                    }),
+                )
+                .await
+                .expect_err("a format without a running header must refuse one");
+            assert!(
+                err.to_string().contains("only a .docx has one"),
+                "the refusal must say which format carries one: {err}"
+            );
+        }
+    }
+
+    /// An empty or whitespace-only link text, footnote, running header or running footer
+    /// is content no reader shows: each is refused rather than written as an invisible
+    /// part of a call that reports success.
+    #[tokio::test]
+    async fn blank_content_is_refused() {
+        let (_dir, ws) = workspace();
+        for block in [
+            json!({ "type": "link", "text": "", "url": "https://example.com" }),
+            json!({ "type": "paragraph", "text": "x", "footnote": " " }),
+        ] {
+            let err = resolve_content(
+                &ws,
+                &json!({ "content": [block] }),
+                "docx",
+                PathAccess::Workspace,
+            )
+            .await
+            .expect_err("empty content must be refused");
+            assert!(
+                err.to_string().contains("is empty"),
+                "the refusal must say the field is empty: {err}"
+            );
+        }
+        for key in ["header", "footer"] {
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "create", "format": "docx", "file_name": "blank",
+                        key: " ", "content": [{ "type": "paragraph", "text": "x" }],
+                    }),
+                )
+                .await
+                .expect_err("a blank running header or footer must be refused");
+            assert!(
+                err.to_string().contains("is empty"),
+                "the refusal must say the field is empty: {err}"
+            );
+        }
+    }
+
+    /// A link's address must be one an office application can follow: the schemes it
+    /// follows are an allowlist, so a scheme outside it is refused; the document
+    /// carries the address the parse produced rather than the raw string.
+    #[tokio::test]
+    async fn a_link_address_must_be_followable() {
+        let (_dir, ws) = workspace();
+        let err = resolve_content(
+            &ws,
+            &json!({ "content": [{ "type": "link", "text": "x", "url": "example.com" }] }),
+            "docx",
+            PathAccess::Workspace,
+        )
+        .await
+        .expect_err("an address without a scheme cannot be followed");
+        assert!(
+            err.to_string().contains("absolute URL"),
+            "the refusal must say what a link's address is: {err}"
+        );
+        let err = resolve_content(
+            &ws,
+            &json!({ "content": [{ "type": "link", "text": "x", "url": "javascript:alert(1)" }] }),
+            "docx",
+            PathAccess::Workspace,
+        )
+        .await
+        .expect_err("a scheme outside the allowlist must be refused");
+        assert!(
+            err.to_string()
+                .contains("must be an http, https, mailto or tel address"),
+            "the refusal must name the schemes a link may use: {err}"
+        );
+        // Parsing trims the space around an address and skips an embedded tab or
+        // newline, so the raw string can state an address that is not the one given
+        // and that no application follows: the block carries the parsed one.
+        let resolved = resolve_content(
+            &ws,
+            &json!({ "content": [{ "type": "link", "text": "x", "url": " https://exa\nmple.com " }] }),
+            "docx",
+            PathAccess::Workspace,
+        )
+        .await
+        .expect("a padded http address is the same address");
+        assert_eq!(
+            resolved[0]["url"],
+            json!("https://example.com/"),
+            "the document would state an address other than the one that parses: {resolved}"
+        );
+    }
+
+    /// An edit cannot rewrite the entries a table of contents was written with,
+    /// so changing a heading it lists is refused and said rather than leaving the
+    /// table disagreeing with the headings — while the body's own text still
+    /// edits, and a fragment only the table's entries hold is named as the table's.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn editing_a_heading_a_contents_lists_is_refused() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "toc",
+                "content": [
+                    { "type": "contents" },
+                    { "type": "heading", "level": 1, "text": "Alpha" },
+                    { "type": "paragraph", "text": "Body" },
+                ],
+            }),
+        )
+        .await;
+        let path = single(&reply);
+        // Every op that would change the heading the table was written from — its
+        // text or the style its level is stated in — is refused by name.
+        for edit in [
+            json!({ "op": "replace_text", "find": "Alpha", "replace": "Beta" }),
+            json!({ "op": "insert_text", "find": "Alpha", "insert": " EXTRA", "position": "after" }),
+            json!({ "op": "remove_text", "find": "Alpha" }),
+            json!({ "op": "remove_paragraph", "find": "Alpha" }),
+            json!({ "op": "format_paragraph", "find": "Alpha", "style": "Normal" }),
+            json!({ "op": "format_paragraph", "find": "Alpha", "list": "number" }),
+        ] {
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "file_name": "edited",
+                        "path": path.to_string_lossy(),
+                        "edits": [edit],
+                    }),
+                )
+                .await
+                .expect_err("a heading the table of contents lists must be refused");
+            let message = err.to_string();
+            assert!(message.starts_with("usage:"), "got: {message}");
+            assert!(
+                message.contains("table of contents"),
+                "the refusal must name the table it would leave disagreeing: {message}"
+            );
+        }
+        // A paragraph added after the heading takes its style, so it becomes a
+        // heading the table cannot list: said rather than left silent.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "added",
+                "path": path.to_string_lossy(),
+                "edits": [{ "op": "add_paragraph", "after": "Alpha", "text": "Under the heading" }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("does not list it"),
+            "the heading the table does not list is not reported: {reply}"
+        );
+        // A fragment the headings do not hold still edits.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "edited",
+                "path": path.to_string_lossy(),
+                "edits": [{ "op": "replace_text", "find": "Body", "replace": "Text" }],
+            }),
+        )
+        .await;
+        assert!(
+            converted_text(&ws, &single(&reply)).await.contains("Text"),
+            "the body's own text did not edit"
+        );
+        // A fragment only the table's own entries hold — a heading whose text moved on
+        // while the entries still print the old one — is refused as the table's, not
+        // passed off as text the document lacks.
+        let package = std::fs::read(&path).expect("read the produced package");
+        let body = part_text_bytes(&package, "word/document.xml");
+        let heading = body
+            .split("<w:p>")
+            .find(|paragraph| paragraph.contains(r#"w:val="Heading1""#))
+            .expect("the heading's paragraph");
+        let stale_body = body.replacen(heading, &heading.replacen("Alpha", "Gamma", 1), 1);
+        let stale = write_fixture(
+            &ws,
+            "stale.docx",
+            &repacked(
+                &package,
+                &[],
+                &[("word/document.xml", stale_body.as_bytes())],
+            ),
+        );
+        let err = confined_document()
+            .execute(
+                &ws,
+                json!({
+                    "action": "docx_edit", "file_name": "stale",
+                    "path": stale.to_string_lossy(),
+                    "edits": [{ "op": "replace_text", "find": "Alpha", "replace": "Beta" }],
+                }),
+            )
+            .await
+            .expect_err("a fragment only the table's own entries hold must be refused");
+        assert!(
+            err.to_string().contains("table of contents"),
+            "the refusal must name the table that holds the fragment: {err}"
+        );
+    }
+
+    /// A style that moves a paragraph onto a heading level the table does not list is
+    /// reported, and one naming the level the paragraph already states is no change
+    /// at all: nothing is refused and nothing is said.
+    #[tokio::test]
+    #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
+    async fn a_style_change_is_reported_only_when_it_changes_the_heading() {
+        if runtime_missing() {
+            return;
+        }
+        let (_dir, ws) = workspace();
+        let reply = run(
+            &ws,
+            json!({
+                "action": "create", "format": "docx", "file_name": "toc",
+                "content": [
+                    { "type": "contents" },
+                    { "type": "heading", "level": 1, "text": "Alpha" },
+                    { "type": "paragraph", "text": "Body" },
+                ],
+            }),
+        )
+        .await;
+        let path = single(&reply);
+        // The body paragraph becomes a heading of a level the table covers, which the
+        // static table does not list: said rather than answered as a plain success —
+        // the mirror of a paragraph added after a heading.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "promoted",
+                "path": path.to_string_lossy(),
+                "edits": [{ "op": "format_paragraph", "find": "Body", "style": "Heading 2" }],
+            }),
+        )
+        .await;
+        assert!(
+            reply.contains("does not list"),
+            "the heading the table does not list is not reported: {reply}"
+        );
+        // A style naming the level the heading already states changes nothing, so the
+        // refusal a listed heading gets for another level does not fire — and no note
+        // is owed for a heading that stays the one the table lists.
+        let reply = run(
+            &ws,
+            json!({
+                "action": "docx_edit", "file_name": "same",
+                "path": path.to_string_lossy(),
+                "edits": [{ "op": "format_paragraph", "find": "Alpha", "style": "Heading 1" }],
+            }),
+        )
+        .await;
+        assert!(
+            !reply.contains("does not list"),
+            "a style naming the heading's own level reported a change: {reply}"
+        );
+        let body = part_text(&single(&reply), "word/document.xml");
+        assert!(
+            body.contains(r#"<w:pStyle w:val="Heading1"/>"#),
+            "the heading lost the level the table lists: {body}"
         );
     }
 
@@ -22419,8 +23405,8 @@ mod tests {
     /// the path-access variant this test builds, and the description and the
     /// serialized schema together. Adding to the contract re-records both here, so
     /// growth is a decision made in this test rather than a drift.
-    const BASELINE_DESCRIPTION: usize = 10_168;
-    const BASELINE_TOTAL: usize = 36_516;
+    const BASELINE_DESCRIPTION: usize = 10_295;
+    const BASELINE_TOTAL: usize = 38_165;
 
     /// The whole per-action contract is one compact value: every action has an
     /// entry, each entry declares exactly the arguments that action takes (and the

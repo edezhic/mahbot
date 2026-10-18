@@ -897,6 +897,8 @@ pub(crate) const FAMILIES: &[Family] = &[
                     DOCUMENT_CONTENT_FLAG,
                     DOCUMENT_SHEETS_FLAG,
                     DOCUMENT_SLIDE_SIZE_FLAG,
+                    DOCUMENT_HEADER_FLAG,
+                    DOCUMENT_FOOTER_FLAG,
                     DOCUMENT_METADATA_FLAG,
                     DOCUMENT_FILE_NAME_FLAG,
                     OUTPUT_DIR_FLAG,
@@ -1192,6 +1194,24 @@ const DOCUMENT_CONTENT_FLAG: Flag = Flag {
     secret: false,
     purpose: "The blocks to lay down, as a JSON array — one object per block, with the \
               'text'/'table'/'image'/'...' kind it names beside its own fields",
+};
+
+/// The document tool's `header` argument — a created .docx's running header.
+const DOCUMENT_HEADER_FLAG: Flag = Flag {
+    arg: "header",
+    kind: FlagKind::Value,
+    secret: false,
+    purpose: "A created .docx's running header, one paragraph per line; {page} is the page \
+              number and {pages} the document's page count",
+};
+
+/// The document tool's `footer` argument — a created .docx's running footer.
+const DOCUMENT_FOOTER_FLAG: Flag = Flag {
+    arg: "footer",
+    kind: FlagKind::Value,
+    secret: false,
+    purpose: "A created .docx's running footer, one paragraph per line; {page} is the page \
+              number and {pages} the document's page count",
 };
 
 /// The document tool's `sheets` argument — `create`'s worksheets.

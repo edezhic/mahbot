@@ -27,15 +27,16 @@
 //! draw for a PDF-writing operation, `notes` are the caveats an operation
 //! discovered at run time — already-bracketed, user-facing sentences the reply
 //! appends verbatim — `losses` are the subset of those that say part of what the
-//! call asked for is NOT in the produced file (the three Office edit operations
-//! only; every other operation reports none): what the edit could not carry over,
-//! a reference it left naming the old cell, or something it removed beyond what
-//! was named. A note about the input's own properties — a signature that no longer
-//! matches, a chart or pivot cache nothing recomputes — is not a loss. `class` is
-//! present only on a failure the kit blamed on the request ("usage": the caller
-//! can fix it, see [`read_result`]). A failure of the run itself (a timeout, a
-//! kill, a spawn failure) never reaches the result file and is reported by the
-//! runner, with its own class token.
+//! call asked for is NOT in the produced file: what an Office edit could not carry
+//! over, a reference it left naming the old cell, something it removed beyond what
+//! was named, or a created Word document whose table of contents could not have a
+//! page number worked out, or whose `{pages}` could not be filled in. A note about
+//! the input's own properties — a signature that no longer matches, a chart or
+//! pivot cache nothing recomputes — is not a loss. `class` is present only on a
+//! failure the kit blamed on the request ("usage": the caller can fix it, see
+//! [`read_result`]). A failure of the run itself (a timeout, a kill, a spawn
+//! failure) never reaches the result file and is reported by the runner, with its
+//! own class token.
 //!
 //! # Containment
 //!
@@ -385,7 +386,9 @@ pub(crate) async fn run(request: Value) -> Result<KitOutcome> {
             .and_then(|count| usize::try_from(count).ok()),
         unsupported: string_array(&value, "unsupported"),
         notes: string_array(&value, "notes"),
-        // The kit reports `losses` only for the three edit operations; every
+        // The kit reports `losses` for the operations that can fall short — the
+        // three edits, and a create whose table of contents could not have every
+        // page number worked out or whose `{pages}` could not be filled in; any
         // other operation leaves it out, which reads as no loss.
         lossy: !string_array(&value, "losses").is_empty(),
     })
