@@ -118,9 +118,14 @@ pub(crate) enum SessionsMessage {
         deleted: usize,
     },
 
-    /// Coalesced runtime-change tick (250 ms): refresh list timestamps and
+    /// Coalesced runtime-change tick (250 ms): refresh the cached list labels,
+    /// add sessions whose agent started working after the page was opened, and
     /// merge the selected session's live transcript when its agent is running.
     RuntimeChanged,
+
+    /// Result of the live-membership read started for running agents the list
+    /// was missing. A failed read is silent — the next runtime tick retries.
+    LiveSessionsRead(Result<Vec<SessionMetadata>, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +261,9 @@ pub(crate) struct SessionsState {
     /// on each runtime-change tick (to refresh relative-time labels).
     /// `view()` builds widgets from this data on every frame.
     cached_session_items: Option<Vec<CachedSessionItem>>,
+    /// Whether a live-membership read is in flight. One read per gap, not one
+    /// per tick.
+    membership_load_in_flight: bool,
 
     // ── Transcript viewport fields ───────────────────────────────
     /// Stable scrollable ID for the transcript area, preserves scroll position
@@ -280,6 +288,7 @@ impl SessionsState {
             pending_collapses: HashSet::new(),
             measure_cache: RefCell::new(HashMap::new()),
             cached_session_items: None,
+            membership_load_in_flight: false,
             scrollable_id: Id::new("session_transcript_scroll"),
             auto_scroll_enabled: false,
         }
@@ -310,10 +319,13 @@ impl SessionsState {
         match msg {
             SessionsMessage::Refreshed(sessions) => {
                 self.sessions = sessions;
+                // A fresh full read supersedes any in-flight membership probe.
+                self.membership_load_in_flight = false;
                 self.rebuild_session_cache();
                 self.load_state.clear_error();
                 self.load_state.finish_loading();
-                Task::none()
+                // Catches a session created while this list read was in flight.
+                self.refresh_live_membership()
             }
             SessionsMessage::RefreshError(e) => {
                 self.load_state.fail(e);
@@ -493,6 +505,16 @@ impl SessionsState {
                 Task::none()
             }
             SessionsMessage::RuntimeChanged => self.on_runtime_changed(),
+            SessionsMessage::LiveSessionsRead(result) => {
+                self.membership_load_in_flight = false;
+                match result {
+                    Ok(sessions) => self.absorb_live_sessions(sessions),
+                    Err(error) => {
+                        tracing::debug!(error = %error, "live session membership read failed");
+                    }
+                }
+                Task::none()
+            }
             SessionsMessage::Toast(_) | SessionsMessage::LinkClicked(_) => Task::none(),
             SessionsMessage::Escape => {
                 self.clear_selection();
@@ -573,9 +595,70 @@ impl SessionsState {
         self.cached_session_items = if items.is_empty() { None } else { Some(items) };
     }
 
-    /// Coalesced runtime-change tick: refresh the cached relative-time labels
-    /// and, when the selected session's agent is running, merge its live
-    /// transcript into the view.
+    /// Coalesced runtime-change tick: refresh the cached relative-time labels,
+    /// add sessions whose agent started working since the page was opened, and
+    /// merge the selected session's live transcript into the view.
+    fn on_runtime_changed(&mut self) -> Task<SessionsMessage> {
+        self.rebuild_session_cache();
+        Task::batch([
+            self.merge_selected_transcript(),
+            self.refresh_live_membership(),
+        ])
+    }
+
+    /// Add running agents' sessions the list does not hold yet, so a session
+    /// that starts working while the page is open appears without re-entering
+    /// it. Metadata only — never a transcript — and only for the missing ids,
+    /// so a tick with no gap issues no read. A registered agent whose first
+    /// message is not stored yet has no row; it keeps the gap open and is
+    /// re-probed on later ticks (one primary-key lookup). Failure is silent:
+    /// the next tick retries.
+    fn refresh_live_membership(&mut self) -> Task<SessionsMessage> {
+        // Before the first successful list read the page has no membership
+        // baseline to complete, and `Refreshed` runs this itself once it does.
+        if self.membership_load_in_flight || !self.load_state.has_loaded() {
+            return Task::none();
+        }
+        let listed: HashSet<&str> = self.sessions.iter().map(|s| s.agent_id.as_str()).collect();
+        let missing: Vec<String> = crate::agent::registry::AGENT_REGISTRY
+            .list()
+            .into_iter()
+            .map(|handle| handle.agent_id)
+            .filter(|id| !listed.contains(id.as_str()))
+            .collect();
+        if missing.is_empty() {
+            return Task::none();
+        }
+        self.membership_load_in_flight = true;
+        Task::perform(
+            async move {
+                crate::session::store()
+                    .list_sessions_with_metadata_for_ids(&missing)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            SessionsMessage::LiveSessionsRead,
+        )
+    }
+
+    /// Append the live-membership result, skipping rows the list already holds
+    /// (a full refresh may have landed in between). Existing rows keep their
+    /// position: the list is re-sorted only on the next page entry.
+    fn absorb_live_sessions(&mut self, sessions: Vec<SessionMetadata>) {
+        let listed: HashSet<&str> = self.sessions.iter().map(|s| s.agent_id.as_str()).collect();
+        let added: Vec<SessionMetadata> = sessions
+            .into_iter()
+            .filter(|s| !listed.contains(s.agent_id.as_str()))
+            .collect();
+        if added.is_empty() {
+            return;
+        }
+        self.sessions.extend(added);
+        self.rebuild_session_cache();
+    }
+
+    /// Merge the selected session's live transcript into the view while its
+    /// agent is running.
     ///
     /// The merge is append-oriented and diffed by the longest common entry
     /// prefix, so markdown re-parsing is limited to the changed tail and
@@ -587,9 +670,7 @@ impl SessionsState {
     /// running check — `None` when the agent is not running; a recycled agent
     /// id surfaces the new run's fresh (empty) holder, replacing the displayed
     /// transcript wholesale.
-    fn on_runtime_changed(&mut self) -> Task<SessionsMessage> {
-        self.rebuild_session_cache();
-
+    fn merge_selected_transcript(&mut self) -> Task<SessionsMessage> {
         let Some(ref key) = self.selected_session else {
             return Task::none();
         };
@@ -1345,6 +1426,42 @@ mod tests {
                 result: Some("ok".to_string()),
             }],
         }
+    }
+
+    fn metadata(agent_id: &str) -> SessionMetadata {
+        SessionMetadata {
+            agent_id: agent_id.to_string(),
+            last_activity: chrono::Utc::now(),
+            message_count: 1,
+            token_length: None,
+            role: Some("engineer".to_string()),
+            user_name: None,
+            workspace_name: Some("ws".to_string()),
+            custom_role: None,
+            custom_identifier: None,
+            launch_stopped: false,
+        }
+    }
+
+    #[test]
+    fn live_sessions_are_appended_without_reordering_or_duplicating() {
+        let mut state = SessionsState::new();
+        state.sessions = vec![metadata("old_a"), metadata("old_b")];
+
+        // `old_a` came back again (a full refresh landed in between); only the
+        // genuinely new row is added, after the existing ones.
+        state.absorb_live_sessions(vec![metadata("new"), metadata("old_a")]);
+
+        let ids: Vec<&str> = state.sessions.iter().map(|s| s.agent_id.as_str()).collect();
+        assert_eq!(ids, ["old_a", "old_b", "new"]);
+        let cached: Vec<&str> = state
+            .cached_session_items
+            .as_ref()
+            .expect("list cache rebuilt")
+            .iter()
+            .map(|i| i.agent_id.as_str())
+            .collect();
+        assert_eq!(cached, ["old_a", "old_b", "new"]);
     }
 
     #[test]

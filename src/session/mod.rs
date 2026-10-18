@@ -1173,6 +1173,31 @@ impl SessionStore {
             .await
     }
 
+    /// Metadata for `agent_ids` only — the Sessions page's live-membership
+    /// read. It looks up an agent that started working after the page was
+    /// opened and is therefore absent from the list; metadata columns only, so
+    /// no transcript is ever read. An agent that has not stored its first
+    /// message yet has no row and is simply absent from the result.
+    pub(crate) async fn list_sessions_with_metadata_for_ids(
+        &self,
+        agent_ids: &[String],
+    ) -> Result<Vec<SessionMetadata>> {
+        if agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let params: Vec<Value> = agent_ids.iter().cloned().map(Value::Text).collect();
+        self.conn
+            .query_map_strict(
+                &sessions_list_sql(&format!(
+                    "WHERE sm.agent_id IN ({})",
+                    db::sql_in_placeholders(params.len())
+                )),
+                params,
+                session_metadata_row,
+            )
+            .await
+    }
+
     /// Like [`list_sessions_with_metadata`], but excludes sessions whose
     /// `agent_id` starts with any of the given prefixes by adding a `WHERE`
     /// clause (e.g., `"manager_"`, `"ticket_"`).
