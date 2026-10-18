@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::ChatMessage;
+use crate::Workspace;
 use crate::session::SessionMetadata;
 
 use iced::widget::{
@@ -129,8 +130,13 @@ struct CachedSessionItem {
     /// title without an icon.
     role: Option<crate::Role>,
     /// User name when present (Some and non-empty), otherwise the workspace
-    /// name (may be empty if both are absent).
+    /// name (may be empty if both are absent). Workspace-scoped roles ignore
+    /// this and are titled by [`Self::workspace_name`] — see
+    /// [`Self::display_title`].
     title: String,
+    /// The workspace the agent belongs to, as recorded in the session context.
+    /// `None` when the session has no workspace (or an empty one).
+    workspace_name: Option<String>,
     /// The custom role this session belongs to, when it is a custom-role
     /// session — its name titles the row instead of `title`. `None` for a coder
     /// branch.
@@ -153,7 +159,13 @@ impl CachedSessionItem {
     /// instead of the user/workspace name every other role shows; a coder branch
     /// is titled `Coder · <branch>` so it is distinguishable from a single coder
     /// run.
-    fn display_title(&self) -> String {
+    ///
+    /// A workspace's manager and maintainer belong to exactly one registered
+    /// workspace, so their rows are titled by its registered name (`mahbot_rlx`,
+    /// never the folder basename and never the account name). When that
+    /// workspace is no longer registered the row shows the role alone rather
+    /// than a stale name.
+    fn display_title(&self, workspaces: &HashMap<String, Workspace>) -> String {
         match (self.role, self.custom_role.as_deref()) {
             (Some(crate::Role::Custom), Some(name)) => {
                 custom_role_title(name, self.custom_identifier.as_deref())
@@ -162,6 +174,14 @@ impl CachedSessionItem {
                 Some(branch) => format!("Coder{}", branch_suffix(branch)),
                 None => self.title.clone(),
             },
+            (Some(role @ (crate::Role::Manager | crate::Role::Maintainer)), _) => self
+                .workspace_name
+                .as_deref()
+                .and_then(|name| workspaces.get(name))
+                .map_or_else(
+                    || role.display_label().to_string(),
+                    |ws| crate::util::truncate(&ws.name, CARD_TITLE_MAX_CHARS),
+                ),
             _ => self.title.clone(),
         }
     }
@@ -538,6 +558,7 @@ impl SessionsState {
                     agent_id: s.agent_id.clone(),
                     role,
                     title: crate::util::truncate(name, CARD_TITLE_MAX_CHARS),
+                    workspace_name: s.workspace_name.clone().filter(|n| !n.is_empty()),
                     custom_role: s.custom_role.clone(),
                     custom_identifier: s.custom_identifier.clone(),
                     msg_count_label: format!("{} msgs", s.message_count),
@@ -604,7 +625,10 @@ impl SessionsState {
     }
 
     #[expect(clippy::too_many_lines)]
-    pub(crate) fn view(&self) -> Element<'_, SessionsMessage> {
+    pub(crate) fn view(
+        &self,
+        workspaces: &HashMap<String, Workspace>,
+    ) -> Element<'_, SessionsMessage> {
         let mut content = column![];
 
         // Error display — inset to align with the vscroll-wrapped list below.
@@ -649,7 +673,7 @@ impl SessionsState {
                         theme::TEXT_PRIMARY
                     };
                     title_row = title_row.push(
-                        text(item.display_title())
+                        text(item.display_title(workspaces))
                             .size(theme::TEXT_13)
                             .color(title_color),
                     );
@@ -1407,5 +1431,63 @@ mod tests {
 
         assert!(state.selected_error.is_none());
         assert!(!state.selected_loading);
+    }
+
+    fn cached_item(
+        role: crate::Role,
+        user: Option<&str>,
+        workspace: Option<&str>,
+    ) -> CachedSessionItem {
+        CachedSessionItem {
+            agent_id: "agent".to_string(),
+            role: Some(role),
+            title: user.or(workspace).unwrap_or_default().to_string(),
+            workspace_name: workspace.map(str::to_string),
+            custom_role: None,
+            custom_identifier: None,
+            msg_count_label: String::new(),
+            token_label: None,
+            timestamp_label: String::new(),
+        }
+    }
+
+    fn workspace_map(names: &[&str]) -> HashMap<String, Workspace> {
+        names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    Workspace {
+                        name: (*name).to_string(),
+                        ..Workspace::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn workspace_scoped_cards_are_titled_by_their_registered_workspace() {
+        let map = workspace_map(&["mahbot_rlx"]);
+
+        for role in [crate::Role::Manager, crate::Role::Maintainer] {
+            let scoped = cached_item(role, Some("admin"), Some("mahbot_rlx"));
+            assert_eq!(scoped.display_title(&map), "mahbot_rlx");
+            // The last turn's user never decides a workspace-scoped title.
+            let no_user = cached_item(role, None, Some("mahbot_rlx"));
+            assert_eq!(no_user.display_title(&map), "mahbot_rlx");
+            // A workspace no longer registered leaves the role alone.
+            let orphaned = cached_item(role, Some("admin"), Some("deleted_ws"));
+            assert_eq!(orphaned.display_title(&map), role.display_label());
+            // A session with no recorded workspace is equally "not known".
+            let no_workspace = cached_item(role, Some("admin"), None);
+            assert_eq!(no_workspace.display_title(&map), role.display_label());
+        }
+
+        // Every other role keeps the user name it shows today.
+        let assistant = cached_item(crate::Role::Assistant, Some("admin"), Some("mahbot_rlx"));
+        assert_eq!(assistant.display_title(&map), "admin");
+        let engineer = cached_item(crate::Role::Engineer, Some("alice"), Some("mahbot_rlx"));
+        assert_eq!(engineer.display_title(&map), "alice");
     }
 }

@@ -2230,7 +2230,10 @@ impl Dashboard {
                 iced::widget::stack([base.into(), modal]).into()
             }
             Page::Logs => self.logs_state.view().map(Message::Logs),
-            Page::Sessions => self.sessions_state.view().map(Message::Sessions),
+            Page::Sessions => self
+                .sessions_state
+                .view(&self.workspaces)
+                .map(Message::Sessions),
             Page::Alarms => self.alarms_state.view().map(Message::Alarms),
             Page::Shell => {
                 if self.page_available(Page::Shell) {
