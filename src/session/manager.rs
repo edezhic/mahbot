@@ -752,7 +752,10 @@ impl Session {
     /// workspace boilerplate  — src/prompt/context/workspace.md, with the
     ///                          per-role frame from context/workspace_frame.md
     ///                          (or context/workspace_frame_admin.md for the
-    ///                          admin's Assistant); substituted (always)
+    ///                          admin's Assistant); substituted (always). Its
+    ///                          `<workspace-context>` file material includes
+    ///                          `MEMORY.md` only for the account's own
+    ///                          Assistant ([`carries_personal_memory`])
     /// skills                 — if any skills exist in the workspace
     /// alarms                 — Assistant only, when the user has active alarms
     /// personal_files         — Assistant only, when the personal folder shows
@@ -810,9 +813,11 @@ impl Session {
             build_board_context(ws, role),
         );
 
-        let workspace_context = match stored_context.as_deref() {
-            Some(ctx) => ctx.to_owned(),
-            None => build_workspace_context(ws.as_path()).await,
+        let workspace_context = if let Some(ctx) = stored_context.as_deref() {
+            ctx.to_owned()
+        } else {
+            let personal_memory = carries_personal_memory(ws, *role, user_name);
+            build_workspace_context(ws.as_path(), personal_memory).await
         };
 
         let workspace_context = {
@@ -1187,6 +1192,17 @@ async fn fetch_assistant_context(
         fetch_personal_files(user_name),
         custom_roles
     )
+}
+
+/// Whether the file-derived workspace context for this session carries the
+/// account's personal memory (`MEMORY.md`): only the Assistant of the account
+/// whose personal workspace it is. No other role — in a personal folder or a
+/// project workspace — and no other account's Assistant receives it; a
+/// `MEMORY.md` sitting in a project workspace is nobody's continuity record.
+fn carries_personal_memory(ws: &Workspace, role: Role, user_name: &str) -> bool {
+    matches!(role, Role::Assistant)
+        && crate::users::is_valid_personal_user_name(user_name)
+        && crate::users::personal_user_name(&ws.name) == Some(user_name)
 }
 
 /// The workspace-frame asset for a role: the admin's Assistant is not confined
@@ -2384,5 +2400,100 @@ mod tests {
             msgs[block_b + 1].content.starts_with("second"),
             "the second earlier row is untouched too"
         );
+    }
+
+    /// The personal memory (`MEMORY.md`) is the owning account's
+    /// Assistant-only continuity record: another role in that folder gets none
+    /// of it, another account's Assistant gets none of it, a `MEMORY.md` in a
+    /// project workspace reaches nobody, and a non-agent model call carries
+    /// none either. Everything else in the context block still renders.
+    #[tokio::test]
+    #[serial_test::serial(active_models)] // seeds the process-global catalog caches
+    async fn personal_memory_reaches_only_the_owning_assistant() {
+        const MEMORY: &str = "durable preference: tea over coffee";
+        const SHARED: &str = "the user's folder";
+
+        async fn context(ws: &Workspace, role: crate::Role, user_name: &str) -> String {
+            Session::build_context_messages(ws, &role, None, false, user_name, None)
+                .await
+                .0
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        crate::util::test::init_test_stores().await;
+        // Empty catalog seeds keep the Assistant block hermetic (no network).
+        crate::tools::media_catalog::image::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::media_catalog::image::ImageCatalog::default(),
+        )));
+        crate::tools::media_catalog::video::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::media_catalog::video::VideoCatalog::default(),
+        )));
+
+        let user = "memory_gate_owner";
+        let personal = crate::users::personal_workspace_struct(user);
+        std::fs::create_dir_all(personal.as_path()).unwrap();
+        std::fs::write(personal.as_path().join("MEMORY.md"), MEMORY).unwrap();
+        std::fs::write(personal.as_path().join("README.md"), SHARED).unwrap();
+
+        // The owner's Assistant keeps the section, unchanged.
+        let assistant = context(&personal, crate::Role::Assistant, user).await;
+        assert!(assistant.contains("--- MEMORY.md ---"));
+        assert!(assistant.contains(MEMORY));
+
+        // Every other role in the same folder renders the context without it,
+        // and the rest of the workspace material still renders.
+        for role in [
+            crate::Role::Manager,
+            crate::Role::Engineer,
+            crate::Role::Analyst,
+            crate::Role::Coder,
+            crate::Role::Qa,
+            crate::Role::Reviewer,
+            crate::Role::Discovery,
+            crate::Role::Maintainer,
+            crate::Role::Sanitation,
+        ] {
+            let rendered = context(&personal, role, user).await;
+            assert!(
+                !rendered.contains(MEMORY),
+                "{role:?} in a personal folder received the memory"
+            );
+            assert!(
+                rendered.contains(SHARED),
+                "{role:?} lost the rest of the workspace context"
+            );
+        }
+
+        // Another account's Assistant in that folder does not inherit it.
+        let stranger = context(&personal, crate::Role::Assistant, "memory_gate_other").await;
+        assert!(!stranger.contains(MEMORY));
+
+        // A project workspace's MEMORY.md is nobody's continuity record, while
+        // its other context files still reach the prompt.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("MEMORY.md"), MEMORY).unwrap();
+        std::fs::write(dir.path().join("README.md"), SHARED).unwrap();
+        let project =
+            crate::workspace::test_ws_named(&dir.path().to_string_lossy(), "memory_gate_project");
+        for role in [crate::Role::Assistant, crate::Role::Analyst] {
+            let rendered = context(&project, role, user).await;
+            assert!(
+                !rendered.contains(MEMORY),
+                "{role:?} in a project workspace received its MEMORY.md"
+            );
+            assert!(rendered.contains(SHARED));
+        }
+
+        // A non-agent model call carrying the workspace context carries none.
+        let mut messages = Vec::new();
+        crate::prompt::prepend_general_context(&mut messages, &personal).await;
+        assert!(
+            messages.iter().any(|m| m.content.contains(SHARED)),
+            "the rest of the workspace context must still render"
+        );
+        assert!(messages.iter().all(|m| !m.content.contains(MEMORY)));
     }
 }

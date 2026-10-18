@@ -94,23 +94,37 @@ fn append_file_section(out: &mut String, name: &str, content: &str) {
     push_truncated(out, trimmed);
 }
 
-/// Build workspace context content from workspace files.
-pub(crate) async fn build_workspace_context(workspace: &Path) -> String {
-    const WORKSPACE_FILES: &[&str] = &[
-        "README.md",
-        "BOOTSTRAP.md",
-        "MEMORY.md",
-        "CLAUDE.md",
-        "AGENTS.md",
-        "AGENTS.local.md",
-        "CLAUDE.local.md",
-        ".cursorrules",
-        "copilot-instructions.md",
-        ".github/copilot-instructions.md",
-    ];
+/// The account's personal memory — a continuity record for its own Assistant
+/// only, never context for another role or another account.
+const MEMORY_FILE: &str = "MEMORY.md";
 
+/// Workspace files rendered, in this order, into the workspace context.
+const WORKSPACE_FILES: &[&str] = &[
+    "README.md",
+    "BOOTSTRAP.md",
+    MEMORY_FILE,
+    "CLAUDE.md",
+    "AGENTS.md",
+    "AGENTS.local.md",
+    "CLAUDE.local.md",
+    ".cursorrules",
+    "copilot-instructions.md",
+    ".github/copilot-instructions.md",
+];
+
+/// Build workspace context content from workspace files.
+///
+/// `personal_memory` admits the [`MEMORY_FILE`] section. Only the Assistant of
+/// the account whose personal folder this is passes `true`; every other
+/// session — another role in that folder, any role in a project workspace, and
+/// every non-agent model call — passes `false`, so this builder never renders
+/// an account's continuity record for anyone else.
+pub(crate) async fn build_workspace_context(workspace: &Path, personal_memory: bool) -> String {
     let mut out = String::new();
     for &filename in WORKSPACE_FILES {
+        if filename == MEMORY_FILE && !personal_memory {
+            continue;
+        }
         let path = workspace.join(filename);
         if let Ok(raw) = tokio::fs::read_to_string(&path).await {
             append_file_section(&mut out, filename, &raw);
@@ -137,7 +151,8 @@ pub(crate) fn wrap_workspace_context(content: &str) -> String {
 ///
 /// Uses the stored general context row (role = NULL) when discovery has
 /// produced one; otherwise falls back to the file-derived context builder
-/// (the same fallback role agents use). The block is stable per workspace —
+/// (the same fallback role agents use, minus the personal memory — a non-agent
+/// call is nobody's Assistant session). The block is stable per workspace —
 /// it does not vary between requests. Returns an empty string when no
 /// context source has content (no stored row and no context files).
 async fn build_general_workspace_context(ws: &crate::Workspace) -> String {
@@ -149,7 +164,7 @@ async fn build_general_workspace_context(ws: &crate::Workspace) -> String {
     };
     let content = match stored {
         Some(ctx) => ctx,
-        None => build_workspace_context(ws.as_path()).await,
+        None => build_workspace_context(ws.as_path(), false).await,
     };
     wrap_workspace_context(&content)
 }
@@ -167,7 +182,7 @@ pub(crate) async fn prepend_general_context(
 }
 
 /// Format a ticket as a `<current-ticket>` block for injection as a
-/// separate system message (after memory context, before user message).
+/// separate system message (after the workspace context, before user message).
 pub(crate) fn format_ticket_block(ticket: &crate::pipeline::board::Ticket) -> String {
     let mut comments = String::new();
     if !ticket.comments.is_empty() {
