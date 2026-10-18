@@ -115,7 +115,7 @@
 //! tool, the diagnostics runner, the `custom` tool's script, a user's alarm program,
 //! and every step of a rewritten line's plan, [`super::plan`] included) with the grep
 //! engine's own probe (`tools::shell::grep_engine::probe_engine`); and the file
-//! manager (`gui::editor::perform_reveal_in_finder`).
+//! manager (`gui::reveal_in_file_manager`).
 //!
 //! Not covered, on purpose: the terminal the owner opens inside the app
 //! (`gui::shell`, spawned through a pseudoconsole) and the owner's own browser

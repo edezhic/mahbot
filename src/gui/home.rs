@@ -66,6 +66,8 @@ struct DisplayMessage {
     pub reply_reference: Option<ReplyReference>,
     /// Pre-parsed markdown items for rendering.
     pub md_items: Vec<iced::widget::markdown::Item>,
+    /// `[FILE:…]` markers of the raw content, in order.
+    pub file_markers: Vec<super::media_markers::FileMarker>,
     /// True when this is an optimistic placeholder pushed before the pipeline
     /// confirmation arrives. The `ChatEvent::Message` handler replaces these.
     pub is_optimistic: bool,
@@ -87,12 +89,15 @@ fn display_message(
     is_optimistic: bool,
 ) -> DisplayMessage {
     use iced::widget::markdown;
-    let md_items: Vec<markdown::Item> = if direction == ChatDirection::Divider {
-        Vec::new()
+    let (md_items, file_markers) = if direction == ChatDirection::Divider {
+        (Vec::new(), Vec::new())
     } else {
         let processed = super::media_markers::preprocess(&content);
         let processed = super::markdown_breaks::hard_breaks(&processed);
-        markdown::parse(&processed).collect()
+        (
+            markdown::parse(&processed).collect(),
+            super::media_markers::file_markers(&content),
+        )
     };
     DisplayMessage {
         id,
@@ -103,6 +108,7 @@ fn display_message(
         timestamp,
         reply_reference,
         md_items,
+        file_markers,
         is_optimistic,
     }
 }
@@ -367,6 +373,9 @@ pub enum HomeMessage {
     ScrollChanged(scrollable::Viewport),
     /// Markdown link was clicked.
     LinkClicked(String),
+    /// A `[FILE:…]` reveal attempted from a transcript finished. `Ok` needs no
+    /// further action; an error becomes an error toast.
+    FileRevealed(Result<(), String>),
     /// Reset session button pressed — reset session and display.
     ClearChat,
     /// Copy a chat message's raw markdown content to the clipboard.
@@ -923,6 +932,7 @@ impl HomeState {
                         super::media_markers::selectable_markdown_view(
                             &msg.md_items,
                             theme::markdown_settings(),
+                            &msg.file_markers,
                         )
                         .map(HomeMessage::LinkClicked)
                     };
@@ -1408,9 +1418,27 @@ impl HomeState {
                 Task::none()
             }
             HomeMessage::LinkClicked(url) => {
-                super::open_url(&url);
-                Task::none()
+                if let Some(target) = super::media_markers::file_link_target(&url) {
+                    let target = target.to_string();
+                    let workspace =
+                        crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME);
+                    // The reveal stats and spawns a launcher: keep it out of the
+                    // update handler.
+                    Task::perform(
+                        async move {
+                            super::media_markers::reveal_file_marker(&target, Some(&workspace))
+                        },
+                        HomeMessage::FileRevealed,
+                    )
+                } else {
+                    super::open_url(&url);
+                    Task::none()
+                }
             }
+            HomeMessage::FileRevealed(result) => match result {
+                Ok(()) => Task::none(),
+                Err(error) => Task::done(HomeMessage::Toast(ToastMessage::Error(error))),
+            },
             HomeMessage::TypingTick => {
                 if self.typing {
                     self.typing_tick_state = (self.typing_tick_state + 1) % 3;
@@ -1863,6 +1891,7 @@ mod tests {
             timestamp: None,
             reply_reference: None,
             md_items: Vec::new(),
+            file_markers: Vec::new(),
             is_optimistic,
         }
     }
@@ -2628,6 +2657,7 @@ mod tests {
                 snippet: "original quote".to_string(),
             }),
             md_items: Vec::new(),
+            file_markers: Vec::new(),
             is_optimistic: true,
         });
 

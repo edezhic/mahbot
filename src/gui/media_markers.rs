@@ -8,7 +8,8 @@
 //!   process-lifetime cached handle; undecodable or oversized payloads degrade
 //!   to the `🖼️ image` placeholder (never raw base64 text, never a blank)
 //! - `[AUDIO:path]` → 🎵 emoji + filename (text)
-//! - `[FILE:path]` → 📄 emoji + filename (text)
+//! - `[FILE:path]` → 📄 emoji + filename (text), clickable: a click reveals
+//!   the file in the OS file manager
 //! - `[VIDEO:path]` → 🎬 emoji + placeholder text
 //! - `[Audio transcription of ...]: text` → 🔊 emoji + transcribed text
 //! - `[Video transcription of ...]: text` → 🎬 emoji + transcribed text
@@ -32,12 +33,24 @@
 //! adding a new marker kind there automatically propagates to this module,
 //! `enrichment.rs`, `agent.rs`, and `compatible.rs` without needing per-kind
 //! regexes anywhere.
+//!
+//! # Clickable file markers
+//!
+//! A `[FILE:…]` marker stays the plain `📄 name` label it renders as today; the
+//! viewer only attaches a `mahbot-file:` link to it. Labels are found in the
+//! *parsed* text, in body order, which leaves a few exotic blind spots: a name
+//! the parser splits into styled spans is never found, a literal `📄 name`
+//! written as prose can absorb a marker's link, and a marker rendered inside a
+//! code block (deliberately never linked) still counts as the earlier candidate
+//! for its label.
 
 use iced::advanced::{image as advanced_image, text};
-use iced::widget::{image, markdown};
-use iced::{ContentFit, Element, Font, Length};
+use iced::widget::{container, image, markdown};
+use iced::{ContentFit, Element, Font, Length, Pixels, padding};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{LazyLock, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::util::media_target;
 use crate::util::{
@@ -125,20 +138,25 @@ fn replace_media_markers(s: &str) -> String {
                     }
                 }
                 MediaMarkerKind::Audio => format!("🎵 {}", file_name_or_path(path)),
-                MediaMarkerKind::File => {
-                    // A data URI carries no file name: `file_name_or_path` would
-                    // return a chunk of its base64 payload, so name it generically
-                    // instead of dumping the blob into the bubble.
-                    if path.trim().starts_with("data:") {
-                        "📄 file".to_string()
-                    } else {
-                        format!("📄 {}", file_name_or_path(path))
-                    }
-                }
+                MediaMarkerKind::File => file_marker_label(path),
                 MediaMarkerKind::Video => format!("🎬 Video: {}", file_name_or_path(path)),
             }
         })
         .to_string()
+}
+
+/// The label a `[FILE:path]` marker shows: `📄 name`. A data URI carries no
+/// file name (`file_name_or_path` would return a chunk of its base64 payload),
+/// so it is named generically instead of dumping the blob into the bubble.
+///
+/// The click handling finds the marker in the parsed text by this exact label,
+/// so both the preprocessor and [`file_markers`] must build it here.
+fn file_marker_label(path: &str) -> String {
+    if path.trim().starts_with("data:") {
+        "📄 file".to_string()
+    } else {
+        format!("📄 {}", file_name_or_path(path))
+    }
 }
 
 /// Handle the `[Saved <kind>: path]` upload annotations produced by the channel
@@ -423,22 +441,199 @@ fn local_path_image_handle(path: &str) -> Option<image::Handle> {
     handle
 }
 
+// ── Clickable file markers ──────────────────────────────────────
+
+/// A `[FILE:…]` marker in a transcript body: the label [`preprocess`] renders
+/// for it and the target it names. `target` is empty when the marker names a
+/// payload (a data URI) rather than a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileMarker {
+    pub label: String,
+    pub target: String,
+}
+
+/// The link value a file marker's click carries.
+const FILE_LINK_PREFIX: &str = "mahbot-file:";
+
+/// The `[FILE:…]` markers of a body, in body order. The labels are exactly
+/// what `preprocess` renders, so the viewer can find them in the parsed text.
+pub(crate) fn file_markers(content: &str) -> Vec<FileMarker> {
+    MEDIA_MARKER_RE
+        .captures_iter(content)
+        .filter_map(|caps| {
+            let (kind, path) = parse_media_marker(&caps);
+            if kind != MediaMarkerKind::File {
+                return None;
+            }
+            Some(FileMarker {
+                label: file_marker_label(path),
+                // A data URI names a payload, not a path: no target to reveal,
+                // so the click can only report that there is nothing to open.
+                target: if path.trim().starts_with("data:") {
+                    String::new()
+                } else {
+                    path.to_string()
+                },
+            })
+        })
+        .collect()
+}
+
+/// The target a `[FILE:…]` click carries, or `None` for any other link.
+pub(crate) fn file_link_target(uri: &str) -> Option<&str> {
+    uri.strip_prefix(FILE_LINK_PREFIX)
+}
+
+fn file_link_uri(target: &str) -> String {
+    format!("{FILE_LINK_PREFIX}{target}")
+}
+
+/// Resolve a marker target the way a hand-over does: an absolute target as it
+/// is, a relative one against the conversation's workspace.
+fn resolve_file_marker_target(target: &str, workspace: Option<&Path>) -> Result<PathBuf, String> {
+    if target.is_empty() {
+        return Err("The marker does not name a file.".to_string());
+    }
+    // `[FILE:…]` is local-only, exactly as at delivery time.
+    if media_target::is_valid_remote_url(target) {
+        return Err("FILE targets are local files, not URLs.".to_string());
+    }
+    let raw = Path::new(target);
+    if raw.is_absolute() {
+        return Ok(raw.to_path_buf());
+    }
+    workspace
+        .map(|root| root.join(raw))
+        .ok_or_else(|| format!("Cannot open '{target}': the conversation's workspace is unknown."))
+}
+
+/// Reveal a marker's target in the platform file manager. Only an existing
+/// regular file is handed over: the launchers report success and failure
+/// unreliably, so a target that is gone, is not a file, or names no path at all
+/// is reported instead of opening something.
+pub(crate) fn reveal_file_marker(target: &str, workspace: Option<&Path>) -> Result<(), String> {
+    let path = resolve_file_marker_target(target, workspace)?;
+    if !path.exists() {
+        return Err(format!("File not found: {}", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("Not a file: {}", path.display()));
+    }
+    super::reveal_in_file_manager(&path)
+}
+
 // ── Selectable markdown Viewer (iced_selection + inline images) ────
 
 /// A markdown `Viewer` rendering text through `iced_selection` (selectable,
 /// copyable) while keeping the inline-image rendering of the previous viewer.
-pub(crate) struct SelectableMediaViewer;
+struct SelectableMediaViewer<'a> {
+    files: &'a [FileMarker],
+    /// Markers already linked during this build. Labels are matched per
+    /// paragraph, so without this a later marker with the same label would
+    /// resolve to the first marker's target.
+    linked: RefCell<Vec<bool>>,
+}
 
 /// Render markdown items as selectable text with inline image support.
-pub(crate) fn selectable_markdown_view(
-    items: &[markdown::Item],
+pub(crate) fn selectable_markdown_view<'a>(
+    items: &'a [markdown::Item],
     settings: impl Into<markdown::Settings>,
-) -> Element<'_, markdown::Uri, iced::Theme, iced::Renderer> {
-    markdown::view_with(items, settings, &SelectableMediaViewer)
+    files: &'a [FileMarker],
+) -> Element<'a, markdown::Uri, iced::Theme, iced::Renderer> {
+    markdown::view_with(items, settings, &SelectableMediaViewer::new(files))
+}
+
+impl<'a> SelectableMediaViewer<'a> {
+    fn new(files: &'a [FileMarker]) -> Self {
+        Self {
+            files,
+            linked: RefCell::new(vec![false; files.len()]),
+        }
+    }
+
+    /// The spans to render for one block, with file-marker labels linked. A
+    /// block with nothing to link keeps the parsed spans as they are.
+    fn marker_spans(
+        &self,
+        spans: &Arc<[text::Span<'static, markdown::Uri>]>,
+    ) -> Arc<[text::Span<'static, markdown::Uri>]> {
+        self.linkified_spans(spans)
+            .map_or_else(|| spans.clone(), Arc::from)
+    }
+
+    /// Replace each file marker's rendered label in `spans` with a linked copy
+    /// of the same span: same text, font and colour (the link carries no
+    /// colour, so a marker never becomes a visibly coloured link), with the
+    /// marker URI attached. `None` when no label is there to link, so the caller
+    /// keeps the parsed spans.
+    fn linkified_spans(
+        &self,
+        spans: &[text::Span<'static, markdown::Uri>],
+    ) -> Option<Vec<text::Span<'static, markdown::Uri>>> {
+        let mut linked = self.linked.borrow_mut();
+        if !self.files.iter().enumerate().any(|(index, file)| {
+            !linked[index]
+                && spans
+                    .iter()
+                    .any(|span| can_link(span) && span.text.contains(&file.label))
+        }) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(spans.len() + self.files.len());
+        for span in spans {
+            if !can_link(span) {
+                out.push(span.clone());
+                continue;
+            }
+            let mut rest: &str = span.text.as_ref();
+            let mut split = false;
+            while let Some((at, index)) = self
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !linked[*i])
+                .filter_map(|(i, file)| rest.find(&file.label).map(|at| (at, i)))
+                .min_by_key(|(at, i)| (*at, std::cmp::Reverse(self.files[*i].label.len())))
+            {
+                split = true;
+                if at > 0 {
+                    out.push(span_with_text(span, &rest[..at]));
+                }
+                let label = &self.files[index].label;
+                let mut link = span_with_text(span, label);
+                link.link = Some(file_link_uri(&self.files[index].target));
+                out.push(link);
+                linked[index] = true;
+                rest = &rest[at + label.len()..];
+            }
+            if !split {
+                out.push(span.clone());
+            } else if !rest.is_empty() {
+                out.push(span_with_text(span, rest));
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Whether a span may take a file marker's link: code spans (the inline-code
+/// highlight) and real links keep their own behaviour.
+fn can_link(span: &text::Span<'static, markdown::Uri>) -> bool {
+    span.link.is_none() && span.highlight.is_none()
+}
+
+fn span_with_text(
+    span: &text::Span<'static, markdown::Uri>,
+    text: &str,
+) -> text::Span<'static, markdown::Uri> {
+    text::Span {
+        text: std::borrow::Cow::Owned(text.to_owned()),
+        ..span.clone()
+    }
 }
 
 impl<'a, Theme, Renderer> markdown::Viewer<'a, markdown::Uri, Theme, Renderer>
-    for SelectableMediaViewer
+    for SelectableMediaViewer<'a>
 where
     Theme: markdown::Catalog + iced_selection::text::Catalog + 'a,
     Renderer: text::Renderer<Paragraph = iced::advanced::graphics::text::Paragraph, Font = Font>
@@ -495,7 +690,23 @@ where
         text: &'a markdown::Text,
         index: usize,
     ) -> Element<'a, markdown::Uri, Theme, Renderer> {
-        iced_selection::markdown::heading(settings, level, text, index, |url| url)
+        let size = match level {
+            markdown::HeadingLevel::H1 => settings.h1_size,
+            markdown::HeadingLevel::H2 => settings.h2_size,
+            markdown::HeadingLevel::H3 => settings.h3_size,
+            markdown::HeadingLevel::H4 => settings.h4_size,
+            markdown::HeadingLevel::H5 => settings.h5_size,
+            markdown::HeadingLevel::H6 => settings.h6_size,
+        };
+        let spans = text.spans(settings.style);
+        let rich = iced_selection::rich_text(self.marker_spans(&spans)).size(size);
+        container(rich.on_link_click(|url| url))
+            .padding(padding::top(if index > 0 {
+                settings.text_size / 2.0
+            } else {
+                Pixels::ZERO
+            }))
+            .into()
     }
 
     fn paragraph(
@@ -503,7 +714,11 @@ where
         settings: markdown::Settings,
         text: &markdown::Text,
     ) -> Element<'a, markdown::Uri, Theme, Renderer> {
-        iced_selection::markdown::paragraph(settings, text, |url| url)
+        let spans = text.spans(settings.style);
+        iced_selection::rich_text(self.marker_spans(&spans))
+            .size(settings.text_size)
+            .on_link_click(|url| url)
+            .into()
     }
 
     fn code_block(
@@ -673,6 +888,133 @@ mod tests {
         for (i, (name, input, expected)) in cases.iter().enumerate() {
             assert_eq!(preprocess(input), *expected, "case {i} ({name})");
         }
+    }
+
+    // ── Clickable file markers ────────────────────────────────────
+
+    #[test]
+    fn file_markers_pair_labels_with_targets() {
+        let body = "Get [FILE:generated/report.pdf] and [FILE:/tmp/notes.txt] then \
+                    [FILE:data:text/plain;base64,aGVsbG8=]";
+        let markers = file_markers(body);
+        assert_eq!(
+            markers,
+            vec![
+                FileMarker {
+                    label: "📄 report.pdf".to_string(),
+                    target: "generated/report.pdf".to_string(),
+                },
+                FileMarker {
+                    label: "📄 notes.txt".to_string(),
+                    target: "/tmp/notes.txt".to_string(),
+                },
+                FileMarker {
+                    label: "📄 file".to_string(),
+                    target: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn linkified_spans_links_only_the_marker_label() {
+        let span = text::Span::new("Get 📄 report.pdf now");
+        let files = [FileMarker {
+            label: "📄 report.pdf".to_string(),
+            target: "/tmp/report.pdf".to_string(),
+        }];
+        let spans = SelectableMediaViewer::new(&files)
+            .linkified_spans(&[span])
+            .unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_ref()).collect();
+        assert_eq!(texts, ["Get ", "📄 report.pdf", " now"]);
+        assert_eq!(spans[0].link, None);
+        assert_eq!(spans[1].link, Some(file_link_uri("/tmp/report.pdf")));
+        assert_eq!(
+            spans[1].color, None,
+            "a file marker must keep its plain colour"
+        );
+        assert!(
+            !spans[1].underline,
+            "a file marker must not be underlined at rest"
+        );
+        assert_eq!(spans[2].link, None);
+    }
+
+    #[test]
+    fn linkified_spans_links_same_named_markers_to_their_own_targets() {
+        let files = [
+            FileMarker {
+                label: "📄 notes.txt".to_string(),
+                target: "first/notes.txt".to_string(),
+            },
+            FileMarker {
+                label: "📄 notes.txt".to_string(),
+                target: "second/notes.txt".to_string(),
+            },
+        ];
+        let viewer = SelectableMediaViewer::new(&files);
+        let first = viewer
+            .linkified_spans(&[text::Span::new("Saved 📄 notes.txt")])
+            .unwrap();
+        let second = viewer
+            .linkified_spans(&[text::Span::new("Again 📄 notes.txt")])
+            .unwrap();
+        assert_eq!(
+            first[1].link,
+            Some(file_link_uri("first/notes.txt")),
+            "each block must link the next marker, not always the first"
+        );
+        assert_eq!(second[1].link, Some(file_link_uri("second/notes.txt")));
+    }
+
+    #[test]
+    fn file_marker_targets_resolve_against_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        assert_eq!(
+            resolve_file_marker_target("generated/report.pdf", Some(root)).unwrap(),
+            root.join("generated/report.pdf"),
+            "a relative target resolves against the conversation's workspace"
+        );
+        let absolute = root.join("elsewhere/report.pdf");
+        assert_eq!(
+            resolve_file_marker_target(&absolute.to_string_lossy(), Some(root)).unwrap(),
+            absolute,
+            "an absolute target is used as it is"
+        );
+        assert_eq!(
+            resolve_file_marker_target("report.pdf", None).unwrap_err(),
+            "Cannot open 'report.pdf': the conversation's workspace is unknown."
+        );
+        assert_eq!(
+            resolve_file_marker_target("https://example.com/report.pdf", Some(root)).unwrap_err(),
+            "FILE targets are local files, not URLs."
+        );
+        assert_eq!(
+            resolve_file_marker_target("", Some(root)).unwrap_err(),
+            "The marker does not name a file."
+        );
+    }
+
+    #[test]
+    fn reveal_file_marker_refuses_a_target_that_is_not_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let missing = root.join("generated/report.pdf");
+        assert_eq!(
+            reveal_file_marker("generated/report.pdf", Some(root)).unwrap_err(),
+            format!("File not found: {}", missing.display()),
+            "a relative target must resolve against the workspace"
+        );
+
+        std::fs::create_dir(root.join("folder")).unwrap();
+        assert_eq!(
+            reveal_file_marker("folder", Some(root)).unwrap_err(),
+            format!("Not a file: {}", root.join("folder").display())
+        );
     }
 
     #[test]

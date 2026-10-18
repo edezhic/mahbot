@@ -187,9 +187,17 @@ pub(crate) fn build_ledger_with_sources(
     (entries, sources)
 }
 
+/// A transcript body parsed for display: its markdown items and the
+/// `[FILE:…]` markers it contains, in body order (the viewer turns each
+/// marker's rendered label into a click).
+pub(crate) struct ParsedBody {
+    pub items: Vec<markdown::Item>,
+    pub files: Vec<media_markers::FileMarker>,
+}
+
 /// Per-entry markdown parse for bubble bodies: Message → its content,
 /// ToolRound → its narration. None = nothing to render.
-pub(crate) fn parse_entry_bodies(entries: &[SessionEntry]) -> Vec<Option<Vec<markdown::Item>>> {
+pub(crate) fn parse_entry_bodies(entries: &[SessionEntry]) -> Vec<Option<ParsedBody>> {
     entries
         .iter()
         .map(|entry| {
@@ -200,7 +208,10 @@ pub(crate) fn parse_entry_bodies(entries: &[SessionEntry]) -> Vec<Option<Vec<mar
             let processed = media_markers::preprocess(display);
             let escaped = escape_html_blocks(&processed);
             let with_breaks = markdown_breaks::hard_breaks(&escaped);
-            Some(markdown::parse(&with_breaks).collect())
+            Some(ParsedBody {
+                items: markdown::parse(&with_breaks).collect(),
+                files: media_markers::file_markers(display),
+            })
         })
         .collect()
 }

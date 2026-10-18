@@ -65,6 +65,7 @@ pub use theme::JETBRAINS_MONO;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -3920,6 +3921,44 @@ fn shared_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::Pi
             label: ws.display_name(),
         })
         .collect()
+}
+
+/// Reveal a path in the platform's file manager: Finder on macOS, Explorer on
+/// Windows, and the containing folder on Linux (where `xdg-open` has no select
+/// verb). A directory is accepted too — macOS and Windows select it in its
+/// parent, Linux just opens that parent. The launchers report success and
+/// failure unreliably, so their outcome is never trusted: a caller that
+/// requires a real file checks for it beforehand.
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("Could not open Finder: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg("/select,").arg(path);
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        cmd.spawn()
+            .map_err(|e| format!("Could not open Explorer: {e}"))?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("No containing folder: {}", path.display()))?;
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("Could not open the file manager: {e}"))?;
+    }
+
+    Ok(())
 }
 
 /// Open an address with the platform's own handler (fire-and-forget).

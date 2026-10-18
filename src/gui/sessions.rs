@@ -9,11 +9,12 @@ use crate::Workspace;
 use crate::session::SessionMetadata;
 
 use iced::widget::{
-    Column, Id, Space, button, column, container, markdown, responsive, row, scrollable, text,
+    Column, Id, Space, button, column, container, responsive, row, scrollable, text,
 };
 use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
+use std::path::{Path, PathBuf};
 
 use super::ToastMessage;
 use super::media_markers;
@@ -21,7 +22,7 @@ use super::menus::{ContextMenu, MenuItem};
 use super::session_view::preview::{
     MAX_PREVIEW_LINES, MessageMeasure, measure_message, re_measure, width_bucket,
 };
-use super::session_view::{self, SessionEntry, ToolCallEntry};
+use super::session_view::{self, ParsedBody, SessionEntry, ToolCallEntry};
 use super::theme;
 use super::widgets::{self, BubbleSide, align_bubble, selectable_text};
 
@@ -48,13 +49,18 @@ const CARD_TITLE_MAX_CHARS: usize = 32;
 const CARD_TITLE_BRANCH_MAX_CHARS: usize = CARD_TITLE_MAX_CHARS / 2;
 
 /// Shared transcript render context: the flat session ledger, its per-entry
-/// markdown bodies, the element expansion set, the collapse-measurement
+/// parsed bodies, the element expansion set, the collapse-measurement
 /// cache, the single text measurement width (bubble body width, used for
 /// all collapsible-element measurement), and whether the ledger can be
 /// truncated (a stored, idle session).
 struct TranscriptCtx<'a> {
     entries: &'a [SessionEntry],
-    entry_md: &'a [Option<Vec<markdown::Item>>],
+    entry_md: &'a [Option<ParsedBody>],
+    /// Root folder of the conversation's workspace; a relative file marker
+    /// resolves against it. Owned because the `responsive` closure that builds
+    /// the transcript is a `move` closure — a `Fn` closure cannot lend a
+    /// captured value to the element it returns.
+    workspace_root: Option<PathBuf>,
     expanded: &'a HashSet<(usize, usize)>,
     measure_cache: &'a RefCell<HashMap<(usize, usize), MessageMeasure>>,
     text_width: f32,
@@ -98,6 +104,17 @@ pub(crate) enum SessionsMessage {
 
     /// A link was clicked in rendered markdown.
     LinkClicked(String),
+
+    /// A `[FILE:…]` marker was clicked: reveal `target` in the file manager,
+    /// resolving a relative target against `workspace`.
+    RevealFile {
+        target: String,
+        workspace: Option<PathBuf>,
+    },
+
+    /// A [`SessionsMessage::RevealFile`] finished: an error becomes an error
+    /// toast, success needs no action.
+    FileRevealed(Result<(), String>),
 
     /// A toast notification to surface from the dashboard.
     Toast(ToastMessage),
@@ -218,15 +235,29 @@ fn custom_role_title(name: &str, identifier: Option<&str>) -> String {
     format!("{}{suffix}", crate::util::truncate(name, room))
 }
 
+/// The root a transcript's relative `[FILE:…]` markers resolve against: the
+/// session's own workspace. A personal workspace is synthetic (never in the
+/// map), so it resolves by name; a stored name that is itself an absolute path
+/// still resolves when the workspace row is gone.
+fn workspace_root_for(name: &str, workspaces: &HashMap<String, Workspace>) -> Option<PathBuf> {
+    if let Some(user) = crate::users::personal_user_name(name) {
+        return Some(crate::users::personal_workspace_path(user));
+    }
+    workspaces
+        .get(name)
+        .map(|ws| PathBuf::from(&ws.path))
+        .or_else(|| Path::new(name).is_absolute().then(|| PathBuf::from(name)))
+}
+
 pub(crate) struct SessionsState {
     sessions: Vec<SessionMetadata>,
     load_state: super::common::AsyncLoadState,
     selected_session: Option<String>,
     /// The flat session ledger built from the selected session's messages.
     entries: Vec<SessionEntry>,
-    /// Per-entry markdown bodies, parallel to `entries` (parsed from the
+    /// Per-entry parsed bodies, parallel to `entries` (parsed from the
     /// ledger via `session_view::parse_entry_bodies`).
-    entry_md: Vec<Option<Vec<markdown::Item>>>,
+    entry_md: Vec<Option<ParsedBody>>,
     /// For each entry, the index of the stored `sessions` row it was built from
     /// (see `session_view::build_ledger_with_sources`). `None` while the ledger
     /// has no stored-row identity: before the first stored load, and after any
@@ -516,6 +547,16 @@ impl SessionsState {
                 Task::none()
             }
             SessionsMessage::Toast(_) | SessionsMessage::LinkClicked(_) => Task::none(),
+            SessionsMessage::RevealFile { target, workspace } => Task::perform(
+                // The reveal stats and spawns a launcher: keep it out of the
+                // update handler.
+                async move { media_markers::reveal_file_marker(&target, workspace.as_deref()) },
+                SessionsMessage::FileRevealed,
+            ),
+            SessionsMessage::FileRevealed(result) => match result {
+                Ok(()) => Task::none(),
+                Err(error) => Task::done(SessionsMessage::Toast(ToastMessage::Error(error))),
+            },
             SessionsMessage::Escape => {
                 self.clear_selection();
                 Task::none()
@@ -841,6 +882,12 @@ impl SessionsState {
             // Transcript on the right side. Wrapped in `responsive` so the
             // collapse measurement uses the real bubble body width, correct on
             // first render and after every window resize.
+            let workspace_root = self
+                .selected_session
+                .as_deref()
+                .and_then(|key| self.sessions.iter().find(|session| session.agent_id == key))
+                .and_then(|session| session.workspace_name.as_deref())
+                .and_then(|name| workspace_root_for(name, workspaces));
             let transcript: iced::Element<'_, SessionsMessage> = if self.selected_loading {
                 iced::widget::container(widgets::loading_text())
                     .width(Length::Fill)
@@ -881,6 +928,7 @@ impl SessionsState {
                     let ctx = TranscriptCtx {
                         entries,
                         entry_md,
+                        workspace_root: workspace_root.clone(),
                         expanded,
                         measure_cache,
                         text_width,
@@ -1189,14 +1237,15 @@ fn thinking_block<'a>(
 /// element shows a plain clickable preview; an expanded (or short) element
 /// shows the markdown body parsed from `md`. `content` is the plain text used
 /// for the collapse measurement (at the bubble body width); `md` is the parsed
-/// markdown for the expanded view. Narration bodies render italic at
+/// body (markdown items and file markers) for the expanded view. Narration
+/// bodies render italic at
 /// [`theme::NARRATION_TEXT_SIZE`]; user/assistant bodies stay at
 /// [`theme::MARKDOWN_TEXT_SIZE`] regular.
 fn body_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
     content: &'a str,
-    md: Option<&'a [markdown::Item]>,
+    md: Option<&'a ParsedBody>,
     is_narration: bool,
 ) -> Element<'a, SessionsMessage> {
     let size = if is_narration {
@@ -1210,13 +1259,22 @@ fn body_block<'a>(
     } else {
         theme::FONT_REGULAR
     };
-    let expanded: Element<'a, SessionsMessage> = if let Some(md) = md {
+    let expanded: Element<'a, SessionsMessage> = if let Some(parsed) = md {
         let settings = if is_narration {
             theme::narration_markdown_settings()
         } else {
             theme::markdown_settings()
         };
-        media_markers::selectable_markdown_view(md, settings).map(SessionsMessage::LinkClicked)
+        let workspace = ctx.workspace_root.clone();
+        media_markers::selectable_markdown_view(&parsed.items, settings, &parsed.files).map(
+            move |url| match media_markers::file_link_target(&url) {
+                Some(target) => SessionsMessage::RevealFile {
+                    target: target.to_string(),
+                    workspace: workspace.clone(),
+                },
+                None => SessionsMessage::LinkClicked(url),
+            },
+        )
     } else {
         selectable_text(content, theme::TEXT_PRIMARY)
             .size(size)
@@ -1259,7 +1317,7 @@ fn render_tool_round<'a>(
     reasoning: Option<&'a str>,
     calls: &'a [ToolCallEntry],
 ) -> Element<'a, SessionsMessage> {
-    let md = ctx.entry_md.get(i).and_then(|m| m.as_deref());
+    let md = ctx.entry_md.get(i).and_then(|m| m.as_ref());
     let mut bubble_col = Column::new().spacing(theme::SPACE_4);
 
     if let Some(reasoning) = session_view::promoted_reasoning(narration, reasoning) {
@@ -1341,7 +1399,7 @@ fn render_tool_round<'a>(
 /// bubble, and a `ToolRound` renders a single assistant bubble containing the
 /// round's reasoning, narration, and tool calls with their results.
 fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMessage> {
-    let md = ctx.entry_md.get(i).and_then(|m| m.as_deref());
+    let md = ctx.entry_md.get(i).and_then(|m| m.as_ref());
     let entry = &ctx.entries[i];
     match entry {
         SessionEntry::Message {
@@ -1581,6 +1639,34 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn workspace_root_for_resolves_every_stored_name_shape() {
+        let admin = crate::users::ADMIN_USER_NAME;
+        assert_eq!(
+            workspace_root_for(&format!("personal:{admin}"), &HashMap::new()),
+            Some(crate::users::personal_workspace_path(admin)),
+            "a personal workspace is synthetic, so it resolves by name"
+        );
+
+        let mut map = workspace_map(&["mahbot_rlx"]);
+        map.get_mut("mahbot_rlx").unwrap().path = "/tmp/ws/mahbot_rlx".to_string();
+        assert_eq!(
+            workspace_root_for("mahbot_rlx", &map),
+            Some(PathBuf::from("/tmp/ws/mahbot_rlx")),
+            "a registered workspace resolves to its path"
+        );
+        assert_eq!(
+            workspace_root_for("/tmp/ws/stored", &map),
+            Some(PathBuf::from("/tmp/ws/stored")),
+            "an absolute stored name is its own root"
+        );
+        assert_eq!(
+            workspace_root_for("gone", &map),
+            None,
+            "an unknown relative name has no root"
+        );
     }
 
     #[test]

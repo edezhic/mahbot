@@ -5641,33 +5641,8 @@ impl EditorState {
     fn perform_reveal_in_finder(path: String) -> Task<EditorMessage> {
         Task::perform(
             async move {
-                #[cfg(target_os = "macos")]
-                {
-                    if let Err(e) = std::process::Command::new("open")
-                        .arg("-R")
-                        .arg(&path)
-                        .spawn()
-                    {
-                        tracing::warn!("Failed to open Finder for {path}: {e}");
-                    }
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    let mut cmd = std::process::Command::new("explorer");
-                    cmd.arg("/select,").arg(&path);
-                    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-                    if let Err(e) = cmd.spawn() {
-                        tracing::warn!("Failed to open Explorer for {path}: {e}");
-                    }
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                {
-                    if let Some(parent) = std::path::Path::new(&path).parent() {
-                        if let Err(e) = std::process::Command::new("xdg-open").arg(parent).spawn() {
-                            tracing::warn!("Failed to open file manager for {path}: {e}");
-                        }
-                    }
+                if let Err(e) = super::reveal_in_file_manager(std::path::Path::new(&path)) {
+                    tracing::warn!("Failed to reveal {path}: {e}");
                 }
             },
             |()| (),
