@@ -1090,7 +1090,9 @@ impl Connection {
     /// created by another writer in between is not an error; that insert then
     /// reports zero rows and the update runs once more, so the caller's values
     /// win. `update_params` is a closure because the update can run twice.
-    /// Callers that need the pair to be atomic run it inside a transaction.
+    /// Callers that need the pair to be atomic run it inside a transaction —
+    /// through [`TxGuard::upsert_row`], never this method, which would re-lock
+    /// the mutex the guard holds.
     ///
     /// The engine's upsert form is unusable while change capture is enabled on
     /// the store (`PRAGMA capture_data_changes_conn`); only its `DO UPDATE`
@@ -2742,7 +2744,11 @@ where
 ///
 /// The transaction's own work goes through this guard: `query` for what it
 /// reads, `execute` / `upsert_row` / `execute_batch` for what it changes, and
-/// `execute_one` for a change that reads its own result back.
+/// `execute_one` for a change that reads its own result back. Each calls the
+/// helper behind the [`Connection`] entry point, or the inner
+/// `store::Connection`, on the mutex held here; the entry points themselves
+/// cannot be used — a write would re-lock that mutex on a detached task and wait
+/// forever, and a read is refused outright.
 ///
 /// It is the only place a read can see the
 /// transaction's own uncommitted writes, and the connection's read entry refuses
@@ -2762,25 +2768,14 @@ pub(crate) struct TxGuard<'a> {
 }
 
 impl TxGuard<'_> {
-    /// Upsert one row without the engine's `INSERT ... ON CONFLICT ... DO UPDATE`
-    /// form: `update_sql` runs first, and when it matched no row `insert_sql`
-    /// creates one.
+    /// Upsert one row inside the held transaction: the update-then-insert
+    /// contract of [`Connection::upsert_row`] — including why the engine's own
+    /// upsert form is unusable under change capture, and how a caller that wraps
+    /// the error must render the whole chain — run on the connection this guard
+    /// holds.
     ///
-    /// `insert_sql` must be an `INSERT ... ON CONFLICT ... DO NOTHING`, so a row
-    /// created by another writer in between is not an error; that insert then
-    /// reports zero rows and the update runs once more, so the caller's values
-    /// win. `update_params` is a closure because the update can run twice.
-    /// Callers that need the pair to be atomic run it inside a transaction.
-    ///
-    /// The engine's upsert form is unusable while change capture is enabled on
-    /// the store (`PRAGMA capture_data_changes_conn`); only its `DO UPDATE`
-    /// branch has been observed to abort, with a record-decode error (`Payload
-    /// too small for indicated header size`, `Invalid Text value`, `TEXT value
-    /// contains invalid UTF-8`). The precise engine condition is not isolated.
-    ///
-    /// A caller that wraps this write's error in its own context must render the
-    /// whole `anyhow` chain when it reports the failure (`?e`, or `{:#}` in a
-    /// message): the outer context alone (`%e`) hides the engine's cause.
+    /// `insert_sql` must be the `INSERT ... ON CONFLICT ... DO NOTHING` form and
+    /// `update_params` a closure, because the update can run twice.
     pub async fn upsert_row<U, I>(
         &self,
         update_sql: &str,
