@@ -77,9 +77,13 @@
 //! [`ENSURE_CHAT_HISTORY_CONVERSATION_INDEX`]). `67` adds the trigger-retry
 //! state on `alarms` — when a retried occurrence may run again and how many
 //! attempts in a row did not finish in time. `68` renames the `coder` role to
-//! `worker` in the stored data (see [`rename_retired_role_to_worker`]).
+//! `worker` in the stored data (see [`rename_retired_role_to_worker`]). `69`
+//! writes `audio_transcription_use_local = "false"` into every install that
+//! never wrote the row, so an installation whose owner never chose a value is
+//! no longer treated as having local speech enabled (see
+//! [`seed_audio_transcription_disabled`]).
 //!
-//! Future schema changes resume the chain at id `69` with monotonically
+//! Future schema changes resume the chain at id `70` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -1227,6 +1231,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(rename_retired_role_to_worker),
     },
+    Migration {
+        id: "69",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(seed_audio_transcription_disabled),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -1246,6 +1255,32 @@ pub(crate) async fn run_migrations(conn: &Connection, db: TargetDb) -> anyhow::R
 /// uses it as the marker of "built by this product".
 pub(crate) const MIGRATIONS_TABLE: &str = "schema_migrations";
 
+/// True when the catalog still has entries to apply to `db`. The boot bring-up
+/// asks this before it decides whether to run the open's integrity scan: a start
+/// that is about to write schema DDL into the store must refuse an already
+/// unreadable store first and repair structure before building on it (see
+/// [`crate::db::open_store`]).
+///
+/// Reads [`MIGRATIONS_TABLE`], which the boot usability gate
+/// ([`crate::db::has_product_schema`]) has already required to exist.
+pub(crate) async fn has_pending(conn: &Connection, db: TargetDb) -> anyhow::Result<bool> {
+    let applied = applied_ids(conn).await?;
+    Ok(MIGRATIONS
+        .iter()
+        .any(|migration| migration.target == db && !applied.contains(migration.id)))
+}
+
+/// The ids already recorded in [`MIGRATIONS_TABLE`].
+async fn applied_ids(conn: &Connection) -> anyhow::Result<HashSet<String>> {
+    Ok(conn
+        .query(&format!("SELECT id FROM {MIGRATIONS_TABLE}"), ())
+        .await
+        .context("Failed to read applied migrations")?
+        .into_iter()
+        .filter_map(|row| row.get::<String>(0).ok())
+        .collect())
+}
+
 /// The migration loop, parameterized by a catalog so tests can replay the
 /// retired `1`–`23` chain (see the test fixtures). Creates [`MIGRATIONS_TABLE`],
 /// reads the applied ids, and runs each entry once, in catalog order, targeting
@@ -1263,13 +1298,7 @@ async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> 
     .await
     .context("Failed to create schema_migrations tracking table")?;
 
-    let applied: HashSet<String> = conn
-        .query(&format!("SELECT id FROM {MIGRATIONS_TABLE}"), ())
-        .await
-        .context("Failed to read applied migrations")?
-        .into_iter()
-        .filter_map(|row| row.get::<String>(0).ok())
-        .collect();
+    let applied = applied_ids(conn).await?;
 
     for migration in catalog {
         if migration.target != db {
@@ -2538,6 +2567,30 @@ async fn run_retire_old_image_gen_model(conn: &Connection) -> anyhow::Result<()>
     Ok(())
 }
 
+fn seed_audio_transcription_disabled(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_seed_audio_transcription_disabled(conn))
+}
+
+/// Catalog `69`: persist the transcription-off flag on every install that never
+/// wrote it, so an owner who never chose a value is no longer treated as having
+/// local speech enabled — the ~2 GB Qwen3-ASR recogniser is not loaded, and the
+/// voice stack (wake word, microphone recording, transcription) stays off until
+/// the owner turns it on. The row keeps its meaning afterwards: absence still
+/// means enabled, which is what enabling the setting writes.
+///
+/// `DO NOTHING` makes this an insert-if-absent: an existing row (the user's
+/// `"false"` or anything else they wrote) is never overwritten, and a row the
+/// user deletes by enabling is not re-written later because the catalog's id
+/// check makes the body run once.
+async fn run_seed_audio_transcription_disabled(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO config_kv (key, value) VALUES (?1, 'false') ON CONFLICT (key) DO NOTHING",
+        params![crate::config::CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL],
+    )
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2554,7 +2607,7 @@ mod tests {
             .collect()
     }
 
-    async fn applied_ids(conn: &Connection) -> Vec<String> {
+    async fn recorded_ids(conn: &Connection) -> Vec<String> {
         conn.query("SELECT id FROM schema_migrations", ())
             .await
             .expect("read schema_migrations")
@@ -3899,7 +3952,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63`/`65`–`68` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63`/`65`–`69` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -3920,17 +3973,17 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         )
         .await;
 
-        let mut applied = applied_ids(&conn).await;
+        let mut applied = recorded_ids(&conn).await;
         applied.sort();
         assert_eq!(
             applied,
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68"
+                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–68 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–69 tail exactly"
         );
     }
 
@@ -4196,7 +4249,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         )
         .await;
 
-        let mut applied = applied_ids(&conn).await;
+        let mut applied = recorded_ids(&conn).await;
         applied.sort();
         assert_eq!(
             applied,
@@ -4302,7 +4355,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .await
             .expect("delta 35");
 
-        let mut applied = applied_ids(&conn).await;
+        let mut applied = recorded_ids(&conn).await;
         applied.sort();
         assert_eq!(
             applied,
@@ -4389,6 +4442,14 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         conn.execute("INSERT INTO config_kv (key, value) VALUES ('k', 'v')", ())
             .await
             .unwrap();
+        // Catalog `69`'s row is already present, so its insert-if-absent is a
+        // strict no-op on this reopen.
+        conn.execute(
+            "INSERT INTO config_kv (key, value) VALUES (?1, 'false')",
+            params![crate::config::CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL],
+        )
+        .await
+        .unwrap();
     }
 
     /// A snapshot of everything the reopen must leave untouched.
@@ -4539,8 +4600,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// are a no-op here too: the seeded rows
     /// name none of the retired stages and claim no earlier command run, so no job
     /// is deleted, no phase is rewritten and the empty `workspace_contexts` stays
-    /// empty, and the seeded `config_kv` row is an unrelated key while the
-    /// seeded account's pick is NULL.
+    /// empty, and the seeded `config_kv` rows are an unrelated key plus catalog
+    /// `69`'s already-present transcription flag while the seeded account's pick
+    /// is NULL.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
     async fn old_catalog_current_db_reopens_as_noop() {
@@ -4557,7 +4619,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .expect("old catalog");
         seed_current_core_rows(&conn).await;
 
-        let before_ids = applied_ids(&conn).await;
+        let before_ids = recorded_ids(&conn).await;
         let before = snapshot_core_state(&conn).await;
 
         run_migrations(&conn, TargetDb::Core)
@@ -4568,16 +4630,16 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
         ] {
             expected_ids.push(id.to_string());
         }
         expected_ids.sort();
-        let mut after_ids = applied_ids(&conn).await;
+        let mut after_ids = recorded_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–68"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–69"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -4753,7 +4815,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         .await
         .unwrap();
 
-        let before_ids = applied_ids(&conn).await;
+        let before_ids = recorded_ids(&conn).await;
         let before_tables = table_defs(&conn).await;
         let before_indexes = index_defs(&conn).await;
         let before_tool_calls_cols = column_names(&conn, "tool_calls").await;
@@ -4769,7 +4831,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("58".to_string());
         expected_ids.push("64".to_string());
         expected_ids.sort();
-        let mut after_ids = applied_ids(&conn).await;
+        let mut after_ids = recorded_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
@@ -4909,7 +4971,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             })
             .collect();
         let before_other = column_sets(&conn, &untouched_tables).await;
-        let mut before_ids = applied_ids(&conn).await;
+        let mut before_ids = recorded_ids(&conn).await;
         before_ids.sort();
 
         run_migrations(&conn, TargetDb::Core)
@@ -4956,16 +5018,16 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
         ] {
             expected_ids.push(id.to_string());
         }
         expected_ids.sort();
-        let mut after_ids = applied_ids(&conn).await;
+        let mut after_ids = recorded_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–68"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–69"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -6519,6 +6581,39 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert!(
             !contexts.contains_key("coder"),
             "the superseded key is gone"
+        );
+    }
+    /// The boot open's schema reason to run its integrity scan: a catalog entry
+    /// the store does not carry. A store at the catalog's head has none.
+    #[tokio::test]
+    async fn has_pending_reads_the_catalog_against_the_ledger() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        run_migrations(&conn, TargetDb::Core).await.unwrap();
+        assert!(
+            !has_pending(&conn, TargetDb::Core).await.unwrap(),
+            "a store at the catalog's head has nothing pending"
+        );
+        let newest = MIGRATIONS
+            .iter()
+            .rev()
+            .find(|migration| migration.target == TargetDb::Core)
+            .expect("the core catalog has entries")
+            .id;
+        conn.execute(
+            &format!("DELETE FROM schema_migrations WHERE id = '{newest}'"),
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(
+            has_pending(&conn, TargetDb::Core).await.unwrap(),
+            "an entry the ledger no longer records is pending again"
         );
     }
 }

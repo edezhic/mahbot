@@ -160,17 +160,17 @@ async fn sweep_expired(store: &LogStore) -> u64 {
     }
 }
 
-/// Background loop: one paced sweep every [`SWEEP_INTERVAL`] — and one straight
-/// away, so a launch carries on from where the last one stopped instead of
-/// waiting out a whole interval first.
+/// Background loop: one paced sweep every [`SWEEP_INTERVAL`], the first one a
+/// whole interval after start — never at the same instant the stores are coming
+/// up.
 pub async fn run_retention_loop(store: Arc<LogStore>) {
     loop {
+        if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_INTERVAL).await {
+            break;
+        }
         match sweep_expired(&store).await {
             0 => debug!("Log retention: nothing to remove"),
             removed => debug!(removed, "Log retention: removed expired records"),
-        }
-        if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_INTERVAL).await {
-            break;
         }
     }
 }

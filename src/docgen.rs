@@ -398,8 +398,8 @@ pub(crate) async fn run(request: Value) -> Result<KitOutcome> {
 /// directory removed afterwards, and cache SUCCESS only.
 ///
 /// A failure is retried on the next call because a kit that is broken now may
-/// become usable: the product replaces the managed runtime with the newest
-/// release on every start, so a permanent refusal would outlive its cause.
+/// become usable: the product keeps the managed runtime at its newest release on
+/// every start, so a permanent refusal would outlive its cause.
 pub(crate) async fn probe() -> Result<()> {
     static PROBED: OnceLock<()> = OnceLock::new();
     if PROBED.get().is_some() {

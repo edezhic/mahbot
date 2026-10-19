@@ -314,17 +314,17 @@ async fn trim_over_cap_conversations(store: &ChatHistoryStore) -> Result<u64> {
 }
 
 /// Background loop: hold the cap of every conversation the store holds — one
-/// sweep per [`SWEEP_INTERVAL`], and one straight away, so a launch repairs
-/// what the last one did not finish and what the store carried in.
+/// sweep per [`SWEEP_INTERVAL`], the first one a whole interval after start so
+/// the repair never competes with the store bring-up.
 pub async fn run_cap_loop() {
     loop {
+        if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_INTERVAL).await {
+            break;
+        }
         match trim_over_cap_conversations(store()).await {
             Ok(0) => debug!("Chat history cap: every conversation is within it"),
             Ok(removed) => debug!(removed, "Chat history cap: removed messages past it"),
             Err(e) => warn!("Chat history cap: the sweep did not complete: {e}"),
-        }
-        if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_INTERVAL).await {
-            break;
         }
     }
 }

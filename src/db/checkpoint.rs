@@ -150,9 +150,9 @@
 //! Every reclaiming checkpoint this module issues — the exit round's attempt and
 //! the periodic round's first attempt and each retry — goes through
 //! [`checkpoint_attempt`], which runs the pre-shrink gate first;
-//! [`crate::db::shrink_gate`] owns what it checks and what it accepts. The two
-//! boot-time repair sites gate themselves before their own reclaiming
-//! checkpoint, and `Connection::checkpoint_ungated()` is the raw engine call that
+//! [`crate::db::shrink_gate`] owns what it checks and what it accepts. The boot
+//! rebuild site gates itself before its own reclaiming checkpoint, and
+//! `Connection::checkpoint_ungated()` is the raw engine call that
 //! must not carry a reclaiming checkpoint outside the gate.
 //!
 //! # The engine's real cause is kept
@@ -444,10 +444,13 @@ async fn checkpoint_stores(round: CheckpointRound) {
 }
 
 /// The periodic round's integrity verification, independent of the checkpoint.
-/// No in-place action: runtime-detected btree/index desync is handled by the
-/// next boot's store open, not mid-run, and the known FTS count-mismatch false
-/// positive is already filtered by the `quick_check` row scan. Failing rounds are
-/// recorded durably (see [`record_integrity_failure`]).
+/// No in-place action: a round must not repair under live readers, so
+/// runtime-detected btree/index desync is recorded durably and the store is marked
+/// as owing a scan ([`record_integrity_failure`]). The next start runs that scan
+/// before its readers exist and clears the marker (see
+/// [`crate::db::open_present_store`]) — that is where the repair happens, not
+/// mid-run. The known FTS count-mismatch false positive is already filtered by
+/// the `quick_check` row scan.
 async fn verify_integrity(name: &'static str, conn: &impl OwnConnection, root: Option<&Path>) {
     // The filtered problem list, not `quick_check()`: a condition the boot path
     // deliberately leaves report-only (an unrecognised signature) is tolerated
@@ -511,8 +514,8 @@ async fn guarded_checkpoint(
 /// One checkpoint attempt: the pre-shrink gate first when the attempt is
 /// reclaiming (see [`crate::db::shrink_gate`]), then the engine's own call
 /// through the panic guard. Both rounds issue every reclaiming checkpoint through
-/// here, so a retry is gated exactly like the round's first attempt (the
-/// boot-time repair sites gate themselves — see the module doc).
+/// here, so a retry is gated exactly like the round's first attempt (the boot
+/// repair site gates itself — see the module doc).
 async fn checkpoint_attempt(
     name: &'static str,
     conn: &impl OwnConnection,
@@ -1056,6 +1059,11 @@ static INTEGRITY_FAILURE_ROUNDS: RoundCounter = RoundCounter::new();
 /// files a [`FailureKind::RuntimeIntegrityFailure`] block, every further round
 /// only warns. No drain and no behaviour change otherwise. Filed once per
 /// condition ([`failure_record::record`]).
+///
+/// The same call marks the store as owing a scan
+/// ([`crate::db::wal_guard::note_integrity_scan_owed`]): the round must not repair
+/// under live readers, so the next start is where a detected desync is repaired,
+/// before that start's readers exist (see `crate::db::open_present_store`).
 fn record_integrity_failure(
     name: &'static str,
     db_path: &Path,
@@ -1081,6 +1089,7 @@ fn record_integrity_failure(
         e,
         root,
     );
+    crate::db::wal_guard::note_integrity_scan_owed(db_path);
 }
 
 /// Multi-line failure report for the genuine-failure terminal path. The engine's
@@ -1393,6 +1402,10 @@ mod tests {
             );
         }
         let body = std::fs::read_to_string(tmp.path().join("error.log")).unwrap();
+        assert!(
+            crate::db::wal_guard::integrity_scan_owed(conn.db_path()),
+            "a recorded runtime integrity failure must mark the store as owing a scan"
+        );
         assert_eq!(
             body.matches("MahBot runtime integrity failure").count(),
             1,

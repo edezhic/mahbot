@@ -17,9 +17,10 @@
 //! combined `SHASUMS256.txt` file and a zip archive — both share the same
 //! tag/version/swap/extract primitives.
 //!
-//! [`install_on_start`] is the shared start-time policy: every tool is brought
-//! to its newest release on every product start, straight away when no copy is
-//! installed and after the boot has settled otherwise.
+//! [`install_on_start`] is the shared start-time policy: a missing (or
+//! non-executable) copy is installed at once, while a copy in place is left
+//! untouched until [`REFRESH_DELAY`] has passed and is compared with the newest
+//! release only then — the release is downloaded only when the two differ.
 //!
 //! The product's own install location lives here too — [`mahbot_install_dir`], built
 //! on [`user_programs_dir`] — as the one place inside the product that names it: the
@@ -63,6 +64,25 @@ pub(crate) async fn fetch_latest_tag(repo: &str, timeout: Duration) -> Result<St
         return Err("release redirect resolved to an empty tag".to_string());
     }
     Ok(tag)
+}
+
+/// The newest release of a managed tool: the tag its download URLs are built
+/// from, and the version the installed copy is compared with. One lookup answers
+/// both, so an update never resolves the same release twice (see
+/// [`install_on_start`]). The error is a path-free, URL-free sentence because it
+/// is recorded verbatim.
+pub(crate) struct Release {
+    pub(crate) tag: String,
+    pub(crate) version: semver::Version,
+}
+
+/// The newest release, from the repository's `releases/latest` redirect
+/// ([`fetch_latest_tag`] plus [`version_from_tag`]).
+pub(crate) async fn latest_release(repo: &str, timeout: Duration) -> Result<Release, String> {
+    let tag = fetch_latest_tag(repo, timeout).await?;
+    let version = version_from_tag(&tag)
+        .ok_or_else(|| "the newest release's tag carries no version".to_string())?;
+    Ok(Release { tag, version })
 }
 
 // ── Path-free failure reasons ───────────────────────────────────────
@@ -127,6 +147,15 @@ pub(crate) fn parse_sha256_sidecar(body: &str) -> Option<(String, String)> {
 #[must_use]
 pub(crate) fn parse_version_token(s: &str) -> Option<semver::Version> {
     semver::Version::parse(s.strip_prefix('v').unwrap_or(s)).ok()
+}
+
+/// The release version a tag carries. The helper's tags look like `v1.5.140`
+/// and bun's like `bun-v1.2.21`; a tag that is a bare version keeps its
+/// prerelease suffix (`v1.5.140-rc1`), so the whole tag is tried before its
+/// dash-separated segments; `None` when no token is a version.
+#[must_use]
+pub(crate) fn version_from_tag(tag: &str) -> Option<semver::Version> {
+    parse_version_token(tag).or_else(|| tag.split(['-', '_', '/']).find_map(parse_version_token))
 }
 
 // ── In-place binary swap ────────────────────────────────────────────
@@ -235,15 +264,26 @@ pub(crate) fn place_extracted(fresh: &Path, dest: &Path) -> Result<(), String> {
 
 // ── Start-time install policy ───────────────────────────────────────
 
-/// How long an existing copy waits before it is refreshed, so the download never
-/// competes with the boot.
+/// How long an existing copy waits before its version is checked, so the check
+/// (and any download it leads to) never competes with the boot.
 const REFRESH_DELAY: Duration = Duration::from_mins(5);
 
-/// Bring one of the product's own tools to the newest release: straight away when
-/// no copy is installed, else once the boot has settled. `present` reports whether
-/// the tool's own directory holds a copy — it decides only WHEN this runs, never
-/// what is installed, because whatever sits there is always replaced — and after a
-/// failure it says whether the host was left with a working copy at all.
+/// Bring one of the product's own tools to the newest release. `present` reports
+/// whether the tool's own directory holds an executable copy — it decides
+/// whether anything is compared at all and, after a failure, whether the host
+/// was left with a working copy. A copy that is absent (or not executable) has
+/// nothing to probe or compare, so it is installed straight away; a copy in
+/// place is left untouched until [`REFRESH_DELAY`] has passed and only then
+/// checked. Each step is a closure this function calls, so none of them can run
+/// before that delay: `installed_version` answers with the copy's version (`None`
+/// when it cannot run), `latest` looks the newest release up, and `install` runs
+/// only when the two differ — a matching version is a [`tracing::debug`] line and
+/// no download at all. `install` receives the release the comparison already
+/// resolved (`None` when there was nothing to compare, so it resolves one
+/// itself), which is what keeps the release tag from being fetched twice on the
+/// update path. A working copy whose newest release cannot be looked up is left
+/// as it is, with the failure recorded and retried on the next start; an
+/// unusable one is repaired, because the copy is what must exist.
 ///
 /// Every failure is recorded at WARN — the level that survives the 8-hour INFO
 /// retention and shows in the product's own issues view — because a tool that is
@@ -257,30 +297,58 @@ const REFRESH_DELAY: Duration = Duration::from_mins(5);
 pub(crate) async fn install_on_start(
     tool: &str,
     present: impl Fn() -> bool,
-    install: impl std::future::Future<Output = Result<PathBuf, String>>,
+    installed_version: impl AsyncFnOnce() -> Option<semver::Version>,
+    latest: impl AsyncFnOnce() -> Result<Release, String>,
+    install: impl AsyncFnOnce(Option<Release>) -> Result<PathBuf, String>,
 ) {
     let missing = !present();
+    let mut release = None;
     if !missing {
+        // Both facts a comparison needs are kept off the boot path: the probe
+        // spawns the tool and the update it may lead to downloads a release,
+        // neither of which may compete with the interface coming up. The closures
+        // are called only here, after the delay.
         tokio::time::sleep(REFRESH_DELAY).await;
-    }
-    match install.await {
-        Ok(path) if missing => tracing::info!("{tool} installed at {}", path.display()),
-        Ok(path) => tracing::debug!("{tool} brought up to date at {}", path.display()),
-        Err(reason) => {
-            let reason = crate::util::truncate(&reason, 1024);
-            // The step that failed says which part did not finish; the state says
-            // what the host is left with, and never more than that: a failed step
-            // can leave the copy placed but not registered, and it can fail before
-            // anything is placed.
-            let state = match (present(), missing) {
-                (true, true) => "was installed but not completely",
-                (true, false) => "could not be brought fully up to date",
-                (false, true) => "could not be installed",
-                (false, false) => "left the host without a working copy",
-            };
-            tracing::warn!("{tool} {state} (retried on the next start): {reason}");
+        let installed = installed_version().await;
+        match (installed, latest().await) {
+            // The copy is the release on offer: nothing to download. SemVer
+            // precedence, so a banner's build metadata never forces a re-download
+            // of the same version.
+            (Some(installed), Ok(latest)) if installed.cmp_precedence(&latest.version).is_eq() => {
+                tracing::debug!("{tool} is already at {} — not downloading", latest.version);
+                return;
+            }
+            // A copy that works but whose newest release cannot be looked up: the
+            // failed check says nothing about the copy, so it is left alone.
+            (Some(_), Err(reason)) => {
+                report_failure(tool, &present, missing, &reason);
+                return;
+            }
+            (_, Ok(latest)) => release = Some(latest),
+            // Nothing to compare and no release: install (or repair) the copy and
+            // let the step report why the release it needs cannot be reached.
+            (None, Err(_)) => {}
         }
     }
+    match install(release).await {
+        Ok(path) if missing => tracing::info!("{tool} installed at {}", path.display()),
+        Ok(path) => tracing::debug!("{tool} brought up to date at {}", path.display()),
+        Err(reason) => report_failure(tool, &present, missing, &reason),
+    }
+}
+
+/// Record a failed attempt at WARN. `present` is re-probed after the attempt so
+/// the message can say what the host is left with — a failed step may have placed
+/// the copy without registering it, or failed before anything was placed.
+fn report_failure(tool: &str, present: &impl Fn() -> bool, missing: bool, reason: &str) {
+    let reason = crate::util::truncate(reason, 1024);
+    let state = match (present(), missing) {
+        (true, true) => "was installed but not completely",
+        (true, false) => "could not be brought fully up to date",
+        (false, true) => "could not be installed",
+        (false, false) => "left the host without a working copy",
+    };
+    tracing::warn!("{tool} {state} (retried on the next start): {reason}");
 }
 
 // ── Archive extraction ──────────────────────────────────────────────
@@ -652,6 +720,26 @@ mod tests {
         );
         assert_eq!(parse_version_token("latest"), None);
         assert_eq!(parse_version_token(""), None);
+    }
+
+    #[test]
+    fn release_tags_carry_a_version_after_their_prefix() {
+        // chrome-use tags are bare versioned tags, bun's carry a `bun-` prefix.
+        assert_eq!(
+            version_from_tag("v1.5.140"),
+            Some(semver::Version::new(1, 5, 140))
+        );
+        assert_eq!(
+            version_from_tag("bun-v1.2.21"),
+            Some(semver::Version::new(1, 2, 21))
+        );
+        // A bare tagged version keeps its prerelease suffix rather than being
+        // read as its release.
+        assert_eq!(
+            version_from_tag("v1.5.140-rc1"),
+            Some(semver::Version::parse("1.5.140-rc1").unwrap())
+        );
+        assert_eq!(version_from_tag("latest"), None);
     }
 
     #[test]

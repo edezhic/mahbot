@@ -15,9 +15,9 @@
 //!   `local_transcriber` `Mutex<Option<_>>`.  Unifying these would change
 //!   synchronization semantics (poisoning, init-once, contention).
 //! * `local_transcriber` gained its guard when its init moved off the awaited
-//!   boot path: the boot-time background load/download must never leave its
-//!   state stuck in `Loading` — a panic in the spawned chain now flips it to
-//!   `Failed` (the honest terminal state).
+//!   path: the background load/download must never leave its state stuck in
+//!   `Loading` — a panic in the spawned chain now flips it to `Failed` (the
+//!   honest terminal state).
 //!
 //! Memory-ordering semantics are preserved exactly from the original copies:
 //! `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.

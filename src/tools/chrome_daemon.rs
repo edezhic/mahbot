@@ -570,12 +570,13 @@ const CHROME_USE_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Install hint for the definitive not-found case — appended to every
 /// user-facing message that names the chrome-use CLI as missing. The helper is
-/// brought up to date automatically every time the product starts, so if it is
-/// still missing the automatic install failed: check the logs and it will retry
-/// on the next start.
-pub(crate) const CHROME_USE_INSTALL_HINT: &str = "It is brought up to date automatically every \
-     time the product starts — if it is still missing the automatic install \
-     failed; check the logs and it will retry on the next start.";
+/// checked automatically on every product start and updated when a newer release
+/// exists, so if it is still missing the automatic install failed: check the logs
+/// and it will retry on the next start.
+pub(crate) const CHROME_USE_INSTALL_HINT: &str = "It is checked automatically every time the \
+     product starts and updated when a newer release exists — if it is still \
+     missing or broken the automatic install failed; check the logs and it will \
+     retry on the next start.";
 
 /// Resolved absolute path of the chrome-use binary (the product's own copy
 /// only, at [`crate::util::managed_bin::chrome_use_bin_path`]), cached after the
@@ -716,8 +717,8 @@ fn release_asset_name() -> Result<String, String> {
 
 /// Parse the local chrome-use version from `--version` stdout, bounded by
 /// [`CLI_TIMEOUT`]. `None` when the CLI is missing, the probe fails (timeout or
-/// non-zero exit), or the banner holds no parseable semver — the caller reports
-/// that state rather than assuming the CLI is outdated.
+/// non-zero exit), or the banner holds no parseable semver — a missing or
+/// unusable copy, which the start-time policy treats as needing (re)install.
 pub(crate) async fn cli_version() -> Option<semver::Version> {
     let path = cli_path()?;
     let mut cmd = Command::new(&path);
@@ -1542,10 +1543,10 @@ struct SweepTab {
 }
 
 // chrome-use CLI behaviors this sweep relies on (live-verified against
-// 1.5.100; note the installed copy is replaced with the newest release on every
-// product start, and that ≥1.5.101 idle keeps external tabs alive — the explicit
-// close/stop the sweep uses still cleans up, so the verified behaviors below are
-// unchanged):
+// 1.5.100; note the installed copy is checked against the newest release on every
+// product start and updated when they differ, and that ≥1.5.101 idle keeps
+// external tabs alive — the explicit close/stop the sweep uses still cleans up,
+// so the verified behaviors below are unchanged):
 // - `tab list --session <name>` enumerates only that session's tab group (the
 //   relay scopes `Target.getTargets` per announced group, leeguooooo/chrome-use#40). When the
 //   session has no daemon the CLI spawns one: an empty group makes it create a
@@ -2487,58 +2488,66 @@ async fn download_chrome_use_binary(tag: &str) -> Result<(tempfile::TempDir, Pat
     Ok((dir, out_path))
 }
 
-/// Bring the product's own copy of chrome-use to the newest release.
+/// Install the newest chrome-use release over whatever sits at the destination.
 ///
-/// The release is always fetched and whatever sits at the destination is replaced
-/// — a copy the owner installed himself, one a package manager put there, or the
-/// product's own from the previous start. No version is compared and nothing about
-/// the existing copy is consulted. `Err` names the failing step with no local path
-/// and no value read from the owner or his environment (see
-/// [`crate::util::managed_bin::install_on_start`]); the copy already at the
-/// destination is never removed or invalidated by a failure here, so the machine
-/// is never left without a working helper.
+/// Called only when the installed copy differs from the newest release (a missing
+/// or unusable copy included), so a matching version never reaches here. Whatever
+/// sits at the destination is replaced — a copy the owner installed himself, one a
+/// package manager put there, or the product's own from the previous start. `Err`
+/// names the failing step with no local path and no value read from the owner or
+/// his environment (see [`crate::util::managed_bin::install_on_start`]); the copy
+/// already at the destination is never removed or invalidated by a failure here,
+/// so the machine is never left without a working helper.
 ///
-/// The native-host registration is refreshed whether or not the swap landed: it
-/// binds the helper's full path, and that path is the same either way — a copy the
-/// product may not replace is still the copy the browser has to launch.
-async fn install_chrome_use() -> Result<PathBuf, String> {
+/// The native-host registration is NOT part of this: it binds the helper's full
+/// path, which an install never changes, so it is the caller's step and runs on
+/// every start (see [`run_chrome_use_management`]).
+async fn install_chrome_use(
+    release: Option<crate::util::managed_bin::Release>,
+) -> Result<PathBuf, String> {
     // The location the helper goes to, named once here — before anything is fetched,
-    // so an unresolvable home costs no download: the registration binds the same path
-    // even when the swap does not land, because the copy the browser has to launch is
-    // the one that location names either way.
+    // so an unresolvable home costs no download.
     let dest = crate::util::managed_bin::chrome_use_bin_path(chrome_bin()).ok_or_else(|| {
         "the helper's install directory is unavailable (the owner's home could not be resolved)"
             .to_string()
     })?;
-    let tag = crate::util::managed_bin::fetch_latest_tag(
-        CHROME_USE_RELEASE_REPO,
-        CHROME_USE_RELEASE_TIMEOUT,
-    )
-    .await?;
+    // The tag the caller's comparison already resolved; an absent copy had none
+    // to compare, so this start resolves the newest release itself.
+    let tag = match release {
+        Some(release) => release.tag,
+        None => {
+            crate::util::managed_bin::fetch_latest_tag(
+                CHROME_USE_RELEASE_REPO,
+                CHROME_USE_RELEASE_TIMEOUT,
+            )
+            .await?
+        }
+    };
     let (_temp, fresh) = download_chrome_use_binary(&tag).await?;
     let placed = crate::util::managed_bin::place_extracted(&fresh, &dest);
     // The copy belongs at the location the resolver looks in; clear any cached path
     // so the next probe re-resolves it.
     invalidate_cli_path();
-    let registered = register_native_host(&dest).await;
-    // The first failing step's reason is the one reported — the swap's, when it did
-    // not land, or the registration's when it did — and a copy left in place is what
-    // the caller's own `present()` check reports afterwards.
-    placed.and(registered).map(|()| dest)
+    placed.map(|()| dest)
 }
 
-/// Register the freshly placed binary as the native-messaging host.
+/// Register the installed binary as the native-messaging host.
 ///
-/// Registration binds the helper's full path, so it is redone after every install
-/// — the copy is placed on every start, so the registration runs on every start
-/// too (a bounded subprocess). A launcher pointing at a copy that is no longer
-/// the installed one is the classic silent relay failure. `--no-profile` is
+/// Registration binds the helper's full path, and that path is the same for every
+/// install, so this runs on every start rather than only with a download: a
+/// registration that did not land (Chrome not installed yet, a refused subprocess)
+/// is repaired by the next start even when the installed version already matches.
+/// A launcher pointing at a copy that is no longer the installed one is the classic
+/// silent relay failure. `--no-profile` is
 /// REQUIRED on macOS to avoid chrome-use's default of writing and queueing the
 /// `ab-connect.mobileconfig` managed-configuration profile
 /// (ExtensionInstallForcelist) that flips Chrome into "managed by your
 /// organization" mode; mahbot never creates or re-queues that profile in any
-/// flow. Supported since chrome-use v1.5.93; the binary is always freshly
-/// downloaded so the flag is always available.
+/// flow. Supported since chrome-use v1.5.93: the copy here is this product's own
+/// (downloaded at or after that version), and one older than it can only be a
+/// copy whose update did not land — an unreadable release lookup leaves a working
+/// copy in place — so the registration fails with its own reason and is retried
+/// on the next start rather than downloading a release to enable the flag.
 ///
 /// A registration failure never removes the binary: the error says the installed
 /// copy is left in place and the next start tries again, because the browser must
@@ -2570,22 +2579,44 @@ async fn run_install_step(label: &str, mut cmd: Command) -> Result<(), String> {
 
 // ── Managed install ───────────────────────────────────────────────────
 /// Spawned one-shot task: install the product's own copy of chrome-use straight
-/// away when it is missing, else bring it to the newest release once the boot has
-/// settled — on every product start, deliberately without a version comparison and
-/// without looking at what is already there. The copy in place is what the agents
-/// run — which copy the owner's own terminal resolves first is his search path's own
-/// order, which the product neither knows nor changes — and the native-host
-/// registration is refreshed on every install so the browser launches the helper
-/// that is actually installed. Failures are non-fatal, recorded at WARN (the level
-/// the product's own issues view shows) and retried on the next start; every level
-/// and the shape itself live in [`crate::util::managed_bin::install_on_start`].
+/// away when it is absent or not executable, else check the installed version
+/// against the newest release once the boot has settled and update only when the
+/// two differ. The copy in place is what the agents run — which copy the owner's own
+/// terminal resolves first is his search path's own order, which the product
+/// neither knows nor changes. The native-host registration follows, on every
+/// start: its bound path does not depend on the version, and a registration that
+/// did not land must be repaired by the next start even when nothing was
+/// downloaded. Failures are non-fatal, recorded at WARN (the level the product's
+/// own issues view shows) and retried on the next start; the install's levels and
+/// shape live in [`crate::util::managed_bin::install_on_start`].
 pub async fn run_chrome_use_management() {
     crate::util::managed_bin::install_on_start(
         "chrome-use",
         || cli_path().is_some(),
-        install_chrome_use(),
+        async || cli_version().await,
+        async || {
+            crate::util::managed_bin::latest_release(
+                CHROME_USE_RELEASE_REPO,
+                CHROME_USE_RELEASE_TIMEOUT,
+            )
+            .await
+        },
+        async |release| install_chrome_use(release).await,
     )
     .await;
+    // Only a working copy can be registered; with none, the install above already
+    // reported why. `cli_path` is the resolver every spawn goes through, so the
+    // registered path is the one the agents will run.
+    let Some(dest) = cli_path() else {
+        return;
+    };
+    if let Err(reason) = register_native_host(&dest).await {
+        let reason = crate::util::truncate(&reason, 1024);
+        tracing::warn!(
+            "chrome-use's native-host registration could not be refreshed (retried on the next \
+             start): {reason}"
+        );
+    }
 }
 
 /// One-time cleanup of stale mahbot-owned chrome-session artifacts at watchdog

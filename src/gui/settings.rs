@@ -1301,13 +1301,15 @@ impl SettingsState {
                     self.set_both(CONFIG_KEY_VOICE_ENABLED, "");
                     sync_voice_state(false);
                 }
-                // Toggle ON: kick the model load/download in the background —
-                // load from cache first, otherwise download with retries. A
-                // terminal failure is recovered via retry_init (same path as
-                // the inline Retry button); any other state falls through to
-                // spawn_background_init, which claims Uninit→Loading with the
-                // same panic→Failed guard the boot path uses (a raw spawn
-                // here could strand the transcriber in Loading on a panic).
+                // Toggle ON: kick the model load/download in the background now
+                // (otherwise the recogniser loads on the first voice
+                // operation) — load from cache first, otherwise download with
+                // retries. A terminal failure is recovered via retry_init (same
+                // path as the inline Retry button); any other state falls
+                // through to spawn_background_init, which claims Uninit→Loading
+                // with the same panic→Failed guard every background load uses
+                // (a raw spawn here could strand the transcriber in Loading on
+                // a panic).
                 if enabled && !crate::audio::local_transcriber::is_loaded() {
                     if !crate::audio::local_transcriber::retry_init() {
                         crate::audio::local_transcriber::spawn_background_init();
@@ -3331,8 +3333,10 @@ impl SettingsState {
             status_label("Ready")
         } else if crate::audio::local_transcriber::is_failed() {
             retry_status_row("Download failed", SettingsMessage::RetryTranscription)
+        } else if crate::audio::local_transcriber::is_loading() {
+            status_label("Loading…")
         } else {
-            status_label("Downloading…")
+            status_label("Loads on first use")
         };
         let transcription_row = field_row(
             "Transcription",

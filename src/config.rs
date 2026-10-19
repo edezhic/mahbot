@@ -275,9 +275,11 @@ pub struct ConfigData {
     /// Enable local Qwen3-ASR audio transcription (macOS only — the audio
     /// subsystem has no other platform support).
     ///
-    /// When `true` (default) and the model is cached or can be downloaded, audio
-    /// transcription runs fully locally via the `qwen-asr` crate with Qwen3-ASR-0.6B.
-    /// Audio never leaves the machine.
+    /// Absence of the row means enabled; catalog `69` writes `"false"` into
+    /// every install that never wrote it, so an untouched installation ships
+    /// disabled. When enabled and the model is cached or can be downloaded,
+    /// audio transcription runs fully locally via the `qwen-asr` crate with
+    /// Qwen3-ASR-0.6B. Audio never leaves the machine.
     ///
     /// Set to `"false"` to disable audio transcription entirely — audio markers
     /// are replaced with just the icon combo and the temp file is deleted, so
@@ -1055,17 +1057,17 @@ pub(crate) fn default_model_routing(model: &str) -> Option<&'static str> {
 
 /// Seed the fresh-install defaults into a brand-new config database
 ///
-/// A fresh install must not load or download any audio model until the user
-/// enables a feature, so `audio_transcription_use_local` is seeded to
-/// `"false"` (the existing reading semantics are unchanged: absence of the
-/// row = enabled, `"false"` = disabled). It must also show populated model
-/// pickers: the Settings GUI reads the raw snapshot fields
-/// (`config.image_gen_models` / `config.video_models`), not the
-/// default-resolving `list_or` accessors, so the image/video generation model
-/// lists are seeded too. The active selection is per-user (see
-/// `crate::users`), not a config field, so no singular key is seeded. `fresh`
-/// is the pre-open file-existence discriminator captured in [`load_or_init`] —
-/// existing databases receive zero writes.
+/// The transcription-off flag is not seeded here: catalog `69` writes it for
+/// every install that never wrote it, fresh or existing, when the config store
+/// opens — so the migration is the single owner of that initial value. This
+/// function seeds the rows a fresh install must show: the image/video
+/// generation model lists (the Settings GUI reads the raw snapshot fields
+/// `config.image_gen_models` / `config.video_models`, not the default-resolving
+/// `list_or` accessors) and the default model slots' routing. The active
+/// selection is per-user (see `crate::users`), not a config field, so no
+/// singular key is seeded. `fresh` is the pre-open file-existence discriminator
+/// captured in [`load_or_init`] — the seed itself writes nothing to existing
+/// databases.
 async fn seed_fresh_install_defaults(
     fresh: bool,
     store: &crate::config_db::ConfigStore,
@@ -1073,9 +1075,6 @@ async fn seed_fresh_install_defaults(
     if !fresh {
         return Ok(());
     }
-    store
-        .set_kv(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, "false")
-        .await?;
     store
         .set_kv(CONFIG_KEY_IMAGE_GEN_MODELS, FRESH_INSTALL_IMAGE_GEN_MODELS)
         .await?;
@@ -1097,7 +1096,7 @@ async fn seed_fresh_install_defaults(
         }
     }
     tracing::info!(
-        "Fresh config database: seeded fresh-install defaults (audio transcription off; image/video generation model sets; provider routing for the default model slots)"
+        "Fresh config database: seeded fresh-install defaults (image/video generation model sets; provider routing for the default model slots)"
     );
     Ok(())
 }
@@ -1166,13 +1165,13 @@ pub async fn reload_from_db() -> Result<()> {
     let store = crate::config_db::store();
     let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
 
-    // Fresh-install seed: a brand-new config
-    // database gets the transcription-off default (so no audio model is
-    // downloaded or loaded at boot) plus the image/video generation model
-    // lists (so the Settings GUI pickers are populated; the active selection
-    // is per-user, not a config field).
-    // Existing installs are never written (the flag is only set when the config
-    // store did not exist before the store open).
+    // Fresh-install seed: a brand-new config database gets the image/video
+    // generation model lists (so the Settings GUI pickers are populated; the
+    // active selection is per-user, not a config field). The transcription-off
+    // setting is not part of this seed — catalog `69` writes it for every install
+    // that never wrote it, and the config store open above already ran it. What
+    // this seed itself writes lands in a brand-new config database only (its
+    // `fresh` flag is decided by the config store not existing before that open).
     seed_fresh_install_defaults_from_flag(store).await?;
 
     // Rewrite persisted old-default manager/worker rows to the new default
@@ -1347,7 +1346,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
             // The foreground warmup above (or its deliberate skip on revert)
             // is the only warmup this save performs — recreate_all must not
             // fire a second background warmup of the same endpoint.
-            crate::providers::recreate_all(&CONFIG.snapshot(), false).await;
+            crate::providers::recreate_all(&CONFIG.snapshot(), false);
             return Ok(PersistOutcome {
                 value: canonical,
                 warning,
@@ -1364,7 +1363,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         // the OpenRouter key field.
         CONFIG_KEY_PROVIDER_KEY | CONFIG_KEY_PROVIDER_ENDPOINT_KEY => {
             let _ = probe_validate_write(key, &trimmed).await?;
-            crate::providers::recreate_all(&CONFIG.snapshot(), true).await;
+            crate::providers::recreate_all(&CONFIG.snapshot(), true);
             return Ok(PersistOutcome {
                 value: canonical,
                 warning: None,
@@ -2078,14 +2077,15 @@ mod tests {
     }
 
     /// Fresh-install seed: the fresh-install
-    /// defaults land in brand-new config databases only — existing databases
-    /// receive zero writes.
+    /// defaults land in brand-new config databases only — the seed itself
+    /// writes nothing to existing databases.
     ///
-    /// The seeded set is the transcription-off default (so no audio model is
-    /// downloaded or loaded at boot) plus the image/video generation model
-    /// lists (so the Settings GUI model pickers, which read the raw snapshot
-    /// fields, are populated on fresh installs). The active selection is
-    /// per-user (see `crate::users`), not a config field.
+    /// The seeded set is the image/video generation model lists (so the
+    /// Settings GUI model pickers, which read the raw snapshot fields, are
+    /// populated on fresh installs). The active selection is per-user (see
+    /// `crate::users`), not a config field. The transcription-off row is not the
+    /// seed's: catalog `69` writes it on every store open that never wrote it,
+    /// so it is present on both lanes.
     ///
     /// This test drives the real boot chain end-to-end instead of hand-picking
     /// `fresh` values: the discriminator probe (`config_db_is_fresh` — the
@@ -2145,7 +2145,7 @@ mod tests {
                     "bytedance/seedance-2.0-mini\nminimax/hailuo-3".to_string()
                 ),
             ],
-            "a fresh config database must be seeded with the fresh-install defaults"
+            "a fresh config database must hold catalog 69's transcription row plus the fresh-install defaults"
         );
         // Manager and worker share the same default model, so the two seed
         // passes collapse into a single routing row.
@@ -2168,9 +2168,13 @@ mod tests {
         seed_fresh_install_defaults_from_flag(&existing_store)
             .await
             .unwrap();
-        assert!(
-            existing_store.get_all_kv().await.unwrap().is_empty(),
-            "an existing config database must receive zero writes"
+        assert_eq!(
+            existing_store.get_all_kv().await.unwrap(),
+            vec![(
+                "audio_transcription_use_local".to_string(),
+                "false".to_string()
+            )],
+            "an existing config database receives only catalog 69's transcription row; the seed adds nothing"
         );
         assert!(
             existing_store

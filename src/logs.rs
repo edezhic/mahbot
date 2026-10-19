@@ -1932,11 +1932,44 @@ mod tests {
 
     /// Boot-time refusal: a logs store whose main DB file is corrupt is never
     /// quarantined or recreated — `LogStore::open` errors with a `StoreRefusal`
-    /// and leaves the file byte-for-byte as it was.
+    /// naming its integrity check and leaves the file byte-for-byte as it was.
+    ///
+    /// The open only scans when the start has a reason for it (see
+    /// `db::open_present_store`); here the reason is one catalog entry still to
+    /// apply — an install one migration behind — which is the deterministic
+    /// stand-in for a start that is not an ordinary clean one. The ledger keeps
+    /// its other rows, so the product-schema gate passes and the scan is what
+    /// refuses.
     #[tokio::test]
     async fn test_log_store_open_refuses_corrupt_store() {
         let tmp = seeded_closed_store().await;
         let root = tmp.path();
+
+        let pending = crate::db::migrations::MIGRATIONS
+            .iter()
+            .rev()
+            .find(|migration| migration.target == crate::db::migrations::TargetDb::Logs)
+            .expect("the logs catalog has entries")
+            .id;
+        // Put the store one entry behind, then hand it off clean again (the
+        // checkpoint keeps the journal empty, so the pending catalog entry is the
+        // one reason left).
+        {
+            let store = LogStore::open(root).await.expect("reopen healthy store");
+            store
+                .conn
+                .execute(
+                    &format!("DELETE FROM schema_migrations WHERE id = '{pending}'"),
+                    (),
+                )
+                .await
+                .expect("record the newest logs migration as unapplied");
+            store
+                .conn
+                .checkpoint_ungated()
+                .await
+                .expect("checkpoint the fixture store");
+        }
 
         // Corrupt a b-tree page in the main DB file (zero page 2; the header
         // page 1 stays intact so the file still passes the shape check).
@@ -1950,9 +1983,15 @@ mod tests {
         let err = LogStore::open(root)
             .await
             .expect_err("a corrupt store must be refused, not recreated");
+        let refusal = err
+            .downcast_ref::<crate::db::StoreRefusal>()
+            .unwrap_or_else(|| panic!("expected a StoreRefusal, got: {err:#}"));
         assert!(
-            err.downcast_ref::<crate::db::StoreRefusal>().is_some(),
-            "expected a StoreRefusal, got: {err:#}"
+            refusal
+                .reason
+                .contains("integrity check cannot read a table"),
+            "the warranted scan, not an earlier gate, must be what refuses: {}",
+            refusal.reason
         );
         assert_eq!(
             std::fs::read(&db_path).expect("read db file"),

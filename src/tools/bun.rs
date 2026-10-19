@@ -1,15 +1,15 @@
 //! Managed bun runtime (JS/TS runtime, <https://bun.sh>) — installed in bun's
-//! OWN standard user directory (`~/.bun/bin`) and brought to the newest release
-//! on every product start — no version comparison, no look at what is already
-//! there. Silent: there is no consent flow (agents invoke `bun` through the
-//! Shell tool, and the product's own tools spawn it by absolute path).
+//! OWN standard user directory (`~/.bun/bin`). On every product start its
+//! installed version is compared with the newest release and the runtime is
+//! downloaded only when the two differ (a copy that is absent or not executable
+//! is installed straight away). Silent: there is no consent flow (agents invoke
+//! `bun` through the Shell tool, and the product's own tools spawn it by
+//! absolute path).
 
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
 use std::process::Stdio;
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
 use tokio::process::Command;
 
 /// GitHub repo whose releases host the bun runtime (single source of truth).
@@ -20,6 +20,11 @@ const BUN_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for a bun release download (zips are ~30–90 MB).
 const BUN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Timeout for the local `bun --version` probe. A healthy runtime answers in
+/// milliseconds; the bound only keeps a hung copy from holding the start-time
+/// management task.
+const BUN_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for the macOS AVX2 `sysctl` probe.
 #[cfg(target_os = "macos")]
@@ -46,6 +51,32 @@ pub(crate) fn bun_binary_path() -> Option<PathBuf> {
     crate::util::managed_bin::bun_bin_dir()
         .map(|d| d.join(bun_file_name()))
         .filter(|p| crate::util::is_executable(p))
+}
+
+/// The installed copy's version, from `bun --version`. `None` means the copy is
+/// absent or unusable — it cannot be spawned, times out, exits non-zero or prints
+/// no parseable version — which is exactly the "needs (re)install" answer the
+/// start-time policy takes.
+async fn installed_version() -> Option<semver::Version> {
+    let path = bun_binary_path()?;
+    let mut cmd = Command::new(path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    cmd.arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(BUN_VERSION_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .and_then(crate::util::managed_bin::parse_version_token)
 }
 
 /// Bun release-asset platform tag, e.g. `darwin-x64` or `linux-x64-musl`.
@@ -208,12 +239,17 @@ async fn shasums256_hash(
 }
 
 /// Bring the runtime's own directory (`~/.bun/bin`) up to the newest bun
-/// release: resolve the tag, download this platform's asset, verify it against
-/// the published `SHASUMS256.txt` hash, extract the single binary and place it.
-/// Returns the installed path. Every failure message is path-free and URL-free
-/// (see [`crate::util::managed_bin::download_reason`]), because it is recorded
+/// release: take the tag (the one the caller resolved, or — for an absent copy,
+/// which has no version to compare — the newest release's own), download this
+/// platform's asset, verify it against the published `SHASUMS256.txt` hash,
+/// extract the single binary and place it. Returns the installed path. Called
+/// only when the installed copy differs from the newest release (a missing or
+/// unusable copy included). Every failure message is path-free and URL-free (see
+/// [`crate::util::managed_bin::download_reason`]), because it is recorded
 /// verbatim.
-async fn install_latest() -> Result<PathBuf, String> {
+async fn install_latest(
+    release: Option<crate::util::managed_bin::Release>,
+) -> Result<PathBuf, String> {
     use crate::util::http::{DownloadSizeCheck, build_download_client, download_verified};
 
     // The destination is resolved before anything is fetched: an unresolvable home
@@ -221,8 +257,13 @@ async fn install_latest() -> Result<PathBuf, String> {
     let dest = crate::util::managed_bin::bun_bin_dir()
         .ok_or_else(|| "bun install dir unavailable (home not resolvable)".to_string())?
         .join(bun_file_name());
-    let tag =
-        crate::util::managed_bin::fetch_latest_tag(BUN_RELEASE_REPO, BUN_RELEASE_TIMEOUT).await?;
+    let tag = match release {
+        Some(release) => release.tag,
+        None => {
+            crate::util::managed_bin::fetch_latest_tag(BUN_RELEASE_REPO, BUN_RELEASE_TIMEOUT)
+                .await?
+        }
+    };
     let asset = format!("bun-{}.zip", bun_asset_name().await?);
     let url = format!("https://github.com/{BUN_RELEASE_REPO}/releases/download/{tag}/{asset}");
     let client = build_download_client(BUN_DOWNLOAD_TIMEOUT)
@@ -261,16 +302,19 @@ async fn install_latest() -> Result<PathBuf, String> {
 }
 
 /// Spawned one-shot task: install the product's own bun runtime straight away
-/// when it is missing, else bring it to the newest release once the boot has
-/// settled — whatever sits in the runtime's own directory (`~/.bun/bin`) is
-/// always replaced, with no version comparison and no look at what is already
-/// there. The shared shape and its failure levels live in
+/// when it is absent or not executable, else check its version against the
+/// newest release once the boot has settled and bring it up to date only when
+/// the two differ. The shared shape and its failure levels live in
 /// [`crate::util::managed_bin::install_on_start`].
 pub async fn run_bun_management() {
     crate::util::managed_bin::install_on_start(
         "bun",
         || bun_binary_path().is_some(),
-        install_latest(),
+        async || installed_version().await,
+        async || {
+            crate::util::managed_bin::latest_release(BUN_RELEASE_REPO, BUN_RELEASE_TIMEOUT).await
+        },
+        async |release| install_latest(release).await,
     )
     .await;
 }

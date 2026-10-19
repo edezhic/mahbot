@@ -5,26 +5,26 @@
 //! This module is the **only** audio transcription path — the previous
 //! API-based transcriber has been removed.  When the model is
 //! available, inference runs fully locally with Qwen3-ASR-0.6B.  The model
-//! (~1.88 GB BF16 safetensors) is downloaded on first boot to
+//! (~1.88 GB BF16 safetensors) is downloaded on first use to
 //! `~/.mahbot/models/qwen3-asr-0.6b/` (in the background — see below) and
 //! memory-mapped by the `qwen-asr` crate — zero-copy weight loading with
 //! minimal RSS overhead.
 //!
 //! # Boot strategy
 //!
-//! The boot path never waits for the model: [`spawn_background_init_if_enabled`]
-//! kicks the load-or-download chain off as a background task after the config
-//! store is open (so `audio_transcription_use_local` is authoritative), and the
-//! app + background services start regardless. A voice message that arrives
-//! before the background load completes gets the icon-only annotation (the
-//! load typically finishes within the first seconds of boot — the ~4 s model
-//! load runs concurrently with the rest of startup).
+//! Boot never preloads the recogniser. The model is loaded by the first
+//! operation that needs it — the first voice message, the voice stack's own
+//! demand ([`crate::audio::voice`]), or the Settings toggle that turns the
+//! setting on. [`ensure_loaded`] is that awaited "make sure it is loaded": with
+//! the weights already on disk (the ordinary case) it loads them (~4 s), or waits
+//! out the cache load a voice press already started; otherwise it kicks the
+//! background download retry loop and reports that the model is not ready yet.
 //!
 //! # Download strategy
 //!
 //! Files are SHA256-verified **once, at download time** (the streaming
-//! `download_verified` hasher) — there is no per-boot re-verification of the
-//! ~1.9 GB model (that was ~4.4 s of the awaited boot path). A silently
+//! `download_verified` hasher) — there is no per-use re-verification of the
+//! ~1.9 GB model (that was ~4.4 s of the old awaited boot path). A silently
 //! corrupted cache is therefore caught at load time instead: `QwenCtx::load`
 //! returns `None` and the init falls through to the download+verify recovery
 //! loop. Note the load is mmap-based, so partial corruption can survive the
@@ -62,7 +62,7 @@ use anyhow::{Context, Result};
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -151,6 +151,16 @@ const DOWNLOAD_RETRY_BASE_SECS: u64 = 5;
 /// Maximum number of download retry attempts.
 const MAX_DOWNLOAD_RETRIES: u32 = 12;
 
+/// How often a caller that needs the recogniser checks whether an in-flight load
+/// has settled ([`ensure_loaded`]).
+const LOAD_WAIT_POLL: Duration = Duration::from_millis(100);
+
+/// The longest a caller waits for a load already in flight. Only a cache load is
+/// waited on ([`ensure_loaded`]), and a cache read of the 1.88 GB of weights takes
+/// seconds even from a cold disk; the bound is far below a download's own
+/// ([`MODEL_DOWNLOAD_TIMEOUT`]) so that case can never be waited out.
+const LOAD_WAIT_LIMIT: Duration = Duration::from_mins(2);
+
 // ── State machine ─────────────────────────────────────────────────────
 
 /// Global singleton handle — `None` until loaded.
@@ -178,6 +188,32 @@ static SHARED_MODEL: Mutex<Option<Arc<qwen_asr::context::QwenModel>>> = Mutex::n
 /// auto-retry and the explicit GUI retry
 /// ([`VoiceCommand::RetryModelLoading`]) are the only recovery knobs.
 static STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
+
+/// True while the loader in [`STATE`] is downloading rather than loading a cache
+/// — set for the whole run of [`download_retry_loop`], which is entered exactly
+/// when there is no cache to load (or the cache on disk would not load).
+///
+/// A caller waiting for `Loading` stops waiting the moment this is set
+/// ([`wait_until_settled`]): a cache read takes seconds, a download takes
+/// minutes, and whoever just spoke gets an answer either way.
+static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`DOWNLOADING`] for the duration of a download, however it ends — panic
+/// or cancellation included.
+struct DownloadPhase;
+
+impl DownloadPhase {
+    fn enter() -> Self {
+        DOWNLOADING.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for DownloadPhase {
+    fn drop(&mut self) {
+        DOWNLOADING.store(false, Ordering::Release);
+    }
+}
 
 /// Atomically store a ready transcriber and transition state to [`ModelState::Ready`].
 fn set_transcriber_ready(tc: QwenLocalTranscriber) {
@@ -210,9 +246,9 @@ pub struct QwenLocalTranscriber {
 impl QwenLocalTranscriber {
     /// Load the model from an explicit directory path.
     ///
-    /// Unlike [`try_init_from_cache`](super::try_init_from_cache), this does
-    /// not resolve the directory via [`crate::audio::models_subdir`] and
-    /// therefore does not depend on the CONFIG storage root being set.
+    /// Unlike [`ensure_loaded`], this does not resolve the directory via
+    /// [`crate::audio::models_subdir`] and therefore does not depend on the
+    /// CONFIG storage root being set.
     fn try_load_from(dir: &Path) -> Option<Self> {
         let dir_str = dir.to_string_lossy().to_string();
         let mut ctx = qwen_asr::context::QwenCtx::load(&dir_str)?;
@@ -272,8 +308,11 @@ impl QwenLocalTranscriber {
 /// A shutdown guard races against the inference so that a stalled model
 /// cannot block pipeline exit.
 ///
-/// Returns an error if the local model is unavailable; the caller annotates
-/// the message with just the audio-transcription icon combo on failure.
+/// Returns an error if the local model cannot be loaded — a cache load already
+/// in flight is waited out, while a download (this call's own or another's) and
+/// a terminal load failure are reported, distinctly, rather than blocked on or
+/// mistaken for each other; the caller annotates the message with just the
+/// audio-transcription icon combo on failure.
 pub async fn transcribe_file_async(path: &Path, inference_timeout: Duration) -> Result<String> {
     let owned = path.to_owned();
 
@@ -286,6 +325,11 @@ pub async fn transcribe_file_async(path: &Path, inference_timeout: Duration) -> 
     if samples.is_empty() {
         anyhow::bail!("Audio file is empty after decoding");
     }
+
+    // Nothing preloads the recogniser: the first operation that needs it loads
+    // it here (the ordinary case is the cached weights already on disk) or waits
+    // out the load the voice press started.
+    anyhow::ensure!(ensure_loaded().await, "{}", unloaded_message());
 
     // Step 2: Clone the inference handle while holding the outer lock,
     // then release the outer lock before running inference.
@@ -757,10 +801,14 @@ async fn download_once(
 /// Panic-safety: a [`ModelLoadGuard`] transitions `Loading → Failed` on drop,
 /// so a panic or cancellation in this task never leaves [`STATE`] stuck in
 /// [`ModelState::Loading`] (which would silently disable transcription until
-/// restart). Since the boot path now drives this loop from a background task,
+/// restart). Since the first-use path drives this loop from a background task,
 /// a stuck-Loading state would be both silent and permanent — Failed is the
 /// honest terminal state.
 async fn download_retry_loop() {
+    // A caller waiting on this load stops waiting from here on: its remaining
+    // work is a download, not a cache read. Declared first so the terminal state
+    // lands before the flag clears.
+    let _download = DownloadPhase::enter();
     // Loading → Failed on drop (panic/cancel safety). No-op on the terminal
     // states set by the success/retry-cap paths below.
     let _guard = ModelLoadGuard::new(&STATE);
@@ -903,7 +951,7 @@ fn cache_present(dir: &Path) -> bool {
 }
 
 /// Shared cache-check + load logic used by both the awaited entry
-/// ([`try_init_from_cache`]) and the background boot init
+/// ([`ensure_loaded`]) and the background load
 /// ([`init_background`]). The caller is responsible for the STATE atomic
 /// guard.
 ///
@@ -936,8 +984,8 @@ async fn try_init_inner(dir: PathBuf) -> bool {
     false
 }
 
-/// Background load-or-download chain for the boot path — spawned by
-/// [`spawn_background_init`] and never awaited by the boot path.
+/// Background load-or-download chain — spawned by [`spawn_background_init`] and
+/// never awaited by its caller.
 ///
 /// STATE must already be `Loading` (the caller owns the `Uninit → Loading`
 /// transition via [`try_lock_init`]). Loads from cache when all files are
@@ -964,8 +1012,10 @@ async fn init_background(dir: PathBuf) {
 /// Returns `None` if the caller acquired the lock and should proceed.
 /// Returns `Some(true)` if already initialised (ModelState::Ready) — caller
 /// should return success.
-/// Returns `Some(false)` if another thread is loading or a previous
-/// attempt failed — caller should return failure.
+/// Returns `Some(false)` when a load is in flight (`Loading`) or a previous
+/// attempt failed (`Failed`) — the caller owns telling those two apart:
+/// [`ensure_loaded`] waits the load out and fails on `Failed`, while
+/// [`spawn_background_init`] treats both as nothing to start.
 fn try_lock_init() -> Option<bool> {
     match STATE.load(Ordering::Acquire) {
         ModelState::Ready => return Some(true),
@@ -984,14 +1034,32 @@ fn try_lock_init() -> Option<bool> {
 /// (resolved via [`crate::audio::models_subdir`], which depends on the CONFIG
 /// storage root).
 ///
-/// Awaits the cache load (fast with warm page cache — no per-boot SHA256), or
-/// spawns a detached background download when the cache is missing/corrupt.
-/// Used by the config-save path ([`crate::providers::recreate_all`]) and the
-/// TTS e2e test; the boot path uses [`spawn_background_init_if_enabled`]
-/// instead so it never waits on the load.
-pub async fn try_init_from_cache() -> bool {
-    if let Some(result) = try_lock_init() {
-        return result;
+/// The awaited "make sure it is loaded": a cache load already in flight is
+/// **waited out**, not reported as unavailable — the voice press starts the load
+/// a moment before the transcription that needs its result, so failing here would
+/// answer the first utterance of a start with "not available" for a load that is
+/// finishing. The wait is bounded ([`LOAD_WAIT_LIMIT`]) and succeeds only on
+/// `Ready`; `Failed` is reported as the load's own failure.
+///
+/// A download is not waited on — it is minutes, not seconds. With no files on
+/// disk this call either spawns the download detached and returns `false`, or,
+/// when another task already has it in flight, returns `false` at once. A cache
+/// that is on disk but will not load falls through to a download, and the wait
+/// ends the moment the loader moves on to it ([`DOWNLOADING`]).
+///
+/// With no load in flight and the files on disk this call claims the load and
+/// awaits it (fast with a warm page cache — no SHA256 re-verification).
+///
+/// Used by every first operation that needs the model:
+/// [`transcribe_file_async`], the TTS e2e test, and the wake-word benchmark
+/// (`voice_pipeline_e2e_test::ensure_voice_models_loaded`).
+pub async fn ensure_loaded() -> bool {
+    if let Some(ready) = try_lock_init() {
+        if ready {
+            return true;
+        }
+        let cached = models_subdir(MODEL_DIR_NAME).is_some_and(|dir| cache_present(&dir));
+        return cached && wait_until_settled(|| STATE.load(Ordering::Acquire)).await;
     }
 
     let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
@@ -1002,13 +1070,40 @@ pub async fn try_init_from_cache() -> bool {
     try_init_inner(dir).await
 }
 
-/// Kick off the local ASR transcriber's load-or-download chain as a background
-/// task (boot path).
+/// The wait itself, over any state source.
 ///
-/// The boot path never awaits this: the app and background services start
-/// regardless, and the ~4 s model load (or a full download when the cache is
-/// missing) runs concurrently with the rest of boot. The load starts here —
-/// it is **not** deferred until the first voice message.
+/// Ends as soon as the answer is known: `Ready`, `Failed`/`Uninit`, a loader that
+/// has moved on to downloading ([`DOWNLOADING`]), or [`LOAD_WAIT_LIMIT`]. The
+/// state machine is a bare atomic with no notification, so a short poll is the
+/// whole mechanism.
+async fn wait_until_settled(mut state: impl FnMut() -> ModelState) -> bool {
+    let deadline = tokio::time::Instant::now() + LOAD_WAIT_LIMIT;
+    loop {
+        match state() {
+            ModelState::Ready => return true,
+            // Failed: the load being waited on ended in failure. Uninit: an
+            // explicit retry reset it, so the load this call waited on is gone.
+            ModelState::Failed | ModelState::Uninit => return false,
+            // Still loading — unless what it is doing from here is a download.
+            ModelState::Loading if DOWNLOADING.load(Ordering::Acquire) => return false,
+            ModelState::Loading => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!("Local transcriber: the model load did not settle in time");
+            return false;
+        }
+        tokio::time::sleep(LOAD_WAIT_POLL).await;
+    }
+}
+
+/// Kick off the local ASR transcriber's load-or-download chain as a background
+/// task.
+///
+/// The caller has already decided the model is needed (the voice stack's
+/// first-use demand, a config save that enables transcription, or an explicit
+/// retry); nothing here is awaited, so the ~4 s model load (or a full download
+/// when the cache is missing) runs off the caller's path. Boot never calls it:
+/// starting the process is not a demand.
 ///
 /// No-op when the transcriber is already ready/loading, or when a previous
 /// attempt failed (Failed is terminal for the automatic lifecycle — only the
@@ -1042,27 +1137,25 @@ pub fn spawn_background_init() {
     });
 }
 
-/// Boot entry: spawn the ASR background init unless `audio_transcription_use_local`
-/// is explicitly `"false"` (the config store must already be loaded — the
-/// caller runs this after [`crate::config::reload_from_db`]).
-pub fn spawn_background_init_if_enabled() {
-    let disabled = crate::config::CONFIG
-        .snapshot()
-        .audio_transcription_use_local
-        .as_deref()
-        == Some("false");
-    if disabled {
-        tracing::debug!(
-            "Local audio transcription is disabled by config — skipping background init"
-        );
-        return;
-    }
-    spawn_background_init();
-}
-
 /// True if the local transcriber is loaded and ready for use.
 pub fn is_loaded() -> bool {
     STATE.is_ready()
+}
+
+/// The transcriber's lifecycle state, for callers that resolve a user-facing
+/// status from it (the voice pipeline never preloads the model, so "not loaded"
+/// alone cannot tell a load in flight from none having started).
+pub(crate) fn state() -> ModelState {
+    STATE.load(Ordering::Acquire)
+}
+
+/// True while the transcriber's load is in flight (`Loading`).
+///
+/// Nothing preloads the model, so "not loaded" alone cannot tell a load in
+/// flight from one that has not started yet: this distinguishes the two for the
+/// voice pipeline's own demand report and for the Settings status.
+pub(crate) fn is_loading() -> bool {
+    state() == ModelState::Loading
 }
 
 /// True if the local transcriber failed to load (terminal `Failed` state).
@@ -1071,6 +1164,17 @@ pub fn is_loaded() -> bool {
 /// [`VoiceStatus::ModelError`] when the shared ASR model is unavailable.
 pub fn is_failed() -> bool {
     STATE.load(Ordering::Acquire) == ModelState::Failed
+}
+
+/// Why [`ensure_loaded`] answered `false`, in the terms the caller reports: a
+/// terminal load failure and a load (or download) still in progress are
+/// different news for someone who just spoke.
+fn unloaded_message() -> &'static str {
+    if is_failed() {
+        "the local speech model failed to load (the loader logged why)"
+    } else {
+        "the local speech model is still loading"
+    }
 }
 
 /// Clone the shared Qwen3-ASR model Arc for encoder reuse by the wake-word
@@ -1410,5 +1514,30 @@ mod tests {
         std::fs::write(&path, b"this is not an mp3 file at all").unwrap();
         let result = decode_audio_to_mono_f32(&path);
         assert!(result.is_err(), "Non-MP3 data should fail to decode");
+    }
+
+    // ── First-use load wait ─────────────────────────────────────────────
+
+    /// A load in flight is waited out and reported by the state it settles on:
+    /// `Ready` as loaded, `Failed` as the load's own failure. The voice press
+    /// starts the load a moment before the transcription that needs it, and
+    /// treating that moment as "not available" is exactly the first-utterance
+    /// failure this wait exists to prevent.
+    #[tokio::test]
+    async fn an_in_flight_load_is_waited_out() {
+        for (settled, loaded) in [(ModelState::Ready, true), (ModelState::Failed, false)] {
+            let state = Arc::new(AtomicModelState::new(ModelState::Loading));
+            let settling = state.clone();
+            let load = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                settling.store(settled, Ordering::Release);
+            });
+            assert_eq!(
+                wait_until_settled(|| state.load(Ordering::Acquire)).await,
+                loaded,
+                "a load settling on {settled:?} must be reported as loaded={loaded}"
+            );
+            load.await.unwrap();
+        }
     }
 }

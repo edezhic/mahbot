@@ -1299,39 +1299,24 @@ fn ensure_voice_models_loaded() -> Result<(), String> {
         return Ok(());
     }
 
-    // Await the shared transcriber load.  The benchmark runs inside a tokio
+    // Await the shared transcriber load, which also waits out a load another
+    // path started.  The benchmark runs inside a tokio
     // spawn_blocking task, so a runtime handle is usually present; fall back to
     // a fresh current-thread runtime otherwise (same pattern as
     // `faph_download_file`).
     let loaded = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.block_on(crate::audio::local_transcriber::try_init_from_cache())
+        handle.block_on(crate::audio::local_transcriber::ensure_loaded())
     } else {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("cannot build transcriber-init runtime: {e}"))?;
-        rt.block_on(crate::audio::local_transcriber::try_init_from_cache())
+        rt.block_on(crate::audio::local_transcriber::ensure_loaded())
     };
 
     if loaded {
         info!("Shared Qwen3-ASR model loaded for wake-word benchmark");
         return Ok(());
-    }
-
-    // A concurrent boot-path init may own the load — poll briefly before
-    // declaring failure (the load is ~4 s with a warm page cache).
-    if !crate::audio::local_transcriber::is_failed() {
-        for _ in 0..75 {
-            // 15 s of 200 ms polls
-            if crate::audio::local_transcriber::is_loaded() {
-                info!("Shared Qwen3-ASR model loaded for wake-word benchmark (concurrent init)");
-                return Ok(());
-            }
-            if crate::audio::local_transcriber::is_failed() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
     }
 
     Err(

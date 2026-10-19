@@ -290,16 +290,27 @@ mod tests {
             "set_kv should overwrite existing key"
         );
 
-        // 4. get_all with multiple items (sorted by key)
+        // 4. get_all with multiple items (sorted by key). Only the keys this
+        // test owns are pinned — migrations seed config rows of their own, and
+        // the ordering is checked over the whole list.
         store.set_kv("beta", "second").await.unwrap();
         let all = store.get_all_kv().await.unwrap();
+        let mine: Vec<(String, String)> = all
+            .iter()
+            .filter(|(k, _)| k == "alpha" || k == "beta")
+            .cloned()
+            .collect();
         assert_eq!(
-            all,
+            mine,
             vec![
                 ("alpha".to_string(), "updated".to_string()),
                 ("beta".to_string(), "second".to_string()),
             ],
-            "get_all_kv should return all pairs sorted by key"
+            "get_all_kv should return this test's pairs in key order"
+        );
+        assert!(
+            all.windows(2).all(|w| w[0].0 <= w[1].0),
+            "get_all_kv should return pairs sorted by key"
         );
 
         // 5. delete
@@ -315,8 +326,13 @@ mod tests {
 
         // 8. remaining item still present
         let all = store.get_all_kv().await.unwrap();
+        let mine: Vec<(String, String)> = all
+            .iter()
+            .filter(|(k, _)| k == "alpha" || k == "beta")
+            .cloned()
+            .collect();
         assert_eq!(
-            all,
+            mine,
             vec![("beta".to_string(), "second".to_string())],
             "only the undeleted item should remain"
         );

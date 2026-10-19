@@ -200,7 +200,7 @@ static REFUSAL_ROUNDS: RoundCounter = RoundCounter::new();
 ///
 /// `store` names the logical store; `db_path` is the main file actually checked
 /// — the path of the connection that runs the checkpoint ([`OwnConnection::db_path`]):
-/// the writing connection for the boot-time repairs, the store's maintenance
+/// the writing connection for the boot repair, the store's maintenance
 /// connection for the periodic round — and it keys the count, so a probe of
 /// another file — the boot rebuild's temp copy — never consumes this one's
 /// first-refusal slot. `root` is the storage root the block is filed under

@@ -103,7 +103,9 @@
 //! `self_update::run_cargo_with_timeout` — an update of a downloaded copy runs no
 //! cargo at all); that update's host probes (`self_update::host_probe`: `sw_vers` or
 //! `getconf`, Windows answering from the running system and spawning nothing); the
-//! replacement instance (`self_update::spawn_new_instance_from`); the
+//! replacement instance (`self_update::spawn_new_instance_from`); the managed bun
+//! runtime's version probe (`tools::bun::installed_version`) — the runtime's own
+//! `--version`, which decides whether a download is due at all; the
 //! browser-automation CLI (`tools::chrome_daemon::cli_probe`, `cli_version`,
 //! `tasklist_has`, `register_native_host`, `run_cli`) with the shared
 //! `chrome::spawn::spawn_cli` and the browser itself
@@ -622,7 +624,7 @@ mod tests {
     /// The number of spawn sites the sweep must see — the module docs' inventory,
     /// counted. A site that constant and that inventory do not account for fails
     /// the sweep, and a scan that stopped reading the tree finds far fewer.
-    const SPAWN_SITES: usize = 15;
+    const SPAWN_SITES: usize = 16;
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()

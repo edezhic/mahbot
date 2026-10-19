@@ -229,7 +229,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     // Run the idempotent per-store post-open hooks on the shared connection,
     // in a defined order, before exposing the store cells.
     let board = crate::pipeline::board::BoardStore { conn: conn.clone() };
-    board.after_open(&root).await?;
+    board.after_open().await?;
     let users = crate::users::UserStore { conn: conn.clone() };
     users.ensure_admin_user().await?;
 
@@ -1724,7 +1724,7 @@ impl Connection {
     ///
     /// A reclaiming checkpoint must pass
     /// [`crate::db::shrink_gate::shrink_allowed`] first — the checkpoint rounds
-    /// and the boot-time repairs do (see [`crate::db::shrink_gate`]).
+    /// and the boot repair do (see [`crate::db::shrink_gate`]).
     pub(crate) async fn checkpoint_ungated(&self) -> anyhow::Result<CheckpointOutcome> {
         self.run_checkpoint(CheckpointMode::Truncate).await
     }
@@ -1765,7 +1765,7 @@ impl Connection {
 /// The store's own upkeep reads — the reads the store issues to itself.
 ///
 /// The store's record of changes (CDC), the compaction the exit round and the
-/// boot-time repairs run, the search-index repair and its probes, and the
+/// boot repair run, the search-index repair and its probes, and the
 /// pre-shrink probe those callers ask of the writing connection are all upkeep:
 /// they judge or maintain the store itself rather than serve a caller, and the
 /// compaction and the repair must not run against a reader's reading position
@@ -2997,8 +2997,7 @@ async fn is_fts_index(conn: &Connection, index: &str) -> bool {
 }
 
 /// Name of the ticket-title FTS index. This const pair is the single shared
-/// known-good copy used by [`crate::db::ensure_fts_index`], the boot repair
-/// ([`crate::db::repair_ticket_title_fts_if_corrupt`]), and the runtime repair
+/// known-good copy used by [`crate::db::ensure_fts_index`] and the repair
 /// ([`crate::db::repair_ticket_title_fts_runtime`]) — imported by
 /// `crate::pipeline::board::after_open`. The append-only migrations catalog
 /// independently carries its own raw-SQL schema entry (by design); the const
@@ -3007,10 +3006,10 @@ pub(crate) const TICKETS_FTS_INDEX_NAME: &str = "idx_tickets_title_fts";
 
 /// Known-good DDL for the ticket-title FTS index. The const pair is the single
 /// shared known-good copy used by [`crate::db::ensure_fts_index`] and the
-/// boot/runtime repairs — never rebuilt from `sqlite_master`, whose stored DDL
-/// for a corrupt index is untrusted. It is imported by
-/// `crate::pipeline::board::after_open`. The append-only migrations catalog
-/// carries its own raw-SQL schema entry (by design).
+/// repair — never rebuilt from `sqlite_master`, whose stored DDL for a corrupt
+/// index is untrusted. It is imported by `crate::pipeline::board::after_open`.
+/// The append-only migrations catalog carries its own raw-SQL schema entry (by
+/// design).
 pub(crate) const TICKETS_FTS_INDEX_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
 USING fts (title) WITH (tokenizer = 'ngram')";
 
@@ -3030,19 +3029,20 @@ async fn title_fts_match_probe(conn: &Connection) -> anyhow::Result<()> {
         .map(|_: Option<()>| ())
 }
 
-/// Boot-time corruption probe for the ticket-title FTS index. Returns
-/// `Some(evidence)` when the corruption signature is detected (quick_check
-/// problems attributable to the index, or a failing MATCH probe), `None`
-/// when healthy.
-async fn detect_ticket_title_fts_corruption(
+/// Corruption evidence for the ticket-title FTS index, from the `quick_check`
+/// rows a caller already read plus the MATCH probe: `Some(evidence)` when the
+/// corruption signature is present, `None` when healthy. It reads only the
+/// probe query — a caller that has just scanned the store never scans it
+/// again — and the probe is what reaches the MATCH-level breakage `quick_check`
+/// cannot see.
+async fn ticket_title_fts_evidence(
     conn: &Connection,
-    index: &str,
+    problems: &[String],
 ) -> anyhow::Result<Option<String>> {
-    let problems = conn.quick_check_problems().await?;
     let fts_problems: Vec<&str> = problems
         .iter()
         .map(String::as_str)
-        .filter(|p| names_ticket_title_fts(p, index))
+        .filter(|p| names_ticket_title_fts(p, TICKETS_FTS_INDEX_NAME))
         .collect();
     if !fts_problems.is_empty() {
         return Ok(Some(fts_problems.join("; ")));
@@ -3122,8 +3122,7 @@ async fn verify_rebuilt_ticket_title_fts(conn: &Connection, index: &str) -> anyh
 }
 
 /// Drop+CREATE and post-rebuild verification results, returned for callers
-/// that need to branch on them (the runtime recovery); the boot path ignores
-/// them (all outcomes are logged here, never propagated — fail-safe).
+/// that need to branch on them (the runtime recovery).
 struct TicketTitleFtsRebuildOutcome {
     drop_create: anyhow::Result<()>,
     verified: anyhow::Result<()>,
@@ -3135,24 +3134,19 @@ struct TicketTitleFtsRebuildOutcome {
 /// already threaded in. Mirrors `drop_create_index_fallback`'s transactional
 /// DROP+CREATE: a failed CREATE rolls the DROP back, leaving the original
 /// index for operator review; ticket rows are never touched. Then verify
-/// (filtered quick_check, index presence, MATCH smoke on a known title) and,
-/// on request (`reclaim_after_rebuild`), run a WAL checkpoint — successful
-/// checkpointing is the observable that the corruption is actually gone. All
+/// (filtered quick_check, index presence, MATCH smoke on a known title). All
 /// outcomes logged, never propagated (fail-safe).
 ///
-/// `reclaim_after_rebuild` controls the post-rebuild checkpoint: `true` (boot
-/// path, pre-serve, no live writers) runs a TRUNCATE checkpoint so a clean store
-/// handoff is observable. `false` skips the internal checkpoint for either of
-/// two reasons — the runtime caller re-checkpoints itself right after in the
-/// failed attempt's mode (a second back-to-back PASSIVE here would be redundant,
-/// and TRUNCATE under live writers is the corruption vector the periodic loop
-/// deliberately avoids), or the boot path's pre-shrink gate refused the
-/// reclaiming checkpoint.
+/// No reclaiming checkpoint is issued here: a rebuild reached from a live round
+/// must not TRUNCATE under the writers the periodic loop deliberately keeps it
+/// away from, and the boot repair's own start leaves its checkpoint to the exit
+/// path like every other write of that start. The rebuilt index's pages reach
+/// the main file on the next checkpoint round; committed transactions are
+/// durable without it.
 async fn rebuild_ticket_title_fts(
     conn: &Connection,
     index: &str,
     ddl: &str,
-    reclaim_after_rebuild: bool,
 ) -> TicketTitleFtsRebuildOutcome {
     let quoted = index.replace('"', "\"\"");
     // Transactional DROP+CREATE: a failed CREATE rolls the DROP back via the
@@ -3180,142 +3174,9 @@ async fn rebuild_ticket_title_fts(
             );
         }
     }
-    if reclaim_after_rebuild {
-        match conn.checkpoint_ungated().await {
-            Ok(o) if o.is_complete() => {
-                info!(
-                    index,
-                    checkpointed_frames = o.checkpointed_frames,
-                    "post-repair WAL checkpoint complete — corruption cleared"
-                );
-            }
-            Ok(o) => {
-                warn!(
-                    index,
-                    busy = o.busy,
-                    log_frames = o.log_frames,
-                    checkpointed_frames = o.checkpointed_frames,
-                    "post-repair WAL checkpoint incomplete"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    index,
-                    error = %e,
-                    "post-repair WAL checkpoint failed"
-                );
-            }
-        }
-    }
     TicketTitleFtsRebuildOutcome {
         drop_create,
         verified,
-    }
-}
-
-/// Boot-time detection + repair of corruption localized to the ticket-title
-/// FTS index (incident: recurring "FTS Drop: transaction already committed" /
-/// "non-index page" panics and a WAL that never checkpoints). Runs from
-/// `BoardStore::after_open` on the consolidated connection, after
-/// `ensure_fts_index` and after the class-B open repair (which now vetoes
-/// FTS-shaped indexes and delegates here). Idempotent; ticket rows untouched.
-///
-/// Fail-safe: detection and rebuild are separate `catch_unwind` boundaries
-/// (a panicking turso op re-enters the caller via `run_detached`'s
-/// `resume_unwind`). A panicking probe is itself corruption evidence — the
-/// rebuild is still attempted; a panicking rebuild is logged loudly and boot
-/// continues. The instance must never crash-loop over this path, and detection
-/// must never be silently skipped.
-///
-/// The rebuild drops and recreates the index, so it holds the store's readers
-/// off exactly as the runtime repair does ([`Connection::quiet_readers`]; see
-/// [`repair_ticket_title_fts_runtime`] for why a reader must not be in flight
-/// under an index move). At this point in the open nothing has read yet, so the
-/// guard is free; a reader that does not fall idle in time leaves the repair to
-/// the runtime round (`Deferred` there), which is where a boot that cannot take
-/// the store quiet also leaves it.
-///
-/// `store` and `root` are the refusal record's identity and artifact directory:
-/// the post-rebuild TRUNCATE is a reclaiming checkpoint, so it passes the
-/// pre-shrink gate first (see [`crate::db::shrink_gate`]), and a refusal means
-/// the rebuild runs without shrinking. The probe necessarily runs BEFORE the
-/// DROP+CREATE rebuild (the gate guards the checkpoint at the end of it), so a
-/// refusal blocks a round in which no reclaiming checkpoint may ever be issued
-/// (the rebuild itself may then fail or find nothing to do), and the page count
-/// it judges can be one rebuild older than the checkpoint it guards — the
-/// documented pre-check window, with the refusal cost being one conservative
-/// skipped shrink.
-pub(crate) async fn repair_ticket_title_fts_if_corrupt(
-    conn: &Connection,
-    index: &str,
-    ddl: &str,
-    store: &'static str,
-    root: Option<&Path>,
-) {
-    let detected = AssertUnwindSafe(detect_ticket_title_fts_corruption(conn, index))
-        .catch_unwind()
-        .await;
-    let evidence = match detected {
-        Ok(Ok(evidence)) => evidence,
-        Ok(Err(e)) => {
-            error!(
-                index,
-                error = %e,
-                "ticket-title FTS boot probe failed — boot continues; index left as-is for operator review"
-            );
-            return;
-        }
-        Err(panic) => {
-            warn!(
-                index,
-                panic = %crate::util::panic_message(&panic),
-                "ticket-title FTS boot probe panicked — treating as corruption evidence, attempting the rebuild"
-            );
-            Some("detection probe panicked".to_string())
-        }
-    };
-    let Some(evidence) = evidence else {
-        info!(
-            index,
-            "ticket-title FTS boot probe: index healthy — no repair"
-        );
-        return;
-    };
-    warn!(
-        index,
-        evidence = %evidence,
-        "ticket-title FTS corruption signature detected at boot — rebuilding the index (ticket rows untouched)"
-    );
-    // The rebuild drops and recreates the index: take the readers out of service
-    // for it (see this function's doc) and keep them out through the
-    // post-rebuild checkpoint, whose TRUNCATE a held reading position would
-    // answer busy. A reader that does not fall idle in time leaves the repair to
-    // the runtime round rather than running it under a live reader.
-    let Some(_quiet) = conn.quiet_readers().await else {
-        warn!(
-            index,
-            "the store's readers did not fall idle — leaving the index as it is; the periodic \
-             round retries this repair"
-        );
-        return;
-    };
-    // The post-rebuild TRUNCATE is the reclaiming checkpoint this gate
-    // protects; a refusal means the rebuild runs without shrinking.
-    let reclaim_after_rebuild = crate::db::shrink_gate::shrink_allowed(conn, store, root).await;
-    let rebuilt = AssertUnwindSafe(rebuild_ticket_title_fts(
-        conn,
-        index,
-        ddl,
-        reclaim_after_rebuild,
-    ))
-    .catch_unwind()
-    .await;
-    if let Err(panic) = rebuilt {
-        error!(
-            index,
-            panic = %crate::util::panic_message(&panic),
-            "ticket-title FTS boot repair panicked — boot continues; index left as-is for operator review"
-        );
     }
 }
 
@@ -3353,18 +3214,21 @@ impl TicketTitleFtsRuntimeRepair {
     }
 }
 
-/// The periodic round's variant of the boot-time ticket-title FTS repair: invoked
-/// after a first attempt that failed or was answered busy. Runs the same boot
-/// primitives (see [`repair_ticket_title_fts_if_corrupt`]) — detection and the
-/// drop+recreate rebuild — via its own wrapper so the post-rebuild checkpoint
-/// mode and the caller-visible outcome can differ from the boot path.
+/// The ticket-title FTS repair, as the periodic round reaches it: the round's
+/// recovery step once a checkpoint attempt failed or was answered busy (see
+/// [`crate::db::checkpoint::periodic_checkpoint_and_verify`]). That round runs its
+/// own `quick_check` for verification and hands the result to no repair, so this
+/// entry point takes the scan it needs. The open's warranted scan reaches the
+/// same repair through [`repair_ticket_title_fts_from_scan`], which shares the
+/// rows it already read.
+///
 /// Execution is synchronous and holds the writing connection, so the store
 /// serves nothing else while the repair runs — acceptable for this rare recovery
 /// path. Its statements are ordinary statements: the per-statement limit applies
 /// to the rebuild exactly as to everything else, and a rebuild that outran it is
 /// cut like any other statement. The `sqlite_master` presence check
 /// first makes stores that carry no ticket-title FTS index (e.g. logs.db)
-/// no-ops. Panics use the same `catch_unwind` discipline as the boot path.
+/// no-ops. Panics are caught per probe so one caller can never escape.
 ///
 /// # What else may be in flight
 ///
@@ -3391,11 +3255,56 @@ impl TicketTitleFtsRuntimeRepair {
 pub(crate) async fn repair_ticket_title_fts_runtime(
     conn: &Connection,
 ) -> TicketTitleFtsRuntimeRepair {
+    // Quiet the readers before the scan: a repair deferred here is not paid for
+    // with a full pass over the store.
     let Some(_quiet) = conn.quiet_readers().await else {
         return TicketTitleFtsRuntimeRepair::Deferred(
             "reader connections did not fall idle".to_string(),
         );
     };
+    // Panic-guarded: a panicking probe is itself corruption evidence (boot
+    // precedent) — the rebuild is attempted on it, never escaped.
+    match AssertUnwindSafe(conn.quick_check_problems())
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(problems)) => {
+            repair_ticket_title_fts_from_scan(conn, FtsScan::Problems(problems)).await
+        }
+        Ok(Err(e)) => TicketTitleFtsRuntimeRepair::Failed(format!("detection probe failed: {e}")),
+        Err(panic) => {
+            repair_ticket_title_fts_from_scan(
+                conn,
+                FtsScan::Panicked(format!(
+                    "detection probe panicked: {}",
+                    crate::util::panic_message(&panic)
+                )),
+            )
+            .await
+        }
+    }
+}
+
+/// What FTS detection reads besides its MATCH probe.
+enum FtsScan {
+    /// The `quick_check` rows the caller read — the open's one scan, shared.
+    Problems(Vec<String>),
+    /// The caller's own scan panicked — corruption evidence, so the rebuild is
+    /// attempted on it.
+    Panicked(String),
+}
+
+/// The repair body from a scan the caller owns: the presence check, detection
+/// from `scan` plus the MATCH probe, and the drop+recreate rebuild when the
+/// evidence says so. The open's warranted scan passes the rows it already read,
+/// so that start never scans the store twice.
+///
+/// The callers own the readers: [`repair_ticket_title_fts_runtime`] takes them
+/// out of service first, and the open's call site runs before any reader exists.
+async fn repair_ticket_title_fts_from_scan(
+    conn: &Connection,
+    scan: FtsScan,
+) -> TicketTitleFtsRuntimeRepair {
     // Absent index → nothing to repair (non-domain stores never carry it).
     // Panic-guarded like every probe on this path: a turso panic must become
     // this repair's own `Failed` outcome, never escape to the outer per-store
@@ -3425,32 +3334,33 @@ pub(crate) async fn repair_ticket_title_fts_runtime(
         return TicketTitleFtsRuntimeRepair::NotApplicable;
     }
 
-    let detected = AssertUnwindSafe(detect_ticket_title_fts_corruption(
-        conn,
-        TICKETS_FTS_INDEX_NAME,
-    ))
-    .catch_unwind()
-    .await;
-    let evidence = match detected {
-        // Present and probe-clean → nothing about this attempt was FTS-shaped.
-        Ok(Ok(None)) => return TicketTitleFtsRuntimeRepair::Healthy,
-        Ok(Ok(Some(evidence))) => evidence,
-        Ok(Err(e)) => {
-            return TicketTitleFtsRuntimeRepair::Failed(format!("detection probe failed: {e}"));
+    let evidence = match scan {
+        FtsScan::Panicked(evidence) => evidence,
+        FtsScan::Problems(problems) => {
+            let detected = AssertUnwindSafe(ticket_title_fts_evidence(conn, &problems))
+                .catch_unwind()
+                .await;
+            match detected {
+                // Present and probe-clean → nothing about this attempt was FTS-shaped.
+                Ok(Ok(None)) => return TicketTitleFtsRuntimeRepair::Healthy,
+                Ok(Ok(Some(evidence))) => evidence,
+                Ok(Err(e)) => {
+                    return TicketTitleFtsRuntimeRepair::Failed(format!(
+                        "detection probe failed: {e}"
+                    ));
+                }
+                Err(panic) => format!(
+                    "detection probe panicked: {}",
+                    crate::util::panic_message(&panic)
+                ),
+            }
         }
-        // A panicking probe is itself corruption evidence (boot precedent) —
-        // attempt the rebuild.
-        Err(panic) => format!(
-            "detection probe panicked: {}",
-            crate::util::panic_message(&panic)
-        ),
     };
 
     let rebuilt = AssertUnwindSafe(rebuild_ticket_title_fts(
         conn,
         TICKETS_FTS_INDEX_NAME,
         TICKETS_FTS_INDEX_DDL,
-        false,
     ))
     .catch_unwind()
     .await;
@@ -3532,12 +3442,30 @@ async fn execute_schema_ddl(conn: &Connection, sql: &str) -> anyhow::Result<()> 
 /// [`LOG_DB_NAME`] to `root/db/{LOG_DB_NAME}.db`.
 #[must_use]
 pub(crate) fn store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
-    let stem = if name == LOG_DB_NAME {
+    store_dir(root).join(format!("{}.db", store_stem(name)))
+}
+
+/// The stem of the physical store file a logical store name lives in: only the
+/// logs store is a file of its own, every other name is consolidated into core.
+#[must_use]
+fn store_stem(name: &str) -> &str {
+    if name == LOG_DB_NAME {
         LOG_DB_NAME
     } else {
         CONSOLIDATED_DB_NAME
-    };
-    store_dir(root).join(format!("{stem}.db"))
+    }
+}
+
+/// The migration catalog target of the physical store a logical store name
+/// lives in — [`store_stem`]'s rule read one step on, so the layout decides the
+/// catalog and not a second copy of it.
+#[must_use]
+fn store_target(name: &str) -> migrations::TargetDb {
+    if store_stem(name) == LOG_DB_NAME {
+        migrations::TargetDb::Logs
+    } else {
+        migrations::TargetDb::Core
+    }
 }
 
 /// The store directory of a storage root — where both physical stores live,
@@ -3616,12 +3544,14 @@ pub(crate) fn text_is_actionable_signal(text: &str) -> bool {
 /// nothing). An existing file must pass the file-level shape check
 /// ([`crate::db::wal_guard::classify_store_shape`]) and then open AND carry the
 /// product's own schema, otherwise the call refuses with a [`StoreRefusal`] and
-/// leaves the file exactly as it is. The data-preserving repairs still run on an
-/// opened store; only a repair that *fails* refuses — a condition the repairs
-/// deliberately leave report-only (an unknown quick_check signature) opens the
-/// store exactly as it does today. Per-store `open()` constructors are generated
-/// by [`crate::define_store!`] on top of [`open_consolidated_store`] (which calls
-/// this function for the consolidated file).
+/// leaves the file exactly as it is. The data-preserving repairs run only when
+/// [`open_present_store`] finds a reason for them (an unclean previous end, a
+/// recorded runtime integrity failure, or a pending schema change); only a repair
+/// that *fails* refuses — a condition the repairs deliberately leave report-only
+/// (an unknown quick_check signature) opens the store exactly as it does today.
+/// Per-store `open()` constructors are generated by [`crate::define_store!`] on top
+/// of [`open_consolidated_store`] (which calls this function for the consolidated
+/// file).
 pub(crate) async fn open_store(
     root: &Path,
     name: &'static str,
@@ -3657,14 +3587,51 @@ pub(crate) async fn open_store(
 }
 
 /// Open an existing, shape-valid store: require it to open and to carry the
-/// product's own schema, then run the data-preserving repairs. Every failure is
-/// a refusal — the store is never quarantined, recreated or emptied.
+/// product's own schema, then run the data-preserving repairs **when this start
+/// has a reason for them**. Every failure is a refusal — the store is never
+/// quarantined, recreated or emptied.
+///
+/// # When the integrity scan runs
+///
+/// The scan costs a full pass over the store, so it is not on the path to
+/// readiness on an ordinary start. Three facts warrant it, all read here:
+///
+/// - **The previous run did not end cleanly.** A clean exit checkpoints with
+///   TRUNCATE, which leaves the `-wal` at zero bytes (see
+///   [`crate::db::checkpoint`]); a journal larger than its own header carries
+///   frames — committed work that run wrote but never checkpointed — so the
+///   previous run ended without reaching that checkpoint and left the pair in a
+///   state this start is the first to open since.
+/// - **A runtime integrity check failed.** The periodic round records the failure
+///   and marks the store as owing a scan
+///   ([`crate::db::wal_guard::note_integrity_scan_owed`]) instead of repairing
+///   under live readers, so the next open is where that repair happens, before any
+///   reader exists. A scan that completes every repair clears the marker; one
+///   whose ticket-title FTS rebuild did not complete re-arms it, so the next start
+///   retries ([`run_repairs`]).
+/// - **The catalog still has entries to apply to this store.** This start is
+///   about to write schema DDL into the store (the catalog runs right after this
+///   open, see [`open_consolidated_store`] and [`crate::logs`]), so a store that
+///   is already unreadable must be refused *before* that, and a structural
+///   repair must land before new schema is built on top of it.
+///
+/// Everything else is left to the periodic integrity round
+/// ([`crate::db::checkpoint::periodic_checkpoint_and_verify`]), which runs
+/// every ten minutes and is the one owner of a healthy store's verification.
 async fn open_present_store(
     root: &Path,
     db_path: &Path,
     name: &'static str,
     schema: &str,
 ) -> anyhow::Result<Connection> {
+    // Stat-only, and taken BEFORE the store is opened (the module's lock rule):
+    // the size of the journal the previous run left behind. A journal of its
+    // header alone holds no frames — only a larger one carries work the previous
+    // run never checkpointed.
+    let uncheckpointed_journal =
+        crate::db::wal_guard::wal_size(db_path) > crate::db::wal_guard::WAL_HEADER_BYTES;
+    // Stat-only too: the marker a failed runtime integrity check left behind.
+    let scan_owed = crate::db::wal_guard::integrity_scan_owed(db_path);
     let conn = match open_with_schema(db_path, schema).await {
         Ok(conn) => conn,
         // A resource/permission/lock condition is environmental, never store
@@ -3697,6 +3664,14 @@ async fn open_present_store(
             )
             .into());
         }
+    }
+    // The ledger was read successfully just above, so a failure here is the
+    // engine's and propagates as the open's own error — never as damage.
+    if !uncheckpointed_journal
+        && !scan_owed
+        && !migrations::has_pending(&conn, store_target(name)).await?
+    {
+        return Ok(conn);
     }
     run_repairs(conn, root, db_path, name, schema).await
 }
@@ -3732,10 +3707,22 @@ async fn has_product_schema(conn: &Connection) -> anyhow::Result<bool> {
     Ok(recorded > 0)
 }
 
-/// Run the data-preserving repairs on an opened store. Only outcomes that used
-/// to fall back to moving the store aside and recreating it are refusals now;
-/// every repair that preserves the data keeps handling exactly what it handles
-/// today.
+/// Run the data-preserving repairs on an opened store — the one integrity scan
+/// the open performs, and only when [`open_present_store`] found a reason for it.
+/// Only outcomes that used to fall back to moving the store aside and recreating
+/// it are refusals now; every repair that preserves the data keeps handling
+/// exactly what it handles today.
+///
+/// The scan is taken once and shared: the btree repair classifies its rows and
+/// the ticket-title FTS repair detects from the same ones, so a warranted start
+/// that finds nothing wrong pays for one full scan, never two. A start that does
+/// repair pays for that scan plus the repair's own verification — the FTS rebuild
+/// re-checks the index it just rebuilt (see [`rebuild_ticket_title_fts`]).
+///
+/// It also settles the store's integrity-scan marker: cleared once every repair
+/// the scan owns has completed, and re-armed when the FTS rebuild reported
+/// `Failed` — a MATCH-only breakage `quick_check` cannot see, so the next start
+/// must try again.
 async fn run_repairs(
     conn: Connection,
     root: &Path,
@@ -3743,25 +3730,101 @@ async fn run_repairs(
     name: &'static str,
     schema: &str,
 ) -> anyhow::Result<Connection> {
-    match repair_btree_index_if_desynced(conn, root, db_path, name, schema).await {
-        Ok((RepairOutcome::Unreadable, _conn)) => {
-            Err(StoreRefusal::new(name, db_path, "its integrity check cannot read a table").into())
+    // All problem rows, not just the first: quick_check can surface a named
+    // index desync in one row and overflow-aliasing in another — the
+    // overflow-aliasing veto must hold regardless of row order.
+    let problems = match conn.quick_check_problems().await {
+        Ok(problems) => problems,
+        Err(e) => {
+            // The quick_check itself failed to run — an actionable signal
+            // (resource/permission condition or lock contention) is never a
+            // repair finding; propagate it.
+            if is_actionable_signal(&e) {
+                return Err(e);
+            }
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' quick_check could not run: {e} — unreadable table; the \
+                 store is refused",
+            ));
+            return Err(StoreRefusal::new(
+                name,
+                db_path,
+                "its integrity check cannot read a table",
+            )
+            .into());
         }
-        Ok((_, conn)) => Ok(conn),
-        // A resource/permission/lock condition is environmental, never store
-        // damage: propagate it unwrapped so it is recorded (and shown) as the
-        // condition it is, not as an unusable store.
-        Err(e) if is_actionable_signal(&e) => Err(e),
-        // Only a data-preserving rebuild that could not complete reaches here:
-        // the original family is preserved or quarantined for recovery and the
-        // store is refused, never replaced with an empty one.
-        Err(e) => Err(StoreRefusal::new(
-            name,
-            db_path,
-            format!("the data-preserving rebuild could not be completed: {e:#}"),
-        )
-        .into()),
+    };
+    let (outcome, conn) =
+        match repair_desynced_btree_index(conn, &problems, root, db_path, name, schema).await {
+            Ok((RepairOutcome::Unreadable, _conn)) => {
+                return Err(StoreRefusal::new(
+                    name,
+                    db_path,
+                    "its integrity check cannot read a table",
+                )
+                .into());
+            }
+            Ok((outcome, conn)) => (outcome, conn),
+            // A resource/permission/lock condition is environmental, never store
+            // damage: propagate it unwrapped so it is recorded (and shown) as the
+            // condition it is, not as an unusable store.
+            Err(e) if is_actionable_signal(&e) => return Err(e),
+            // Only a data-preserving rebuild that could not complete reaches here:
+            // the original family is preserved or quarantined for recovery and the
+            // store is refused, never replaced with an empty one.
+            Err(e) => {
+                return Err(StoreRefusal::new(
+                    name,
+                    db_path,
+                    format!("the data-preserving rebuild could not be completed: {e:#}"),
+                )
+                .into());
+            }
+        };
+    // A rebuilt store was created from the old store's recorded DDL, filled by
+    // the row copy and then verified by its own quick_check: nothing the old
+    // file's scan found survives into it, so the FTS half has nothing to detect.
+    if matches!(outcome, RepairOutcome::Migrated) {
+        crate::db::wal_guard::clear_integrity_scan_owed(db_path);
+        return Ok(conn);
     }
+    // The same scan owns the ticket-title FTS index: its own detection reaches a
+    // MATCH-only breakage that `quick_check` cannot see, so the one FTS repair
+    // runs here, from the rows already read — never by scanning again. This is
+    // before any reader exists (they are enabled once the store is final), so no
+    // reader has to be taken out of service for the rebuild. Stores without the
+    // index (logs.db) are a presence-check no-op.
+    let fts = repair_ticket_title_fts_from_scan(&conn, FtsScan::Problems(problems)).await;
+    match &fts {
+        // Silent. `Deferred` is the runtime entry point's own outcome (that is the
+        // one that quietens readers) and cannot occur here.
+        TicketTitleFtsRuntimeRepair::NotApplicable
+        | TicketTitleFtsRuntimeRepair::Healthy
+        | TicketTitleFtsRuntimeRepair::Deferred(_) => {}
+        // Rebuilt and verified: INFO, the level the log store's retention keeps.
+        TicketTitleFtsRuntimeRepair::Rebuilt(_) => info!(
+            db = %name,
+            outcome = %fts.summary(),
+            "ticket-title FTS index rebuilt by the open's integrity scan",
+        ),
+        // A repair that did not complete leaves the store serving a broken
+        // index: that is a finding operators must see, not an INFO line.
+        TicketTitleFtsRuntimeRepair::Failed(_) => error!(
+            db = %name,
+            outcome = %fts.summary(),
+            "ticket-title FTS repair failed during the open's integrity scan",
+        ),
+    }
+    // The scan settled every repair it owns, so the store stops owing one — except
+    // a failed FTS rebuild, which `quick_check` cannot see: that store is marked as
+    // still owing a scan, so the next start retries what could not be completed
+    // here whatever the reason for this scan was.
+    if matches!(&fts, TicketTitleFtsRuntimeRepair::Failed(_)) {
+        crate::db::wal_guard::note_integrity_scan_owed(db_path);
+    } else {
+        crate::db::wal_guard::clear_integrity_scan_owed(db_path);
+    }
+    Ok(conn)
 }
 
 /// Open (or create) the single consolidated domain database file.
@@ -3841,9 +3904,10 @@ enum RepairOutcome {
     Unreadable,
 }
 
-/// Open a raw-DDL fixture store and run the repair half of the existing-store
-/// open (the boot path additionally requires the product-schema ledger, which
-/// these fixtures are built without).
+/// Open a fixture store and run the repair half of the existing-store open,
+/// unconditionally — what `open_present_store` runs when the start warrants the
+/// integrity scan. (The boot path additionally requires the product-schema
+/// ledger, which the raw-DDL fixtures are built without.)
 #[cfg(test)]
 async fn open_and_repair_for_test(
     root: &Path,
@@ -3967,12 +4031,15 @@ async fn snapshot_store_via_engine(
     }
 }
 
-/// Class-B btree-index desync repair: `quick_check` names a specific
-/// non-FTS index → REINDEX in place, DROP+CREATE as the fallback (both
+/// Class-B btree-index desync repair, from the problem rows the open's single
+/// integrity scan produced ([`run_repairs`] owns that scan): `quick_check` names
+/// a specific non-FTS index → REINDEX in place, DROP+CREATE as the fallback (both
 /// validated on the 324MB prod sessions copy — both M>N and M<N desync forms,
-/// survives reopen and TRUNCATE). Returns `Ok(([`RepairOutcome`], conn))`; an
-/// actionable quick_check failure (ENOSPC/EMFILE/permission, or lock
-/// contention) propagates as `Err` — it is a signal, never a repair finding.
+/// survives reopen and TRUNCATE). A problem naming the ticket-title FTS index is
+/// left report-only here (§ "FTS Drop"); the same scan hands FTS detection its
+/// rows right after ([`run_repairs`]). Returns `Ok(([`RepairOutcome`], conn))`:
+/// a scan that cannot run at all, and a problem naming an unreadable table, are
+/// [`run_repairs`]'s refusals — this path observes neither.
 ///
 /// Preconditions are satisfied by construction at boot: single-writer,
 /// exclusive access, and a snapshot (engine-produced `VACUUM INTO`) taken before
@@ -3982,34 +4049,18 @@ async fn snapshot_store_via_engine(
 /// data-preservingly instead (see [`migrate_overflow_aliased_store`]).
 /// Unreadable tables surface as quick_check scan failures ("Invalid page
 /// type"/"short read") and refuse the store.
-async fn repair_btree_index_if_desynced(
+async fn repair_desynced_btree_index(
     conn: Connection,
+    problems: &[String],
     root: &Path,
     db_path: &Path,
     name: &'static str,
     schema: &str,
 ) -> anyhow::Result<(RepairOutcome, Connection)> {
-    // All problem rows, not just the first: quick_check can surface a named
-    // index desync in one row and overflow-aliasing in another — the
-    // overflow-aliasing veto must hold regardless of row order.
-    let problems = match conn.quick_check_problems().await {
-        Ok(p) if p.is_empty() => return Ok((RepairOutcome::NoRepair, conn)),
-        Ok(p) => p,
-        Err(e) => {
-            // The quick_check itself failed to run — an actionable signal
-            // (resource/permission condition or lock contention) is never a
-            // repair finding; propagate it.
-            if is_actionable_signal(&e) {
-                return Err(e);
-            }
-            crate::boot::boot_diagnostic(format!(
-                "store '{name}' quick_check could not run: {e} — unreadable table; the \
-                 store is refused",
-            ));
-            return Ok((RepairOutcome::Unreadable, conn));
-        }
-    };
-    let index = match classify_repair_target(&problems) {
+    if problems.is_empty() {
+        return Ok((RepairOutcome::NoRepair, conn));
+    }
+    let index = match classify_repair_target(problems) {
         RepairTarget::Unreadable => {
             crate::boot::boot_diagnostic(format!(
                 "store '{name}' quick_check cannot scan a table ({}) — unreadable table; \
@@ -4051,15 +4102,14 @@ async fn repair_btree_index_if_desynced(
                 ));
                 return Ok((RepairOutcome::NoRepair, conn));
             }
-            // FTS indexes are never rebuilt in place here: REINDEX/DROP+CREATE on
-            // the FTS backing dir is the documented "FTS Drop" panic class, and
-            // the dedicated boot repair (`repair_ticket_title_fts_if_corrupt`, run
-            // from BoardStore::after_open) owns FTS rebuilds. Leave the desync
-            // reported.
+            // FTS indexes are never REINDEXed or DROP+CREATEd here — that is the
+            // documented "FTS Drop" panic class. The index is left to the one FTS
+            // repair, which this same scan runs after this (see
+            // [`run_repairs`]); report the finding either way.
             if is_fts_index(&conn, &index).await {
                 crate::boot::boot_diagnostic(format!(
-                    "store '{name}' quick_check flagged FTS index '{index}' — in-place repair \
-                     out of scope; the after_open FTS repair owns its rebuild",
+                    "store '{name}' quick_check flagged FTS index '{index}' — its own repair \
+                     owns the rebuild",
                 ));
                 return Ok((RepairOutcome::NoRepair, conn));
             }
@@ -4236,10 +4286,11 @@ async fn migrate_overflow_aliased_store(
     if let Err(failure) = outcome {
         return match failure {
             MigrateFailure::Actionable(e) => Err(e),
-            // The aliasing persists: every boot re-runs this full rebuild
-            // attempt (fresh-store open + DDL replay + data copy) before
-            // falling back to NoRepair — the operator-facing signal to
-            // intervene (e.g. restore from backup).
+            // The aliasing persists: the boot repair is the only path that acts
+            // on it, so a later warranted start re-runs this full rebuild attempt
+            // (fresh-store open + DDL replay + data copy) before falling back to
+            // NoRepair — the operator-facing signal to intervene (e.g. restore
+            // from backup), filed durably until such a start runs.
             MigrateFailure::Finding(msg) => {
                 crate::boot::boot_diagnostic(format!(
                     "store '{name}' rebuild aborted: {msg} — original store preserved \
@@ -4389,9 +4440,10 @@ async fn migrate_overflow_aliased_store(
         Ok((RepairOutcome::Migrated, reopened))
     } else {
         // Transient read errors only (no finding reported above): the swap
-        // succeeded and the store is in place — the next boot re-verifies.
+        // succeeded and the store is in place — the periodic integrity round is
+        // what re-verifies it from here.
         if !finding_reported {
-            warn!(db = %name, "post-swap verification incomplete (transient read errors) — store is in place; re-verified on the next boot");
+            warn!(db = %name, "post-swap verification incomplete (transient read errors) — store is in place; the periodic integrity round verifies it from here");
         }
         Ok((RepairOutcome::NoRepair, reopened))
     }
@@ -5684,8 +5736,12 @@ mod tests {
     }
 
     /// A plausible-shaped real store with content damage must refuse, never be
-    /// quarantined or recreated: `open_consolidated_store` errors with a
+    /// quarantined or recreated: the open's integrity scan errors with a
     /// `StoreRefusal` and leaves the main file byte-for-byte as it was.
+    ///
+    /// The scan itself is only on the boot path when the start has a reason for
+    /// it (see `open_present_store`); this exercises the scan's own outcome, the
+    /// same entry the warranted boot takes.
     #[tokio::test]
     async fn existing_corrupt_store_is_refused_not_recreated() {
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
@@ -5705,7 +5761,7 @@ mod tests {
         corrupted[4096..8192].fill(0); // zero the page-2 b-tree page
         std::fs::write(&db_path, &corrupted).unwrap();
 
-        let err = open_consolidated_store(root)
+        let err = open_and_repair_for_test(root, &db_path, CONSOLIDATED_DB_NAME, "")
             .await
             .expect_err("a content-damaged store must be refused");
         assert!(
@@ -5718,6 +5774,99 @@ mod tests {
             "the refused store's main file must be unchanged"
         );
         assert_not_quarantined(db_path.parent().unwrap(), "a refused store");
+    }
+
+    /// The gate's unclean-end reason: a `-wal` carrying frames (the previous run
+    /// never reached its exit checkpoint) warrants the open's one integrity scan,
+    /// and a clean start of the same store runs none. The breakage the scan
+    /// repairs here is the ticket-title FTS index, which the open reaches only
+    /// through the warranted scan.
+    #[tokio::test]
+    async fn uncheckpointed_journal_warrants_the_open_scan() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let root = tmp.path();
+        let db_path = store_db_path(root, CONSOLIDATED_DB_NAME);
+        {
+            let conn = open_consolidated_store(root)
+                .await
+                .expect("build a real product store");
+            insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
+            conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
+        }
+        assert!(
+            wal_guard::wal_size(&db_path) > wal_guard::WAL_HEADER_BYTES,
+            "the fixture must leave frames in the journal, not just its header"
+        );
+
+        let conn = open_store(root, CONSOLIDATED_DB_NAME, "")
+            .await
+            .expect("the store opens");
+        assert!(
+            is_fts_index(&conn, TICKETS_FTS_INDEX_NAME).await,
+            "an unclean previous end must reach the scan that repairs the index"
+        );
+
+        // Break it again and hand the store off the way a clean exit does: the
+        // journal is truncated, so the next start has no reason to scan.
+        conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
+        conn.checkpoint_ungated()
+            .await
+            .expect("truncate the journal");
+        drop(conn);
+        assert_eq!(
+            wal_guard::wal_size(&db_path),
+            0,
+            "a clean exit leaves no journal behind"
+        );
+
+        let conn = open_store(root, CONSOLIDATED_DB_NAME, "")
+            .await
+            .expect("the store opens");
+        assert!(
+            !is_fts_index(&conn, TICKETS_FTS_INDEX_NAME).await,
+            "a clean start runs no scan, so nothing repairs an index it was not told to"
+        );
+    }
+
+    /// The gate's runtime-failure reason: the periodic round cannot repair under
+    /// live readers, so it leaves a marker beside the store
+    /// ([`wal_guard::note_integrity_scan_owed`]). An otherwise clean start runs the
+    /// scan that marker asks for, and a completed scan clears it — the start after
+    /// that is ordinary again.
+    #[tokio::test]
+    async fn a_recorded_runtime_integrity_failure_warrants_the_open_scan() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let root = tmp.path();
+        let db_path = store_db_path(root, CONSOLIDATED_DB_NAME);
+        {
+            let conn = open_consolidated_store(root)
+                .await
+                .expect("build a real product store");
+            insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
+            conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
+            conn.checkpoint_ungated()
+                .await
+                .expect("truncate the journal");
+        }
+        assert_eq!(
+            wal_guard::wal_size(&db_path),
+            0,
+            "the journal must not be the reason here — the marker is"
+        );
+        assert!(!wal_guard::integrity_scan_owed(&db_path));
+
+        wal_guard::note_integrity_scan_owed(&db_path);
+        let conn = open_store(root, CONSOLIDATED_DB_NAME, "")
+            .await
+            .expect("the store opens");
+        assert!(
+            is_fts_index(&conn, TICKETS_FTS_INDEX_NAME).await,
+            "a recorded runtime integrity failure must reach the scan that repairs the index"
+        );
+        assert!(
+            !wal_guard::integrity_scan_owed(&db_path),
+            "a completed scan clears the marker"
+        );
     }
 
     /// The quick_check desync parser names exactly the non-FTS btree index,
@@ -7045,7 +7194,7 @@ mod tests {
         );
     }
 
-    // ── ticket-title FTS boot repair tests ─────────────────────────────
+    // ── ticket-title FTS repair tests ──────────────────────────────────
 
     /// Classification of quick_check problems as attributable to the
     /// ticket-title FTS index (user-visible index name or the internal FTS dir).
@@ -7097,19 +7246,17 @@ mod tests {
         assert!(!is_fts_index(&conn, "does_not_exist").await);
     }
 
-    /// A healthy FTS index (with content) is a clean no-op: the corruption
-    /// probe reports no evidence.
+    /// A healthy FTS index (with content) is a clean no-op: the repair reports
+    /// the index healthy and touches nothing.
     #[tokio::test]
-    async fn detect_healthy_title_fts_is_none() {
+    async fn healthy_title_fts_is_not_rebuilt() {
         let tmp = tempfile::TempDir::new().unwrap();
         let conn = open_consolidated_store(tmp.path()).await.unwrap();
         insert_fts_ticket(&conn, "t-1", "Important bug fix").await;
-        let evidence = detect_ticket_title_fts_corruption(&conn, "idx_tickets_title_fts")
-            .await
-            .unwrap();
+        let outcome = repair_ticket_title_fts_runtime(&conn).await;
         assert!(
-            evidence.is_none(),
-            "healthy FTS index must not report corruption: {evidence:?}"
+            matches!(outcome, TicketTitleFtsRuntimeRepair::Healthy),
+            "healthy FTS index must not report corruption: {outcome:?}"
         );
     }
 
@@ -7135,17 +7282,14 @@ mod tests {
             "idx_tickets_title_fts",
             "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
              USING fts (title) WITH (tokenizer = 'ngram')",
-            true,
         )
         .await;
 
         // Idempotent re-run safety: healthy again after the rebuild.
-        let evidence = detect_ticket_title_fts_corruption(&conn, "idx_tickets_title_fts")
-            .await
-            .unwrap();
+        let after = repair_ticket_title_fts_runtime(&conn).await;
         assert!(
-            evidence.is_none(),
-            "rebuilt FTS index must be healthy: {evidence:?}"
+            matches!(after, TicketTitleFtsRuntimeRepair::Healthy),
+            "rebuilt FTS index must be healthy: {after:?}"
         );
 
         // MATCH smoke on the known title returns that ticket.
@@ -7180,15 +7324,15 @@ mod tests {
     }
 
     /// End-to-end: a store whose title FTS index no longer serves MATCH is
-    /// detected by the boot probe and actually repaired — the index is rebuilt
-    /// FTS-shaped from the known DDL, MATCH works again, ticket rows survive,
-    /// and a re-run of the probe is clean (idempotent). Real pager-level
-    /// corruption of an FTS-shaped index cannot be fabricated deterministically;
-    /// substituting a same-named plain btree index is the closest deterministic
-    /// stand-in for "MATCH unusable" (in a real boot, ensure_fts_index would fix
-    /// this exact shape first — the repair path is exercised directly here).
+    /// detected by the repair and actually rebuilt — the index is FTS-shaped
+    /// again from the known DDL, MATCH works again, ticket rows survive, and a
+    /// re-run of the probe is clean (idempotent). Real pager-level corruption of
+    /// an FTS-shaped index cannot be fabricated deterministically; substituting a
+    /// same-named plain btree index is the closest deterministic stand-in for
+    /// "MATCH unusable" (in a real boot, ensure_fts_index would fix this exact
+    /// shape first — the repair path is exercised directly here).
     #[tokio::test]
-    async fn broken_title_fts_store_is_detected_and_repaired_end_to_end() {
+    async fn broken_title_fts_store_is_detected_and_rebuilt_end_to_end() {
         let tmp = tempfile::TempDir::new().unwrap();
         let conn = open_consolidated_store(tmp.path()).await.unwrap();
         insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
@@ -7197,16 +7341,11 @@ mod tests {
         conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
         assert!(!is_fts_index(&conn, "idx_tickets_title_fts").await);
 
-        // Full boot entry: detection must fire and the repair must rebuild.
-        repair_ticket_title_fts_if_corrupt(
-            &conn,
-            "idx_tickets_title_fts",
-            "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
-             USING fts (title) WITH (tokenizer = 'ngram')",
-            "core",
-            Some(tmp.path()),
-        )
-        .await;
+        // The one repair entry point: detection must fire and the rebuild run.
+        assert!(matches!(
+            repair_ticket_title_fts_runtime(&conn).await,
+            TicketTitleFtsRuntimeRepair::Rebuilt(_)
+        ));
 
         // Index is FTS-shaped again and MATCH finds the known ticket.
         assert!(is_fts_index(&conn, "idx_tickets_title_fts").await);
@@ -7221,12 +7360,10 @@ mod tests {
         assert_eq!(matched, "t-1");
 
         // Probe is clean afterwards (idempotent re-run safety) and rows survived.
-        assert!(
-            detect_ticket_title_fts_corruption(&conn, "idx_tickets_title_fts")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(matches!(
+            repair_ticket_title_fts_runtime(&conn).await,
+            TicketTitleFtsRuntimeRepair::Healthy
+        ));
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM tickets", (), |r| r.get::<i64>(0))
             .await

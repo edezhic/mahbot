@@ -2915,11 +2915,11 @@ mod tests {
 
         // ── Load ASR model ────────────────────────────────────────────
         //
-        // `try_init_from_cache()` resolves the same directory that was
+        // `ensure_loaded()` resolves the same directory that was
         // pre-flight checked above (via models_subdir → test-owned storage
         // root → symlink → real cache).
 
-        if !crate::audio::local_transcriber::try_init_from_cache().await {
+        if !crate::audio::local_transcriber::ensure_loaded().await {
             eprintln!(
                 "SKIP: ASR model files present but could not be loaded \
                  (corrupted or incomplete files).\

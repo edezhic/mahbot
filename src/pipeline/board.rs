@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 crate::define_store! {
     /// Global board store.
     pub static BOARD: BoardStore,
-    post_open_rooted = after_open,
+    post_open = after_open,
     expect = "BOARD not initialized — call init_all_stores() first",
 }
 
@@ -717,13 +717,11 @@ impl BoardStore {
     /// append-only catalog ([`crate::db::migrations`]) applied once by
     /// [`crate::db::open_consolidated_store`].
     ///
-    /// After the FTS index is ensured, a boot-time detect+repair of corruption
-    /// localized to the title FTS index runs (fail-safe: it never fails the
-    /// boot — see [`crate::db::repair_ticket_title_fts_if_corrupt`]).
-    /// `root` is the storage root the store was opened under (the repair files
-    /// its refusal record there) — it comes from the caller, never from a
-    /// re-resolution of the global config.
-    pub(crate) async fn after_open(&self, root: &std::path::Path) -> anyhow::Result<()> {
+    /// It deliberately does NOT scan the index for corruption: the periodic
+    /// round's own repair ([`crate::db::repair_ticket_title_fts_runtime`]) owns
+    /// that, and the open's repair scan (when the start warrants one) runs
+    /// before this hook.
+    pub(crate) async fn after_open(&self) -> anyhow::Result<()> {
         crate::db::ensure_fts_index(
             &self.conn,
             crate::db::TICKETS_FTS_INDEX_NAME,
@@ -731,14 +729,6 @@ impl BoardStore {
             crate::db::TICKETS_FTS_INDEX_DDL,
         )
         .await?;
-        crate::db::repair_ticket_title_fts_if_corrupt(
-            &self.conn,
-            crate::db::TICKETS_FTS_INDEX_NAME,
-            crate::db::TICKETS_FTS_INDEX_DDL,
-            crate::db::CONSOLIDATED_DB_NAME,
-            Some(root),
-        )
-        .await;
         Ok(())
     }
 

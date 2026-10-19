@@ -33,8 +33,15 @@
 //! holds no lock yet: the boot bring-up (the pre-flight scan and the open of
 //! each store both run before that store is locked). No other read is permitted
 //! while this process holds the store.
+//!
+//! The one per-store fact this module also owns is the marker a failed runtime
+//! integrity check leaves beside its store
+//! ([`note_integrity_scan_owed`]): stat-only, like the `-wal` size, and read by
+//! the boot gate as a reason to scan before any reader exists.
 
 use std::path::Path;
+
+use tracing::warn;
 
 /// A store data file's file-level shape, classified before any store is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,14 +113,52 @@ pub(crate) fn stat_size(path: &Path) -> std::io::Result<u64> {
 }
 
 /// The store's `-wal` size, read stat-only — the fact source for the running
-/// service (the periodic checkpoint cap and the persistent-failure report both
-/// use it). The `-wal` can hold committed-but-not-checkpointed frames; see the
-/// module doc's lock rule for why the store itself may not be opened. A stat
-/// that fails reads as 0, which leaves the cap below its threshold — the
-/// conservative side for a size the caller only compares against a cap.
+/// service (the periodic checkpoint cap and the persistent-failure report) and for
+/// the boot open's integrity-scan gate (`db::open_present_store`). The `-wal` can
+/// hold committed-but-not-checkpointed frames; see the module doc's lock rule for
+/// why the store itself may not be opened. A stat that fails reads as 0 — the
+/// conservative side for a size compared against a cap, and for the boot gate
+/// "no journal left behind", i.e. no reason to scan.
 #[must_use]
 pub(super) fn wal_size(db_path: &Path) -> u64 {
     stat_size(&crate::db::wal_path(db_path)).unwrap_or(0)
+}
+
+/// The marker a failed runtime integrity check leaves beside its store:
+/// `<db path>-needs-integrity-scan`. The periodic round must not repair under
+/// live readers, so it records the failure and leaves this marker; the next
+/// start reads it stat-only as a reason to run the repair scan before its
+/// readers exist (see `db::open_present_store`).
+fn integrity_scan_marker(db_path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}-needs-integrity-scan", db_path.display()))
+}
+
+/// Record that the store at `db_path` owes an integrity scan — the periodic
+/// round's durable half, written with the failure report. Best-effort: a marker
+/// that cannot be written costs the next start one reason to scan, which is
+/// reported here, never propagated (the failure record already holds the finding).
+pub(crate) fn note_integrity_scan_owed(db_path: &Path) {
+    if let Err(e) = std::fs::write(integrity_scan_marker(db_path), b"") {
+        warn!(error = %e, "could not mark the store as owing an integrity scan");
+    }
+}
+
+/// True when a previous run's integrity check failed for this store and no scan
+/// has cleared the marker since.
+#[must_use]
+pub(crate) fn integrity_scan_owed(db_path: &Path) -> bool {
+    integrity_scan_marker(db_path).exists()
+}
+
+/// The scan completed every repair the store owed, so the marker has served its
+/// purpose. Best-effort: a marker that cannot be removed costs one more scan on
+/// the next start, and the periodic round re-marks a store that is still failing.
+pub(crate) fn clear_integrity_scan_owed(db_path: &Path) {
+    if let Err(e) = std::fs::remove_file(integrity_scan_marker(db_path))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(error = %e, "could not clear the store's integrity-scan marker");
+    }
 }
 
 /// Classify a store data file's file-level shape: absent, present, or unusable

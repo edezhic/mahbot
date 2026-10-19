@@ -116,13 +116,11 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
         .await
         .map_err(|e| mahbot::boot::record_startup_failure("config::reload_from_db", e))?;
 
-    // macOS-only local Qwen3-ASR transcriber: start the load-or-download chain
-    // as a background task. Config is authoritative here (honors a user-set
-    // audio_transcription_use_local=false) and this runs BEFORE the provider
-    // init below, so the ~4s model load overlaps with the rest of boot. Never
-    // awaited — the app and background services start regardless.
-    #[cfg(target_os = "macos")]
-    mahbot::audio::local_transcriber::spawn_background_init_if_enabled();
+    // The macOS local Qwen3-ASR recogniser is deliberately NOT loaded here: the
+    // model loads on the first use of the voice stack (a voice message, or the
+    // voice stack's own demand to listen) — see
+    // `mahbot::audio::local_transcriber::spawn_background_init` — so an install whose
+    // owner never enabled local speech loads nothing at start.
     mahbot::providers::init_global()
         .map_err(|e| mahbot::boot::record_startup_failure("providers::init_global", e))?;
 
@@ -170,8 +168,11 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
         "MahBot initialized — dashboard ready"
     );
 
-    let admin_target = mahbot::self_update::resolve_admin_telegram_target().await;
+    // The admin's Telegram target is only needed by the detached "back online"
+    // notice below, so the lookup is not on the path to readiness: it runs
+    // inside the task that sends the notice.
     tokio::spawn(async move {
+        let admin_target = mahbot::self_update::resolve_admin_telegram_target().await;
         mahbot::self_update::notify_admin(
             &mahbot::self_update::back_online_message(start_paused),
             admin_target.as_deref(),
@@ -408,9 +409,10 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     // The product's own tools — the chrome-use browser helper and the bun
     // runtime. Both follow the shared start-time policy in
-    // `managed_bin::install_on_start`: a missing copy is installed straight away,
-    // an existing one is refreshed once the boot has settled, with no version
-    // comparison, and a non-fatal failure is retried on the next start.
+    // `managed_bin::install_on_start`: a copy that is absent (or not executable)
+    // is installed straight away, while a copy in place is compared with the
+    // newest release only once the boot has settled and downloaded only when the
+    // versions differ. A non-fatal failure is retried on the next start.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
