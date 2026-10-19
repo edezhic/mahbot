@@ -748,14 +748,16 @@ pub(crate) async fn cli_version() -> Option<semver::Version> {
 /// is the kill, and that same bound (capped at the longest declaration mahbot makes
 /// for a verb it forwards no `--timeout` to) is what chrome-use is given. Every call
 /// here is a product-owned probe rather than agent work (`status`, `extension
-/// status`, a daemon probe, a lifecycle stop), so chrome-use's relay self-heal is
-/// suppressed and its kill is armed once the child is spawned — before that child
-/// has booted far enough to apply the clock declared to it — so what ends a probe
-/// that stays silent is the product's own bound, which is the "no answer at all"
-/// reading the wedge checks are built on. The raw [`CliRun`] is handed back so a
-/// caller that turns on the difference between "nothing was asked" and "no answer"
-/// can tell them apart.
-async fn run_cli_bounded_at(
+/// status`, a daemon probe, a lifecycle stop, a render's settle wait), so
+/// chrome-use's relay self-heal is suppressed and its kill is armed once the child
+/// is spawned — before that child has booted far enough to apply the clock declared
+/// to it — so what ends a probe that stays silent is the product's own bound, which
+/// is the "no answer at all" reading the wedge checks are built on. The raw
+/// [`CliRun`] is handed back so a caller that turns on the difference between
+/// "nothing was asked" and "no answer" can tell them apart; the renderer's settle
+/// wait ([`super::rasterize_html`]) reads it only to log which leg it took, because
+/// a settle that stays silent is never the render's failure.
+pub(crate) async fn run_cli_bounded_at(
     path: &Path,
     args: &[&str],
     session: Option<&str>,

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 
 use crate::chrome::contract::ChromeResponse;
-use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
+use crate::chrome::spawn::CliRun;
 use crate::chrome::{CliRecovery, SESSION_STOP_TIMEOUT};
 use crate::tools::chrome::ChromeTool;
 use crate::tools::path::PathAccess;
@@ -263,25 +263,12 @@ async fn page_box(
     }
 }
 
-/// A settle wait: bounded by a short product clock of its own (chrome-use's
-/// `--fn` form ignores a forwarded `--timeout`, so the declaration is what would
-/// end it) and its failure is never the render's.
+/// A settle wait: best effort, never the render's failure, bounded by
+/// [`SETTLE_BOUND`] through the shared product probe
+/// ([`super::chrome_daemon::run_cli_bounded_at`]) — chrome-use's `--fn` form
+/// ignores a forwarded `--timeout`, so the product's own bound is what ends it.
 async fn best_effort_step(cli: &Path, session: &str, args: &[&str], name: &str) {
-    let clocks = crate::chrome::probe_clocks(SETTLE_BOUND);
-    match spawn_cli(CliSpawn {
-        path: cli,
-        args,
-        session: Some(session),
-        json: true,
-        capture_stderr: false,
-        timeout: CliTimeout::Bounded(clocks.kill),
-        cancel_kills: true,
-        input: None,
-        chrome_side: clocks.chrome_side,
-        recovery: CliRecovery::Suppressed,
-    })
-    .await
-    {
+    match super::chrome_daemon::run_cli_bounded_at(cli, args, Some(session), SETTLE_BOUND).await {
         CliRun::Output(_) => {}
         CliRun::TimedOut => tracing::debug!(page = name, "rasterize: the settle wait timed out"),
         CliRun::SpawnFailure => {

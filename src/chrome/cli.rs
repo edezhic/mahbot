@@ -45,7 +45,7 @@ use crate::chrome::{
 };
 use crate::tools::chrome_daemon::{
     CliStatus, SessionRecovery, cli_path, cli_probe, cli_version, ensure_ready_for_actions,
-    readiness, recover_unresponsive_session,
+    readiness, recover_unresponsive_session, run_cli_bounded_at,
 };
 use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, truncate_sandwich};
 use serde_json::{Value, json};
@@ -1682,12 +1682,12 @@ impl StepClocks {
         }
     }
 
-    /// The product's own probe (`session stop`, `session status`, the ephemeral
-    /// close): `bound` IS the kill and [`probe_clocks`] declares that same bound to
-    /// chrome-use — capped at [`CHROME_USE_DECLARED_BUDGET`] for a probe whose own
-    /// bound sits above it, as the `session stop` paths do — and its relay self-heal
-    /// is suppressed: the documented exception, where the product reports "the tool
-    /// did not answer" instead of spending the recovery window.
+    /// The product's own probe (`session stop`, `session status`): `bound` IS the
+    /// kill and [`probe_clocks`] declares that same bound to chrome-use — capped at
+    /// [`CHROME_USE_DECLARED_BUDGET`] for a probe whose own bound sits above it, as
+    /// the `session stop` paths do — and its relay self-heal is suppressed: the
+    /// documented exception, where the product reports "the tool did not answer"
+    /// instead of spending the recovery window.
     fn probe(bound: Duration) -> Self {
         let recovery = CliRecovery::Suppressed;
         Self {
@@ -2945,23 +2945,15 @@ async fn close_ephemeral(name: &str) {
         );
         return;
     };
-    // A lifecycle close, not agent work (the probe exception in
-    // [`StepClocks::probe`]): the product bounds it itself, declares chrome-use's
-    // clock honestly, and suppresses the relay self-heal — derived through the
-    // one probe shape so it cannot drift from the CLI's other probes.
-    let clocks = StepClocks::probe(SESSION_STOP_TIMEOUT);
-    match spawn_cli(CliSpawn {
-        path: &path,
-        args: &["session", "stop", name],
-        session: None,
-        json: true,
-        capture_stderr: false,
-        cancel_kills: true,
-        timeout: CliTimeout::Bounded(clocks.call.kill),
-        input: None,
-        chrome_side: clocks.call.chrome_side,
-        recovery: clocks.recovery,
-    })
+    // A lifecycle close, not agent work: the shared product probe
+    // ([`run_cli_bounded_at`]) bounds it with its own product clock and suppresses
+    // the relay self-heal, exactly like the CLI's other probes.
+    match run_cli_bounded_at(
+        &path,
+        &["session", "stop", name],
+        None,
+        SESSION_STOP_TIMEOUT,
+    )
     .await
     {
         CliRun::Output(out) => {
