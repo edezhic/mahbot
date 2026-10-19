@@ -83,9 +83,7 @@ impl ToolFailuresState {
                 }
             }
             ToolFailuresMessage::RefreshError(generation, e) => {
-                // Fail-open tab: mark has_loaded even on error so the empty
-                // state ("No tool failures") renders instead of "Loading…".
-                self.state.handle_refresh_error(generation, e, true);
+                self.state.handle_refresh_error(generation, e);
                 Task::none()
             }
         }
@@ -154,16 +152,17 @@ impl ToolFailuresState {
         // Error display — inset to align with the vscroll-wrapped entries below.
         content = widgets::push_error_banner_inset(content, state.load_state.error());
 
-        // Entries or empty state
+        // The banner above reports errors; the placeholder below is this tab's
+        // ordinary empty state, so an unloaded failure is never a blank body.
         if state.load_state.loading() && !state.load_state.has_loaded() {
             content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
-        } else if state.entries.is_empty() && state.load_state.has_loaded() {
+        } else if state.entries.is_empty() {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::bug::<iced::Theme, iced::Renderer>(),
                 "No tool failures",
                 theme::TEXT_MUTED,
             ));
-        } else if !state.entries.is_empty() {
+        } else {
             let entries_view = {
                 widgets::vscroll(
                     Column::with_children(

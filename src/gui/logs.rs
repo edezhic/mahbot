@@ -327,7 +327,7 @@ impl LogsState {
                 let Some(data) = self.tab_data_mut(tab) else {
                     return Task::none();
                 };
-                data.handle_refresh_error(generation, e, false);
+                data.handle_refresh_error(generation, e);
                 Task::none()
             }
             LogMessage::RequestClear => {

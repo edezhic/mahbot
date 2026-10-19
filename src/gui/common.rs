@@ -114,12 +114,6 @@ impl PaginationState {
 /// 1. [`start_loading`](AsyncLoadState::start_loading) — called before a fetch
 /// 2. [`finish_loading`](AsyncLoadState::finish_loading) — on success
 /// 3. [`fail`](AsyncLoadState::fail) — on error
-///
-/// # Behavioural note
-///
-/// Most pages set `has_loaded` only on success, but `ToolFailuresState` also sets it
-/// on error.  That page uses [`set_has_loaded`](AsyncLoadState::set_has_loaded) to
-/// preserve the divergence without exposing the fields directly.
 #[derive(Debug, Clone)]
 pub(crate) struct AsyncLoadState {
     loading: bool,
@@ -165,10 +159,8 @@ impl AsyncLoadState {
 
     /// Mark failure of an async load.
     ///
-    /// Note: does **not** touch `has_loaded` — most pages leave it at its previous
-    /// value (the initial `false`) so the view continues to show "Loading…".
-    /// Pages that need to set `has_loaded = true` on error (e.g. `ToolFailuresState`)
-    /// can do so via [`set_has_loaded`](Self::set_has_loaded).
+    /// Leaves `has_loaded` untouched, so a failed read never counts as a
+    /// completed one — each view decides what an unloaded failure renders.
     pub(crate) fn fail(&mut self, error: String) {
         self.error = Some(error);
         self.loading = false;
@@ -180,14 +172,6 @@ impl AsyncLoadState {
     /// prior error banner without re-triggering the loading spinner.
     pub(crate) fn clear_error(&mut self) {
         self.error = None;
-    }
-
-    /// Mark `has_loaded` as `true` regardless of error state.
-    ///
-    /// Only used by `ToolFailuresState` which shows an empty state instead of
-    /// "Loading…" after the first attempt, even on failure.
-    pub(crate) fn set_has_loaded(&mut self) {
-        self.has_loaded = true;
     }
 }
 
@@ -270,8 +254,6 @@ impl<T> PolledList<T> {
 /// differ), so callers use [`begin_refresh`](Self::begin_refresh) to prepare a
 /// refresh and [`handle_refreshed`](Self::handle_refreshed)/
 /// [`handle_refresh_error`](Self::handle_refresh_error) to process responses.
-/// `handle_refresh_error` takes `set_has_loaded_on_error` so the Tool Failures
-/// tab marks `has_loaded` on error while the Logs tabs leave it unset.
 pub(crate) struct PaginatedTabState<T> {
     pub(crate) entries: Vec<T>,
     pub(crate) load_state: AsyncLoadState,
@@ -325,22 +307,12 @@ impl<T> PaginatedTabState<T> {
         false
     }
 
-    /// Process a failed refresh response. `set_has_loaded_on_error` preserves
-    /// the Tool-Failures-only behaviour of marking `has_loaded` on error; Logs
-    /// tabs pass `false`.
-    pub(crate) fn handle_refresh_error(
-        &mut self,
-        generation: u64,
-        e: String,
-        set_has_loaded_on_error: bool,
-    ) {
+    /// Process a failed refresh response.
+    pub(crate) fn handle_refresh_error(&mut self, generation: u64, e: String) {
         if generation != self.refresh_generation {
             return;
         }
         self.load_state.fail(e);
-        if set_has_loaded_on_error {
-            self.load_state.set_has_loaded();
-        }
     }
 
     /// Drop the loaded entries and return to the first page — the post-delete
