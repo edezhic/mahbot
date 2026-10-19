@@ -160,6 +160,14 @@ pub(crate) async fn run_git_worktree_diff(
 }
 
 /// Run `git status --porcelain` and return the output.
+///
+/// The plain, newline-delimited form is deliberate: the same output feeds the
+/// sanitation file listing and [`has_unstaged_changes`], whose byte-level
+/// worktree column test must keep counting an entry whose path does not parse.
+/// Under `-z` the whole status is one NUL-delimited stream — a single "line" to
+/// that test, which would then read only the first record and could report a
+/// dirty tree as clean. Quoting and the ` -> ` delimiter the parsers handle are
+/// the price of that gate.
 pub async fn run_git_status(repo_path: &Path) -> anyhow::Result<String> {
     run_git_command(repo_path, &["status", "--porcelain"]).await
 }
@@ -363,14 +371,16 @@ async fn run_git_trimmed_env(
 /// Check if `git status --porcelain` output contains any unstaged changes.
 ///
 /// Looks for any line where the worktree status column (second character) is
-/// non-space — this indicates an unstaged modification, deletion, or untracked
-/// file (`??` has `?` in the worktree column, `!!` ignored lines also have `!`
-/// but are excluded here since default `--porcelain` doesn't show ignored files).
-/// Fully-staged-only entries (`M `, `A `) are ignored.
+/// non-space — an unstaged modification, deletion, or untracked file (`??` has
+/// `?` there). Fully-staged-only entries (`M `, `A `) are ignored.
+///
+/// The test is byte-level, not a record parse, on purpose: an entry whose path no
+/// parser accepts still counts as a change, so a dirty tree is never mistaken for
+/// a clean one. `!!` ignored lines would count too; the callers' invocation simply
+/// never asks git for ignored files.
 ///
 /// This is a pure parsing function with no I/O — callers run `git status`
 /// themselves and pass the captured stdout here.
-///
 #[must_use]
 pub fn has_unstaged_changes(porcelain: &str) -> bool {
     porcelain.lines().any(|line| {
@@ -1700,98 +1710,173 @@ pub async fn run_git_commit_message(
 
 /// List new or untracked files in the working tree.
 ///
-/// Delegates to [`run_git_status`] to run `git status --porcelain`, then passes
-/// the output to [`parse_new_files_from_porcelain`] for parsing.
-///
-/// Catches both `??` (untracked) and any entry starting with `A` (staged as new,
-/// including `A ` clean staged and `AM` staged+modified).
+/// Runs `git status --porcelain` and selects the entries a sanitation pass has
+/// to inspect: untracked (`??`) files and files staged as new (`A`). An entry
+/// whose quoted path does not decode is skipped rather than reported as raw text
+/// (see [`PorcelainRecord`]) — the wrong-path alternative, at the theoretical cost
+/// of an empty list letting the sanitation commit proceed uninspected.
 pub(crate) async fn list_new_or_untracked_files(repo_path: &Path) -> anyhow::Result<Vec<String>> {
     let porcelain = run_git_status(repo_path).await?;
     Ok(parse_new_files_from_porcelain(&porcelain))
 }
 
-/// Shared helper for parsing file paths from `git status --porcelain` output.
+/// One parsed `git status --porcelain` record: both status columns and the path.
 ///
-/// Iterates over lines, applies `predicate` to select relevant entries, then
-/// extracts the path portion (starting at index 3 after the 2-char status
-/// prefix and space). Guarded with `get(3..)` to avoid panics on malformed
-/// input (empty lines, truncated porcelain entries).
-fn parse_porcelain_paths(porcelain: &str, predicate: impl FnMut(&&str) -> bool) -> Vec<String> {
-    porcelain
-        .lines()
-        .filter(predicate)
-        // Note: porcelain lines are at minimum 4 chars (<XY><space><path>), but
-        // we guard with `get()` to prevent panics on malformed input.
-        .filter_map(|line| {
-            let path = line.get(3..)?;
-            if path.is_empty() {
-                None
-            } else {
-                Some(unquote_c_style(path).unwrap_or_else(|| path.to_string()))
-            }
-        })
-        .collect()
+/// The record is `<XY><space><path>`, `X` the index status and `Y` the worktree
+/// status. Git C-quotes a path that needs it, quoting each side of a rename or
+/// copy pair independently, so the path comes back unquoted; a rename or copy
+/// yields its **destination** — the name that exists in the working tree — for
+/// either column, never the `old -> new` text. A record too short to hold a path,
+/// or one whose quoted path has escapes that do not decode, yields `None` and is
+/// skipped rather than reported as its raw text. A field not wrapped in quotes on
+/// both ends is taken literally — git always wraps a quoted path on both ends, so
+/// the only such field is an unquoted path (the status map reads it the same way).
+///
+/// This is the record parser of the two path listings. The status map parses its
+/// own records because it classifies rather than lists, sharing only
+/// [`split_rename_paths`]. Where the views legitimately differ:
+///
+/// - A trailing-slash entry is a directory, not a file. The plain `--porcelain`
+///   reading of [`list_new_or_untracked_files`] collapses an untracked directory
+///   to one `dir/` entry, so [`parse_new_files_from_porcelain`] keeps it; the
+///   snapshot's `--untracked-files=all` reading lists a directory's contents and
+///   grows a trailing slash only for a collapsed nested repository, so
+///   [`parse_untracked_from_porcelain`] drops it; the map strips the slash to key
+///   a tree row.
+/// - A deleted entry (`D` in either column) is stored by no view: the map skips
+///   it, neither listing selects it — except `AD`, whose `A` column the new-files
+///   list selects and the map still skips — and a deletion registers only in the
+///   byte-level [`has_unstaged_changes`], which reads columns rather than records
+///   (so ` D` counts and `D ` does not).
+/// - ` A`, the intent-to-add state of `git add -N`, is `Added` in the map and
+///   excluded by both listings, which select on the index column.
+struct PorcelainRecord {
+    /// Index (staged) status column.
+    index: char,
+    /// Worktree (unstaged) status column.
+    worktree: char,
+    /// Path relative to the repository root, unquoted.
+    path: String,
 }
 
-/// Parse new/added file paths from `git status --porcelain` output.
+/// Parse one `git status --porcelain` record — see [`PorcelainRecord`].
 ///
-/// Returns file paths for entries where the index status indicates a new file:
-/// - `??` — untracked file
-/// - `A ` at position 0 — staged as new (first char is `A`)
-///
-/// This correctly catches `A ` (staged, clean) and `AM` (staged as new, then
-/// modified in working tree) because both start with `A`. The porcelain format
-/// is `<XY><space><path>` where X = index status, Y = working tree status.
-/// Path always starts at index 3.
-///
-/// Excludes ` A` (not tracked, added only to working tree — this is a file
-/// that exists but is not tracked by git; it falls under `??` instead).
-///
-/// To parse only truly untracked files (those prefixed with `?? `), use
-/// [`parse_untracked_from_porcelain`] instead.
-#[must_use]
-fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
-    parse_porcelain_paths(porcelain, |line| {
-        line.starts_with("?? ") || line.starts_with('A')
+/// The two status columns must be followed by their separator space; anything
+/// else is not a record.
+fn parse_porcelain_record(line: &str) -> Option<PorcelainRecord> {
+    let mut chars = line.chars();
+    let index = chars.next()?;
+    let worktree = chars.next()?;
+    if chars.next()? != ' ' {
+        return None;
+    }
+    let field = chars.as_str();
+    if field.is_empty() {
+        return None;
+    }
+    let path = if index == 'R' || index == 'C' || worktree == 'R' || worktree == 'C' {
+        split_rename_paths(field)?
+    } else {
+        unquote_c_style(field)?
+    };
+    Some(PorcelainRecord {
+        index,
+        worktree,
+        path,
     })
 }
 
-/// Parse only truly untracked file paths from `git status --porcelain` output.
+/// The paths of the records `select` accepts, in git's order.
+fn parse_porcelain_paths(
+    porcelain: &str,
+    mut select: impl FnMut(&PorcelainRecord) -> bool,
+) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter_map(parse_porcelain_record)
+        .filter(|record| select(record))
+        .map(|record| record.path)
+        .collect()
+}
+
+/// The destination path of a rename or copy record, from its `<old> -> <new>`
+/// field.
 ///
-/// Returns file paths for entries where the porcelain status is `?? ` (untracked
-/// file not in the index). Unlike [`parse_new_files_from_porcelain`], this does
-/// *not* include staged-as-new (`A `) files — it only catches entries starting
-/// with `?? `.
+/// The delimiter is the first ` -> ` outside a quoted span: git quotes each side
+/// independently, so neither "the field starts quoted" nor "the last ` -> ` wins"
+/// identifies it — a quoted source with a plain destination, a plain source with a
+/// quoted destination, and a quoted destination containing the delimiter all split
+/// here. The source is only scanned, never returned: the recorded path is the one
+/// that exists in the working tree. `None` when there is no delimiter or the
+/// destination is not a path, and the caller skips the record.
+fn split_rename_paths(field: &str) -> Option<String> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (at, c) in field.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quoted && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if !quoted && let Some(destination) = field[at..].strip_prefix(" -> ") {
+            return unquote_c_style(destination).filter(|path| !path.is_empty());
+        }
+    }
+    None
+}
+
+/// New/added file paths from a plain `git status --porcelain` reading.
 ///
-/// A trailing slash marks a collapsed nested repository: `--untracked-files=all`
-/// still reports it as one `dir/` entry because git does not descend into it.
-/// Such an entry is not a file and is excluded, so a capped read never counts it
-/// as an omitted file.
+/// Selects `??` (untracked) records and index-column `A` ones: `A ` (staged,
+/// clean), `AM` (staged, then modified), and `AD` (added, then deleted). Excludes
+/// ` A` — the intent-to-add state of `git add -N` — which is a real status but
+/// carries a space in the index column, so nothing is staged.
 ///
-/// Use this when you only want files that are truly untracked and do not want
-/// overlap with staged-as-new files that might already be present from a
-/// `git diff HEAD` parse.
+/// To list only truly untracked files, use [`parse_untracked_from_porcelain`].
+#[must_use]
+fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
+    parse_porcelain_paths(porcelain, |record| {
+        record.index == 'A' || (record.index == '?' && record.worktree == '?')
+    })
+}
+
+/// Untracked file paths from the snapshot's `--untracked-files=all` reading.
+///
+/// Selects `??` records only, so staged-as-new files the tracked half of the
+/// snapshot already covers are not listed twice. A trailing-slash entry is a
+/// collapsed nested repository rather than a file and is dropped — see
+/// [`PorcelainRecord`].
 #[must_use]
 fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
-    parse_porcelain_paths(porcelain, |line| line.starts_with("?? "))
-        .into_iter()
-        .filter(|path| !path.ends_with('/'))
-        .collect()
+    parse_porcelain_paths(porcelain, |record| {
+        record.index == '?' && record.worktree == '?'
+    })
+    .into_iter()
+    .filter(|path| !path.ends_with('/'))
+    .collect()
 }
 
 /// Parse `git status --porcelain` output into a map of file path → `GitFileStatus`.
 ///
-/// The porcelain format uses a two-column status (index + worktree).
-/// If either column is `M` the file is [`GitFileStatus::Modified`]; otherwise
-/// staged-new (`A`) and untracked (`??`) entries both map to
-/// [`GitFileStatus::Added`]. If a file appears both modified and added,
-/// `Modified` wins. Rename entries (`R`) extract
-/// the new path after ` -> `. Deleted files (`D`) are ignored. Handles
-/// git's C-style quoting for paths with special characters.
+/// The porcelain format uses a two-column status (index + worktree). If either
+/// column is `M` the file is [`GitFileStatus::Modified`]; otherwise staged-new
+/// (`A`) and untracked (`??`) entries both map to [`GitFileStatus::Added`] — so
+/// the unmerged `AA`, `AU` and `UA` store `Added` through their `A` column. If a
+/// file appears both modified and added, `Modified` wins. A rename in either
+/// column keys its destination as [`GitFileStatus::Modified`] (see
+/// [`split_rename_paths`]); a copy is skipped, as is a rename field that does not
+/// split. A deleted entry (`D` in either column — `D `, ` D`, `AD`, `DU`, `DD`)
+/// is skipped, the deletion taking precedence over an `A` column. Everything else
+/// (`UU`, typechange) stores nothing. Handles git's C-style quoting for paths
+/// with special characters, and a path that does not unquote is skipped.
 ///
-/// Keys are the paths as emitted by `git status --porcelain` — repo-root-relative.
+/// Keys are the paths as emitted by `git status --porcelain` —
+/// repo-root-relative, with a trailing slash stripped so they match a tree row.
 /// When the workspace is the repository root, this is the same key space as the
 /// editor's file tree.
+///
+/// The differences from the path listings are stated on [`PorcelainRecord`].
 #[must_use]
 pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
     let mut map: HashMap<String, GitFileStatus> = HashMap::new();
@@ -1815,33 +1900,22 @@ pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFil
             continue;
         }
 
-        // Rename entries: "R  old_path -> new_path"
-        // Both paths may be individually C-quoted by git. The separator
-        // ` -> ` appears at the boundary between the two paths.
-        if ix == 'R' {
-            let rest = &trimmed[2..];
-            let rest = rest.trim_start();
-            let new_path: String = if rest.starts_with('"') {
-                // Both paths are quoted. The boundary is `" -> "`.
-                // rsplit_once on `" -> "` strips the opening quote of the
-                // new path — add it back so `unquote_c_style` can strip both.
-                if let Some((_, tail)) = rest.rsplit_once("\" -> \"") {
-                    format!("\"{tail}")
-                } else {
-                    // Malformed — skip.
-                    continue;
-                }
-            } else {
-                // Unquoted paths: split on ` -> `.
-                if let Some((_, tail)) = rest.rsplit_once(" -> ") {
-                    tail.to_string()
-                } else {
-                    continue;
-                }
+        // Rename entries: "R  old_path -> new_path". Git quotes each side
+        // separately, so the split cannot assume a shared quoting style. The
+        // worktree column is treated the same way as a robustness rule: ` R`
+        // ("renamed in work tree") is documented but not observed in practice, and
+        // if it ever appears, dropping the row would be worse than keying its
+        // destination. The destination is the path in the tree either way.
+        if ix == 'R' || wt == 'R' {
+            let Some(new_path) = split_rename_paths(trimmed[2..].trim_start()) else {
+                continue;
             };
-            if let Some(unquoted) = unquote_c_style(&new_path) {
-                map.insert(unquoted, GitFileStatus::Modified);
-            }
+            map.insert(new_path, GitFileStatus::Modified);
+            continue;
+        }
+
+        // Copies are skipped: the classification below knows only M and A.
+        if ix == 'C' || wt == 'C' {
             continue;
         }
 
@@ -3441,6 +3515,17 @@ D  deleted.rs
         }
     }
 
+    /// A path that does not unquote is skipped by both listings — they report
+    /// real paths or nothing — while the byte-level unstaged check still counts
+    /// the entry (see `has_unstaged_changes_cases`).
+    #[test]
+    fn parse_porcelain_paths_skip_malformed_quoted_paths() {
+        let porcelain = "?? \"broken\\q.rs\"\n?? good.rs\nA  \"also\\qbroken.rs\"\n";
+
+        assert_eq!(parse_untracked_from_porcelain(porcelain), vec!["good.rs"]);
+        assert_eq!(parse_new_files_from_porcelain(porcelain), vec!["good.rs"]);
+    }
+
     // ── parse_untracked_from_porcelain — ??-only untracked parsing ──
 
     /// Verify that `parse_untracked_from_porcelain` catches only `?? ` (truly
@@ -3528,6 +3613,11 @@ AM staged_then_modified.js
                 expected: &[("new_file.rs", Some(GitFileStatus::Added))],
             },
             Case {
+                name: "intent-to-add ( A) is added",
+                input: " A intent.rs\n",
+                expected: &[("intent.rs", Some(GitFileStatus::Added))],
+            },
+            Case {
                 name: "staged and unstaged modified (MM)",
                 input: "MM both.rs\n",
                 expected: &[("both.rs", Some(GitFileStatus::Modified))],
@@ -3546,6 +3636,41 @@ AM staged_then_modified.js
                 name: "rename with arrow in old path",
                 input: "R  \"old -> name.rs\" -> \"new -> name.rs\"\n",
                 expected: &[("new -> name.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "rename from a quoted source to a plain destination",
+                input: "R  \"a b.txt\" -> plain.txt\n",
+                expected: &[("plain.txt", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "rename into a quoted destination containing the delimiter",
+                input: "R  plain.txt -> \"new -> name.txt\"\n",
+                expected: &[("new -> name.txt", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "rename carried in the worktree column",
+                input: " R old.rs -> new.rs\n",
+                expected: &[("new.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "copy skipped",
+                input: "C  old.rs -> copy.rs\n",
+                expected: &[],
+            },
+            Case {
+                name: "unmerged add/add (AA) is added",
+                input: "AA both.rs\n",
+                expected: &[("both.rs", Some(GitFileStatus::Added))],
+            },
+            Case {
+                name: "added then deleted (AD) skipped",
+                input: "AD gone.rs\n",
+                expected: &[],
+            },
+            Case {
+                name: "typechange and unmerged (UU) skipped",
+                input: " T link\nUU conflict.rs\n",
+                expected: &[],
             },
             Case {
                 name: "untracked directory (trailing slash stripped)",
@@ -3650,6 +3775,66 @@ AM staged_then_modified.js
                 }
             }
         }
+    }
+
+    /// A rename whose source git quotes (a space is enough) and whose
+    /// destination is plain: the sides are quoted independently, so the record
+    /// must still yield the destination.
+    #[tokio::test]
+    async fn git_status_rename_with_a_quoted_source_keys_its_destination() {
+        let (_dir, repo_path) = init_temp_repo();
+        // Pin the detection the fixture shape depends on, so an owner's global
+        // `status.renames = false` cannot turn this into `D ` + `A `.
+        run_git_command(&repo_path, &["config", "status.renames", "true"])
+            .await
+            .unwrap();
+        std::fs::write(repo_path.join("a b.txt"), b"moved\n").unwrap();
+        run_git_commit(&repo_path, "add").await.unwrap();
+        run_git_command(&repo_path, &["mv", "a b.txt", "plain.txt"])
+            .await
+            .unwrap();
+
+        let porcelain = run_git_status(&repo_path).await.unwrap();
+        assert!(
+            porcelain.starts_with("R  \"a b.txt\" -> plain.txt"),
+            "git's quoting is what this pins, got {porcelain:?}"
+        );
+
+        let map = parse_git_status_porcelain(&porcelain);
+        assert_eq!(
+            map.get("plain.txt"),
+            Some(&GitFileStatus::Modified),
+            "got {map:?}"
+        );
+        assert!(!map.contains_key("a b.txt"), "got {map:?}");
+    }
+
+    /// A rename into a name that itself contains the ` -> ` delimiter: git quotes
+    /// only the destination, so splitting at the quoted side's own delimiter
+    /// would key a bogus path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_status_rename_into_a_name_with_the_delimiter_keys_its_destination() {
+        let (_dir, repo_path) = init_temp_repo();
+        run_git_command(&repo_path, &["config", "status.renames", "true"])
+            .await
+            .unwrap();
+        run_git_command(&repo_path, &["mv", "test.txt", "new -> name.txt"])
+            .await
+            .unwrap();
+
+        let porcelain = run_git_status(&repo_path).await.unwrap();
+        assert!(
+            porcelain.starts_with("R  test.txt -> \"new -> name.txt\""),
+            "git's quoting is what this pins, got {porcelain:?}"
+        );
+
+        let map = parse_git_status_porcelain(&porcelain);
+        assert_eq!(
+            map.get("new -> name.txt"),
+            Some(&GitFileStatus::Modified),
+            "got {map:?}"
+        );
     }
 
     // ── parse_numstat_lines — numstat line parsing ──
@@ -3837,8 +4022,8 @@ AM staged_then_modified.js
 
     // ── has_unstaged_changes ─────────────────────────────────────────
 
-    /// Empty, fully-staged, unstaged, dual-status, untracked, mixed, and
-    /// trailing-newline porcelain inputs.
+    /// Empty, fully-staged, unstaged, dual-status, untracked, mixed,
+    /// trailing-newline, and unparseable-path porcelain inputs.
     #[test]
     fn has_unstaged_changes_cases() {
         let cases: &[(&str, &str, bool)] = &[
@@ -3870,6 +4055,14 @@ AM staged_then_modified.js
             ),
             ("trailing_newline_unstaged", " M file.rs\n", true),
             ("trailing_newline_staged", "M  file.rs\n", false),
+            // A path no parser accepts must still count: this gate runs on
+            // bytes, not records, so a malformed entry can never read as clean.
+            ("unparseable_quoted_path", " M \"broken\\q.rs\"\n", true),
+            (
+                "unparseable_path_after_staged",
+                "M  file.rs\n M \"broken\\q.rs\"\n",
+                true,
+            ),
         ];
         for (name, input, expected) in cases {
             assert_eq!(has_unstaged_changes(input), *expected, "case: {name}");
