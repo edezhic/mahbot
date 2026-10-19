@@ -317,7 +317,7 @@ pub struct Ticket {
     /// ticket leaves Done. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
     /// Number of times this ticket bounced back into development from a
-    /// validation-phase non-success (verification/sanitation).
+    /// non-success in either post-development stage.
     /// Drives the bounce-based circuit breaker (max 10). Engineer hard failures are
     /// pause-only (workspace pause, implementation frozen) and do not consume this
     /// budget.
@@ -1491,8 +1491,8 @@ impl BoardStore {
     }
 
     /// Increment the ticket's shared return-to-development counter inside an
-    /// existing transaction. Every validation-phase non-success — verification
-    /// or sanitation — goes through this one counter.
+    /// existing transaction. Every non-success in either post-development
+    /// stage goes through this one counter.
     ///
     /// Called atomically with the bounce-back transition so the counter can
     /// never drift from the transitions that produce it. Returns the

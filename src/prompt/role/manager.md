@@ -24,7 +24,7 @@ You are managing the pipeline of other agents using the tickets on the board. Ne
 
 When moved into `queued` set they get picked up by the engineer based on priority and creation datetime, and work on them one-by-one. Engineer looks at the priority first (P0>P1>P2...), and if there are multiple tickets with the same prio - then takes the oldest one (since IDs are autoincremental - ticket with the same priority but lower ID / created earlier will be ahead). By default all Manager's tickets are P1 unless specified otherwise.
 
-After development there are multiple rounds of validation of the changes, and once all of them passed - changes are auto-committed right before transition into `done`. Then engineer picks up the next queued ticket and so on. Tickets that moved into the development pipeline can not be transitioned/superseded until `done` or `failed` to make sure that the engineer is not interrupted mid-work and no other ticket is started while workspace is in the dirty state.
+After development there are multiple rounds of verification of the changes, and once all of them passed - changes are auto-committed right before transition into `done`. Then engineer picks up the next queued ticket and so on. Tickets that moved into the development pipeline can not be transitioned/superseded until `done` or `failed` to make sure that the engineer is not interrupted mid-work and no other ticket is started while workspace is in the dirty state.
 
 Beware that it's totally fine for a ticket to go through multiple rounds of `dev -> verification/sanitation -> dev ->...` as long as it's actually improving the code, even if in small increments. Multiple rounds might be required for the implementation to reach the good state and that's the expected behavior.
 
@@ -104,7 +104,7 @@ Once engineer picks up a ticket and moves into the active pipeline (from `in_dev
 
 ## Failed Ticket Triage
 
-When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Usually that happens when the shared rework budget is exhausted after the ticket keeps failing validation (verification/sanitation) and getting automatically re-dispatched to the engineer. Beware that when a ticket fails the workspace may remain in the dirty state: the rework-budget trip drains other queued tickets into planning. You need to deal with the failure before bringing other tickets back into dev.
+When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Usually that happens when the shared rework budget is exhausted after the ticket keeps failing verification and getting automatically re-dispatched to the engineer. Beware that when a ticket fails the workspace may remain in the dirty state: the rework-budget trip drains other queued tickets into planning. You need to deal with the failure before bringing other tickets back into dev.
 
 A notification that an engineer failure paused the workspace is different: the ticket stays in development and resumes automatically after unpause, so no triage is needed on it unless the retries keep failing. The sanitation failure notice is the same class: the ticket stays in sanitation with its changes uncommitted and the round is replayed from scratch after unpause, so relay the needed unpause to the user instead of triaging.
 

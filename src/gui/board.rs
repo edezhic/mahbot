@@ -673,8 +673,8 @@ impl BoardState {
     ///
     /// Keyed off the action label. The keyword chain
     /// (Cancel → Pause → Queued → Backlog) drives both the icon and the
-    /// tooltip, so the two can never drift apart. Rework is automatic via
-    /// validation failures — there is no manual rework action anymore.
+    /// tooltip, so the two can never drift apart. Rework is automatic via a
+    /// bounce — there is no manual rework action anymore.
     /// The trailing `circle_check`/"move phase" pair is a defensive
     /// catch-all for labels outside [`Self::available_actions`].
     fn action_icon_and_tooltip<'a>(
@@ -816,7 +816,7 @@ impl BoardState {
         .spacing(theme::SPACE_2)
         .align_y(Alignment::Center);
         let tooltip_text = format!(
-            "Validation bounces: {bounce_count} (max {})",
+            "Verification bounces: {bounce_count} (max {})",
             crate::pipeline::MAX_BOUNCES,
         );
         Some(tooltip_hint(indicator, tooltip_text))
@@ -1019,9 +1019,9 @@ impl BoardState {
                         if phase == TicketPhase::Cancelled {
                             crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
                         }
-                        // Re-dispatch into development is automatic via a
-                        // validation non-success (the unified bounce) — there
-                        // is no manual "Redo Queued" action anymore.
+                        // Re-dispatch into development is automatic on a
+                        // post-development non-success — there is no manual
+                        // "Redo Queued" action anymore.
                         board
                             .transition_to(&ticket_id, None, phase, "user")
                             .await

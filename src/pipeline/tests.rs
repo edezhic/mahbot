@@ -555,7 +555,7 @@ async fn every_third_bounce_notifies_manager() {
                 job.content.contains(&format!(
                     "⏳ This ticket has been returned to development {} times already; \
                      the rework budget allows {budget} returns in total, after which the \
-                     next validation failure stops the ticket.",
+                     next verification failure stops the ticket.",
                     bounced.bounce_count,
                 )),
                 "looping notice missing or miscounted:\n{}",

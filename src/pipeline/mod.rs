@@ -569,8 +569,8 @@ async fn run_claim_pipeline(ws: &Workspace) {
 /// Neutral reason for a phase-gate bail (transients are not misattributed).
 const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 
-/// Maximum tolerated validation-phase bounces before the ticket fails (the
-/// 11th bounce fails). Enforced by the unified validation-failure bounce path.
+/// Maximum tolerated bounces from the post-development stages before the
+/// ticket fails (the 11th bounce fails). Enforced by the unified bounce path.
 pub const MAX_BOUNCES: usize = 10;
 
 /// GUI bounce-badge escalation threshold: at or below this many bounces the
@@ -1693,7 +1693,7 @@ async fn clear_implementation_roster(conn: &crate::db::Connection, job_id: &str,
     }
 }
 
-// ── Bounce breaker (unified validation non-success) ─────────────────────
+// ── Bounce breaker (unified post-development non-success) ───────────────
 
 /// Comment posted when the bounce breaker trips: a fixed failure notice that
 /// names the "circuit breaker" and the configured `MAX_BOUNCES` budget.
@@ -1764,9 +1764,10 @@ async fn drain_queued_siblings(ticket: &Ticket) {
     }
 }
 
-/// Unified validation-failure bounce. Increments the shared bounce budget for
-/// EVERY validation-phase non-success outcome. On exhaustion the ticket trips
-/// to Failed (terminal); the phase job is deleted and the puller re-drives.
+/// Unified bounce for a non-success in either post-development stage.
+/// Increments the shared bounce budget for EVERY such outcome. On exhaustion
+/// the ticket trips to Failed (terminal); the phase job is deleted and the
+/// puller re-drives.
 /// On a non-exhausting bounce the ticket goes back to InDevelopment and the
 /// phase job is deleted so the puller creates a fresh engineer attempt.
 ///
