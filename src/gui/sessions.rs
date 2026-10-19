@@ -976,29 +976,27 @@ fn common_entry_prefix(old: &[SessionEntry], new: &[SessionEntry]) -> usize {
     old.iter().zip(new).take_while(|(a, b)| a == b).count()
 }
 
-/// Author label above a bubble, aligned to the bubble's side. One non-accent
-/// color for every role, so roles stay visually consistent.
-fn author_label<'a>(role: crate::ChatRole) -> Element<'a, SessionsMessage> {
+/// Author label above a bubble for the roles that carry one, flush left like
+/// their bubbles. One non-accent color for every labeled role, so roles stay
+/// visually consistent.
+///
+/// `Assistant` bubbles are unlabelled — `None`, so neither the label nor the
+/// gap it occupied is emitted.
+fn author_label<'a>(role: crate::ChatRole) -> Option<Element<'a, SessionsMessage>> {
     let name = match role {
         crate::ChatRole::System => "System",
         crate::ChatRole::User => "User",
-        crate::ChatRole::Assistant => "Assistant",
         crate::ChatRole::Tool => "Tool",
+        crate::ChatRole::Assistant => return None,
     };
     let label = text(name).size(theme::TEXT_11).color(theme::TEXT_SECONDARY);
-    align_bubble(
-        label,
-        if matches!(role, crate::ChatRole::Assistant) {
-            BubbleSide::Right
-        } else {
-            BubbleSide::Left
-        },
-    )
+    Some(align_bubble(label, BubbleSide::Left))
 }
 
-/// Author-labeled chat-bubble row for one ledger entry: the label sits above
-/// the bubble, both aligned to the bubble's side (assistant right, others
-/// left). Same background/typography as the Home chat bubbles.
+/// Chat-bubble row for one ledger entry: the roles that carry an author label
+/// render it above the bubble; the bubble itself aligns right for assistant
+/// rounds and left otherwise. Same background/typography as the Home chat
+/// bubbles.
 ///
 /// `menu` wraps the BUBBLE alone — not the label, and not the spacer
 /// `align_bubble` adds beside it, so the menu's hit target is the bubble.
@@ -1008,6 +1006,11 @@ fn bubble_row(
     menu: Option<MenuItem<SessionsMessage>>,
 ) -> Element<'_, SessionsMessage> {
     let assistant = matches!(role, crate::ChatRole::Assistant);
+    let side = if assistant {
+        BubbleSide::Right
+    } else {
+        BubbleSide::Left
+    };
     let bubble: Element<'_, SessionsMessage> = container(body)
         .padding(theme::PAD_10)
         .style(theme::bubble_style(
@@ -1024,19 +1027,11 @@ fn bubble_row(
         Some(item) => ContextMenu::new(bubble, vec![item]).into(),
         None => bubble,
     };
-    column![
-        author_label(role),
-        align_bubble(
-            bubble,
-            if assistant {
-                BubbleSide::Right
-            } else {
-                BubbleSide::Left
-            },
-        )
-    ]
-    .spacing(theme::SPACE_2)
-    .into()
+    let mut row = Column::new().spacing(theme::SPACE_2);
+    if let Some(label) = author_label(role) {
+        row = row.push(label);
+    }
+    row.push(align_bubble(bubble, side)).into()
 }
 
 /// Resolve the collapse measurement for an element at the current
@@ -1391,15 +1386,19 @@ fn render_tool_round<'a>(
     }
 
     // One bubble for the whole round, same container as assistant text rounds
-    // (right-aligned, 75% width, author label above).
+    // (right-aligned, 75% width, no author label).
     bubble_row(crate::ChatRole::Assistant, bubble_col, None)
 }
 
 /// Render one ledger entry as a chat-bubble row: a `Message` renders its own
 /// bubble, and a `ToolRound` renders a single assistant bubble containing the
 /// round's reasoning, narration, and tool calls with their results.
-fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMessage> {
-    let md = ctx.entry_md.get(i).and_then(|m| m.as_ref());
+///
+/// `None` means the entry has nothing to render at all: a message with neither
+/// a body nor thinking whose role carries no author label (i.e. an assistant
+/// message) would be a blank row, so the caller skips it — a zero-size child
+/// would still leave a band of inter-entry spacing.
+fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Option<Element<'a, SessionsMessage>> {
     let entry = &ctx.entries[i];
     match entry {
         SessionEntry::Message {
@@ -1407,27 +1406,34 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMe
             content,
             thinking,
         } => {
+            if thinking.is_none() && content.is_none() {
+                // Nothing to show but the author: the row is the author label,
+                // which exists only for the labelled roles.
+                return author_label(*role);
+            }
             let mut bubble_col = Column::new().spacing(theme::SPACE_4);
             if let Some(thinking) = thinking {
                 bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), thinking));
             }
             if let Some(content) = content {
+                let md = ctx.entry_md.get(i).and_then(Option::as_ref);
                 bubble_col = bubble_col.push(body_block(ctx, (i, 0), content, md, false));
             }
-            if thinking.is_some() || content.is_some() {
-                let menu = (ctx.truncatable && matches!(role, crate::ChatRole::User))
-                    .then(|| MenuItem::new("Truncate".into(), SessionsMessage::TruncateSession(i)));
-                bubble_row(*role, bubble_col, menu)
-            } else {
-                // Nothing to show but the author.
-                author_label(*role)
-            }
+            let menu = (ctx.truncatable && matches!(role, crate::ChatRole::User))
+                .then(|| MenuItem::new("Truncate".into(), SessionsMessage::TruncateSession(i)));
+            Some(bubble_row(*role, bubble_col, menu))
         }
         SessionEntry::ToolRound {
             narration,
             reasoning,
             calls,
-        } => render_tool_round(ctx, i, narration.as_deref(), reasoning.as_deref(), calls),
+        } => Some(render_tool_round(
+            ctx,
+            i,
+            narration.as_deref(),
+            reasoning.as_deref(),
+            calls,
+        )),
     }
 }
 
@@ -1446,7 +1452,9 @@ fn render_transcript<'a>(
     }
     let mut items = Column::new().spacing(widgets::CHAT_VERTICAL_RHYTHM);
     for i in 0..ctx.entries.len() {
-        items = items.push(render_entry(ctx, i));
+        if let Some(entry) = render_entry(ctx, i) {
+            items = items.push(entry);
+        }
     }
     widgets::vscroll_tracked(
         items,
@@ -1499,6 +1507,35 @@ mod tests {
             custom_identifier: None,
             launch_stopped: false,
         }
+    }
+
+    #[test]
+    fn a_bodyless_assistant_row_is_skipped_but_labelled_roles_keep_it() {
+        let expanded = HashSet::new();
+        let cache = RefCell::new(HashMap::new());
+        let entries = [
+            msg(ChatRole::User, None),
+            msg(ChatRole::System, None),
+            msg(ChatRole::Tool, None),
+            msg(ChatRole::Assistant, None),
+            msg(ChatRole::Assistant, Some("done")),
+        ];
+        let ctx = TranscriptCtx {
+            entries: &entries,
+            entry_md: &[],
+            workspace_root: None,
+            expanded: &expanded,
+            measure_cache: &cache,
+            text_width: 300.0,
+            truncatable: false,
+        };
+
+        let rendered: Vec<bool> = (0..entries.len())
+            .map(|i| render_entry(&ctx, i).is_some())
+            .collect();
+        // Only the bodyless assistant row is skipped: the labelled roles keep
+        // their label-only row, and an assistant row with a body still renders.
+        assert_eq!(rendered, [true, true, true, false, true]);
     }
 
     #[test]
