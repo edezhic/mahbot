@@ -881,9 +881,10 @@ fn walk_command<'a>(
 const PRODUCT_BINARY: &str = env!("CARGO_PKG_NAME");
 
 /// The product binary's second words that only read — the whole of what a
-/// read-only shell may ask the product itself for. Case-sensitive everywhere:
-/// the binary compares its own `argv[1]` the same way, so `mahbot DEBUG` is a
-/// daemon launch rather than the debug command (see [`check_product_segment`]).
+/// read-only shell may ask the product itself for. The comparison is
+/// case-sensitive everywhere, and so is the binary's command table: `mahbot
+/// DEBUG` names no entry point and is refused as misuse rather than querying
+/// (see [`check_product_segment`]).
 const PRODUCT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     // The documented read-only query surface ([`crate::db::debug`]): a
     // read-only store query or a schema dump.
@@ -6766,12 +6767,12 @@ mod tests {
     }
 
     /// The product's own binary is judged by its own rule: only its read-only
-    /// second words run, everything else — a daemon launch, the chrome frontend,
+    /// second words run, everything else — a bare launch, the chrome frontend,
     /// the configuration, workspace and producing families, a
     /// bench binary — is refused. The second word is read POSITIONALLY, so
     /// `mahbot foo debug` is a refusal too, and the comparison is case-sensitive
-    /// on every platform (the binary compares its own `argv[1]` the same way, so
-    /// `mahbot DEBUG` launches the daemon rather than querying). The path-spelled
+    /// on every platform (the binary's command table is too, so `mahbot DEBUG`
+    /// names no entry point rather than querying). The path-spelled
     /// row is the spelling this shell's own grep rewrite carries, so it must keep
     /// working.
     #[cfg(unix)]
@@ -6811,7 +6812,7 @@ mod tests {
                 false,
             ),
             ("mahbot rasterize --path /tmp/x.svg", false),
-            ("mahbot DEBUG", false),     // a daemon launch, not `debug`
+            ("mahbot DEBUG", false), // no entry point by that word, not `debug`
             ("mahbot foo debug", false), // the verb's own next word is the one read
             ("mahbot -V", true),
             ("mahbot --help", true),

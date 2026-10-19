@@ -2083,6 +2083,12 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// The child is marked as the update hand-off ([`HANDOFF_ENV`] — see
 /// [`acquire_lock`]).
 ///
+/// The replacement inherits the daemon's launch mode — `paused` when the old
+/// process was started paused, nothing otherwise — and never the old process's own
+/// argv: a word this binary has no entry point for (an older build launched the
+/// daemon through one) would be refused by the replacement, and the service would
+/// not come back.
+///
 /// On Unix: null stdin/stdout, stderr → update.log. On Windows: the same, plus
 /// `CREATE_NO_WINDOW`.
 ///
@@ -2116,7 +2122,12 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// [`finalize_update_and_restart`]). Deleting the spawn target while Gatekeeper
 /// is validating its code signature causes `syspolicyd` to SIGKILL the child.
 fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let launch = std::env::args_os().nth(1);
+    let args: Vec<std::ffi::OsString> =
+        match crate::cli::entry_point(launch.as_deref().and_then(std::ffi::OsStr::to_str)) {
+            Some(crate::cli::EntryPoint::Paused) => vec!["paused".into()],
+            _ => Vec::new(),
+        };
 
     info!(
         program = %binary_path.display(),

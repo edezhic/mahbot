@@ -39,11 +39,11 @@
 //! the family registry that ties every sub-command to the tool it runs (an
 //! operation per action, the tool's own name where it takes no action, the
 //! family word itself where the family IS the operation, or the product's own
-//! reader — [`DOCUMENT_READ`]), the argv parsing under
-//! it, the help, and the [`Exit`] classes a script reads. The
-//! flag grammar itself is [`grammar`], which `mahbot audio` reads too — the
-//! browser-automation command and the OpenRouter benchmark read their own flags
-//! and word their own refusals.
+//! reader — [`DOCUMENT_READ`]), the command table that resolves a launch's first
+//! word to its [`EntryPoint`] ([`entry_point`]), the argv parsing under it, the
+//! help, and the [`Exit`] classes a script reads. The flag grammar itself is
+//! [`grammar`], which `mahbot audio` reads too — the browser-automation command
+//! and the OpenRouter benchmark read their own flags and word their own refusals.
 
 pub(crate) mod grammar;
 pub(crate) mod instance;
@@ -59,8 +59,10 @@ use crate::util::lock::InstanceLockState;
 ///
 /// It lives beside the family registry rather than in the binary so that the
 /// check that every entry point is listed runs in the library's own test lane
-/// (`every_entry_point_is_listed_in_the_top_level_usage`) — one reachable only
-/// by someone who already knew its word would not be an entry point.
+/// (`every_entry_point_resolves_and_is_listed_in_the_top_level_usage`) — one
+/// reachable only by someone who already knew its word would not be an entry
+/// point. The command table that refuses an unknown word ([`entry_point`]) lives
+/// there for the same reason.
 pub const TOP_LEVEL_USAGE: &str = "\
 mahbot — autonomous agentic engineering system with a GUI dashboard daemon
 
@@ -223,15 +225,15 @@ pub(crate) async fn wait_for_service() -> ServiceGate {
 ///
 /// What separates [`Usage`](Exit::Usage) from [`Failed`](Exit::Failed) is who
 /// judges. Misuse covers what a frontend can settle without the target at all: a
-/// word no family or operation has, a flag the operation does not take, a flag
-/// with no value after it, a token that is not a flag at all, an argument that is
-/// not valid text — and, for a frontend that opens the files itself, what the
-/// filesystem says about the paths it was handed: an input that is missing, is not
-/// a regular file, or cannot be read; a destination directory that is not there; a
-/// destination that is already taken. Everything the TARGET of the command judges
-/// is a failed operation instead: a value the tool does not accept, an argument
-/// the tool finds missing, a refusal the tool returns, an operation it carried out
-/// only in part.
+/// word no family, operation or entry point has, a flag the operation does not
+/// take, a flag with no value after it, a token that is not a flag at all, an
+/// argument that is not valid text — and, for a frontend that opens the files
+/// itself, what the filesystem says about the paths it was handed: an input that
+/// is missing, is not a regular file, or cannot be read; a destination directory
+/// that is not there; a destination that is already taken. Everything the TARGET
+/// of the command judges is a failed operation instead: a value the tool does not
+/// accept, an argument the tool finds missing, a refusal the tool returns, an
+/// operation it carried out only in part.
 ///
 /// A frontend that only CARRIES the operation to a running product — this one,
 /// over IPC — holds no copy of the target's own rules (see the module doc), so
@@ -1606,16 +1608,69 @@ const CUSTOM_TOOL_FLAG: Flag = Flag {
 };
 
 /// One of the command lines this module fronts, resolved from its word by
-/// [`family`]. Opaque on purpose: a caller either has one — the word names a
+/// [`entry_point`]. Opaque on purpose: a caller either has one — the word names a
 /// family — or it does not, so the gate and the dispatch cannot disagree and
 /// the registry is looked up once.
 pub struct Cli(&'static Family);
 
-/// Resolve a command-line word to its family: `Some` when `mahbot <word>` is
-/// one of these command lines, `None` when the caller must keep dispatching.
+/// Resolve a command-line word to its family: `Some` when `mahbot <word>` is one
+/// of these command lines. Every family is an entry point ([`entry_point`]); this
+/// is the registry lookup under it.
 #[must_use]
-pub fn family(word: &str) -> Option<Cli> {
+fn family(word: &str) -> Option<Cli> {
     FAMILIES.iter().find(|family| family.word == word).map(Cli)
+}
+
+/// One entry point a launch's first word can name: the binary's whole command
+/// table, the families beside the fixed words below. The ladder dispatches on this
+/// answer alone, so a word it serves and a word it knows are one fact, and a word
+/// with no variant here is refused as the caller's own misuse.
+pub enum EntryPoint {
+    /// `mahbot` with no first word: the dashboard daemon.
+    Daemon,
+    /// `mahbot paused`: the daemon, with every registered workspace paused before
+    /// the poll loop starts.
+    Paused,
+    /// `-h`/`--help`.
+    Help,
+    /// `-V`/`--version`.
+    Version,
+    /// `mahbot debug` — the read-only query tool ([`crate::db::debug`]).
+    Debug,
+    /// `mahbot __grep-engine` — the shell's own grep serving.
+    GrepEngine,
+    /// `mahbot __env-dump` — the shell-environment reader's child dumper.
+    EnvDump,
+    /// `mahbot bench-openrouter` — the standalone provider benchmark.
+    BenchOpenRouter,
+    /// `mahbot audio` — the speech command.
+    Audio,
+    /// `mahbot chrome` — the browser-automation command.
+    Chrome,
+    /// One of the command-line families ([`FAMILIES`]).
+    Family(Cli),
+}
+
+/// Resolve a launch's first word — `None` when the launch had none — to the entry
+/// point it names, or `None` when this build has no entry point by that word.
+///
+/// The words are compiled into the binary, so an instance — running or not — takes
+/// no part in the answer.
+#[must_use]
+pub fn entry_point(word: Option<&str>) -> Option<EntryPoint> {
+    Some(match word {
+        None => EntryPoint::Daemon,
+        Some("paused") => EntryPoint::Paused,
+        Some("-h" | "--help") => EntryPoint::Help,
+        Some("-V" | "--version") => EntryPoint::Version,
+        Some("debug") => EntryPoint::Debug,
+        Some("__grep-engine") => EntryPoint::GrepEngine,
+        Some("__env-dump") => EntryPoint::EnvDump,
+        Some("bench-openrouter") => EntryPoint::BenchOpenRouter,
+        Some("audio") => EntryPoint::Audio,
+        Some("chrome") => EntryPoint::Chrome,
+        Some(word) => EntryPoint::Family(family(word)?),
+    })
 }
 
 /// Whether this command line fronts `tool` by name.
@@ -2607,6 +2662,25 @@ pub fn refuse_non_text_argument() -> i32 {
     Exit::Usage.code()
 }
 
+/// What a first word no entry point has is told. It is never echoed: a value
+/// mistyped as a word is not printed back ([`grammar::read_token`]), and a first
+/// word is as likely a stray value — a secret among them — as a misspelled
+/// command.
+const UNKNOWN_ENTRY_POINT: &str = "the first word names no entry point of this build — nothing \
+                                   was started; run 'mahbot -h' for the commands this build has";
+
+/// Refuse a first word this build has no entry point for, returning this command
+/// line's misuse class.
+///
+/// The word names nothing the binary can do, so no instance could give it meaning
+/// and the launch must not fall through to the daemon — where it would either
+/// start one or report the instance lock instead of the caller's own mistake.
+#[must_use]
+pub fn refuse_unknown_entry_point() -> i32 {
+    crate::util::print_stderr(&format!("mahbot: {UNKNOWN_ENTRY_POINT}"));
+    Exit::Usage.code()
+}
+
 /// What one attempt's result means for the caller.
 struct Verdict {
     /// The product's own answer, printed to stdout verbatim — present whenever
@@ -2707,25 +2781,68 @@ mod tests {
     use crate::chrome::contract::OutKind;
     use crate::db::ipc::CallReply;
 
-    /// Every entry point is discoverable from `mahbot -h`: the families from the
-    /// registry, and the command lines that belong to none of them — `paused`,
-    /// the speech command, the browser CLI, the debugger and the benchmark. One
-    /// left out of the top-level usage would be reachable only by someone who
-    /// already knew its word; `mahbot audio` above all, which has to be
-    /// discoverable on a platform where it can only refuse.
+    /// Every first word this build has is one entry point, and every entry point
+    /// the help publishes is discoverable from `mahbot -h`: the families from the
+    /// registry, and the command lines that belong to none of them — `paused`, the
+    /// speech command, the browser CLI, the debugger and the benchmark. One left
+    /// out of the top-level usage would be reachable only by someone who already
+    /// knew its word; `mahbot audio` above all, which has to be discoverable on a
+    /// platform where it can only refuse.
     ///
-    /// The families are checked in the derived form ([`family_syntax`]), so a
-    /// tool or operation rename cannot leave the top-level help stale; the
-    /// non-family entries have no registry to derive from and are checked by
-    /// their own word.
+    /// Resolution is pinned word by word, so a misrouting — `paused` losing the
+    /// pause flag to the daemon, a hidden verb landing on the wrong frontend — is
+    /// caught here rather than by a run. The families are checked in the derived
+    /// form ([`family_syntax`]), so a tool or operation rename cannot leave the
+    /// top-level help stale; the non-family entries have no registry to derive from
+    /// and are checked by their own word.
     ///
-    /// The bare launch is not in the list: it has no word after `mahbot`, so the
-    /// shape this loop looks for cannot match it.
+    /// Both directions of the tie are held: a word this build has an entry point
+    /// for resolves to it, while a word it has none for resolves to nothing and is
+    /// never the daemon by fallback. A bare launch is the daemon; it is the one
+    /// entry with no word.
     ///
     /// Here — beside the registry — so the library's own test lane holds the tie,
     /// not just the whole-workspace run.
     #[test]
-    fn every_entry_point_is_listed_in_the_top_level_usage() {
+    fn every_entry_point_resolves_and_is_listed_in_the_top_level_usage() {
+        assert!(matches!(entry_point(Some("-h")), Some(EntryPoint::Help)));
+        assert!(matches!(
+            entry_point(Some("--help")),
+            Some(EntryPoint::Help)
+        ));
+        assert!(matches!(entry_point(Some("-V")), Some(EntryPoint::Version)));
+        assert!(matches!(
+            entry_point(Some("--version")),
+            Some(EntryPoint::Version)
+        ));
+        assert!(matches!(
+            entry_point(Some("paused")),
+            Some(EntryPoint::Paused)
+        ));
+        assert!(matches!(
+            entry_point(Some("debug")),
+            Some(EntryPoint::Debug)
+        ));
+        assert!(matches!(
+            entry_point(Some("__grep-engine")),
+            Some(EntryPoint::GrepEngine)
+        ));
+        assert!(matches!(
+            entry_point(Some("__env-dump")),
+            Some(EntryPoint::EnvDump)
+        ));
+        assert!(matches!(
+            entry_point(Some("bench-openrouter")),
+            Some(EntryPoint::BenchOpenRouter)
+        ));
+        assert!(matches!(
+            entry_point(Some("audio")),
+            Some(EntryPoint::Audio)
+        ));
+        assert!(matches!(
+            entry_point(Some("chrome")),
+            Some(EntryPoint::Chrome)
+        ));
         for word in ["paused", "audio", "chrome", "debug", "bench-openrouter"] {
             let entry = format!("  mahbot {word} ");
             assert!(
@@ -2734,12 +2851,19 @@ mod tests {
             );
         }
         for family in FAMILIES {
+            assert!(
+                matches!(entry_point(Some(family.word)), Some(EntryPoint::Family(_))),
+                "'{}' must resolve to its family",
+                family.word
+            );
             let entry = format!("  {}", family_syntax(family));
             assert!(
                 TOP_LEVEL_USAGE.lines().any(|line| line.starts_with(&entry)),
                 "'{entry}' has no entry in the top-level usage"
             );
         }
+        assert!(matches!(entry_point(None), Some(EntryPoint::Daemon)));
+        assert!(entry_point(Some("frobnicate")).is_none());
     }
 
     /// The admin Assistant's own toolset — the toolset the command line fronts.

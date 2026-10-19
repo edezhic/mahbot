@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use mahbot::agent::message_router;
 use mahbot::channels::broadcast_and_persist_incoming_message;
 use mahbot::channels::telegram::{ControlInput, control_input, user_command_entries};
+use mahbot::cli::EntryPoint;
 use mahbot::config::CONFIG;
 use mahbot::gui::{Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::logs::LogStore;
@@ -696,8 +697,24 @@ async fn shutdown_after_dashboard() {
     mahbot::db::checkpoint::checkpoint_all_databases().await;
 }
 
-// The verb ladder is deliberately one function: every entry point the process
-// can be launched as is visible in one place, in dispatch order.
+/// A short-lived current-thread runtime for a command-line entry point: each of
+/// them runs one operation and exits, so nothing the daemon's own runtime carries
+/// is needed.
+fn command_line_runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
+}
+
+/// The words after the command word: what a dispatched entry point reads
+/// (`argv[0]` is the binary, `argv[1]` the word `mahbot::cli` resolved).
+fn command_line_args() -> Vec<String> {
+    std::env::args().skip(2).collect()
+}
+
+// The verb ladder is deliberately one function: every dispatch is visible in one
+// place, and its words are `mahbot::cli`'s command table. Every entry point the
+// process can be launched as is dispatched here.
 #[expect(clippy::too_many_lines)]
 fn main() -> Result<()> {
     mahbot::shutdown::install_fatal_signal_handlers();
@@ -716,123 +733,110 @@ fn main() -> Result<()> {
         std::process::exit(mahbot::cli::refuse_non_text_argument());
     }
 
-    // Debug subcommand: run SQL query directly, skip all GUI/instance setup.
-    // Must be checked before lock acquisition so the debug tool can query
-    // databases while an instance is running. No tracing init, no Iced.
-    if std::env::args().nth(1).as_deref() == Some("debug") {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        match rt.block_on(mahbot::db::debug::run_debug()) {
-            Ok(()) => std::process::exit(0),
-            Err(e) => {
-                mahbot::util::print_stderr(&format!("Error: {e:#}"));
-                std::process::exit(1);
+    // The command table (`mahbot::cli`) holds every first word this build has, the
+    // hidden verbs the shell tool and the environment reader spawn included. A word
+    // it has none for is the caller's own mistake, refused here — before the storage
+    // root, the temp root and the instance lock, so nothing is started, filed or
+    // waited on.
+    let Some(entry) = mahbot::cli::entry_point(std::env::args().nth(1).as_deref()) else {
+        std::process::exit(mahbot::cli::refuse_unknown_entry_point());
+    };
+
+    // Every entry point that is a command line runs its own frontend and exits,
+    // before the daemon's pre-boot steps: each has to work while an instance holds
+    // the lock taken below. What is left for the daemon is a bare launch and
+    // `paused`, a launch mode rather than a command line.
+    let start_paused = match entry {
+        // Read-only SQL directly, with no GUI or instance setup. The surface that
+        // must work WHILE an instance holds the lock, hence before lock
+        // acquisition. No tracing init, no Iced.
+        EntryPoint::Debug => {
+            let rt = command_line_runtime()?;
+            match rt.block_on(mahbot::db::debug::run_debug()) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    mahbot::util::print_stderr(&format!("Error: {e:#}"));
+                    std::process::exit(1);
+                }
             }
         }
-    }
 
-    // Hidden grep-engine subcommand: served by the shell tool's transparent
-    // grep interception. Also dispatched before lock acquisition — an instance
-    // holds the lock, so a normally-dispatched second process would fail.
-    if std::env::args().nth(1).as_deref() == Some("__grep-engine") {
-        let code = mahbot::run_grep_engine(&std::env::args().skip(2).collect::<Vec<_>>());
-        std::process::exit(code);
-    }
+        // Served by the shell tool's transparent grep interception. Also before
+        // lock acquisition — an instance holds the lock, so a normally dispatched
+        // second process would fail.
+        EntryPoint::GrepEngine => {
+            std::process::exit(mahbot::run_grep_engine(&command_line_args()));
+        }
 
-    // Hidden environment-dumper subcommand: the shell-env reader spawns this
-    // binary as a child of the owner's own shell, so it inherits exactly the
-    // environment that shell exported and prints it to stdout. Dispatched here,
-    // before the instance lock and before `temp::init_temp_root()`, and it must
-    // touch neither — nor tracing, nor the stores: an instance holds the lock,
-    // and the dumper's only job is to write its environment out.
-    if std::env::args().nth(1).as_deref() == Some("__env-dump") {
-        std::process::exit(mahbot::shell_env::dump_environment(
-            &std::env::args().skip(2).collect::<Vec<_>>(),
-        ));
-    }
+        // The shell-env reader spawns this binary as a child of the owner's own
+        // shell, so it inherits exactly the environment that shell exported and
+        // prints it to stdout. It must touch neither the instance lock nor
+        // `temp::init_temp_root()` — nor tracing, nor the stores: an instance
+        // holds the lock, and the dumper's only job is to write its environment
+        // out.
+        EntryPoint::EnvDump => {
+            std::process::exit(mahbot::shell_env::dump_environment(&command_line_args()));
+        }
 
-    // bench-openrouter subcommand: standalone OpenRouter provider benchmark.
-    // Dispatched before lock acquisition — it must work while another instance
-    // holds the lock. It never opens a live store: the config-store lookup goes
-    // through that instance's debug channel while the location is held, is
-    // skipped with a printed notice when the location may be held but the channel
-    // cannot be reached, and reads the store directly only when nothing holds it.
-    if std::env::args().nth(1).as_deref() == Some("bench-openrouter") {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let code = rt.block_on(mahbot::bench_openrouter::run_cli());
-        std::process::exit(code);
-    }
+        // Standalone benchmark: it must work while another instance holds the
+        // lock. It never opens a live store — the config-store lookup goes through
+        // that instance's debug channel while the location is held, is skipped
+        // with a printed notice when the location may be held but the channel
+        // cannot be reached, and reads the store directly only when nothing holds
+        // it.
+        EntryPoint::BenchOpenRouter => {
+            let rt = command_line_runtime()?;
+            std::process::exit(rt.block_on(mahbot::bench_openrouter::run_cli()));
+        }
 
-    // `mahbot audio` subcommand: the product's own speech engine on the command
-    // line — a recording into text, text into a spoken file. Dispatched before
-    // lock acquisition + temp-root init like the other CLIs: it touches only the
-    // speech models under the storage root (never a store, never the settings),
-    // so it works while the product is stopped and runs alongside it without
-    // disturbing it.
-    if std::env::args().nth(1).as_deref() == Some("audio") {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let args = std::env::args().skip(2).collect::<Vec<_>>();
-        let code = rt.block_on(mahbot::run_audio_cli(&args));
-        std::process::exit(code);
-    }
+        // The product's own speech engine on the command line — a recording into
+        // text, text into a spoken file. It touches only the speech models under
+        // the storage root (never a store, never the settings), so it works while
+        // the product is stopped and runs alongside it without disturbing it.
+        EntryPoint::Audio => {
+            let rt = command_line_runtime()?;
+            std::process::exit(rt.block_on(mahbot::run_audio_cli(&command_line_args())));
+        }
 
-    // `mahbot chrome` subcommand: browser automation CLI over the
-    // shared chrome core. Dispatched before lock acquisition + temp-root init
-    // so it can run alongside the instance (it uses its own session namespace);
-    // chrome-use resolves to the product's own copy at its standard install
-    // directory, which needs no config.
-    if std::env::args().nth(1).as_deref() == Some("chrome") {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let args = std::env::args().skip(2).collect::<Vec<_>>();
-        let code = rt.block_on(mahbot::run_chrome_cli(&args));
-        std::process::exit(code);
-    }
+        // Browser automation over the shared chrome core. Runs alongside the
+        // instance (it uses its own session namespace); chrome-use resolves to the
+        // product's own copy at its standard install directory, which needs no
+        // config.
+        EntryPoint::Chrome => {
+            let rt = command_line_runtime()?;
+            std::process::exit(rt.block_on(mahbot::run_chrome_cli(&command_line_args())));
+        }
 
-    // The command-line families (`mahbot <family> …`, every family
-    // `mahbot::cli::FAMILIES` publishes): the command line's frontends onto the
-    // product's own tools. Dispatched before lock acquisition and temp-root init
-    // like the other CLIs — the operations run IN the instance, which holds the
-    // lock, and this process never opens one of its stores.
-    if let Some(word) = std::env::args().nth(1)
-        && let Some(cli) = mahbot::cli::family(&word)
-    {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let args = std::env::args().skip(2).collect::<Vec<_>>();
-        std::process::exit(rt.block_on(mahbot::cli::run(cli, &args)));
-    }
+        // The command-line families (`mahbot <family> …`, every family
+        // `mahbot::cli::FAMILIES` publishes): frontends onto the product's own
+        // tools. The operations run IN the instance, which holds the lock, and this
+        // process never opens one of its stores.
+        EntryPoint::Family(cli) => {
+            let rt = command_line_runtime()?;
+            std::process::exit(rt.block_on(mahbot::cli::run(cli, &command_line_args())));
+        }
 
-    // Top-level help/version flags: print and exit before temp-root init and
-    // lock acquisition, so they work while an instance holds the lock (and when
-    // it doesn't — without this they would boot the GUI).
-    // Only exact argv[1] tokens are matched; subcommand-level flags
-    // (`mahbot chrome -h` etc.) keep routing to their own CLI handlers.
-    match std::env::args().nth(1).as_deref() {
-        Some("-h" | "--help") => {
+        // The help and version flags print and exit before the temp root and the
+        // lock, so they work while an instance holds it (and when it doesn't —
+        // otherwise they would boot the GUI). Only the exact first tokens are
+        // matched; a subcommand-level flag (`mahbot chrome -h` etc.) reaches its
+        // own frontend above.
+        EntryPoint::Help => {
             mahbot::util::print_stdout(mahbot::cli::TOP_LEVEL_USAGE);
             return Ok(());
         }
-        Some("-V" | "--version") => {
+        EntryPoint::Version => {
             mahbot::util::print_stdout(concat!("mahbot ", env!("CARGO_PKG_VERSION")));
             return Ok(());
         }
-        _ => {}
-    }
 
-    // `mahbot paused` is a startup mode, not a subcommand: the launch continues
-    // into the normal GUI startup, with a flag that pauses every registered
-    // workspace before any background task starts (see `bootstrap_mahbot`). Only
-    // this exact argv[1] token is matched — no argument, or anything else,
-    // behaves exactly as before.
-    let start_paused = std::env::args().nth(1).as_deref() == Some("paused");
+        // A startup mode, not a command line: the launch continues into the normal
+        // GUI startup with the flag that pauses every registered workspace before
+        // any background task starts (see `bootstrap_mahbot`).
+        EntryPoint::Paused => true,
+        // A bare `mahbot`: the daemon.
+        EntryPoint::Daemon => false,
+    };
 
     // The platform's own exemption from slowing this process down because its window is
     // not visible, asked for here — before anything else the daemon does, so it holds for
@@ -860,8 +864,9 @@ fn main() -> Result<()> {
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
     // platform's temp variables to it — BEFORE any temp use (config, logs,
     // stores, shell children). The debug, __grep-engine, __env-dump,
-    // bench-openrouter, audio, chrome, the command-line families and help/version
-    // dispatches above must NOT create the root (they exit before this point).
+    // bench-openrouter, audio, chrome, the command-line families, help/version
+    // dispatches above and a refused unknown first word must NOT create the root
+    // (they exit before this point).
     mahbot::temp::init_temp_root().map_err(|e| {
         mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e)
     })?;
