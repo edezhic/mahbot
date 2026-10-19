@@ -1556,7 +1556,7 @@ async fn deliver_single_user_response(
         &user.name,
         channel,
         response,
-        Some(role.as_str().to_string()),
+        role.as_str().to_string(),
         &job.workspace_name,
         Some(crate::generate_id()),
     )
@@ -1607,7 +1607,7 @@ pub async fn deliver_unregistered_user_response(
         user_name,
         ch,
         response,
-        Some(role.as_str().to_string()),
+        role.as_str().to_string(),
         &job.workspace_name,
         Some(crate::generate_id()),
     )

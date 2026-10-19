@@ -27,107 +27,58 @@ use tokio_util::sync::CancellationToken;
 
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 
-/// Entry for a single chat message that should be both broadcast to the GUI
-/// dashboard and persisted to chat_history. Fields map directly to the
-/// [`crate::ChatEvent::Message`] and [`ChatHistoryInsert`] parameters.
-#[derive(Debug, Clone)]
-struct BroadcastPersistEntry {
-    user_name: String,
-    channel: String,
-    content: String,
-    direction: ChatDirection,
-    agent_role: Option<String>,
-    broadcast_id: Option<String>,
-    workspace: String,
-    optimistic_id: Option<String>,
-    reply_reference: Option<crate::channels::ReplyReference>,
-}
-
-impl BroadcastPersistEntry {
-    /// Broadcast this entry to [`crate::CHAT_BROADCAST`] and persist it to
-    /// `chat_history`.
-    async fn broadcast_and_persist(self) {
-        debug_assert!(
-            self.direction != ChatDirection::Agent || self.agent_role.is_some(),
-            "BroadcastPersistEntry: direction=Agent but agent_role is None"
-        );
-
-        let message_id = crate::generate_id();
-        let timestamp = db::now();
-
-        let db_direction = match self.direction {
-            ChatDirection::Agent => "agent".to_string(),
-            ChatDirection::User => "user".to_string(),
-            ChatDirection::Divider => {
-                unreachable!("Divider markers should not go through broadcast_and_persist")
-            }
-        };
-
-        broadcast_chat_event(
-            &message_id,
-            &self.user_name,
-            &self.content,
-            self.direction,
-            &self.channel,
-            self.agent_role.clone(),
-            &self.workspace,
-            self.optimistic_id.clone(),
-            self.reply_reference.clone(),
-            &timestamp,
-            false,
-        );
-
-        let store = crate::channels::chat_history::store();
-        let _ = store
-            .insert(&ChatHistoryInsert {
-                message_id,
-                user_name: self.user_name,
-                direction: db_direction,
-                content: self.content,
-                agent_role: self.agent_role,
-                broadcast_id: self.broadcast_id,
-                workspace: self.workspace,
-                timestamp: Some(timestamp),
-                reply_reference: self.reply_reference,
-            })
-            .await;
-    }
-}
-
 /// Broadcast an agent response to CHAT_BROADCAST for live GUI display and
 /// persist it to chat_history. This is the canonical entry point for all
-/// agent responses — used by the per-agent consumer loop in
-/// [`crate::agent::message_router`] and by the raw reply-target delivery path.
+/// agent responses: the delivery paths in [`crate::agent::message_router`]
+/// (registered users and raw reply targets) and the macOS voice notice in
+/// `crate::audio::voice`.
 ///
 /// TTS audio playback is handled separately by `crate::audio::tts::init_listener()`
 /// (macOS-only), which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST)
 /// and triggers speech for the admin's own assistant messages.  This function
 /// does not itself invoke any TTS logic.
 ///
-/// Takes explicit `user_name` (canonical user name), `channel` (e.g. "telegram", "gui"),
-/// and primitive fields — does **not** depend on [`crate::SendMessage`], so it can be used
-/// from the per-agent consumer loop which works from [`crate::users::UserRecord`].
+/// Takes primitive fields rather than [`crate::SendMessage`], so the per-agent
+/// consumer loop can call it with a [`crate::users::UserRecord`].
 pub(crate) async fn broadcast_and_persist_agent_response(
     user_name: &str,
     channel: &str,
     content: &str,
-    agent_role: Option<String>,
+    agent_role: String,
     workspace: &str,
     broadcast_id: Option<String>,
 ) {
-    BroadcastPersistEntry {
-        user_name: user_name.to_string(),
-        channel: channel.to_string(),
-        content: content.to_string(),
-        direction: ChatDirection::Agent,
-        agent_role, // moved — no clone needed
-        broadcast_id,
-        workspace: workspace.to_string(),
-        optimistic_id: None,   // agent messages must not carry one
-        reply_reference: None, // agent responses never carry a reply reference
-    }
-    .broadcast_and_persist()
-    .await;
+    let message_id = crate::generate_id();
+    let timestamp = db::now();
+
+    broadcast_chat_event(
+        &message_id,
+        user_name,
+        content,
+        ChatDirection::Agent,
+        channel,
+        Some(agent_role.clone()),
+        workspace,
+        None, // agent messages must not carry one
+        None, // agent responses never carry a reply reference
+        &timestamp,
+        false,
+    );
+
+    let store = crate::channels::chat_history::store();
+    let _ = store
+        .insert(&ChatHistoryInsert {
+            message_id,
+            user_name: user_name.to_string(),
+            direction: "agent".to_string(),
+            content: content.to_string(),
+            agent_role: Some(agent_role),
+            broadcast_id,
+            workspace: workspace.to_string(),
+            timestamp: Some(timestamp),
+            reply_reference: None,
+        })
+        .await;
 }
 
 /// Send a [`ChatEvent::Message`] to the broadcast channel.
@@ -310,7 +261,8 @@ pub fn spawn_scoped_typing_task(
     })
 }
 
-/// Cancel the typing task (via token) and await its completion.
+/// Await a typing task's shutdown, logging a crash. Cancellation belongs to the
+/// caller: cancel the token the task was spawned with, then await this.
 pub async fn stop_typing(handle: tokio::task::JoinHandle<()>) {
     if let Err(error) = handle.await {
         tracing::error!("Typing task crashed: {error}");

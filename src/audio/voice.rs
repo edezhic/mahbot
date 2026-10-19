@@ -2468,7 +2468,7 @@ impl PipelineCtx {
             user_name,
             "voice",
             msg,
-            Some("voice".to_string()),
+            "voice".to_string(),
             &ws.name,
             None,
         )

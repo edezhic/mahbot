@@ -13,8 +13,7 @@
 //!
 //! Messages are written by the central broadcast-and-persist paths:
 //! `broadcast_and_persist_incoming_message` for incoming user messages and
-//! `broadcast_and_persist_agent_response` / `BroadcastPersistEntry` for outgoing
-//! agent responses.
+//! `broadcast_and_persist_agent_response` for outgoing agent responses.
 //!
 //! Each message gets a NanoID for deduplication.
 
