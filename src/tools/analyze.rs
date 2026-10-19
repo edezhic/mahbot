@@ -1387,14 +1387,7 @@ pub(crate) fn extract_query_telemetry_from_history(
     let mut searches = 0usize;
     let mut queries = Vec::new();
     for msg in history {
-        let Some(decoded) = crate::session::decode_native_history_message(msg) else {
-            continue;
-        };
-        let crate::session::DecodedNativeHistoryMessage::Assistant {
-            tool_calls: Some(calls),
-            ..
-        } = decoded
-        else {
+        let Some(calls) = crate::session::decoded_tool_calls(msg) else {
             continue;
         };
         tool_calls += calls.len();

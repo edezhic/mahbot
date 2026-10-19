@@ -54,12 +54,19 @@ pub(crate) const SUMMARIZATION_IMAGE_COUNT: usize = 10;
 /// after summarization compaction.
 const RETENTION_PER_SIDE: usize = 3;
 
-/// Decode the tool-call payload of a native assistant history frame.
+/// Decode the tool-call payload of a native assistant history frame — the one
+/// calls-only view of [`decode_native_history_message`].
+///
 /// Returns `Some(calls)` only when the message decodes as an assistant frame
 /// carrying a tool-call payload; `None` covers non-assistant frames, decode
 /// failures, and frames without a payload. `Some([])` (payload present but
-/// empty) stays distinguishable from `None`.
-fn decoded_tool_calls(msg: &ChatMessage) -> Option<Vec<ToolCall>> {
+/// empty) stays distinguishable from `None` — a present-but-empty call list is
+/// a tool-call frame with nothing to run, not an absence of one.
+///
+/// Callers span unrelated concerns — retention-window selection, dead-session
+/// dangling-tail detection, tool-result settling, and query/command telemetry
+/// over persisted history — so a semantic change here reaches all of them.
+pub(crate) fn decoded_tool_calls(msg: &ChatMessage) -> Option<Vec<ToolCall>> {
     match decode_native_history_message(msg) {
         Some(DecodedNativeHistoryMessage::Assistant { tool_calls, .. }) => tool_calls,
         _ => None,
@@ -994,40 +1001,24 @@ impl SessionStore {
             .collect::<Result<Vec<_>, _>>()
             .context("decode tool-call frame candidate rows")?;
 
-        let mut frame: Option<(i64, String)> = None;
+        let mut frame: Option<(i64, Vec<ToolCall>)> = None;
         for (id, content) in candidates {
             let msg = ChatMessage {
                 role: ChatRole::Assistant,
                 content,
             };
-            if is_tool_call_frame(&msg) {
-                frame = Some((id, msg.content));
+            if let Some(calls) = decoded_tool_calls(&msg) {
+                // Frame call order is the provider-valid result order.
+                frame = Some((id, calls));
                 break;
             }
         }
-        let Some((frame_row_id, frame_content)) = frame else {
+        let Some((frame_row_id, frame_calls)) = frame else {
             tracing::warn!(
                 agent_id,
                 "settle_tool_results: no tool-call frame found — no-op"
             );
             return Ok(Vec::new());
-        };
-
-        // Decode the frame's ordered tool-call ids (frame call order is the
-        // provider-valid result order).
-        let frame_calls = {
-            let msg = ChatMessage {
-                role: ChatRole::Assistant,
-                content: frame_content,
-            };
-            let Some(DecodedNativeHistoryMessage::Assistant {
-                tool_calls: Some(calls),
-                ..
-            }) = decode_native_history_message(&msg)
-            else {
-                unreachable!("is_tool_call_frame verified the frame decodes");
-            };
-            calls
         };
 
         let captured: Vec<SettledRow> = tx

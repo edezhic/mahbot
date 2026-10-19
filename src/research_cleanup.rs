@@ -220,20 +220,13 @@ pub(crate) async fn write_results_md(job_id: &str, result: &str) {
 // ── Raw shell-command capture ────────────────────────────────────────────
 
 /// Extract every shell tool-call command from a session history. The canonical
-/// [`decode_native_history_message`](crate::session::decode_native_history_message)
-/// already un-nests provider-wrapped JSON arguments — read them directly. Never
-/// fails: unreadable sessions contribute nothing (fail-open).
+/// [`decoded_tool_calls`](crate::session::decoded_tool_calls) already un-nests
+/// provider-wrapped JSON arguments — read them directly. Never fails:
+/// unreadable sessions contribute nothing (fail-open).
 fn commands_from_history(history: &[crate::ChatMessage]) -> Vec<String> {
     let mut out = Vec::new();
     for msg in history {
-        let Some(decoded) = crate::session::decode_native_history_message(msg) else {
-            continue;
-        };
-        let crate::session::DecodedNativeHistoryMessage::Assistant {
-            tool_calls: Some(calls),
-            ..
-        } = decoded
-        else {
+        let Some(calls) = crate::session::decoded_tool_calls(msg) else {
             continue;
         };
         for call in calls {
