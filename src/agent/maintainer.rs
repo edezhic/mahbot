@@ -16,7 +16,6 @@ use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::agent::run_default_agent;
 use crate::db;
-use crate::pipeline::board::TicketPhase;
 
 /// Maximum number of tickets allowed in Analysis + Planning + Queued
 /// before the maintainer pauses ticket creation.
@@ -76,11 +75,11 @@ struct StoredMaintainerRecommendations {
 ///
 /// ## Behavioural notes
 ///
-/// * **Pipeline throttle**: `is_maintainer_pipeline_full` checks run concurrently
-///   for all workspaces rather than sequentially, so the pre-dev ticket-count
-///   throttle sees a slightly wider window of concurrent ticket counts —
-///   acceptable since the maintainer is best-effort and the per-workspace
-///   count check is still atomic.
+/// * **Pipeline throttle**: `is_maintainer_pipeline_full` runs concurrently for
+///   all workspaces, so one workspace's pre-dev count can be stale relative to
+///   another's — acceptable since the maintainer is best-effort. Each count is
+///   a single statement over the three pre-dev phases, so a ticket moving
+///   between them is never counted twice.
 /// * **Double-dispatch guard**: a defensive registry check per task — a live
 ///   run for the same deterministic id is never re-dispatched. The loop
 ///   itself is sequential (`join_all` blocks the next cycle), so the guard
@@ -445,30 +444,26 @@ fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
 }
 
 /// Returns `true` if the maintainer should skip because the pre-dev pipeline
-/// has reached `MAX_PRE_DEV_TICKETS` or more tickets (Analysis + Planning +
-/// Queued).
+/// (Analysis + Planning + Queued) has reached `MAX_PRE_DEV_TICKETS`.
 ///
-/// If the board is unavailable, returns `false` to allow the run through.
+/// One statement over all three phases: separate per-phase counts are not one
+/// snapshot, so a ticket transitioning between them could be counted twice.
+/// Fails open — an unavailable board or a failed count lets the run through.
 async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
     let Some(board) = crate::pipeline::board::BOARD.get() else {
         return false;
     };
 
-    let count_phase = |phase: TicketPhase| async move {
-        match board.count_by_phase(phase, Some(&ws.name)).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(workspace = %ws.name, %phase, error = %e, "Maintainer: failed to count tickets");
-                0
-            }
+    let pre_dev_count = match board.count_pre_dev_tickets(&ws.name).await {
+        Ok(count) => count,
+        Err(e) => {
+            warn!(
+                workspace = %ws.name,
+                error = %e,
+                "Maintainer: failed to count pre-development tickets"
+            );
+            return false;
         }
-    };
-
-    let pre_dev_count = {
-        let analysis = count_phase(TicketPhase::Analysis).await;
-        let planning = count_phase(TicketPhase::Planning).await;
-        let queued = count_phase(TicketPhase::Queued).await;
-        analysis + planning + queued
     };
 
     if pre_dev_count >= MAX_PRE_DEV_TICKETS {

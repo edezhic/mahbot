@@ -108,8 +108,8 @@ crate::columns! {
 ///
 /// Only one ticket at a time per workspace may be in this pipeline. Any ticket in one of these
 /// phases blocks new Engineer dispatches for that workspace. The Maintainer uses a separate
-/// pre-development threshold (Analysis + Planning + Queued) and is no longer
-/// directly suppressed by this constant.
+/// pre-development count (Analysis + Planning + Queued) and is no longer directly suppressed
+/// by this constant.
 ///
 /// Occupancy is owned by the phase job (a short-lived job whose `kind` is the
 /// ticket's current phase) — a ticket in any of these phases always has a
@@ -1866,24 +1866,26 @@ impl BoardStore {
         Ok(out)
     }
 
-    /// Count how many tickets have the given phase, optionally filtered by workspace.
+    /// Count the maintainer's pre-development tickets (Analysis + Planning +
+    /// Queued) for one workspace in a single snapshot — the ticket-creation
+    /// throttle reading.
     ///
-    /// Excludes archived tickets to stay consistent with [`list_all_tickets`](Self::list_all_tickets)
-    /// and most other read paths in this module. Currently unused for `Done` or `Cancelled`
-    /// (the only phases that ever get archived), so this is a defensive consistency fix —
-    /// callers that pass a terminal phase will not see archived tickets in the count.
-    pub async fn count_by_phase(
-        &self,
-        phase: TicketPhase,
-        workspace_name: Option<&str>,
-    ) -> Result<i64> {
+    /// Archived tickets are excluded: the GUI can archive a ticket in any
+    /// phase, and archived work must not throttle new tickets. Callers treat
+    /// an `Err` as fail-open.
+    pub(crate) async fn count_pre_dev_tickets(&self, workspace_name: &str) -> Result<i64> {
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM tickets \
-                 WHERE phase = ?1 \
-                   AND (?2 IS NULL OR workspace_name = ?2) \
-                   AND is_archived = 0",
-                db::params![phase.as_ref(), workspace_name],
+                 WHERE workspace_name = ?1 \
+                 AND phase IN (?2, ?3, ?4) \
+                 AND is_archived = 0",
+                db::params![
+                    workspace_name,
+                    TicketPhase::Analysis.as_ref(),
+                    TicketPhase::Planning.as_ref(),
+                    TicketPhase::Queued.as_ref(),
+                ],
                 |row| row.get(0),
             )
             .await
