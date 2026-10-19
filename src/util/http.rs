@@ -30,20 +30,15 @@ pub(crate) fn install_ring_provider() {
     });
 }
 
-/// HTTP client shared by [`crate::tools::video_gen::VideoGenTool`],
-/// [`crate::tools::web_search::WebSearchTool`], and
-/// [`crate::providers::transcribe::MediaTranscriber`] — all call their
-/// respective APIs with a 2-minute timeout.
-///
-/// If a future requirement needs different timeouts for a particular consumer,
-/// simply remove this static and re-add separate `OnceLock` statics in the
-/// relevant files (a trivial change — exactly the original pattern).
+/// Shared client for media and provider requests: a 2-minute request timeout
+/// and a 10-second connect timeout. [`media_http_client()`] hands it out and
+/// names its consumers.
 static MEDIA_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Dedicated HTTP client for image-generation POSTs — a 10-minute request
 /// timeout (generations routinely take 92–99 s and load spikes push further).
-/// Kept separate from [`MEDIA_HTTP_CLIENT`] so the 2-minute cap of the other
-/// media consumers (search, video, transcribe, catalog) is never raised.
+/// Kept separate from [`MEDIA_HTTP_CLIENT`] so that window serves image
+/// generation alone instead of becoming the shared media policy.
 static IMAGE_GEN_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Return a Bearer Authorization header value built from the configured
@@ -54,11 +49,9 @@ static IMAGE_GEN_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// sending a request with a blank `"Bearer "` header that would produce an
 /// opaque 401 response.
 ///
-/// Used by [`crate::tools::image_gen::ImageGenTool`],
-/// [`crate::tools::video_gen::VideoGenTool`], and the
-/// [`MediaTranscriber`](crate::providers::transcribe::MediaTranscriber) — all
-/// OpenRouter-based tools that require this header.  Any future
-/// OpenRouter-based media tools should reuse this helper as well.
+/// Used by [`crate::tools::image_gen::ImageGenTool`] directly and by the video
+/// and transcription paths through the provider request helpers below.  Any
+/// future OpenRouter-based media tool should reuse this helper as well.
 #[must_use]
 pub fn bearer_auth_header() -> Option<String> {
     let key = crate::config::CONFIG.provider_key()?;
@@ -233,15 +226,27 @@ pub async fn get_bytes_from_provider(
         .map_err(|e| anyhow::anyhow!("{error_context} failed to read response body: {e}"))
 }
 
-/// Return the shared media-generation HTTP client, initialising it on first
-/// call with a 2-minute request timeout and a 10-second connection timeout.
+/// Return the shared media HTTP client, initialising it on first call with a
+/// 2-minute request timeout and a 10-second connection timeout.
 ///
-/// Used by [`crate::tools::video_gen::VideoGenTool`], [`crate::tools::web_search::WebSearchTool`] (web search APIs),
-/// and `MediaTranscriber` — all of which need the same timeout.  Image
-/// generation uses its own dedicated 10-minute client
-/// ([`image_gen_http_client`]).  If a future consumer requires a different
-/// timeout it should call [`build_http_client`] directly with the
-/// appropriate duration.
+/// Direct users are the
+/// [`WebSearchTool`](crate::tools::web_search::WebSearchTool) and
+/// `util::upload_bridge`'s ephemeral-host uploads and URL verification GETs
+/// (the bridge is what `video_edit`'s local clip and image inputs and video
+/// transcription upload through).  Everything else reaches the client through
+/// [`post_json_to_provider`], [`get_json_from_provider`] and
+/// [`get_bytes_from_provider`]: video generation/edit job submit, poll and
+/// download (`tools::fetch_async_video`), transcription
+/// (`providers::transcribe::MediaTranscriber`), and the media catalog cache.
+///
+/// The 2-minute cap is the default, not a guarantee for every caller: the
+/// video download passes the remaining job window as `request_timeout` to
+/// [`get_bytes_from_provider`], the video poll is raced against that same
+/// window by its caller, and the catalog cache bounds its fetch with a
+/// 10-second timeout of its own.  Image generation uses its dedicated
+/// 10-minute client ([`image_gen_http_client`]).  A consumer with a different
+/// timeout policy should build through [`build_http_client`] and hold the
+/// client for the process (a `OnceLock`) rather than rebuild it per call.
 #[must_use]
 pub fn media_http_client() -> &'static reqwest::Client {
     MEDIA_HTTP_CLIENT.get_or_init(|| build_http_client(Duration::from_mins(2)))

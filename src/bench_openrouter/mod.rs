@@ -125,7 +125,7 @@ const fn hex_digit(n: u8) -> char {
 /// back to the original id. Examples:
 ///
 /// - `deepseek/deepseek-v4-flash-0731` → `deepseek_2fdeepseek-v4-flash-0731`
-/// - `a/b` → `a_2fb`, while `a-b` → `a-2fb` and `a_b` → `a_5fb` (all distinct)
+/// - `a/b` → `a_2fb`, while `a-b` → `a-b` and `a_b` → `a_5fb` (all distinct)
 #[must_use]
 fn model_slug(model: &str) -> String {
     let mut slug = String::with_capacity(model.len() + 8);
