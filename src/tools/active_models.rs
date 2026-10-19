@@ -173,9 +173,12 @@ fn tool_param_name(catalog_key: &str) -> Option<&'static str> {
 /// Render the declared image parameters (typed catalog fields only, mapped to
 /// the `image_gen` tool parameter names). `None` when the model declares no
 /// renderable envelope (only unmapped/unknown parameters) — a header-only
-/// section would carry no actionable capability info.
+/// section would carry no actionable capability info. Rendering is derived
+/// from the buffer: the header is the entire prefix written before any field,
+/// so a longer buffer means the section rendered.
 fn render_image_section(model: &str, info: &ImageModelInfo) -> Option<String> {
     let mut out = format!("Image model: {model}\n");
+    let header = out.len();
     let mut params: Vec<(&str, &ParameterConstraint)> = info
         .supported_parameters
         .iter()
@@ -185,15 +188,12 @@ fn render_image_section(model: &str, info: &ImageModelInfo) -> Option<String> {
     // param — dedupe by tool name so the envelope lists it once.
     params.sort_by_key(|(name, _)| *name);
     params.dedup_by_key(|(name, _)| *name);
-    let mut rendered = false;
     for (name, constraint) in params {
         match constraint {
             ParameterConstraint::Enum(values) => {
-                rendered = true;
                 let _ = writeln!(out, "- {name}: {}", join_capped(values, MAX_LIST_VALUES));
             }
             ParameterConstraint::Range { max } => {
-                rendered = true;
                 // A model may declare more reference images than the provider
                 // accepts — the advertised maximum is clamped to the ceiling.
                 let max = if name == "images" {
@@ -204,27 +204,29 @@ fn render_image_section(model: &str, info: &ImageModelInfo) -> Option<String> {
                 let _ = writeln!(out, "- {name}: max {max}");
             }
             ParameterConstraint::Boolean => {
-                rendered = true;
                 let _ = writeln!(out, "- {name}: supported");
             }
             ParameterConstraint::Unknown => {}
         }
     }
-    rendered.then_some(out)
+    (out.len() > header).then_some(out)
 }
 
 /// Render the declared video capabilities (typed catalog fields only; the
 /// field names match the `video_gen` tool schema) plus the static per-model
 /// video-edit nuances. `None` when the model declares no capability fields
-/// and no nuance data (a header-only section would be noise).
+/// and no nuance data (a header-only section would be noise). Rendering is
+/// derived from the buffer: the header is the entire prefix written before any
+/// field, so a longer buffer means the section rendered — a helper collapsing
+/// the repeated `- label: …` lines must therefore write to the buffer and
+/// return nothing, never a flag.
 fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<String> {
     let mut out = format!("Video model: {model}\n");
-    let mut rendered = false;
+    let header = out.len();
     if let Some(info) = info {
         if let Some(resolutions) = &info.resolutions
             && !resolutions.is_empty()
         {
-            rendered = true;
             let _ = writeln!(
                 out,
                 "- resolution: {}",
@@ -234,7 +236,6 @@ fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<St
         if let Some(ratios) = &info.aspect_ratios
             && !ratios.is_empty()
         {
-            rendered = true;
             let _ = writeln!(
                 out,
                 "- aspect_ratio: {}",
@@ -244,19 +245,16 @@ fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<St
         if let Some(durations) = &info.durations
             && !durations.is_empty()
         {
-            rendered = true;
             let _ = writeln!(out, "- duration: {} seconds", format_durations(durations));
         }
         if let Some(sizes) = &info.sizes
             && !sizes.is_empty()
         {
-            rendered = true;
             let _ = writeln!(out, "- size: {}", join_capped(sizes, MAX_LIST_VALUES));
         }
         if let Some(frames) = &info.frame_images
             && !frames.is_empty()
         {
-            rendered = true;
             let _ = writeln!(
                 out,
                 "- frame images: {}",
@@ -264,7 +262,6 @@ fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<St
             );
         }
         if let Some(audio) = info.generate_audio {
-            rendered = true;
             let _ = writeln!(
                 out,
                 "- generate_audio: {}",
@@ -272,15 +269,13 @@ fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<St
             );
         }
         if let Some(seed) = info.seed {
-            rendered = true;
             let _ = writeln!(out, "- seed: {}", if seed { "yes" } else { "no" });
         }
     }
     if let Some(nuance) = crate::tools::video_edit::video_edit_nuances(model) {
-        rendered = true;
         let _ = writeln!(out, "- editing: {nuance}");
     }
-    rendered.then_some(out)
+    (out.len() > header).then_some(out)
 }
 
 /// Join values, capping the rendered list so future catalogs cannot bloat
