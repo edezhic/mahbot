@@ -1758,7 +1758,7 @@ impl DocumentTool {
             ("header", "a running header"),
             ("footer", "a running footer"),
         ] {
-            let Some(text) = opt_string(args, key)? else {
+            let Some(text) = super::get_opt_str_strict(args, key)? else {
                 continue;
             };
             if format != "docx" {
@@ -1780,7 +1780,7 @@ impl DocumentTool {
         // A slide size is a presentation's own: the page a document or a PDF is
         // laid out on is not choosable, so a `size` named for one is refused
         // rather than silently dropped.
-        let size = opt_string(args, "size")?;
+        let size = super::get_opt_str_strict(args, "size")?;
         if let Some(size) = size {
             if format != "pptx" {
                 anyhow::bail!(
@@ -1818,7 +1818,7 @@ impl DocumentTool {
             request["content"] = resolve_content(ws, args, format, self.access).await?;
         }
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             &format!("{}_{}", default_base(format), crate::util::unix_millis()),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), format).await?;
@@ -1846,7 +1846,7 @@ impl DocumentTool {
         let family = require_sample_family(&sample).await?;
         let extension = copy_extension(&sample, family);
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             &input_base(&sample, "filled"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), &extension).await?;
@@ -1895,7 +1895,7 @@ impl DocumentTool {
         }
         let extension = copy_extension(&input, family);
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             &input_base(&input, "edited"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), &extension).await?;
@@ -1960,7 +1960,7 @@ impl DocumentTool {
             require_pdf(input).await?;
         }
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             &input_base(&inputs[0], "merged"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
@@ -1986,7 +1986,7 @@ impl DocumentTool {
         let metadata = opt_metadata(args)?;
         require_pdf(&input).await?;
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             crate::util::name_stem(&file_name_of(&input)),
         );
         let bases: Vec<String> = (0..groups.len())
@@ -2044,7 +2044,7 @@ impl DocumentTool {
         set_metadata(&mut request, opt_metadata(args)?);
         require_pdf(&input).await?;
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             &input_base(&input, "rotated"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
@@ -2070,7 +2070,7 @@ impl DocumentTool {
         set_metadata(&mut request, opt_metadata(args)?);
         require_pdf(&input).await?;
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             &input_base(&input, "cropped"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
@@ -2107,7 +2107,7 @@ impl DocumentTool {
         set_metadata(&mut request, opt_metadata(args)?);
         require_pdf(&input).await?;
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             &input_base(&input, "resized"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
@@ -2141,7 +2141,7 @@ impl DocumentTool {
             "give a fraction just above zero",
         )?;
         set_number(&mut request, args, "rotate")?;
-        if let Some(color) = opt_string(args, "color")? {
+        if let Some(color) = super::get_opt_str_strict(args, "color")? {
             // A pdf argument is named quoted, as the neighbouring refusals do.
             require_hex_color("\"color\"", color)?;
             request["color"] = json!(color);
@@ -2151,7 +2151,10 @@ impl DocumentTool {
         }
         set_metadata(&mut request, opt_metadata(args)?);
         require_pdf(&input).await?;
-        let base = sanitize_base(opt_string(args, "file_name")?, &input_base(&input, "text"));
+        let base = sanitize_base(
+            super::get_opt_str_strict(args, "file_name")?,
+            &input_base(&input, "text"),
+        );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
         request["output"] = json!(outputs[0].to_string_lossy());
         self.deliver(request, &outputs, "stamped text into").await
@@ -2179,7 +2182,10 @@ impl DocumentTool {
         set_positive_number(&mut request, args, "height", &RULES.dimension_points)?;
         set_metadata(&mut request, opt_metadata(args)?);
         require_pdf(&input).await?;
-        let base = sanitize_base(opt_string(args, "file_name")?, &input_base(&input, "image"));
+        let base = sanitize_base(
+            super::get_opt_str_strict(args, "file_name")?,
+            &input_base(&input, "image"),
+        );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
         request["output"] = json!(outputs[0].to_string_lossy());
         self.deliver(request, &outputs, "inserted the image into")
@@ -2202,7 +2208,7 @@ impl DocumentTool {
         let metadata = opt_metadata(args)?;
         require_pdf(&input).await?;
         let base = sanitize_base(
-            opt_string(args, "file_name")?,
+            super::get_opt_str_strict(args, "file_name")?,
             &input_base(&input, "filled"),
         );
         let outputs = reserve(output, std::slice::from_ref(&base), "pdf").await?;
@@ -2993,13 +2999,11 @@ fn validate_docx_edit(object: &serde_json::Map<String, Value>, op: &str, at: &st
 
 /// Require an `insert_text`'s optional `position` to be `after` or `before`.
 fn require_position(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
-    match object.get("position") {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(position)) if position == "after" || position == "before" => Ok(()),
-        Some(Value::String(position)) => anyhow::bail!(
+    match optional_string(object.get("position"), at, "position")? {
+        None | Some("after" | "before") => Ok(()),
+        Some(position) => anyhow::bail!(
             "usage: {at}.position must be \"after\" or \"before\", got \"{position}\""
         ),
-        Some(v) => Err(super::wrong_type(&format!("{at}.position"), "a string", v)),
     }
 }
 
@@ -3349,13 +3353,12 @@ fn require_merge_range(object: &serde_json::Map<String, Value>, at: &str) -> Res
 /// font colour — to be the shape the kit parses (see [`require_hex_color`]);
 /// returns whether it was stated.
 fn require_color(object: &serde_json::Map<String, Value>, at: &str) -> Result<bool> {
-    match object.get("color") {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::String(color)) => {
+    match optional_string(object.get("color"), at, "color")? {
+        None => Ok(false),
+        Some(color) => {
             require_hex_color(&format!("{at}.color"), color)?;
             Ok(true)
         }
-        Some(v) => Err(super::wrong_type(&format!("{at}.color"), "a string", v)),
     }
 }
 
@@ -3441,16 +3444,13 @@ fn require_alignment<W: AsRef<str> + std::fmt::Display>(
     values: &[W],
     at: &str,
 ) -> Result<bool> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::String(value)) if values.iter().any(|allowed| allowed.as_ref() == value) => {
-            Ok(true)
-        }
-        Some(Value::String(value)) => anyhow::bail!(
+    match optional_string(object.get(key), at, key)? {
+        None => Ok(false),
+        Some(value) if values.iter().any(|allowed| allowed.as_ref() == value) => Ok(true),
+        Some(value) => anyhow::bail!(
             "usage: {at}.{key} must be {}, got \"{value}\"",
             listed(values)
         ),
-        Some(value) => Err(super::wrong_type(&format!("{at}.{key}"), "a string", value)),
     }
 }
 
@@ -4270,24 +4270,9 @@ fn resolve_sheets(args: &Value) -> Result<Value> {
                 "usage: sheets[{index}] must be an object — hint: {{\"name\": …, \"rows\": [[…]]}}"
             );
         };
-        require_taken_keys(
-            object,
-            &format!("sheets[{index}]"),
-            "a sheet",
-            &sheet_field_names(),
-            &[],
-        )?;
-        let name = match object.get("name") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(name)) => Some(name.as_str()),
-            Some(value) => {
-                return Err(super::wrong_type(
-                    &format!("sheets[{index}].name"),
-                    "a string",
-                    value,
-                ));
-            }
-        };
+        let at = format!("sheets[{index}]");
+        require_taken_keys(object, &at, "a sheet", &sheet_field_names(), &[])?;
+        let name = optional_string(object.get("name"), &at, "name")?;
         // A sheet with no name is written as `Sheet<n>` by its position, the
         // kit's own writer default. Resolving it here means the request always
         // carries an explicit name, so the kit never has to default in the
@@ -4671,30 +4656,17 @@ fn require_optional_bool(
     }
 }
 
-/// A present optional string, `at` naming where it sits for the refusal (`""`
-/// for a top-level field): an absent or null value is `None`, a string is read,
-/// and a value of another type is refused rather than read as absent (the shared
-/// [`super::get_opt_str`] is deliberately silent, which would drop the caller's
-/// value instead of telling them about it). The displayed path is built only on
-/// the error path, so reading a value allocates nothing.
+/// A present optional string, `at` naming the prefix of the path it sits at: an
+/// absent or null value is `None`, a string is read, and a value of another type
+/// is refused rather than read as absent, the way the shared
+/// [`super::get_opt_str_strict`] refuses a top-level one — this helper only adds
+/// the caller-built path prefix a nested field's refusal names.
 fn optional_string<'a>(value: Option<&'a Value>, at: &str, key: &str) -> Result<Option<&'a str>> {
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text)),
-        Some(other) => {
-            let named = if at.is_empty() {
-                key.to_string()
-            } else {
-                format!("{at}.{key}")
-            };
-            Err(super::wrong_type(&named, "a string", other))
-        }
+        Some(other) => Err(super::wrong_type(&format!("{at}.{key}"), "a string", other)),
     }
-}
-
-/// A present optional string of a top-level argument.
-fn opt_string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
-    optional_string(args.get(key), "", key)
 }
 
 /// The PDF description `metadata` names, in the kit's shape: every field it
@@ -4984,22 +4956,9 @@ impl Pages {
 /// sit beside another element: the two would name the same page twice, which the
 /// per-element duplicate rule already refuses for named pages.
 fn page_selections(args: &Value) -> Result<Vec<String>> {
-    let selections = match args.get("pages") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(elements)) => {
-            let mut selections = Vec::with_capacity(elements.len());
-            for element in elements {
-                match element {
-                    Value::String(selection) => selections.push(selection.clone()),
-                    // The element's own name is what a caller can fix, so the
-                    // refusal is the array's, naming the shape it wants.
-                    other => return Err(super::wrong_type("pages", "an array of strings", other)),
-                }
-            }
-            selections
-        }
-        Some(v) => return Err(super::wrong_type("pages", "an array of strings", v)),
-    };
+    // The element's own name is what a caller can fix, so the refusal is the
+    // array's, naming the shape it wants.
+    let selections = super::get_str_array(args, "pages")?;
     if selections.len() > 1
         && selections
             .iter()
