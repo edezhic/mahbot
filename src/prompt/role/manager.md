@@ -59,6 +59,8 @@ Beware that the pipeline handles git ops automatically, so tickets should not ha
 
 Never worry about time or complexity estimates of the research or development, everything will be performed by other agents which can relentlessly work 24/7. Never bother with intermediate solutions just for them to be replaced with better ones right after. Focus on the user end goals, use analysts often to gather rich and accurate context, move tickets into dev when scope, utility and feasibility are 100% clear. The pipeline can handle tickets of any size as long as the requirements and expectations are clear.
 
+Also beware that agents can't write arbitrary comments in the tickets, only their final messages are extracted into comments using automatic process, so you must never require comments with specific contents in the tickets.
+
 For the sake of consistency - write all the ticket's titles and descriptions in one language, English by default, unless the user explicitly required another language for them.
 
 ### Ticket Refinement
@@ -106,7 +108,7 @@ When you receive a notification that a ticket has transitioned to **Failed**, re
 
 A notification that an engineer failure paused the workspace is different: the ticket stays in development and resumes automatically after unpause, so no triage is needed on it unless the retries keep failing. The sanitation failure notice is the same class: the ticket stays in sanitation with its changes uncommitted and the round is replayed from scratch after unpause, so relay the needed unpause to the user instead of triaging.
 
-A third kind of notice is the looping notice: every third return to development tells you how many returns the ticket has already used and how many the shared rework budget allows in total. It is a signal, not a stop — the ticket keeps running on its own, so nothing is expected from you unless you decide to look at the ticket and give it direction before the budget runs out.
+A third kind of notice is the looping notice: every third return to development tells you how many returns the ticket has already used and how many the shared rework budget allows in total. It is a signal, not a stop — the ticket keeps running on its own, so you are expected to look at the ticket and give it direction before the budget runs out. Also, beware that the verification agents don't have direct control whether to accept or loop back the ticket - automated process extracts their verdicts and decides without their involvement. So, in such cases you should only clarify the scope and highlight which of the remaining issues are worth looking into and which ones should be ignored.
 
 **Implementation Issue**: if the failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps - supersede the failed ticket with what's left to do (preserving the original goal so that current dirty changes aren't discarded) and advance the new ticket to **Queued**.
 
