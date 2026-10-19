@@ -1022,7 +1022,7 @@ impl BoardStore {
 
     /// Claim a workspace's oldest eligible [`TicketPhase::Backlog`] ticket and
     /// transition it to Analysis. See [`claim_for_phase`] for the shared
-    /// semantics. The Backlog shape additionally applies a `created_at <= ?5`
+    /// semantics. The Backlog shape additionally applies a `created_at <= ?6`
     /// cutoff excluding tickets younger than [`BACKLOG_CLAIM_GRACE`], so a
     /// fresh ticket stays in Backlog ~5s — claiming it into Analysis within
     /// the window would spawn analysts that immediately get cancelled (plus a
@@ -1519,63 +1519,15 @@ impl BoardStore {
         })
     }
 
-    /// Shared implementation for checking if a workspace has active tickets.
-    ///
-    /// Returns `true` if any ticket in the workspace has a pipeline-occupied
-    /// phase ([`PIPELINE_OCCUPIED_PHASES`]), or a
-    /// [`Queued`](TicketPhase::Queued) ticket,
-    /// optionally excluding a specific ticket ID.
-    ///
-    /// [`has_active_tickets_excluding`] delegates to this helper.
-    ///
-    /// # Parameters
-    ///
-    /// * `workspace_name` — The workspace to check.
-    /// * `exclude_ticket_id` — When `Some(id)`, that ticket is excluded from
-    ///   the check. When `None`, no exclusion is applied (the SQL clause
-    ///   `(?2 IS NULL OR id != ?2)` short-circuits to `TRUE`).
-    ///
-    /// Excludes archived tickets — the only phases that ever get archived are
-    /// `Done` and `Cancelled`, neither of which appears in
-    /// `PIPELINE_OCCUPIED_PHASES`, so this is a defensive consistency measure.
-    ///
-    /// # Parameter binding note
-    ///
-    /// The SQL always binds three positional parameters:
-    /// - `?1`: `workspace_name`
-    /// - `?2`: `exclude_ticket_id` (may be `None`)
-    /// - `?3`: Queued phase value
-    async fn has_active_tickets_internal(
-        &self,
-        workspace_name: &str,
-        exclude_ticket_id: Option<&str>,
-    ) -> Result<bool> {
-        let occupied_sql = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES);
-        let sql = format!(
-            "SELECT 1 FROM tickets WHERE \
-             (phase IN ({occupied_sql}) OR phase = ?3) \
-             AND workspace_name = ?1 AND is_archived = 0 \
-             AND (?2 IS NULL OR id != ?2) LIMIT 1",
-        );
-        let queued = TicketPhase::Queued.as_ref();
-        let rows = self
-            .conn
-            .query(&sql, db::params![workspace_name, exclude_ticket_id, queued])
-            .await?;
-        Ok(!rows.is_empty())
-    }
-
     /// Check if the workspace has any active tickets other than the excluded one.
     ///
-    /// "Active" means a ticket whose phase is either a pipeline-occupied phase
-    /// (`PIPELINE_OCCUPIED_PHASES`) or [`TicketPhase::Queued`]
-    /// (unstarted backlog tickets are considered active to suppress Done
-    /// notifications until the pipeline is fully drained).
+    /// "Active" means a pipeline-occupied phase ([`PIPELINE_OCCUPIED_PHASES`])
+    /// or [`TicketPhase::Queued`]. This is not [`WORKING_PHASES`]: `Analysis`
+    /// is working but not active, while `Queued` is active but not working.
     ///
-    /// Delegates to `has_active_tickets_internal`.
-    ///
-    /// Non-active phases (not matched by the query): `Done`, `Cancelled`,
-    /// `Failed`, `Backlog`, `Analysis`, `Planning`.
+    /// Archived tickets are excluded — the GUI can archive a ticket in any
+    /// phase, even though callers are expected to archive only terminal ones
+    /// (see [`count_pre_dev_tickets`](Self::count_pre_dev_tickets)).
     ///
     /// # Race condition note
     ///
@@ -1584,15 +1536,32 @@ impl BoardStore {
     /// each other as active and both buffer their Done transitions. In this
     /// scenario all tickets are already in Done in the database — the only
     /// consequence is that Done notifications are delayed until the next
-    /// [`crate::agent::message_router::MessageKind::UserMessage`] drains the buffer. This is an accepted trade-off:
-    /// the race window is small and the buffer always drains eventually.
-    pub async fn has_active_tickets_excluding(
+    /// [`crate::agent::message_router::MessageKind::UserMessage`] drains the
+    /// buffer. This is an accepted trade-off: the race window is small and the
+    /// buffer always drains eventually.
+    pub(crate) async fn has_active_tickets_excluding(
         &self,
         workspace_name: &str,
         exclude_ticket_id: &str,
     ) -> Result<bool> {
-        self.has_active_tickets_internal(workspace_name, Some(exclude_ticket_id))
-            .await
+        let occupied_sql = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES);
+        let sql = format!(
+            "SELECT 1 FROM tickets WHERE \
+             (phase IN ({occupied_sql}) OR phase = ?2) \
+             AND workspace_name = ?1 AND is_archived = 0 AND id != ?3 LIMIT 1",
+        );
+        let rows = self
+            .conn
+            .query(
+                &sql,
+                db::params![
+                    workspace_name,
+                    TicketPhase::Queued.as_ref(),
+                    exclude_ticket_id
+                ],
+            )
+            .await?;
+        Ok(!rows.is_empty())
     }
 
     /// Add a comment to a ticket (append-only).
