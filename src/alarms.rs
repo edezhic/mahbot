@@ -440,7 +440,7 @@ pub(crate) async fn add_alarm(
     if let Some(encoded) = &encoded_trigger {
         anyhow::ensure!(
             encoded.chars().count() <= MAX_ALARM_TRIGGER_CHARS,
-            "Alarm trigger too long (maximum {MAX_ALARM_TRIGGER_CHARS} characters)"
+            "Alarm trigger too long: the stored trigger — the tool name plus its arguments as JSON — is limited to {MAX_ALARM_TRIGGER_CHARS} characters; shorten the arguments"
         );
     }
 
@@ -449,7 +449,7 @@ pub(crate) async fn add_alarm(
         .map(|f| {
             db::parse_utc_timestamp(f)
                 .map(|dt| dt.to_rfc3339())
-                .with_context(|| format!("Invalid RFC3339/ISO-8601 fire time: {f}"))
+                .with_context(|| format!("Invalid RFC3339/ISO-8601 fire time: {f} — pass a UTC timestamp like 2026-08-28T10:30:00Z"))
         })
         .transpose()?;
 
@@ -459,12 +459,15 @@ pub(crate) async fn add_alarm(
         (Some(fire), None) => {
             anyhow::ensure!(
                 db::parse_utc_timestamp(fire)? > db::parse_utc_timestamp(&db::now())?,
-                "Cannot set an alarm for a time in the past"
+                "Cannot set an alarm for a time in the past: pass a future RFC3339/ISO-8601 UTC time (convert the user's local time to UTC)"
             );
             ("one-shot", None, fire.clone())
         }
         (None, Some(interval)) => {
-            anyhow::ensure!(interval >= 5, "Period must be at least 5 seconds");
+            anyhow::ensure!(
+                interval >= 5,
+                "Period must be at least 5 seconds: raise `interval_seconds`"
+            );
             let interval_secs = i64::try_from(interval)
                 .ok()
                 .filter(|v| *v <= MAX_PERIOD_SECS)
@@ -479,7 +482,9 @@ pub(crate) async fn add_alarm(
                 .unwrap_or(DateTime::<chrono::Utc>::MAX_UTC);
             ("periodic", Some(interval_secs), next.to_rfc3339())
         }
-        _ => anyhow::bail!("Exactly one of fire_at or interval_seconds must be provided"),
+        _ => anyhow::bail!(
+            "Exactly one of fire_at or interval_seconds must be provided: pass `fire_at` for a one-shot reminder or `interval_seconds` for a periodic one, never both"
+        ),
     };
 
     // Enforce the per-session active cap.
@@ -493,7 +498,7 @@ pub(crate) async fn add_alarm(
     let count: i64 = rows.first().map(|r| r.get(0)).transpose()?.unwrap_or(0);
     anyhow::ensure!(
         count < MAX_ACTIVE_ALARMS,
-        "Alarm limit reached (maximum {MAX_ACTIVE_ALARMS} active alarms)"
+        "Alarm limit reached (maximum {MAX_ACTIVE_ALARMS} active alarms): remove one with `remove_alarm` before adding another"
     );
 
     let id = crate::generate_id();

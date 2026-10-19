@@ -1,6 +1,6 @@
 ## Leftover processes
 
-A command that exits while a process it started still holds the command's output channel is reported as a FINISHED call — its own exit status and the output above it are the result. The process it left behind is left RUNNING, no further output from it is collected, and it is named where the containment it lives in can be named; where it cannot, the note says exactly that. {{mode_sentence}}
+A command that exits while a process it started still holds its output channel is reported FINISHED — its own exit status and the output above are the result. The leftover is left RUNNING, no further output from it is collected, and it is named where the containment can be named; where it cannot, the note says so. {{mode_sentence}}
 
 ---
 

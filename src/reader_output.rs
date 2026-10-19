@@ -191,6 +191,11 @@ pub(crate) fn slide_label(template: &str, number: &str) -> String {
 /// block in the enclosing flow.
 pub(crate) const TEXT_BOX: &str = "[text box]";
 
+/// The mark that follows a Word link's own content: `(link: ADDRESS)`, or
+/// `(link: internal)` for an anchor inside the same document. The address and
+/// its closing `)` are the reader's; this is the opening the description names.
+pub(crate) const DOC_LINK: &str = "(link: ";
+
 // ── Chart marks ─────────────────────────────────────────────────
 //
 // The vocabulary a chart's content prints as, wherever a reading prints it: the

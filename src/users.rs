@@ -118,23 +118,37 @@ fn normalize_telegram_binding(value: &str) -> anyhow::Result<String> {
     match telegram_key(trimmed) {
         Some(TelegramKey::Number(id)) => {
             if is_telegram_service_id(&id) {
-                anyhow::bail!("'{id}' is a Telegram service identity and cannot be bound");
+                anyhow::bail!(
+                    "'{id}' is a Telegram service identity, not a person — pass the account's \
+                     own numeric id or @username instead"
+                );
             }
             Ok(id)
         }
         Some(TelegramKey::Nickname(nickname)) => {
             if nickname.is_empty() {
-                anyhow::bail!("Telegram binding is empty");
+                anyhow::bail!(
+                    "Telegram binding is empty — pass the account's numeric id or @username"
+                );
             }
             if nickname == TELEGRAM_UNKNOWN_SENTINEL {
-                anyhow::bail!("'unknown' is a reserved Telegram nickname and cannot be bound");
+                anyhow::bail!(
+                    "'unknown' is a reserved Telegram nickname, not an account — pass the \
+                     account's own numeric id or @username instead"
+                );
             }
             if is_telegram_service_nickname(&nickname) {
-                anyhow::bail!("'@{nickname}' is a Telegram service identity and cannot be bound");
+                anyhow::bail!(
+                    "'@{nickname}' is a Telegram service identity, not a person — pass the \
+                     account's own numeric id or @username instead"
+                );
             }
             Ok(nickname)
         }
-        None => anyhow::bail!("a Telegram id of nothing but zeros is not a person's number"),
+        None => anyhow::bail!(
+            "a Telegram id of nothing but zeros is not a person's number — pass the account's \
+             numeric id or @username"
+        ),
     }
 }
 
@@ -469,7 +483,8 @@ impl UserStore {
         // at all, so an owner found here is always someone else.
         if let Some(owner) = self.telegram_binding_owner(&identifier).await? {
             anyhow::bail!(
-                "{} is already bound to user '{owner}'",
+                "{} is already bound to user '{owner}' — remove that binding on the \
+                 Settings → Users page first, then attach it to this account",
                 describe_telegram_binding(&identifier)
             );
         }

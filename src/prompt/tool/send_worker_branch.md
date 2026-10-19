@@ -1,1 +1,1 @@
-A continuable worker conversation named by `branch`. Naming it continues the branch and restores its history, creating it on first use; a later use may point it at another folder. It runs as a normal worker and reports back as a `<worker-report>` message.
+A continuable worker conversation named by `branch`: naming it continues the branch and restores its history, creating it on first use; a later use may point it at another folder. It runs as a normal worker and reports back as a `<worker-report>` message.

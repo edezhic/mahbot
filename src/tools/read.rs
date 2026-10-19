@@ -1332,6 +1332,7 @@ mod tests {
                 crate::reader_output::DOC_ENDNOTES,
                 crate::reader_output::DOC_COMMENTS,
                 crate::reader_output::TEXT_BOX,
+                crate::reader_output::DOC_LINK,
                 crate::reader_output::CHART_SHEET,
                 &chart_header,
                 &chart_none,

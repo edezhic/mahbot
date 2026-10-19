@@ -48,8 +48,8 @@ use super::{
 };
 use crate::document::{DocOutcome, SkippedImages, ensure_out_dir};
 use crate::reader_output::{
-    CHART_SHEET, MARK_STORED, NO_VALUES, Unshown, UnshownKind, column_index, column_letters,
-    sheet_header, text_block, text_lines,
+    CHART_SHEET, DOC_LINK, MARK_STORED, NO_VALUES, Unshown, UnshownKind, column_index,
+    column_letters, sheet_header, text_block, text_lines,
 };
 use crate::util::one_line;
 use quick_xml::Reader;
@@ -2077,7 +2077,8 @@ fn render_lines(
         if let Some(link) = links_at[index] {
             shown[link] = true;
             let link = &hyperlinks[link];
-            text.push_str(" (link: ");
+            text.push(' ');
+            text.push_str(DOC_LINK);
             // The caption a link carries is what it shows where the cell's own value
             // does not: it is named in front of the target when the two differ, so a
             // caption this reading would otherwise drop is still read.
@@ -2105,7 +2106,7 @@ fn render_lines(
             _ => String::new(),
         };
         lines.push(format!(
-            "{}:{display} (link: {})",
+            "{}:{display} {DOC_LINK}{})",
             link.reference, link.target
         ));
     }

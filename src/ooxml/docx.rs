@@ -87,8 +87,8 @@ use super::{
     rels_part_of, resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
 };
 use crate::reader_output::{
-    TEXT_BOX, WORD_COMMENT, WORD_ENDNOTE, WORD_FOOTER, WORD_FOOTNOTE, WORD_HEADER, labeled_block,
-    lines_of, text_lines,
+    DOC_LINK, TEXT_BOX, WORD_COMMENT, WORD_ENDNOTE, WORD_FOOTER, WORD_FOOTNOTE, WORD_HEADER,
+    labeled_block, lines_of, text_lines,
 };
 use crate::util::{one_line, truncate};
 use quick_xml::Reader;
@@ -767,7 +767,7 @@ impl Word {
             if !sink.is_empty() && !sink.ends_with('\n') {
                 sink.push(if spans_lines { '\n' } else { ' ' });
             }
-            let _ = write!(sink, "(link: {address})");
+            let _ = write!(sink, "{DOC_LINK}{address})");
         }
         result
     }

@@ -2022,12 +2022,20 @@ pub(crate) fn worker_branch_name(agent_id: &str) -> Option<&str> {
 /// `rolex` and `roleplay` shadow nothing and are allowed.
 #[must_use]
 pub(crate) fn custom_role_name_is_reserved(name: &str) -> bool {
+    reserved_custom_role_prefixes().any(|prefix| {
+        let word = prefix.trim_end_matches('_');
+        name.eq_ignore_ascii_case(word) || starts_with_ignore_ascii_case(name, prefix)
+    })
+}
+
+/// Every agent-id prefix a custom role name must not shadow, with its `_` — the
+/// set [`custom_role_name_is_reserved`] tests and the one its refusal names.
+/// Deduped: `rolerun_` is both a transient prefix and a custom-role one.
+pub(crate) fn reserved_custom_role_prefixes() -> impl Iterator<Item = &'static str> {
+    let mut seen = std::collections::BTreeSet::new();
     non_user_facing_agent_id_prefixes()
         .chain([CUSTOM_ROLE_AGENT_ID_PREFIX, CUSTOM_ROLE_RUN_AGENT_ID_PREFIX])
-        .any(|prefix| {
-            let word = prefix.trim_end_matches('_');
-            name.eq_ignore_ascii_case(word) || starts_with_ignore_ascii_case(name, prefix)
-        })
+        .filter(move |prefix| seen.insert(*prefix))
 }
 
 // ── Existing tests ──────────────────────────────────────────────

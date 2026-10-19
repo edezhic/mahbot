@@ -271,11 +271,16 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
     validate_segment(name, MAX_ROLE_NAME_CHARS, "a custom role name")?;
     anyhow::ensure!(
         name.starts_with(|c: char| c.is_ascii_alphabetic()),
-        "a custom role name must start with a letter"
+        "a custom role name must start with a letter — rename it to begin with an ASCII letter"
     );
     anyhow::ensure!(
         !crate::session::custom_role_name_is_reserved(name),
-        "a custom role name must not collide with a built-in agent namespace"
+        "a custom role name must not collide with a built-in agent namespace ({}) — choose a \
+         name outside that set",
+        crate::session::reserved_custom_role_prefixes()
+            .map(|prefix| prefix.trim_end_matches('_'))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     Ok(())
 }
@@ -298,15 +303,15 @@ pub(crate) fn validate_worker_branch(branch: &str) -> Result<()> {
 
 /// Shared charset/length check for a name or an identifier.
 fn validate_segment(value: &str, max_chars: usize, what: &str) -> Result<()> {
-    anyhow::ensure!(!value.is_empty(), "{what} must not be empty");
+    anyhow::ensure!(!value.is_empty(), "{what} must not be empty — name one");
     anyhow::ensure!(
         value.chars().count() <= max_chars,
-        "{what} must be at most {max_chars} characters"
+        "{what} must be at most {max_chars} characters — shorten it"
     );
     for c in value.chars() {
         anyhow::ensure!(
             c.is_ascii_alphanumeric() || c == '_' || c == '-',
-            "{what} may only contain ASCII letters, digits, '_' and '-'"
+            "{what} may only contain ASCII letters, digits, '_' and '-' — replace every other character"
         );
     }
     Ok(())

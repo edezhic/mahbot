@@ -1,1 +1,1 @@
-`addressee` is required: it names who receives the message, and the matching note below says what each value needs.
+One addressee per call.
