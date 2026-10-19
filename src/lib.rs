@@ -1349,6 +1349,9 @@ pub(crate) struct EngineerSummary {
     /// Concise bullet points of what was implemented / fixed / executed.
     #[serde(default)]
     pub items: Vec<String>,
+    /// Measurements or figures the ticket explicitly asked for.
+    #[serde(default)]
+    pub reported: Vec<String>,
     /// One short paragraph summarizing the completed work (optional — legacy
     /// extractions and models emitting null leave it absent).
     pub summary: Option<String>,

@@ -98,6 +98,18 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     for item in items {
         let _ = write!(out, "\n- {}", item.replace('\n', " "));
     }
+    let reported: Vec<&str> = summary
+        .reported
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if !reported.is_empty() {
+        out.push_str("\n\n### Reported");
+        for entry in reported {
+            let _ = write!(out, "\n- {}", entry.replace('\n', " "));
+        }
+    }
     let synopsis = summary.summary.as_deref().unwrap_or("").trim();
     if !synopsis.is_empty() {
         let _ = write!(out, "\n\n### Summary\n{synopsis}");
