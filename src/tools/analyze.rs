@@ -519,10 +519,7 @@ pub(crate) async fn run_analyze_with_job(
                 None,
             );
             let _ = agent.session.init(&slot.agent_id).await;
-            runs.push(AnalyzeRun::Completed {
-                agent,
-                response: Some(raw.clone()),
-            });
+            runs.push(AnalyzeRun::settle(agent, Some(raw.clone())));
         } else if let Some(run) = fresh_iter.next() {
             runs.push(run);
         } else {
@@ -534,22 +531,17 @@ pub(crate) async fn run_analyze_with_job(
     let conn = &crate::session::store().conn;
     for (slot, run) in slots.iter().zip(&runs) {
         let (status, outcome) = match run {
-            AnalyzeRun::Completed {
-                response: Some(raw),
-                ..
-            } => (crate::jobs::RowStatus::Done, raw.clone()),
-            AnalyzeRun::Completed {
-                agent,
-                response: None,
-            } => (
-                crate::jobs::RowStatus::Failed,
-                agent.failure_reason("no-response: analyst produced no response"),
-            ),
-            AnalyzeRun::Failed { reason } => (crate::jobs::RowStatus::Failed, reason.clone()),
+            AnalyzeRun::Completed { response, .. } => (crate::jobs::RowStatus::Done, response),
+            AnalyzeRun::Failed { reason } => (crate::jobs::RowStatus::Failed, reason),
         };
-        if let Err(e) =
-            crate::jobs::write_agent_outcome(conn, job_id, &slot.agent_id, status, Some(&outcome))
-                .await
+        if let Err(e) = crate::jobs::write_agent_outcome(
+            conn,
+            job_id,
+            &slot.agent_id,
+            status,
+            Some(outcome.as_str()),
+        )
+        .await
         {
             // Sync calls fail the tool call on a checkpoint DB error so the
             // model retries; async/boot-resume warn-and-continue (the outcomes
@@ -633,7 +625,7 @@ async fn run_analyze_slots(
         .await
         .into_iter()
         .map(|m| match m {
-            RoundMember::Done((agent, response)) => AnalyzeRun::Completed { agent, response },
+            RoundMember::Done((agent, response)) => AnalyzeRun::settle(agent, response),
             RoundMember::TimedOut => AnalyzeRun::Failed {
                 reason: "timeout: analyst still running when the round deadline expired"
                     .to_string(),
@@ -809,25 +801,26 @@ pub(crate) fn round_timeout() -> Duration {
     crate::util::env_duration_secs("MAHBOT_ROUND_TIMEOUT_SECS", DEFAULT_ROUND_TIMEOUT_SECS)
 }
 
-/// One analyst's outcome in a parallel round. `Failed` covers members that
-/// never completed (stuck past the round deadline, panicked, or cancelled) —
-/// the reason is surfaced, never silent.
+/// One analyst's outcome in a parallel round. `Completed` always carries the
+/// analyst's text; every way of producing none — stuck past the round deadline,
+/// panicked, cancelled, or finished without a response — is spelled
+/// [`Self::Failed`] with its reason surfaced, never silent.
 #[expect(clippy::large_enum_variant)] // Agent is inherently large; the enum is transient
 enum AnalyzeRun {
-    Completed {
-        agent: Agent,
-        response: Option<String>,
-    },
-    Failed {
-        reason: String,
-    },
+    Completed { agent: Agent, response: String },
+    Failed { reason: String },
 }
 
 impl AnalyzeRun {
-    fn response(&self) -> Option<&str> {
-        match self {
-            Self::Completed { response, .. } => response.as_deref(),
-            Self::Failed { .. } => None,
+    /// Settle one finished slot. A member that finished without text is a
+    /// [`Self::Failed`] carrying the agent's own recorded reason, so the real
+    /// error chain (not a bare literal) reaches the caller.
+    fn settle(agent: Agent, response: Option<String>) -> Self {
+        match response.filter(|text| !text.trim().is_empty()) {
+            Some(response) => Self::Completed { agent, response },
+            None => Self::Failed {
+                reason: agent.failure_reason("no-response: analyst produced no response"),
+            },
         }
     }
 }
@@ -929,9 +922,9 @@ fn analyst_slot(
 
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
 /// ≥2 valid → extract findings and run the shared grouping pass (≥2 with
-/// parseable claims group; a single parseable source skips grouping). Failed
-/// members and completed members without a usable response count as no-response,
-/// with their reasons surfaced in the error. `Ok(None)` is a round that was
+/// parseable claims group; a single parseable source skips grouping). A failed
+/// member is the single spelling of "no response" (see [`AnalyzeRun::settle`]),
+/// with its reason surfaced in the error. `Ok(None)` is a round that was
 /// cancelled before this phase's first model call: no text was produced and the
 /// caller receives nothing.
 async fn consolidate_analyst_runs(
@@ -959,43 +952,36 @@ async fn consolidate_analyst_runs(
     // phantom row on 0/1-valid-response rounds where no grouping call runs.
     let valid_count = runs
         .iter()
-        .filter(|r| r.response().is_some_and(|t| !t.trim().is_empty()))
+        .filter(|r| matches!(r, AnalyzeRun::Completed { .. }))
         .count();
     match valid_count {
         0 => {
-            let reasons: Vec<String> = runs
+            // Every run is a failure here (a completed run always carries text).
+            let reasons: Vec<&str> = runs
                 .iter()
-                .map(|r| match r {
-                    AnalyzeRun::Failed { reason } => reason.clone(),
-                    AnalyzeRun::Completed { agent, .. } => {
-                        agent.failure_reason("no-response: analyst produced no response")
-                    }
+                .filter_map(|r| match r {
+                    AnalyzeRun::Failed { reason } => Some(reason.as_str()),
+                    AnalyzeRun::Completed { .. } => None,
                 })
                 .collect();
-            let suffix = if reasons.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", reasons.join("; "))
-            };
             Err(super::internal_fault(&format!(
-                "all parallel analysts failed to produce a response{suffix}"
+                "all parallel analysts failed to produce a response ({})",
+                reasons.join("; ")
             )))
         }
         1 => Ok(Some(
-            single_raw_response(&runs).expect("exactly one valid response"),
+            runs.into_iter()
+                .find_map(|r| match r {
+                    AnalyzeRun::Completed { response, .. } => Some(response),
+                    AnalyzeRun::Failed { .. } => None,
+                })
+                .expect("exactly one valid response"),
         )),
         _ => {
             let outcomes = extract_findings(runs, deadline, round_key).await;
             consolidate_findings(ws, analyze, outcomes, round_key, deadline).await
         }
     }
-}
-
-fn single_raw_response(runs: &[AnalyzeRun]) -> Option<String> {
-    runs.iter().find_map(|r| match r {
-        AnalyzeRun::Completed { response, .. } => response.clone().filter(|t| !t.trim().is_empty()),
-        AnalyzeRun::Failed { .. } => None,
-    })
 }
 
 /// Extract structured claim-level findings from each valid analyst response
@@ -1017,21 +1003,12 @@ async fn extract_findings(
             let extraction_prompt = extraction_prompt.clone();
             let round_key = round_key.to_string();
             tokio::spawn(async move {
-                let (agent, response) = match run {
+                let (agent, raw) = match run {
                     AnalyzeRun::Completed { agent, response } => (agent, response),
                     AnalyzeRun::Failed { reason } => {
                         return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
                     }
                 };
-                let Some(raw) = response else {
-                    let reason = agent.failure_reason("no-response: analyst produced no response");
-                    return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
-                };
-                if raw.trim().is_empty() {
-                    return AnalystOutcome::NoResponse(
-                        "no-response: analyst produced no response".to_string(),
-                    );
-                }
                 // Nothing new starts for a round the caller has cancelled: the
                 // extraction loop re-asks on a parse failure, so the whole call
                 // chain is abandoned at the signal instead of asking again. The
@@ -1793,24 +1770,19 @@ async fn verify_disputed_groups(
 /// (extraction success or failure) in `### Report from Analyst N` sections.
 /// No-response analysts render with their reason so nothing is silently lost.
 fn render_raw_analyst_dump(outcomes: &[AnalystOutcome]) -> String {
-    let mut sections = Vec::new();
-    for (i, o) in outcomes.iter().enumerate() {
-        match o {
-            AnalystOutcome::Findings { raw, .. } | AnalystOutcome::ParseFailed { raw, .. } => {
-                sections.push(format!(
-                    "### Report from Analyst {}\n{}",
-                    i + 1,
+    let sections: Vec<String> = outcomes
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let body = match o {
+                AnalystOutcome::Findings { raw, .. } | AnalystOutcome::ParseFailed { raw, .. } => {
                     escape_fences(raw)
-                ));
-            }
-            AnalystOutcome::NoResponse(reason) => {
-                sections.push(format!(
-                    "### Report from Analyst {}\nno response: {reason}",
-                    i + 1
-                ));
-            }
-        }
-    }
+                }
+                AnalystOutcome::NoResponse(reason) => format!("no response: {reason}"),
+            };
+            format!("### Report from Analyst {}\n{body}", i + 1)
+        })
+        .collect();
     sections.join("\n\n")
 }
 
@@ -1884,7 +1856,7 @@ mod tests {
     // ── Consolidation edge-case tests (no LLM provider needed) ──
 
     /// Build a bare analyst run for pipeline tests: a real `Agent` (no stores
-    /// touched) plus an optional raw response.
+    /// touched) settled from an optional raw response.
     fn test_analyst_run(ws: &Workspace, response: Option<&str>) -> AnalyzeRun {
         let agent = Agent::new(
             format!("analyze_test_{}", crate::generate_suffix()),
@@ -1898,10 +1870,7 @@ mod tests {
             None,
             None,
         );
-        AnalyzeRun::Completed {
-            agent,
-            response: response.map(ToString::to_string),
-        }
+        AnalyzeRun::settle(agent, response.map(ToString::to_string))
     }
 
     /// A failed round member (stuck past the deadline, panicked, cancelled).
