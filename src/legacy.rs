@@ -220,14 +220,7 @@ fn convert_doc(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
             let mut unshown = Unshown::default();
             let images = write_pictures(|| doc.images(), out_dir, &mut unshown, &mut notes);
             let text = sections.join("\n").trim_end().to_string();
-            DocOutcome::Text {
-                page_text: !text.is_empty(),
-                text,
-                images,
-                notes,
-                unshown,
-                all_page_text_lost: false,
-            }
+            DocOutcome::text(text, images, notes, unshown)
         }
         Err(err) => doc_error(&err),
     }
@@ -320,14 +313,7 @@ fn convert_xls(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
                     .count(),
             );
             let text = blocks.join("\n\n").trim_end().to_string();
-            DocOutcome::Text {
-                page_text: !text.is_empty(),
-                text,
-                images,
-                notes,
-                unshown,
-                all_page_text_lost: false,
-            }
+            DocOutcome::text(text, images, notes, unshown)
         }
         Err(err) => xls_error(&err),
     }
@@ -422,14 +408,7 @@ fn convert_ppt(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
                 );
             }
             let text = blocks.join("\n\n").trim_end().to_string();
-            DocOutcome::Text {
-                page_text: !text.is_empty(),
-                text,
-                images,
-                notes,
-                unshown,
-                all_page_text_lost: false,
-            }
+            DocOutcome::text(text, images, notes, unshown)
         }
         Err(err) => ppt_error(&err),
     }

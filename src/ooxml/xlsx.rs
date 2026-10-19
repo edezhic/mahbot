@@ -223,14 +223,7 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     }
     notes.extend(skipped.notes());
     let text = blocks.join("\n\n").trim_end().to_string();
-    DocOutcome::Text {
-        page_text: !text.is_empty(),
-        text,
-        images,
-        notes,
-        unshown,
-        all_page_text_lost: false,
-    }
+    DocOutcome::text(text, images, notes, unshown)
 }
 
 /// Walk every sheet the workbook declares, in workbook order: their blocks, the

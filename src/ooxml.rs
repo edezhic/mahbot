@@ -268,14 +268,7 @@ pub(crate) fn convert_pptx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     ));
     notes.extend(skipped.notes());
     let text = blocks.join("\n\n").trim_end().to_string();
-    DocOutcome::Text {
-        page_text: !text.is_empty(),
-        text,
-        images,
-        notes,
-        unshown,
-        all_page_text_lost: false,
-    }
+    DocOutcome::text(text, images, notes, unshown)
 }
 
 /// The diagram text a reading shows for each slide of a presentation package,

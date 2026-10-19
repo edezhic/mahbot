@@ -181,8 +181,8 @@ pub(crate) enum DocOutcome {
         /// Whether the text the reading returned is the document's own content
         /// rather than only its own description or form list. A PDF whose pages
         /// yielded no text but whose Info dictionary or form did says false; every
-        /// other reading says true exactly when it has text. A caller reporting the
-        /// absence of page text reads this flag, never `text.is_empty()`.
+        /// other reading sets it through [`DocOutcome::text`]. A caller reporting
+        /// the absence of page text reads this flag, never `text.is_empty()`.
         page_text: bool,
     },
     /// A recognized format whose bytes could not be read (corrupt, or
@@ -190,6 +190,28 @@ pub(crate) enum DocOutcome {
     Unreadable { reason: String },
     /// A format this project does not convert.
     Unsupported,
+}
+
+impl DocOutcome {
+    /// A reading whose text is the document's own content: `page_text` is whether
+    /// it printed anything, and `all_page_text_lost` is false. The PDF reading
+    /// builds [`DocOutcome::Text`] directly instead — both flags are computed per
+    /// page there.
+    pub(crate) fn text(
+        text: String,
+        images: Vec<PathBuf>,
+        notes: Vec<String>,
+        unshown: Unshown,
+    ) -> Self {
+        Self::Text {
+            page_text: !text.is_empty(),
+            text,
+            images,
+            notes,
+            unshown,
+            all_page_text_lost: false,
+        }
+    }
 }
 
 // ── What a file really is, from its own bytes ───────────────────
@@ -448,14 +470,10 @@ fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome
         DocumentKind::LegacyPpt => {
             crate::legacy::convert(bytes, crate::legacy::Family::Ppt, Some(out_dir))
         }
-        DocumentKind::PlainText => DocOutcome::Text {
-            text: String::from_utf8_lossy(bytes).into_owned(),
-            images: Vec::new(),
-            notes: Vec::new(),
-            unshown: Unshown::default(),
-            all_page_text_lost: false,
-            page_text: !bytes.is_empty(),
-        },
+        DocumentKind::PlainText => {
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            DocOutcome::text(text, Vec::new(), Vec::new(), Unshown::default())
+        }
         DocumentKind::Unsupported => DocOutcome::Unsupported,
     }
 }

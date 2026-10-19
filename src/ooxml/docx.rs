@@ -2537,14 +2537,7 @@ pub(crate) fn convert_docx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         &mut skipped,
         &mut unshown,
     );
-    DocOutcome::Text {
-        page_text: !text.is_empty(),
-        text,
-        images,
-        notes: skipped.notes(),
-        unshown,
-        all_page_text_lost: false,
-    }
+    DocOutcome::text(text, images, skipped.notes(), unshown)
 }
 
 #[cfg(test)]
