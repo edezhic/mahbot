@@ -1275,6 +1275,25 @@ async fn insert_round_slots(
     Ok(())
 }
 
+/// Re-arm every slot in `cohorts` that has not completed, so mid-run comment
+/// routing and the Running Agents view track the resumed members.
+///
+/// Resume-only: the call also stamps the job's updated time, so a fresh round
+/// (whose slots are already launched) must not call it. A cohort whose slots
+/// all completed is a no-op.
+async fn rearm_resumed_slots(ticket_id: &str, job_id: &str, stage: &str, cohorts: &[&[AgentSlot]]) {
+    let not_done: Vec<String> = cohorts
+        .iter()
+        .flat_map(|cohort| cohort.iter())
+        .filter(|slot| slot.status != crate::jobs::RowStatus::Done)
+        .map(|slot| slot.agent_id.clone())
+        .collect();
+    let conn = &crate::session::store().conn;
+    if let Err(e) = crate::jobs::rearm_roster_launched(conn, job_id, &not_done).await {
+        warn!(ticket = %ticket_id, job = %job_id, stage = %stage, error = %e, "Failed to re-arm resumed round slots");
+    }
+}
+
 async fn checkpoint_parallel_outcomes(
     job_id: &str,
     launched: &[&AgentSlot],

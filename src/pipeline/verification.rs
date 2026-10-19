@@ -28,8 +28,8 @@ use super::{
     AgentSlot, ExtractionMode, FinalizeOutcome, ParallelVerdict, TicketPhase, TransitionCtx,
     agent_slot_from_roster_row, bounce_to_development, build_agent_slots, build_round_grouping,
     comment_and_transition, debug, guard_job_phase, info, insert_round_slots, pause_freezing,
-    read_roster_or_bail, render_joint_comment, reset_phase_attempt, run_parallel_agents,
-    sync_phase_job_task, warn,
+    read_roster_or_bail, rearm_resumed_slots, render_joint_comment, reset_phase_attempt,
+    run_parallel_agents, sync_phase_job_task, warn,
 };
 
 /// The stage's own name: the role the consolidated round comment is authored
@@ -414,21 +414,10 @@ async fn execute_round(
     commands: Option<DiagnosticsCommands>,
 ) {
     if resume {
-        // Re-arm the not-Done slots as launched so comment routing and the
-        // Running Agents view track the in-flight participants.
-        let not_done: Vec<String> = plan
-            .reviewers
-            .iter()
-            .chain(&plan.testers)
-            .filter(|s| s.status != crate::jobs::RowStatus::Done)
-            .map(|s| s.agent_id.clone())
-            .collect();
-        if let Err(e) =
-            crate::jobs::rearm_roster_launched(&crate::session::store().conn, &job_id, &not_done)
-                .await
-        {
-            warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to re-arm resumed verification slots");
-        }
+        // A fresh round's slots are already launched — re-arming those would only
+        // stamp the job's updated time again.
+        let cohorts: [&[AgentSlot]; 2] = [&plan.reviewers, &plan.testers];
+        rearm_resumed_slots(&ticket.id, &job_id, "verification", &cohorts).await;
     }
     let reviewer_count = plan.reviewers.len();
     let tester_count = plan.testers.len();

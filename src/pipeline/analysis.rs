@@ -10,8 +10,8 @@ use super::{
     AgentSlot, BoardStore, ExtractionMode, FinalizeOutcome, JointRound, ParallelVerdict,
     TicketPhase, TransitionCtx, Write, agent_slot_from_roster_row, build_agent_slots,
     build_round_grouping, debug, deserialize_verdict_outcome, guard_job_phase, info,
-    insert_round_slots, issue_grade, pause_freezing, render_joint_comment, reset_phase_attempt,
-    run_parallel_agents, warn, with_comment_and_transition,
+    insert_round_slots, issue_grade, pause_freezing, rearm_resumed_slots, render_joint_comment,
+    reset_phase_attempt, run_parallel_agents, warn, with_comment_and_transition,
 };
 
 /// Number of parallel analyst agents in the base cohort of an analysis round.
@@ -575,17 +575,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
     if plan.escalation.is_empty() {
         // Base round not yet escalated: re-run the not-Done base slots with their
         // stored tasks, then re-evaluate escalation on the resumed base verdicts.
-        // Re-arm the not-Done slots as launched so comment routing and the
-        // Running Agents view track the in-flight members while the round runs.
-        let not_done: Vec<String> = plan
-            .base
-            .iter()
-            .filter(|s| s.status != crate::jobs::RowStatus::Done)
-            .map(|s| s.agent_id.clone())
-            .collect();
-        if let Err(e) = crate::jobs::rearm_roster_launched(conn, job_id, &not_done).await {
-            warn!(ticket = %ticket.id, error = %e, "Failed to re-arm resumed analysis base slots");
-        }
+        rearm_resumed_slots(&ticket.id, job_id, "analysis base", &[&plan.base]).await;
         run_analysis_round(&ticket, &ws, job_id, &plan.base, true).await;
     } else {
         // Base round completed (it triggered the escalation). Reconstruct the
@@ -688,7 +678,6 @@ async fn resume_escalation_round(
     base_results: Vec<ParallelVerdict>,
     escalation_slots: Vec<AgentSlot>,
 ) {
-    let conn = &crate::session::store().conn;
     // The plan only hands this path a non-empty escalation cohort.
     let entries = parse_escalation_entries(&escalation_slots[0].task);
     if entries.is_empty() {
@@ -702,14 +691,13 @@ async fn resume_escalation_round(
     {
         return;
     }
-    let not_done: Vec<String> = escalation_slots
-        .iter()
-        .filter(|s| s.status != crate::jobs::RowStatus::Done)
-        .map(|s| s.agent_id.clone())
-        .collect();
-    if let Err(e) = crate::jobs::rearm_roster_launched(conn, job_id, &not_done).await {
-        warn!(ticket = %ticket.id, error = %e, "Failed to re-arm resumed escalation roster slots");
-    }
+    rearm_resumed_slots(
+        &ticket.id,
+        job_id,
+        "analysis escalation",
+        &[&escalation_slots],
+    )
+    .await;
     let (extra, extra_paused) =
         run_blocker_verification(ticket, ws, job_id, &entries, &escalation_slots, true).await;
     if extra_paused {
