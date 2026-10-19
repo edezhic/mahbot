@@ -574,16 +574,12 @@ impl Tool for DocumentTool {
         let ppt_comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
         let input_mb = megabytes(crate::util::FILE_MAX_BYTES).to_string();
         let edit_text_max = RULES.edit_text_max.to_string();
-        let pdf_metadata_fields = crate::docgen::pdf_metadata_fields_spelled();
-        let pdf_date_format = crate::docgen::pdf_date_format();
         crate::prompt::substitute(
             &crate::prompt::load_prompt("tool/document.md"),
             &[
                 ("{{input_location}}", self.input_location()),
                 ("{{input_mb}}", &input_mb),
                 ("{{edit_text_max}}", &edit_text_max),
-                ("{{pdf_metadata_fields}}", &pdf_metadata_fields),
-                ("{{pdf_date_format}}", pdf_date_format),
                 // The Word marks are quoted from the shared list: the ones a
                 // reading prints in brackets and the labels it adds without them
                 // (see `spelled_docx_marks`).
@@ -597,8 +593,6 @@ impl Tool for DocumentTool {
                 ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
                 ("{{ppt_diagram_text_lost_mark}}", &marks.diagram_text_lost),
                 ("{{ppt_no_text_mark}}", &marks.no_text),
-                ("{{pptx_sizes}}", &pptx_size_list()),
-                ("{{pptx_default_size}}", &RULES.pptx_default_size.inches()),
             ],
         )
     }
@@ -23354,8 +23348,8 @@ mod tests {
         // inside a sentence, so the whole-number guard above would not cover it.
         let default_deck = RULES.pptx_default_size.inches();
         assert!(
-            description.contains(&default_deck),
-            "the description does not state the default deck's size {default_deck:?}:\n{description}"
+            schema.contains(&default_deck),
+            "the schema does not state the default deck's size {default_deck:?}:\n{schema}"
         );
         // A slide mark is not a number, so the whole-number guard above would
         // assert nothing for it: what the description owes the model is to name
@@ -23414,8 +23408,8 @@ mod tests {
     /// the path-access variant this test builds, and the description and the
     /// serialized schema together. Adding to the contract re-records both here, so
     /// growth is a decision made in this test rather than a drift.
-    const BASELINE_DESCRIPTION: usize = 10_295;
-    const BASELINE_TOTAL: usize = 38_165;
+    const BASELINE_DESCRIPTION: usize = 9_532;
+    const BASELINE_TOTAL: usize = 37_402;
 
     /// The whole per-action contract is one compact value: every action has an
     /// entry, each entry declares exactly the arguments that action takes (and the

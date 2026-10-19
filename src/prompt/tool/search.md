@@ -9,32 +9,13 @@ They are not interchangeable — `grep_mode` is ignored when `mode="files"`.
 
 ## mode="files" — Fuzzy file name search
 
-Find files by their path/name. Uses frecency-ranked fuzzy matching (replaces glob).
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `query`   | required | Fuzzy text to match against file paths. Supports inline constraints like `*.rs` (extension) and `src/` (path segment). |
-| `path`    | optional | Path segment filter — appends a trailing-slash constraint (e.g. `"src"` → `src/`). Use this or inline `src/` syntax in query. |
-| `ext`     | optional | File extension filter — appends a glob constraint (e.g. `"rs"` → `*.rs`). Use this or inline `*.rs` syntax in query. |
-| `max_results` | 50 (max 500) | Max files to return |
-| `offset`  | 0 | Pagination offset (0-based). In 'files' mode: skips this many items. In 'grep' mode: skips this many **files** (not matches). Use `next_file_offset` from grep results for correct pagination. |
+Find files by their path/name. Uses fuzzy matching (replaces glob).
 
 Parameters `grep_mode`, `case_sensitive`, and `context_lines` are IGNORED in this mode.
 
 ## mode="grep" — File content search
 
 Search file contents (replaces rg). Uses an indexed engine with early termination.
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `query`   | required | Pattern to find in file contents. Supports inline constraints like `*.rs` (extension) and `src/` (path segment). |
-| `path`    | optional | Path segment filter — appends a trailing-slash constraint (e.g. `"src"` → `src/`). Use this or inline `src/` syntax in query. |
-| `ext`     | optional | File extension filter — appends a glob constraint (e.g. `"rs"` → `*.rs`). Use this or inline `*.rs` syntax in query. |
-| `grep_mode` | `fuzzy` | How to interpret the pattern — see grep modes below |
-| `case_sensitive` | `true` | When `true`: case-sensitive. When `false`: smart-case (case-insensitive if pattern is all lowercase) |
-| `context_lines` | 0 | Lines of context before and after each match |
-| `max_results` | 50 (max 500) | Max matches to return |
-| `offset`  | 0 | **File-based** pagination offset (0-based). Skips this many **files** (not individual matches). ⚠ Different from 'files' mode where offset is item-based. Use `next_file_offset` from the response for correct pagination — do NOT simply increment by max_results. |
 
 **Pagination protocol:** When results include a `── pagination ──` section with `next_file_offset: <N>`, pass `"offset": <N>` in your next call with the same query to fetch the next page. A `next_file_offset` of `0` means there are no more files to search.
 
