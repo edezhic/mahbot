@@ -585,10 +585,14 @@ fn finish_read_body(resolved_path: &Path, body: String, recovery_note: Option<&s
 }
 
 /// Read a resolved file path (content, symbols, or zoom mode) — the shared tail
-/// of a non-document read: [`execute_read`] and the document hook both return
-/// through it for a file the converter did not take, so a step added to one
-/// reaches the other.
-async fn read_resolved(res: &ResolvedRead, args: &serde_json::Value) -> anyhow::Result<String> {
+/// of a non-document read: [`execute_read`] and the command line's document
+/// reader both return through it for a file the converter did not take, so a
+/// step added to one reaches the other. Empty `args` is the read tool's own
+/// default mode, which is what the command line's reader asks for.
+pub(super) async fn read_resolved(
+    res: &ResolvedRead,
+    args: &serde_json::Value,
+) -> anyhow::Result<String> {
     let resolved_path = res.path.as_path();
     let recovery_note = res.recovery_note.as_deref();
     let meta = tokio::fs::metadata(resolved_path)

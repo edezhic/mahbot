@@ -11,9 +11,11 @@
 //! document tool, the picture tool, the two video tools and the rasterizer — so a
 //! script reaches a document or a PDF, a picture, a clip and a rendered picture
 //! with the very operations the assistant has, the same values, limits and mutual
-//! exclusions, and the account's own model choice. The frontend never opens or
-//! writes a store itself, so there is no second writer and no second copy of any
-//! rule.
+//! exclusions, and the account's own model choice. The document family also runs
+//! the product's own READER as its `read`: the very reading the `read` tool
+//! performs, with the whole text and every image written out. The frontend never
+//! opens or writes a store itself, so there is no second writer and no second
+//! copy of any rule.
 //!
 //! What the producing families add is a destination: where the produced files
 //! go is the COMMAND LINE's own operand, carried beside the operation's own
@@ -35,8 +37,9 @@
 //! be served at all, and the waiter the instance side blocks on — plus the
 //! execution entry point in [`instance`], and the frontend's own command line:
 //! the family registry that ties every sub-command to the tool it runs (an
-//! operation per action, the tool's own name where it takes no action, or the
-//! family word itself where the family IS the operation), the argv parsing under
+//! operation per action, the tool's own name where it takes no action, the
+//! family word itself where the family IS the operation, or the product's own
+//! reader — [`DOCUMENT_READ`]), the argv parsing under
 //! it, the help, and the [`Exit`] classes a script reads. The
 //! flag grammar itself is [`grammar`], which `mahbot audio` reads too — the
 //! browser-automation command and the OpenRouter benchmark read their own flags
@@ -80,8 +83,8 @@ Usage:
   mahbot send [flags]    Hand one message to an agent and finish: one-way — the
                          answer arrives in your assistant's conversation
   mahbot document <operation> [flags]
-                         Produce a document or a PDF with the RUNNING product's
-                         document tool
+                         Read a document with the RUNNING product's reader, or
+                         produce one with its document tool
   mahbot image gen [flags]
                          Produce a picture with the RUNNING product's picture tool
   mahbot video <gen|edit> [flags]
@@ -294,7 +297,8 @@ pub(crate) struct Family {
 pub(crate) enum Surface {
     /// `mahbot <word> <operation> [flags]`: one operation per command-line
     /// sub-command, each running one of the family's tools — under the tool's own
-    /// `action` where it has one, and as the tool itself where it has none.
+    /// `action` where it has one, and as the tool itself where it has none — or,
+    /// in one case, the product's own reader ([`DOCUMENT_READ`]).
     Operations(&'static [Operation]),
     /// The family IS its operation: `mahbot <word> [flags]`, no operation word
     /// at all. The single tool the family fronts takes no `action`, and the args
@@ -309,7 +313,8 @@ pub(crate) struct Operation {
     pub(crate) tool: &'static str,
     /// The tool's own `action` value, or `None` where the tool takes no action
     /// (the picture tool and both video tools): the operation then IS that tool,
-    /// and the args it is handed carry no `action` key.
+    /// and the args it is handed carry no `action` key. [`DOCUMENT_READ`] is the
+    /// one action no tool holds: the instance reads it as the product's reader.
     pub(crate) action: Option<&'static str>,
     /// One line for the family's help and the operation's own help.
     pub(crate) purpose: &'static str,
@@ -318,10 +323,10 @@ pub(crate) struct Operation {
 }
 
 /// The sub-command word of one operation, derived rather than written down so a
-/// sub-command can never be spelled a way its tool or action is not: the tool's
-/// own action with `_` written `-` (`fill_template` → `fill-template`), or — for
-/// a tool that takes no action — the tool's own name with the family word it
-/// carries dropped (`image_gen` in `image` → `gen`).
+/// sub-command can never be spelled a way its tool or action is not: the
+/// operation's action with `_` written `-` (`fill_template` → `fill-template`),
+/// or — for a tool that takes no action — the tool's own name with the family
+/// word it carries dropped (`image_gen` in `image` → `gen`).
 fn operation_word(family: &Family, operation: &Operation) -> String {
     match operation.action {
         Some(action) => action.replace('_', "-"),
@@ -493,6 +498,17 @@ impl FlagKind {
         )
     }
 }
+
+/// The document family's `read` operation word — the `action` value the instance
+/// reads as "the product's own reader"
+/// ([`crate::tools::read_document::read_for_command_line`]).
+///
+/// It is deliberately no action of the document tool: agents read documents
+/// through the `read` tool they have, so the tool gains no action and its prompt
+/// nothing new, while the operation is served by the shared reading instead (see
+/// [`instance`]). The registry test ties every tool-backed operation to its
+/// tool's actions and pins this one separately.
+pub(crate) const DOCUMENT_READ: &str = "read";
 
 /// The command lines this file fronts: the admin Assistant's own toolset — the
 /// tools each family's `tools` names. Nothing else the owner holds is reachable
@@ -874,10 +890,10 @@ pub(crate) const FAMILIES: &[Family] = &[
     //
     // These families front the tools every Assistant holds regardless of its
     // account (the media models they use resolve per-user), so the command line
-    // reaches exactly what the owner's own assistant can already produce — the
-    // same operations, the same values, the same limits and the same mutual
-    // exclusions, all judged by the tool itself. What the command line adds is
-    // the DESTINATION, its own operand ([`FlagKind::Destination`]).
+    // reaches exactly what the owner's own assistant can already do — the same
+    // operations, the same values, the same limits and the same mutual
+    // exclusions. What the command line adds is the DESTINATION, its own operand
+    // ([`FlagKind::Destination`]).
     Family {
         word: "document",
         tools: &["document"],
@@ -885,9 +901,16 @@ pub(crate) const FAMILIES: &[Family] = &[
         // such tool, so the call comes back as the environment's class — nothing
         // ran — rather than as a failed operation.
         protocol: crate::db::ipc::CALL_STORE,
-        purpose: "Produce a document or a PDF with the running product's own document tool — \
-                  write, fill a template, edit an Office file, and every PDF operation",
+        purpose: "Read a document with the product's own reader, or produce one with its document \
+                  tool — write, fill a template, edit an Office file, and every PDF operation",
         surface: Surface::Operations(&[
+            Operation {
+                tool: "document",
+                action: Some(DOCUMENT_READ),
+                purpose: "Read a document with the running product's own reader: its full text and \
+                          every image it produces, in a folder of their own",
+                flags: &[DOCUMENT_PATH_FLAG, DOCUMENT_FILE_NAME_FLAG, OUTPUT_DIR_FLAG],
+            },
             Operation {
                 tool: "document",
                 action: Some("create"),
@@ -1155,19 +1178,20 @@ const OUTPUT_DIR_FLAG: Flag = Flag {
     arg: "output_dir",
     kind: FlagKind::Destination,
     secret: false,
-    purpose: "The directory the produced files go into; it must already exist, and it is the \
-              directory this command is run in when it is left out",
+    purpose: "The directory the operation writes into — the produced file(s), or the one folder \
+              they are all in; it must already exist, and it is the directory this command is run \
+              in when it is left out",
 };
 
-/// The document tool's shared `file_name` argument: the base name of what it
+/// The document family's shared `file_name` argument: the base name of what it
 /// produces, which every one of its operations takes — so every one of them
 /// carries it.
 const DOCUMENT_FILE_NAME_FLAG: Flag = Flag {
     arg: "file_name",
     kind: FlagKind::Value,
     secret: false,
-    purpose: "The base name of the produced file, without its extension (which follows the \
-              format); a free name is used, so nothing already there is overwritten",
+    purpose: "The base name of what is produced, without an extension where one is appended; a \
+              free name is used, so nothing already there is overwritten",
 };
 
 /// The document tool's `format` argument — `create` only.
@@ -1236,7 +1260,7 @@ const DOCUMENT_METADATA_FLAG: Flag = Flag {
 };
 
 /// The document tool's `path` argument: the one input file most of its
-/// operations act on.
+/// operations act on — and the file the reader reads.
 const DOCUMENT_PATH_FLAG: Flag = Flag {
     arg: "path",
     kind: FlagKind::Path,
@@ -2108,10 +2132,9 @@ const EXIT_CLASS_HELP: &str = "\nExit codes:\n  0  the operation was carried out
 /// own help must learn the same contract as one reading the family's.
 const RUNNING_CONTRACT_HELP: &str = "\nA frontend onto the RUNNING product, acting with the \
      owner's authority and with no agent session behind it: the operation is carried into the \
-     instance that is already up and the owner's own tool runs it there — the same validation, \
-     and the same immediate effect (a value it writes is in use at once, with no restart). The \
-     product must be running: there is no way to run these operations against its stores \
-     directly.\n";
+     instance that is already up and the product itself runs it there — the same validation, and \
+     the same immediate effect (a value it writes is in use at once, with no restart). The product \
+     must be running: there is no way to run these operations against its stores directly.\n";
 
 /// Where the two streams go — shared by every help, like the two blocks above.
 const OUTPUT_HELP: &str = "\nOutput:\n  stdout  the product's answer, word for word\n  stderr  \
@@ -2158,21 +2181,10 @@ fn family_help(family: &Family) -> String {
     out.push_str(RUNNING_CONTRACT_HELP);
     match family.surface {
         Surface::Operations(operations) => {
-            let listed = family
-                .tools
-                .iter()
-                .map(|tool| format!("`{tool}`"))
-                .collect::<Vec<_>>()
-                .join(" and ");
-            let (noun, them, verb) = if family.tools.len() == 1 {
-                ("tool", "that tool", "offers")
-            } else {
-                ("tools", "those tools", "offer")
-            };
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "\nEvery operation below is run by the same {listed} {noun} the owner's assistant \
-                 calls, so this command line offers exactly the operations {them} {verb}.\n"
+                "\nEvery operation below is carried out inside the product, by the same code the \
+                 owner's assistant runs — so this command line brings no behaviour of its own."
             );
             let _ = write!(out, "\nUsage: {}\n", family_syntax(family));
             out.push_str("\nOperations:\n");
@@ -2194,11 +2206,11 @@ fn family_help(family: &Family) -> String {
             }
             out.push_str(if produces_files(family) {
                 "\nFlags:\n  The one flag every operation takes is the destination above; every \
-                 other flag belongs to the operation whose tool argument it names.\n\n  -h, --help  \
+                 other flag belongs to the operation whose argument it names.\n\n  -h, --help  \
                  Print this help and exit\n"
             } else {
                 "\nFlags:\n  None are common to every operation: a flag belongs to the operation \
-                 whose tool argument it names.\n\n  -h, --help  Print this help and exit\n"
+                 whose argument it names.\n\n  -h, --help  Print this help and exit\n"
             });
         }
         // The family word IS the operation, so there is no operation list below
@@ -2786,6 +2798,15 @@ mod tests {
     /// argument set, or — for a tool whose actions declare their own arguments —
     /// the action's entry plus the arguments that stand beside the action.
     fn argument_schema(operation: &Operation) -> serde_json::Map<String, serde_json::Value> {
+        // The reader is no tool action: its arguments are the two inputs the
+        // reading takes, and the flag tie judges only their type (see
+        // [`DOCUMENT_READ`]).
+        if operation.action == Some(DOCUMENT_READ) {
+            return ["path", "file_name"]
+                .into_iter()
+                .map(|name| (name.to_string(), serde_json::json!({ "type": "string" })))
+                .collect();
+        }
         let schema = tool_schema(operation.tool);
         let top = schema["properties"]
             .as_object()
@@ -2916,14 +2937,14 @@ mod tests {
         }
     }
 
-    /// The command line and the tools must agree on what exists, in both
-    /// directions: an operation the tool cannot run, an action the command line
-    /// cannot reach, a tool no operation runs, and a duplicate on either side all
-    /// fail here. A tool that takes no `action` has none in the registry either —
-    /// its operation IS the tool. A standalone family has no operation word at
-    /// all: the family word IS its operation.
+    /// Every operation names a tool its family fronts, and the words a family
+    /// answers to are derived and unique: two operations of one family could
+    /// derive the same word (an action kebab-cased, a tool's own name with the
+    /// family word dropped), and the first match would shadow the second in the
+    /// lookup `run` does. A standalone family has no operation word at all: the
+    /// family word IS its operation.
     #[test]
-    fn operations_match_the_tools_own_actions() {
+    fn every_family_fronts_its_tools_under_unique_words() {
         for family in FAMILIES {
             assert!(
                 !family.tools.is_empty(),
@@ -2955,11 +2976,6 @@ mod tests {
                     operation.tool
                 );
             }
-            // The words a family answers to are DERIVED (an action kebab-cased, a
-            // tool's own name with the family word dropped), so two operations of
-            // one family could derive the same word — and the first match would
-            // shadow the second in the lookup `run` does, silently. A family that
-            // spans two tools is where that is reachable at all.
             let words: Vec<String> = operations
                 .iter()
                 .map(|operation| operation_word(family, operation))
@@ -2974,9 +2990,28 @@ mod tests {
                 "'mahbot {}' derives the same operation word twice, so one would shadow the other",
                 family.word
             );
+        }
+    }
+
+    /// The command line and the tools must agree on what exists, in both
+    /// directions: an operation the tool cannot run, an action the command line
+    /// cannot reach, and a duplicate on either side all fail here. A tool that
+    /// takes no `action` has none in the registry either — its operation IS the
+    /// tool. The one operation no tool action backs is pinned by
+    /// [`the_reader_is_the_one_operation_no_tool_backs`].
+    #[test]
+    fn operations_match_the_tools_own_actions() {
+        for family in FAMILIES {
+            let Surface::Operations(operations) = family.surface else {
+                continue;
+            };
             for tool in family.tools {
                 let ours: Vec<Option<&str>> = operations
                     .iter()
+                    // The reader is no tool action: it is pinned in its own test.
+                    .filter(|operation| {
+                        !(operation.tool == "document" && operation.action == Some(DOCUMENT_READ))
+                    })
                     .filter(|operation| operation.tool == *tool)
                     .map(|operation| operation.action)
                     .collect();
@@ -3019,6 +3054,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The reader is the one operation no tool action backs: exactly one operation
+    /// names it, it is the document family's, and the document tool publishes no
+    /// such action — so the tie above stays one-for-one for every tool-backed
+    /// operation without an action invented to satisfy it.
+    #[test]
+    fn the_reader_is_the_one_operation_no_tool_backs() {
+        let mut readers = Vec::new();
+        for family in FAMILIES {
+            let Surface::Operations(operations) = family.surface else {
+                continue;
+            };
+            for operation in operations {
+                if operation.action == Some(DOCUMENT_READ) {
+                    readers.push((family, operation));
+                }
+            }
+        }
+        assert_eq!(
+            readers.len(),
+            1,
+            "exactly one operation must name the reader's action"
+        );
+        let (family, operation) = readers[0];
+        assert_eq!(
+            family.word, "document",
+            "the reader belongs to the document family"
+        );
+        assert_eq!(
+            operation.tool, "document",
+            "the reader is served by the document tool"
+        );
+        assert!(
+            !tool_actions(&tool_schema("document")).contains(&DOCUMENT_READ),
+            "the reader must not be an action of the document tool"
+        );
     }
 
     /// A tool that takes no action is named by its operations from its OWN name
@@ -3387,6 +3459,23 @@ mod tests {
         }
     }
 
+    /// The document family's help lists the reader as an operation of its own,
+    /// and the family's own line no longer describes it as producing alone.
+    #[test]
+    fn the_document_help_lists_the_reader() {
+        let family = family("document").expect("the document family").0;
+        let help = family_help(family);
+        assert!(
+            help.lines()
+                .any(|line| line.trim_start().starts_with(&format!("{DOCUMENT_READ} "))),
+            "the reader has no operation row:\n{help}"
+        );
+        assert!(
+            !help.contains("Produce a document"),
+            "the family no longer only produces:\n{help}"
+        );
+    }
+
     /// Both helps carry the whole contract: that the product must be running,
     /// that these commands act with the owner's authority, and the exit classes a
     /// script reads — a caller entering through one operation's own help must
@@ -3397,9 +3486,13 @@ mod tests {
     fn every_help_states_the_running_product_and_the_exit_classes() {
         for family in FAMILIES {
             let helps = match family.surface {
-                Surface::Operations(operations) => {
-                    vec![family_help(family), operation_help(family, &operations[0])]
-                }
+                Surface::Operations(operations) => std::iter::once(family_help(family))
+                    .chain(
+                        operations
+                            .iter()
+                            .map(|operation| operation_help(family, operation)),
+                    )
+                    .collect(),
                 Surface::Standalone(flags) => {
                     let help = family_help(family);
                     let usage = format!("Usage: mahbot {} [flags]", family.word);

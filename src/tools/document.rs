@@ -65,6 +65,9 @@ use std::sync::LazyLock;
 /// command-line call, which names its destination.
 const GENERATED_DIR: &str = "generated";
 
+/// The marker every produced file reaches a caller through: `[FILE:<path>]`.
+pub(crate) const FILE_MARKER: &str = "[FILE:";
+
 /// Longest base name the tool keeps from `file_name`; the extension and the
 /// uniqueness suffix are added on top, and a cap keeps the result well inside a
 /// filesystem's component limit.
@@ -545,7 +548,7 @@ impl Tool for DocumentTool {
     /// the tool advertises the marker kind: an answer that omitted it gets it
     /// appended, and the media sweep keeps a file the reply mentions.
     fn media_marker(&self) -> Option<&'static str> {
-        Some("[FILE:")
+        Some(FILE_MARKER)
     }
 
     /// Every produced file reaches the user only through its marker, and one
@@ -5315,8 +5318,14 @@ async fn remove_files(paths: &[PathBuf]) {
     }
 }
 
+/// [`FILE_MARKER`] around one produced file's absolute path — the line every
+/// producing operation's answer carries, the reader's included.
+pub(crate) fn file_marker(path: &Path) -> String {
+    format!("{FILE_MARKER}{}]", path.to_string_lossy())
+}
+
 /// A one-line description of what was produced.
-fn describe(prefix: &str, names: &[String], sizes: &[u64]) -> String {
+pub(crate) fn describe(prefix: &str, names: &[String], sizes: &[u64]) -> String {
     if names.len() == 1 {
         return format!(
             "{prefix} {} ({})",
@@ -5376,7 +5385,7 @@ fn strip_output_extension(name: &str) -> &str {
 /// model's name leaves nothing usable. A trailing extension the tool appends
 /// itself is stripped, so a name that already carries one is not doubled.
 #[must_use]
-fn sanitize_base(raw: Option<&str>, fallback: &str) -> String {
+pub(crate) fn sanitize_base(raw: Option<&str>, fallback: &str) -> String {
     let candidate = raw.map_or_else(|| clean_component(fallback), clean_component);
     let preferred = strip_output_extension(&candidate);
     if preferred.is_empty() {

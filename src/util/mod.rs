@@ -1407,23 +1407,48 @@ pub(crate) fn name_stem(name: &str) -> &str {
 /// those copies collide.
 #[must_use]
 pub(crate) fn suffixed_name(name: &str, n: u32) -> String {
-    if n <= 1 {
-        return name.to_string();
-    }
     let stem = name_stem(name);
     match name.strip_prefix(stem) {
-        Some(ext) if !ext.is_empty() => format!("{stem}_{n}{ext}"),
-        _ => format!("{name}_{n}"),
+        Some(ext) if !ext.is_empty() => format!("{}{ext}", numbered(stem, n)),
+        _ => numbered(name, n),
+    }
+}
+
+/// `name` with the `n`-th attempt's `_<n>` suffix at its very end — the form a
+/// leaf with no extension takes (see [`suffixed_name`] for the one that keeps
+/// an extension).
+fn numbered(name: &str, n: u32) -> String {
+    if n <= 1 {
+        name.to_string()
+    } else {
+        format!("{name}_{n}")
+    }
+}
+
+/// The first leaf under `dir` that `claim` accepts, walking `leaf`'s attempts in
+/// order. The claim itself IS the collision check: two concurrent callers must
+/// not pick the same leaf, so a check-then-act probe would let them overwrite
+/// each other.
+async fn claim_unique<T>(
+    dir: &Path,
+    leaf: impl Fn(u32) -> String,
+    mut claim: impl AsyncFnMut(PathBuf) -> std::io::Result<T>,
+) -> std::io::Result<(PathBuf, T)> {
+    let mut counter = 1u32;
+    loop {
+        let candidate = dir.join(leaf(counter));
+        match claim(candidate.clone()).await {
+            Ok(value) => return Ok((candidate, value)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
+            Err(e) => return Err(e),
+        }
     }
 }
 
 /// Create a NEW empty file `dir`/`name`, disambiguating with a `_<n>` counting
 /// suffix (see [`suffixed_name`]) when a file of that name is already there, and
-/// return the open handle with its path.
-///
-/// The `create_new` open *is* the collision check: two concurrent callers must
-/// not pick the same free name, so a check-then-act probe would let them
-/// overwrite each other.
+/// return the open handle with its path — the collision check is
+/// [`claim_unique`]'s.
 ///
 /// Whatever is written through the returned handle must be FLUSHED before the
 /// path is handed on ([`write_unique_file`] is this rule already obeyed): a
@@ -1435,20 +1460,33 @@ pub(crate) async fn create_unique_file(
     dir: &Path,
     name: &str,
 ) -> std::io::Result<(tokio::fs::File, PathBuf)> {
-    let mut counter = 1u32;
-    loop {
-        let candidate = dir.join(suffixed_name(name, counter));
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-            .await
-        {
-            Ok(file) => return Ok((file, candidate)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
-            Err(e) => return Err(e),
-        }
-    }
+    let (path, file) = claim_unique(
+        dir,
+        |n| suffixed_name(name, n),
+        async |candidate| {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(candidate)
+                .await
+        },
+    )
+    .await?;
+    Ok((file, path))
+}
+
+/// Create a NEW directory `dir`/`name`, disambiguating with a `_<n>` counting
+/// suffix when a directory or file of that name is already there — the same
+/// scheme [`create_unique_file`] uses, except that a directory has no extension,
+/// so the suffix goes at the very end (`2024.report` → `2024.report_2`).
+pub(crate) async fn create_unique_dir(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let (path, ()) = claim_unique(
+        dir,
+        |n| numbered(name, n),
+        async |candidate| tokio::fs::create_dir(candidate).await,
+    )
+    .await?;
+    Ok(path)
 }
 
 /// Write `bytes` into a newly created unique file `dir`/`name` and answer its

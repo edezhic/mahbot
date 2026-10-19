@@ -1,12 +1,16 @@
-//! Document reads for the read tool: what the shared converter
-//! ([`crate::document`]) extracts from is converted here and delivered the read
-//! tool's way — extracted text inlined (or spilled when it does not fit the tool
-//! output budget), extracted rasters attached as images.
+//! Document reads: what the shared converter ([`crate::document`]) extracts from
+//! is converted here and delivered two ways from ONE reading — the read tool's
+//! (extracted text inlined, or spilled when it does not fit the tool output
+//! budget, extracted rasters attached as images) and the command line's (the
+//! whole text and every raster written into a folder of their own). Detection,
+//! conversion, scrubbing and the reader's wording are shared; only the delivery
+//! is the caller's own — how many images it hands over, and the command line's
+//! lack of any length limit.
 //!
-//! Artifacts (a page raster, an embedded image, a spilled text body) are
-//! per-call intermediates in a uniquely named `read_<nonce>` directory, removed
-//! when the run ends like a shell spill. Every access but the workspace-only one
-//! writes them into the daemon temp service area
+//! The read tool's artifacts (a page raster, an embedded image, a spilled text
+//! body) are per-call intermediates in a uniquely named `read_<nonce>` directory,
+//! removed when the run ends like a shell spill. Every access but the
+//! workspace-only one writes them into the daemon temp service area
 //! ([`crate::tools::shell::agent_temp_dir`]); the workspace-only read, which
 //! cannot open temp paths, into its caller's workspace `uploads/` (a re-read
 //! re-converts). What a crash leaves
@@ -39,27 +43,23 @@ const HEAD_SNIFF_BYTES: usize = 16;
 /// unwritable workspace) — the file itself is fine.
 const NO_ARTIFACT_DIR_REASON: &str = "could not be converted";
 
-/// Convert `res` when it is a container the shared converter extracts from — the
-/// same detection the inbound path uses, so the two cannot disagree about what a
-/// document is. `Ok(None)` when it is not (the ordinary read applies), `Err` only
-/// for an oversized container.
-pub(super) async fn read_document(
-    ws: &Workspace,
-    res: &super::read::ResolvedRead,
-    access: PathAccess,
-) -> anyhow::Result<Option<ToolOutput>> {
+/// The reader's one document decision: `Some(file_name)` when `path` is a
+/// regular file the shared converter extracts from — the same content-first
+/// detection the inbound attachment path uses — and `None` when the ordinary
+/// read applies. `Err` only for a document over the product's size ceiling.
+async fn document_target(path: &Path) -> anyhow::Result<Option<String>> {
     // Only a regular file is converted: a directory keeps the ordinary listing
     // read, and a special file is never opened (the converter's read is unbounded).
-    let Ok(meta) = tokio::fs::metadata(&res.path).await else {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
         return Ok(None);
     };
     if !meta.is_file() {
         return Ok(None);
     }
-    let Some(name) = res.path.file_name().and_then(|n| n.to_str()) else {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return Ok(None);
     };
-    let Some(head) = peek_head(&res.path).await else {
+    let Some(head) = peek_head(path).await else {
         return Ok(None);
     };
     // Classified before the size check, so an oversized NON-document falls back
@@ -74,6 +74,71 @@ pub(super) async fn read_document(
         crate::util::FILE_MAX_BYTES,
         "File too large to convert",
     )?;
+    Ok(Some(name.to_owned()))
+}
+
+/// A converted reading's parts — the [`DocOutcome::Text`] fields as one value.
+struct ConvertedDocument {
+    text: String,
+    images: Vec<PathBuf>,
+    notes: Vec<String>,
+    unshown: Unshown,
+    all_page_text_lost: bool,
+    page_text: bool,
+}
+
+/// What one conversion attempt produced.
+enum Conversion {
+    /// A document the converter read.
+    Reading(ConvertedDocument),
+    /// A container it does not take (an Outlook `.msg`, say, or a file that
+    /// changed between the sniff and the conversion): the ordinary read applies.
+    Ordinary,
+    /// The reader's own short reason for a document it could not read.
+    Unreadable(String),
+}
+
+/// Convert `path` into `dir` as both entrances deliver it, so detection,
+/// conversion and scrubbing are one implementation for both.
+async fn convert_reading(path: &Path, name: &str, dir: &Path) -> Conversion {
+    match crate::document::convert_document_file(path, name, dir).await {
+        DocOutcome::Text {
+            text,
+            images,
+            notes,
+            unshown,
+            all_page_text_lost,
+            page_text,
+        } => Conversion::Reading(ConvertedDocument {
+            // The read tool returns `false` from `should_scrub_output`, and the
+            // scrub `read_resolved` does instead is path-based — it sees the
+            // container's path, never what was extracted from it — so this text
+            // is scrubbed here for both entrances. (The inbound route delivers
+            // the same text unscrubbed.)
+            text: crate::util::scrub_credentials(text.trim()),
+            images,
+            notes,
+            unshown,
+            all_page_text_lost,
+            page_text,
+        }),
+        DocOutcome::Unreadable { reason } => Conversion::Unreadable(reason),
+        DocOutcome::Unsupported => Conversion::Ordinary,
+    }
+}
+
+/// Convert `res` when it is a container the shared converter extracts from — the
+/// same detection the inbound path uses, so the two cannot disagree about what a
+/// document is. `Ok(None)` when it is not (the ordinary read applies), `Err` only
+/// for an oversized container.
+pub(super) async fn read_document(
+    ws: &Workspace,
+    res: &super::read::ResolvedRead,
+    access: PathAccess,
+) -> anyhow::Result<Option<ToolOutput>> {
+    let Some(name) = document_target(&res.path).await? else {
+        return Ok(None);
+    };
 
     // No artifact directory, no conversion — a plain answer, not a failed call.
     let dir = match create_artifact_dir(ws, access).await {
@@ -85,40 +150,218 @@ pub(super) async fn read_document(
     };
     crate::tools::shell::record_spill_owner(dir.clone());
 
-    let outcome = match crate::document::convert_document_file(&res.path, name, &dir).await {
-        // The ordinary read applies: the file changed under us between the sniff
-        // and the conversion, or the container names no Office document at all
-        // (an Outlook `.msg`, say) and so is not one this converter reads.
-        DocOutcome::Unsupported => None,
-        DocOutcome::Unreadable { reason } => Some(plain_answer(res, &reason)),
-        DocOutcome::Text {
-            text,
-            images,
-            notes,
-            unshown,
-            all_page_text_lost,
-            page_text,
-        } => Some(
-            compose_output(
-                res,
-                &dir,
-                ConvertedDocument {
-                    text,
-                    images,
-                    notes,
-                    unshown,
-                    all_page_text_lost,
-                    page_text,
-                },
-            )
-            .await,
-        ),
+    let outcome = match convert_reading(&res.path, &name, &dir).await {
+        Conversion::Reading(reading) => Some(compose_output(res, &dir, reading).await),
+        Conversion::Unreadable(reason) => Some(plain_answer(res, &reason)),
+        // The file changed under us, or the container names no Office document
+        // at all: the ordinary read applies.
+        Conversion::Ordinary => None,
     };
     // Empty-only removal (`remove_dir` refuses a non-empty directory): an answer
     // pointing at nothing leaves no directory behind, anything it points at keeps
     // one until the run-end hook reclaims it.
     let _ = tokio::fs::remove_dir(&dir).await;
     Ok(outcome)
+}
+
+/// Read `args`'s `path` the way the read tool does, for the command line: the
+/// same detection, conversion and wording, with the whole text and every produced
+/// image written into a folder of their own inside `destination` instead of
+/// inlined, attached or spilled.
+///
+/// `destination` is the caller's `--output-dir`, already resolved to an existing,
+/// writable directory by the frontend ([`crate::cli::resolve_output_dir`]) and
+/// not judged again here. A failure after the folder is made removes it; a killed
+/// process cannot clean up, so what it wrote stays.
+pub(crate) async fn read_for_command_line(
+    ws: &Workspace,
+    args: &serde_json::Value,
+    destination: &Path,
+) -> anyhow::Result<super::ToolAnswer> {
+    let path = super::get_str(args, "path")?;
+    // The read tool's own resolution — the live-store refusal included — runs
+    // before anything is opened or written.
+    let res = super::read::resolve_content_read(ws, path, PathAccess::Unrestricted).await?;
+
+    let display = res.path.display().to_string();
+    let fallback = crate::util::name_stem(crate::util::file_name_or_path(&display)).to_string();
+    let base =
+        crate::tools::document::sanitize_base(super::get_opt_str(args, "file_name"), &fallback);
+    let base = if base.is_empty() {
+        "document".to_string()
+    } else {
+        base
+    };
+    // The reader's own document decision, before the destination is touched: an
+    // input over the size ceiling is refused with no folder made.
+    let target = document_target(&res.path).await?;
+    let folder = crate::util::create_unique_dir(destination, &base)
+        .await
+        .with_context(|| format!("failed to create a folder in {}", destination.display()))?;
+
+    let answer = write_command_line_reading(&res, &folder, target).await;
+    if answer.is_err() {
+        let _ = tokio::fs::remove_dir_all(&folder).await;
+    }
+    answer
+}
+
+/// Write one reading's whole delivery into `folder`: the text as
+/// `<folder>.txt`, every produced image where the converter already wrote it,
+/// and the reader's own report beside them. Nothing here bounds the content; the
+/// only thing bounded is the answer's own listing.
+async fn write_command_line_reading(
+    res: &super::read::ResolvedRead,
+    folder: &Path,
+    target: Option<String>,
+) -> anyhow::Result<super::ToolAnswer> {
+    let display = res.path.display().to_string();
+    // Whether the reading came from the converter or from the ordinary fallback:
+    // only a converted document owes the reader's document notes.
+    let (reading, is_document) = match target {
+        Some(name) => match convert_reading(&res.path, &name, folder).await {
+            Conversion::Reading(reading) => (reading, true),
+            // The read tool's own rendering of a document it cannot read: the
+            // caller sends it as the refusal, and the folder leaves nothing.
+            Conversion::Unreadable(reason) => {
+                return Err(anyhow::anyhow!(answer_line(&display, reason)));
+            }
+            Conversion::Ordinary => (ordinary_reading(res).await?, false),
+        },
+        None => (ordinary_reading(res).await?, false),
+    };
+
+    let mut produced: Vec<PathBuf> = Vec::new();
+    if !reading.text.is_empty() {
+        let folder_name = folder
+            .file_name()
+            .expect("a created folder has a name")
+            .to_string_lossy();
+        let text_path = folder.join(format!("{folder_name}.txt"));
+        tokio::fs::write(&text_path, reading.text.as_bytes())
+            .await
+            .with_context(|| format!("failed to write {}", text_path.display()))?;
+        produced.push(text_path);
+    }
+    produced.extend(reading.images.iter().cloned());
+
+    // Every image is written, so every one was delivered — the basis the
+    // reader's no-text sentence names images on. The ordinary read of an empty
+    // file produces an empty body, and that empty answer is the reader's own.
+    let images_delivered = !reading.images.is_empty();
+    let mut report = Vec::new();
+    if is_document && reading.text.is_empty() && !reading.all_page_text_lost {
+        report.push(no_text_line(&display, images_delivered));
+    }
+    report.extend(reading_notes(&display, &reading, images_delivered));
+
+    let answer = if produced.is_empty() {
+        // Nothing was written: the folder goes away and the reader's own words
+        // are the whole answer.
+        let _ = tokio::fs::remove_dir_all(folder).await;
+        report.join("\n")
+    } else {
+        let names: Vec<String> = produced
+            .iter()
+            .map(|path| crate::util::file_name_or_path(&path.display().to_string()).to_string())
+            .collect();
+        let mut sizes = Vec::with_capacity(produced.len());
+        for path in &produced {
+            let meta = tokio::fs::metadata(path)
+                .await
+                .with_context(|| format!("failed to read back {}", path.display()))?;
+            sizes.push(meta.len());
+        }
+        let mut lines = vec![crate::tools::document::describe("read", &names, &sizes)];
+        lines.extend(report.iter().cloned());
+        lines.extend(
+            produced
+                .iter()
+                .map(|path| crate::tools::document::file_marker(path)),
+        );
+        let full = lines.join("\n");
+        if full.len() <= crate::util::TOOL_OUTPUT_BUDGET_BYTES {
+            full
+        } else {
+            // The listing and the description are replaced by the folder once;
+            // every file is still written, and the report lines stay.
+            let lead = format!(
+                "read {} files — they are all in {}",
+                produced.len(),
+                folder.display()
+            );
+            std::iter::once(lead)
+                .chain(report)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    // A reading the reader failed on every page of is a PARTIAL read: what it
+    // could not read is named in the notes, and the family's exit classes keep a
+    // partial operation in the failed class. Anything the reader did read is
+    // delivered whole above.
+    Ok(if reading.all_page_text_lost {
+        super::ToolAnswer::partial(answer)
+    } else {
+        super::ToolAnswer::done(answer)
+    })
+}
+
+/// The ordinary read of a file the converter does not take, as the parts a
+/// reading would have produced: no notes, and the text is the file's whole
+/// line-numbered rendering. An empty file has none, and the reader's answer for it
+/// is empty too. A raster keeps the read tool's one-line annotation as its text;
+/// the payload the agent's read would attach is the caller's own input file, so
+/// nothing is copied beside the reading.
+async fn ordinary_reading(res: &super::read::ResolvedRead) -> anyhow::Result<ConvertedDocument> {
+    // The read tool's own content read, with no arguments and so in its default
+    // mode.
+    let text = super::read::read_resolved(res, &serde_json::json!({})).await?;
+    Ok(ConvertedDocument {
+        // The body is the file's own content wherever it has any — the fact the
+        // no-text sentence is gated on, so a whitespace-only body is still text.
+        page_text: !text.is_empty(),
+        text,
+        images: Vec::new(),
+        notes: Vec::new(),
+        unshown: Unshown::default(),
+        all_page_text_lost: false,
+    })
+}
+
+/// The reader's no-text sentence: the one naming images only when an image was
+/// actually delivered.
+fn no_text_line(display: &str, images_delivered: bool) -> String {
+    answer_line(
+        display,
+        if images_delivered {
+            crate::document::NO_TEXT_LAYER_NOTE
+        } else {
+            crate::document::NO_TEXT_NOTE
+        },
+    )
+}
+
+/// The reader's own notes for one reading, in its order: what the reading found
+/// and did not show, its own notes, then — when no page produced text — the
+/// no-text sentence. Empty when every page's text was lost: the notes already say
+/// so, and "no text" would report a reader failure as a document with none.
+fn reading_notes(
+    display: &str,
+    reading: &ConvertedDocument,
+    images_delivered: bool,
+) -> Vec<String> {
+    let mut notes: Vec<String> = reading
+        .unshown
+        .lines()
+        .iter()
+        .chain(&reading.notes)
+        .map(|body| answer_line(display, body))
+        .collect();
+    if !reading.page_text && !reading.all_page_text_lost && !reading.text.is_empty() {
+        notes.push(no_text_line(display, images_delivered));
+    }
+    notes
 }
 
 /// The plain answer naming `reason` for a document this tool cannot read: never
@@ -213,87 +456,38 @@ async fn attach_images(images: &[PathBuf]) -> (Vec<ImagePayload>, usize) {
     (attached, unattached)
 }
 
-/// A converted reading's parts, as [`compose_output`] takes them — the
-/// [`DocOutcome::Text`] fields as one value, so the answer's composition needs
-/// one argument rather than six.
-struct ConvertedDocument {
-    text: String,
-    images: Vec<PathBuf>,
-    notes: Vec<String>,
-    unshown: Unshown,
-    all_page_text_lost: bool,
-    page_text: bool,
-}
-
-/// Turn a converted document's parts into the read tool's result: scrub the text,
-/// attach the rasters when there are few enough, and say what was delivered and
-/// what the reading did not show.
+/// Turn a converted reading into the read tool's result: attach the rasters when
+/// there are few enough, and say what was delivered and what the reading did not
+/// show.
 async fn compose_output(
     res: &super::read::ResolvedRead,
     dir: &Path,
-    converted: ConvertedDocument,
+    reading: ConvertedDocument,
 ) -> ToolOutput {
-    let ConvertedDocument {
-        text,
-        images,
-        notes,
-        unshown,
-        all_page_text_lost,
-        page_text,
-    } = converted;
     let display = res.path.display().to_string();
-    // The read tool returns `false` from `should_scrub_output`, and the scrub it
-    // does instead is path-based inside `read_resolved` — it sees the container's
-    // path, never what was extracted from it — so this text is scrubbed here,
-    // unconditionally: the inbound route delivers the same extracted text
-    // unscrubbed.
-    let text = crate::util::scrub_credentials(text.trim());
+    let over_cap = reading.images.len() > MAX_INJECTED_IMAGES;
+    let (attached, unattached) = attach_images(&reading.images).await;
 
-    let over_cap = images.len() > MAX_INJECTED_IMAGES;
-    let (attached, unattached) = attach_images(&images).await;
-
-    let mut text_block = if text.is_empty() {
+    let mut text_block = if reading.text.is_empty() {
         // The reader failed on every page it was asked for: the notes below name
         // those pages, and the "no text" sentences would report a reader failure
         // as a document that has no text.
-        if all_page_text_lost {
+        if reading.all_page_text_lost {
             String::new()
-        } else if attached.is_empty() {
-            // Name the content provided as images only when an image actually was
-            // attached; with none — none produced, all over the cap, or none
-            // encodable — the plain sentence is the honest one.
-            answer_line(&display, crate::document::NO_TEXT_NOTE)
         } else {
-            answer_line(&display, crate::document::NO_TEXT_LAYER_NOTE)
+            // The plain sentence is the honest one unless an image was actually
+            // attached: none produced, all over the cap, and none encodable all
+            // read the same way.
+            no_text_line(&display, !attached.is_empty())
         }
     } else {
         format!(
-            "{}\n\n{text}",
-            answer_line(&display, "extracted text follows")
+            "{}\n\n{}",
+            answer_line(&display, "extracted text follows"),
+            reading.text
         )
     };
-    // The report of what the reading did not show leads the notes: a kind and its
-    // count, ahead of the detail of each loss.
-    let mut trailing: Vec<String> = unshown
-        .lines()
-        .iter()
-        .chain(&notes)
-        .map(|body| answer_line(&display, body))
-        .collect();
-    // A description, an annotation or a form list can carry the text while no
-    // page produced any: that is still a reading with no page text, and it says
-    // so. An image is named only when one was actually delivered. The empty-text
-    // case already says it as the whole answer above.
-    if !page_text && !all_page_text_lost && !text.is_empty() {
-        trailing.push(answer_line(
-            &display,
-            if attached.is_empty() {
-                crate::document::NO_TEXT_NOTE
-            } else {
-                crate::document::NO_TEXT_LAYER_NOTE
-            },
-        ));
-    }
+    let mut trailing = reading_notes(&display, &reading, !attached.is_empty());
     if unattached > 0 {
         // Not the inbound sentence ("could not be read"): there the image
         // pipeline rejected an image it was handed, here the image could not be
@@ -311,10 +505,15 @@ async fn compose_output(
     let (full_listing, folder_listing) = if over_cap {
         let head = format!(
             "[{display}: {} extracted image(s) were not attached ({MAX_INJECTED_IMAGES} is the per-call limit);",
-            images.len()
+            reading.images.len()
         );
         let mut listing = vec![format!("{head} read them individually as images:]")];
-        listing.extend(images.iter().map(|image| image.display().to_string()));
+        listing.extend(
+            reading
+                .images
+                .iter()
+                .map(|image| image.display().to_string()),
+        );
         let folder = vec![format!(
             "{head} they are all in {} — list that folder, then read the images you need.]",
             dir.display()
@@ -352,8 +551,8 @@ async fn compose_output(
         }
     };
     let mut listing = pick_listing(&text_block);
-    if !fits(&text_block, listing) && !text.is_empty() {
-        text_block = spill_text(dir, &display, &text).await;
+    if !fits(&text_block, listing) && !reading.text.is_empty() {
+        text_block = spill_text(dir, &display, &reading.text).await;
         listing = pick_listing(&text_block);
     }
 
@@ -452,6 +651,60 @@ mod tests {
             .scope(read_document(ws, &res, access))
             .await
             .expect("read the document")
+    }
+
+    /// Read one fixture through the command line's entrance into `destination`.
+    async fn command_line_read(
+        ws: &Workspace,
+        destination: &Path,
+        path: &str,
+        file_name: Option<&str>,
+    ) -> anyhow::Result<crate::tools::ToolAnswer> {
+        let mut args = serde_json::json!({
+            "action": crate::cli::DOCUMENT_READ,
+            "path": path,
+        });
+        if let Some(file_name) = file_name {
+            args["file_name"] = serde_json::Value::String(file_name.to_string());
+        }
+        read_for_command_line(ws, &args, destination).await
+    }
+
+    /// The absolute paths an answer's `[FILE:...]` markers name.
+    fn marked_files(answer: &str) -> Vec<PathBuf> {
+        answer
+            .split(crate::tools::document::FILE_MARKER)
+            .skip(1)
+            .map(|rest| PathBuf::from(rest.split(']').next().unwrap_or_default()))
+            .collect()
+    }
+
+    /// The file names inside `folder`, sorted.
+    fn folder_names(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(folder)
+            .expect("the reading's folder")
+            .map(|entry| {
+                entry
+                    .expect("a folder entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The names inside `folder` whose extension is `extension`, sorted.
+    fn files_with_extension(folder: &Path, extension: &str) -> Vec<String> {
+        folder_names(folder)
+            .into_iter()
+            .filter(|name| {
+                Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
+            })
+            .collect()
     }
 
     /// A one-page PDF with a painted rectangle and no text layer: the page has
@@ -1009,6 +1262,395 @@ mod tests {
             6,
             "spilling the text frees room for the per-image paths again: {}",
             out.text
+        );
+    }
+
+    /// The command line's entrance is the read tool's own reading, delivered to
+    /// disk: the whole extracted text and every image the converter produced,
+    /// each named by an absolute `[FILE:]` path inside one new folder.
+    #[tokio::test]
+    async fn command_line_reading_writes_the_readers_text_and_every_image() {
+        crate::util::test::init_test_stores().await;
+        let fixture = docx_with_images(DOCX_BODY, 3);
+        let (_dir, ws) = temp_workspace(&[("report.docx", &fixture)]);
+        let destination = TempDir::new().expect("destination");
+
+        let answer = command_line_read(&ws, destination.path(), "report.docx", None)
+            .await
+            .expect("a document is read");
+        assert!(
+            !answer.partial,
+            "a whole reading is not partial: {}",
+            answer.text
+        );
+
+        let folder = destination.path().join("report");
+        assert!(folder.is_dir(), "the reading writes into its own folder");
+        let text = std::fs::read_to_string(folder.join("report.txt"))
+            .expect("the reader's text is written");
+        assert!(
+            text.contains("First paragraph") && text.contains("Second paragraph"),
+            "{text}"
+        );
+        let images = files_with_extension(&folder, "png");
+        assert_eq!(images.len(), 3, "every media entry is written");
+
+        let marked = marked_files(&answer.text);
+        assert_eq!(
+            marked.len(),
+            4,
+            "the text and three images are named: {}",
+            answer.text
+        );
+        assert!(
+            marked
+                .iter()
+                .all(|path| path.is_absolute() && path.exists() && path.starts_with(&folder)),
+            "{marked:?}"
+        );
+    }
+
+    /// An old binary Office document converts through the command line exactly as
+    /// it does for an agent: its text and its embedded picture land in the folder.
+    #[tokio::test]
+    async fn command_line_reading_converts_an_old_binary_document() {
+        crate::util::test::init_test_stores().await;
+        let png = noisy_png(16, 16);
+        let fixture = doc_picture_fixture("Legacy body text", &png);
+        let (_dir, ws) = temp_workspace(&[("old.doc", &fixture)]);
+        let destination = TempDir::new().expect("destination");
+
+        let answer = command_line_read(&ws, destination.path(), "old.doc", None)
+            .await
+            .expect("an old document is read");
+        assert!(!answer.partial);
+
+        let folder = destination.path().join("old");
+        let text = std::fs::read_to_string(folder.join("old.txt")).expect("the text is written");
+        assert!(text.contains("Legacy body text"), "{text}");
+        assert_eq!(
+            files_with_extension(&folder, "png").len(),
+            1,
+            "the embedded picture is written beside the text"
+        );
+        assert_eq!(
+            marked_files(&answer.text).len(),
+            2,
+            "the text and the picture are named: {}",
+            answer.text
+        );
+    }
+
+    /// A document with no text layer is delivered the same way: one raster per
+    /// page and no text file, with the read tool's own "no text" sentence.
+    #[tokio::test]
+    async fn command_line_reading_of_a_text_free_pdf_writes_an_image_per_page_and_no_text_file() {
+        crate::util::test::init_test_stores().await;
+        let painted = b"0.1 0.5 0.9 rg 0 0 612 792 re f".as_slice();
+        let bytes = multi_page_pdf(&[
+            ("/MediaBox [0 0 612 792]", painted),
+            ("/MediaBox [0 0 612 792]", painted),
+        ]);
+        let (_dir, ws) = temp_workspace(&[("scan.pdf", &bytes)]);
+        let destination = TempDir::new().expect("destination");
+
+        let answer = command_line_read(&ws, destination.path(), "scan.pdf", None)
+            .await
+            .expect("a PDF is read");
+        assert!(!answer.partial);
+        assert!(
+            answer.text.contains(crate::document::NO_TEXT_LAYER_NOTE),
+            "{}",
+            answer.text
+        );
+
+        let names = folder_names(&destination.path().join("scan"));
+        assert_eq!(
+            names,
+            ["page_1.jpg", "page_2.jpg"],
+            "one raster per page: {names:?}"
+        );
+        assert!(
+            files_with_extension(&destination.path().join("scan"), "txt").is_empty(),
+            "a text-free document writes no text file: {names:?}"
+        );
+    }
+
+    /// A reading the reader lost every page of is a PARTIAL operation: the pages
+    /// it could not read are named in the reader's own words, the page it still
+    /// rendered is written, and the family's partial class applies.
+    #[tokio::test]
+    async fn command_line_reading_that_lost_its_text_is_partial() {
+        crate::util::test::init_test_stores().await;
+        let (_dir, ws) = temp_workspace(&[("broken.pdf", &pdf_with_no_media_box())]);
+        let destination = TempDir::new().expect("destination");
+
+        let answer = command_line_read(&ws, destination.path(), "broken.pdf", None)
+            .await
+            .expect("the page that still renders is delivered");
+        assert!(answer.partial, "{}", answer.text);
+        assert!(
+            answer
+                .text
+                .contains("broken.pdf: the text of page 1 could not be read (1 of 1 pages)"),
+            "the reader's own wording: {}",
+            answer.text
+        );
+        assert!(
+            !answer.text.contains(crate::document::NO_TEXT_NOTE),
+            "a reader failure is not a document without text: {}",
+            answer.text
+        );
+        assert_eq!(
+            files_with_extension(&destination.path().join("broken"), "jpg"),
+            ["page_1.jpg"],
+            "the page it could render is still written"
+        );
+        assert!(
+            files_with_extension(&destination.path().join("broken"), "txt").is_empty(),
+            "no text was extracted, so no text file"
+        );
+    }
+
+    /// A document with neither text nor images writes nothing: no folder, and the
+    /// reader's own sentence — never a command-line-only one — is the answer.
+    #[tokio::test]
+    async fn command_line_reading_of_nothing_to_write_keeps_the_readers_words() {
+        crate::util::test::init_test_stores().await;
+        let fixture = zip_fixture(&[("word/document.xml", EMPTY_DOCX_BODY)]);
+        let (_dir, ws) = temp_workspace(&[("blank.docx", &fixture)]);
+        let destination = TempDir::new().expect("destination");
+
+        let answer = command_line_read(&ws, destination.path(), "blank.docx", None)
+            .await
+            .expect("a document with no text is still read");
+        assert!(!answer.partial);
+        assert!(
+            answer
+                .text
+                .contains("blank.docx: no text could be extracted]"),
+            "the reader's own sentence: {}",
+            answer.text
+        );
+        assert_eq!(
+            std::fs::read_dir(destination.path())
+                .expect("the destination")
+                .count(),
+            0,
+            "nothing produced, so no folder"
+        );
+    }
+
+    /// A document the reader cannot parse is the read tool's own refusal — and a
+    /// failed reading leaves no folder behind.
+    #[tokio::test]
+    async fn command_line_reading_leaves_no_folder_for_an_unreadable_document() {
+        crate::util::test::init_test_stores().await;
+        let (_dir, ws) = temp_workspace(&[("broken.pdf", b"%PDF-1.4\ngarbage")]);
+        let destination = TempDir::new().expect("destination");
+
+        let error = command_line_read(&ws, destination.path(), "broken.pdf", None)
+            .await
+            .err()
+            .expect("a corrupt PDF is a refusal");
+        let message = format!("{error:#}");
+        assert!(message.contains("could not be parsed"), "{message}");
+        assert!(message.contains("broken.pdf"), "{message}");
+        assert!(
+            !destination.path().join("broken").exists(),
+            "a failed reading leaves no folder"
+        );
+    }
+
+    /// A protected document is the reader's own refusal too, in the reader's own
+    /// words (`password-protected`), and it also leaves no folder.
+    #[tokio::test]
+    async fn command_line_reading_reports_a_protected_document_in_the_readers_words() {
+        crate::util::test::init_test_stores().await;
+        let fixture = doc_fixture("secret", &[], true);
+        let (_dir, ws) = temp_workspace(&[("secret.doc", &fixture)]);
+        let destination = TempDir::new().expect("destination");
+
+        let error = command_line_read(&ws, destination.path(), "secret.doc", None)
+            .await
+            .err()
+            .expect("a protected document is a refusal");
+        let message = format!("{error:#}");
+        assert!(message.contains("password-protected"), "{message}");
+        assert_eq!(
+            std::fs::read_dir(destination.path())
+                .expect("the destination")
+                .count(),
+            0,
+            "a failed reading writes nothing"
+        );
+    }
+
+    /// A file that is not a document takes the read tool's ordinary fallback —
+    /// the line-numbered rendering, written as the text — never a refusal. An
+    /// empty file has no rendering, so nothing is written and the answer is the
+    /// empty one the read tool gives it.
+    #[tokio::test]
+    async fn command_line_reading_of_a_non_document_is_the_ordinary_read() {
+        crate::util::test::init_test_stores().await;
+        let (_dir, ws) = temp_workspace(&[("notes.md", b"first\nsecond\n"), ("empty.md", b"")]);
+        let destination = TempDir::new().expect("destination");
+
+        let answer = command_line_read(&ws, destination.path(), "notes.md", None)
+            .await
+            .expect("a text file is read");
+        assert!(!answer.partial);
+        let text = std::fs::read_to_string(destination.path().join("notes/notes.txt"))
+            .expect("the ordinary read's rendering");
+        assert!(
+            text.contains("1: first") && text.contains("2: second"),
+            "the fallback is the read tool's line-numbered rendering: {text}"
+        );
+
+        let empty = command_line_read(&ws, destination.path(), "empty.md", None)
+            .await
+            .expect("an empty file is read");
+        assert_eq!(empty.text, "", "the read tool's answer for it is empty");
+        assert!(
+            !destination.path().join("empty").exists(),
+            "nothing produced, so no folder"
+        );
+    }
+
+    /// The command line has no length limit: a long text and a hundred images
+    /// are all written, and only the ANSWER is collapsed — to one folder line.
+    #[tokio::test]
+    async fn command_line_reading_is_uncapped() {
+        crate::util::test::init_test_stores().await;
+        let filler = "lorem ipsum dolor sit amet ".repeat(400);
+        let body = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{filler}</w:t></w:r></w:p></w:body></w:document>"#
+        );
+        let fixture = docx_with_images(body.as_bytes(), 120);
+        let (_dir, ws) = temp_workspace(&[("many.docx", &fixture)]);
+        let destination = TempDir::new().expect("destination");
+
+        let answer = command_line_read(&ws, destination.path(), "many.docx", None)
+            .await
+            .expect("a big document is read");
+        assert!(!answer.partial);
+
+        let folder = destination.path().join("many");
+        let images = files_with_extension(&folder, "png").len();
+        assert_eq!(images, 120, "every image is written, with no cap");
+        let text = std::fs::read(folder.join("many.txt")).expect("the text is written");
+        assert!(
+            text.len() > crate::util::TOOL_OUTPUT_BUDGET_BYTES,
+            "the whole text is written: {} bytes",
+            text.len()
+        );
+        assert!(
+            !answer.text.contains("saved to "),
+            "the command line never spills: {}",
+            answer.text
+        );
+        assert!(
+            !answer.text.contains("too long to inline"),
+            "{}",
+            answer.text
+        );
+        assert!(
+            answer.text.contains("they are all in"),
+            "the listing collapses to the folder: {}",
+            answer.text
+        );
+        assert!(
+            answer.text.len() <= crate::util::TOOL_OUTPUT_BUDGET_BYTES,
+            "the collapsed answer fits the shared budget: {} bytes",
+            answer.text.len()
+        );
+    }
+
+    /// `--file-name` replaces the folder's base name through the family's own
+    /// sanitisation, and the text file inside takes that name.
+    #[tokio::test]
+    async fn command_line_reading_takes_its_folder_name_from_the_flag() {
+        crate::util::test::init_test_stores().await;
+        let fixture = zip_fixture(&[("word/document.xml", DOCX_BODY)]);
+        let (_dir, ws) = temp_workspace(&[("report.docx", &fixture)]);
+        let destination = TempDir::new().expect("destination");
+
+        command_line_read(&ws, destination.path(), "report.docx", Some("dir/summary"))
+            .await
+            .expect("a document is read");
+        // A name carrying a directory is reduced to its last component, like every
+        // other name the family writes.
+        assert_eq!(
+            folder_names(&destination.path().join("summary")),
+            ["summary.txt"]
+        );
+    }
+
+    /// A second reading into the same destination gets the family's numeric
+    /// suffix, and the first folder is left untouched. A dotted base keeps its
+    /// dots: a folder has no extension, so the suffix goes at the end.
+    #[tokio::test]
+    async fn command_line_reading_twice_gets_the_familys_numeric_suffix() {
+        crate::util::test::init_test_stores().await;
+        let fixture = zip_fixture(&[("word/document.xml", DOCX_BODY)]);
+        let (_dir, ws) = temp_workspace(&[("2024.report.docx", &fixture)]);
+        let destination = TempDir::new().expect("destination");
+
+        command_line_read(&ws, destination.path(), "2024.report.docx", None)
+            .await
+            .expect("first reading");
+        let first = std::fs::read_to_string(destination.path().join("2024.report/2024.report.txt"))
+            .expect("the first folder's text");
+        let second = command_line_read(&ws, destination.path(), "2024.report.docx", None)
+            .await
+            .expect("second reading");
+        assert!(!second.partial);
+
+        let second_folder = destination.path().join("2024.report_2");
+        assert!(
+            second_folder.is_dir(),
+            "the family's numeric suffix disambiguates a dotted base: {:?}",
+            folder_names(destination.path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_folder.join("2024.report_2.txt"))
+                .expect("the second text"),
+            first,
+            "the same reading, delivered again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("2024.report/2024.report.txt"))
+                .expect("the first folder is still there"),
+            first,
+            "the first reading is untouched"
+        );
+    }
+
+    /// The product's live store is refused by the read tool's own resolution,
+    /// before anything is opened — and no folder is made for it.
+    #[tokio::test]
+    async fn command_line_reading_refuses_the_products_live_store_before_reading() {
+        crate::util::test::init_test_stores().await;
+        let (_dir, ws) = temp_workspace(&[]);
+        let destination = TempDir::new().expect("destination");
+        let store = crate::db::store_db_path(
+            crate::util::test::test_root(),
+            crate::db::CONSOLIDATED_DB_NAME,
+        );
+
+        let error = command_line_read(&ws, destination.path(), &store.to_string_lossy(), None)
+            .await
+            .err()
+            .expect("the live store is refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("live databases"), "{message}");
+        assert_eq!(
+            std::fs::read_dir(destination.path())
+                .expect("the destination")
+                .count(),
+            0,
+            "nothing was created"
         );
     }
 }

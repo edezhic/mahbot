@@ -949,7 +949,7 @@ fn check_product_segment(segment: &str, second: Option<&str>) -> Result<(), Stri
              Its other command lines change the product, drive it or restart it: its \
              `config`/`workspace` families carry the owner's own configuration and workspace \
              authority, its `send` family dispatches the agents its dispatch tool reaches, and \
-             its {producing} families run the assistant's own producing tools, making files with \
+             its {producing} families run the assistant's own tools for them, making files with \
              the owner's own account (a picture or a video paid for through his provider account, \
              a document written where the caller says) — \
              the same authority the roles holding those tools already have, so a read-only shell \
@@ -6801,6 +6801,9 @@ mod tests {
                 "mahbot document create --format pdf --output-dir /tmp",
                 false,
             ),
+            // The reader is refused with the rest of its family: the whole family
+            // is treated as producing, as it always has been.
+            ("mahbot document read --path /tmp/x.pdf", false),
             ("mahbot image gen --prompt a cat", false),
             ("mahbot video gen --prompt a cat", false),
             (

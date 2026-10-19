@@ -4,7 +4,10 @@
 //! [`CallRequest`] and gets back a [`CallReply`]. The operation runs on the
 //! very tool an agent's assistant calls, in the owner's own workspace and with
 //! the owner's own toolset — so the frontend has no rules of its own to keep in
-//! step with the product's.
+//! step with the product's. The document family's `read` is the one operation
+//! with no tool behind it: it runs the product's own reader
+//! ([`crate::tools::read_document`]) and is served here before the toolset is
+//! consulted.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -56,6 +59,19 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
         return unknown_tool_refusal(&call);
     }
 
+    // The document family's `read` runs the product's own READER, which is no
+    // tool (see `cli::DOCUMENT_READ`), so it is served here, before the toolset
+    // is built. A product built before the operation answers it as an unknown
+    // action of the document tool — the failed class, since the family itself is
+    // served; one operation's absence cannot raise the family's protocol value
+    // without withholding the family's existing operations.
+    if call.tool == "document"
+        && call.args.get("action").and_then(serde_json::Value::as_str)
+            == Some(crate::cli::DOCUMENT_READ)
+    {
+        return execute_document_read(&call).await;
+    }
+
     // The owner's workspace and the admin Assistant's own toolset: the command
     // line exposes exactly what the owner's own tools hold and nothing else.
     let ws = crate::users::personal_workspace_struct(crate::users::ADMIN_USER_NAME);
@@ -89,14 +105,6 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
         role: "cli".to_string(),
         workspace: ws.name.clone(),
     });
-    // The same span the agent loop opens, so the logs bridge attributes the
-    // operation's rows to `cli` exactly as it attributes an agent's.
-    let span = tracing::info_span!(
-        "agent",
-        agent_id = %"cli",
-        role = %"cli",
-        workspace = %ws.path
-    );
 
     let args = call.args.clone();
     let started = Instant::now();
@@ -105,52 +113,94 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
     // is read here because nothing in the tools' arguments carries it — a tool
     // argument would be model input, while this is the caller's own operand.
     let output_dir = call.output_dir.as_deref().map(std::path::PathBuf::from);
-    let outcome = crate::agent::CURRENT_TOOL_COMMAND_LINE
-        .scope(true, async {
-            crate::agent::CURRENT_TOOL_USER_NAME
-                .scope(user_name, async {
-                    crate::agent::CURRENT_TOOL_CHANNEL
-                        .scope(channel, async {
-                            crate::agent::CURRENT_TOOL_AGENT_TRACKING
-                                .scope(tracking, async {
-                                    crate::agent::CURRENT_TOOL_OUTPUT_DIR
-                                        .scope(output_dir, async {
-                                            match AssertUnwindSafe(tool.execute_answer(&ws, args))
-                                                .catch_unwind()
-                                                .await
-                                            {
-                                                Ok(Ok(answer)) => Ok(answer),
-                                                // A panic is a refusal carrying the panic's own
-                                                // message, never a severed exchange — the crate builds
-                                                // with `panic = "unwind"` on purpose.
-                                                Err(payload) => {
-                                                    Err(crate::util::panic_message(&*payload))
-                                                }
-                                                // The tool's own wording, unwrapped: the caller reads
-                                                // it as the product's answer, so it must not carry the
-                                                // `Error executing <tool>: …` envelope that is worded
-                                                // for a model's failure block. The record below wraps
-                                                // it the way an agent's failure is recorded. Any
-                                                // context chain is kept — `Display` alone would hide
-                                                // the cause the outermost context names.
-                                                Ok(Err(e)) => Err(format!("{e:#}")),
-                                            }
-                                        })
-                                        .await
-                                })
-                                .await
-                        })
-                        .await
-                })
-                .await
-        })
-        .instrument(span)
-        .await;
+    let outcome = carry_out(&ws, async {
+        crate::agent::CURRENT_TOOL_COMMAND_LINE
+            .scope(true, async {
+                crate::agent::CURRENT_TOOL_USER_NAME
+                    .scope(user_name, async {
+                        crate::agent::CURRENT_TOOL_CHANNEL
+                            .scope(channel, async {
+                                crate::agent::CURRENT_TOOL_AGENT_TRACKING
+                                    .scope(tracking, async {
+                                        crate::agent::CURRENT_TOOL_OUTPUT_DIR
+                                            .scope(output_dir, tool.execute_answer(&ws, args))
+                                            .await
+                                    })
+                                    .await
+                            })
+                            .await
+                    })
+                    .await
+            })
+            .await
+    })
+    .await;
     let duration_ms = crate::util::millis_i64(started.elapsed());
 
     record_operation(&call, tool_name, duration_ms, &outcome, &ws.path);
 
     reply(outcome, &call.secrets)
+}
+
+/// Serve the document family's `read`: the same reading the read tool does,
+/// with the caller's destination and the family's answer shape.
+async fn execute_document_read(call: &CallRequest) -> CallReply {
+    let ws = crate::users::personal_workspace_struct(crate::users::ADMIN_USER_NAME);
+    // The frontend resolves a producing family's destination before it sends
+    // anything ([`crate::cli::resolve_output_dir`]), so a call without one is a
+    // malformed call, not a retryable one: there is nowhere to write.
+    let Some(destination) = call.output_dir.as_deref() else {
+        return CallReply::refused(
+            "the document family's read was sent with no destination directory, so nothing ran",
+        );
+    };
+    let started = Instant::now();
+    let outcome = carry_out(
+        &ws,
+        crate::tools::read_document::read_for_command_line(
+            &ws,
+            &call.args,
+            std::path::Path::new(destination),
+        ),
+    )
+    .await;
+    record_operation(
+        call,
+        "document",
+        crate::util::millis_i64(started.elapsed()),
+        &outcome,
+        &ws.path,
+    );
+    reply(outcome, &call.secrets)
+}
+
+/// Run one command-line operation the way the instance carries every one of them
+/// out: under the span the agent loop opens (so the logs bridge attributes its
+/// rows to `cli` exactly as it attributes an agent's), with a panic turned into
+/// its own message rather than a severed exchange — the crate builds with
+/// `panic = "unwind"` on purpose — and an error returned as the product's own
+/// wording: unwrapped, because the caller reads it as the answer and the `Error
+/// executing <tool>: …` envelope is worded for a model's failure block, and with
+/// any context chain kept, since `Display` alone would hide the cause.
+async fn carry_out<T>(
+    ws: &crate::Workspace,
+    operation: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Result<T, String> {
+    let span = tracing::info_span!(
+        "agent",
+        agent_id = %"cli",
+        role = %"cli",
+        workspace = %ws.path
+    );
+    match AssertUnwindSafe(operation)
+        .catch_unwind()
+        .instrument(span)
+        .await
+    {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(payload) => Err(crate::util::panic_message(&*payload)),
+    }
 }
 
 /// Hold the registry guard that keeps a graceful drain (or an update hand-off)
@@ -179,8 +229,8 @@ pub(crate) fn hold_flight() -> crate::agent::registry::NonAgentCallGuard {
 /// treats this class as the environment's, so the sentence carries the restart
 /// advice. A tool a family DOES front that the owner's toolset does not hold is a
 /// product-side inconsistency ([`crate::Role::Assistant`]'s own toolset is the
-/// command line's whole surface), where nothing is implied about the build and a
-/// restart is the wrong advice. The caller's own secrets are removed on both
+/// command line's whole tool surface), where nothing is implied about the build
+/// and a restart is the wrong advice. The caller's own secrets are removed on both
 /// paths: the tool name is caller input like any other.
 fn unknown_tool_refusal(call: &CallRequest) -> CallReply {
     let wording = if crate::cli::fronts_tool(&call.tool) {
@@ -698,8 +748,10 @@ mod tests {
             .split("[FILE:")
             .nth(1)
             .and_then(|rest| rest.split(']').next())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| panic!("the PDF is named: {}", created.answer));
+            .map_or_else(
+                || panic!("the PDF is named: {}", created.answer),
+                std::path::PathBuf::from,
+            );
         let page = execute(CallRequest {
             tool: "rasterize".to_string(),
             args: serde_json::json!({ "path": source.to_string_lossy(), "page": 1 }),
@@ -715,6 +767,65 @@ mod tests {
                 .await
                 .expect("the page's picture is there")[..8],
             [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+    }
+
+    /// The document family's `read` runs the product's own reader (no tool): the
+    /// converted text lands in a folder under the destination the caller chose.
+    #[tokio::test]
+    async fn execute_reads_a_document_into_the_destination_the_caller_chose() {
+        crate::util::test::init_test_stores().await;
+        crate::cli::mark_ready();
+
+        let destination = crate::util::test::test_root().join("cli-read-destination");
+        let _ = tokio::fs::remove_dir_all(&destination).await;
+        tokio::fs::create_dir_all(&destination)
+            .await
+            .expect("a destination of the caller's own");
+        let source = destination.join("report.docx");
+        tokio::fs::write(
+            &source,
+            crate::ooxml::test_fixtures::zip_fixture(&[(
+                "word/document.xml",
+                crate::ooxml::test_fixtures::DOCX_BODY,
+            )]),
+        )
+        .await
+        .expect("a document at hand");
+
+        let reply = execute(CallRequest {
+            tool: "document".to_string(),
+            args: serde_json::json!({
+                "action": crate::cli::DOCUMENT_READ,
+                "path": source.to_string_lossy(),
+            }),
+            secrets: Vec::new(),
+            output_dir: Some(destination.to_string_lossy().into_owned()),
+        })
+        .await;
+        assert_eq!(reply.outcome, CallOutcome::Done, "answer: {}", reply.answer);
+
+        let file = reply
+            .answer
+            .split(crate::tools::document::FILE_MARKER)
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .map_or_else(
+                || panic!("the reading names its file: {}", reply.answer),
+                std::path::PathBuf::from,
+            );
+        assert!(
+            file.is_absolute() && file.starts_with(&destination),
+            "the file lands under the destination the caller chose: {}",
+            file.display()
+        );
+        assert!(file.exists(), "the named file is there: {}", file.display());
+        let text = tokio::fs::read_to_string(&file)
+            .await
+            .expect("the reading's text");
+        assert!(
+            text.contains("First paragraph") && text.contains("Second paragraph"),
+            "the reader's extracted text is written as the text: {text}"
         );
     }
 

@@ -1,11 +1,12 @@
 //! Document conversion: turn a document's bytes into the text and image files
 //! an agent can read, and report a short user-facing reason when it cannot.
 //!
-//! Shared by the inbound attachment flow ([`crate::channels::enrichment`]) and
-//! by the read tool ([`crate::tools`]); nothing here touches channel state, the
-//! database, or the network. [`convert_document_file`] is the bounded async
-//! entry point both go through, and [`needs_extraction`] tells the read tool
-//! whether a file is one of the containers this module extracts from.
+//! Shared by the inbound attachment flow ([`crate::channels::enrichment`]), by
+//! the read tool and — through [`crate::tools::read_document`] — by the command
+//! line's document reader ([`crate::cli`]); nothing here touches channel state,
+//! the database, or the network. [`convert_document_file`] is the bounded async
+//! entry point every caller goes through, and [`needs_extraction`] tells a
+//! caller whether a file is one of the containers this module extracts from.
 //!
 //! Format detection and the PDF arm live here; the ZIP-container OOXML formats
 //! (Word, Excel, PowerPoint) live in [`crate::ooxml`], their pre-OOXML binary
