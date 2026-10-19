@@ -79,15 +79,10 @@ fn refuse_project(raw: &str) -> anyhow::Error {
 /// exactly as before; an empty or whitespace-only value counts as no place.
 /// Everything else is decided here and now, before anything is dispatched.
 pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option<Workspace>> {
-    let raw = match args.get("place") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::String(s)) => s.as_str(),
-        Some(other) => return Err(super::wrong_type("place", "a string", other)),
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
+    let raw = super::get_opt_str_strict(args, "place")?.map(str::trim);
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
         return Ok(None);
-    }
+    };
 
     // A value that is not an absolute path can only be a registered workspace
     // name: registered names are letters and underscores, never a path.

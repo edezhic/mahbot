@@ -443,11 +443,7 @@ impl SendTool {
         if !self.declares(arg) {
             return Ok(None);
         }
-        match args.get(arg.as_str()) {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(serde_json::Value::String(value)) => Ok(Some(value)),
-            Some(other) => Err(super::wrong_type(arg.as_str(), "a string", other)),
-        }
+        super::get_opt_str_strict(args, arg.as_str())
     }
 
     /// The optional `place` this call names: `None` when it names none, and

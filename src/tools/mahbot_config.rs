@@ -373,16 +373,9 @@ impl MahbotConfigTool {
     }
 
     async fn exec_list_grants(&self, args: serde_json::Value) -> anyhow::Result<String> {
-        let user = match args.get("user") {
-            None | Some(serde_json::Value::Null) => None,
-            // `get_opt_str` is deliberately silent, so a wrong-typed user would
-            // masquerade as "every user" — reject it here, before the store is
-            // touched, like the other argument checks.
-            Some(v) => Some(
-                v.as_str()
-                    .ok_or_else(|| super::wrong_type("user", "a string", v))?,
-            ),
-        };
+        // Refuse a wrong-typed user before the store is touched, like the other
+        // argument checks.
+        let user = super::get_opt_str_strict(&args, "user")?;
         let store = crate::users::store();
         let Some(user) = user else {
             let all = store.list_grants().await?;

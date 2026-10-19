@@ -223,16 +223,7 @@ impl WebSearchCache {
         &self,
         args: &'a Value,
     ) -> anyhow::Result<(&'a str, Option<u64>)> {
-        let query = match args.get("query") {
-            None | Some(Value::Null) => None,
-            // `get_opt_str` is deliberately silent, so a wrong-typed query
-            // would masquerade as absent — reject it here instead.
-            Some(v) => Some(
-                v.as_str()
-                    .ok_or_else(|| super::wrong_type("query", "a string", v))?
-                    .trim(),
-            ),
-        };
+        let query = super::get_opt_str_strict(args, "query")?.map(str::trim);
         let expand_id = super::get_opt_u64(args, "expand")?;
 
         match (query, expand_id) {
