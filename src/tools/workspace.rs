@@ -490,13 +490,9 @@ async fn list_board(only: Option<&str>, phase: Option<&str>) -> anyhow::Result<S
             break;
         }
         // The first line is always shown — the notice must never read "the first
-        // 0 of N tickets" — so one line larger than the whole budget is cut
-        // instead of escaping the tool's own limit, which is what protects the
-        // context now that the framework's clip is off.
-        if line.len() > OUTPUT_BYTE_LIMIT {
-            let cut = OUTPUT_BYTE_LIMIT - "…".len();
-            line = format!("{}…", crate::util::truncate_bytes(&line, cut));
-        }
+        // 0 of N tickets" — so a line larger than the whole budget is cut rather
+        // than escaping the tool's own limit.
+        line = crate::util::cut_bytes(&line, OUTPUT_BYTE_LIMIT);
         bytes += line.len() + 1;
         lines.push(line);
     }

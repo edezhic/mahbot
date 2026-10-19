@@ -260,7 +260,9 @@ async fn bounded_image_data_uri(path: &std::path::Path) -> anyhow::Result<String
             // Over-cap: fall back to a bounded JPEG re-encode. If it is still
             // over-cap it fails closed rather than forward an over-cap payload.
             tracing::warn!(path = %path.display(), "image data-URI exceeds the encoded-payload cap — re-encoding to a bounded JPEG");
-            let reencoded = crate::util::local_image_to_compressed_data_uri(path).await?;
+            let reencoded = crate::util::local_image_to_compressed_data_uri_with_meta(path)
+                .await?
+                .data_uri;
             if reencoded.len() <= media_target::MAX_DATA_URI_ENCODED_BYTES {
                 Ok(reencoded)
             } else {

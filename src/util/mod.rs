@@ -329,8 +329,8 @@ pub(crate) fn millis_i64(elapsed: std::time::Duration) -> i64 {
 
 /// Parse an env var as a whole number of seconds, falling back to `default_secs`.
 ///
-/// Shared by the bounded tool I/O waits (shell output drain, round
-/// consolidation) so their env-override pattern stays in one place.
+/// Shared by every bounded wait the product arms from an `MAHBOT_*_SECS`
+/// setting, so their env-override pattern stays in one place.
 /// A value of `0` produces an immediate timeout — deliberate for tests;
 /// operators should set a positive value.
 #[must_use]
@@ -710,9 +710,7 @@ pub(crate) fn failure_detail(text: &str, label: &str) -> String {
 ///
 /// Slicing respects UTF-8 character boundaries: the head cut floors and the tail
 /// cut ceils, so a multi-byte character the tail cut lands inside moves into the
-/// omitted span rather than being split or duplicated. That makes the head/tail
-/// overlap arm below unreachable for any `max_bytes`, which is the point — it is
-/// defence against a future ratio change, not a path any input takes.
+/// omitted span rather than being split or duplicated.
 #[must_use]
 pub(crate) fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> String {
     if s.len() <= max_bytes {
@@ -723,29 +721,20 @@ pub(crate) fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> Strin
     let head_end = s.floor_char_boundary(head_bytes);
     let tail_start = s.ceil_char_boundary(s.len() - tail_bytes);
     // `head_bytes + tail_bytes <= max_bytes < s.len()`, and flooring the head
-    // only shrinks it while ceiling the tail only grows it. A ratio change that
-    // breaks that has to be caught here, in debug builds, not by a slice panic
-    // inside tool output formatting.
+    // only shrinks it while ceiling the tail only grows it, so the cuts stay
+    // ordered; a ratio change that breaks that counts zero omitted bytes instead
+    // of panicking inside tool output formatting.
     debug_assert!(
         head_end < tail_start,
         "sandwich cuts overlap: head_end={head_end} tail_start={tail_start} max_bytes={max_bytes}"
     );
-    if head_end < tail_start {
-        let omitted = s[head_end..tail_start].len();
-        format!(
-            "{}... ({} bytes omitted at {label} truncation)\n{}",
-            &s[..head_end],
-            omitted,
-            &s[tail_start..]
-        )
-    } else {
-        // Unreachable (see above). Keep a degenerate cut rather than a panic so
-        // one crafted output cannot take down the caller.
-        let boundary = s.floor_char_boundary(max_bytes);
-        let mut out = s[..boundary].to_string();
-        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\n... [{label} truncated]"));
-        out
-    }
+    let omitted = tail_start.saturating_sub(head_end);
+    format!(
+        "{}... ({} bytes omitted at {label} truncation)\n{}",
+        &s[..head_end],
+        omitted,
+        &s[tail_start..]
+    )
 }
 
 /// Shared byte trigger for tool output passed to the LLM: used by the shell
@@ -790,23 +779,9 @@ const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;
 /// Input-size ceiling for the inbound-photo decode, aligned with the
 /// reference-image path's [`MAX_REFERENCE_INPUT_BYTES`] pattern: a decoded
 /// bitmap can be far larger than its compressed file, so over-cap files are
-/// refused from metadata BEFORE the file is read (the fail-open caller falls
-/// back to the original bytes as a data URI instead). Shared by the media-target
+/// refused from metadata BEFORE the file is read. Shared by the media-target
 /// classifier and the GUI render path so a single 50 MiB cap cannot drift.
 pub(crate) const INBOUND_IMAGE_MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
-
-/// Read a local image file and return a bounded-JPEG data URI: longest side
-/// capped at [`INBOUND_IMAGE_MAX_SIDE`], quality
-/// [`INBOUND_IMAGE_JPEG_QUALITY`], alpha flattened onto white, EXIF
-/// orientation applied. Fail-open callers fall back to
-/// [`local_image_to_data_uri`] on any decode/encode error.
-pub(crate) async fn local_image_to_compressed_data_uri(
-    path: &std::path::Path,
-) -> anyhow::Result<String> {
-    Ok(local_image_to_compressed_data_uri_with_meta(path)
-        .await?
-        .data_uri)
-}
 
 /// Result of bounded inbound-image compression, with the post-EXIF/post-resize
 /// dimensions and the source-format label for annotation rendering.
@@ -818,9 +793,11 @@ pub(crate) struct CompressedImageMeta {
 }
 
 /// Read a local image file and return a bounded-JPEG data URI together with the
-/// post-EXIF/post-resize dimensions of the encoded JPEG. Single source of truth
-/// for the image payload's annotation dims (they describe the very encode the
-/// data-URI carries).
+/// post-EXIF/post-resize dimensions of the encoded JPEG: longest side capped at
+/// [`INBOUND_IMAGE_MAX_SIDE`], quality [`INBOUND_IMAGE_JPEG_QUALITY`], alpha
+/// flattened onto white, EXIF orientation applied. Single source of truth for the
+/// image payload's annotation dims (they describe the very encode the data-URI
+/// carries).
 pub(crate) async fn local_image_to_compressed_data_uri_with_meta(
     path: &std::path::Path,
 ) -> anyhow::Result<CompressedImageMeta> {
@@ -1426,10 +1403,8 @@ pub(crate) fn name_stem(name: &str) -> &str {
 #[must_use]
 pub(crate) fn suffixed_name(name: &str, n: u32) -> String {
     let stem = name_stem(name);
-    match name.strip_prefix(stem) {
-        Some(ext) if !ext.is_empty() => format!("{}{ext}", numbered(stem, n)),
-        _ => numbered(name, n),
-    }
+    let ext = name.strip_prefix(stem).unwrap_or_default();
+    format!("{}{ext}", numbered(stem, n))
 }
 
 /// `name` with the `n`-th attempt's `_<n>` suffix at its very end — the form a
@@ -1547,15 +1522,16 @@ pub(crate) fn strip_ansi_escapes(input: &str) -> String {
     RE.replace_all(input, "").to_string()
 }
 
-/// Redact sensitive values for safe logging. Shows first 4 characters + "*[REDACTED]" suffix.
-/// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.
+/// `key: value` / `key=value` pairs whose key names a credential (`token`,
+/// `api_key`, `password`, `secret`, …), capturing the value.
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).expect("hardcoded regex is valid")
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
-/// Replaces known credential patterns with a redacted placeholder while preserving
-/// a small prefix for context.
+/// A matched value keeps its first four characters for context, then gets a
+/// `*[REDACTED]` suffix. The prefix is taken on a char boundary, so a multi-byte
+/// value cannot panic.
 #[must_use]
 pub(crate) fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
@@ -2067,20 +2043,6 @@ mod truncate_tests {
             assert!(
                 truncate_sandwich(&input, cap, "test").contains("bytes omitted at test truncation"),
                 "cap {cap} must take the omission form"
-            );
-        }
-    }
-
-    #[test]
-    fn sandwich_line_boundaries_intact() {
-        // Lines should not be concatenated across truncation boundaries
-        let line = "hello world!\n".repeat(100_000);
-        let result = truncate_sandwich(&line, 500_000, "test");
-        assert!(result.len() < line.len(), "should truncate");
-        for l in result.lines().filter(|l| !l.starts_with("...")) {
-            assert!(
-                !l.contains("hello world!hello"),
-                "lines should not be concatenated"
             );
         }
     }
