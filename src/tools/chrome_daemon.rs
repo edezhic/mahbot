@@ -1987,7 +1987,11 @@ async fn session_stop_via(path: &Path, session: &str, bound: Duration) -> Sessio
 /// not have (see [`session_stop_via`]). The answer distinguishes a stop that was
 /// issued and confirmed from one issued but not confirmed (the child ran) and
 /// from one that never started.
-async fn session_stop_outcome(path: &Path, session: &str, bound: Duration) -> SessionRecovery {
+pub(super) async fn session_stop_outcome(
+    path: &Path,
+    session: &str,
+    bound: Duration,
+) -> SessionRecovery {
     let args = ["session", "stop"];
     let clocks = probe_clocks(bound);
     match spawn_cli(CliSpawn {

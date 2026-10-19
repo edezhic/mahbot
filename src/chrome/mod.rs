@@ -367,6 +367,33 @@ pub(crate) fn is_blank_page_url(url: &str) -> bool {
 pub(crate) fn is_chrome_error_page(url: &str) -> bool {
     url.trim().starts_with("chrome-error://")
 }
+/// How a navigation ended, read off the answer's committed URL: the tab never
+/// left its scratch page, or Chrome committed to its own error page. `None` when
+/// the answer carries no committed URL at all (nothing to judge).
+pub(crate) enum NavigationFailure {
+    Blank,
+    ErrorPage,
+}
+/// [`NavigationFailure`] of one `open` answer — the one reading both the
+/// interactive tool and a rasterize capture refuse a navigation by.
+pub(crate) fn navigation_failure(
+    response: &crate::chrome::contract::ChromeResponse,
+) -> Option<NavigationFailure> {
+    let committed = response.data.as_ref()?.get("url")?.as_str()?;
+    if is_blank_page_url(committed) {
+        Some(NavigationFailure::Blank)
+    } else if is_chrome_error_page(committed) {
+        Some(NavigationFailure::ErrorPage)
+    } else {
+        None
+    }
+}
+/// The net error code an error page's probe named, when it named one.
+pub(crate) fn error_page_code(probe: &crate::chrome::contract::ChromeResponse) -> Option<String> {
+    crate::chrome::contract::parse_error_page_probe(probe)
+        .filter(|probe| probe.is_error_page)
+        .and_then(|probe| probe.code)
+}
 
 /// Escape a string for embedding in a single-quoted JavaScript literal.
 /// Shared by the CLI's count/eval shims and the interactive tool's

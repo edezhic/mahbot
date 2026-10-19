@@ -1,18 +1,18 @@
-//! The `rasterize` tool: a file in, an ordinary picture out.
+//! The `rasterize` tool: a file or a page in, an ordinary picture out.
 //!
-//! A vector file is markup, and a PDF is a container: the product could only read
-//! either as text or as extracted pages. This renders it with the engine's own
-//! rasterizer ([`resvg`] for SVG — pure Rust, in process, nothing to configure;
-//! hayro for a PDF page) into a PNG, the product's usual picture format: the
-//! assistant sees it through the ordinary tool-result payload, sends it to the
-//! user through the ordinary `[IMAGE:path]` marker, and the file itself is a
-//! picture like any other. Nothing about the way pictures are shown or delivered
+//! An SVG is markup, a PDF is a container, and an HTML file or a web address is
+//! a page: the product could only read them as text or as extracted pages. This
+//! renders them into a PNG, the product's usual picture format: the assistant
+//! sees it through the ordinary tool-result payload, sends it to the user
+//! through the ordinary `[IMAGE:path]` marker, and the file itself is a picture
+//! like any other. Nothing about the way pictures are shown or delivered
 //! changes, and neither does the document pipeline this action deliberately sits
 //! outside of.
 //!
-//! SVG and one page of a PDF are the inputs accepted today. The tool is named and
-//! described by the action rather than by those formats, so a further one is a
-//! further input rather than a new tool.
+//! SVG, one page of a PDF, a local HTML file and an http(s) address are the
+//! inputs accepted today. The tool is named and described by the action rather
+//! than by those formats, so a further one is a further input rather than a new
+//! tool.
 //!
 //! Four rules the implementation exists to hold:
 //!
@@ -21,20 +21,25 @@
 //!   spelling and the canonical target, at the caller's own size limit — so a
 //!   conversion never reaches a file the caller could not have read itself, and a
 //!   reference is never an unbounded read. A reference outside the boundary is not
-//!   a refusal: it is simply not drawn.
+//!   a refusal: it is simply not drawn. An HTML page is held to the same gate,
+//!   inside the caller's personal workspace (see [`super::rasterize_html`]).
 //! * **The machine's fonts, the product's font as the answer.** The engine
 //!   resolves the families a file names against the machine's own collection, and
 //!   would answer a family it cannot find with a hardcoded serif (or drop the span
 //!   entirely); the database it is handed answers an unresolved family — and text
 //!   that names none — with the font the product ships, so text is drawn rather
 //!   than lost (see [`fonts`]).
-//! * **A bounded, contained render.** The picture's long side is capped, the work
-//!   runs on a blocking thread with a panic that becomes an ordinary refusal, and
-//!   a compressed input is unwrapped here, bounded by the limit any input obeys.
+//! * **A bounded, contained render.** The picture's long side is capped; an
+//!   in-process render runs on a blocking thread with a panic that becomes an
+//!   ordinary refusal, a compressed input is unwrapped here (bounded by the limit
+//!   any input obeys), and a browser capture is bounded by one budget.
 //! * **One page of a PDF.** A PDF of several pages is rendered one named page at a
 //!   time: the page's visible area (a crop honoured), a refusal that says how many
 //!   pages there are when `page` is missing or past the end, and nothing
 //!   interactive — form values, comments, links — in the picture.
+//!
+//! A browser capture never shares the in-process renders' permit pool, so it
+//! cannot delay one; the capture's own rules live with it.
 
 use std::borrow::Cow;
 use std::io::Cursor;
@@ -54,11 +59,13 @@ use tokio::sync::Semaphore;
 use super::path::PathAccess;
 use crate::{Tool, Workspace};
 
-/// The longest side of a produced picture, in pixels: a larger drawing or page is
-/// scaled down to it with its aspect ratio kept, and one already smaller is left
-/// at its own size — never enlarged. 2048 is the same order as the page rasters
-/// the document readers produce, and bounds one render at 16 MB of pixels.
-const MAX_LONG_SIDE_PX: u32 = 2048;
+/// The longest side of a produced picture, in pixels: a drawing or page larger
+/// than it is scaled down to it with its aspect ratio kept, and one already
+/// smaller is left at its own size; an HTML page is captured at the fixed
+/// viewport and then fitted down to it. 2048 is the same order as the page
+/// rasters the document readers produce, and bounds one render at 16 MB of
+/// pixels.
+pub(super) const MAX_LONG_SIDE_PX: u32 = 2048;
 
 /// The first two bytes of a gzip stream — how a compressed drawing is told from
 /// markup without parsing it.
@@ -68,14 +75,34 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 /// parsing it.
 const PDF_MAGIC: &[u8; 5] = b"%PDF-";
 
-/// How many renders may run at once, process-wide. The engine is synchronous and
-/// one render holds a whole picture's worth of pixels for as long as it runs, so
-/// this bounds the work the action can put on the machine at once.
+/// How many in-process renders may run at once, process-wide. The engine is
+/// synchronous and one render holds a whole picture's worth of pixels for as
+/// long as it runs, so this bounds the work the action can put on the machine
+/// at once. HTML renders take [`HTML_RENDERS`] instead: a browser capture must
+/// never delay an in-process one.
 static RENDERS: Semaphore = Semaphore::const_new(2);
 
+/// How many browser captures may run at once, process-wide — one browser session
+/// each, so this bounds the tabs the action can open on the owner's Chrome. A
+/// separate permit pool from [`RENDERS`], so an HTML render never delays an
+/// in-process one.
+static HTML_RENDERS: Semaphore = Semaphore::const_new(2);
+
+/// Which renderer an input is handed to, from its bytes and its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderKind {
+    /// One page of a PDF, rendered in process.
+    Pdf,
+    /// SVG markup, plain or gzip-compressed, rendered in process.
+    Svg,
+    /// A page captured through the product's connected browser.
+    Html,
+}
+
 /// The `rasterize` tool. `access` is the caller's [`PathAccess`], fixed when the
-/// role's toolset is built: the drawing and the resources it refers to are read
-/// under it exactly as a `read` of them would be.
+/// role's toolset is built: the input, the resources a drawing refers to and
+/// every file the page server hands out are read under it exactly as a `read` of
+/// them would be.
 pub(crate) struct RasterizeTool {
     access: PathAccess,
 }
@@ -106,12 +133,12 @@ impl Tool for RasterizeTool {
             &json!({
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to render — an SVG, or one page of a PDF — anywhere you may read files"
+                    "description": "What to render: an SVG, one page of a PDF, an HTML file inside your personal workspace, or an http(s) address"
                 },
                 "page": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "The 1-based page to render, for a PDF of several pages; a PDF's one page needs none, and naming a page for any other file is refused."
+                    "description": "The 1-based page to render, for a PDF of several pages; naming a page for any other input is refused."
                 }
             }),
             &["path"],
@@ -128,9 +155,33 @@ impl Tool for RasterizeTool {
 }
 
 impl RasterizeTool {
-    /// Render the file one call names, and answer the picture the product wrote.
+    /// Render the file or address one call names, and answer the picture the
+    /// product wrote.
     async fn rasterize(&self, ws: &Workspace, args: &serde_json::Value) -> anyhow::Result<PathBuf> {
         let requested = super::get_str(args, "path")?;
+        let page = super::get_opt_u64(args, "page")?;
+        // An address is never resolved as a file: the page it names is fetched by
+        // the product's own browser, under the URL policy a navigation obeys. Any
+        // other address scheme is refused as one — `file://` included — rather
+        // than looked up as a file path it cannot be.
+        if let Some(url) = as_render_url(requested) {
+            // A page names one page of a PDF, and a page has no pages to choose from.
+            if page.is_some() {
+                return Err(page_is_for_pdf(requested));
+            }
+            crate::chrome::validate_url(url)
+                .map_err(|error| anyhow::anyhow!("cannot render {requested}: {error:#}"))?;
+            let workspace = ws.as_path().to_string_lossy();
+            let _permit = capture_permit().await;
+            let picture = super::rasterize_html::render_url(url, requested, &workspace).await?;
+            return super::save_generated_file(ws, &picture, "rasterized", "png").await;
+        }
+        if let Some(scheme) = non_http_address(requested) {
+            anyhow::bail!(
+                "cannot render {requested}: only an http(s) address is rendered as a page, and \
+                 this one uses {scheme}"
+            );
+        }
         // The input is resolved through the read gate before anything else, so a
         // path the caller may not read is never even stat'ed — and the boundary
         // every resource a drawing refers to is held to is this same one.
@@ -159,40 +210,212 @@ impl RasterizeTool {
             );
         }
 
-        let dir = drawing.parent().unwrap_or(&drawing).to_path_buf();
-        let root = ws.as_path().to_path_buf();
-        let access = self.access;
-        let name = requested.to_string();
-        let page = super::get_opt_u64(args, "page")?;
-        let is_pdf = data.starts_with(PDF_MAGIC);
+        let kind = classify(&data, &drawing);
         // A page names one page of a PDF; any other file is a single picture with
         // no pages to choose from, so naming one there is refused rather than
         // silently ignored.
-        if page.is_some() && !is_pdf {
-            anyhow::bail!(
-                "cannot render {requested}: naming a page is for a PDF, and this file has no pages"
-            );
+        if page.is_some() && kind != RenderKind::Pdf {
+            return Err(page_is_for_pdf(requested));
         }
-        let _permit = RENDERS
-            .acquire()
-            .await
-            .expect("the render semaphore is never closed");
-        let rendered = if is_pdf {
-            tokio::task::spawn_blocking(move || render_pdf_page_png(&data, &name, page)).await
-        } else {
-            tokio::task::spawn_blocking(move || render_png(&data, &dir, &root, access, &name)).await
-        };
-        let picture = match rendered {
-            Ok(rendered) => rendered?,
-            // A contained render: whatever killed the render on this file — a
-            // panic in the engine is the case its own reports name — is this
-            // tool's own refusal rather than the process's end.
-            Err(_died) => anyhow::bail!(
-                "cannot render {requested}: the renderer failed on this file — hint: try a \
-                 different file"
-            ),
+        let name = requested.to_string();
+        let picture = match kind {
+            RenderKind::Pdf => {
+                let render_name = name.clone();
+                in_process_render(&name, move || {
+                    render_pdf_page_png(&data, &render_name, page)
+                })
+                .await?
+            }
+            RenderKind::Svg => {
+                let dir = drawing.parent().unwrap_or(&drawing).to_path_buf();
+                let root = ws.as_path().to_path_buf();
+                let access = self.access;
+                let render_name = name.clone();
+                in_process_render(&name, move || {
+                    render_png(&data, &dir, &root, access, &render_name)
+                })
+                .await?
+            }
+            RenderKind::Html => self.html_picture(ws, &drawing, requested).await?,
         };
         super::save_generated_file(ws, &picture, "rasterized", "png").await
+    }
+
+    /// Render a local HTML page out of the caller's personal workspace: the page
+    /// server only ever hands out files from under that root, so a file outside
+    /// it is refused before anything is started.
+    async fn html_picture(
+        &self,
+        ws: &Workspace,
+        drawing: &Path,
+        requested: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let Some(root) = personal_root() else {
+            anyhow::bail!(
+                "cannot render {requested}: a page is rendered from your personal workspace, and \
+                 this call has none — hint: run the render from a user session"
+            );
+        };
+        let root = tokio::fs::canonicalize(&root)
+            .await
+            .map(|root| crate::util::strip_verbatim_prefix(&root))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot render {requested}: your personal workspace could not be read ({error})"
+                )
+            })?;
+        if !crate::util::is_within(drawing, &root) {
+            anyhow::bail!(
+                "cannot render {requested}: a page is rendered from your personal workspace, and \
+                 this file is outside it — hint: put the file in your personal workspace and name \
+                 it there"
+            );
+        }
+        let workspace = ws.as_path().to_string_lossy();
+        let _permit = capture_permit().await;
+        super::rasterize_html::render_file(&root, drawing, self.access, requested, &workspace).await
+    }
+}
+
+/// One browser-capture permit, process-wide: a capture never takes one of the
+/// in-process renders' permits and so never delays one.
+async fn capture_permit() -> tokio::sync::SemaphorePermit<'static> {
+    HTML_RENDERS
+        .acquire()
+        .await
+        .expect("the browser-capture semaphore is never closed")
+}
+
+/// The one refusal for naming a page where there are none to choose from: only a
+/// PDF has pages, and neither an address nor a single picture has any.
+fn page_is_for_pdf(name: &str) -> anyhow::Error {
+    anyhow::anyhow!("cannot render {name}: naming a page is for a PDF — only a PDF has pages")
+}
+
+/// The address a call names, when what it names is one: a trimmed `http`/`https`
+/// URL with a host. Anything else is a local path, resolved as a file.
+fn as_render_url(requested: &str) -> Option<&str> {
+    let trimmed = requested.trim();
+    let url = url::Url::parse(trimmed).ok()?;
+    (matches!(url.scheme(), "http" | "https") && url.host().is_some()).then_some(trimmed)
+}
+
+/// The scheme of an address that is not http(s) — a `file://` a caller may try,
+/// or any other scheme that carries a host (a single-letter drive prefix does
+/// not, so a Windows path stays a path).
+fn non_http_address(requested: &str) -> Option<String> {
+    let trimmed = requested.trim();
+    if trimmed.to_ascii_lowercase().starts_with("file://") {
+        return Some("file".to_string());
+    }
+    let url = url::Url::parse(trimmed).ok()?;
+    (url.host().is_some() && !matches!(url.scheme(), "http" | "https"))
+        .then(|| url.scheme().to_string())
+}
+
+/// The root an HTML input must live under: the caller's personal workspace,
+/// built from the caller's name only when it is a name the product itself builds
+/// a workspace path from. No valid user identity — none bound, or a stored name
+/// that is not a user name — means no personal workspace, and the hard boundary
+/// refuses rather than widening to whatever workspace the call happens to run in.
+fn personal_root() -> Option<PathBuf> {
+    let user = crate::agent::tool_user_name();
+    crate::users::is_valid_personal_user_name(&user)
+        .then(|| crate::users::personal_workspace_path(&user))
+}
+
+/// Which renderer an input's bytes and name select: a PDF by its magic, a
+/// compressed drawing by its gzip magic, then HTML by its markup or its name —
+/// and SVG for everything else.
+fn classify(data: &[u8], path: &Path) -> RenderKind {
+    if data.starts_with(PDF_MAGIC) {
+        RenderKind::Pdf
+    } else if data.starts_with(&GZIP_MAGIC) {
+        RenderKind::Svg
+    } else if is_html_document(data, path) {
+        RenderKind::Html
+    } else {
+        RenderKind::Svg
+    }
+}
+
+/// Whether an input is an HTML page: what it opens with decides, and a file whose
+/// name says `.html`/`.htm` is a page whatever its markup is.
+fn is_html_document(data: &[u8], path: &Path) -> bool {
+    let markup = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
+    if opens_as_html(markup) {
+        return true;
+    }
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("html" | "htm")
+    )
+}
+
+/// Whether the markup opens as an HTML document, past the comments, processing
+/// instructions and declarations a page may put before its doctype or root
+/// element: an HTML doctype, or the first element being `<html`.
+fn opens_as_html(markup: &[u8]) -> bool {
+    let mut rest = markup;
+    loop {
+        rest = rest.trim_ascii_start();
+        if let Some(after) = rest.strip_prefix(b"<!--") {
+            let Some(end) = after.windows(3).position(|window| window == b"-->") else {
+                return false;
+            };
+            rest = &after[end + 3..];
+        } else if let Some(after) = rest.strip_prefix(b"<?") {
+            let Some(end) = after.windows(2).position(|window| window == b"?>") else {
+                return false;
+            };
+            rest = &after[end + 2..];
+        } else if let Some(declaration) = rest.strip_prefix(b"<!") {
+            let Some(end) = declaration.iter().position(|byte| *byte == b'>') else {
+                return false;
+            };
+            let mut words = declaration[..end]
+                .split(u8::is_ascii_whitespace)
+                .filter(|word| !word.is_empty());
+            if words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case(b"doctype"))
+                && words
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case(b"html"))
+            {
+                return true;
+            }
+            rest = &declaration[end + 1..];
+        } else {
+            break;
+        }
+    }
+    rest.get(..5)
+        .is_some_and(|tag| tag.eq_ignore_ascii_case(b"<html"))
+        && rest
+            .get(5)
+            .is_some_and(|next| next.is_ascii_whitespace() || *next == b'>' || *next == b'/')
+}
+
+/// Run one in-process render under the shared permit, on a blocking thread,
+/// turning a panic in the engine into this tool's own refusal rather than the
+/// process's end.
+async fn in_process_render(
+    name: &str,
+    render: impl FnOnce() -> anyhow::Result<Vec<u8>> + Send + 'static,
+) -> anyhow::Result<Vec<u8>> {
+    let _permit = RENDERS
+        .acquire()
+        .await
+        .expect("the render semaphore is never closed");
+    match tokio::task::spawn_blocking(render).await {
+        Ok(rendered) => rendered,
+        Err(_died) => anyhow::bail!(
+            "cannot render {name}: the renderer failed on this file — hint: try a different file"
+        ),
     }
 }
 
@@ -393,8 +616,8 @@ fn refusal(name: &str, error: &usvg::Error) -> anyhow::Error {
         usvg::Error::SvgzFeatureNotEnabled => "its compressed form could not be unwrapped",
     };
     anyhow::anyhow!(
-        "cannot render {name}: {reason} — hint: this input is read as SVG, and a PDF starts with \
-         its own marker"
+        "cannot render {name}: {reason} — hint: this tool reads SVG markup, a PDF, and an HTML \
+         page"
     )
 }
 
@@ -459,8 +682,13 @@ mod tests {
         (dir, ws)
     }
 
-    /// The bytes of the picture one call produces.
-    async fn rendered_png(access: PathAccess, ws: &Workspace, args: serde_json::Value) -> Vec<u8> {
+    /// The picture one successful call produced: the path its delivery marker
+    /// names, and its bytes.
+    async fn produced(
+        access: PathAccess,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> (String, Vec<u8>) {
         let answer = RasterizeTool::new(access)
             .execute(ws, args)
             .await
@@ -469,7 +697,15 @@ mod tests {
             .strip_prefix("[IMAGE:")
             .and_then(|marker| marker.strip_suffix(']'))
             .unwrap_or_else(|| panic!("the answer carries the delivery marker: {answer}"));
-        std::fs::read(produced).expect("the produced picture is on disk")
+        (
+            produced.to_string(),
+            std::fs::read(produced).expect("the produced picture is on disk"),
+        )
+    }
+
+    /// The bytes of the picture one call produces.
+    async fn rendered_png(access: PathAccess, ws: &Workspace, args: serde_json::Value) -> Vec<u8> {
+        produced(access, ws, args).await.1
     }
 
     /// Render `name` out of `ws` and answer the picture the tool produced.
@@ -754,7 +990,7 @@ mod tests {
             ),
             (
                 json!({ "path": "drawing.svg", "page": 1 }),
-                "naming a page is for a PDF, and this file has no pages",
+                "naming a page is for a PDF",
             ),
         ] {
             let error = RasterizeTool::new(PathAccess::Unrestricted)
@@ -764,5 +1000,260 @@ mod tests {
             let text = refused(error);
             assert!(text.contains(reason), "{text}");
         }
+    }
+
+    /// A tiny valid PNG, which the capture stand-in answers with.
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    /// A user's personal workspace — the live `<storage>/userspaces/<user>` root,
+    /// the shared test root here — with `files` written into it.
+    fn personal_workspace(user: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let personal = crate::users::personal_workspace_path(user);
+        std::fs::create_dir_all(&personal).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(personal.join(name), bytes).unwrap();
+        }
+        personal
+    }
+
+    #[test]
+    fn an_input_is_classified_by_its_bytes_then_its_name() {
+        let path = Path::new;
+        assert_eq!(
+            classify(b"<!DOCTYPE html><html></html>", path("notes.txt")),
+            RenderKind::Html,
+            "a doctype is HTML whatever the name says"
+        );
+        assert_eq!(
+            classify(b"\xEF\xBB\xBF \n<!doctype HTML>", path("notes.txt")),
+            RenderKind::Html,
+            "a BOM and leading whitespace do not hide the doctype"
+        );
+        assert_eq!(
+            classify(b"<!DOCTYPE  html><p>x</p>", path("notes.txt")),
+            RenderKind::Html,
+            "the doctype is compared by word, not by exact spacing"
+        );
+        assert_eq!(
+            classify(
+                b"<!-- saved from url -->\n<html lang=\"en\">",
+                path("notes.txt")
+            ),
+            RenderKind::Html,
+            "a leading comment does not hide the root element"
+        );
+        assert_eq!(
+            classify(b"hello <html lang=\"en\">", path("notes.txt")),
+            RenderKind::Svg,
+            "HTML is what the markup opens with, not a tag mentioned later"
+        );
+        assert_eq!(
+            classify(RED_HALF.as_bytes(), path("page.htm")),
+            RenderKind::Html,
+            "an HTML name classifies unusual markup"
+        );
+        assert_eq!(
+            classify(b"<p>no doctype</p>", path("page.html")),
+            RenderKind::Html
+        );
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(RED_HALF.as_bytes()).unwrap();
+        assert_eq!(
+            classify(&gz.finish().unwrap(), path("page.html")),
+            RenderKind::Svg,
+            "gzip keeps an SVG an SVG"
+        );
+        assert_eq!(
+            classify(b"%PDF-1.7", path("page.html")),
+            RenderKind::Pdf,
+            "a PDF marker wins over the name"
+        );
+        assert_eq!(
+            classify(RED_HALF.as_bytes(), path("drawing.svg")),
+            RenderKind::Svg
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(html_capture)]
+    async fn a_page_outside_the_personal_workspace_is_refused() {
+        let user = "rasterize-outside-probe";
+        let personal = personal_workspace(user, &[]);
+        assert!(personal.is_dir(), "the live personal root is in place");
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("page.html"), b"<!DOCTYPE html>").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(tiny_png())
+        });
+        let (_dir, ws) = workspace(&[]);
+
+        let error = crate::agent::CURRENT_TOOL_USER_NAME
+            .scope(user.to_string(), async {
+                RasterizeTool::new(PathAccess::Unrestricted)
+                    .execute(
+                        &ws,
+                        json!({ "path": outside.path().join("page.html").to_string_lossy() }),
+                    )
+                    .await
+            })
+            .await
+            .expect_err("a page outside the personal workspace is refused");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("a page is rendered from your personal workspace")
+                && text.contains("put the file in your personal workspace"),
+            "{text}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing was captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_render_with_no_user_has_no_personal_workspace() {
+        let (_dir, ws) = workspace(&[("page.html", b"<!DOCTYPE html>")]);
+
+        let error = RasterizeTool::new(PathAccess::Unrestricted)
+            .execute(&ws, json!({ "path": "page.html" }))
+            .await
+            .expect_err("no user means no personal workspace to render from");
+        assert!(
+            format!("{error:#}").contains("a page is rendered from your personal workspace"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(html_capture)]
+    async fn a_page_inside_the_personal_workspace_renders_through_the_browser() {
+        let user = "rasterize-inside-probe";
+        let personal = personal_workspace(user, &[("page.html", b"<!DOCTYPE html><h1>hi</h1>")]);
+        let png = tiny_png();
+        let expected = png.clone();
+        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |url| {
+            let rest = url
+                .strip_prefix("http://127.0.0.1:")
+                .unwrap_or_else(|| panic!("the page URL names the loopback server: {url}"));
+            let (port, rest) = rest
+                .split_once('/')
+                .unwrap_or_else(|| panic!("port then token: {url}"));
+            assert!(port.parse::<u16>().is_ok(), "{url}");
+            let (token, name) = rest
+                .split_once('/')
+                .unwrap_or_else(|| panic!("token then name: {url}"));
+            assert_eq!(token.len(), 64, "the token is random hex: {url}");
+            assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{url}");
+            assert_eq!(name, "page.html", "{url}");
+            Ok(expected.clone())
+        });
+        let (_dir, ws) = workspace(&[]);
+        let path = personal.join("page.html");
+
+        let (produced, bytes) = crate::agent::CURRENT_TOOL_USER_NAME
+            .scope(user.to_string(), async {
+                produced(
+                    PathAccess::Unrestricted,
+                    &ws,
+                    json!({ "path": path.to_string_lossy() }),
+                )
+                .await
+            })
+            .await;
+        assert!(
+            produced.replace('\\', "/").contains("/generated/"),
+            "{produced}"
+        );
+        assert_eq!(bytes, png, "the capture's bytes are the picture written");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(html_capture)]
+    async fn naming_a_page_for_a_page_or_an_address_is_refused() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(tiny_png())
+        });
+        let (_dir, ws) = workspace(&[("page.html", b"<!DOCTYPE html><p>hi</p>")]);
+
+        for args in [
+            json!({ "path": "page.html", "page": 1 }),
+            json!({ "path": "https://example.com/report", "page": 1 }),
+        ] {
+            let error = RasterizeTool::new(PathAccess::Unrestricted)
+                .execute(&ws, args)
+                .await
+                .expect_err("a page is for a PDF");
+            assert!(
+                format!("{error:#}").contains("naming a page is for a PDF"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing was captured"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(html_capture)]
+    async fn an_address_renders_the_url_it_names() {
+        let png = tiny_png();
+        let expected = png.clone();
+        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |url| {
+            assert_eq!(url, "https://example.com/report");
+            Ok(expected.clone())
+        });
+        let (_dir, ws) = workspace(&[]);
+
+        let (_, bytes) = produced(
+            PathAccess::Unrestricted,
+            &ws,
+            json!({ "path": " https://example.com/report " }),
+        )
+        .await;
+        assert_eq!(bytes, png);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(html_capture)]
+    async fn a_non_http_address_is_never_captured() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(tiny_png())
+        });
+        let (_dir, ws) = workspace(&[]);
+
+        for path in ["file:///etc/passwd", "ftp://example.com/file"] {
+            let error = RasterizeTool::new(PathAccess::Unrestricted)
+                .execute(&ws, json!({ "path": path }))
+                .await
+                .expect_err("only http(s) addresses are pages");
+            assert!(
+                format!("{error:#}").contains("only an http(s) address"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing was captured"
+        );
     }
 }

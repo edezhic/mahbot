@@ -1135,8 +1135,9 @@ const RASTER_PATH_FLAG: Flag = Flag {
     arg: "path",
     kind: FlagKind::Path,
     secret: false,
-    purpose: "The file to render — an SVG, or one page of a PDF — resolved where this command \
-              runs, and read with the owner's own authority",
+    purpose: "The file to render — an SVG, one page of a PDF, or an HTML file inside your \
+              personal workspace — or an http(s) address; resolved where this command runs, and \
+              read with the owner's own authority",
 };
 
 /// The rasterizer's `page` argument: which page of a PDF to render.

@@ -32,6 +32,7 @@ pub(crate) mod mahbot_debug;
 pub mod media_catalog;
 pub(crate) mod path;
 pub(crate) mod rasterize;
+pub(crate) mod rasterize_html;
 pub(crate) mod read;
 pub(crate) mod read_document;
 pub(crate) mod research;

@@ -124,8 +124,11 @@ tempfile = "3"
 unicode-normalization = "0.1"
 unicase = "2.10"
 
-# URL parsing + IP netmask matching for chrome URL validation (SSRF guard)
+# URL parsing + IP netmask matching for chrome URL validation (SSRF guard).
+# `percent-encoding` is `url`'s own path-segment codec (already in the graph);
+# the rasterize page server decodes a request path with it directly.
 url = "2"
+percent-encoding = "2.3"
 ipnet = "2"
 
 # chrome-use release archive download/extract (tar.gz sidecar-verified)
@@ -213,10 +216,10 @@ tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 # Also the container format for `.docx` ingestion.
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
-# Rasterizing: a vector file or a PDF page in, an ordinary picture out
-# (src/tools/rasterize.rs). Pure Rust and in-process — no browser, no
-# rendering service, nothing to configure or download — so the single
-# self-contained binary holds.
+# Rasterizing an SVG or a PDF page: a pure-Rust in-process engine for the tool's
+# SVG and PDF inputs — an HTML input renders through the product's connected
+# browser instead and does not touch it — so the single self-contained binary
+# holds.
 #   text           — draw `<text>` instead of dropping it: the engine lays it out
 #                    with the faces the machine has (`system-fonts` finds them,
 #                    `memmap-fonts` maps rather than reads them) and the product's

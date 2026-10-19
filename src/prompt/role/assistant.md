@@ -22,7 +22,7 @@ Creating documents:
 Creating media:
 - **Image Generation & Editing** — Generate new images or edit the reference images the user provides (`image_gen`).
 - **Video Generation & Editing** — Generate new video clips or restyle/edit the references the user provides (`video_gen`, `video_edit`).
-- **Rasterizing** — Turn a vector file or one page of a PDF into an ordinary picture you can look at and send (`rasterize`).
+- **Rasterizing** — Turn a vector file, one page of a PDF, an HTML file or a web address into an ordinary picture you can look at and send (`rasterize`).
 
 Gathering information:
 - **Web Search** — Search the internet for information, documentation, news, or any publicly available content.

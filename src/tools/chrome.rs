@@ -5,10 +5,9 @@ use crate::chrome::contract::{
     chrome_session_stop_command, chrome_use_warning, classify_call_failure, eval_count,
     expect_outcome, extract_output, extract_snapshot_text, is_daemon_unavailable_code,
     is_daemon_unavailable_error, is_self_launched_browser_error, is_session_unresponsive_error,
-    is_unreachable_tab_error, net_error_phrase, parse_error_page_probe, parse_first,
-    sanitize_timeout_message, self_launched_browser_error, self_launched_browser_note,
-    truncated_output_error, unreachable_tab_message, unreached_browser_error,
-    with_condition_timeout_note,
+    is_unreachable_tab_error, net_error_phrase, parse_first, sanitize_timeout_message,
+    self_launched_browser_error, self_launched_browser_note, truncated_output_error,
+    unreachable_tab_message, unreached_browser_error, with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
 use crate::chrome::forms::{
@@ -305,9 +304,9 @@ impl Drop for ChromeRunSessions {
 /// leftover is a NOTE on it ([`crate::chrome::contract::chrome_leftover_pipe_note`]),
 /// never a failure — which is why it travels beside the output instead of turning
 /// into an `Err`.
-struct ActionOutput<T> {
-    output: T,
-    leftover_pipes: bool,
+pub(super) struct ActionOutput<T> {
+    pub(super) output: T,
+    pub(super) leftover_pipes: bool,
 }
 
 /// Chrome tool for fetching content from web pages.
@@ -488,47 +487,39 @@ impl ChromeTool {
         response: &ChromeResponse,
         workspace: &str,
     ) -> anyhow::Result<()> {
-        let Some(committed_url) = response
-            .data
-            .as_ref()
-            .and_then(|d| d.get("url"))
-            .and_then(Value::as_str)
-        else {
-            return Ok(());
-        };
-        if crate::chrome::is_chrome_error_page(committed_url) {
-            // Best-effort: ask the error page which net error code Chrome
-            // rendered (the same probe the CLI `open` uses); the generic
-            // message is the fallback when nothing recognizable renders.
-            let code = self
-                .run_command(&["eval", ERROR_PAGE_PROBE_JS], tab, workspace)
-                .await
-                .ok()
-                .and_then(|call| parse_error_page_probe(&call.output))
-                .filter(|p| p.is_error_page)
-                .and_then(|p| p.code);
-            match code {
-                Some(code) => anyhow::bail!(
-                    "Navigation to {url} failed — Chrome rendered its error page: {code} ({}). \
-                     Verify the URL and network.",
-                    net_error_phrase(&code)
-                ),
-                None => anyhow::bail!(
-                    "Navigation to {url} failed — Chrome landed on its error page \
-                     (chrome-error://chromewebdata/), meaning the site is unreachable (DNS failure, \
-                     refused connection, or a blocked/unsafe port). Verify the URL and network."
-                ),
+        match crate::chrome::navigation_failure(response) {
+            Some(crate::chrome::NavigationFailure::ErrorPage) => {
+                // Best-effort: ask the error page which net error code Chrome
+                // rendered (the same probe the CLI `open` uses); the generic
+                // message is the fallback when nothing recognizable renders.
+                let code = self
+                    .run_command(&["eval", ERROR_PAGE_PROBE_JS], tab, workspace)
+                    .await
+                    .ok()
+                    .and_then(|call| crate::chrome::error_page_code(&call.output));
+                match code {
+                    Some(code) => anyhow::bail!(
+                        "Navigation to {url} failed — Chrome rendered its error page: {code} ({}). \
+                         Verify the URL and network.",
+                        net_error_phrase(&code)
+                    ),
+                    None => anyhow::bail!(
+                        "Navigation to {url} failed — Chrome landed on its error page \
+                         (chrome-error://chromewebdata/), meaning the site is unreachable (DNS failure, \
+                         refused connection, or a blocked/unsafe port). Verify the URL and network."
+                    ),
+                }
             }
+            Some(crate::chrome::NavigationFailure::Blank) => {
+                self.close_session(tab).await;
+                anyhow::bail!(
+                    "Navigation failed: the tab is still on a blank page after opening {url} — the \
+                     page never loaded. This usually means the site is unreachable or blocks \
+                     automated navigation, or the chrome-use extension relay is down."
+                );
+            }
+            None => Ok(()),
         }
-        if crate::chrome::is_blank_page_url(committed_url) {
-            self.close_session(tab).await;
-            anyhow::bail!(
-                "Navigation failed: the tab is still on a blank page after opening {url} — the \
-                 page never loaded. This usually means the site is unreachable or blocks \
-                 automated navigation, or the chrome-use extension relay is down."
-            );
-        }
-        Ok(())
     }
 
     /// Fail with an actionable error when the chrome-use CLI is missing or the
@@ -546,7 +537,7 @@ impl ChromeTool {
     /// the stored verdict classified a cause,
     /// [`super::chrome_daemon::refusal_message`] appends that cause's concrete
     /// remedy to the fact list.
-    async fn ensure_available() -> anyhow::Result<()> {
+    pub(super) async fn ensure_available() -> anyhow::Result<()> {
         match super::chrome_daemon::cli_probe().await {
             super::chrome_daemon::CliStatus::Available => {}
             super::chrome_daemon::CliStatus::Missing => {
@@ -750,15 +741,13 @@ impl ChromeTool {
         )
     }
 
-    /// Run an chrome-use command and parse the JSON response.
+    /// Run an chrome-use command in this run's session and parse the JSON
+    /// response.
     ///
-    /// The child's own EXIT decides the call ([`crate::chrome::spawn`]); a process
-    /// it left behind still holding the call's output channel is carried as
-    /// [`ActionOutput::leftover_pipes`], a NOTE on that result rather than an error
-    /// ([`crate::chrome::contract::chrome_leftover_pipe_note`]). A call that FAILS
-    /// while holding such a leftover keeps its own failure — the helper is named
-    /// in the failure text and gets the leftover's one durable record
-    /// ([`Self::record_leftover`]).
+    /// The session is resolved here, at the single dispatch point, so a missing
+    /// CLI never registers a pointless release — the run-end release queue only
+    /// needs sessions that were actually dispatched; the call itself is
+    /// [`Self::dispatch_call`].
     async fn dispatch_command(
         &self,
         args: &[&str],
@@ -771,11 +760,6 @@ impl ChromeTool {
                 super::chrome_daemon::CHROME_USE_INSTALL_HINT
             )
         })?;
-        // Resolve the logical tab to this run's namespaced physical session
-        // at the single dispatch point, and record the physical name after
-        // the CLI path resolved, so a missing CLI never registers a pointless
-        // release — the run-end release queue only needs sessions that were
-        // actually dispatched.
         let session = self.resolve_session(tab);
         self.chrome_sessions.track(&session);
 
@@ -783,12 +767,29 @@ impl ChromeTool {
         logged_args.extend(["--json", "--session", &session]);
         debug!("chrome-use args: {:?}", logged_args);
 
-        let clocks = Self::call_clocks(args);
+        Self::dispatch_call(&cli, &session, args, Self::call_clocks(args), workspace).await
+    }
 
+    /// One chrome-use call in `session`, read the one way every call in this tool
+    /// is read: the child's own EXIT decides it ([`crate::chrome::spawn`]); a
+    /// successful envelope that carries chrome-use's browser-replacement note is a
+    /// failure because the work went to a browser chrome-use launched itself, not
+    /// the owner's real one; a cut-off answer names itself; and a process the call
+    /// left behind still holding its output channel is carried as a NOTE on that
+    /// result, never as the failure — but it is recorded durably
+    /// ([`Self::record_leftover`]) and named in the failure text
+    /// ([`crate::chrome::contract::chrome_leftover_pipe_note`]).
+    pub(super) async fn dispatch_call(
+        cli: &Path,
+        session: &str,
+        args: &[&str],
+        clocks: crate::chrome::ChromeCallClocks,
+        workspace: &str,
+    ) -> anyhow::Result<ActionOutput<ChromeResponse>> {
         // The elapsed time of this dispatch, carried on the durable rows it may
         // write (see [`Self::record_leftover`]).
         let started = Instant::now();
-        let output = Self::spawn_call(&cli, args, &session, clocks).await?;
+        let output = Self::spawn_call(cli, args, session, clocks).await?;
         let elapsed = started.elapsed();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -804,20 +805,17 @@ impl ChromeTool {
             &stdout,
             &stderr,
         ) {
-            ParsedRun::Ok(resp) => {
-                // A successful envelope that carries chrome-use's
-                // browser-replacement note is NOT a success: the work went to a
-                // browser chrome-use launched itself, not the owner's real one.
+            ParsedRun::Ok(response) => {
                 // Deliberately NOT the daemon-down path — the daemon and the
                 // relay may be healthy, and what was lost is the connection to
                 // the real browser — so health is left untouched (see
                 // `self_launched_browser_error`). The call FAILS, so its failure
                 // text is already its durable record; nothing else is written.
-                if let Some(note) = self_launched_browser_note(&resp) {
+                if let Some(note) = self_launched_browser_note(&response) {
                     anyhow::anyhow!("{}", self_launched_browser_error(&note))
                 } else {
                     return Ok(ActionOutput {
-                        output: resp,
+                        output: response,
                         leftover_pipes: leftover,
                     });
                 }
@@ -840,7 +838,7 @@ impl ChromeTool {
                     code.as_deref(),
                     retryable,
                     args.first().copied().unwrap_or(""),
-                    &session,
+                    session,
                 )
                 .await
             }
@@ -851,10 +849,10 @@ impl ChromeTool {
             // text the agent reads (see [`chrome_leftover_pipe_note`]). The
             // failure keeps its own text and classification — a leftover never
             // decides the outcome.
-            Self::record_leftover(&session, workspace, elapsed);
+            Self::record_leftover(session, workspace, elapsed);
             return Err(anyhow::anyhow!(
                 "{}",
-                crate::tools::with_note(&failed.to_string(), &chrome_leftover_pipe_note(&session))
+                crate::tools::with_note(&failed.to_string(), &chrome_leftover_pipe_note(session))
             ));
         }
         Err(failed)
@@ -931,7 +929,7 @@ impl ChromeTool {
     /// fetch — write it once for the call whose chrome-use calls held the
     /// leftover. `elapsed` is the time the record's call took — that chrome-use
     /// call's dispatch for a failure record, the whole dispatch for the other two.
-    fn record_leftover(session: &str, workspace: &str, elapsed: Duration) {
+    pub(super) fn record_leftover(session: &str, workspace: &str, elapsed: Duration) {
         crate::logs::record_stray_event(&crate::logs::StrayEvent {
             source: crate::logs::STRAY_SOURCE_CHROME_TOOL,
             message: "chrome-use exited while a helper it had started still held the call's output \
