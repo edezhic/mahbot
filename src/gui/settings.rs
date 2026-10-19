@@ -24,6 +24,7 @@ use crate::config::{
 };
 use crate::custom_role::{CustomRole, CustomRoleBehavior};
 use crate::tools::custom::ToolListing;
+use crate::tools::media_catalog::image::validate_image_model;
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
@@ -1607,20 +1608,15 @@ impl SettingsState {
                         // Image-gen additions are validated against the catalog
                         // (fail-open when it is unavailable) before the list is
                         // mutated; the input buffer is kept on rejection so the
-                        // user can correct it. Image models always run on
-                        // OpenRouter, so validation always runs
-                        // against the default endpoint — a custom chat endpoint
-                        // must not gate media model additions.
+                        // user can correct it.
                         ModelPickerTarget::ImageGen => {
                             let model = self.model_picker_inputs[t.idx()].text().trim().to_string();
                             if model.is_empty() {
                                 return Task::none();
                             }
-                            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
                             Task::perform(
                                 async move {
-                                    let ok = crate::tools::media_catalog::image::
-                                        validate_image_model_for_endpoint(&model, &endpoint)
+                                    let ok = validate_image_model(&model)
                                         .await
                                         .map_err(|e| e.to_string());
                                     (model, ok)

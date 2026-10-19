@@ -3,12 +3,11 @@
 //! cache/backoff behavior cannot drift. Also hosts the shared envelope parser
 //! ([`parse_envelope`]) so the `{ "data": [...] }` contract is single-source.
 //!
-//! Caching: fetched once (single-flight), keyed by the configured provider
-//! endpoint, and reused for [`CATALOG_TTL`]. A failed fetch — including a
-//! timeout — is stored as a short-lived negative cache
-//! ([`CATALOG_RETRY_BACKOFF`]) and degrades to fail-open: [`Catalog::get`]
-//! returns `None` and callers proceed without capability data. Capability
-//! checks can force a refresh on a membership miss via [`Catalog::refresh_for_miss`]
+//! Fetched once per endpoint (single-flight) and reused for [`CATALOG_TTL`]. A
+//! failed fetch — including a timeout — is stored as a negative cache for
+//! [`CATALOG_RETRY_BACKOFF`] and degrades to fail-open: [`Catalog::get`] returns
+//! `None` and callers proceed without capability data. Capability checks can
+//! force a refresh on a membership miss via [`Catalog::refresh_for_miss`]
 //! (cooldown-bounded); a plain [`Catalog::get`] never refreshes.
 
 use crate::util::UnwrapPoison;

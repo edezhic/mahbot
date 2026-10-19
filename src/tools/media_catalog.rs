@@ -1,33 +1,20 @@
-//! Consolidated image & video model-catalog cluster.
+//! Image & video model-catalog clients.
 //!
-//! The generic single-flight, endpoint-keyed, TTL-cached fetch machinery
-//! (`Catalog`) is shared by the image and video catalog clients so their
-//! cache/backoff behavior cannot drift. That generic machinery — along with
-//! the shared envelope parser (`parse_envelope`), so the `{ "data": [...] }`
-//! contract is single-source — now lives in [`crate::util::catalog_cache`].
+//! Both fetch through the single-flight, endpoint-keyed, TTL-cached machinery in
+//! [`crate::util::catalog_cache`], whose module docs carry the caching and
+//! fail-open contract. Media always targets OpenRouter, never a custom chat
+//! endpoint, so both clients read the default endpoint.
 //!
-//! Caching: fetched once (single-flight), keyed by the configured provider
-//! endpoint, and reused for `CATALOG_TTL`. A failed fetch — including a
-//! timeout — is stored as a short-lived negative cache
-//! (`CATALOG_RETRY_BACKOFF`) and degrades to fail-open: `Catalog::get`
-//! returns `None` and callers proceed without capability data.
-//!
-//! The nested `image` and `video` submodules keep the twin clients'
-//! namespaces separate, since each declares the same helper names
-//! (`parse_catalog`, `get_catalog`, `seed_cache`, a local `CATALOG`).
+//! They live in separate submodules because each declares the same helper names
+//! (`CATALOG`, `parse_catalog`, `get_catalog`, `seed_cache`).
 
 /// Client for the OpenRouter image-models catalog (`GET {base}/images/models`).
 ///
-/// The catalog declares per-model image-generation parameters (parameter
-/// names, enums, ranges, output modalities). Every image-gen capability and
-/// parameter decision is driven by this data — never by model-name branches.
-///
-/// Caching: fetched once (single-flight), keyed by the configured provider
-/// endpoint, and reused for 24h. A failed fetch — including a timeout — is
-/// stored as a short-lived negative cache (1-min backoff) and degrades to
-/// fail-open: `get_catalog` returns `None` and callers send minimal
-/// parameters instead of rejecting generation. The cache machinery lives in
-/// [`crate::util::catalog_cache`], shared with the video catalog.
+/// Each entry declares its generation parameters (`supported_parameters`:
+/// names, enums, ranges) and its output modalities
+/// (`architecture.output_modalities`). Every image-gen capability and parameter
+/// decision is driven by this data — never by model-name branches. Models are
+/// keyed by `id`.
 pub mod image {
     use crate::util::catalog_cache::{Catalog, parse_envelope};
     use serde_json::Value;
@@ -165,29 +152,19 @@ pub mod image {
         }
     }
 
-    // ── Cached fetch (single-flight, endpoint-keyed, fail-open) ─────────
+    // ── Cached fetch ───────────────────────────────────────────────────
 
     static CATALOG: Catalog<ImageCatalog> =
         Catalog::new("/images/models", "Image models catalog", parse_catalog);
 
-    /// Return the cached catalog for the default OpenRouter endpoint — media
-    /// always targets OpenRouter, never a custom chat endpoint.
+    /// The cached catalog; `None` when it is unavailable — callers fail open.
     pub(crate) async fn get_catalog() -> Option<Arc<ImageCatalog>> {
-        let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
-        get_catalog_for_endpoint(endpoint).await
-    }
-
-    /// Return the cached catalog for `endpoint` if fresh, otherwise fetch it
-    /// (single-flight). Returns `None` (fail-open) when the catalog is
-    /// unavailable — retried after a short negative-cache backoff.
-    pub(crate) async fn get_catalog_for_endpoint(endpoint: &str) -> Option<Arc<ImageCatalog>> {
-        CATALOG.get(endpoint).await
+        CATALOG.get(crate::config::DEFAULT_PROVIDER_ENDPOINT).await
     }
 
     /// Test-only: seed the shared cache (no network).
     #[cfg(test)]
     pub(crate) fn seed_cache(catalog: Option<Arc<ImageCatalog>>) {
-        // Media always targets OpenRouter — seed the default key.
         let endpoint = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
         CATALOG.seed(&endpoint, catalog);
     }
@@ -218,7 +195,7 @@ pub mod image {
     /// verdict immediately (no network). A membership miss forces one atomic
     /// catalog refresh ([`Catalog::refresh_for_miss`], cooldown-bounded) and
     /// re-checks, so a model added to OpenRouter after the cached snapshot was
-    /// taken is accepted instead of being rejected for up to [`CATALOG_TTL`].
+    /// taken is accepted instead of being rejected until that snapshot expires.
     /// Outcomes:
     /// - `Ok(Some(info))` — present and not text-only; `info` feeds request building;
     /// - `Ok(None)` — catalog unavailable (fetch failed/negative backoff) → fail-open;
@@ -262,33 +239,17 @@ pub mod image {
     }
 
     /// Write-time validation that `model` can generate images, using the catalog
-    /// when available. Fail-open (a catalog outage passes the check) now lives
-    /// in [`resolve_image_model`] — this validates against the currently
-    /// committed endpoint.
+    /// when available (a catalog outage passes — see [`resolve_image_model`]).
     ///
-    /// Used by the settings save path, the GUI model picker, and the Telegram
-    /// model commands.
+    /// Used by the Telegram model commands and the GUI model picker.
     ///
     /// # Errors
     ///
     /// - Catalog available and the model is absent from it or text-only.
     pub async fn validate_image_model(model: &str) -> anyhow::Result<()> {
-        // Media always targets OpenRouter — validate against the
-        // default endpoint, never a custom chat endpoint.
-        let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
-        validate_image_model_for_endpoint(model, endpoint).await
-    }
-
-    /// Like [`validate_image_model`], but against the catalog for the explicit
-    /// `endpoint` rather than the currently committed one — the settings page
-    /// uses this so a model edit is checked against the endpoint it will run
-    /// under (the model picker validates additions against the staged endpoint;
-    /// the active-model persist against the committed one).
-    pub(crate) async fn validate_image_model_for_endpoint(
-        model: &str,
-        endpoint: &str,
-    ) -> anyhow::Result<()> {
-        resolve_image_model(endpoint, model).await.map(|_| ())
+        resolve_image_model(crate::config::DEFAULT_PROVIDER_ENDPOINT, model)
+            .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -544,15 +505,10 @@ pub mod image {
 
 /// Client for the OpenRouter video-models catalog (`GET {base}/videos/models`).
 ///
-/// Mirrors the image-side catalog: fetched once (single-flight), keyed by the
-/// configured provider endpoint, reused for 24h, with a short negative-cache
-/// backoff on failure and fail-open semantics (`get_catalog` returns
-/// `None`). The cache machinery lives in [`crate::util::catalog_cache`],
-/// shared with the image catalog. The video response shape differs from the
-/// image one — flat per-model fields with high null variability (aleph-2
-/// declares no resolutions/durations/sizes) — so it gets its own tolerant
-/// parser. Models are looked up by `id`, never `canonical_slug` (they differ
-/// for every live model).
+/// The response shape is flat per-model fields with high null variability
+/// (aleph-2 declares no resolutions/durations/sizes), so it gets its own
+/// tolerant parser. Models are looked up by `id`, never `canonical_slug` (they
+/// differ for every live model).
 pub(crate) mod video {
     use crate::util::catalog_cache::{Catalog, parse_envelope};
     use serde_json::Value;
@@ -626,29 +582,19 @@ pub(crate) mod video {
             .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
     }
 
-    // ── Cached fetch (single-flight, endpoint-keyed, fail-open) ─────────
+    // ── Cached fetch ───────────────────────────────────────────────────
 
     static CATALOG: Catalog<VideoCatalog> =
         Catalog::new("/videos/models", "Video models catalog", parse_catalog);
 
-    /// Return the cached catalog for the default OpenRouter endpoint — media
-    /// always targets OpenRouter, never a custom chat endpoint.
+    /// The cached catalog; `None` when it is unavailable — callers fail open.
     pub(crate) async fn get_catalog() -> Option<Arc<VideoCatalog>> {
-        let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
-        get_catalog_for_endpoint(endpoint).await
-    }
-
-    /// Return the cached catalog for `endpoint` if fresh, otherwise fetch it
-    /// (single-flight). Returns `None` (fail-open) when the catalog is
-    /// unavailable — retried after a short negative-cache backoff.
-    pub(crate) async fn get_catalog_for_endpoint(endpoint: &str) -> Option<Arc<VideoCatalog>> {
-        CATALOG.get(endpoint).await
+        CATALOG.get(crate::config::DEFAULT_PROVIDER_ENDPOINT).await
     }
 
     /// Test-only: seed the shared cache (no network).
     #[cfg(test)]
     pub(crate) fn seed_cache(catalog: Option<Arc<VideoCatalog>>) {
-        // Media always targets OpenRouter — seed the default key.
         let endpoint = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
         CATALOG.seed(&endpoint, catalog);
     }
