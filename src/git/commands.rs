@@ -159,7 +159,19 @@ pub(crate) async fn run_git_worktree_diff(
     run_git_command(repo_path, &["diff", &base, "--no-color", "--find-renames"]).await
 }
 
-/// Run `git status --porcelain` and return the output.
+/// Run `git status --porcelain --untracked-files=normal` and return the output.
+///
+/// The untracked mode is pinned because it is otherwise the owner's
+/// `status.showUntrackedFiles` (global config is still read; only
+/// `safe.directory` is injected). With it set to `no`, this reader — the
+/// sanitation clean-tree check and its file listing, and the reviewed-base dirty
+/// guard — would call a tree whose only changes are untracked files clean, and
+/// sanitation would move the ticket to Done without committing its new files.
+/// `normal` is git's own mode when `-u` is absent, so a default configuration
+/// sees no change, and it keeps the dirty checks cheap. Git's promise that the
+/// porcelain format is unchanged across Git versions and regardless of user
+/// configuration is about the format, not about which files are selected, so the
+/// flag is not redundant.
 ///
 /// The plain, newline-delimited form is deliberate: the same output feeds the
 /// sanitation file listing and [`has_unstaged_changes`], whose byte-level
@@ -169,7 +181,11 @@ pub(crate) async fn run_git_worktree_diff(
 /// dirty tree as clean. Quoting and the ` -> ` delimiter the parsers handle are
 /// the price of that gate.
 pub async fn run_git_status(repo_path: &Path) -> anyhow::Result<String> {
-    run_git_command(repo_path, &["status", "--porcelain"]).await
+    run_git_command(
+        repo_path,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )
+    .await
 }
 
 /// Run `git status --porcelain --untracked-files=all`.
@@ -1664,8 +1680,13 @@ pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
 /// matching other files.
 ///
 /// All errors from all three steps are absorbed. After the sequence, the working
-/// tree is verified via `git status --porcelain -- <path>`: if the output is
+/// tree is verified via
+/// `git status --porcelain --untracked-files=normal -- <path>`: if the output is
 /// empty the operation succeeded; otherwise the remaining changes are reported.
+/// The untracked mode is pinned for the same reason [`run_git_status`] pins it —
+/// the owner's `status.showUntrackedFiles` must not decide this answer — so a
+/// leftover `git clean` deliberately keeps (a nested repository needs `-ff`) is
+/// reported as the failure it is instead of a silent success.
 ///
 /// Note: `git reset HEAD` also exits with non-zero status when the path is
 /// outside the repository — callers should validate paths before calling this.
@@ -1686,7 +1707,14 @@ pub async fn run_git_discard(
     let _ = run_git_command(repo_path, clean_args).await;
 
     // Verify: check if any changes remain.
-    match run_git_command(repo_path, &["status", "--porcelain", "--", &path]).await {
+    let status_args = [
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+        "--",
+        &path,
+    ];
+    match run_git_command(repo_path, &status_args).await {
         Ok(status) if status.trim().is_empty() => Ok(()),
         Ok(status) => anyhow::bail!("Changes remain after discard:\n{}", status.trim()),
         Err(e) => anyhow::bail!("Discard ran but verification failed: {e}"),
@@ -1710,11 +1738,16 @@ pub async fn run_git_commit_message(
 
 /// List new or untracked files in the working tree.
 ///
-/// Runs `git status --porcelain` and selects the entries a sanitation pass has
-/// to inspect: untracked (`??`) files and files staged as new (`A`). An entry
-/// whose quoted path does not decode is skipped rather than reported as raw text
-/// (see [`PorcelainRecord`]) — the wrong-path alternative, at the theoretical cost
-/// of an empty list letting the sanitation commit proceed uninspected.
+/// Runs [`run_git_status`], so it reads the same pinned untracked mode as every
+/// other reader here, and selects the entries a sanitation pass has to inspect:
+/// untracked (`??`) files and files staged as new (`A`). An untracked directory
+/// arrives as its single collapsed `dir/` entry: this list goes into the
+/// sanitation prompt uncapped, so the per-file `-uall` form would let one
+/// un-ignored build directory blow the prompt budget, while the collapsed entry
+/// already names the directory and keeps the tree dirty. An entry whose quoted
+/// path does not decode is skipped rather than reported as raw text (see
+/// [`PorcelainRecord`]) — the wrong-path alternative, at the theoretical cost of
+/// an empty list letting the sanitation commit proceed uninspected.
 pub(crate) async fn list_new_or_untracked_files(repo_path: &Path) -> anyhow::Result<Vec<String>> {
     let porcelain = run_git_status(repo_path).await?;
     Ok(parse_new_files_from_porcelain(&porcelain))
@@ -1736,11 +1769,12 @@ pub(crate) async fn list_new_or_untracked_files(repo_path: &Path) -> anyhow::Res
 /// own records because it classifies rather than lists, sharing only
 /// [`split_rename_paths`]. Where the views legitimately differ:
 ///
-/// - A trailing-slash entry is a directory, not a file. The plain `--porcelain`
-///   reading of [`list_new_or_untracked_files`] collapses an untracked directory
-///   to one `dir/` entry, so [`parse_new_files_from_porcelain`] keeps it; the
-///   snapshot's `--untracked-files=all` reading lists a directory's contents and
-///   grows a trailing slash only for a collapsed nested repository, so
+/// - A trailing-slash entry is a directory, not a file. The
+///   `--untracked-files=normal` reading of [`list_new_or_untracked_files`]
+///   collapses an untracked directory to one `dir/` entry, so
+///   [`parse_new_files_from_porcelain`] keeps it; the snapshot's
+///   `--untracked-files=all` reading lists a directory's contents and grows a
+///   trailing slash only for a collapsed nested repository, so
 ///   [`parse_untracked_from_porcelain`] drops it; the map strips the slash to key
 ///   a tree row.
 /// - A deleted entry (`D` in either column) is stored by no view: the map skips
@@ -1826,7 +1860,7 @@ fn split_rename_paths(field: &str) -> Option<String> {
     None
 }
 
-/// New/added file paths from a plain `git status --porcelain` reading.
+/// New/added file paths from a `git status --porcelain` reading.
 ///
 /// Selects `??` (untracked) records and index-column `A` ones: `A ` (staged,
 /// clean), `AM` (staged, then modified), and `AD` (added, then deleted). Excludes
@@ -4018,6 +4052,45 @@ AM staged_then_modified.js
 
         let result = run_git_discard(&repo_path, "test.txt", DiscardTarget::File).await;
         assert!(result.is_ok(), "discarding a clean file should succeed");
+    }
+
+    /// The untracked mode is pinned on the status readers and the discard
+    /// verification, so the owner's `status.showUntrackedFiles` cannot decide
+    /// what the pipeline sees: with it off, untracked files stay visible to both
+    /// readings and a leftover discard must still be reported as a failure.
+    #[tokio::test]
+    async fn status_readers_pin_the_untracked_mode() {
+        let (_dir, repo_path) = init_temp_repo();
+        std::fs::create_dir(repo_path.join("sub")).unwrap();
+        std::fs::write(repo_path.join("sub/file.txt"), b"new\n").unwrap();
+        // A nested repository, which `git clean -fd` deliberately keeps (it needs
+        // `-ff`), so the discard below leaves an untracked entry behind.
+        let nested = repo_path.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        run_git_command(&nested, &["init", "-q"]).await.unwrap();
+        run_git_command(&repo_path, &["config", "status.showUntrackedFiles", "no"])
+            .await
+            .unwrap();
+
+        let porcelain = run_git_status(&repo_path).await.unwrap();
+        assert!(
+            porcelain.lines().any(|line| line == "?? sub/"),
+            "untracked files must stay visible with the owner's mode off:\n{porcelain}"
+        );
+
+        assert_eq!(
+            list_new_or_untracked_files(&repo_path).await.unwrap(),
+            ["nested/", "sub/"],
+            "the listing must keep the collapsed directory entry, not read as empty"
+        );
+
+        let err = run_git_discard(&repo_path, "nested", DiscardTarget::Directory)
+            .await
+            .expect_err("a leftover must be reported, not passed off as a success");
+        assert!(
+            err.to_string().contains("Changes remain after discard"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── has_unstaged_changes ─────────────────────────────────────────
