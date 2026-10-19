@@ -1533,35 +1533,6 @@ fn strip_html_tags(s: &str) -> String {
     out
 }
 
-/// Classification of a Telegram edit failure (`editMessageReplyMarkup`) —
-/// matched on stable substrings independent of
-/// Telegram's wording; a reworded error hits `Other` (delivery unaffected,
-/// no recovery).
-#[derive(Debug)]
-pub enum EditMessageFailure {
-    /// Target message was deleted.
-    NotFound,
-    /// Past Telegram's 48-hour edit window.
-    CannotEdit,
-    /// Message is unchanged ("message is not modified") — success/no-op.
-    NotModified,
-    /// Any other failure (delivery unaffected, no recovery).
-    Other,
-}
-
-fn classify_edit_failure(description: &str) -> EditMessageFailure {
-    let lower = description.to_lowercase();
-    if lower.contains("not found") {
-        EditMessageFailure::NotFound
-    } else if lower.contains("not modified") {
-        EditMessageFailure::NotModified
-    } else if lower.contains("can't be edited") || lower.contains("cant be edited") {
-        EditMessageFailure::CannotEdit
-    } else {
-        EditMessageFailure::Other
-    }
-}
-
 /// Shared conversion for outbound text: decode HTML entities (e.g. &#39;
 /// that LLMs may emit) before markdown→HTML conversion so they don't get
 /// double-escaped.
@@ -2577,14 +2548,14 @@ impl TelegramChannel {
     /// Replace a previously sent message's inline keyboard in place
     /// (`editMessageReplyMarkup`). `reply_markup` must be a full
     /// `{"inline_keyboard": [...]}` value (or `Value::Null` to remove the
-    /// keyboard). Failures are classified with the shared edit-failure
-    /// classifier; callers typically treat every failure as a no-op.
+    /// keyboard). Setting a keyboard identical to the current one comes back as
+    /// an error, which is cosmetic for a refresh.
     pub async fn edit_reply_markup(
         &self,
         chat_id: &str,
         message_id: i64,
         reply_markup: &serde_json::Value,
-    ) -> Result<(), EditMessageFailure> {
+    ) -> anyhow::Result<()> {
         self.post_telegram_json(
             "editMessageReplyMarkup",
             serde_json::json!({
@@ -2596,7 +2567,9 @@ impl TelegramChannel {
         )
         .await
         .map(|_| ())
-        .map_err(|(_, desc)| classify_edit_failure(&desc))
+        .map_err(|(status, desc)| {
+            anyhow::anyhow!("editMessageReplyMarkup failed ({status}): {desc}")
+        })
     }
 
     async fn send_attachment(

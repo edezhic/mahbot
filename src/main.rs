@@ -1368,9 +1368,9 @@ async fn handle_set_model_action(
 
 /// Best-effort in-place refresh of the pressed model picker: rebuild the
 /// keyboard and replace the one the callback's own message carries. Any failure
-/// (a callback without source-message identity, a deleted/48h-expired message,
-/// an identical keyboard, a transport error) is cosmetic — the pick is already
-/// applied, so the failure is logged at debug and skipped.
+/// (a callback without source-message identity, a deleted message, an identical
+/// keyboard, a transport error) is cosmetic — the pick is already applied, so
+/// the failure is logged at debug and skipped.
 async fn refresh_pressed_models_keyboard(msg: &ChannelMessage, is_image: bool) {
     let (Some(chat_id), Some(message_id)) = (&msg.chat_id, msg.message_id) else {
         return;
