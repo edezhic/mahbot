@@ -1,3 +1,11 @@
+//! The Telegram transport: Bot API long polling, update decoding, send and
+//! edit with the Bot API's own HTML subset, media upload and download, and the
+//! forward-only intake ledger that stops an update being handled twice.
+//!
+//! Not the shared message plane (`crate::channels`) and not the bot command
+//! handlers — this file turns updates into intake claims and `ChannelMessage`
+//! values, and turns replies into Bot API calls.
+
 use crate::channels::ReplyReference;
 use crate::channels::reply::normalize_reply_text;
 use crate::channels::telegram_intake::{Intake, TelegramIntakeStore, listener_claim};

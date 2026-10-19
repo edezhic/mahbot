@@ -123,7 +123,7 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
         .await
         .map_err(|e| record_bring_up_failure(&root, "logs", e))?;
     let _ = crate::gui::LOG_BROADCAST.set(log_broadcast);
-    crate::search_engine::init_global(); // sync — no I/O
+    crate::workspace_index::init_global(); // sync — no I/O
     crate::pipeline::chronicle::init_global(); // sync — no I/O
     // These globals are not stores, so a failure here has no store to name —
     // but it is still a start-up failure and must be recorded, not lost.

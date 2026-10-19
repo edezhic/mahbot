@@ -164,8 +164,8 @@ pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
 /// periodic temp cleaner only — the accepted crash-class edge, no retry
 /// machinery).
 pub(crate) async fn release_run_folder(job_id: &str) {
-    if crate::search_engine::registry_initialized() {
-        crate::search_engine::remove_engine(job_id);
+    if crate::workspace_index::registry_initialized() {
+        crate::workspace_index::remove_engine(job_id);
     }
     let path = run_root_path(job_id);
     match tokio::fs::remove_dir_all(&path).await {

@@ -1,11 +1,17 @@
-/// Transcribes videos (via public URLs produced by the ephemeral upload
-/// bridge) into text descriptions during the enrichment phase, so the main
-/// agent loop only sees text. The API key is read from the live config by
-/// [`bearer_auth_header()`](crate::util::http::bearer_auth_header) at request
-/// time, so config reloads take effect immediately without recreating the
-/// transcriber.
+//! Provider-backed video transcription for channel enrichment: a video (via
+//! the ephemeral upload bridge's public URL) becomes a text description, so the
+//! main agent loop only ever sees text.
+//!
+//! Not the document converter and not local speech recognition — this is the
+//! remote transcription path; microphone audio on macOS goes through
+//! `crate::audio`.
+
 use crate::util::UnwrapPoison;
 
+/// The transcriber for one configured endpoint and model. Its API key comes
+/// from the live config at request time, read by
+/// [`bearer_auth_header()`](crate::util::http::bearer_auth_header), so config
+/// reloads take effect immediately without recreating the transcriber.
 #[derive(Clone)]
 pub(crate) struct MediaTranscriber {
     api_url: String,
@@ -241,7 +247,7 @@ fn finish_transcription(
             // blanket `transport` label; the single-shot path never retries,
             // but the durable `failure_class` column stays honest.
             let failure = crate::providers::failure_class(
-                crate::providers::reliable::classify_err(&e),
+                crate::providers::error_class::classify_err(&e),
                 false,
             );
             let chain = format!("{e:#}");

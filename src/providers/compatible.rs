@@ -1180,7 +1180,7 @@ async fn scoped_http_error(
     };
 
     let class = crate::providers::failure_class(
-        crate::providers::reliable::classify_err(&inner),
+        crate::providers::error_class::classify_err(&inner),
         body_read_failed,
     );
     scoped_metadata_error(inner, class, &body, retry_after_ms)

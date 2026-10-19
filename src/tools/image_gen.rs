@@ -1,3 +1,11 @@
+//! The `image_gen` tool: text-to-image and image-to-image through OpenRouter's
+//! dedicated Image API, walking the account's model picker and returning the
+//! file path the reply can embed.
+//!
+//! Not the media catalog itself (`tools::media_catalog`) and not image
+//! analysis — this tool resolves a model, sends one request and downloads the
+//! result.
+
 use crate::retry::RETRY_AFTER_MAX_MS;
 use crate::tools::media_catalog::image::{ImageModelInfo, resolve_image_model};
 use crate::util::error::retry_after_header;

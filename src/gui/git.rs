@@ -889,9 +889,9 @@ async fn with_ws_path<T>(
 /// a non-blocking send — never lock the picker (deadlock).
 async fn register_watch_task(name: String, path: String) -> Result<WatchId, String> {
     tokio::task::spawn_blocking(move || {
-        let entry = match crate::search_engine::get_engine_by_name(&name) {
+        let entry = match crate::workspace_index::get_engine_by_name(&name) {
             Some(entry) => entry,
-            None => crate::search_engine::get_or_init_engine(&name, std::path::Path::new(&path))?,
+            None => crate::workspace_index::get_or_init_engine(&name, std::path::Path::new(&path))?,
         };
         if !entry.picker.wait_for_watcher(WATCH_READY_WAIT) {
             return Err(format!(
@@ -1063,7 +1063,7 @@ impl GitState {
         let Some(id) = self.watch_id.take() else {
             return;
         };
-        if let Some(entry) = crate::search_engine::get_engine_by_name(&name) {
+        if let Some(entry) = crate::workspace_index::get_engine_by_name(&name) {
             let _ = entry.picker.unwatch(id);
         }
     }

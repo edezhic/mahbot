@@ -1,5 +1,7 @@
-//! The product's icon — the artwork itself, and every surface outside the window
-//! it has to appear on.
+//! The product's icon — the artwork itself, and every surface outside the
+//! window it has to appear on: the file's own resource on Windows, the running
+//! application's Dock tile on macOS, the launcher entry on Linux, and the
+//! dashboard's own renderings.
 //!
 //! One approved file serves everything this code owns: `assets/mb-icon-256.png`,
 //! decoded once and handed out as it is. Where a platform asks for a size the

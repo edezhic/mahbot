@@ -1,3 +1,6 @@
+//! Telegram transport tests: update and callback decoding, attachment markers,
+//! listener framing, intake claims and Bot API HTML rendering.
+
 use super::*;
 use crate::channels::telegram_intake::{IN_PROGRESS, Intake, RETENTION_HOURS, TelegramIntakeStore};
 use crate::util::test::{TicketFixture, canonical_without_verbatim_prefix};

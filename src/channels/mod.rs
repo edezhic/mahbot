@@ -1,3 +1,13 @@
+//! The shared middle of every conversation: the helpers that move a message
+//! between a transport, the persistence layer and the GUI, plus the pieces
+//! every transport shares.
+//!
+//! Owns broadcast-and-persist fan-out, link enrichment, reply references, GUI
+//! chat history and drafts, and the Telegram transport and its intake ledger
+//! under `telegram*`. Not the message routing into an agent (that is
+//! `crate::agent::message_router`) and not the Telegram command handlers,
+//! which stay in the binary.
+
 pub(crate) mod chat_draft;
 pub(crate) mod chat_history;
 mod enrichment;

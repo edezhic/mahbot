@@ -1,3 +1,14 @@
+//! One agent's turn: from a routed job to a finalized session, through every
+//! tool round in between, plus the role and toolset metadata a turn is built
+//! from. The entry points are `run_agent` and `run_default_agent`.
+//!
+//! The submodules own what a running agent reads and publishes: static `Role`
+//! metadata (`role`), the live running-agent registry (`registry`), the
+//! per-agent message mailbox (`message_router`), workspace skills (`skills`),
+//! structured extraction (`extraction`) and the maintenance agent
+//! (`maintainer`). Not the conversation store (`crate::session`) and not the
+//! dashboard's view of a run.
+
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;

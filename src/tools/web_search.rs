@@ -1,3 +1,11 @@
+//! The `web_search` tool: one query against a chosen backend (Firecrawl or
+//! Exa), and the per-session expand-id cache that tool instance owns.
+//!
+//! Not workspace file search (`tools::search`) and not link enrichment — this
+//! tool reaches the public web. The cache is deliberately session-scoped: a new
+//! tool instance starts empty, and an expand id is valid only in the session
+//! that earned it.
+
 use crate::Tool;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

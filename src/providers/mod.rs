@@ -5,8 +5,8 @@
 //! are supported; the outer retry orchestration lives in [`crate::retry`].
 
 pub(crate) mod compatible;
+pub(crate) mod error_class;
 pub(crate) mod reasoning;
-pub(crate) mod reliable;
 pub(crate) mod transcribe;
 
 pub(crate) use reasoning::plaintext_for_display;
@@ -89,11 +89,11 @@ impl std::error::Error for ScopedCallError {}
 /// envelope was truncated mid-read (the defect class this hardening targets);
 /// a non-retryable status (auth, quota) still aborts immediately.
 #[must_use]
-pub(crate) fn failure_class(class: reliable::ErrorClass, truncated: bool) -> FailureClass {
+pub(crate) fn failure_class(class: error_class::ErrorClass, truncated: bool) -> FailureClass {
     match class {
-        reliable::ErrorClass::NonRetryable => FailureClass::NonRetryable,
-        reliable::ErrorClass::Retryable if truncated => FailureClass::TruncatedEnvelope,
-        reliable::ErrorClass::Retryable => FailureClass::Transport,
+        error_class::ErrorClass::NonRetryable => FailureClass::NonRetryable,
+        error_class::ErrorClass::Retryable if truncated => FailureClass::TruncatedEnvelope,
+        error_class::ErrorClass::Retryable => FailureClass::Transport,
     }
 }
 

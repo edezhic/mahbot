@@ -1,12 +1,20 @@
+//! The product's entry point: the verb ladder that dispatches subcommands
+//! before the instance lock, the daemon's composition, and the iced dashboard
+//! it finally runs.
+//!
+//! The module tree is the library's; this file owns the wiring the library
+//! cannot do for itself — bootstrap, background-task spawn, the message
+//! pipeline, the shutdown drain — and the Telegram command surface. The work
+//! itself stays in the library. Built for the GUI subsystem so a Windows
+//! launch never puts a console window on the screen: the platform gives such a
+//! process no console of its own. How a shell treats it turns on the form of
+//! launch — at an interactive prompt it does not wait for such a program and
+//! does not hand its exit code back, while from a command file it waits. A
+//! launch with no console loses this file's own prints — accepted, never fatal:
+//! they go through `mahbot::util::print_stdout` / `print_stderr`, where the
+//! policy lives. Conditional so the binary's own test harness stays a console
+//! program and `cargo test --bins` output stays visible.
 #![warn(clippy::pedantic)]
-// Built for the GUI subsystem so a Windows launch never puts a console window on
-// the screen: the platform gives such a process no console of its own. How a shell
-// treats it turns on the form of launch — at an interactive prompt it does not wait
-// for such a program and does not hand its exit code back, while from a command file
-// it waits. A launch with no console loses this file's own prints — accepted, never
-// fatal: they go through `mahbot::util::print_stdout` / `print_stderr`, where the
-// policy lives. Conditional so the binary's own test harness stays a console program
-// and `cargo test --bins` output stays visible.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use anyhow::Result;
@@ -78,7 +86,8 @@ async fn bootstrap_mahbot_safe(
     }
 }
 
-/// Async startup for `MahBot` — runs on Iced's Tokio runtime via a boot [`Task`].
+/// Async startup for `MahBot` — runs on Iced's Tokio runtime via a boot
+/// [`iced::Task`].
 ///
 /// `start_paused` is the `mahbot paused` startup mode: every registered
 /// workspace is put on pause before the poll loop that claims work starts.
@@ -344,12 +353,12 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::db::ipc::run_ipc_listener(&ipc_root, log_store.clone()).await;
     });
 
-    // Eagerly initialize search engines for all existing workspaces.
+    // Eagerly initialize the per-workspace file indexes for all existing workspaces.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
-        "search-engine-init",
-        mahbot::search_engine::init_all_engines(),
+        "workspace-index-init",
+        mahbot::workspace_index::init_all_engines(),
     );
 
     // Warm the computer tool's capture-channel probe once at boot so the cached

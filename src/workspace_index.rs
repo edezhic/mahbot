@@ -1,9 +1,19 @@
-//! Shared per-workspace search engine registry.
+//! The per-workspace file index: one scan-backed `SharedFilePicker` per
+//! workspace, shared by every caller.
 //!
-//! Each workspace gets a single [`SharedFilePicker`] that all agents share.
-//! Background filesystem scanning begins eagerly when a workspace is
-//! registered (on app startup or workspace add), and `ensure_scanned` gates
-//! searches on scan readiness.
+//! The registry creates an index on demand (`get_or_init_engine`) and eagerly
+//! for the workspaces known at start-up (`init_all_engines`). Either path
+//! registers the index before use, scanning starts when it is registered, and
+//! `ensure_scanned` gates searches on scan readiness. It is the single source
+//! of the indexes the file-search tool, `read`, `edit`, the editor and the Git
+//! page use, and of the lifecycle paths that reuse or release one — branch
+//! launch and stop, session deletion and transient-session purge, research-run
+//! cleanup.
+//!
+//! Not a search engine and not the search tool: this module owns the indexes
+//! and their lifecycle. Its items keep their historical names
+//! (`SearchEngineEntry`, `get_or_init_engine`, `remove_engine`,
+//! `init_all_engines`).
 
 use crate::util::UnwrapPoison;
 use fff_search::FilePicker;
@@ -33,7 +43,7 @@ pub fn init_global() {
 fn registry() -> &'static RwLock<HashMap<String, Arc<SearchEngineEntry>>> {
     REGISTRY
         .get()
-        .expect("search engine registry not initialized — call search_engine::init_global()")
+        .expect("search engine registry not initialized — call workspace_index::init_global()")
 }
 
 /// Whether the global search-engine registry has been initialized.

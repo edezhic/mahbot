@@ -207,7 +207,7 @@ pub(crate) fn display_label(launch: &crate::Launch) -> String {
 /// deliberately stopped (so automatic recovery never restarts it), drop the
 /// launch's deferred envelopes (so boot replay does not replay them) and release
 /// the engine of the folder it worked in (see
-/// [`crate::search_engine::release_path_named_engine`]).
+/// [`crate::workspace_index::release_path_named_engine`]).
 ///
 /// The persisted mark — not the in-memory cancel signal — is what survives a
 /// restart; a later explicit launch of the same branch clears it
@@ -226,13 +226,13 @@ pub(crate) async fn stop(agent_id: &str) -> Result<()> {
     crate::jobs::delete_pending_jobs_for(agent_id).await?;
     // The branch is going away, so release the engine of the folder it last
     // worked in: nothing else keeps it alive (see
-    // `crate::search_engine::release_path_named_engine`). Best-effort — a failed
+    // `crate::workspace_index::release_path_named_engine`). Best-effort — a failed
     // read just leaves it registered.
     if let Some(workspace) = crate::session::store()
         .session_workspace_name(agent_id)
         .await
     {
-        crate::search_engine::release_path_named_engine(&workspace);
+        crate::workspace_index::release_path_named_engine(&workspace);
     }
     Ok(())
 }

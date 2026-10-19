@@ -1113,8 +1113,8 @@ pub async fn init_test_stores() {
         // Set CONFIG storage root (no-op if already set by another test)
         let _ = crate::config::CONFIG.try_set_storage_root(test_root().clone());
 
-        // search_engine is sync — must be initialized before workspace
-        crate::search_engine::init_global();
+        // workspace_index is sync — must be initialized before workspace
+        crate::workspace_index::init_global();
 
         // chronicle is sync — lightweight allocation, no DB I/O.
         crate::pipeline::chronicle::init_global();

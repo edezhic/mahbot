@@ -1,10 +1,13 @@
-use crate::util::error::HttpError;
+//! Provider error classification: one error becomes `ErrorClass::Retryable` or
+//! `ErrorClass::NonRetryable`, and the hint tables below resolve the cases a
+//! status code alone gets wrong. The split decides whether an attempt continues
+//! or aborts immediately, so a doomed call does not burn the retry budget.
+//!
+//! Not a retry layer — there is no loop, no backoff and no attempt counter
+//! here. The retry authority is `crate::retry`; this module's verdict reaches
+//! it through `providers::failure_class`, which maps it onto `FailureClass`.
 
-// ── Error Classification ─────────────────────────────────────────────────
-// Errors are split into retryable (transient server/network failures) and
-// non-retryable (permanent client errors). This distinction drives whether
-// the retry loop continues or aborts immediately — avoiding wasted latency
-// on errors that cannot self-heal.
+use crate::util::error::HttpError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorClass {

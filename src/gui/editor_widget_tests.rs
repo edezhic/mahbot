@@ -1,3 +1,5 @@
+//! Editor widget tests: buffer, cursor, selection and rendering primitives.
+
 use super::*;
 
 #[test]

@@ -6,7 +6,9 @@
 //! line is dispatched before the instance lock — and neither touches its stores
 //! or its settings: the only thing either reads or writes is the speech model set
 //! under the product's own data folder, which it obtains the way the product does
-//! when it needs it — once, saying so on standard error, and no retry loop.
+//! when it needs it — once, saying so on standard error, and no retry loop. The
+//! command compiles everywhere, and where the engine does not exist it refuses
+//! both operations, naming the platform.
 //!
 //! The product's read-aloud switches are not this command's. They govern what the
 //! app does with its own replies and its own voice notes, while these operations

@@ -1,3 +1,10 @@
+//! The `edit` tool: edits an existing file by precise string replacement, and
+//! creates a new file when no `old_string` anchor is given, within the caller's
+//! path access.
+//!
+//! Not the dashboard's editor (`crate::gui::editor`) and not the document
+//! generator — this tool changes source and text files in place.
+
 use super::path::PathAccess;
 use crate::{Tool, Workspace};
 use anyhow::Result;
@@ -544,7 +551,7 @@ fn update_search_index_after_write(ws: &Workspace, file_path: &std::path::Path) 
     if !crate::util::is_within(file_path, &ws_root) {
         return;
     }
-    let Some(entry) = crate::search_engine::get_engine_by_name(&ws.name) else {
+    let Some(entry) = crate::workspace_index::get_engine_by_name(&ws.name) else {
         return;
     };
 

@@ -255,7 +255,7 @@ impl Session {
                     // that folder is now unreferenced — release it (the new
                     // folder's engine is created on demand and kept for as long
                     // as the branch works there).
-                    crate::search_engine::release_path_named_engine(&previous);
+                    crate::workspace_index::release_path_named_engine(&previous);
                 }
                 // Caching: system prompt is NOT rebuilt on every subsequent
                 // turn (see doc comment above). The session DB caches the full

@@ -1089,7 +1089,7 @@ impl SessionStore {
         // Every deletion path (the `/clear` command, the Sessions page, the
         // maintainer's self-cleanup) goes through here, so this is where a
         // launch folder's search engine — held for the session's lifetime and
-        // referenced by nothing else (see `search_engine::release_path_named_engine`)
+        // referenced by nothing else (see `workspace_index::release_path_named_engine`)
         // is released. Read the recorded folder before the rows go; release it
         // only for a real removal.
         let workspace = self.session_workspace_name(agent_id).await;
@@ -1109,7 +1109,7 @@ impl SessionStore {
         if deleted > 0
             && let Some(workspace) = workspace
         {
-            crate::search_engine::release_path_named_engine(&workspace);
+            crate::workspace_index::release_path_named_engine(&workspace);
         }
         Ok(deleted > 0)
     }
@@ -1623,7 +1623,7 @@ const TRANSIENT_SESSION_TTL_HOURS: i64 = 2;
 /// Both `sessions` and `session_metadata` tables are cleaned up in a single transaction.
 /// The launch folders of the purged rows are released with them — this is where a
 /// one-off custom-role run's search engine dies (see
-/// [`crate::search_engine::release_path_named_engine`]).
+/// [`crate::workspace_index::release_path_named_engine`]).
 pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     let cutoff = (Utc::now() - ChronoDuration::hours(TRANSIENT_SESSION_TTL_HOURS)).to_rfc3339();
     let session_store = store();
@@ -1656,7 +1656,7 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
 
     // The launch folders of the rows about to go: a one-off custom-role run's
     // engine is held for the run and referenced by nothing else (see
-    // `search_engine::release_path_named_engine`), and this bulk purge is the one
+    // `workspace_index::release_path_named_engine`), and this bulk purge is the one
     // path that ends such a session without going through `delete`.
     let purged_folders: Vec<String> = tx
         .query(
@@ -1690,7 +1690,7 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     // After the commit: the purged sessions are gone, so the launch folders they
     // named are no longer referenced by anything.
     for workspace in purged_folders {
-        crate::search_engine::release_path_named_engine(&workspace);
+        crate::workspace_index::release_path_named_engine(&workspace);
     }
 
     Ok(deleted)

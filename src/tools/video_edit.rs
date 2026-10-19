@@ -1,3 +1,10 @@
+//! The `video_edit` tool: an existing clip plus an instruction becomes one
+//! edited clip through OpenRouter's async videos API, with local files
+//! uploaded to the ephemeral host at job time.
+//!
+//! Not video generation (`video_gen`) and not local encoding — this tool only
+//! submits one edit job, polls and downloads the result.
+
 use crate::Tool;
 use anyhow::Context;
 use async_trait::async_trait;

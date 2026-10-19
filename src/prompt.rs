@@ -1,3 +1,12 @@
+//! The embedded prompt assets and the one-pass machinery that fills them in:
+//! `rust_embed` over `src/prompt/`, the `\n---\n` section splitter, the
+//! `{{key}}` substituter, and the workspace and ticket context blocks
+//! installed into a call.
+//!
+//! Not the prompts themselves — those are the `.md` files under `src/prompt/`,
+//! loaded by asset key — and not a template engine: substitution is one pass
+//! and never cascades.
+
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;

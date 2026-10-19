@@ -2118,7 +2118,7 @@ mod tests {
         const NOTICE_TARGET: &str = "mahbot::tools::edit";
         const NOTICE: &str =
             "Search index capacity exhausted after file write — background rescan needed";
-        const ENGINE_TARGET: &str = "mahbot::search_engine";
+        const ENGINE_TARGET: &str = "mahbot::workspace_index";
         const ENGINE: &str = "Search engine created — background scan started";
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

@@ -1,5 +1,8 @@
-//! The document kit runner — the one place the embedded JavaScript document kit
-//! is materialized and invoked.
+//! The document kit: the embedded JavaScript document kit and its `rules.json`
+//! vocabulary, compiled in once and materialized on demand. The kit runner's
+//! `run` and `probe` entry points serve `crate::tools::document` alone, while
+//! the rules and mark tables are shared by the document readers and by
+//! rasterization.
 //!
 //! The kit (`assets/docgen/document-kit.js`, built from `assets/docgen/kit.js`
 //! and the shared `assets/docgen/rules.json`) is a self-contained bundle that

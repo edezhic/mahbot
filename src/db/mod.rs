@@ -1,3 +1,19 @@
+//! The store layer: the two physical databases this product keeps, and the
+//! single connection discipline every caller shares.
+//!
+//! The consolidated domain store (`core.db`: board, sessions, workspaces,
+//! users, config, chat history, alarms, custom roles, Telegram intake) and the
+//! logs store (`logs.db`) are the only files. This module owns the connection
+//! surface (`Connection`, `TxGuard`, `ReaderPool`, `Maintenance`), the
+//! transaction helpers, the timestamp and column conventions, and the
+//! store-facing pragmas. The schema lives in `migrations`, the change stream
+//! in `cdc`, and the store-lock, checkpoint and read-only debug rules in their
+//! own submodules.
+//!
+//! Not the place to build a store handle: a database opened outside `store`
+//! has neither the experimental feature flags nor the per-statement timeout,
+//! and the timeout would be silently disarmed.
+
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;

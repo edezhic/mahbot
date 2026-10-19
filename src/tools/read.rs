@@ -1,3 +1,12 @@
+//! The `read` tool: line-numbered content reads, tree-sitter `symbols` and
+//! `zoom`, directory listings, credential scrubbing for sensitive paths, and
+//! the one-metadata-sniff decision that hands a document container to
+//! `tools::read_document`.
+//!
+//! Not the document converter itself — the readers live in `crate::document`
+//! and the tool-facing wrapper in `tools::read_document`; this tool only
+//! decides that a content read is a document and delegates.
+
 use std::path::{Path, PathBuf};
 
 use super::listing::{ListingEntry, format_listing, human_readable_size};
@@ -614,7 +623,7 @@ pub(super) async fn read_resolved(
 
 /// Wildcard path: return matching workspace files instead of failing open.
 async fn recover_wildcard_path(ws: &Workspace, path: &str) -> anyhow::Result<String> {
-    if !crate::search_engine::registry_initialized() {
+    if !crate::workspace_index::registry_initialized() {
         anyhow::bail!(
             "Wildcard path '{path}' requires the workspace search index, which is unavailable."
         );
@@ -1462,7 +1471,7 @@ mod tests {
         // suite), the "without index" condition cannot be reproduced. Skip
         // silently so CI isn't broken; run this test individually to verify
         // the error path: cargo test -- read_wildcard_without_search_index
-        if crate::search_engine::registry_initialized() {
+        if crate::workspace_index::registry_initialized() {
             return;
         }
 

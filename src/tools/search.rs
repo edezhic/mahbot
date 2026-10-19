@@ -2,10 +2,10 @@
 //! name matching, content grep, constraint filtering, and pagination.
 //!
 //! All agents searching the same workspace share a single engine instance
-//! managed by [`crate::search_engine`]. Background scanning starts eagerly.
+//! managed by [`crate::workspace_index`]. Background scanning starts eagerly.
 
 use crate::Tool;
-use crate::search_engine;
+use crate::workspace_index;
 use async_trait::async_trait;
 use fff_search::file_picker::FuzzySearchOptions;
 use fff_search::grep::{GrepMode, GrepSearchOptions};
@@ -196,8 +196,8 @@ fn resolve_query(args: &serde_json::Value) -> Option<String> {
 /// the live watcher populates it incrementally as files are added.
 async fn resolve_workspace_engine(
     ws: &crate::Workspace,
-) -> anyhow::Result<std::sync::Arc<search_engine::SearchEngineEntry>> {
-    search_engine::resolve_engine(&ws.name, &ws.path, "")
+) -> anyhow::Result<std::sync::Arc<workspace_index::SearchEngineEntry>> {
+    workspace_index::resolve_engine(&ws.name, &ws.path, "")
         .await
         .map_err(|e| anyhow::anyhow!(e))
 }
@@ -211,7 +211,7 @@ pub struct SearchTool;
 
 impl SearchTool {
     fn search_files(
-        entry: &search_engine::SearchEngineEntry,
+        entry: &workspace_index::SearchEngineEntry,
         query: &str,
         max_results: usize,
         offset: usize,
@@ -240,7 +240,7 @@ impl SearchTool {
     /// match/file counts. Path mapping happens inside because `SearchResult`
     /// borrows from the picker behind the lock guard.
     fn fuzzy_file_search(
-        entry: &search_engine::SearchEngineEntry,
+        entry: &workspace_index::SearchEngineEntry,
         query: &str,
         max_results: usize,
         offset: usize,
@@ -306,7 +306,7 @@ impl SearchTool {
         query: &str,
         max_results: usize,
     ) -> anyhow::Result<Vec<String>> {
-        if !crate::search_engine::registry_initialized() {
+        if !crate::workspace_index::registry_initialized() {
             return Ok(vec![]);
         }
         let entry = resolve_workspace_engine(ws).await?;
@@ -315,7 +315,7 @@ impl SearchTool {
     }
 
     fn search_greps(
-        entry: &search_engine::SearchEngineEntry,
+        entry: &workspace_index::SearchEngineEntry,
         query: &str,
         max_results: usize,
         offset: usize,

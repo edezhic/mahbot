@@ -3601,10 +3601,10 @@ mod tests {
         std::fs::create_dir_all(&place_dir).unwrap();
         let place =
             crate::workspace::test_ws_named(place_dir.to_str().unwrap(), "dir-cancel-place-test");
-        crate::search_engine::get_or_init_engine(&place.name, std::path::Path::new(&place.path))
+        crate::workspace_index::get_or_init_engine(&place.name, std::path::Path::new(&place.path))
             .unwrap();
         assert!(
-            crate::search_engine::get_engine_by_name(&place.name).is_some(),
+            crate::workspace_index::get_engine_by_name(&place.name).is_some(),
             "the place's search engine must be registered before the dispatch"
         );
 
@@ -3629,7 +3629,7 @@ mod tests {
             "the cancelled dispatch must write no row for a start to resume"
         );
         assert!(
-            crate::search_engine::get_engine_by_name(&place.name).is_none(),
+            crate::workspace_index::get_engine_by_name(&place.name).is_none(),
             "a cancelled round must not leave its picker/watcher held"
         );
     }
@@ -3807,7 +3807,7 @@ mod tests {
     /// round's rows are swept.
     #[tokio::test]
     #[serial_test::serial(drain, recover_from_restart)]
-    async fn a_cancel_releases_a_placed_rounds_search_engine() {
+    async fn a_cancel_releases_a_placed_rounds_workspace_index() {
         crate::util::test::init_management_test_stores().await;
         let caller = crate::workspace::test_ws_named(
             "/tmp/test_ws_analyze_cancel_place_release",
@@ -3823,10 +3823,10 @@ mod tests {
         let place = crate::tools::delegation::workspace_at_dir(&place_path)
             .await
             .unwrap();
-        crate::search_engine::get_or_init_engine(&place.name, std::path::Path::new(&place.path))
+        crate::workspace_index::get_or_init_engine(&place.name, std::path::Path::new(&place.path))
             .unwrap();
         assert!(
-            crate::search_engine::get_engine_by_name(&place.name).is_some(),
+            crate::workspace_index::get_engine_by_name(&place.name).is_some(),
             "the placed round's engine must be registered before the cancel"
         );
         let job_id = "analyze_cancel_place_release_job";
@@ -3865,7 +3865,7 @@ mod tests {
         .expect("the cancel is answered");
         assert!(answer.contains("Cancelled the analysis round"), "{answer}");
         assert!(
-            crate::search_engine::get_engine_by_name(&place.name).is_none(),
+            crate::workspace_index::get_engine_by_name(&place.name).is_none(),
             "a cancelled round must not leave its picker/watcher held for a resume that cannot happen"
         );
         assert!(!cancel_row_exists("jobs", job_id).await);

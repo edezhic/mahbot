@@ -10,96 +10,178 @@
     clippy::doc_markdown
 )]
 
+// ── Agent and task orchestration ─────────────────────────────────────────
+// The execution engine for one agent: the work loop, tool rounds, role
+// metadata, the running-agent registry and the per-agent message router.
 pub mod agent;
+// Reminders that outlive the process, and who gets told when one fires.
 pub mod alarms;
-pub(crate) mod analyze_cancel;
-/// The product's own icon: the artwork, and the surfaces outside the window it
-/// appears on (the file's own resource on Windows, the running application's Dock
-/// tile on macOS, the launcher entry on Linux, the dashboard's own renderings).
+// Admin-defined custom roles: the record, its validation and its granted
+// tool subset.
+pub(crate) mod custom_role;
+// The durable rows behind async work, plus boot recovery and the shutdown
+// drain.
+pub mod jobs;
+// Branch lifecycle for custom roles and worker branches: start, resume and
+// stop.
+pub(crate) mod launch;
+
+// ── Pipeline and tickets ─────────────────────────────────────────────────
+// Where parallel participants' answers are grouped and merged into one
+// verdict.
+pub(crate) mod consensus;
+// Ticket movement from backlog to done: claim, dispatch, phase bodies, bounce
+// handling and pause.
+pub mod pipeline;
+
+// ── Workspaces, sessions and users ───────────────────────────────────────
+// Git command wrappers and diff parsing, shared by the pipeline's worktree
+// checks, the dashboard and nightly re-analysis.
+pub(crate) mod git;
+// Conversation persistence: the in-memory session, its store, summarization
+// and the live transcript snapshots.
+pub mod session;
+// The account row and what it binds: a preferred workspace and channel
+// recipients.
+pub mod users;
+// Workspace records and discovery, workspace analysis, and the editor's open
+// tabs.
+pub mod workspace;
+// The per-workspace file index shared by file search, read, edit, the editor,
+// the Git page and the lifecycle paths that release it.
+pub mod workspace_index;
+
+// ── Tools ────────────────────────────────────────────────────────────────
+// Every agent-callable tool, from the shell and browser to media generation
+// and document reading.
+pub mod tools;
+
+// ── Documents and formats ────────────────────────────────────────────────
+// The embedded document kit, its `rules.json` vocabulary and the PDF font,
+// shared by the document readers and rasterization.
+pub(crate) mod docgen;
+// The one converter every document read passes through: the OOXML, legacy
+// Office and PDF arms behind a single entry point.
+pub(crate) mod document;
+// The CFB reader for pre-OOXML Word, Excel and PowerPoint files.
+pub(crate) mod legacy;
+// The ZIP-package reader for `.docx`, `.xlsx` and `.pptx` parts.
+pub(crate) mod ooxml;
+// What a PDF says outside its page text: metadata, annotations and AcroForm
+// fields.
+pub(crate) mod pdf_marks;
+// The printed shape of a converted document: block headers, unit marks and
+// story names.
+pub(crate) mod reader_output;
+
+// ── Providers and model I/O ──────────────────────────────────────────────
+// A standalone benchmark for OpenRouter models, run outside the product.
+pub mod bench_openrouter;
+// The local Candle GGUF embedder behind archived-ticket semantic search.
+pub(crate) mod embedder;
+// Model providers: the OpenAI-compatible client, reasoning replay,
+// transcription and the error classification table.
+pub mod providers;
+// The single retry authority for LLM calls: attempt schedules, backoff and the
+// per-attempt failure trail.
+pub(crate) mod retry;
+
+// ── Channels ─────────────────────────────────────────────────────────────
+// The message plane: intake, enrichment, reply references, chat history and
+// the transport implementations.
+pub mod channels;
+
+// ── Stores and observability ─────────────────────────────────────────────
+// The `config_kv` and model-routing rows in the domain store.
+pub mod config_db;
+// All persistence: the Turso connection layer, schema catalog, change capture,
+// checkpoints, store guards and the read-only debug surface.
+pub mod db;
+// How long each by-product class lives, and the paced sweep that removes it.
+pub mod log_retention;
+// The logs store: tracing installation, the batched writer, issue records and
+// the GUI's live log feed.
+pub mod logs;
+// Two row families — one per tool call, one per LLM request — built for the
+// log store's writers.
+pub(crate) mod stats;
+// Fire-and-forget rows about the product's own work, drained by a task of
+// their own.
+pub(crate) mod telemetry;
+
+// ── GUI and desktop ──────────────────────────────────────────────────────
+// The product's artwork, and every surface outside the window that needs it.
 pub mod app_icon;
-/// Local audio subsystem (wake word, voice commands, local transcription,
-/// read-aloud TTS, cues). macOS-only: the speech engine it is built on has no
-/// other platform support, and nothing here has a fallback. Linux and Windows
-/// builds have no audio feature, no audio dependency and no audio control at
-/// all — an inbound voice message is refused at intake there, as are the
-/// command line's own audio operations ([`audio_cli`]).
+// Spawning chrome-use and keeping its tolerant envelope, forms and action
+// registry in one place.
+pub(crate) mod chrome;
+// Every page and widget of the dashboard, plus the iced application entry.
+pub mod gui;
+// What a fresh install is walked through before it is usable.
+pub(crate) mod onboarding;
+// A broadcast that tells the dashboard an in-memory registry changed.
+pub(crate) mod runtime_events;
+
+// ── CLI and prompts ──────────────────────────────────────────────────────
+// The operation channel a `mahbot` command line carries into the live instance,
+// and the instance side that serves it.
+pub mod cli;
+// Loading and substitution for the embedded prompt assets every LLM call is
+// built from.
+pub(crate) mod prompt;
+
+// ── Media ────────────────────────────────────────────────────────────────
+// Microphone-to-meaning on macOS: wake word, voice commands, local
+// transcription, read-aloud TTS and cues.
 #[cfg(target_os = "macos")]
 pub mod audio;
-/// The product's own speech engine on the command line (`mahbot audio`): a
-/// recording into text, and text into a spoken file. Standalone — it needs no
-/// running product and touches no store — and compiled everywhere, because the
-/// command exists (and refuses, naming the platform) where the engine does not.
+// The `mahbot audio` command line: a recording into text, text into a spoken
+// file, with no daemon involved.
 pub(crate) mod audio_cli;
-pub mod bench_openrouter;
-pub mod boot;
-pub mod channels;
-pub(crate) mod chrome;
-/// Command-line frontends onto the running product: the operation channel the
-/// `mahbot` CLI carries into the live instance, and the instance side that
-/// executes it.
-pub mod cli;
-pub mod config;
-pub mod config_db;
-pub(crate) mod consensus;
-pub(crate) mod custom_role;
-pub mod db;
-/// The document kit runner: the embedded script and PDF text font the
-/// `document` tool runs on the managed bun runtime ([`crate::tools::document`]).
-pub(crate) mod docgen;
-pub(crate) mod document;
-pub(crate) mod embedder;
-pub(crate) mod git;
-pub mod gui;
-pub mod jobs;
-/// Launching and stopping a continuable branch — a custom role's, or a worker
-/// branch's.
-pub(crate) mod launch;
-/// Legacy binary Office reading (Word/Excel/PowerPoint): the CFB-container arm
-/// of the shared document converter ([`crate::document`]).
-pub(crate) mod legacy;
-pub mod log_retention;
-pub mod logs;
-pub(crate) mod onboarding;
-/// Minimal ONNX runtime whose only consumer is the TTS pipeline
-/// ([`crate::audio::tts`]), so it is built only where that exists.
+// A hand-rolled ONNX executor sized for the four pinned TTS models.
 #[cfg(target_os = "macos")]
 pub(crate) mod onnx;
-/// OOXML package reading (Word/Excel/PowerPoint): the ZIP-container arm of the
-/// shared document converter ([`crate::document`]).
-pub(crate) mod ooxml;
-/// PDF content beside the page text — the file's own description, its
-/// annotations and its form fields: the metadata/annotation/form arm of the
-/// shared document converter ([`crate::document`]).
-pub(crate) mod pdf_marks;
-pub mod pipeline;
-/// The platform's own exemption from the way it slows a process whose window is not
-/// visible, asked for once on the daemon's start-up path.
+
+// ── Lifecycle and platform support ───────────────────────────────────────
+// How the process comes up: one ordering for every store open, plus the failure
+// line before tracing exists.
+pub mod boot;
+// Defaults, persisted overrides, model routing and the process-global handle.
+pub mod config;
+// Asking the OS not to throttle a daemon whose window is never visible.
 pub mod power;
-pub(crate) mod prompt;
-pub mod providers;
-/// The marks every document reader prints: the block headers, the unit marks
-/// and the story names shared by the OOXML readers and the legacy one.
-pub(crate) mod reader_output;
-pub(crate) mod research_cancel;
-pub mod research_cleanup;
-pub(crate) mod retry;
-pub(crate) mod round_cancel;
-pub(crate) mod runtime_events;
-pub mod search_engine;
+// Downloading, verifying and swapping in a new version, under the instance
+// lock.
 pub mod self_update;
-pub mod session;
+// The owner's own shell environment, re-read in the background for commands
+// that need it.
 pub mod shell_env;
+// Shutdown and drain: the token, the signal sources, the two-request protocol
+// and every path that skips it.
 pub mod shutdown;
-pub(crate) mod stats;
-/// The records the product writes about its own work, written by a task of their
-/// own rather than on the path that produced them ([`crate::telemetry`]).
-pub(crate) mod telemetry;
+// Ownership of the daemon's private temp directory, from creation to cleanup.
 pub mod temp;
-pub mod tools;
-pub mod users;
+
+// ── Cancellation and cleanup ─────────────────────────────────────────────
+// The cancel action behind the `analyze` tool, confined to the caller's own
+// dispatched runs.
+pub(crate) mod analyze_cancel;
+// Stopping a research run on request, and settling the rows of runs cancelled
+// earlier.
+pub(crate) mod research_cancel;
+// The single release point for a research run's folders, archive and command
+// dump.
+pub mod research_cleanup;
+// Stop flags for running deep-research and analyze rounds, and the guard that
+// keeps each entry alive.
+pub(crate) mod round_cancel;
+
+// ── Shared utilities ─────────────────────────────────────────────────────
+// Shared helpers: HTTP and TLS, locking, paths, managed binaries, media
+// markers, tree-sitter and test fixtures.
 pub mod util;
+// The maths and wire format behind hybrid archived-ticket search.
 pub(crate) mod vector;
-pub mod workspace;
 
 /// Hidden grep-engine subcommand entry (dispatched from `main()` before the
 /// instance lock; the shell tool's transparent grep interception rewrites

@@ -232,11 +232,12 @@ fn data_dir(dir: &Path) -> Option<PathBuf> {
 /// of that round releases it, even after the directory itself is gone — see
 /// [`release_placed_engine`].
 pub(crate) fn release_exec_engine(exec: &Workspace) {
-    if !exec.name.starts_with(DIR_WORKSPACE_PREFIX) || !crate::search_engine::registry_initialized()
+    if !exec.name.starts_with(DIR_WORKSPACE_PREFIX)
+        || !crate::workspace_index::registry_initialized()
     {
         return;
     }
-    crate::search_engine::remove_engine(&exec.name);
+    crate::workspace_index::remove_engine(&exec.name);
 }
 
 /// Release the search engine a round placed in `dir` created, named by the

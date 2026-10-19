@@ -1,3 +1,8 @@
+//! The `video_gen` tool: one job on OpenRouter's async videos API — submit,
+//! poll, download — returning the path the reply can embed.
+//!
+//! Not video editing (`video_edit`) and not local encoding.
+
 use crate::Tool;
 use async_trait::async_trait;
 use serde_json::json;

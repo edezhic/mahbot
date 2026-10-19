@@ -1,3 +1,6 @@
+//! Editor tests: text matching, selection, buffer operations and the
+//! file-backed editing paths.
+
 use super::*;
 use crate::gui::editor_widget::{EditorAction, EditorBuffer};
 

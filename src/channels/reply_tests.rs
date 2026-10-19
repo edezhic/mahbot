@@ -1,3 +1,6 @@
+//! Reply-reference tests: normalization, marker injection and author labels
+//! for `channels::reply`.
+
 use super::*;
 use crate::channels::enrich_links;
 

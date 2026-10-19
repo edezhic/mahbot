@@ -1063,7 +1063,7 @@ impl WorkspaceStore {
         clear_pending_pickup_cooldown(name);
         // Eagerly initialize the shared search engine for this workspace.
         if let Err(e) =
-            crate::search_engine::get_or_init_engine(name, std::path::Path::new(&ws.path))
+            crate::workspace_index::get_or_init_engine(name, std::path::Path::new(&ws.path))
         {
             tracing::warn!(workspace_name = name, error = %e, "Failed to init search engine on workspace add");
         }
@@ -1153,7 +1153,7 @@ impl WorkspaceStore {
                 "abandoned workspace jobs"
             );
         }
-        crate::search_engine::remove_engine(name);
+        crate::workspace_index::remove_engine(name);
         clear_pending_pickup_cooldown(name);
         Ok(())
     }
@@ -2436,7 +2436,7 @@ mod tests {
 
         // add() requires: search engine globals initialized + CONFIG storage
         // root set. Initialize the minimum globals (init_global is idempotent).
-        crate::search_engine::init_global();
+        crate::workspace_index::init_global();
         // Point the storage root at the shared test root. A per-test TempDir
         // would leave the global storage root pointing at a deleted directory
         // once the TempDir drops — the shared root lives for the whole
@@ -3116,7 +3116,7 @@ mod tests {
         let (store, _tmp) = test_store().await;
         // delete() removes the workspace's search engine from the global
         // registry (init_global is idempotent).
-        crate::search_engine::init_global();
+        crate::workspace_index::init_global();
         insert_direct(&store, "doomed_ws", "/tmp/doomed_ws", false, false, 0, 0).await;
 
         // Seed users via raw SQL: two reference the workspace being deleted,
