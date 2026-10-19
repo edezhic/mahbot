@@ -4501,9 +4501,9 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
 /// `finish_shell_output` (timing, spill-to-file).  `TOOL_OUTPUT_BUDGET_BYTES`
 /// (5 KB) gates the head/tail truncation and spill preview — it is a trigger,
 /// not a truncation cutoff.  `finish_shell_output` → `try_spill_to_file`'s
-/// use of `crate::util::truncate_tool_output` (5 KB head+tail) provides a final
-/// safety net for output that still exceeds the threshold after all pipeline
-/// stages.
+/// use of `crate::util::truncate_tool_output` (a ~5 KB head+tail trigger plus
+/// its omission marker) provides a final safety net for output that still
+/// exceeds the threshold after all pipeline stages.
 ///
 /// Stages: line filters, collapse, truncate, line_truncation,
 ///         on_empty, output_transform.

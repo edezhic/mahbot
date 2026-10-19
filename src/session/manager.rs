@@ -2101,11 +2101,11 @@ mod tests {
         assert!(rendered.contains("  You audit. ## Rules Be thorough."));
 
         // A long multi-line Cyrillic prompt is cut on a char boundary with an
-        // ellipsis.
+        // ellipsis, inside the cap.
         let long = "Правило номер один и его подробное описание,\n".repeat(40);
         let excerpt = role_prompt_excerpt(&long);
         assert!(excerpt.ends_with('…'));
-        assert!(excerpt.chars().count() <= MAX_ROLE_EXCERPT_CHARS + 1);
+        assert!(excerpt.chars().count() <= MAX_ROLE_EXCERPT_CHARS);
         assert!(!excerpt.contains('\n'));
 
         // Composed end to end: the admin's Assistant gets the block, a guest's

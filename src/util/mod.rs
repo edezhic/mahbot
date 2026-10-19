@@ -236,13 +236,25 @@ pub(crate) fn injected_image_user_message(data_uris: &[String]) -> String {
     message
 }
 
-/// Truncate a string to `max_chars` Unicode characters, appending "…" if truncated.
+/// Truncate a string to at most `max_chars` Unicode characters, appending "…"
+/// if truncated. The ellipsis counts against `max_chars`, so a truncated result
+/// is never longer than the cap. Trailing whitespace at the cut is stripped from
+/// the kept prefix. Empty for `max_chars == 0`; the input unchanged when it
+/// already fits.
 #[must_use]
 pub fn truncate(input: &str, max_chars: usize) -> String {
-    match input.char_indices().nth(max_chars) {
-        Some((idx, _)) => format!("{}…", input[..idx].trim_end()),
-        None => input.to_string(),
+    let Some(last_kept) = max_chars.checked_sub(1) else {
+        return String::new();
+    };
+    let mut chars = input.char_indices();
+    let Some((cut, _)) = chars.nth(last_kept) else {
+        return input.to_string();
+    };
+    if chars.next().is_none() {
+        // Exactly `max_chars` chars — it fits, no ellipsis.
+        return input.to_string();
     }
+    format!("{}…", input[..cut].trim_end())
 }
 
 /// Truncate to at most `max_bytes` bytes at a UTF-8 char boundary (no ellipsis).
@@ -666,35 +678,41 @@ pub(crate) fn log_join_failures(
     }
 }
 
-/// Byte cap for failure-detail dumps (error chains, raw verdict responses).
-/// Retry-exhaustion chains embed up to 13 per-attempt errors, and comment
-/// dumps are read verbatim by downstream agents — the sandwich truncation
-/// keeps the head (outermost context) and tail (last attempt's cause).
+/// Byte trigger for failure-detail dumps (error chains, raw verdict responses).
+/// Retry-exhaustion chains embed up to 13 per-attempt errors, and comment dumps
+/// are read verbatim by downstream agents — the sandwich truncation keeps the
+/// head (outermost context) and tail (last attempt's cause); the omission marker
+/// it inserts is additional to this number (see [`truncate_sandwich`]).
 pub(crate) const FAILURE_DETAIL_CAP: usize = 24_000;
 
 /// Canonical scrub+truncate failure-comment detail: scrub secrets, then
-/// sandwich-truncate to [`FAILURE_DETAIL_CAP`]. Failure dumps rendered
-/// through this path keep one canonical ordering and cap. (Some adjacent
-/// sites deliberately diverge — scrub-only early-returns and a
-/// truncate-then-scrub raw dump — and are intentionally not unified here.)
+/// sandwich-truncate at [`FAILURE_DETAIL_CAP`]. Failure dumps rendered through
+/// this path keep one canonical ordering and cap. (Some adjacent sites
+/// deliberately diverge — scrub-only early-returns and a truncate-then-scrub raw
+/// dump — and are intentionally not unified here.)
 #[must_use]
 pub(crate) fn failure_detail(text: &str, label: &str) -> String {
     truncate_sandwich(&scrub_credentials(text), FAILURE_DETAIL_CAP, label)
 }
 
-/// Truncate a string to at most `max_bytes` bytes using a head/tail
-/// "sandwich" strategy: keeps the first ~2/3 and last ~1/3, inserting an
-/// omission marker between them. Returns the input unchanged if it fits
-/// within the limit.
+/// Truncate a string using a head/tail "sandwich" strategy: keeps the first
+/// ~2/3 and last ~1/3 of `max_bytes` and inserts an omission marker between
+/// them. Returns the input unchanged if it fits within `max_bytes`.
+///
+/// `max_bytes` is a trigger, not a bound on the result: the output is
+/// head + tail + marker, so it exceeds `max_bytes` by the marker's own length —
+/// tens of bytes, depending on the label and the digit count of the omitted
+/// total.
 ///
 /// The marker format is `"... (N bytes omitted at {label} truncation)\n"`,
 /// where `label` provides context for the truncation (e.g., `"shell output"`,
 /// `"tool output"`, `"stderr"`).
 ///
-/// Slicing respects UTF-8 character boundaries via `floor_char_boundary`.
-/// An overlap guard is included as defense-in-depth; it only triggers if
-/// the head and tail ranges would intersect (impossible under the 2/3 + 1/3
-/// split, but guards against future ratio changes).
+/// Slicing respects UTF-8 character boundaries: the head cut floors and the tail
+/// cut ceils, so a multi-byte character the tail cut lands inside moves into the
+/// omitted span rather than being split or duplicated. That makes the head/tail
+/// overlap arm below unreachable for any `max_bytes`, which is the point — it is
+/// defence against a future ratio change, not a path any input takes.
 #[must_use]
 pub(crate) fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> String {
     if s.len() <= max_bytes {
@@ -703,7 +721,15 @@ pub(crate) fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> Strin
     let head_bytes = max_bytes * 2 / 3;
     let tail_bytes = max_bytes / 3;
     let head_end = s.floor_char_boundary(head_bytes);
-    let tail_start = s.floor_char_boundary(s.len().saturating_sub(tail_bytes));
+    let tail_start = s.ceil_char_boundary(s.len() - tail_bytes);
+    // `head_bytes + tail_bytes <= max_bytes < s.len()`, and flooring the head
+    // only shrinks it while ceiling the tail only grows it. A ratio change that
+    // breaks that has to be caught here, in debug builds, not by a slice panic
+    // inside tool output formatting.
+    debug_assert!(
+        head_end < tail_start,
+        "sandwich cuts overlap: head_end={head_end} tail_start={tail_start} max_bytes={max_bytes}"
+    );
     if head_end < tail_start {
         let omitted = s[head_end..tail_start].len();
         format!(
@@ -713,23 +739,22 @@ pub(crate) fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> Strin
             &s[tail_start..]
         )
     } else {
-        // Head and tail would overlap — simple truncation fallback
+        // Unreachable (see above). Keep a degenerate cut rather than a panic so
+        // one crafted output cannot take down the caller.
         let boundary = s.floor_char_boundary(max_bytes);
         let mut out = s[..boundary].to_string();
-        let _ = std::fmt::Write::write_fmt(
-            &mut out,
-            format_args!("\n... [{label} truncated at {max_bytes} bytes]"),
-        );
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\n... [{label} truncated]"));
         out
     }
 }
 
-/// Shared byte budget for tool output passed to the LLM: used by the shell
+/// Shared byte trigger for tool output passed to the LLM: used by the shell
 /// spill threshold, the read tool preview cap, and [`truncate_tool_output`].
 pub(crate) const TOOL_OUTPUT_BUDGET_BYTES: usize = 5_000;
 
 /// Truncate tool output for LLM consumption (delegates to [`truncate_sandwich`]
-/// with the shared [`TOOL_OUTPUT_BUDGET_BYTES`] limit). Returns input unchanged if within limit.
+/// with the shared [`TOOL_OUTPUT_BUDGET_BYTES`] trigger — the omission marker is
+/// additional). Returns input unchanged if within the trigger.
 #[must_use]
 pub(crate) fn truncate_tool_output(output: &str) -> String {
     truncate_sandwich(output, TOOL_OUTPUT_BUDGET_BYTES, "tool output")
@@ -1929,6 +1954,25 @@ mod media_mime_tests {
 mod truncate_tests {
     use super::*;
 
+    // ── truncate: cap counts the ellipsis ─────────────────────────────────
+
+    #[test]
+    fn truncate_keeps_the_cap_including_the_ellipsis() {
+        // Cap 0 has no room for anything, not even the marker.
+        assert_eq!(truncate("hello", 0), "");
+        // Cap 1 is the marker alone.
+        assert_eq!(truncate("hello", 1), "…");
+        // A cut inside a multi-byte char never splits it.
+        assert_eq!(truncate("😀😀😀", 2), "😀…");
+        assert_eq!(truncate("ааааа", 4), "ааа…");
+        // Exact fit, and anything shorter, passes through with no marker.
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("", 5), "");
+        // Trailing whitespace at the cut is stripped from the kept prefix.
+        assert_eq!(truncate("ab   cd", 4), "ab…");
+        assert_eq!(truncate("hello world", 5), "hell…");
+    }
+
     // ── truncate_sandwich: passthrough ────────────────────────────────────
 
     #[test]
@@ -2005,6 +2049,33 @@ mod truncate_tests {
             result.contains('🐱'),
             "multibyte char at boundary should survive intact"
         );
+    }
+
+    #[test]
+    fn sandwich_tail_start_rounds_up_to_a_char_boundary() {
+        // 16 'a's, a 4-byte char the tail cut of a 24-byte cap lands inside
+        // (bytes 16..20), then a visible tail. The input exceeds the cap by 2
+        // bytes, and flooring the tail start used to put it at 16 — on the head
+        // cut — folding the tail into the omitted span. Ceiling moves it to 20:
+        // the char joins the omitted span and the tail survives.
+        let input = format!("{}🐱bbbbcd", "a".repeat(16));
+        assert_eq!(input.len(), 26);
+        let result = truncate_sandwich(&input, 24, "test");
+        assert!(
+            result.ends_with("bbbbcd"),
+            "the tail must survive the boundary case, got: {result:?}"
+        );
+        assert!(
+            result.contains("bytes omitted at test truncation"),
+            "the boundary case must take the omission form, got: {result:?}"
+        );
+        // The cuts can never meet, whatever the cap or the string shape.
+        for cap in [12, 18, 24, 25] {
+            assert!(
+                truncate_sandwich(&input, cap, "test").contains("bytes omitted at test truncation"),
+                "cap {cap} must take the omission form"
+            );
+        }
     }
 
     #[test]

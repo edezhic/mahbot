@@ -2,29 +2,6 @@ use super::*;
 use crate::channels::enrich_links;
 
 #[test]
-fn truncate_capped_total_never_exceeds_cap() {
-    assert_eq!(truncate_capped("hello world", 5), "hell…");
-    assert_eq!(truncate_capped("hello world", 5).chars().count(), 5);
-    // Degenerate cap: the result must still respect "at most max_chars".
-    assert_eq!(truncate_capped("hello", 0), "");
-    assert_eq!(truncate_capped("hello", 1), "…");
-}
-
-#[test]
-fn truncate_capped_multibyte_char_boundary_safe() {
-    // Three 4-byte emoji, capped to 2 chars → first emoji + ellipsis, no panic.
-    assert_eq!(truncate_capped("😀😀😀", 2), "😀…");
-    // Cyrillic chars are single-codepoint Unicode; no mid-char split.
-    assert_eq!(truncate_capped("ааааа", 4), "ааа…");
-}
-
-#[test]
-fn truncate_capped_no_ellipsis_when_within_cap() {
-    assert_eq!(truncate_capped("hello", 10), "hello");
-    assert_eq!(truncate_capped("", 5), "");
-}
-
-#[test]
 fn normalize_decodes_entities_before_angle_strip() {
     // `&lt;b&gt;` decodes to `<b>` only after HTML decoding; the trailing
     // angle brackets are then stripped, leaving the inner text.

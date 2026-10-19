@@ -16,11 +16,12 @@ use crate::tools::ticket::{GET_TICKET_COMMENT_MAX, GET_TICKET_DESC_MAX, GET_TICK
 use crate::workspace::WorkspaceStore;
 use crate::{Role, Tool, Workspace, WorkspaceStatus};
 
-/// The tool's own byte budget, needed because the framework's 5 KB output clip
-/// is off for it (see [`WorkspaceTool::preserve_full_output`]): the `board`
-/// listing and the shortened `ticket` view bound themselves, and a byte cap is
-/// required alongside `BOARD_LINE_LIMIT` because a title, a description and a
-/// comment are all unbounded. `ticket` with `full: true` is deliberately exempt.
+/// The tool's own byte budget, needed because the framework's ~5 KB tool-output
+/// truncation is off for it (see [`WorkspaceTool::preserve_full_output`]): the
+/// `board` listing and the shortened `ticket` view bound themselves, and a byte
+/// cap is required alongside `BOARD_LINE_LIMIT` because a title, a description
+/// and a comment are all unbounded. `ticket` with `full: true` is deliberately
+/// exempt.
 const OUTPUT_BYTE_LIMIT: usize = 24_000;
 const BOARD_LINE_LIMIT: usize = 100;
 
@@ -81,8 +82,8 @@ impl Tool for WorkspaceTool {
 
     fn preserve_full_output(&self) -> bool {
         // A `ticket` answer can carry hundreds of KB of comments, so a fixed
-        // 5 KB clip is wrong for the whole tool; the read paths bound
-        // themselves instead (`OUTPUT_BYTE_LIMIT`).
+        // ~5 KB tool-output truncation is wrong for the whole tool; the read
+        // paths bound themselves instead (`OUTPUT_BYTE_LIMIT`).
         true
     }
 

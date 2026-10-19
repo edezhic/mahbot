@@ -3596,7 +3596,10 @@ mod tests {
             .strip_prefix("long (link: ")
             .and_then(|rest| rest.strip_suffix(')'))
             .expect("a link mark");
-        assert_eq!(address, format!("{}…", "x".repeat(MAX_LINK_TARGET_CHARS)));
+        assert_eq!(
+            address,
+            format!("{}…", "x".repeat(MAX_LINK_TARGET_CHARS - 1))
+        );
     }
 
     // ── Text boxes ──────────────────────────────────────────────

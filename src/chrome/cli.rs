@@ -2334,8 +2334,9 @@ async fn open(
 /// operation's bounded sub-steps ([`StepClocks::bounded`]): skipped
 /// under 500 ms of budget (mirroring the error-page probe); a failed step,
 /// an unrecognized response shape, or a content-free page yields no content.
-/// Non-empty content is byte-capped so the single-line JSON envelope stays
-/// valid and within the tool-output budget.
+/// Non-empty content is byte-truncated so the single-line JSON envelope stays
+/// valid: `TOOL_OUTPUT_BUDGET_BYTES` triggers the head/tail sandwich and the
+/// omission marker it inserts is additional to that trigger.
 async fn capture_open_content(path: &Path, session: &str, budget: Duration) -> Option<String> {
     if budget < Duration::from_millis(500) {
         return None;

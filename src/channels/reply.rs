@@ -19,24 +19,6 @@ pub struct ReplyReference {
     pub snippet: String,
 }
 
-/// Truncate `input` to at most `max_chars` chars, appending `…` only when a
-/// truncation actually occurred. Unlike [`crate::util::truncate`] (which may
-/// return `max_chars + 1` chars), the total length never exceeds `max_chars`.
-#[must_use]
-fn truncate_capped(input: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    let byte_idx = input
-        .char_indices()
-        .nth(max_chars - 1)
-        .map_or(input.len(), |(idx, _)| idx);
-    format!("{}…", &input[..byte_idx])
-}
-
 /// Normalize a raw reply snippet into the deterministic shared form used by
 /// both the GUI quote header and the Telegram channel.
 ///
@@ -48,7 +30,9 @@ fn truncate_capped(input: &str, max_chars: usize) -> String {
 /// 4. Collapse `\r\n` and `\n` to single spaces (other whitespace untouched).
 /// 5. Map media markers inline (IMAGE→`[Photo]`, AUDIO→`[Voice message]`,
 ///    VIDEO→`[Video]`, FILE→`[File]`) via [`TELEGRAM_MEDIA_MARKER_RE`].
-/// 6. Cap at [`REPLY_SNIPPET_MAX_CHARS`].
+/// 6. Cap at [`REPLY_SNIPPET_MAX_CHARS`] — the ellipsis counts inside the cap,
+///    and whitespace at the cut is trimmed (a shared-helper consequence: a cut
+///    landing in a run of spaces drops that run).
 ///
 /// The mapping operates on the raw message content — callers invoke this
 /// before any markdown preprocessing so a live data-URI marker still maps.
@@ -89,7 +73,7 @@ pub fn normalize_reply_text(raw: &str) -> String {
         .into_owned();
 
     // 6. Cap.
-    truncate_capped(&text, REPLY_SNIPPET_MAX_CHARS)
+    crate::util::truncate(&text, REPLY_SNIPPET_MAX_CHARS)
 }
 
 /// Render the reply marker prefix prepended to a routed message. The trailing

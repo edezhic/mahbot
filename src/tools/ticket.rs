@@ -445,8 +445,8 @@ impl Tool for GetTicketTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // Ticket content (descriptions, comments) can exceed the 5 KB
-        // budget — the LLM needs it in full.
+        // Ticket content (descriptions, comments) can exceed the ~5 KB
+        // tool-output trigger — the LLM needs it in full.
         true
     }
 
@@ -1090,8 +1090,8 @@ mod tests {
 
         let out = ticket.detailed_display_limited(500, 200, 3);
 
-        // (a) description capped at 500 chars + ellipsis
-        assert!(out.contains(&format!("Description: {}…", "x".repeat(500))));
+        // (a) description capped at 500 chars, ellipsis included
+        assert!(out.contains(&format!("Description: {}…", "x".repeat(499))));
         assert!(
             !out.contains(&long_desc),
             "full description must not appear"
@@ -1101,12 +1101,13 @@ mod tests {
         assert!(out.contains("Title: Limited"));
         assert!(out.contains("Reporter: test"));
         assert!(out.contains("Priority: P1"));
-        // (b) comments older than the last three capped at 200 chars + ellipsis
+        // (b) comments older than the last three capped at 200 chars, ellipsis
+        // included
         assert!(out.contains(&format!(
             "[engineer] (2026-01-01T00:00:00): {}…",
-            "a".repeat(200)
+            "a".repeat(199)
         )));
-        assert!(out.contains(&format!("[qa] (2026-01-02T00:00:00): {}…", "b".repeat(200))));
+        assert!(out.contains(&format!("[qa] (2026-01-02T00:00:00): {}…", "b".repeat(199))));
         // (c) last three comments shown in full
         assert!(out.contains(&format!(
             "[reviewer] (2026-01-03T00:00:00): {}",
@@ -1173,7 +1174,7 @@ mod tests {
             .await
             .expect("execute");
         assert!(
-            result.contains(&format!("Description: {}…", "y".repeat(500))),
+            result.contains(&format!("Description: {}…", "y".repeat(499))),
             "same-agent default view must truncate the description"
         );
         assert!(!result.contains(&long_desc));

@@ -603,9 +603,10 @@ mod tests {
         let err = result.unwrap_err();
         let http_err = err.downcast_ref::<crate::util::error::HttpError>().unwrap();
 
-        // The body should be truncated to 500 Unicode chars + "…" (1 char, 3 bytes).
+        // The body is truncated to 500 Unicode chars with the ellipsis counted
+        // inside the cap, so at most 499 ASCII chars + "…" (3 bytes) = 502.
         assert!(
-            http_err.body.len() <= 503,
+            http_err.body.len() <= 502,
             "body should be truncated, got {} bytes",
             http_err.body.len()
         );

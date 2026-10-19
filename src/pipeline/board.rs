@@ -377,7 +377,7 @@ impl Ticket {
     /// The returned string can be arbitrarily large (unbounded descriptions
     /// and comments). Callers that need truncation should apply their own
     /// limits (see `GetTicketTool::preserve_full_output` for an example that
-    /// disables the default 5 KB truncation). `GetTicketTool` uses
+    /// disables the default ~5 KB tool-output truncation). `GetTicketTool` uses
     /// [`Self::detailed_display_limited`] for its default truncated view.
     ///
     /// ## Changing this output

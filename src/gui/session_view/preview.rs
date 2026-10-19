@@ -116,9 +116,9 @@ fn shape_ceiling(avail: f32, need: u32) -> usize {
 /// in the preview — for unwrapped code/fence lines that would make the
 /// "3-line preview" render as many visual lines. The cap is measured from
 /// the body font's glyph advance (mono: uniform), not hardcoded, so it
-/// tracks the real rendered width. One character is reserved for the
-/// truncate ellipsis ("…"), so a capped line (content + ellipsis) never
-/// exceeds the transcript width and cannot wrap to a 4th visual line.
+/// tracks the real rendered width. The truncate ellipsis counts inside the cap,
+/// so a capped line (content + ellipsis) never exceeds the transcript width and
+/// cannot wrap to a 4th visual line.
 fn preview_line_char_budget(
     font_sys: &mut cosmic_text::FontSystem,
     attrs: &Attrs,
@@ -137,7 +137,7 @@ fn preview_line_char_budget(
         .first()
         .map_or(0.0, |l| l.w);
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let budget = ((avail / advance.max(1.0)) as usize).saturating_sub(1);
+    let budget = (avail / advance.max(1.0)) as usize;
     budget.max(1)
 }
 
