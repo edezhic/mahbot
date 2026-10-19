@@ -998,12 +998,12 @@ const REFERENCE_COMPRESSION_LADDER: &[(f32, u8)] = &[
 pub(crate) struct ReferenceImage {
     data_uri: String,
     /// Original file bytes kept for later ladder steps (aggregate body budget);
-    /// holding them avoids re-reading the file (no TOCTOU window).
+    /// holding them avoids re-reading the file (no TOCTOU window). Emptied by
+    /// [`ReferenceImage::release_source_bytes`] and never empty before it (the
+    /// content sniffer refuses empty input), so an empty buffer means the image
+    /// is final.
     source_bytes: Vec<u8>,
     next_step: usize,
-    /// Terminal state after [`ReferenceImage::release_source_bytes`]: the
-    /// request body is final, so no further compression is possible.
-    released: bool,
 }
 
 impl ReferenceImage {
@@ -1013,25 +1013,21 @@ impl ReferenceImage {
         &self.data_uri
     }
 
-    /// True while the compression ladder still has steps left.
+    /// True while the compression ladder still has steps left and the bytes to
+    /// take them are still retained.
     #[must_use]
     pub(crate) fn has_compression_left(&self) -> bool {
-        !self.released && self.next_step < REFERENCE_COMPRESSION_LADDER.len()
+        !self.source_bytes.is_empty() && self.next_step < REFERENCE_COMPRESSION_LADDER.len()
     }
 
-    /// Apply the next compression step (used by the aggregate body budget).
-    /// Errors — loudly, not panicking — when no steps remain or the source
-    /// bytes were released, so a caller contract violation surfaces instead of
-    /// corrupting state. The guards are unreachable from the current
-    /// budget-loop caller (which filters on `has_compression_left` first);
-    /// they exist to bound any future caller.
+    /// Apply the next compression step (used by the aggregate body budget). The
+    /// guard keeps a caller that skipped [`ReferenceImage::has_compression_left`]
+    /// from panicking on the ladder index.
     pub(crate) fn compress_more(&mut self) -> anyhow::Result<()> {
-        if self.released {
-            anyhow::bail!("Reference image is final — its source bytes were released");
-        }
-        if self.next_step >= REFERENCE_COMPRESSION_LADDER.len() {
-            anyhow::bail!("Reference image compression ladder exhausted");
-        }
+        anyhow::ensure!(
+            self.has_compression_left(),
+            "Reference image compression is already final"
+        );
         let out =
             with_block_in_place(|| compress_reference_step(&self.source_bytes, self.next_step))?;
         self.next_step += 1;
@@ -1042,7 +1038,6 @@ impl ReferenceImage {
     /// Drop the retained original bytes once the request body is final — no
     /// further compression is possible (or needed) after this point.
     pub(crate) fn release_source_bytes(&mut self) {
-        self.released = true;
         self.source_bytes = Vec::new();
     }
 }
@@ -1098,7 +1093,6 @@ pub(crate) async fn load_reference_image(
             ),
             source_bytes: bytes,
             next_step: 0,
-            released: false,
         });
     }
 
@@ -1129,7 +1123,6 @@ pub(crate) async fn load_reference_image(
                 data_uri: format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out)),
                 source_bytes: bytes,
                 next_step: step + 1,
-                released: false,
             });
         }
         step += 1;
@@ -2519,6 +2512,19 @@ mod reference_image_tests {
             img.data_uri(),
             format!("data:image/png;base64,{}", STANDARD.encode(&bytes))
         );
+    }
+
+    #[tokio::test]
+    async fn released_reference_reports_no_compression_left() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.png");
+        std::fs::write(&path, noisy_png(64, 64)).unwrap();
+
+        let mut img = load_reference_image(&path, 1_500_000).await.unwrap();
+        assert!(img.has_compression_left());
+        img.release_source_bytes();
+        assert!(!img.has_compression_left());
+        assert!(img.compress_more().is_err());
     }
 
     #[tokio::test]
