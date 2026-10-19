@@ -1836,16 +1836,6 @@ mod tests {
         assert_eq!(chat_credential(&ConfigData::STRUCT_FIELDS_DEFAULT), None);
     }
 
-    // NOTE: Per-struct normalize tests (`model_routing_normalize`) have been
-    // intentionally removed as redundant.  The `normalize()` method is a
-    // one-line delegation to `non_empty()` with no conditional logic.  The
-    // `non_empty` / `trimmed_or_none` primitive is covered exhaustively by
-    // `trimmed_or_none_trims_whitespace` above, and the end-to-end integration
-    // through `normalize_entries()` is covered by `normalize_entries_works`
-    // below.  If a new normalization scenario is added, it should be added to
-    // the primitive test AND exercised through the integration test — there is
-    // no need for per-struct test duplication.
-
     /// Verify that [`ConfigData::normalize_entries`] normalises every entry in
     /// `model_routings`.
     #[test]

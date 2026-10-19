@@ -15,17 +15,22 @@ pub(crate) enum ErrorClass {
     NonRetryable,
 }
 
-/// Body-text hints that indicate the error is retryable even when other
-/// signals (like `NON_RETRYABLE_HINTS` or 4xx status codes) suggest otherwise.
+/// Body-text hints that indicate a 429 is retryable even when its body also
+/// reads as billing or quota exhaustion.
+///
+/// Consulted only for a typed [`HttpError`] carrying status 429 Too Many
+/// Requests: a 4xx other than 408 and 429 is classified non-retryable before
+/// any hint is consulted, so none here can override one. Every other status,
+/// and any error that is not a typed [`HttpError`], is retryable without
+/// consulting these hints at all.
 ///
 /// These overrides handle cases where upstream proxy providers (e.g. OpenRouter)
 /// forward error metadata from transient upstream rate limits that coincidentally
 /// contain keywords like `insufficient_quota` in non-permanent contexts
 /// (e.g. `metadata.provider_error_code` forwarded from Alibaba).
 ///
-/// Priority: retryable overrides are checked first, then non-retryable hints,
-/// then status-code defaults. If ANY retryable override matches, the error
-/// is classified as Retryable regardless of other indicators.
+/// These hints are checked **before** [`NON_RETRYABLE_HINTS`], so a 429 body
+/// that matches both is classified retryable.
 const RETRYABLE_OVERRIDES: &[&str] = &[
     // Upstream provider reports a transient rate limit in its raw error
     // text (e.g. Alibaba/Qwen forwarded by OpenRouter).

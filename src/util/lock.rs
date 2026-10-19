@@ -40,7 +40,7 @@ pub(crate) fn lock_file_path(storage_root: &Path) -> PathBuf {
 ///
 /// Returns:
 /// - `Ok(true)` — lock acquired.
-/// - `Ok(false)` — lock held by another process.
+/// - `Ok(false)` — the lock is already held.
 /// - `Err(io::Error)` — non-retryable OS error.
 pub fn try_flock(file: &File) -> io::Result<bool> {
     match file.try_lock() {

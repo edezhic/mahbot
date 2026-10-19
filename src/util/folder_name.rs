@@ -17,9 +17,9 @@
 /// The rule in the words the surfaces that propose a name use, so that what
 /// they ask for is what [`folder_name_problem`] accepts.
 pub(crate) const RULE_SUMMARY: &str = "not empty, not only dots, no / \\ : * ? \" < > |, no \
-     control characters, nothing ending in a dot or a space, no reserved device name (CON, NUL, \
-     PRN, AUX, COM1-9, LPT1-9 — also with an extension or a superscript digit, plus CONIN$ and \
-     CONOUT$), and at most 255 bytes";
+     character below U+0020, nothing ending in a dot or a space, no reserved device name in any \
+     letter case (CON, NUL, PRN, AUX, COM1-9, LPT1-9, COM¹-³, LPT¹-³ — also with an extension — \
+     plus CONIN$ and CONOUT$), and at most 255 bytes";
 
 /// Longest accepted name, in bytes of UTF-8 — the tightest per-component limit
 /// among the platforms the product runs on. A byte count is the safe side of
@@ -30,7 +30,7 @@ const MAX_NAME_BYTES: usize = 255;
 
 /// Windows' reserved device names, which address a device instead of a file in
 /// every directory: the documented set, the superscript COM¹/COM²/COM³ and
-/// LPT¹/²/³ spellings its digit test also matches, and the console names.
+/// LPT¹/²/³ spellings, and the console names. The list is fixed — not a pattern.
 const RESERVED_DEVICE_NAMES: [&str; 30] = [
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "com¹", "com²",

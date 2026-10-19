@@ -26,11 +26,17 @@ pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 
 /// Role string for system comments — `"system"`.
 ///
-/// Used only to post non-agent ticket comments: the engineer hard-failure
-/// notice (`development.rs`) and the phase-reset / bounce-breaker trip notices
-/// (`pipeline/mod.rs`). It is posting-only — no site reads or compares a
-/// comment's role against this value, and the GUI badge for `"system"` is an
-/// unrelated generic fallback in `gui/theme.rs`.
+/// Two uses, both where a ticket has no agent author:
+///
+/// - the circuit-breaker trip comment `bounce_to_development` posts when the
+///   bounce budget is exhausted (`pipeline/mod.rs`);
+/// - the actor `attributed_actor` substitutes in the chronicle
+///   (`pipeline/chronicle.rs`) when `last_transition_actor` is absent or blank
+///   — legacy rows with no recorded actor included — so this value reaches a
+///   stored `ticket_chronicle.actor`, not only comments.
+///
+/// `gui/theme.rs` gives `"system"` the generic unknown-role badge colour on its
+/// own; it does not read this constant.
 pub(crate) const SYSTEM_ROLE: &str = "system";
 
 // ── RoleInfo ──────────────────────────────────────────────────────────────

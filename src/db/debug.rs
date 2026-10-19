@@ -142,14 +142,14 @@ fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
     }
 }
 
-/// Validate a store name against the canonical list. `all_valid` appends the
+/// Validate a store name against the accepted set. `all_valid` appends the
 /// literal `all` option to the hint — only callers that accept `--db all`
 /// pass `true`.
 ///
-/// Accepts both the LOGICAL store names ([`turso_mod::store_names`]) and the
-/// PHYSICAL consolidated file name ([`turso_mod::CONSOLIDATED_DB_NAME`], shown
-/// as the label in `--db all` output). Both lists must stay in sync
-/// with the debug CLI's `--db` surface.
+/// The accepted set is [`turso_mod::debug_db_names`]: the logical store names
+/// ([`turso_mod::store_names`]) plus the physical consolidated file name
+/// ([`turso_mod::CONSOLIDATED_DB_NAME`], shown as the label in `--db all`
+/// output).
 pub(crate) fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
     let names = turso_mod::debug_db_names();
     if names.contains(&name) {

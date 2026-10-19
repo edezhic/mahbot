@@ -215,30 +215,35 @@ fn second_instance_refusal(lock_path: &Path) -> anyhow::Error {
 /// Attempt to acquire an exclusive lock on the given file path.
 ///
 /// Opens the file (creating it if necessary) and calls [`try_flock`], which takes
-/// an exclusive whole-file lock without blocking. Returns immediately if another
-/// process holds the lock.
+/// an exclusive whole-file lock without blocking. Returns immediately if the lock
+/// is held.
 ///
 /// # Returns
 ///
 /// - `Ok(Some(file))` — lock acquired successfully. **The caller must keep the
 ///   returned `File` alive for the lifetime of the lock.**
-/// - `Ok(None)` — another process holds the lock.
+/// - `Ok(None)` — another handle holds the lock: another process, or a second
+///   descriptor in this process, which the kernel treats as independent.
 /// - `Err(...)` — a non-retryable OS error occurred (propagated from [`try_flock`]
 ///   or file open).
 ///
 /// # Caller responsibilities
 ///
-/// Shared helper used by [`acquire_lock`] (sync, at startup) and
-/// [`reacquire_instance_lock`] (async, after failed spawn). Each caller handles
-/// its own concerns:
+/// The production callers are [`acquire_lock`] (sync, at startup),
+/// [`wait_for_handoff`] (the hand-off poll) and [`reacquire_instance_lock`]
+/// (async, after a failed spawn); tests call it directly as well.
 ///
+/// - **Refusal**: a second acquisition on a path is refused by this helper
+///   itself — it returns `Ok(None)` rather than waiting. Only
+///   [`reacquire_instance_lock`] checks its own guard and returns early when it
+///   already holds the lock; the other two calls each attempt a lock the process
+///   does not hold.
 /// - **Directory creation**: [`acquire_lock`] ensures the parent directory exists
 ///   before calling this helper.
-/// - **Idempotency guard**: both callers check whether the lock is already held
-///   before calling this helper. Calling this helper while already holding the
-///   lock via a different `File` would fail (the two file descriptors are
-///   independent from the kernel's perspective).
-/// - **Error messages**: each caller formats its own success/failure messages.
+/// - **Messages**: [`acquire_lock`] logs the success — including a file the poll
+///   obtained — and the poll's failure is the same [`second_instance_refusal`] the
+///   immediate attempt returns; only [`reacquire_instance_lock`] has its own
+///   failure wording.
 fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
     let file = open_lock_file(path)
         .with_context(|| format!("failed to open lock file {}", path.display()))?;

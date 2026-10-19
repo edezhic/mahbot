@@ -213,8 +213,7 @@ pub(crate) fn get_engine_by_name(name: &str) -> Option<Arc<SearchEngineEntry>> {
 /// flag and cleans up any associated threads.
 pub(crate) fn remove_engine(workspace_name: &str) {
     let mut reg = registry().write().unwrap_poison();
-    if let Some(entry) = reg.remove(workspace_name) {
-        drop(entry); // explicit: drop Arc before logging
+    if reg.remove(workspace_name).is_some() {
         tracing::info!(workspace_name, "Search engine removed from registry");
     }
 }
