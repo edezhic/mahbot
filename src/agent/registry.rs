@@ -45,7 +45,7 @@ static NEXT_ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 ///   round plus its consolidation LLM call (members share the round key).
 /// - [`Research`](ParentKey::Research) — all sub-agents and orchestrator LLM
 ///   calls of one research run (members share the durable research job id).
-/// - [`Launch`](ParentKey::Launch) — one branch launch (a custom role's or a coder
+/// - [`Launch`](ParentKey::Launch) — one branch launch (a custom role's or a worker
 ///   branch's), keyed by the launch's agent id (one launch is one conversation,
 ///   so the id is the group key).
 ///
@@ -390,7 +390,7 @@ impl AgentRegistry {
 
     /// Cancel every agent belonging to a direct parent invocation (ticket /
     /// analyze round / research run) as a group. Used by the manual-cancel paths
-    /// — the GUI's research stop (analysts, verifier, coder and the cleanup
+    /// — the GUI's research stop (analysts, verifier, worker and the cleanup
     /// agent share the run's [`ParentKey::Research`]) and the analyze tool's
     /// cancel action (the round's analysts and verification analysts share its
     /// [`ParentKey::AnalyzeRound`]).

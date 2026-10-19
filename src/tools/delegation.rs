@@ -15,10 +15,10 @@
 //! key stays the caller's own workspace name (`jobs.workspace_name`), so the
 //! result always lands in the conversation that asked.
 //!
-//! A coder round additionally refuses a registered workspace, anything inside
+//! A worker round additionally refuses a registered workspace, anything inside
 //! one, the filesystem root and the product's own data directory: a ticket-less
-//! coder must never write into a tree whose workspace pipeline owns it. These
-//! are guardrails, not a security boundary — the coder's shell is unchanged.
+//! worker must never write into a tree whose workspace pipeline owns it. These
+//! are guardrails, not a security boundary — the worker's shell is unchanged.
 
 use crate::Workspace;
 use anyhow::{Context as _, Result, bail};
@@ -33,9 +33,9 @@ pub(crate) enum DelegationKind {
     /// The read-only analyst round: a registered workspace and a plain
     /// directory are both legitimate places.
     Analyze,
-    /// The coder round: refuses registered workspaces (and anything inside
+    /// The worker round: refuses registered workspaces (and anything inside
     /// them) and the product's own data directory.
-    Coder,
+    Worker,
 }
 
 /// The registered workspace occupying exactly `dir` — "this path IS that
@@ -96,7 +96,7 @@ pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option
         let Some(ws) = crate::workspace::get_by_name(raw).await? else {
             return Err(refuse_unresolvable(kind, raw));
         };
-        if kind == DelegationKind::Coder {
+        if kind == DelegationKind::Worker {
             return Err(refuse_registered(raw, &ws.name));
         }
         return Ok(Some(ws));
@@ -105,7 +105,7 @@ pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option
     let dir = canonical_dir(raw, &expanded)?;
     let registered = registered_workspaces().await?;
     let exact = registered_at(&registered, &dir);
-    if kind == DelegationKind::Coder {
+    if kind == DelegationKind::Worker {
         if let Some(ws) = exact {
             return Err(refuse_registered(raw, &ws.name));
         }
@@ -289,7 +289,7 @@ fn refuse_unresolvable(kind: DelegationKind, raw: &str) -> anyhow::Error {
              hint: pass the exact name of a registered workspace, or an absolute path to an \
              existing directory"
         ),
-        DelegationKind::Coder => anyhow::anyhow!(
+        DelegationKind::Worker => anyhow::anyhow!(
             "usage: place \"{raw}\" is not an absolute path — hint: this tool only runs in a \
              directory outside the registered workspaces (a registered workspace name never works \
              here); pass an absolute path to an existing directory"
@@ -345,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn absent_null_and_blank_places_mean_no_place() {
         init_management_test_stores().await;
-        for kind in [DelegationKind::Analyze, DelegationKind::Coder] {
+        for kind in [DelegationKind::Analyze, DelegationKind::Worker] {
             for args in [
                 json!({}),
                 json!({"place": null}),
@@ -365,7 +365,7 @@ mod tests {
         let canonical = canon(dir.path());
         let target = canonical.to_str().unwrap();
 
-        for kind in [DelegationKind::Analyze, DelegationKind::Coder] {
+        for kind in [DelegationKind::Analyze, DelegationKind::Worker] {
             let ws = resolve(kind, &json!({ "place": target }))
                 .await
                 .expect("plain directory resolves")
@@ -415,14 +415,14 @@ mod tests {
         assert_eq!(by_path.name, "ws_delegation_alpha");
         assert_eq!(by_path.path, stored);
 
-        // A coder round refuses a registered workspace, by name and by path.
+        // A worker round refuses a registered workspace, by name and by path.
         for args in [
             json!({ "place": "ws_delegation_alpha" }),
             json!({ "place": plain }),
         ] {
-            let err = resolve(DelegationKind::Coder, &args)
+            let err = resolve(DelegationKind::Worker, &args)
                 .await
-                .expect_err("the coder refuses a registered workspace")
+                .expect_err("the worker refuses a registered workspace")
                 .to_string();
             assert!(err.starts_with("usage:"), "{err}");
             assert!(err.contains("ws_delegation_alpha"), "{err}");
@@ -471,9 +471,9 @@ mod tests {
         assert!(ws.name.starts_with("dir-"), "got {}", ws.name);
         assert_ne!(ws.name, "ws_delegation_nested");
 
-        let err = resolve(DelegationKind::Coder, &json!({ "place": target }))
+        let err = resolve(DelegationKind::Worker, &json!({ "place": target }))
             .await
-            .expect_err("the coder refuses anything inside a registered workspace")
+            .expect_err("the worker refuses anything inside a registered workspace")
             .to_string();
         assert!(err.starts_with("usage:"), "{err}");
         assert!(err.contains("ws_delegation_nested"), "{err}");
@@ -496,23 +496,24 @@ mod tests {
             "{unregistered}"
         );
 
-        // The coder's variant must not send the caller down the registered-name
+        // The worker's variant must not send the caller down the registered-name
         // form it always refuses.
-        let coder_unregistered = resolve(DelegationKind::Coder, &json!({ "place": "no_such_ws" }))
-            .await
-            .expect_err("unregistered name for the coder")
-            .to_string();
+        let worker_unregistered =
+            resolve(DelegationKind::Worker, &json!({ "place": "no_such_ws" }))
+                .await
+                .expect_err("unregistered name for the worker")
+                .to_string();
         assert!(
-            coder_unregistered.starts_with("usage:"),
-            "{coder_unregistered}"
+            worker_unregistered.starts_with("usage:"),
+            "{worker_unregistered}"
         );
         assert!(
-            coder_unregistered.contains("never works here"),
-            "{coder_unregistered}"
+            worker_unregistered.contains("never works here"),
+            "{worker_unregistered}"
         );
         assert!(
-            !coder_unregistered.contains("not a registered workspace"),
-            "the coder's hint must not offer the registered-name form: {coder_unregistered}"
+            !worker_unregistered.contains("not a registered workspace"),
+            "the worker's hint must not offer the registered-name form: {worker_unregistered}"
         );
 
         let relative = resolve(DelegationKind::Analyze, &json!({ "place": "sub/dir" }))
@@ -524,7 +525,7 @@ mod tests {
 
         let missing_path = canonical.join("does-not-exist");
         let missing = resolve(
-            DelegationKind::Coder,
+            DelegationKind::Worker,
             &json!({ "place": missing_path.to_str().unwrap() }),
         )
         .await
@@ -536,7 +537,7 @@ mod tests {
         let file = canonical.join("a-file.txt");
         std::fs::write(&file, "x").unwrap();
         let file_err = resolve(
-            DelegationKind::Coder,
+            DelegationKind::Worker,
             &json!({ "place": file.to_str().unwrap() }),
         )
         .await
@@ -556,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn filesystem_root_is_refused_for_both_kinds() {
         init_management_test_stores().await;
-        for kind in [DelegationKind::Analyze, DelegationKind::Coder] {
+        for kind in [DelegationKind::Analyze, DelegationKind::Worker] {
             let err = resolve(kind, &json!({ "place": "/" }))
                 .await
                 .expect_err("the filesystem root is refused")
@@ -567,31 +568,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coder_refuses_the_data_directory_but_allows_personal_workspaces() {
+    async fn worker_refuses_the_data_directory_but_allows_personal_workspaces() {
         init_management_test_stores().await;
         let probe = test_root().join("data-probe-dir");
         std::fs::create_dir_all(&probe).unwrap();
         let err = resolve(
-            DelegationKind::Coder,
+            DelegationKind::Worker,
             &json!({ "place": probe.to_str().unwrap() }),
         )
         .await
-        .expect_err("the data directory is refused for the coder")
+        .expect_err("the data directory is refused for the worker")
         .to_string();
         assert!(err.starts_with("usage:"), "{err}");
         assert!(err.contains("data directory"), "{err}");
 
         // The `userspaces` container itself is NOT a personal workspace — a
-        // ticket-less coder there could write sibling folders next to every
+        // ticket-less worker there could write sibling folders next to every
         // account's personal workspace.
         let container = test_root().join("userspaces");
         std::fs::create_dir_all(&container).unwrap();
         let err = resolve(
-            DelegationKind::Coder,
+            DelegationKind::Worker,
             &json!({ "place": container.to_str().unwrap() }),
         )
         .await
-        .expect_err("the userspaces container itself is refused for the coder")
+        .expect_err("the userspaces container itself is refused for the worker")
         .to_string();
         assert!(err.starts_with("usage:"), "{err}");
         assert!(err.contains("data directory"), "{err}");
@@ -599,7 +600,7 @@ mod tests {
         let personal = test_root().join("userspaces").join("delegation-probe");
         std::fs::create_dir_all(&personal).unwrap();
         let ws = resolve(
-            DelegationKind::Coder,
+            DelegationKind::Worker,
             &json!({ "place": personal.to_str().unwrap() }),
         )
         .await

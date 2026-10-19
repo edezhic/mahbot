@@ -60,7 +60,7 @@ pub(crate) struct Session {
     /// [`attach_transcript`](Self::attach_transcript) from `Agent::new`.
     transcript: Option<Arc<ArcSwap<TranscriptSnapshot>>>,
     /// The launch this session runs under — a custom role's authorial
-    /// definition taken at launch plus the resolved branch address, or a coder
+    /// definition taken at launch plus the resolved branch address, or a worker
     /// branch's address. `Some` for a branch session; `None` for every built-in
     /// role. Set by `Agent::new` from the run's launch.
     pub(crate) launch: Option<crate::Launch>,
@@ -233,7 +233,7 @@ impl Session {
             } else {
                 // A launch's folder is named on EVERY use, so the session's
                 // cached opening context block must follow the folder the branch
-                // now works in — a custom role's OR a coder branch's (the block
+                // now works in — a custom role's OR a worker branch's (the block
                 // is the session's leading system run). The conversation after
                 // the block is never touched. The recorded folder is read BEFORE
                 // the append below rewrites it: it is what tells the change from
@@ -283,7 +283,7 @@ impl Session {
                 self.history.push(user_msg);
             }
             // A branch session records its kind and address — a custom role's
-            // name and the identifier it continues, or a coder branch's `None`
+            // name and the identifier it continues, or a worker branch's `None`
             // role name and its branch name — on EVERY appending turn, so the
             // dead-session poller can resume the branch as the same kind without
             // parsing the agent ID. It sits outside the `is_new` branch so a
@@ -2284,7 +2284,7 @@ mod tests {
         assert_eq!(messages[1].content, launch.prompt);
     }
 
-    /// A coder branch's folder is named on every use, so its cached opening
+    /// A worker branch's folder is named on every use, so its cached opening
     /// context block follows the folder it now works in: the turn in folder B
     /// rebuilds the leading block from B, and the conversation rows after the
     /// block are left untouched.
@@ -2294,7 +2294,7 @@ mod tests {
     /// after the block was cached, so re-rendering A here would slice the
     /// conversation one message too far and drop its first row.
     #[tokio::test]
-    async fn coder_branch_context_block_follows_the_folder() {
+    async fn worker_branch_context_block_follows_the_folder() {
         // A branch turn: appends one message as the launch's own role.
         async fn turn(session: &mut Session, agent_id: &str, msg: &str, ws: &Workspace) {
             session
@@ -2302,7 +2302,7 @@ mod tests {
                     agent_id,
                     msg,
                     ws,
-                    &crate::Role::Coder,
+                    &crate::Role::Worker,
                     None,
                     "gui",
                     "tester",
@@ -2316,7 +2316,7 @@ mod tests {
         async fn block_len(ws: &Workspace, launch: &crate::Launch) -> usize {
             Session::build_context_messages(
                 ws,
-                &crate::Role::Coder,
+                &crate::Role::Worker,
                 None,
                 false,
                 "tester",
@@ -2348,9 +2348,9 @@ mod tests {
         let ws_a = crate::workspace::test_ws_named(&path_a, &path_a);
         let ws_b = crate::workspace::test_ws_named(&path_b, &path_b);
 
-        let agent_id = crate::session::coder_branch_agent_id("feature");
+        let agent_id = crate::session::worker_branch_agent_id("feature");
         let launch = crate::Launch {
-            role: crate::Role::Coder,
+            role: crate::Role::Worker,
             name: String::new(),
             identifier: Some("feature".to_string()),
             prompt: String::new(),
@@ -2453,7 +2453,7 @@ mod tests {
             crate::Role::Manager,
             crate::Role::Engineer,
             crate::Role::Analyst,
-            crate::Role::Coder,
+            crate::Role::Worker,
             crate::Role::Qa,
             crate::Role::Reviewer,
             crate::Role::Discovery,

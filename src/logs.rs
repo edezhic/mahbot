@@ -1384,9 +1384,9 @@ mod tests {
             ),
             (
                 "spans array",
-                r#"{"timestamp":"...","level":"INFO","target":"test","spans":[{"name":"parent"},{"name":"agent","agent_id":"xyz-456","role":"coder","workspace":"/ws"}],"fields":{"message":"writing code"}}"#,
+                r#"{"timestamp":"...","level":"INFO","target":"test","spans":[{"name":"parent"},{"name":"agent","agent_id":"xyz-456","role":"worker","workspace":"/ws"}],"fields":{"message":"writing code"}}"#,
                 "xyz-456",
-                "coder",
+                "worker",
                 "/ws",
             ),
             (

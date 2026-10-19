@@ -303,12 +303,12 @@ fn parent_group_key(parent: &ParentKey) -> &str {
 /// different workspaces drawing the same short NanoID suffix). Research and
 /// branch-launch groups are matched on (kind, key) alone because a run/launch
 /// moves between workspaces:
-/// - a research run's coder round executes in an EPHEMERAL per-run workspace
+/// - a research run's worker round executes in an EPHEMERAL per-run workspace
 ///   whose name IS the run key (job_id) while its analysts and orchestrator
 ///   calls run in the real workspace — a workspace component would split the
 ///   group;
 /// - a branch launch's folder is a property of the LAUNCH, not of the branch
-///   identity, so a branch (a custom role's or a coder's) pointed at a
+///   identity, so a branch (a custom role's or a worker's) pointed at a
 ///   different folder keeps one group: a launch group is keyed by the branch
 ///   address alone, so a member whose recorded workspace differs must join the
 ///   existing group instead of splitting into a second section.
@@ -472,7 +472,7 @@ fn render_section(
 /// - Analyze/research groups: the truncated question/task text; a generic
 ///   fallback when no label was captured. The raw NanoID key is NEVER shown.
 /// - Branch launches: the display label built at spawn (a custom role's name
-///   plus its branch identifier when named, or a coder branch's own label); a
+///   plus its branch identifier when named, or a worker branch's own label); a
 ///   generic fallback when absent.
 /// - Singleton/unattributed groups: generic labels — their workspace name is
 ///   already the section grouping, so repeating it would be redundant.
@@ -1418,18 +1418,18 @@ mod tests {
     }
 
     #[test]
-    fn research_groups_resolve_workspace_across_ephemeral_coder_members() {
-        // A run's coder round executes in an ephemeral per-run workspace whose
+    fn research_groups_resolve_workspace_across_ephemeral_worker_members() {
+        // A run's worker round executes in an ephemeral per-run workspace whose
         // name IS the run key (job_id), while its analysts and orchestrator
         // calls run in the real workspace. The group must resolve to the REAL
-        // workspace whether the coder registers before or after the run's
+        // workspace whether the worker registers before or after the run's
         // real-workspace members, and two concurrent runs must never mix.
         let agents = vec![
-            // run1: ephemeral coder registers first, then a real-workspace
+            // run1: ephemeral worker registers first, then a real-workspace
             // analyst.
             agent_handle(
-                "research_ws1_run1_coder0",
-                "coder",
+                "research_ws1_run1_worker0",
+                "worker",
                 None,
                 "run1",
                 Some(ParentKey::Research("run1".to_string())),
@@ -1442,7 +1442,7 @@ mod tests {
                 Some(ParentKey::Research("run1".to_string())),
             ),
             // run2: real-workspace analyst registers first, then the
-            // ephemeral coder.
+            // ephemeral worker.
             agent_handle(
                 "research_ws1_run2_r1_0",
                 "analyst",
@@ -1451,8 +1451,8 @@ mod tests {
                 Some(ParentKey::Research("run2".to_string())),
             ),
             agent_handle(
-                "research_ws1_run2_coder0",
-                "coder",
+                "research_ws1_run2_worker0",
+                "worker",
                 None,
                 "run2",
                 Some(ParentKey::Research("run2".to_string())),
@@ -1469,7 +1469,7 @@ mod tests {
                 run.workspace, "ws1",
                 "the real workspace wins over the ephemeral per-run workspace"
             );
-            assert_eq!(run.items.len(), 2, "coder + analyst in one group");
+            assert_eq!(run.items.len(), 2, "worker + analyst in one group");
         }
     }
 

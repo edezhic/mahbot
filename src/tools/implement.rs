@@ -1,11 +1,11 @@
-//! The durable single-coder round body (`run_implement_with_job`): the coder
-//! sub-agent a `send` `coder` call dispatches. The coder has full
+//! The durable single-worker round body (`run_implement_with_job`): the worker
+//! sub-agent a `send` `worker` call dispatches. The worker has full
 //! shell/read/edit/search access and mutates the workspace.
 //!
-//! The round itself is dispatched by [`crate::tools::SyncDurableCore::Coder`]
+//! The round itself is dispatched by [`crate::tools::SyncDurableCore::Worker`]
 //! (sync for the Engineer, async for the admin Assistant and custom roles) —
 //! this module owns the round body only; the tool half lives in
-//! [`crate::tools::send`]. The jobs-row kind stays `implement` — the `Coder`
+//! [`crate::tools::send`]. The jobs-row kind stays `implement` — the `Worker`
 //! core's own kind ([`crate::jobs::SpawnChild::Implement`]).
 
 use crate::agent::run_agent;
@@ -13,12 +13,12 @@ use crate::session::analyze_agent_id;
 use crate::{Role, Workspace};
 use anyhow::anyhow;
 
-/// Write a fresh round's durable rows — the jobs row and the single-coder
-/// roster, in ONE tx — and return the coder's agent id. The row fields come
+/// Write a fresh round's durable rows — the jobs row and the single-worker
+/// roster, in ONE tx — and return the worker's agent id. The row fields come
 /// from the call's own [`CoreJobArgs`](crate::tools::CoreJobArgs) (the same
 /// bundle every durable sync core takes), whose spawn record must be present.
 /// The fresh-spawn half of [`run_implement_with_job`], shared with the command
-/// line's handover ([`hand_over_coder_round`]), which must have these rows down
+/// line's handover ([`hand_over_worker_round`]), which must have these rows down
 /// BEFORE it answers its caller.
 async fn spawn_implement_rows(
     exec: &Workspace,
@@ -31,16 +31,16 @@ async fn spawn_implement_rows(
     // [`CoreJobArgs::spawn`](crate::tools::CoreJobArgs::spawn)).
     let Some(record) = args.spawn.as_ref() else {
         return Err(super::internal_fault(
-            "a fresh coder dispatch carries no spawn record",
+            "a fresh worker dispatch carries no spawn record",
         ));
     };
-    let coder_agent_id =
-        analyze_agent_id(&exec.name, Role::Coder.as_str()) + &crate::generate_suffix();
-    // Single-coder roster: one tx puts the job + the coder row down before
+    let worker_agent_id =
+        analyze_agent_id(&exec.name, Role::Worker.as_str()) + &crate::generate_suffix();
+    // Single-worker roster: one tx puts the job + the worker row down before
     // any session write (caller identity + task persisted on the rows).
     let agents = vec![crate::jobs::NewAgent {
-        agent_id: coder_agent_id.clone(),
-        kind: crate::jobs::AgentKind::Coder,
+        agent_id: worker_agent_id.clone(),
+        kind: crate::jobs::AgentKind::Worker,
         idx: Some(0),
         task: task.to_string(),
     }];
@@ -63,10 +63,10 @@ async fn spawn_implement_rows(
         record.custom_launch,
     )
     .await?;
-    Ok(coder_agent_id)
+    Ok(worker_agent_id)
 }
 
-/// The COMMAND LINE's handover of a coder round.
+/// The COMMAND LINE's handover of a worker round.
 ///
 /// [`crate::tools::SyncDurableCore::spawn_dispatch`] answers its caller as soon
 /// as the round is started, which is right for an agent whose own turn is
@@ -83,7 +83,7 @@ async fn spawn_implement_rows(
 ///
 /// `Err` is a failed row write: nothing was dispatched and nothing is running,
 /// so the caller may be told the handover did not happen.
-pub(crate) async fn hand_over_coder_round(
+pub(crate) async fn hand_over_worker_round(
     delivery: &Workspace,
     place: Option<&Workspace>,
     task: &str,
@@ -121,14 +121,14 @@ pub(crate) async fn hand_over_coder_round(
     let (delivery, job_id) = (delivery.clone(), job_id.to_string());
     let exec_dir = place.map(|ws| ws.path.clone());
     tokio::spawn(async move {
-        crate::tools::SyncDurableCore::Coder
+        crate::tools::SyncDurableCore::Worker
             .resume_durable_round(&job_id, &delivery, exec_dir.as_deref())
             .await;
     });
     Ok(())
 }
 
-/// Spawn the implement job + single-coder roster (one tx), then run the coder.
+/// Spawn the implement job + single-worker roster (one tx), then run the worker.
 /// A resume (`spawn: None`) reuses the stored roster (never regenerate ids —
 /// the PK would conflict AND the new id would not match the stored roster row).
 pub(crate) async fn run_implement_with_job(
@@ -137,34 +137,34 @@ pub(crate) async fn run_implement_with_job(
     args: crate::tools::CoreJobArgs<'_>,
 ) -> anyhow::Result<crate::tools::SyncCoreOutcome> {
     let resume = args.spawn.is_none();
-    let (coder_agent_id, pre_done) = match &args.spawn {
+    let (worker_agent_id, pre_done) = match &args.spawn {
         // Resume: reuse the stored roster (never regenerate ids — the PK would
         // conflict AND the new id would not match the stored roster row).
         None => {
             let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, args.job_id)
                 .await?;
             let row = rows.first().ok_or_else(|| {
-                super::internal_fault("coder round resume found no roster row for the stored job")
+                super::internal_fault("worker round resume found no roster row for the stored job")
             })?;
-            // Only a completed (done) coder's outcome is reconstructable — a
-            // failed/launched coder is re-run with its stored task on resume.
+            // Only a completed (done) worker's outcome is reconstructable — a
+            // failed/launched worker is re-run with its stored task on resume.
             let pre_done = (row.status == crate::jobs::RowStatus::Done.as_str())
                 .then(|| row.outcome.clone())
                 .flatten();
             (row.agent_id.clone(), pre_done)
         }
-        // Fresh dispatch: spawn the job + single-coder roster (one tx).
+        // Fresh dispatch: spawn the job + single-worker roster (one tx).
         Some(_) => (spawn_implement_rows(ws, task, &args).await?, None),
     };
 
-    // A completed coder's stored outcome IS the final response — deliver it
+    // A completed worker's stored outcome IS the final response — deliver it
     // without re-running (the LLM work is never lost or duplicated).
     if let Some(outcome) = pre_done {
         return Ok(crate::tools::SyncCoreOutcome::Terminal(Ok(outcome)));
     }
 
-    // Fresh (or resume-without-outcome) run: run the single coder. On resume the
-    // coder reuses its persisted session so an interrupted attempt continues
+    // Fresh (or resume-without-outcome) run: run the single worker. On resume the
+    // worker reuses its persisted session so an interrupted attempt continues
     // rather than redoing the whole task (an empty message when the session
     // already holds the task).
     let parent_key = crate::agent::CURRENT_TOOL_PARENT_KEY
@@ -173,10 +173,10 @@ pub(crate) async fn run_implement_with_job(
     let parent_label = crate::agent::CURRENT_TOOL_PARENT_LABEL
         .try_with(std::clone::Clone::clone)
         .unwrap_or(None);
-    let has_session = resume && crate::session::store().has_content(&coder_agent_id).await;
+    let has_session = resume && crate::session::store().has_content(&worker_agent_id).await;
     let (agent, response) = run_agent(
-        coder_agent_id.clone(),
-        Role::Coder,
+        worker_agent_id.clone(),
+        Role::Worker,
         ws,
         None,
         if has_session { "" } else { task },
@@ -192,19 +192,19 @@ pub(crate) async fn run_implement_with_job(
     )
     .await;
 
-    // CHECKPOINT: persist the coder's terminal outcome so a drain-cut / crash
-    // resume can reconstruct it without re-running a completed coder.
+    // CHECKPOINT: persist the worker's terminal outcome so a drain-cut / crash
+    // resume can reconstruct it without re-running a completed worker.
     let (status, outcome) = match &response {
         Some(r) => (crate::jobs::RowStatus::Done, r.clone()),
         None => (
             crate::jobs::RowStatus::Failed,
-            agent.failure_reason("coder produced no response"),
+            agent.failure_reason("worker produced no response"),
         ),
     };
     if let Err(e) = crate::jobs::write_agent_outcome(
         &crate::session::store().conn,
         args.job_id,
-        &coder_agent_id,
+        &worker_agent_id,
         status,
         Some(&outcome),
     )
@@ -214,9 +214,9 @@ pub(crate) async fn run_implement_with_job(
         // retries; async/boot-resume warn-and-continue (the outcome is
         // recomputable on the next resume).
         if args.fail_on_checkpoint_error {
-            return Err(e.context("failed to checkpoint coder outcome"));
+            return Err(e.context("failed to checkpoint worker outcome"));
         }
-        tracing::warn!(job = %args.job_id, error = %e, "Failed to checkpoint coder outcome");
+        tracing::warn!(job = %args.job_id, error = %e, "Failed to checkpoint worker outcome");
     }
 
     // Drain/shutdown cut the round: leave the job status='launched' for boot
@@ -239,7 +239,7 @@ pub(crate) async fn run_implement_with_job(
 /// [`crate::tools::SyncDurableCore::resume_durable_round`]. `exec_dir` is the
 /// recorded target directory the round ran in, when it had one.
 pub(crate) async fn resume_implement_round(job_id: &str, ws: &Workspace, exec_dir: Option<&str>) {
-    crate::tools::SyncDurableCore::Coder
+    crate::tools::SyncDurableCore::Worker
         .resume_durable_round(job_id, ws, exec_dir)
         .await;
 }
@@ -251,12 +251,12 @@ mod tests {
     use crate::workspace::test_ws;
     use serde_json::json;
 
-    /// The file the scripted coder writes into its execution workspace — a REAL
+    /// The file the scripted worker writes into its execution workspace — a REAL
     /// write through the `edit` tool, so the round's root is observable on disk.
-    const WRITTEN_FILE: &str = "coder-written.txt";
+    const WRITTEN_FILE: &str = "worker-written.txt";
 
-    /// Dispatch one place coder round and assert the shared contract: the
-    /// coder writes into `place`'s directory, while the durable job and the
+    /// Dispatch one place worker round and assert the shared contract: the
+    /// worker writes into `place`'s directory, while the durable job and the
     /// delivered envelope stay keyed to the caller's own workspace and the
     /// envelope names the directory really used.
     async fn assert_place_round_write(delivery: &Workspace, place: &Workspace, job_id: &str) {
@@ -265,7 +265,7 @@ mod tests {
             "a plain directory's identity is the synthetic one, got {}",
             place.name
         );
-        let envelope = crate::tools::SyncDurableCore::Coder
+        let envelope = crate::tools::SyncDurableCore::Worker
             .dispatch_durable(
                 delivery,
                 Some(place),
@@ -283,7 +283,7 @@ mod tests {
             "the delivery key stays the caller's own workspace"
         );
         assert!(
-            envelope.content.contains("CODER DONE"),
+            envelope.content.contains("WORKER DONE"),
             "{}",
             envelope.content
         );
@@ -291,14 +291,14 @@ mod tests {
             envelope
                 .content
                 .contains(&format!("folder=\"{}\"", place.path)),
-            "the coder report names the folder it worked in: {}",
+            "the worker report names the folder it worked in: {}",
             envelope.content
         );
         let written = std::path::Path::new(&place.path).join(WRITTEN_FILE);
         assert_eq!(
             std::fs::read_to_string(&written).unwrap_or_default(),
-            "hello from the coder",
-            "the coder wrote into the place directory ({})",
+            "hello from the worker",
+            "the worker wrote into the place directory ({})",
             written.display()
         );
         let conn = &crate::session::store().conn;
@@ -312,14 +312,14 @@ mod tests {
         assert_eq!(
             place_sessions.len(),
             1,
-            "the coder's session belongs to the place directory"
+            "the worker's session belongs to the place directory"
         );
         assert!(
             place_sessions[0]
                 .get::<String>(0)
                 .unwrap()
                 .contains(&place.name),
-            "the coder's agent id carries the place's identity"
+            "the worker's agent id carries the place's identity"
         );
         let caller_sessions = conn
             .query(
@@ -337,7 +337,7 @@ mod tests {
     /// The async place path end to end, in both shapes: a delivery of its
     /// own plus a separate place directory, and a place that IS the caller's
     /// own directory — still a place, the reply names the directory and the
-    /// coder's session is keyed to the directory's own identity, never silently
+    /// worker's session is keyed to the directory's own identity, never silently
     /// downgraded to an unplaced call.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
@@ -345,7 +345,7 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // Two rounds' scripts in order: each coder really writes the file
+        // Two rounds' scripts in order: each worker really writes the file
         // through `edit`, then answers (`ok` is text-only).
         let _provider_guard = install_fake_provider(std::sync::Arc::new(
             FakeProvider::new()
@@ -353,18 +353,18 @@ mod tests {
                     "writing the file",
                     &[(
                         "edit",
-                        json!({ "path": WRITTEN_FILE, "new_string": "hello from the coder" }),
+                        json!({ "path": WRITTEN_FILE, "new_string": "hello from the worker" }),
                     )],
                 )
-                .ok("CODER DONE")
+                .ok("WORKER DONE")
                 .ok_text_and_tool_calls(
                     "writing the file",
                     &[(
                         "edit",
-                        json!({ "path": WRITTEN_FILE, "new_string": "hello from the coder" }),
+                        json!({ "path": WRITTEN_FILE, "new_string": "hello from the worker" }),
                     )],
                 )
-                .ok("CODER DONE"),
+                .ok("WORKER DONE"),
         ));
 
         // Case 1: a delivery of its own plus a separate place tempdir.
@@ -393,8 +393,8 @@ mod tests {
 
     /// (h) Mirror the analyze durability lifecycle for implement: with drain
     /// active the sync dispatch surfaces [`CallSuspended`] and leaves the
-    /// caller-owned job launched; a Done-coder resume then reconstructs
-    /// "CODER_RESPONSE", settles it as the tool result contiguous after the
+    /// caller-owned job launched; a Done-worker resume then reconstructs
+    /// "WORKER_RESPONSE", settles it as the tool result contiguous after the
     /// frame, and terminalizes the job.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
@@ -409,7 +409,7 @@ mod tests {
         crate::shutdown::drain_begin();
         let res = crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(pin.to_string()), async {
-                crate::tools::SyncDurableCore::Coder
+                crate::tools::SyncDurableCore::Worker
                     .run_sync_dispatch(&ws, "implement task", crate::Role::Engineer)
                     .await
             })
@@ -437,18 +437,18 @@ mod tests {
         );
         let job_id = jobs[0].get::<String>(0).unwrap();
 
-        // Simulate the coder checkpointing Done just before the drain cut: the
+        // Simulate the worker checkpointing Done just before the drain cut: the
         // drain observed the round mid-flight, the durable outcome is intact.
         let roster = crate::jobs::list_agents_for_job(conn, &job_id)
             .await
             .unwrap();
-        let coder_id = roster[0].agent_id.clone();
+        let worker_id = roster[0].agent_id.clone();
         crate::jobs::write_agent_outcome(
             conn,
             &job_id,
-            &coder_id,
+            &worker_id,
             crate::jobs::RowStatus::Done,
-            Some("CODER_RESPONSE"),
+            Some("WORKER_RESPONSE"),
         )
         .await
         .unwrap();
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_implement_h");
 
-        let outcome = crate::tools::SyncDurableCore::Coder
+        let outcome = crate::tools::SyncDurableCore::Worker
             .resume_sync_core(&ws, &job_id, true)
             .await
             .unwrap();
@@ -483,14 +483,14 @@ mod tests {
             panic!("expected a terminal resume outcome");
         };
         let text = result.expect("resumed implement result");
-        assert_eq!(text, "CODER_RESPONSE");
+        assert_eq!(text, "WORKER_RESPONSE");
         crate::jobs::terminalize_job(conn, &job_id).await.unwrap();
         session
             .settle_tool_results(pin, &[("call_implement_h".to_string(), text.clone())], &[])
             .await
             .unwrap();
 
-        // Job terminalized; tool row CODER_RESPONSE contiguous after the frame.
+        // Job terminalized; tool row WORKER_RESPONSE contiguous after the frame.
         let jobs = conn
             .query(
                 "SELECT id FROM jobs WHERE id = ?1",
@@ -512,6 +512,6 @@ mod tests {
         let payload: crate::ToolResultPayload =
             serde_json::from_str(&rows[2].get::<String>(2).unwrap()).unwrap();
         assert_eq!(payload.tool_call_id, "call_implement_h");
-        assert_eq!(payload.content, "CODER_RESPONSE");
+        assert_eq!(payload.content, "WORKER_RESPONSE");
     }
 }

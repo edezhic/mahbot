@@ -4219,7 +4219,7 @@ mod tests {
 
     /// The cancel action refuses everything that is not the caller's own live
     /// quick round — an unknown id, a `deep` investigation the caller owns, a
-    /// deep investigation's queued report, a coder round's queued report, and
+    /// deep investigation's queued report, a worker round's queued report, and
     /// another session's analyze round — and leaves each completely alone: no
     /// signal is fired and every refused row survives. The caller's own live
     /// quick row is stopped and deleted, after which the same id answers as
@@ -4337,7 +4337,7 @@ mod tests {
 
         // Reports queued for THIS caller: only the round's own kind
         // distinguishes them from a quick round's result, and a deep
-        // investigation's report and a coder round's report are not this
+        // investigation's report and a worker round's report are not this
         // action's to destroy.
         for (job_id, kind) in [
             (
@@ -4345,7 +4345,7 @@ mod tests {
                 crate::agent::message_router::MessageKind::ResearchResult,
             ),
             (
-                "cancel_refuses_coder_report",
+                "cancel_refuses_worker_report",
                 crate::agent::message_router::MessageKind::ImplementResult,
             ),
         ] {
@@ -4442,7 +4442,7 @@ mod tests {
         // Leave nothing behind for a sibling test's `recover_from_restart`
         // replay: every queued report and every launched row this test created
         // goes.
-        for report in ["cancel_refuses_deep_report", "cancel_refuses_coder_report"] {
+        for report in ["cancel_refuses_deep_report", "cancel_refuses_worker_report"] {
             crate::jobs::delete_pending_job(conn, report).await.unwrap();
         }
         for launched in ["deep_cancel_round", "someone_elses_analyze"] {

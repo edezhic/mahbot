@@ -7,10 +7,10 @@
 //! via two independent plans merged by id-based coverage; round 1 runs one
 //! analyst per sub-question (high-risk items get a decorrelated second
 //! angle); conditional gap rounds with shrinking width follow, each targeting
-//! the named gaps. A coder-in-loop prototype pass (`run_coder_round`) runs before
+//! the named gaps. A worker-in-loop prototype pass (`run_worker_round`) runs before
 //! the first gap round and after every progress round that refreshes a
 //! non-empty gap list, gated by the analyst budget, round deadline,
-//! shutdown/cancel, and a 30-minute minimum-remaining guard (`CODER_MIN_REMAINING`)
+//! shutdown/cancel, and a 30-minute minimum-remaining guard (`WORKER_MIN_REMAINING`)
 //! — skips are fail-open markers in the report.
 //!
 //! Deadline-aborted analysts are recovered by the wrap-up stage (a dispatch-time
@@ -77,10 +77,10 @@ const CLAIM_ANNOTATION_FAILED: &str = "claim annotation failed — all new claim
 /// links fails entirely — every mutating verdict is treated as weak.
 const CONFIRM_FAILED: &str =
     "annotation link confirmation failed — mutating links treated as weak/unconfirmed";
-/// Minimum remaining round time for a coder round to start (a coder run is
+/// Minimum remaining round time for a worker round to start (a worker run is
 /// not interrupted — starting one with less left would eat the subsequent
 /// gap rounds).
-const CODER_MIN_REMAINING: Duration = Duration::from_mins(30);
+const WORKER_MIN_REMAINING: Duration = Duration::from_mins(30);
 /// Default bound on the wrap-up stage: concurrent extraction of
 /// deadline-aborted analysts' accumulated findings (env-overridable via
 /// `MAHBOT_WRAP_UP_TIMEOUT_SECS`, distinct from the round deadline
@@ -137,11 +137,11 @@ struct ResearchState {
     /// file on boot resume. Not persisted (same rationale as `commands`).
     #[serde(skip)]
     seen_commands: std::collections::HashSet<String>,
-    /// Gap-loop round keys after which a coder round already ran (0 = the
-    /// pre-loop coder, k = after gap round k). Boot resume never re-runs a
-    /// completed coder round (no duplicate prototypes / LLM spend).
+    /// Gap-loop round keys after which a worker round already ran (0 = the
+    /// pre-loop worker, k = after gap round k). Boot resume never re-runs a
+    /// completed worker round (no duplicate prototypes / LLM spend).
     #[serde(default)]
-    coder_rounds_done: Vec<usize>,
+    worker_rounds_done: Vec<usize>,
 }
 
 impl Default for ResearchState {
@@ -159,7 +159,7 @@ impl Default for ResearchState {
             verification: Vec::new(),
             commands: Vec::new(),
             seen_commands: std::collections::HashSet::new(),
-            coder_rounds_done: Vec::new(),
+            worker_rounds_done: Vec::new(),
         }
     }
 }
@@ -2040,69 +2040,69 @@ async fn run_gap_round(
     dispatch_analyst_round(members, resume, deadline, &snapshots).await
 }
 
-/// Record a coder-round marker — a GATE-SKIP (`"skipped — {reason}"`; the
+/// Record a worker-round marker — a GATE-SKIP (`"skipped — {reason}"`; the
 /// round is NOT claimed) or an OUTCOME (dispatched but failed/cancelled).
 /// One marker per key: a fresh marker clears the prior one (a stale
 /// skip/outcome marker is superseded — the report shows one truth per key).
 /// Re-attempt semantics: only the PRE-LOOP key-0 round is re-examined on
-/// boot-resume (`!coder_rounds_done.contains(&0)`); a post-progress round
+/// boot-resume (`!worker_rounds_done.contains(&0)`); a post-progress round
 /// (key ≥ 1) is dispatched only as a side-effect of a progress event inside
 /// the gap loop, so a gate-skip after a long gap round is FINAL — the loop's
 /// already-advanced round_index never revisits the key. That is fail-open per
 /// design (no silent skips — the marker IS the report note; the run
 /// continues without the prototype).
-fn set_coder_marker(state: &mut ResearchState, round_key: usize, suffix: &str) {
-    let marker = format!("coder round {round_key} {suffix}");
-    clear_coder_markers(state, round_key);
+fn set_worker_marker(state: &mut ResearchState, round_key: usize, suffix: &str) {
+    let marker = format!("worker round {round_key} {suffix}");
+    clear_worker_markers(state, round_key);
     state.markers.push(marker);
 }
 
-/// Clear stale coder-round markers for a key — one truth per key.
-fn clear_coder_markers(state: &mut ResearchState, round_key: usize) {
+/// Clear stale worker-round markers for a key — one truth per key.
+fn clear_worker_markers(state: &mut ResearchState, round_key: usize) {
     state
         .markers
-        .retain(|m| !m.starts_with(&format!("coder round {round_key} ")));
+        .retain(|m| !m.starts_with(&format!("worker round {round_key} ")));
 }
 
-/// Claim a coder round at DISPATCH. The claim is IN-MEMORY here — it reaches
+/// Claim a worker round at DISPATCH. The claim is IN-MEMORY here — it reaches
 /// the persisted checkpoint only at the next per-round save (after the round
-/// completes), so a crash mid-coder loses it and boot-resume re-dispatches
+/// completes), so a crash mid-worker loses it and boot-resume re-dispatches
 /// (the accepted crash-duplicate pin). Stale skip/outcome markers for this
 /// key are cleared — the report shows one truth (the final outcome), not
 /// a dead skip plus completed prototypes.
-fn claim_coder_round(state: &mut ResearchState, round_key: usize) {
-    if !state.coder_rounds_done.contains(&round_key) {
-        state.coder_rounds_done.push(round_key);
+fn claim_worker_round(state: &mut ResearchState, round_key: usize) {
+    if !state.worker_rounds_done.contains(&round_key) {
+        state.worker_rounds_done.push(round_key);
     }
-    clear_coder_markers(state, round_key);
+    clear_worker_markers(state, round_key);
 }
 
 /// Un-claim a round that was dispatched but never completed (failure or
 /// cancellation). Only the pre-loop key-0 round is re-attempted by
 /// boot-resume; a post-progress failure is final (marked, fail-open).
-fn unclaim_coder_round(state: &mut ResearchState, round_key: usize) {
-    state.coder_rounds_done.retain(|k| *k != round_key);
+fn unclaim_worker_round(state: &mut ResearchState, round_key: usize) {
+    state.worker_rounds_done.retain(|k| *k != round_key);
 }
 
-/// One coder round: a single Coder sub-agent builds prototypes in the per-run
-/// folder targeting the current gap list. Blocks on the coder (never hard
-/// timed out — a long coder may overrun the round deadline; the loop-top
-/// checks then skip the following gap rounds, fail-open). The coder's response
+/// One worker round: a single Worker sub-agent builds prototypes in the per-run
+/// folder targeting the current gap list. Blocks on the worker (never hard
+/// timed out — a long worker may overrun the round deadline; the loop-top
+/// checks then skip the following gap rounds, fail-open). The worker's response
 /// text is NOT inserted into the report; failures and skips are marked in the
 /// report, never silent.
 ///
 /// Gated at the top by the same checks as the loop top: analyst-budget
 /// exhaustion, round-deadline expiry, shutdown/drain, cancel, and a 30-minute
-/// minimum-remaining guard ([`CODER_MIN_REMAINING`]). Every gate-skip is
+/// minimum-remaining guard ([`WORKER_MIN_REMAINING`]). Every gate-skip is
 /// marked in the report, never silent (fail-open). Only the PRE-LOOP key-0
-/// round is re-attempted on boot-resume (`!coder_rounds_done.contains(&0)`);
+/// round is re-attempted on boot-resume (`!worker_rounds_done.contains(&0)`);
 /// a post-progress skip (key ≥ 1) is final — the advanced `round_index` never
 /// revisits the key. No speculative inline retry: `run_agent` already
 /// exhausts its internal retry bounds before returning Failed, so a second
-/// full coder session would only double the LLM spend of a confirmed failure
-/// (design: a coder failure is fail-open).
+/// full worker session would only double the LLM spend of a confirmed failure
+/// (design: a worker failure is fail-open).
 #[expect(clippy::too_many_arguments)]
-async fn run_coder_round(
+async fn run_worker_round(
     job_id: &str,
     run_root: &str,
     ws: &Workspace,
@@ -2114,23 +2114,23 @@ async fn run_coder_round(
     round_key: usize,
 ) {
     if budget.is_exhausted() {
-        set_coder_marker(state, round_key, "skipped — analyst budget exhausted");
+        set_worker_marker(state, round_key, "skipped — analyst budget exhausted");
         return;
     }
     if std::time::Instant::now() >= deadline {
-        set_coder_marker(state, round_key, "skipped — round deadline expired");
+        set_worker_marker(state, round_key, "skipped — round deadline expired");
         return;
     }
     if crate::shutdown::aborting() {
-        set_coder_marker(state, round_key, "skipped — shutdown/drain");
+        set_worker_marker(state, round_key, "skipped — shutdown/drain");
         return;
     }
     if crate::round_cancel::is_cancelled(job_id) {
-        set_coder_marker(state, round_key, "skipped — run cancelled");
+        set_worker_marker(state, round_key, "skipped — run cancelled");
         return;
     }
-    if std::time::Instant::now() + CODER_MIN_REMAINING >= deadline {
-        set_coder_marker(
+    if std::time::Instant::now() + WORKER_MIN_REMAINING >= deadline {
+        set_worker_marker(
             state,
             round_key,
             "skipped — less than 30 minutes remaining until the round deadline",
@@ -2139,14 +2139,14 @@ async fn run_coder_round(
     }
     // Claimed at dispatch (in-memory — persisted only at the next per-round
     // checkpoint, which happens AFTER the round completes, so a crash
-    // mid-coder loses the claim. Only the PRE-LOOP key-0 round is
+    // mid-worker loses the claim. Only the PRE-LOOP key-0 round is
     // re-dispatched by boot-resume (the accepted crash-duplicate pin);
     // a crashed post-progress round is final, fail-open.
-    claim_coder_round(state, round_key);
+    claim_worker_round(state, round_key);
     let evidence = render_accumulated_evidence(&state.acc);
     let gaps = gap_items(&gap_list.gaps).join("\n");
     let task = substitute(
-        &load_prompt("synthesis/coder_brief.md"),
+        &load_prompt("synthesis/worker_brief.md"),
         &[
             ("{{question}}", question),
             ("{{evidence}}", &evidence),
@@ -2154,9 +2154,9 @@ async fn run_coder_round(
             ("{{run_root}}", run_root),
         ],
     );
-    let coder_ws = Workspace::ephemeral_run(job_id, Path::new(run_root));
-    let agent_id = crate::session::research_agent_id(&ws.name, "coder");
-    // Command collection happens after the run completes — a crash mid-coder
+    let worker_ws = Workspace::ephemeral_run(job_id, Path::new(run_root));
+    let agent_id = crate::session::research_agent_id(&ws.name, "worker");
+    // Command collection happens after the run completes — a crash mid-worker
     // loses the session from the sanitizer (accepted: only the PRE-LOOP key-0
     // round is re-dispatched by boot-resume — with a fresh agent id, since
     // `research_agent_id` embeds a fresh NanoID suffix per call — and the
@@ -2164,8 +2164,8 @@ async fn run_coder_round(
     // a crashed post-progress round is final, fail-open).
     let (agent, response) = run_default_agent(
         &agent_id,
-        Role::Coder,
-        &coder_ws,
+        Role::Worker,
+        &worker_ws,
         &task,
         false,
         None,
@@ -2179,15 +2179,15 @@ async fn run_coder_round(
         .capture_round(job_id, &[agent_id], Path::new(run_root))
         .await;
     if response.is_some() {
-        tracing::info!(job = %job_id, coder_round = round_key, "Coder round completed");
+        tracing::info!(job = %job_id, worker_round = round_key, "Worker round completed");
     } else {
         let cancelled = agent.is_cancelled() || crate::shutdown::aborting();
         let outcome = if cancelled { "cancelled" } else { "failed" };
         // Never completed → not done (only the pre-loop key-0 round is
         // re-attempted by boot-resume; post-progress failures are final —
         // fail-open per design).
-        unclaim_coder_round(state, round_key);
-        set_coder_marker(state, round_key, outcome);
+        unclaim_worker_round(state, round_key);
+        set_worker_marker(state, round_key, outcome);
     }
 }
 
@@ -2210,12 +2210,12 @@ async fn run_coder_round(
 /// `round_index` lags by one while `rounds_dispatched` still counts the final
 /// completed round.
 ///
-/// Coder-in-loop: one prototype pass (key 0) before the loop over the initial
+/// Worker-in-loop: one prototype pass (key 0) before the loop over the initial
 /// gap list, then one after every progress round that refreshes a non-empty
 /// gap list (key = the round's index). Each pass is gated by the same
 /// budget/deadline/shutdown checks as the loop top and persisted with the
 /// per-round checkpoint. Boot-resume re-attempts ONLY the pre-loop key-0
-/// round (the `!coder_rounds_done.contains(&0)` check below); a skipped or
+/// round (the `!worker_rounds_done.contains(&0)` check below); a skipped or
 /// failed post-progress round (key ≥ 1) is FINAL — the loop resumes at the
 /// advanced round_index and never revisits the key (fail-open per design,
 /// skip marker in the report).
@@ -2246,7 +2246,7 @@ async fn gap_rounds(
         incomplete: None,
     };
     // Manual-cancel gate before any further orchestrator call or round:
-    // stop without extracting gaps, dispatching the coder, or spawning
+    // stop without extracting gaps, dispatching the worker, or spawning
     // another gap round. The caller (run_deep_research) observes the fired
     // signal and exits Cancelled regardless of this outcome's value.
     if crate::round_cancel::is_cancelled(job_id) {
@@ -2261,10 +2261,10 @@ async fn gap_rounds(
         outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
         return outcome;
     };
-    // Pre-loop coder round (key 0): one prototype pass over the initial gap
+    // Pre-loop worker round (key 0): one prototype pass over the initial gap
     // list before the first gap round dispatches.
-    if !gap_list.gaps.is_empty() && !state.coder_rounds_done.contains(&0) {
-        run_coder_round(
+    if !gap_list.gaps.is_empty() && !state.worker_rounds_done.contains(&0) {
+        run_worker_round(
             job_id, run_root, ws, question, budget, &gap_list, deadline, state, 0,
         )
         .await;
@@ -2368,10 +2368,10 @@ async fn gap_rounds(
                 return outcome;
             };
             gap_list = next_gap_list;
-            // Post-progress coder round (key = this gap round's index): fresh
+            // Post-progress worker round (key = this gap round's index): fresh
             // prototypes targeting the refreshed gap list.
-            if !gap_list.gaps.is_empty() && !state.coder_rounds_done.contains(&round_index) {
-                run_coder_round(
+            if !gap_list.gaps.is_empty() && !state.worker_rounds_done.contains(&round_index) {
+                run_worker_round(
                     job_id,
                     run_root,
                     ws,
@@ -2991,7 +2991,7 @@ fn render_raw_reports(out: &mut String, raw_reports: &[String], heading: &str) {
 
 /// Render the accumulated evidence as a compact numbered list, plus
 /// analysts' self-reported unanswered aspects. Used by the orchestrator
-/// prompts and the coder brief (`run_coder_round`).
+/// prompts and the worker brief (`run_worker_round`).
 /// Claim ids are their stable 0-based indices in `acc.claims` — the
 /// annotation pass and final synthesis reference them by these ids.
 fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
@@ -3662,7 +3662,7 @@ mod tests {
             }],
             commands: vec![],
             seen_commands: std::collections::HashSet::new(),
-            coder_rounds_done: vec![],
+            worker_rounds_done: vec![],
         };
         state.acc.rebuild_keys();
         let state_json = serde_json::to_string(&state).unwrap();
@@ -4330,60 +4330,60 @@ mod tests {
     }
 
     #[test]
-    fn coder_round_lifecycle_skip_vs_claim_vs_unclaim() {
+    fn worker_round_lifecycle_skip_vs_claim_vs_unclaim() {
         let mut state = ResearchState::default();
         // Gate-skip: marked in the report, NOT claimed — the pre-loop key-0
         // round is re-attempted by boot-resume (post-progress keys are final:
         // the loop's round_index has advanced past them — fail-open per design).
-        set_coder_marker(&mut state, 0, "skipped — analyst budget exhausted");
+        set_worker_marker(&mut state, 0, "skipped — analyst budget exhausted");
         assert!(
             state
                 .markers
                 .iter()
-                .any(|m| m == "coder round 0 skipped — analyst budget exhausted")
+                .any(|m| m == "worker round 0 skipped — analyst budget exhausted")
         );
-        assert!(!state.coder_rounds_done.contains(&0));
+        assert!(!state.worker_rounds_done.contains(&0));
         // Dispatch: claimed; a stale skip marker (a previous gate-skip that
         // was later re-attempted) is cleared — the report shows one truth.
-        claim_coder_round(&mut state, 0);
-        assert!(state.coder_rounds_done.contains(&0));
-        assert!(!state.markers.iter().any(|m| m.contains("coder round 0 ")));
+        claim_worker_round(&mut state, 0);
+        assert!(state.worker_rounds_done.contains(&0));
+        assert!(!state.markers.iter().any(|m| m.contains("worker round 0 ")));
         // Failure: un-claimed (only key-0 is re-attempted by resume); outcome
         // marked — and the outcome marker CLEARS a prior skip marker for the
         // same key (one truth: a failed-then-gate-skipped round must not
         // render both).
-        unclaim_coder_round(&mut state, 0);
-        set_coder_marker(&mut state, 0, "failed");
-        assert!(!state.coder_rounds_done.contains(&0));
-        assert!(state.markers.iter().any(|m| m == "coder round 0 failed"));
+        unclaim_worker_round(&mut state, 0);
+        set_worker_marker(&mut state, 0, "failed");
+        assert!(!state.worker_rounds_done.contains(&0));
+        assert!(state.markers.iter().any(|m| m == "worker round 0 failed"));
         assert!(
             !state
                 .markers
                 .iter()
-                .any(|m| m.contains("coder round 0 skipped")),
+                .any(|m| m.contains("worker round 0 skipped")),
             "outcome marker supersedes the stale skip marker"
         );
         // A later successful dispatch clears the stale outcome marker too.
-        claim_coder_round(&mut state, 0);
-        assert!(!state.markers.iter().any(|m| m.contains("coder round 0 ")));
+        claim_worker_round(&mut state, 0);
+        assert!(!state.markers.iter().any(|m| m.contains("worker round 0 ")));
         // Other rounds' markers are untouched.
-        set_coder_marker(&mut state, 1, "skipped — round deadline expired");
-        claim_coder_round(&mut state, 0);
+        set_worker_marker(&mut state, 1, "skipped — round deadline expired");
+        claim_worker_round(&mut state, 0);
         assert!(
             state
                 .markers
                 .iter()
-                .any(|m| m == "coder round 1 skipped — round deadline expired")
+                .any(|m| m == "worker round 1 skipped — round deadline expired")
         );
-        assert!(!state.markers.iter().any(|m| m.contains("coder round 0 ")));
+        assert!(!state.markers.iter().any(|m| m.contains("worker round 0 ")));
         // A gate-skip after a failure of the SAME key supersedes the failure
         // marker (one truth per key in the final report).
-        set_coder_marker(&mut state, 1, "skipped — round deadline expired");
+        set_worker_marker(&mut state, 1, "skipped — round deadline expired");
         assert_eq!(
             state
                 .markers
                 .iter()
-                .filter(|m| m.starts_with("coder round 1 "))
+                .filter(|m| m.starts_with("worker round 1 "))
                 .count(),
             1,
             "skip re-push dedupes per key"

@@ -289,11 +289,11 @@ pub(crate) fn validate_identifier(identifier: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid custom role branch: {e}"))
 }
 
-/// Validate a coder branch name: the same charset and length rule as a custom
+/// Validate a worker branch name: the same charset and length rule as a custom
 /// role identifier, with a wording of its own.
-pub(crate) fn validate_coder_branch(branch: &str) -> Result<()> {
+pub(crate) fn validate_worker_branch(branch: &str) -> Result<()> {
     validate_segment(branch, MAX_ROLE_IDENTIFIER_CHARS, "a branch")
-        .map_err(|e| anyhow::anyhow!("invalid coder branch: {e}"))
+        .map_err(|e| anyhow::anyhow!("invalid worker branch: {e}"))
 }
 
 /// Shared charset/length check for a name or an identifier.
@@ -353,7 +353,7 @@ mod tests {
         let entries =
             |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_string()).collect() };
         assert!(
-            validate_tools_against(&entries(&["analyze:quick,deep", "send:coder"]), &[]).is_ok()
+            validate_tools_against(&entries(&["analyze:quick,deep", "send:worker"]), &[]).is_ok()
         );
         assert!(validate_tools_against(&entries(&["analyze", "send", "read"]), &[]).is_ok());
         assert!(

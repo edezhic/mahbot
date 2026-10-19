@@ -117,9 +117,9 @@ pub(crate) enum AgentKind {
     Reviewer,
     Tester,
     Engineer,
-    /// Single coder sub-agent for the durable async coder round (`send`'s
-    /// `coder` addressee).
-    Coder,
+    /// Single worker sub-agent for the durable async worker round (`send`'s
+    /// `worker` addressee).
+    Worker,
     Sanitation,
 }
 
@@ -132,7 +132,7 @@ impl AgentKind {
             Self::Reviewer => "reviewer",
             Self::Tester => "tester",
             Self::Engineer => "engineer",
-            Self::Coder => "coder",
+            Self::Worker => "worker",
             Self::Sanitation => "sanitation",
         }
     }
@@ -333,7 +333,7 @@ pub(crate) enum SpawnChild {
     /// Pure kind marker — no child row (resume reads the jobs row alone).
     Analyze,
     /// Pure kind marker — no child row (resume reads the jobs row alone). The
-    /// single coder's roster row holds the dispatched task; the job row holds
+    /// single worker's roster row holds the dispatched task; the job row holds
     /// the caller identity for resume delivery.
     Implement,
     /// research_jobs (id, state).
@@ -624,7 +624,7 @@ pub(crate) async fn complete_job_with_envelope(
     // sweep's own DELETE then serializes behind this tx (single-writer),
     // so no cancelled run can leave a deliverable pending row. Any round
     // that registered a cancel signal is covered by the gate — job kinds
-    // that never register one (a coder round, for instance) keep their
+    // that never register one (a worker round, for instance) keep their
     // unbounded completion. Rolled back HERE rather than by the guard's
     // drop, so a cancelled completion leaves no deferred-cleanup WARN
     // behind either.
@@ -1226,8 +1226,8 @@ pub(crate) enum SyncResumeOutcome {
 /// warned and the row left to the reader's own refusal of that shape. A resume
 /// passes it on and is refused downstream, in the consumer loop's custom-role
 /// funnel; an ownership check derives the fabricated `…_{role}` address
-/// [`envelope_target`] derives for a missing launch, which no live custom/coder
-/// session carries (`Launch::agent_id` is always a `role_…`/`rolerun_…`/`coder_…`
+/// [`envelope_target`] derives for a missing launch, which no live custom/worker
+/// session carries (`Launch::agent_id` is always a `role_…`/`rolerun_…`/`worker_…`
 /// address), so it refuses the row too.
 pub(crate) fn parse_custom_launch(raw: Option<String>) -> Option<crate::Launch> {
     match raw {
@@ -1279,10 +1279,10 @@ pub(crate) struct CallerAnalyzeRound {
 /// is the caller's session — the ONE derivation, so what a cancel treats as the
 /// caller's can never drift from where the result would be delivered. The
 /// `kind = 'analyze'` filter is load-bearing: it refuses the `deep` depth's
-/// `research` job and every coder round, however the id was named. An absent row
+/// `research` job and every worker round, however the id was named. An absent row
 /// answers `None`, and a row whose `custom_launch` cannot be read is read as
 /// launch-less ([`parse_custom_launch`]) — a fabricated address for the
-/// custom/coder roles that carry a launch, so another branch's round is never
+/// custom/worker roles that carry a launch, so another branch's round is never
 /// stopped either.
 pub(crate) async fn analyze_round_owned_by(
     conn: &Connection,
@@ -1988,8 +1988,8 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             });
             resumed_other += 1;
         } else if job.kind == "implement" {
-            // A single-coder implement round interrupted by a crash: resume it
-            // like any other durable envelope kind. The coder roster row holds
+            // A single-worker implement round interrupted by a crash: resume it
+            // like any other durable envelope kind. The worker roster row holds
             // the terminal outcome; the job row holds the caller identity.
             if skip_sync_job(job) || workspace_unresolvable(job).await {
                 continue;
@@ -2340,7 +2340,7 @@ mod tests {
             ),
             (
                 "owned_implement",
-                AgentKind::Coder,
+                AgentKind::Worker,
                 SpawnChild::Implement,
                 Some("pin_b"),
                 None,

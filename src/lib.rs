@@ -51,7 +51,7 @@ pub(crate) mod embedder;
 pub(crate) mod git;
 pub mod gui;
 pub mod jobs;
-/// Launching and stopping a continuable branch — a custom role's, or a coder
+/// Launching and stopping a continuable branch — a custom role's, or a worker
 /// branch's.
 pub(crate) mod launch;
 /// Legacy binary Office reading (Word/Excel/PowerPoint): the CFB-container arm
@@ -867,7 +867,7 @@ pub enum Role {
     Manager,
     Engineer,
     Analyst,
-    Coder,
+    Worker,
     Qa,
     Reviewer,
     Discovery,
@@ -877,30 +877,30 @@ pub enum Role {
     Custom,
 }
 
-/// A launch: one continuable branch of a custom role, or a coder branch. For a
+/// A launch: one continuable branch of a custom role, or a worker branch. For a
 /// custom role it carries the authorial definition as it stood when the launch
 /// was created — a later edit of the record takes effect on the NEXT launch —
-/// for a coder branch the definition fields are empty.
+/// for a worker branch the definition fields are empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Launch {
     /// The role the branch runs as: `custom` for an administrator-defined role,
-    /// `coder` for a coder branch. Absent in envelopes stored before the field
+    /// `worker` for a worker branch. Absent in envelopes stored before the field
     /// existed — those can only be custom-role launches.
     #[serde(default = "Launch::custom_role_default")]
     pub role: Role,
-    /// The custom role's name. Empty for a coder branch.
+    /// The custom role's name. Empty for a worker branch.
     pub name: String,
     /// The branch identifier this launch continues, when the branch was named.
     /// `None` for an unnamed branch (the record's default branch or a one-off run).
     #[serde(default)]
     pub identifier: Option<String>,
-    /// The authorial prompt text, taken at launch. Empty for a coder branch.
+    /// The authorial prompt text, taken at launch. Empty for a worker branch.
     pub prompt: String,
     /// The chosen subset of the admin Assistant's tool names, taken at launch.
-    /// Empty for a coder branch.
+    /// Empty for a worker branch.
     pub tools: Vec<String>,
     /// The resolved session/branch address (`role_{name}`, `role_{name}:{id}`,
-    /// `rolerun_{name}:{suffix}` or `coder_{branch}`).
+    /// `rolerun_{name}:{suffix}` or `worker_{branch}`).
     pub agent_id: String,
     /// The conversation that asked for this launch's work — the asking custom
     /// role's branch, whose folder is `workspace`, so the report returns into

@@ -25,7 +25,7 @@
 //!
 //! Only this round's own id is deleted (never by target), its agents stop as a
 //! group via [`ParentKey::AnalyzeRound`], and its sessions are left as a completed
-//! round's are. A `deep` investigation, a coder round, another agent's round and
+//! round's are. A `deep` investigation, a worker round, another agent's round and
 //! an id that names nothing are refused by the `kind = 'analyze'` filter and the
 //! ownership check and left alone; a repeat cancel of a still-unwinding round is
 //! answered as stopped again while its own invocation is still registered — except
@@ -137,7 +137,7 @@ async fn locate(
         // A queued analyze result addressed to the caller: its round is over and
         // only the delivery is left to discard. The kind filter is load-bearing
         // here too — the same session can have a deep investigation's report or a
-        // coder round's report waiting, and those are not this action's to
+        // worker round's report waiting, and those are not this action's to
         // destroy.
         if envelope.kind == MessageKind::AnalyzeToolResult
             && crate::jobs::envelope_target(&envelope) == caller

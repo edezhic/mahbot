@@ -502,7 +502,7 @@ impl Drop for ExecEngineGuard<'_> {
 /// shutdown/drain. NEVER persisted — the emission-time frame already recorded
 /// the call durably, so the result is simply absent and the universal
 /// resume-completion step re-runs/resumes it. Carried as an `anyhow::Error`
-/// out of a sync dispatch (analyze, coder) so the caller's tool-execution
+/// out of a sync dispatch (analyze, worker) so the caller's tool-execution
 /// layer can mark the outcome `suspended`.
 #[derive(Debug)]
 pub(crate) struct CallSuspended;
@@ -571,7 +571,7 @@ pub(crate) struct SpawnRecord<'a> {
     pub custom_launch: Option<&'a crate::Launch>,
 }
 
-/// The single outcome form of the durable sync cores (analyze, coder):
+/// The single outcome form of the durable sync cores (analyze, worker):
 /// `Terminal` wraps a produced result (Ok or Err — both terminalize with a
 /// durable envelope), `DrainCut` means the round was cut by drain/shutdown —
 /// the job stays status='launched' for resume (boot or live), nothing is
@@ -586,23 +586,23 @@ pub(crate) enum SyncCoreOutcome {
     Cancelled,
 }
 
-/// The sync analyze/coder durable cores, normalized behind one interface so the
+/// The sync analyze/worker durable cores, normalized behind one interface so the
 /// sync dispatch, the resume-completion loop and the per-tool wrappers all
-/// reuse a single body. [`Coder`](Self::Coder)'s `jobs.kind` is
+/// reuse a single body. [`Worker`](Self::Worker)'s `jobs.kind` is
 /// [`crate::jobs::SpawnChild::Implement`]'s (`"implement"`).
 #[derive(Copy, Clone)]
 pub(crate) enum SyncDurableCore {
     Analyze,
-    Coder,
+    Worker,
 }
 
 impl SyncDurableCore {
-    /// The log/site label for this core ("Analyze" / "Coder").
+    /// The log/site label for this core ("Analyze" / "Worker").
     #[must_use]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Analyze => "Analyze",
-            Self::Coder => "Coder",
+            Self::Worker => "Worker",
         }
     }
 
@@ -610,15 +610,15 @@ impl SyncDurableCore {
     pub(crate) fn kind_str(self) -> &'static str {
         match self {
             Self::Analyze => crate::jobs::SpawnChild::Analyze.kind_str(),
-            Self::Coder => crate::jobs::SpawnChild::Implement.kind_str(),
+            Self::Worker => crate::jobs::SpawnChild::Implement.kind_str(),
         }
     }
 
     /// Resolve a dangling tool call to the sync durable core that settles it.
     /// The core is resolved from the tool plus its choice argument, never by
     /// matching a name against a stored round kind: `analyze`'s sync form is the
-    /// quick round and `send`'s is the single-run coder, so a call that asked for
-    /// another kind (`deep`, `coder_branch`, `manager`, `role`), an unknown
+    /// quick round and `send`'s is the single-run worker, so a call that asked for
+    /// another kind (`deep`, `worker_branch`, `manager`, `role`), an unknown
     /// value, a non-string, or an unknown tool name — a retired tool's included
     /// — resolves to `None` and is re-executed instead of binding an unrelated
     /// job. A retired tool name is not resolvable either: history is never
@@ -635,7 +635,7 @@ impl SyncDurableCore {
             return None;
         }
         // Each tool's sync form is its narrowest choice: the quick depth, the
-        // coder addressee. An absent (or explicit null) choice is that narrowest
+        // worker addressee. An absent (or explicit null) choice is that narrowest
         // kind — how a call frame that predates the merge reconnects to its
         // unfinished round.
         let (core, argument, own_choice) = match name {
@@ -644,7 +644,7 @@ impl SyncDurableCore {
                 AnalyzeDepth::ARG,
                 AnalyzeDepth::Quick.as_str(),
             ),
-            "send" => (Self::Coder, Addressee::ARG, Addressee::Coder.as_str()),
+            "send" => (Self::Worker, Addressee::ARG, Addressee::Worker.as_str()),
             _ => return None,
         };
         match args.get(argument) {
@@ -665,7 +665,7 @@ impl SyncDurableCore {
     ) -> anyhow::Result<SyncCoreOutcome> {
         match self {
             Self::Analyze => crate::tools::analyze::run_analyze_with_job(ws, task, args).await,
-            Self::Coder => crate::tools::implement::run_implement_with_job(ws, task, args).await,
+            Self::Worker => crate::tools::implement::run_implement_with_job(ws, task, args).await,
         }
     }
 
@@ -696,7 +696,7 @@ impl SyncDurableCore {
     ) -> Option<crate::round_cancel::CancelGuard> {
         match self {
             Self::Analyze => Some(crate::round_cancel::register(job_id, caller)),
-            Self::Coder => None,
+            Self::Worker => None,
         }
     }
 
@@ -859,7 +859,7 @@ impl SyncDurableCore {
     pub(crate) fn message_kind(self) -> MessageKind {
         match self {
             Self::Analyze => MessageKind::AnalyzeToolResult,
-            Self::Coder => MessageKind::ImplementResult,
+            Self::Worker => MessageKind::ImplementResult,
         }
     }
 
@@ -869,8 +869,8 @@ impl SyncDurableCore {
     /// The analyze envelope keeps the caller-generated `job_id` as its first body
     /// line so the delivered result is correlatable with the immediate ack
     /// placeholder, and `exec_dir` names the directory the round really ran in
-    /// when the caller asked for one. The coder's envelope is the
-    /// `<coder-report>` — no job id, and the folder the coder worked in: the
+    /// when the caller asked for one. The worker's envelope is the
+    /// `<worker-report>` — no job id, and the folder the worker worked in: the
     /// chosen directory when one was given, else the delivery workspace's own
     /// folder.
     #[must_use]
@@ -885,11 +885,11 @@ impl SyncDurableCore {
             Self::Analyze => {
                 build_async_result_envelope(job_id, result, "analyze-tool-result", exec_dir)
             }
-            Self::Coder => build_coder_envelope(
-                "coder_report.md",
+            Self::Worker => build_worker_envelope(
+                "worker_report.md",
                 exec_dir.unwrap_or(&delivery.path),
                 None,
-                &coder_report_text(result),
+                &worker_report_text(result),
             ),
         }
     }
@@ -1155,7 +1155,7 @@ impl SyncDurableCore {
     }
 
     /// Async dispatch entry of [`crate::tools::analyze::AnalyzeTool`]'s quick
-    /// depth and [`crate::tools::send::SendTool`]'s coder addressee: read the
+    /// depth and [`crate::tools::send::SendTool`]'s worker addressee: read the
     /// caller identity from
     /// the `CURRENT_TOOL_*` task-locals, spawn the core's durable dispatch in the
     /// background, catch its panics, and route the resulting envelope to the
@@ -1317,24 +1317,24 @@ pub(crate) fn build_async_result_envelope(
     }
 }
 
-/// A coder's report text — the round's own text, or an explicit failure marker
+/// A worker's report text — the round's own text, or an explicit failure marker
 /// so a failed round is never silently dropped.
-fn coder_report_text(result: &anyhow::Result<String>) -> String {
+fn worker_report_text(result: &anyhow::Result<String>) -> String {
     match result {
         Ok(text) => text.clone(),
         Err(e) => {
-            tracing::debug!(error = %e, "coder report failed");
+            tracing::debug!(error = %e, "worker report failed");
             format!("An error occurred: {e}")
         }
     }
 }
 
-/// Render a branch-report asset (`coder_report.md` / `coder_failure.md`): the
-/// same `<coder-report>` envelope for both, with the folder it happened in and —
+/// Render a branch-report asset (`worker_report.md` / `worker_failure.md`): the
+/// same `<worker-report>` envelope for both, with the folder it happened in and —
 /// only when the turn ran on a named branch — its `branch` attribute. The single
-/// renderer for a coder's report, shared by a single-run dispatch and a coder
+/// renderer for a worker's report, shared by a single-run dispatch and a worker
 /// branch's turn so the two shapes cannot drift.
-pub(crate) fn build_coder_envelope(
+pub(crate) fn build_worker_envelope(
     asset: &str,
     folder: &str,
     branch: Option<&str>,
@@ -1354,15 +1354,15 @@ pub(crate) fn build_coder_envelope(
 }
 
 /// The `branch="id"` attribute a report envelope carries for a named branch,
-/// empty otherwise — the shape `custom_role_message.md`, `coder_report.md` and
-/// `coder_failure.md` all render through `{{branch_attr}}`.
+/// empty otherwise — the shape `custom_role_message.md`, `worker_report.md` and
+/// `worker_failure.md` all render through `{{branch_attr}}`.
 pub(crate) fn branch_attr(identifier: Option<&str>) -> String {
     identifier.map_or_else(String::new, |id| {
         format!(" branch=\"{}\"", envelope_attr(id))
     })
 }
 
-/// An attribute value interpolated into an envelope (`<coder-report folder="…">`,
+/// An attribute value interpolated into an envelope (`<worker-report folder="…">`,
 /// `<manager-message workspace="…">`, `<custom-role-message role="…" workspace="…">`).
 ///
 /// The value is usually a folder path the model itself chose, so ONLY the three

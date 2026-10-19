@@ -63,7 +63,7 @@
 //!
 //! > Manager group (`Role::Manager`, `Role::Assistant`, `Role::Discovery`,
 //! > `Role::Engineer`, `Role::Maintainer`) → manager slot;
-//! > every other role (Analyst, Coder, QA, Reviewer, Sanitation) →
+//! > every other role (Analyst, Worker, QA, Reviewer, Sanitation) →
 //! > worker slot.
 //!
 //! Unset slots fall back to their `DEFAULT_*_MODEL` constant.
@@ -256,7 +256,7 @@ pub struct ConfigData {
     /// Model slot for the Manager group (Manager, Assistant, Discovery,
     /// Engineer, Maintainer).
     pub manager_model: Option<String>,
-    /// Model slot for all worker roles (Analyst, Coder, QA,
+    /// Model slot for all worker roles (Analyst, Worker, QA,
     /// Reviewer, Sanitation).
     pub worker_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
@@ -954,7 +954,7 @@ impl ConfigReload {
     /// Resolve the configured model for a role from the two model slots.
     ///
     /// The manager group (Manager, Assistant, Discovery, Engineer,
-    /// Maintainer) uses the manager slot; every other role (Analyst, Coder,
+    /// Maintainer) uses the manager slot; every other role (Analyst, Worker,
     /// QA, Reviewer, Sanitation) uses the worker slot. Unset slots
     /// fall back to their code default.
     #[must_use]
@@ -1756,7 +1756,7 @@ mod tests {
         }
         for role in [
             Role::Analyst,
-            Role::Coder,
+            Role::Worker,
             Role::Qa,
             Role::Reviewer,
             Role::Sanitation,

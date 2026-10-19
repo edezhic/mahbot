@@ -850,15 +850,15 @@ pub(crate) const FAMILIES: &[Family] = &[
                 secret: false,
                 purpose: "The folder the addressee works in: for 'manager', the project to \
                           message, by its registered name or its own folder; for 'role', a \
-                          registered project, a folder path, or 'personal:<user>'; a coder or \
-                          a coder branch works in a directory outside the registered projects \
+                          registered project, a folder path, or 'personal:<user>'; a worker or \
+                          a worker branch works in a directory outside the registered projects \
                           (one inside is refused), and in your own workspace when it names none",
             },
             Flag {
                 arg: "branch",
                 kind: FlagKind::Value,
                 secret: false,
-                purpose: "The branch to continue or create — a coder branch's, or a custom \
+                purpose: "The branch to continue or create — a worker branch's, or a custom \
                           role's own named branch (ASCII letters, digits, '_' and '-', at most \
                           32 chars)",
             },

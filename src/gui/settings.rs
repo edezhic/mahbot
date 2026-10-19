@@ -3260,10 +3260,10 @@ impl SettingsState {
             "Manager, Assistant, Discovery, Engineer, Maintainer",
         );
         let worker_row = self.config_model_slot_field(
-            "Worker",
+            "Executor",
             crate::config::DEFAULT_WORKER_MODEL,
             CONFIG_KEY_WORKER_MODEL,
-            "Analyst, Coder, QA, Reviewer, Sanitation",
+            "Analyst, Worker, QA, Reviewer, Sanitation",
         );
         section(
             "Models",

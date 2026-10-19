@@ -228,13 +228,13 @@ mod tests {
 
     #[test]
     fn parse_reads_kinds_and_canonicalizes_order() {
-        let parsed = parse(&entries(&["send:manager,coder", "read"])).unwrap();
+        let parsed = parse(&entries(&["send:manager,worker", "read"])).unwrap();
         assert_eq!(
             parsed,
             vec![
                 ToolGrant {
                     tool: "send".to_string(),
-                    kinds: vec!["coder".to_string(), "manager".to_string()],
+                    kinds: vec!["worker".to_string(), "manager".to_string()],
                 },
                 ToolGrant {
                     tool: "read".to_string(),
@@ -263,12 +263,12 @@ mod tests {
         let lost = parse_lossy(&entries(&[
             "read",
             "analyze:bogus",
-            "send:coder",
+            "send:worker",
             "read:quick",
         ]));
         assert_eq!(
             encoded(&lost),
-            entries(&["read", "send:coder"]),
+            entries(&["read", "send:worker"]),
             "the parseable entries survive in their stored order"
         );
     }
@@ -277,11 +277,11 @@ mod tests {
     /// the admin-facing spelling fills it in.
     #[test]
     fn held_kinds_and_describe_all_fill_in_the_narrowest_kind() {
-        let parsed = parse(&entries(&["analyze", "send:coder,role", "read"])).unwrap();
+        let parsed = parse(&entries(&["analyze", "send:worker,role", "read"])).unwrap();
         assert_eq!(held_kinds(&parsed[0]), vec!["quick".to_string()]);
         assert_eq!(
             held_kinds(&parsed[1]),
-            vec!["coder".to_string(), "role".to_string()]
+            vec!["worker".to_string(), "role".to_string()]
         );
         assert!(
             held_kinds(&parsed[2]).is_empty(),
@@ -289,7 +289,7 @@ mod tests {
         );
         assert_eq!(
             describe_all(&entries(&["analyze", "send", "read", "send:manager"])),
-            entries(&["analyze:quick", "send:coder", "read"])
+            entries(&["analyze:quick", "send:worker", "read"])
         );
     }
 
@@ -302,8 +302,8 @@ mod tests {
             entries(&["read", "send:manager"])
         );
         assert_eq!(
-            toggle(&entries(&["send:manager", "read"]), "send", "coder"),
-            entries(&["send:coder,manager", "read"]),
+            toggle(&entries(&["send:manager", "read"]), "send", "worker"),
+            entries(&["send:worker,manager", "read"]),
             "the kind lands in interface order and the entry keeps its position"
         );
         assert_eq!(
@@ -342,17 +342,17 @@ mod tests {
     fn a_grant_can_never_name_the_command_lines_own_assistant() {
         assert!(parse(&entries(&["send:assistant"])).is_err());
         assert!(
-            parse(&entries(&["send:coder,assistant"])).is_err(),
+            parse(&entries(&["send:worker,assistant"])).is_err(),
             "a known kind beside an unknown one does not make the entry valid"
         );
     }
 
     #[test]
     fn encode_roundtrips() {
-        let parsed = parse(&entries(&["send:coder,role", "read", "analyze"])).unwrap();
+        let parsed = parse(&entries(&["send:worker,role", "read", "analyze"])).unwrap();
         assert_eq!(
             encoded(&parsed),
-            entries(&["send:coder,role", "read", "analyze"])
+            entries(&["send:worker,role", "read", "analyze"])
         );
     }
 }

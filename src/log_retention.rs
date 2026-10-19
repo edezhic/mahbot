@@ -208,14 +208,14 @@ mod tests {
             seed(
                 &store,
                 "INSERT INTO tool_calls (agent_id, role, tool_name, recorded_at) \
-                 VALUES ('a', 'Coder', 'read', ?1)",
+                 VALUES ('a', 'Worker', 'read', ?1)",
                 age,
             )
             .await;
             seed(
                 &store,
                 "INSERT INTO tool_calls (agent_id, role, tool_name, error_message, recorded_at) \
-                 VALUES ('a', 'Coder', 'read', 'boom', ?1)",
+                 VALUES ('a', 'Worker', 'read', 'boom', ?1)",
                 age,
             )
             .await;
@@ -223,7 +223,7 @@ mod tests {
             seed(
                 &store,
                 "INSERT INTO tool_calls (agent_id, role, tool_name, success, recorded_at) \
-                 VALUES ('a', 'Coder', 'read', 0, ?1)",
+                 VALUES ('a', 'Worker', 'read', 0, ?1)",
                 age,
             )
             .await;
@@ -257,14 +257,14 @@ mod tests {
         seed(
             &store,
             "INSERT INTO tool_calls (agent_id, role, tool_name, error_message, recorded_at) \
-             VALUES ('a', 'Coder', 'read', 'boom', ?1)",
+             VALUES ('a', 'Worker', 'read', 'boom', ?1)",
             24 * 8,
         )
         .await;
         seed(
             &store,
             "INSERT INTO tool_calls (agent_id, role, tool_name, success, recorded_at) \
-             VALUES ('a', 'Coder', 'read', 0, ?1)",
+             VALUES ('a', 'Worker', 'read', 0, ?1)",
             24 * 8,
         )
         .await;

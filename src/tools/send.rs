@@ -1,7 +1,7 @@
 //! SendTool — hand one message to exactly one addressee.
 //!
-//! The addressees are the coder (a single coder run), a coder branch (a
-//! continuable coder conversation), a project workspace's Manager, and an
+//! The addressees are the worker (a single worker run), a worker branch (a
+//! continuable worker conversation), a project workspace's Manager, and an
 //! administrator-defined custom role. Every holder declares the `addressee`
 //! choice and every call states it — including a holder that can address only
 //! one agent — and a value outside its set is refused.
@@ -11,10 +11,10 @@
 //! unnamed address means — and every handover is durable BEFORE that caller is
 //! answered, since it is gone the moment it returns.
 //!
-//! The Engineer's instance addresses a coder only and runs it synchronously —
-//! the coder's report returns inline. The admin Assistant and a custom role
-//! dispatch asynchronously: the coder reports later as a `<coder-report>`
-//! message, a coder branch's turn delivers its answer into the conversation that
+//! The Engineer's instance addresses a worker only and runs it synchronously —
+//! the worker's report returns inline. The admin Assistant and a custom role
+//! dispatch asynchronously: the worker reports later as a `<worker-report>`
+//! message, a worker branch's turn delivers its answer into the conversation that
 //! asked, the Manager answers as an `<manager-message>`, and a custom role's
 //! answer arrives as a `<custom-role-message>`. Argument mechanics and refusals
 //! live in [`super::delegation`] and [`crate::launch`].
@@ -35,7 +35,7 @@ enum Argument {
     /// The folder the addressee works in (which project a `manager` call
     /// messages).
     Place,
-    /// The branch a coder branch or a custom role continues.
+    /// The branch a worker branch or a custom role continues.
     Branch,
     /// A custom role's name.
     Name,
@@ -86,10 +86,10 @@ pub enum Addressee {
     /// The owner's own assistant — the command line's default address, and one
     /// an agent is never offered (it is not in [`Self::ALL`]).
     Assistant,
-    /// A single coder run: implement a scoped task, report back.
-    Coder,
-    /// A continuable coder conversation: continue (or create) a named branch.
-    CoderBranch,
+    /// A single worker run: make one scoped change, report back.
+    Worker,
+    /// A continuable worker conversation: continue (or create) a named branch.
+    WorkerBranch,
     /// The Manager of one registered project workspace.
     Manager,
     /// An administrator-defined custom role.
@@ -102,12 +102,12 @@ pub enum Addressee {
 /// REQUIRED argument of every address are checked against the table below by
 /// `the_address_help_is_the_vocabulary_it_describes`.
 pub(crate) const ADDRESSEE_FLAG_HELP: &str = "Who receives it: 'assistant' (your own \
-     assistant — the same as naming none), 'coder' (one scoped coder run in the folder \
-     `--place` names, your own workspace when it names none), 'coder_branch' (a \
-     continuable coder conversation, needs `--branch`), 'manager' (the Manager of the \
+     assistant — the same as naming none), 'worker' (one scoped worker run in the folder \
+     `--place` names, your own workspace when it names none), 'worker_branch' (a \
+     continuable worker conversation, needs `--branch`), 'manager' (the Manager of the \
      project `--place` names — what a script aiming at a project should use), or 'role' \
      (a custom role, needs `--name`). An address takes only its own flags: a flag the \
-     address does not take is refused rather than ignored — `--branch` with 'coder', or \
+     address does not take is refused rather than ignored — `--branch` with 'worker', or \
      `--place` with 'assistant', fails the call";
 
 impl Addressee {
@@ -116,23 +116,23 @@ impl Addressee {
 
     /// Every addressee the dispatch tool itself offers, in interface order
     /// (narrowest first). The vocabulary a GRANT is drawn from.
-    pub const ALL: [Self; 4] = [Self::Coder, Self::CoderBranch, Self::Manager, Self::Role];
+    pub const ALL: [Self; 4] = [Self::Worker, Self::WorkerBranch, Self::Manager, Self::Role];
 
     /// Every addressee the COMMAND LINE may name: the tool's own set plus the
     /// owner's own assistant, which leads it. The holder decides which of them
     /// it offers.
     pub const COMMAND_LINE: [Self; 5] = [
         Self::Assistant,
-        Self::Coder,
-        Self::CoderBranch,
+        Self::Worker,
+        Self::WorkerBranch,
         Self::Manager,
         Self::Role,
     ];
 
     /// The wire spellings of [`Self::ALL`], in the same order.
     pub const STRS: &'static [&'static str] = &[
-        Self::Coder.as_str(),
-        Self::CoderBranch.as_str(),
+        Self::Worker.as_str(),
+        Self::WorkerBranch.as_str(),
         Self::Manager.as_str(),
         Self::Role.as_str(),
     ];
@@ -142,8 +142,8 @@ impl Addressee {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Assistant => "assistant",
-            Self::Coder => "coder",
-            Self::CoderBranch => "coder_branch",
+            Self::Worker => "worker",
+            Self::WorkerBranch => "worker_branch",
             Self::Manager => "manager",
             Self::Role => "role",
         }
@@ -164,8 +164,8 @@ impl Addressee {
     const fn does(self) -> &'static str {
         match self {
             Self::Assistant => "hands the message to your own assistant",
-            Self::Coder => "runs one scoped implementation and reports back",
-            Self::CoderBranch => "continues a named coder branch",
+            Self::Worker => "runs one scoped change and reports back",
+            Self::WorkerBranch => "continues a named worker branch",
             Self::Manager => "messages a project's Manager",
             Self::Role => "starts a custom role",
         }
@@ -173,18 +173,18 @@ impl Addressee {
 
     /// The arguments this addressee takes besides the shared `message`.
     fn requirements(self) -> &'static [Requirement] {
-        /// The coder's folder rule, shared by both coder kinds so their `place`
+        /// The worker's folder rule, shared by both worker kinds so their `place`
         /// text stays one entry.
         const OUTSIDE_PROJECTS: &str = "any directory outside the registered projects";
         match self {
             // The message is all it takes.
             Self::Assistant => &[],
-            Self::Coder => &[Requirement {
+            Self::Worker => &[Requirement {
                 arg: Argument::Place,
                 note: OUTSIDE_PROJECTS,
                 required: false,
             }],
-            Self::CoderBranch => &[
+            Self::WorkerBranch => &[
                 Requirement {
                     arg: Argument::Place,
                     note: OUTSIDE_PROJECTS,
@@ -251,7 +251,7 @@ fn labelled(labels: &[&str], note: &str) -> String {
 }
 
 pub struct SendTool {
-    /// Controls how a coder run is dispatched (see [`DispatchMode`]).
+    /// Controls how a worker run is dispatched (see [`DispatchMode`]).
     dispatch_mode: DispatchMode,
     /// The role of the calling agent. Used to route async results to the
     /// correct agent channel.
@@ -260,20 +260,20 @@ pub struct SendTool {
     /// addressee is declared and required like any other.
     kinds: Vec<Addressee>,
     /// Whether the optional `place` argument is accepted. Every addressee takes
-    /// a folder, so every async holder declares it; the Engineer's coder-only
+    /// a folder, so every async holder declares it; the Engineer's worker-only
     /// instance does not.
     accepts_place: bool,
 }
 
 impl SendTool {
-    /// The Engineer's instance: a coder only, synchronously, no `place` — the
-    /// coder's report returns inline in the call's result.
+    /// The Engineer's instance: a worker only, synchronously, no `place` — the
+    /// worker's report returns inline in the call's result.
     #[must_use]
     pub fn engineer() -> Self {
         Self {
             dispatch_mode: DispatchMode::Sync,
             caller_role: Role::Engineer,
-            kinds: vec![Addressee::Coder],
+            kinds: vec![Addressee::Worker],
             accepts_place: false,
         }
     }
@@ -292,11 +292,11 @@ impl SendTool {
 
     /// A custom role's variant: exactly the granted addressees, asynchronously,
     /// with the optional `place`. Never empty — a grant entry that named no kind
-    /// takes the narrowest addressee (`coder`).
+    /// takes the narrowest addressee (`worker`).
     #[must_use]
     pub fn granted(kinds: &[Addressee]) -> Self {
         let kinds = if kinds.is_empty() {
-            vec![Addressee::Coder]
+            vec![Addressee::Worker]
         } else {
             kinds.to_vec()
         };
@@ -452,10 +452,10 @@ impl SendTool {
 
     /// The optional `place` this call names: `None` when it names none, and
     /// `None` for a holder that declares no `place` at all — the Engineer's
-    /// coder-only instance runs where the caller is.
+    /// worker-only instance runs where the caller is.
     async fn optional_place(&self, args: &serde_json::Value) -> Result<Option<Workspace>> {
         if self.declares(Argument::Place) {
-            super::delegation::resolve(super::delegation::DelegationKind::Coder, args).await
+            super::delegation::resolve(super::delegation::DelegationKind::Worker, args).await
         } else {
             Ok(None)
         }
@@ -532,12 +532,12 @@ impl Tool for SendTool {
             if !self.kinds.contains(&addressee) {
                 continue;
             }
-            // The coder note is the one that differs by dispatch: the sync
-            // holder returns the coder's report inline, the async holders get it
-            // later as a `<coder-report>`.
+            // The worker note is the one that differs by dispatch: the sync
+            // holder returns the worker's report inline, the async holders get it
+            // later as a `<worker-report>`.
             let note = match addressee {
-                Addressee::Coder if !self.dispatch_mode.is_async() => {
-                    load_prompt("tool/send_coder_sync.md")
+                Addressee::Worker if !self.dispatch_mode.is_async() => {
+                    load_prompt("tool/send_worker_sync.md")
                 }
                 other => load_prompt(&format!("tool/send_{}.md", other.as_str())),
             };
@@ -574,7 +574,7 @@ impl Tool for SendTool {
         required.push(Addressee::ARG);
         // Every optional argument the holder's addressees take, described from
         // the one per-addressee table — `place` included only where the holder
-        // declares it: the Engineer's coder-only instance runs where the caller is.
+        // declares it: the Engineer's worker-only instance runs where the caller is.
         for arg in Argument::ALL {
             if let Some(description) = self.describe(arg) {
                 properties[arg.as_str()] = json!({
@@ -623,14 +623,14 @@ impl Tool for SendTool {
                         .to_string(),
                 )
             }
-            Addressee::Coder => {
+            Addressee::Worker => {
                 if !self.dispatch_mode.is_async() {
-                    // The Engineer's sync coder run: the report returns inline.
-                    return super::SyncDurableCore::Coder
+                    // The Engineer's sync worker run: the report returns inline.
+                    return super::SyncDurableCore::Worker
                         .run_sync_dispatch(ws, message, self.caller_role)
                         .await;
                 }
-                // A coder round writes outside the registered projects: only a
+                // A worker round writes outside the registered projects: only a
                 // durable background round can honour the optional `place`.
                 let place = self.optional_place(&args).await?;
                 let job_id = crate::generate_id();
@@ -638,7 +638,7 @@ impl Tool for SendTool {
                     // Answered and gone the moment this returns: the round's
                     // durable rows are written BEFORE the acknowledgement, and
                     // the round then runs as a resume of its own rows.
-                    crate::tools::implement::hand_over_coder_round(
+                    crate::tools::implement::hand_over_worker_round(
                         ws,
                         place.as_ref(),
                         message,
@@ -647,7 +647,7 @@ impl Tool for SendTool {
                     )
                     .await?;
                 } else {
-                    super::SyncDurableCore::Coder.spawn_dispatch(
+                    super::SyncDurableCore::Worker.spawn_dispatch(
                         ws,
                         place.as_ref(),
                         message,
@@ -659,20 +659,20 @@ impl Tool for SendTool {
                     .as_ref()
                     .map_or_else(|| ws.path.clone(), |p| p.path.clone());
                 Ok(format!(
-                    "Work handed to a coder in {}; its report arrives as a <coder-report> message.",
+                    "Work handed to a worker in {}; its report arrives as a <worker-report> message.",
                     folder.trim_end_matches(std::path::MAIN_SEPARATOR)
                 ))
             }
-            Addressee::CoderBranch => {
+            Addressee::WorkerBranch => {
                 let branch = super::get_str(&args, Argument::Branch.as_str())?;
                 // A branch is pointed at a folder by the same rule as a single
-                // coder run — the branch may not be a way around the coder's
+                // worker run — the branch may not be a way around the worker's
                 // refusals.
                 let place = self.optional_place(&args).await?;
                 // Read the asker before the launch: the report returns to the
                 // conversation that asked.
                 let asker = crate::agent::tool_custom_launch();
-                crate::launch::coder_branch(
+                crate::launch::worker_branch(
                     ws,
                     branch,
                     message,
@@ -733,9 +733,9 @@ impl Tool for SendTool {
             Addressee::Role => {
                 let name = super::get_str(&args, Argument::Name.as_str())?;
                 // Read through the declaring filter like every other optional
-                // argument. `place` here is NOT resolved the way a coder's is:
+                // argument. `place` here is NOT resolved the way a worker's is:
                 // `launch::custom_role` accepts the personal-workspace spelling
-                // too, which the coder's refusals do not.
+                // too, which the worker's refusals do not.
                 crate::launch::custom_role(
                     name,
                     message,
@@ -870,7 +870,7 @@ mod tests {
         }
 
         /// The next job carrying `needle` — matched by what it carries (an
-        /// analysis by its job id, a coder report by its `<coder-report>`
+        /// analysis by its job id, a worker report by its `<worker-report>`
         /// envelope), never by arrival position, so a slower round or a repeated
         /// delivery cannot cross-wire the assertions.
         async fn report(&mut self, needle: &str) -> crate::agent::message_router::AgentJob {
@@ -974,7 +974,7 @@ mod tests {
     }
 
     /// The two dispatch tools really dispatch: every kind a holder has creates
-    /// the round or reaches the addressee it names, a coder branch is created,
+    /// the round or reaches the addressee it names, a worker branch is created,
     /// continued in another folder and stopped, and a holder that lacks a kind is
     /// refused it.
     #[tokio::test]
@@ -1077,24 +1077,24 @@ mod tests {
         // `research` job carrying the job id the deep answer names — is the proof
         // that the deep kind really dispatched. Both analysis depths report under
         // the same envelope with their own job number, which is what keeps one
-        // analysis apart from another (and from the coder reports below).
+        // analysis apart from another (and from the worker reports below).
         //
         // The round this test started is stopped the way the Running Agents view
         // stops one, so no long-running investigation outlives the test.
         crate::research_cancel::cancel_research_run(&deep_job_id).await;
 
-        // ── send coder (a single run) ─────────────────────────────────────
-        let coder_jobs_before = job_ids_of_kind("implement", TURN_CHANNEL).await;
+        // ── send worker (a single run) ─────────────────────────────────────
+        let worker_jobs_before = job_ids_of_kind("implement", TURN_CHANNEL).await;
         let ack = dispatch(
             &send,
             &caller,
-            json!({ "message": "write it", "addressee": "coder", "place": &folder }),
+            json!({ "message": "write it", "addressee": "worker", "place": &folder }),
         )
         .await
-        .expect("a coder dispatch succeeds");
+        .expect("a worker dispatch succeeds");
         assert!(
             !ack.contains("job "),
-            "a coder dispatch names no job number: {ack}"
+            "a worker dispatch names no job number: {ack}"
         );
         // The round is proven by ITS OWN row — the new `implement` job carrying
         // this turn's channel — never by "some row of that kind exists" in the
@@ -1103,20 +1103,20 @@ mod tests {
             job_ids_of_kind("implement", TURN_CHANNEL)
                 .await
                 .into_iter()
-                .find(|id| !coder_jobs_before.contains(id))
+                .find(|id| !worker_jobs_before.contains(id))
         })
         .await
-        .expect("a coder dispatch creates its own implement round");
+        .expect("a worker dispatch creates its own implement round");
         assert_eq!(round_kind(&job_id).await, "implement");
-        let report = assistant_spy.report("<coder-report").await;
+        let report = assistant_spy.report("<worker-report").await;
         assert!(
-            report.content.contains("<coder-report") && !report.content.contains("Job:"),
-            "a coder report carries no job number: {}",
+            report.content.contains("<worker-report") && !report.content.contains("Job:"),
+            "a worker report carries no job number: {}",
             report.content
         );
         assert!(
             report.content.contains(&folder),
-            "a coder report names the folder it worked in: {}",
+            "a worker report names the folder it worked in: {}",
             report.content
         );
 
@@ -1172,8 +1172,8 @@ mod tests {
         // string is refused, never silently read as absent — which would run the
         // work in the default folder instead of telling the caller.
         for (addressee, extra) in [
-            ("coder", json!({})),
-            ("coder_branch", json!({ "branch": "typed" })),
+            ("worker", json!({})),
+            ("worker_branch", json!({ "branch": "typed" })),
             ("manager", json!({})),
             ("role", json!({ "name": "dispatchable" })),
         ] {
@@ -1191,27 +1191,27 @@ mod tests {
             );
         }
 
-        // ── send coder_branch: created, continued, moved, stopped ─────────
+        // ── send worker_branch: created, continued, moved, stopped ─────────
         let branch = "harness";
-        let branch_agent = crate::session::coder_branch_agent_id(branch);
+        let branch_agent = crate::session::worker_branch_agent_id(branch);
         let mut branch_spy = Spy::register(&branch_agent);
         let ack = dispatch(
             &send,
             &caller,
             json!({
                 "message": "first",
-                "addressee": "coder_branch",
+                "addressee": "worker_branch",
                 "branch": branch,
                 "place": &folder,
             }),
         )
         .await
-        .expect("a coder branch is creatable");
-        assert!(!ack.contains("job "), "a coder branch names no job: {ack}");
+        .expect("a worker branch is creatable");
+        assert!(!ack.contains("job "), "a worker branch names no job: {ack}");
         let first = branch_spy.next_job().await;
         assert_eq!(
             first.custom_role.as_ref().map(|c| c.role),
-            Some(Role::Coder)
+            Some(Role::Worker)
         );
         assert_eq!(
             first
@@ -1238,13 +1238,13 @@ mod tests {
             &caller,
             json!({
                 "message": "second",
-                "addressee": "coder_branch",
+                "addressee": "worker_branch",
                 "branch": branch,
                 "place": &other_folder,
             }),
         )
         .await
-        .expect("a coder branch is continuable");
+        .expect("a worker branch is continuable");
         let second = branch_spy.next_job().await;
         assert_eq!(
             second.custom_role.as_ref().map(|c| c.agent_id.clone()),
@@ -1256,14 +1256,14 @@ mod tests {
             "the folder is taken from the use that named it"
         );
 
-        // A use that names no folder runs where a coder runs today.
+        // A use that names no folder runs where a worker runs today.
         dispatch(
             &send,
             &caller,
-            json!({ "message": "third", "addressee": "coder_branch", "branch": branch }),
+            json!({ "message": "third", "addressee": "worker_branch", "branch": branch }),
         )
         .await
-        .expect("a coder branch runs without a folder");
+        .expect("a worker branch runs without a folder");
         let third = branch_spy.next_job().await;
         assert_eq!(third.workspace_name, caller.name);
 
@@ -1279,24 +1279,24 @@ mod tests {
 
         // A branch that runs delivers its report into the asking conversation and
         // shows up as one session entry.
-        let reporter = crate::session::coder_branch_agent_id("reporter");
+        let reporter = crate::session::worker_branch_agent_id("reporter");
         dispatch(
             &send,
             &caller,
             json!({
                 "message": "report back",
-                "addressee": "coder_branch",
+                "addressee": "worker_branch",
                 "branch": "reporter",
                 "place": &folder,
             }),
         )
         .await
-        .expect("a coder branch dispatches");
+        .expect("a worker branch dispatches");
         let report = assistant_spy.report("branch=\"reporter\"").await;
         assert!(
-            report.content.contains("<coder-report")
+            report.content.contains("<worker-report")
                 && report.content.contains("branch=\"reporter\""),
-            "a coder branch's report names its branch: {}",
+            "a worker branch's report names its branch: {}",
             report.content
         );
         let branch_row = deadline_poll(|| async {
@@ -1307,15 +1307,15 @@ mod tests {
                 .find(|s| s.agent_id == reporter)
         })
         .await
-        .expect("a coder branch is one session-list entry");
-        assert_eq!(branch_row.role.as_deref(), Some("coder"));
+        .expect("a worker branch is one session-list entry");
+        assert_eq!(branch_row.role.as_deref(), Some("worker"));
         assert_eq!(branch_row.custom_identifier.as_deref(), Some("reporter"));
 
         // Deleting the branch exactly as the Sessions page does — abandon its
         // unfinished jobs, then drop the session. The shared global store is
         // written by parallel tests too (see `src/session/mod.rs`), so the
         // claim is scoped to the agents this harness itself worked with: of
-        // them only the two coder branches ever ran, so only they hold a
+        // them only the two worker branches ever ran, so only they hold a
         // session — the reporter's deletion must take its own and nothing else
         // of the harness's.
         let owned = [
@@ -1341,7 +1341,7 @@ mod tests {
                 .then_some(owned_listed)
         })
         .await
-        .expect("the harness's own coder branches are listed before the delete");
+        .expect("the harness's own worker branches are listed before the delete");
 
         crate::jobs::abandon_session_jobs(&reporter).await.unwrap();
         crate::session::store().delete(&reporter).await.unwrap();
@@ -1404,17 +1404,18 @@ mod tests {
                 .is_some()
         );
 
-        let coder_only = SendTool::granted(&[Addressee::Coder]);
-        for addressee in ["coder_branch", "manager", "role"] {
+        let worker_only = SendTool::granted(&[Addressee::Worker]);
+        for addressee in ["worker_branch", "manager", "role"] {
             let err = dispatch(
-                &coder_only,
+                &worker_only,
                 &caller,
                 json!({ "message": "x", "addressee": addressee }),
             )
             .await
-            .expect_err("a coder-only holder has no other addressee");
+            .expect_err("a worker-only holder has no other addressee");
             assert!(
-                err.to_string().contains("`addressee` must be one of coder"),
+                err.to_string()
+                    .contains("`addressee` must be one of worker"),
                 "{err}"
             );
         }
@@ -1604,13 +1605,13 @@ mod tests {
         .unwrap();
 
         // Every conversation the command line's handovers reach is a registered
-        // spy consumer, so nothing is left unconsumed — and the coder round the
+        // spy consumer, so nothing is left unconsumed — and the worker round the
         // resume path really runs reports back into the assistant's session.
         let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
         let mut assistant_spy = Spy::register(&assistant);
         let manager_agent = crate::session::manager_agent_id(&project.name);
         let mut manager_spy = Spy::register(&manager_agent);
-        let _branch_spy = Spy::register(&crate::session::coder_branch_agent_id("cli_branch"));
+        let _branch_spy = Spy::register(&crate::session::worker_branch_agent_id("cli_branch"));
         let role_agent = crate::session::custom_role_agent_id("cli_role", None);
         let _role_spy = Spy::register(&role_agent);
 
@@ -1644,7 +1645,7 @@ mod tests {
                 .await
                 .expect("an unnamed command-line address means the owner's assistant");
         assert!(
-            ack.contains("assistant") && !ack.contains("<coder-report"),
+            ack.contains("assistant") && !ack.contains("<worker-report"),
             "the acknowledgement names the assistant: {ack}"
         );
         assert!(
@@ -1661,7 +1662,7 @@ mod tests {
         .await
         .expect("naming the assistant is the same as naming none");
         assert!(
-            ack.contains("assistant") && !ack.contains("<coder-report"),
+            ack.contains("assistant") && !ack.contains("<worker-report"),
             "{ack}"
         );
         assert!(
@@ -1669,26 +1670,26 @@ mod tests {
             "the named handover is durable when its caller is answered"
         );
 
-        // ── the coder: the round's own row exists before the ack ──────────
-        let coder_jobs_before = command_line_round_ids().await;
+        // ── the worker: the round's own row exists before the ack ──────────
+        let worker_jobs_before = command_line_round_ids().await;
         let ack = dispatch_command_line(
             &send,
             &caller,
-            json!({ "message": "go", "addressee": "coder", "place": &folder }),
+            json!({ "message": "go", "addressee": "worker", "place": &folder }),
         )
         .await
-        .expect("a command-line coder dispatch succeeds");
+        .expect("a command-line worker dispatch succeeds");
         assert!(
-            ack.contains("<coder-report"),
-            "a coder dispatch names its report: {ack}"
+            ack.contains("<worker-report"),
+            "a worker dispatch names its report: {ack}"
         );
-        let coder_jobs_after = command_line_round_ids().await;
+        let worker_jobs_after = command_line_round_ids().await;
         assert!(
-            coder_jobs_after
+            worker_jobs_after
                 .iter()
-                .any(|id| !coder_jobs_before.contains(id)),
+                .any(|id| !worker_jobs_before.contains(id)),
             "the round's own row must exist the moment the command line is answered \
-             (the durability pin, no poll): before={coder_jobs_before:?} after={coder_jobs_after:?}"
+             (the durability pin, no poll): before={worker_jobs_before:?} after={worker_jobs_after:?}"
         );
         // The round really runs through the RESUME path: its report arrives in
         // the assistant's conversation and names the folder it worked in, which
@@ -1697,10 +1698,10 @@ mod tests {
         gate_tx
             .send(true)
             .expect("the gated provider holds the gate");
-        let report = assistant_spy.report("<coder-report").await;
+        let report = assistant_spy.report("<worker-report").await;
         assert!(
             report.content.contains(&folder),
-            "the coder report names the folder the round ran in: {}",
+            "the worker report names the folder the round ran in: {}",
             report.content
         );
 
@@ -1732,23 +1733,23 @@ mod tests {
             delivered.content
         );
 
-        // ── a coder branch ────────────────────────────────────────────────
-        let branch_agent = crate::session::coder_branch_agent_id("cli_branch");
+        // ── a worker branch ────────────────────────────────────────────────
+        let branch_agent = crate::session::worker_branch_agent_id("cli_branch");
         let before = pending_for_content(&branch_agent, BRANCH_TEXT).await;
         dispatch_command_line(
             &send,
             &caller,
             json!({
                 "message": BRANCH_TEXT,
-                "addressee": "coder_branch",
+                "addressee": "worker_branch",
                 "branch": "cli_branch",
             }),
         )
         .await
-        .expect("the command line reaches a coder branch");
+        .expect("the command line reaches a worker branch");
         assert!(
             pending_for_content(&branch_agent, BRANCH_TEXT).await > before,
-            "the coder branch launch is durable when its caller is answered"
+            "the worker branch launch is durable when its caller is answered"
         );
 
         // ── a custom role ─────────────────────────────────────────────────
@@ -1767,7 +1768,7 @@ mod tests {
 
         // Leave the shared global store as the harness found it: the deferred
         // envelopes every handover above persisted are deleted, scoped by the
-        // snapshot taken before the first dispatch. The coder round's own job row
+        // snapshot taken before the first dispatch. The worker round's own job row
         // needs no cleanup: the resume path terminalizes it as the report is
         // delivered, which the assertion above already waited for.
         for row in crate::jobs::list_pending_jobs(&crate::session::store().conn)
@@ -1841,11 +1842,11 @@ mod tests {
         let ack = dispatch_command_line(
             &SendTool::admin(Role::Assistant),
             &caller,
-            json!({ "message": "go", "addressee": "coder" }),
+            json!({ "message": "go", "addressee": "worker" }),
         )
         .await
         .expect("the handover itself succeeds — the round it starts is what dies");
-        assert!(ack.contains("<coder-report"), "{ack}");
+        assert!(ack.contains("<worker-report"), "{ack}");
         let mine: Vec<String> = command_line_round_ids()
             .await
             .into_iter()
@@ -1860,7 +1861,7 @@ mod tests {
         gate_tx
             .send(true)
             .expect("the dying provider holds the gate");
-        let report = assistant_spy.report("<coder-report").await;
+        let report = assistant_spy.report("<worker-report").await;
         assert!(
             report.content.contains("panicked"),
             "the failure must reach the conversation the report would have: {}",
@@ -2029,7 +2030,7 @@ mod tests {
     /// EVERY holder and every argument (all non-empty subsets of
     /// [`Addressee::ALL`]), so the class cannot come back one instance at a time:
     /// a new addressee or argument joins the sweep by existing. The Engineer's
-    /// sync coder — the one holder that declares no `place` — sits outside the
+    /// sync worker — the one holder that declares no `place` — sits outside the
     /// subsets and is pinned by its own tests.
     #[test]
     fn a_holder_reads_only_the_choices_and_requirements_it_has() {
@@ -2048,9 +2049,13 @@ mod tests {
         }
 
         // The prose itself, once: a choice holder reads each held addressee under
-        // its own label, and the two coder kinds share one note.
+        // its own label, and the two worker kinds share one note.
         let admin = SendTool::admin(Role::Assistant);
-        assert!(admin.description().contains("`coder`: One coder sub-agent"));
+        assert!(
+            admin
+                .description()
+                .contains("`worker`: One worker sub-agent")
+        );
         assert!(
             admin
                 .description()
@@ -2060,12 +2065,12 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(place.contains("`coder`/`coder_branch`:"), "{place}");
+        assert!(place.contains("`worker`/`worker_branch`:"), "{place}");
 
-        // The Engineer's own instance: a sync coder that declares the choice
+        // The Engineer's own instance: a sync worker that declares the choice
         // like any other holder, and no folder at all.
         let engineer = SendTool::engineer();
-        assert!(engineer.description().contains("One coder sub-agent"));
+        assert!(engineer.description().contains("One worker sub-agent"));
         assert!(
             engineer
                 .description()
@@ -2075,46 +2080,46 @@ mod tests {
         );
         let schema = engineer.parameters_schema();
         assert_eq!(schema["required"], json!(["message", "addressee"]));
-        assert_eq!(schema["properties"]["addressee"]["enum"], json!(["coder"]));
+        assert_eq!(schema["properties"]["addressee"]["enum"], json!(["worker"]));
         assert!(schema["properties"].get("place").is_none());
     }
 
     /// The Engineer's sync `send` through the tool wrapper, end to end: the
-    /// coder really runs, and its report comes back inline in the call's own
-    /// result — never as the async `<coder-report>` envelope, and with no job
+    /// worker really runs, and its report comes back inline in the call's own
+    /// result — never as the async `<worker-report>` envelope, and with no job
     /// number (nothing was left behind for a later delivery).
     #[tokio::test]
     #[serial_test::serial(provider, channel_registry, drain)] // serializes the process-global fake provider + channel registry + shutdown drain flag
-    async fn engineer_send_returns_the_coder_report_inline() {
+    async fn engineer_send_returns_the_worker_report_inline() {
         use std::sync::Arc;
 
         crate::util::test::init_management_test_stores().await;
         let _policy =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let _provider = crate::util::test::install_fake_provider(Arc::new(
-            crate::util::test::FakeProvider::new().ok("the coder's report"),
+            crate::util::test::FakeProvider::new().ok("the worker's report"),
         ));
 
         let ws = crate::workspace::test_ws("/tmp/test_ws_send_engineer_sync");
         let result = dispatch(
             &SendTool::engineer(),
             &ws,
-            json!({ "message": "do the thing", "addressee": "coder" }),
+            json!({ "message": "do the thing", "addressee": "worker" }),
         )
         .await
-        .expect("the engineer's sync coder dispatch succeeds");
+        .expect("the engineer's sync worker dispatch succeeds");
 
         assert!(
-            result.contains("the coder's report"),
-            "the coder's report returns inline: {result}"
+            result.contains("the worker's report"),
+            "the worker's report returns inline: {result}"
         );
         assert!(
-            !result.contains("<coder-report"),
+            !result.contains("<worker-report"),
             "the sync path returns the report itself, never the async envelope: {result}"
         );
         assert!(
             !result.contains("job "),
-            "a sync coder dispatch names no job number: {result}"
+            "a sync worker dispatch names no job number: {result}"
         );
 
         // The engineer declares no `place`: a call naming one reads it as absent
@@ -2122,7 +2127,7 @@ mod tests {
         dispatch(
             &SendTool::engineer(),
             &ws,
-            json!({ "message": "again", "addressee": "coder", "place": "/no/such/folder" }),
+            json!({ "message": "again", "addressee": "worker", "place": "/no/such/folder" }),
         )
         .await
         .expect("an undeclared argument is inert for the holder that does not declare it");
@@ -2210,8 +2215,8 @@ mod tests {
         for (addressee, flag) in [
             ("assistant", "place"),
             ("assistant", "branch"),
-            ("coder", "branch"),
-            ("coder", "name"),
+            ("worker", "branch"),
+            ("worker", "name"),
             ("manager", "name"),
         ] {
             let mut args = json!({ "message": "go", "addressee": addressee });
@@ -2240,9 +2245,9 @@ mod tests {
             json!({ "message": "do it", "addressee": "manager" }),
         )
         .await
-        .expect_err("the engineer addresses a coder only");
+        .expect_err("the engineer addresses a worker only");
         let err = err.to_string();
-        assert!(err.contains("`addressee` must be one of coder"), "{err}");
+        assert!(err.contains("`addressee` must be one of worker"), "{err}");
 
         let admin = SendTool::admin(Role::Assistant);
         let err = dispatch(
@@ -2253,7 +2258,10 @@ mod tests {
         .await
         .expect_err("an unknown addressee is refused");
         let err = err.to_string();
-        assert!(err.contains("coder, coder_branch, manager, role"), "{err}");
+        assert!(
+            err.contains("worker, worker_branch, manager, role"),
+            "{err}"
+        );
 
         let err = dispatch(
             &admin,
@@ -2263,7 +2271,10 @@ mod tests {
         .await
         .expect_err("an agent session never names the owner's own assistant");
         let err = err.to_string();
-        assert!(err.contains("coder, coder_branch, manager, role"), "{err}");
+        assert!(
+            err.contains("worker, worker_branch, manager, role"),
+            "{err}"
+        );
     }
 
     /// What decides is the marker the executor sets: a turn that ARRIVED over the
@@ -2300,7 +2311,10 @@ mod tests {
         .await
         .expect_err("an agent's turn never names the owner's own assistant");
         let err = err.to_string();
-        assert!(err.contains("coder, coder_branch, manager, role"), "{err}");
+        assert!(
+            err.contains("worker, worker_branch, manager, role"),
+            "{err}"
+        );
     }
 
     /// The address is never assumed: an agent's call that names no addressee is
@@ -2314,7 +2328,7 @@ mod tests {
         for holder in [
             SendTool::admin(Role::Assistant),
             SendTool::engineer(),
-            SendTool::granted(&[Addressee::Coder]),
+            SendTool::granted(&[Addressee::Worker]),
             SendTool::granted(&[Addressee::Manager]),
         ] {
             let err = dispatch(&holder, &ws, json!({ "message": "do it" }))
@@ -2349,18 +2363,18 @@ mod tests {
 
     /// The resume tolerance the required address depends on: an in-flight `send`
     /// frame that predates the choice still reconnects to its unfinished sync
-    /// coder round instead of being refused or restarted. A frame naming another
+    /// worker round instead of being refused or restarted. A frame naming another
     /// addressee stays unresolvable and is re-executed, as today.
     #[test]
-    fn an_absent_address_still_resumes_the_sync_coder() {
+    fn an_absent_address_still_resumes_the_sync_worker() {
         use crate::tools::SyncDurableCore;
         assert!(matches!(
             SyncDurableCore::from_call("send", &json!({ "message": "m" })),
-            Some(SyncDurableCore::Coder)
+            Some(SyncDurableCore::Worker)
         ));
         assert!(matches!(
-            SyncDurableCore::from_call("send", &json!({ "message": "m", "addressee": "coder" })),
-            Some(SyncDurableCore::Coder)
+            SyncDurableCore::from_call("send", &json!({ "message": "m", "addressee": "worker" })),
+            Some(SyncDurableCore::Worker)
         ));
         assert!(
             SyncDurableCore::from_call("send", &json!({ "message": "m", "addressee": "manager" }))

@@ -57,7 +57,7 @@
 //! `session_metadata` and `alarms`), `54`, which adds `jobs.custom_launch`
 //! so a boot resume re-addresses a durable round to its custom branch, `55`,
 //! which adds `session_metadata.personal_changes`, and `56`, which adds
-//! `session_metadata.reply_to` so a coder branch's report survives a restart,
+//! `session_metadata.reply_to` so a worker branch's report survives a restart,
 //! and `57`, which adds `session_metadata.context_block_len` so a launch
 //! session's cached leading context block is measured from what was written
 //! rather than re-derived from live workspace state. `58` adds the
@@ -76,9 +76,10 @@
 //! chat window's read and its conversation cap are both served by (see
 //! [`ENSURE_CHAT_HISTORY_CONVERSATION_INDEX`]). `67` adds the trigger-retry
 //! state on `alarms` — when a retried occurrence may run again and how many
-//! attempts in a row did not finish in time.
+//! attempts in a row did not finish in time. `68` renames the `coder` role to
+//! `worker` in the stored data (see [`rename_retired_role_to_worker`]).
 //!
-//! Future schema changes resume the chain at id `68` with monotonically
+//! Future schema changes resume the chain at id `69` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -91,7 +92,7 @@ use anyhow::Context;
 use futures_util::future::BoxFuture;
 use std::collections::HashSet;
 
-use crate::db::{Connection, params};
+use crate::db::{Connection, TxGuard, params};
 
 /// Which physical database a migration targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -968,7 +969,7 @@ INSERT INTO session_personal_changes (agent_id, baseline)
 ///   longer declares it and entry `63` drops it again.
 /// - `56` adds the nullable `session_metadata.reply_to` column — the JSON
 ///   conversation that asked for a branch's launch (the asking custom role's
-///   branch), so a coder branch's report survives a restart and returns there
+///   branch), so a worker branch's report survives a restart and returns there
 ///   (a no-op on fresh installs, whose baseline already declares it).
 /// - `57` adds the nullable `session_metadata.context_block_len` column — the
 ///   length of a launch session's cached leading context block, recorded when
@@ -1220,6 +1221,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "67",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_alarms_retry_state),
+    },
+    Migration {
+        id: "68",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(rename_retired_role_to_worker),
     },
 ];
 
@@ -1573,6 +1579,435 @@ async fn run_add_alarms_retry_state(conn: &Connection) -> anyhow::Result<()> {
     .await
 }
 
+/// Catalog `68`: the retired role name and its replacement, in the two spellings
+/// the product stores it in — the canonical lowercase one every role column,
+/// agent-id prefix and tool-grant kind uses, and serde's variant spelling inside a
+/// JSON `role` value. The single place the retired spelling survives; everything
+/// below is derived from it.
+const ROLE_RENAME: [(&str, &str); 2] = [("coder", "worker"), ("Coder", "Worker")];
+
+/// Catalog `68`: the canonical lowercase pair — the spelling outside a JSON `role`
+/// value.
+const ROLE_NAMES: (&str, &str) = ROLE_RENAME[0];
+
+/// Catalog `68`: the stored JSON columns carrying a role — a queued
+/// [`AgentJob`](crate::agent::message_router::AgentJob) envelope, the
+/// [`crate::Launch`] a durable round was dispatched by, the routed reply that
+/// carries one, and a research run's checkpoint (whose per-round marker list is
+/// named after the role).
+const ROLE_JSON_COLUMNS: &[(&str, &str, &str)] = &[
+    ("pending_jobs", "id", "envelope"),
+    ("jobs", "id", "custom_launch"),
+    ("session_metadata", "agent_id", "reply_to"),
+    ("research_jobs", "id", "state"),
+];
+
+fn rename_retired_role_to_worker(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_rename_retired_role_to_worker(conn))
+}
+
+/// Data migration (`68`): every stored occurrence of the retired role name moves
+/// to the new one, so an upgraded install keeps its branches, their history,
+/// their per-role contexts and its queued work.
+///
+/// The rule is general over the whole store, never a list of known ids: the
+/// role-name columns, the `{role}_{branch}` agent-id prefix of every branch (its
+/// metadata row, its messages, its personal-change baseline and the envelopes
+/// queued for its address), the role inside the stored JSON payloads, and the
+/// kind grammar of a custom role's tool grants — a grant naming a kind the
+/// vocabulary no longer has is dropped on read, so it would silently narrow that
+/// role's tool set.
+///
+/// A branch whose new id already exists is left untouched rather than merged or
+/// deleted — its old id and its old role stay together, so no unique key can
+/// collide and nothing is lost — and a store holding neither spelling is a strict
+/// no-op. Idempotent: a second run matches nothing.
+async fn run_rename_retired_role_to_worker(conn: &Connection) -> anyhow::Result<()> {
+    let (retired, renamed) = ROLE_NAMES;
+    // The runner gives a Rust body no transaction, so the body opens its own: a
+    // crash mid-rename must never strand half a branch.
+    let tx = conn
+        .begin_tx()
+        .await
+        .context("68: failed to begin the role-rename transaction")?;
+    // Branches first: one the collision guard had to skip keeps its old id, and
+    // the role column below deliberately leaves it its old role too, so id and
+    // role never disagree.
+    rename_branch_agent_ids(&tx).await?;
+    tx.execute(
+        "UPDATE session_metadata SET role = ?1 WHERE role = ?2 AND agent_id NOT GLOB ?3",
+        params![renamed, retired, format!("{retired}_*")],
+    )
+    .await
+    .context("68: failed to rename session_metadata.role")?;
+    // Every other column holding a built-in agent role name. `sessions.role` holds
+    // the MESSAGE role (`user`/`assistant`/`tool`), `alarms.role` the name of a
+    // CUSTOM role an alarm is addressed to, and the telemetry tables are
+    // short-lived: none of the three is this rename's.
+    for (table, column) in [
+        ("jobs", "role"),
+        ("agents", "kind"),
+        ("chat_history", "agent_role"),
+        ("ticket_comments", "role"),
+    ] {
+        tx.execute(
+            &format!("UPDATE {table} SET {column} = ?1 WHERE {column} = ?2"),
+            params![renamed, retired],
+        )
+        .await
+        .with_context(|| format!("68: failed to rename {table}.{column}"))?;
+    }
+    rename_stored_role_contexts(&tx).await?;
+    rename_role_in_stored_json(&tx).await?;
+    rename_role_in_stored_grants(&tx).await?;
+    tx.commit()
+        .await
+        .context("68: failed to commit the role rename")
+}
+
+/// Move every per-workspace per-role context to the new name.
+///
+/// The row is the context gathered FOR the role, so it moves rather than being
+/// dropped: a missing one degrades the role to the file-derived fallback until the
+/// workspace is re-discovered. Where a row for the new name already exists the
+/// retired one is dropped — a workspace keeps one context per role, and the row
+/// already under the new name is the one kept.
+async fn rename_stored_role_contexts(tx: &TxGuard<'_>) -> anyhow::Result<()> {
+    let (retired, renamed) = ROLE_NAMES;
+    let rows = tx
+        .query(
+            "SELECT workspace_name, role FROM workspace_contexts WHERE role = ?1 OR role = ?2",
+            params![retired, renamed],
+        )
+        .await
+        .context("68: failed to read the stored workspace contexts")?;
+    let mut retired_rows: Vec<String> = Vec::new();
+    let mut already_renamed: HashSet<String> = HashSet::new();
+    for row in rows {
+        let workspace = row
+            .get::<String>(0)
+            .context("68: failed to read workspace_contexts.workspace_name")?;
+        let role = row
+            .get::<String>(1)
+            .context("68: failed to read workspace_contexts.role")?;
+        if role == renamed {
+            already_renamed.insert(workspace);
+        } else {
+            retired_rows.push(workspace);
+        }
+    }
+    for workspace in retired_rows {
+        if already_renamed.contains(&workspace) {
+            tx.execute(
+                "DELETE FROM workspace_contexts WHERE workspace_name = ?1 AND role = ?2",
+                params![workspace, retired],
+            )
+            .await
+            .context("68: failed to drop the superseded workspace context")?;
+        } else {
+            tx.execute(
+                "UPDATE workspace_contexts SET role = ?1 WHERE workspace_name = ?2 AND role = ?3",
+                params![renamed, workspace, retired],
+            )
+            .await
+            .context("68: failed to rename a stored workspace context")?;
+        }
+    }
+    Ok(())
+}
+
+/// Every stored address carrying the retired branch prefix.
+///
+/// Three places can hold one: a branch's metadata row, its messages, and the
+/// envelopes queued for it — an envelope is persisted before the first turn that
+/// creates the metadata row, so a branch that never ran has only that.
+async fn retired_branch_addresses(tx: &TxGuard<'_>) -> anyhow::Result<Vec<String>> {
+    let (retired, _) = ROLE_NAMES;
+    let pattern = format!("{retired}_*");
+    let mut addresses: Vec<String> = Vec::new();
+    for sql in [
+        "SELECT agent_id FROM session_metadata WHERE agent_id GLOB ?1",
+        "SELECT DISTINCT agent_id FROM sessions WHERE agent_id GLOB ?1",
+        "SELECT target_agent_id FROM pending_jobs WHERE target_agent_id GLOB ?1",
+    ] {
+        let rows = tx
+            .query(sql, params![pattern.as_str()])
+            .await
+            .context("68: failed to read the stored branch addresses")?;
+        for row in rows {
+            let address = row
+                .get::<String>(0)
+                .context("68: failed to read a stored branch address")?;
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+    }
+    Ok(addresses)
+}
+
+/// Whether `candidate` already belongs to another conversation, in any of the
+/// three places a branch address lives.
+async fn branch_address_taken(tx: &TxGuard<'_>, candidate: &str) -> anyhow::Result<bool> {
+    for sql in [
+        "SELECT agent_id FROM session_metadata WHERE agent_id = ?1",
+        "SELECT agent_id FROM sessions WHERE agent_id = ?1",
+        "SELECT id FROM pending_jobs WHERE target_agent_id = ?1",
+    ] {
+        let taken = !tx
+            .query(sql, params![candidate])
+            .await
+            .context("68: failed to probe a branch's target address")?
+            .is_empty();
+        if taken {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Move every branch's session identity to the new role prefix, with the whole
+/// conversation: the metadata row, the messages, the personal-change baseline
+/// (a child row of the metadata row, so it steps aside and returns under the new
+/// key) and the envelopes queued for the branch's address.
+///
+/// Every address is collected from all three places it can sit in — a branch that
+/// was launched but never ran has an envelope and no metadata row yet, and the
+/// envelope is persisted before the row it addresses exists.
+async fn rename_branch_agent_ids(tx: &TxGuard<'_>) -> anyhow::Result<()> {
+    let (retired, renamed) = ROLE_NAMES;
+    let prefix = format!("{retired}_");
+    for old in retired_branch_addresses(tx).await? {
+        let Some(branch) = old.strip_prefix(&prefix) else {
+            continue;
+        };
+        let new = format!("{renamed}_{branch}");
+        if branch_address_taken(tx, &new).await? {
+            continue;
+        }
+        let baseline = tx
+            .query(
+                "SELECT baseline FROM session_personal_changes WHERE agent_id = ?1",
+                params![old.as_str()],
+            )
+            .await
+            .context("68: failed to read a branch's personal-change baseline")?
+            .into_iter()
+            .next()
+            .map(|row| row.get::<String>(0))
+            .transpose()
+            .context("68: failed to read a branch's personal-change baseline")?;
+        // Out of the way, the parent key, then back in: the baseline is a child
+        // of the metadata row this renames.
+        tx.execute(
+            "DELETE FROM session_personal_changes WHERE agent_id = ?1",
+            params![old.as_str()],
+        )
+        .await
+        .context("68: failed to detach a branch's personal-change baseline")?;
+        tx.execute(
+            "UPDATE session_metadata SET agent_id = ?1 WHERE agent_id = ?2",
+            params![new.as_str(), old.as_str()],
+        )
+        .await
+        .context("68: failed to rename a branch's session")?;
+        if let Some(baseline) = baseline {
+            tx.execute(
+                "INSERT INTO session_personal_changes (agent_id, baseline) VALUES (?1, ?2)",
+                params![new.as_str(), baseline],
+            )
+            .await
+            .context("68: failed to reattach a branch's personal-change baseline")?;
+        }
+        tx.execute(
+            "UPDATE sessions SET agent_id = ?1 WHERE agent_id = ?2",
+            params![new.as_str(), old.as_str()],
+        )
+        .await
+        .context("68: failed to move a branch's messages")?;
+        tx.execute(
+            "UPDATE pending_jobs SET target_agent_id = ?1 WHERE target_agent_id = ?2",
+            params![new.as_str(), old.as_str()],
+        )
+        .await
+        .context("68: failed to re-address a branch's queued envelope")?;
+    }
+    Ok(())
+}
+
+/// The new spelling of a stored branch address, when the string is one; `None`
+/// for every other string, so a folder, a name or a report body keeps its text.
+fn renamed_branch_address(text: &str) -> Option<String> {
+    let (retired, renamed) = ROLE_NAMES;
+    text.strip_prefix(&format!("{retired}_"))
+        .map(|rest| format!("{renamed}_{rest}"))
+}
+
+/// The new spelling of one stored tool-grant entry (`tool` or `tool:kind,…`):
+/// the `send` kind grammar names the role, and an entry naming a kind the
+/// vocabulary no longer has is dropped whole on read
+/// ([`crate::tools::grants::parse_lossy`]), which would silently cost that role
+/// the tool. `None` when the entry names the role nowhere.
+fn renamed_grant(entry: &str) -> Option<String> {
+    let (retired, renamed) = ROLE_NAMES;
+    let rewritten = entry
+        .replace(&format!("{retired}_"), &format!("{renamed}_"))
+        .replace(retired, renamed);
+    (rewritten != entry).then_some(rewritten)
+}
+
+/// Rewrite the role name in the stored JSON payloads, in place — the values a
+/// durable envelope, a launch and a research checkpoint carry, and any object key
+/// named after the role. Written only where something changed; a payload that
+/// does not decode is left exactly as it is, never deleted.
+async fn rename_role_in_stored_json(tx: &TxGuard<'_>) -> anyhow::Result<()> {
+    for (table, key, column) in ROLE_JSON_COLUMNS {
+        let rows = tx
+            .query(
+                &format!("SELECT {key}, {column} FROM {table} WHERE {column} IS NOT NULL"),
+                (),
+            )
+            .await
+            .with_context(|| format!("68: failed to read {table}.{column}"))?;
+        for row in rows {
+            let id = row
+                .get::<String>(0)
+                .with_context(|| format!("68: failed to read {table}.{key}"))?;
+            let raw = row
+                .get::<String>(1)
+                .with_context(|| format!("68: failed to read {table}.{column}"))?;
+            let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if !rename_role_in_payload(&mut payload) {
+                continue;
+            }
+            tx.execute(
+                &format!("UPDATE {table} SET {column} = ?1 WHERE {key} = ?2"),
+                params![payload.to_string(), id],
+            )
+            .await
+            .with_context(|| format!("68: failed to rewrite {table}.{column}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite the role name inside one JSON payload, in place. Returns whether
+/// anything changed.
+///
+/// Three keys carry it: a `role` value (in either stored spelling), an `agent_id`
+/// branch address (its prefix) and a `tools` grant list (the kind grammar). An
+/// object key named after the role — a research checkpoint's per-round marker
+/// list — moves too. Nothing else does: a task, a prompt, a custom role's name or
+/// identifier is the owner's own text and keeps it byte-identical.
+fn rename_role_in_payload(payload: &mut serde_json::Value) -> bool {
+    match payload {
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed = rename_role_in_payload(item) || changed;
+            }
+            changed
+        }
+        serde_json::Value::Object(map) => rename_role_in_object(map),
+        _ => false,
+    }
+}
+
+/// [`rename_role_in_payload`]'s object arm: the keys and values that carry the
+/// role, then the recursion into everything under them.
+fn rename_role_in_object(map: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let mut changed = false;
+    let (retired, renamed) = ROLE_NAMES;
+    let prefix = format!("{retired}_");
+    for key in map.keys().cloned().collect::<Vec<_>>() {
+        if let Some(rest) = key.strip_prefix(&prefix).map(str::to_string) {
+            let renamed_key = format!("{renamed}_{rest}");
+            // Only when the payload does not already hold the new key: a value
+            // is never overwritten by its own rename.
+            if !map.contains_key(&renamed_key)
+                && let Some(value) = map.remove(&key)
+            {
+                map.insert(renamed_key, value);
+                changed = true;
+            }
+        }
+    }
+    for (key, value) in map.iter_mut() {
+        match (key.as_str(), &mut *value) {
+            ("role", serde_json::Value::String(role)) => {
+                if let Some((_, renamed)) = ROLE_RENAME.iter().find(|(retired, _)| role == retired)
+                {
+                    *role = (*renamed).to_string();
+                    changed = true;
+                }
+            }
+            ("agent_id", serde_json::Value::String(address)) => {
+                if let Some(renamed) = renamed_branch_address(address) {
+                    *address = renamed;
+                    changed = true;
+                }
+            }
+            ("tools", serde_json::Value::Array(entries)) => {
+                for entry in entries {
+                    let serde_json::Value::String(entry) = entry else {
+                        continue;
+                    };
+                    if let Some(renamed) = renamed_grant(entry) {
+                        *entry = renamed;
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        changed = rename_role_in_payload(value) || changed;
+    }
+    changed
+}
+
+/// Rewrite a custom role's stored tool grants: the `send` kind grammar names the
+/// role, and an entry naming a kind the vocabulary no longer has is dropped on
+/// read ([`crate::tools::grants::parse_lossy`]), which would silently cost that
+/// role the whole tool.
+async fn rename_role_in_stored_grants(tx: &TxGuard<'_>) -> anyhow::Result<()> {
+    let rows = tx
+        .query("SELECT name, tools FROM custom_roles", ())
+        .await
+        .context("68: failed to read the stored custom-role grants")?;
+    for row in rows {
+        let name = row
+            .get::<String>(0)
+            .context("68: failed to read custom_roles.name")?;
+        let raw = row
+            .get::<String>(1)
+            .context("68: failed to read custom_roles.tools")?;
+        let Ok(mut entries) = serde_json::from_str::<Vec<String>>(&raw) else {
+            continue;
+        };
+        let mut changed = false;
+        for entry in &mut entries {
+            if let Some(renamed) = renamed_grant(entry) {
+                *entry = renamed;
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let encoded = serde_json::to_string(&entries)
+            .context("68: failed to encode a custom role's tool grants")?;
+        tx.execute(
+            "UPDATE custom_roles SET tools = ?1 WHERE name = ?2",
+            params![encoded, name],
+        )
+        .await
+        .context("68: failed to rewrite a custom role's tool grants")?;
+    }
+    Ok(())
+}
+
 fn add_jobs_custom_launch(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_jobs_custom_launch(conn))
 }
@@ -1610,7 +2045,7 @@ fn add_session_metadata_reply_to(conn: &Connection) -> BoxFuture<'_, anyhow::Res
 
 /// Upfill the nullable `session_metadata.reply_to` column for databases created
 /// before delta `56` — the JSON conversation that asked for a branch's launch
-/// (the asking custom role's branch and the folder its turn ran in), so a coder
+/// (the asking custom role's branch and the folder its turn ran in), so a worker
 /// branch's report survives a restart and returns there. Fresh installs get the
 /// column from entry `24`'s `CREATE TABLE`, so the probe makes this a no-op
 /// there. Guarded by [`add_column_if_missing`], so this body is idempotent
@@ -1862,7 +2297,7 @@ const RETIRED_LIFECYCLE_MARKERS: &[&str] = &[
 /// case-folded, its stage-list separators (` and `, `, `, ` then `) are
 /// normalized to `/`, and the `reviewer`/`reviewers` role names are folded out —
 /// so `Review/QA`, `review and QA` and `review then QA` all hit, while a role
-/// list like `analyst/coder/qa/reviewer/sanitation` does not (the reviewer role
+/// list like `analyst/worker/qa/reviewer/sanitation` does not (the reviewer role
 /// survives the merge; only the retired *stage* names are probed, and the fold's
 /// placeholder carries no stage word).
 fn describes_retired_lifecycle(content: &str) -> bool {
@@ -3464,7 +3899,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63`/`65`–`67` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63`/`65`–`68` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -3492,10 +3927,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67"
+                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–67 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–68 tail exactly"
         );
     }
 
@@ -4133,7 +4568,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4142,7 +4577,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–67"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–68"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -4521,7 +4956,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for id in [
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67",
+            "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4530,7 +4965,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–67"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–68"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -4932,7 +5367,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "every phase owns a short-lived `jobs` row",
             "reviewing the diff is what the reviewer does",
             "the reviewer and the analyst read the same tree",
-            "the model slots split inspector roles (analyst/coder/qa/reviewer/sanitation) from the rest",
+            "the model slots split inspector roles (analyst/worker/qa/reviewer/sanitation) from the rest",
             "`review.rs` and `qa.rs` were merged",
         ] {
             assert!(
@@ -5086,7 +5521,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             (Some("engineer"), phase_list),
             (Some("qa"), "the board keeps IN_REVIEW and IN_QA columns"),
             (Some("manager"), spaced_lifecycle),
-            (Some("coder"), "no retired stage is named here"),
+            (Some("worker"), "no retired stage is named here"),
         ] {
             conn.execute(
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
@@ -5200,7 +5635,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "the spaced lifecycle prose names a retired stage"
         );
         assert_eq!(
-            contexts.get("coder"),
+            contexts.get("worker"),
             Some(&"no retired stage is named here".to_string()),
             "a description naming no retired stage survives verbatim"
         );
@@ -5310,7 +5745,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         for (role, content) in [
             ("engineer", already_ran),
             ("qa", diagnostics_phase),
-            ("coder", same_round),
+            ("worker", same_round),
             ("manager", running_service),
         ] {
             conn.execute(
@@ -5417,7 +5852,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "naming the diagnostics phase as a prior stage describes the retired arrangement"
         );
         assert_eq!(
-            contexts.get("coder"),
+            contexts.get("worker"),
             Some(&same_round.to_string()),
             "a same-round description must survive verbatim"
         );
@@ -5625,6 +6060,465 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             users_image_gen_models(&conn).await.get("alice"),
             Some(&Some(RETIRED_IMAGE_GEN_MODEL.to_string())),
             "a later deliberate re-add of the retired id must be kept: one-shot"
+        );
+    }
+    /// Catalog `68` carries every branch of the role across the rename — the
+    /// conversation, the queued work and the gathered context — as one general
+    /// rule, and a store holding no such branch is a no-op it survives.
+    #[expect(clippy::too_many_lines)] // one fixture per stored corner of the rename
+    #[tokio::test]
+    async fn the_role_rename_moves_every_branch_with_its_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        let entry_68 = MIGRATIONS
+            .iter()
+            .position(|m| m.id == "68")
+            .expect("entry 68 in the catalog");
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..entry_68])
+            .await
+            .expect("catalog through 67");
+
+        let now = "2026-10-18T00:00:00Z".to_string();
+        conn.execute(
+            "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) \
+             VALUES ('ws', '/ws', 'ready', ?1, ?1, 0)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        // Two branches, so the rule is exercised as a rewrite over the store
+        // rather than one known id.
+        for branch in ["rlx-stand-2", "another"] {
+            conn.execute(
+                "INSERT INTO session_metadata (agent_id, last_activity, role, user_name, \
+                 workspace_name, custom_identifier, message_count) \
+                 VALUES (?1, ?2, 'coder', 'admin', 'personal:admin', ?3, 1)",
+                params![format!("coder_{branch}"), now.clone(), branch],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (agent_id, role, content, created_at) \
+                 VALUES (?1, 'user', 'earlier words', ?2)",
+                params![format!("coder_{branch}"), now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO session_personal_changes (agent_id, baseline) \
+             VALUES ('coder_rlx-stand-2', '{}')",
+            (),
+        )
+        .await
+        .unwrap();
+        for (id, target) in [("P1", "coder_rlx-stand-2"), ("P2", "coder_unlaunched")] {
+            // `P2` addresses a branch the launch persisted but never ran: no
+            // metadata row exists for it yet.
+            conn.execute(
+                "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    id,
+                    target,
+                    format!(
+                        "{{\"role\":\"Coder\",\"content\":\"go on\",\
+                         \"custom_role\":{{\"role\":\"Coder\",\"agent_id\":\"{target}\"}}}}"
+                    ),
+                    now.clone()
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        // The routed reply a launch carries, and its own durable launch column.
+        conn.execute(
+            "UPDATE session_metadata SET reply_to = ?1 WHERE agent_id = 'coder_another'",
+            params![
+                "{\"launch\":{\"role\":\"Coder\",\"agent_id\":\"coder_rlx-stand-2\"},\
+                  \"workspace\":\"ws\"}"
+            ],
+        )
+        .await
+        .unwrap();
+        for (role, content) in [
+            (Some("coder"), "the context gathered for the role"),
+            (Some("engineer"), "someone else's context"),
+        ] {
+            conn.execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 VALUES ('ws', ?1, ?2, ?3)",
+                params![role, content, now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        // The role's other recorded corners: a job, a roster row, chat history, an
+        // alarm aimed at a branch, and a custom role's stored grant grammar.
+        conn.execute(
+            "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, channel, \
+             retry_count, status, created_at, updated_at) \
+             VALUES ('J1', 'implement', 'coder', 'ws', '', 'admin', '', 0, 'done', ?1, ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET custom_launch = ?1 WHERE id = 'J1'",
+            params![
+                "{\"role\":\"Coder\",\"name\":\"\",\"identifier\":\"rlx-stand-2\",\
+                  \"prompt\":\"\",\"tools\":[],\"agent_id\":\"coder_rlx-stand-2\"}"
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (job_id, agent_id, kind, status, task) \
+             VALUES ('J1', 'A1', 'coder', 'done', '')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, channel, \
+             retry_count, status, created_at, updated_at) \
+             VALUES ('R1', 'research', 'assistant', 'ws', '', 'admin', '', 0, 'launched', ?1, ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, channel, \
+             retry_count, status, created_at, updated_at, custom_launch) \
+             VALUES ('C1', 'rolerun', 'custom', 'ws', '', 'admin', '', 0, 'launched', ?1, ?1, ?2)",
+            params![
+                now.clone(),
+                "{\"role\":\"Custom\",\"name\":\"coder_helper\",\
+                  \"identifier\":\"coder_daily\",\"prompt\":\"Be coder-like.\",\
+                  \"tools\":[\"send:coder,coder_branch\",\"read\"],\
+                  \"agent_id\":\"rolerun_coder_helper:coder_daily\"}"
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO research_jobs (id, state) VALUES ('R1', ?1)",
+            params![
+                "{\"stage\":\"Synthesis\",\"round_index\":2,\n \
+                  \"coder_rounds_done\":[0]}"
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_history (message_id, user_name, direction, content, agent_role, \
+             workspace) VALUES ('M1', 'admin', 'out', 'done', 'coder', 'ws')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO alarms (id, session_id, user_name, kind, text, next_fire_at, status, \
+             created_at, role, identifier) \
+             VALUES ('A1', 's', 'admin', 'agent', '', ?1, 'active', ?1, 'coder', 'rlx-stand-2')",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO custom_roles (name, prompt, tools, behavior, created_at) \
+             VALUES ('writer', '', '[\"send:coder,coder_branch\",\"read\"]', 'continuous', ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("the rename migrates");
+
+        let ids: Vec<String> = conn
+            .query(
+                "SELECT agent_id FROM session_metadata ORDER BY agent_id",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "worker_another".to_string(),
+                "worker_rlx-stand-2".to_string()
+            ],
+            "every branch moves, and no old-named row may be left beside it"
+        );
+        let messages: Vec<(String, String)> = conn
+            .query(
+                "SELECT agent_id, content FROM sessions ORDER BY agent_id",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()))
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                ("worker_another".to_string(), "earlier words".to_string()),
+                (
+                    "worker_rlx-stand-2".to_string(),
+                    "earlier words".to_string()
+                ),
+            ],
+            "the conversation moves with the branch id"
+        );
+        let baselines: Vec<(String, String)> = conn
+            .query(
+                "SELECT agent_id, baseline FROM session_personal_changes",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()))
+            .collect();
+        assert_eq!(
+            baselines,
+            vec![("worker_rlx-stand-2".to_string(), "{}".to_string())],
+            "the branch's baseline is a child of the renamed row and moves with it"
+        );
+        let queued: Vec<(String, String)> = conn
+            .query(
+                "SELECT target_agent_id, envelope FROM pending_jobs ORDER BY id",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()))
+            .collect();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|(target, _)| target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["worker_rlx-stand-2", "worker_unlaunched"],
+            "every queued envelope is re-addressed, including one for a branch with no row yet"
+        );
+        for (id, (target, envelope)) in ["P1", "P2"].into_iter().zip(&queued) {
+            assert!(
+                envelope.contains("\"Worker\"") && envelope.contains(target),
+                "{id}: the envelope must carry the new role and branch address: {envelope}"
+            );
+            assert!(
+                !envelope.contains("Coder") && !envelope.contains("coder_"),
+                "{id}: no old spelling may survive inside the payload: {envelope}"
+            );
+        }
+        let contexts = workspace_context_rows(&conn).await;
+        assert_eq!(
+            contexts.get("worker").map(String::as_str),
+            Some("the context gathered for the role"),
+            "the context gathered for the role stays with it"
+        );
+        assert_eq!(
+            contexts.get("engineer").map(String::as_str),
+            Some("someone else's context"),
+            "another role's context is untouched"
+        );
+        assert!(!contexts.contains_key("coder"), "the old key is gone");
+        for (query, expected) in [
+            ("SELECT role FROM jobs WHERE id = 'J1'", "worker"),
+            ("SELECT kind FROM agents WHERE job_id = 'J1'", "worker"),
+            (
+                "SELECT agent_role FROM chat_history WHERE message_id = 'M1'",
+                "worker",
+            ),
+            (
+                "SELECT role FROM session_metadata WHERE agent_id = 'worker_another'",
+                "worker",
+            ),
+            (
+                "SELECT tools FROM custom_roles WHERE name = 'writer'",
+                "[\"send:worker,worker_branch\",\"read\"]",
+            ),
+            (
+                // A custom role's name is the owner's own text: an alarm addressed
+                // to a role called `coder` keeps it.
+                "SELECT role FROM alarms WHERE id = 'A1'",
+                "coder",
+            ),
+        ] {
+            let value = conn.query(query, ()).await.unwrap()[0]
+                .get::<String>(0)
+                .unwrap();
+            assert_eq!(value, expected, "{query}");
+        }
+
+        // The remaining JSON carriers: the launch a durable round was dispatched
+        // by, the routed reply that carries one, and a research checkpoint whose
+        // per-round marker list is named after the role.
+        for (query, needed) in [
+            (
+                "SELECT custom_launch FROM jobs WHERE id = 'J1'",
+                ["Worker", "worker_rlx-stand-2"],
+            ),
+            (
+                "SELECT reply_to FROM session_metadata WHERE agent_id = 'worker_another'",
+                ["Worker", "worker_rlx-stand-2"],
+            ),
+            (
+                "SELECT state FROM research_jobs WHERE id = 'R1'",
+                ["worker_rounds_done", "round_index"],
+            ),
+        ] {
+            let raw = conn.query(query, ()).await.unwrap()[0]
+                .get::<String>(0)
+                .unwrap();
+            for needle in needed {
+                assert!(
+                    raw.contains(&format!("\"{needle}\"")),
+                    "{query} must carry {needle}: {raw}"
+                );
+            }
+            assert!(
+                !raw.contains("Coder") && !raw.contains("coder_"),
+                "{query} kept an old spelling: {raw}"
+            );
+        }
+
+        // A custom role's own words are the owner's: its name, identifier, prompt
+        // and address keep every letter, while the `send` kinds in its stored
+        // grant follow the vocabulary like the `custom_roles` column does.
+        let launch = conn
+            .query("SELECT custom_launch FROM jobs WHERE id = 'C1'", ())
+            .await
+            .unwrap()[0]
+            .get::<String>(0)
+            .unwrap();
+        for kept in [
+            "coder_helper",
+            "coder_daily",
+            "Be coder-like.",
+            "rolerun_coder_helper:coder_daily",
+        ] {
+            assert!(launch.contains(kept), "{kept} must survive: {launch}");
+        }
+        assert!(
+            launch.contains("send:worker,worker_branch"),
+            "the stored grant is rewritten: {launch}"
+        );
+
+        // A second run of the body matches nothing.
+        rename_retired_role_to_worker(&conn)
+            .await
+            .expect("the rename re-runs");
+        let after: Vec<String> = conn
+            .query(
+                "SELECT agent_id FROM session_metadata ORDER BY agent_id",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(after, ids, "the rename is idempotent");
+    }
+
+    /// The rename never merges into or clobbers a branch already under the new
+    /// name: the existing one keeps its history, the old one is left alone, and a
+    /// workspace whose new-name context already exists keeps that context.
+    #[tokio::test]
+    async fn the_role_rename_collides_with_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        let entry_68 = MIGRATIONS
+            .iter()
+            .position(|m| m.id == "68")
+            .expect("entry 68 in the catalog");
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..entry_68])
+            .await
+            .expect("catalog through 67");
+        let now = "2026-10-18T00:00:00Z".to_string();
+        conn.execute(
+            "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) \
+             VALUES ('ws', '/ws', 'ready', ?1, ?1, 0)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        for (id, role) in [("coder_same", "coder"), ("worker_same", "worker")] {
+            conn.execute(
+                "INSERT INTO session_metadata (agent_id, last_activity, role, message_count) \
+                 VALUES (?1, ?2, ?3, 1)",
+                params![id, now.clone(), role],
+            )
+            .await
+            .unwrap();
+        }
+        for (role, content) in [(Some("coder"), "stale"), (Some("worker"), "current")] {
+            conn.execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 VALUES ('ws', ?1, ?2, ?3)",
+                params![role, content, now.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("the rename migrates on a colliding store");
+        let ids: Vec<String> = conn
+            .query(
+                "SELECT agent_id FROM session_metadata ORDER BY agent_id",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["coder_same".to_string(), "worker_same".to_string()],
+            "the existing new-name branch is never overwritten"
+        );
+        let roles: Vec<String> = conn
+            .query("SELECT role FROM session_metadata ORDER BY agent_id", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["coder".to_string(), "worker".to_string()],
+            "the branch that had to be skipped keeps its old role beside its old id"
+        );
+        let contexts = workspace_context_rows(&conn).await;
+        assert_eq!(
+            contexts.get("worker").map(String::as_str),
+            Some("current"),
+            "the context already under the new name is the one kept"
+        );
+        assert!(
+            !contexts.contains_key("coder"),
+            "the superseded key is gone"
         );
     }
 }

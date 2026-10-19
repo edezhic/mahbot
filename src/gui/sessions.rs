@@ -160,11 +160,11 @@ struct CachedSessionItem {
     /// `None` when the session has no workspace (or an empty one).
     workspace_name: Option<String>,
     /// The custom role this session belongs to, when it is a custom-role
-    /// session — its name titles the row instead of `title`. `None` for a coder
+    /// session — its name titles the row instead of `title`. `None` for a worker
     /// branch.
     custom_role: Option<String>,
     /// The named branch this continuable session continues, when the branch was
-    /// named — a custom role's identifier, or a coder branch's name.
+    /// named — a custom role's identifier, or a worker branch's name.
     custom_identifier: Option<String>,
     /// Pre-formatted message count string.
     msg_count_label: String,
@@ -178,8 +178,8 @@ struct CachedSessionItem {
 impl CachedSessionItem {
     /// The row's title as the list shows it. A custom-role session is titled by
     /// the role it belongs to — and its branch, when the branch was named —
-    /// instead of the user/workspace name every other role shows; a coder branch
-    /// is titled `Coder · <branch>` so it is distinguishable from a single coder
+    /// instead of the user/workspace name every other role shows; a worker branch
+    /// is titled `Worker · <branch>` so it is distinguishable from a single worker
     /// run.
     ///
     /// A workspace's manager and maintainer belong to exactly one registered
@@ -192,8 +192,8 @@ impl CachedSessionItem {
             (Some(crate::Role::Custom), Some(name)) => {
                 custom_role_title(name, self.custom_identifier.as_deref())
             }
-            (Some(crate::Role::Coder), None) => match self.custom_identifier.as_deref() {
-                Some(branch) => format!("Coder{}", branch_suffix(branch)),
+            (Some(crate::Role::Worker), None) => match self.custom_identifier.as_deref() {
+                Some(branch) => format!("Worker{}", branch_suffix(branch)),
                 None => self.title.clone(),
             },
             (Some(role @ (crate::Role::Manager | crate::Role::Maintainer)), _) => self

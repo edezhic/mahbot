@@ -122,7 +122,7 @@ impl Tool for MahbotConfigTool {
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "(create_custom_role / update_custom_role) The chosen subset of your own tools: each entry is a tool name, optionally `name:kind1,kind2` for a tool with kinds (`analyze:quick,deep`, `send:coder,coder_branch,manager,role`); a bare name grants the tool's narrowest kind. An unknown name, an unknown kind and a duplicate are refused. Omit for no tools."
+                    "description": "(create_custom_role / update_custom_role) The chosen subset of your own tools: each entry is a tool name, optionally `name:kind1,kind2` for a tool with kinds (`analyze:quick,deep`, `send:worker,worker_branch,manager,role`); a bare name grants the tool's narrowest kind. An unknown name, an unknown kind and a duplicate are refused. Omit for no tools."
                 },
                 "behavior": {
                     "type": "string",
@@ -692,7 +692,7 @@ mod tests {
         crate::custom_role::create(
             "kind_grants_probe",
             "you hold kinds",
-            &["analyze".to_string(), "send:coder,manager".to_string()],
+            &["analyze".to_string(), "send:worker,manager".to_string()],
             CustomRoleBehavior::Continuous,
         )
         .await
@@ -704,7 +704,7 @@ mod tests {
             .unwrap();
         assert!(out.contains("kind_grants_probe"), "{out}");
         assert!(
-            out.contains("tools: analyze:quick, send:coder,manager"),
+            out.contains("tools: analyze:quick, send:worker,manager"),
             "the listing spells a bare entry's narrowest kind and keeps the stored kinds: {out}"
         );
     }

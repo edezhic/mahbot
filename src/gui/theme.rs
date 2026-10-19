@@ -172,9 +172,9 @@ pub fn role_badge_color(role: &str) -> (Color, Color) {
 pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     match role {
         crate::Role::Manager => lucide::bot(),
-        crate::Role::Engineer => lucide::hammer(),
+        crate::Role::Engineer => lucide::code(),
         crate::Role::Analyst => lucide::scan_search(),
-        crate::Role::Coder => lucide::code(),
+        crate::Role::Worker => lucide::hammer(),
         crate::Role::Qa => lucide::gavel(),
         crate::Role::Maintainer => lucide::cog(),
         crate::Role::Discovery => lucide::search(),
@@ -1061,7 +1061,7 @@ mod tests {
             (TEXT_MUTED, badge_bg(TEXT_MUTED))
         );
         assert_eq!(
-            role_badge_color("coder_abc"),
+            role_badge_color("worker_abc"),
             (TEXT_MUTED, badge_bg(TEXT_MUTED))
         );
     }
@@ -1156,7 +1156,7 @@ mod tests {
         // all flow through the same tuple invariant.
         for name in [
             "analyst_final",
-            "coder_abc",
+            "worker_abc",
             "user",
             "assistant",
             "system",
@@ -1428,7 +1428,7 @@ mod tests {
                 "{author} should resolve to an icon"
             );
         }
-        for author in ["system", "user:admin", "analyst_1", "coder", ""] {
+        for author in ["system", "user:admin", "analyst_1", "worker", ""] {
             assert!(
                 comment_author_icon(author).is_none(),
                 "{author} must render as plain muted text"

@@ -124,9 +124,9 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             display_label: "Analyst",
             ..BASE_ROLE_INFO
         },
-        Role::Coder => &RoleInfo {
+        Role::Worker => &RoleInfo {
             badge_fg: (0.353, 0.604, 0.416),
-            display_label: "Coder",
+            display_label: "Worker",
             ..BASE_ROLE_INFO
         },
         Role::Qa => &RoleInfo {
@@ -318,7 +318,7 @@ impl Role {
     }
 
     /// Core full-shell/read/edit/search tools for the build roles
-    /// (Engineer, Coder).
+    /// (Engineer, Worker).
     fn full_core_tools() -> Vec<Box<dyn Tool>> {
         vec![
             Box::new(ShellTool::new(ShellMode::Full)),
@@ -393,7 +393,7 @@ impl Role {
         t.push(Box::new(ReadTool::new(file_access)));
         if is_admin {
             t.push(Box::new(ShellTool::new(ShellMode::Full)));
-            // The coder and the branch surface, and the Manager/custom-role
+            // The worker and the branch surface, and the Manager/custom-role
             // addressees — one tool, chosen per call.
             t.push(Box::new(SendTool::admin(Role::Assistant)));
             // The admin's session is a trusted local session, so the
@@ -476,7 +476,7 @@ impl Role {
                 t.push(Box::new(ChromeTool::new(chrome_sessions)));
                 t
             }
-            Role::Coder => Self::full_core_tools(),
+            Role::Worker => Self::full_core_tools(),
             // QA runs the build roles' unrestricted shell so it can start the
             // product or its service and observe it while it runs. The mode is
             // the only thing it shares with them: no `edit`, and the
@@ -792,11 +792,11 @@ mod tests {
             props(&both, "analyze")["depth"]["enum"],
             serde_json::json!(["quick", "deep"])
         );
-        let coders = granted(&["send:coder,coder_branch"]);
-        let send = props(&coders, "send");
+        let workers = granted(&["send:worker,worker_branch"]);
+        let send = props(&workers, "send");
         assert_eq!(
             send["addressee"]["enum"],
-            serde_json::json!(["coder", "coder_branch"]),
+            serde_json::json!(["worker", "worker_branch"]),
             "only the granted addressees are offered: {send:?}"
         );
         assert!(
@@ -805,18 +805,18 @@ mod tests {
         );
         assert!(
             send.contains_key("branch"),
-            "`coder_branch` takes a branch name: {send:?}"
+            "`worker_branch` takes a branch name: {send:?}"
         );
-        let branch_only = granted(&["send:coder_branch"]);
+        let branch_only = granted(&["send:worker_branch"]);
         let send = props(&branch_only, "send");
         assert_eq!(
             send["addressee"]["enum"],
-            serde_json::json!(["coder_branch"]),
-            "a coder_branch-only holder declares the choice it holds: {send:?}"
+            serde_json::json!(["worker_branch"]),
+            "a worker_branch-only holder declares the choice it holds: {send:?}"
         );
         assert!(
             send.contains_key("branch"),
-            "a coder_branch holder requires its branch — the continuing kind does \
+            "a worker_branch holder requires its branch — the continuing kind does \
              not imply the single run: {send:?}"
         );
         let manager = granted(&["send:manager"]);
@@ -833,7 +833,7 @@ mod tests {
         let bare = granted(&["send"]);
         assert_eq!(
             props(&bare, "send")["addressee"]["enum"],
-            serde_json::json!(["coder"]),
+            serde_json::json!(["worker"]),
             "a bare entry is the narrowest kind, declared and required like any other"
         );
     }
@@ -897,7 +897,7 @@ mod tests {
     #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
     fn qa_toolset_is_the_build_shell_without_edit() {
         // Acceptance pin: QA verifies runtime behaviour by starting the product
-        // or its service, so it runs the engineer/coder shell (Full mode,
+        // or its service, so it runs the engineer/worker shell (Full mode,
         // background included) — but it must not change the workspace, so it
         // gets no `edit`. The prohibition itself is prompt text
         // (`prompt/role/qa.md`), not a tool restriction.

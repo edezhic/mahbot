@@ -592,7 +592,7 @@ impl Agent {
     /// question/task text explicitly.
     ///
     /// `launch` is the launch this agent runs under — a custom role's (name,
-    /// authorial prompt, tool subset, branch address) or a coder branch's
+    /// authorial prompt, tool subset, branch address) or a worker branch's
     /// address. `Some` only for a branch role. It is attached to the session so
     /// the system prompt is assembled from it (see `Session::append_turn_message`).
     #[must_use]
@@ -1768,7 +1768,7 @@ impl Agent {
                     }
                     Err(e) => {
                         // Drain-cut suspension: the tool's durable work (e.g. a
-                        // sync analyze/coder round) was deliberately left
+                        // sync analyze/worker round) was deliberately left
                         // launched for deterministic resume. The outcome is
                         // marked `suspended` so the tool-result commit SKIPS it
                         // — the call's frame is already durably persisted and
@@ -2936,7 +2936,7 @@ impl Drop for RunEndCleanup {
 /// Returns `(agent, None)` on error (already logged).
 ///
 /// `launch` is the launch this run executes — `Some` for a branch role (a
-/// custom role's authorial prompt and tool subset taken at launch, or a coder
+/// custom role's authorial prompt and tool subset taken at launch, or a worker
 /// branch's address); `None` for every built-in role.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
@@ -5237,11 +5237,11 @@ mod tests {
         };
         let calls = || fake.request_fingerprints.lock().unwrap().len();
 
-        // Pipeline working roles and coder branches keep the pre-turn behaviour.
+        // Pipeline working roles and worker branches keep the pre-turn behaviour.
         for role in [
             crate::Role::Engineer,
             crate::Role::Analyst,
-            crate::Role::Coder,
+            crate::Role::Worker,
             crate::Role::Maintainer,
         ] {
             over_threshold(role).maybe_summarize_after_delivery().await;
@@ -6756,14 +6756,14 @@ mod tests {
         let pin = "frame_window_pin";
         let conn = &crate::session::store().conn;
 
-        // One dangling `send` coder call, emitted AFTER the stale round below.
+        // One dangling `send` worker call, emitted AFTER the stale round below.
         let mut session = Session::default();
         let frame = assistant_replay_payload(
             Some(""),
             &[crate::ToolCall {
-                id: "call_coder_now".to_string(),
+                id: "call_worker_now".to_string(),
                 name: "send".to_string(),
-                arguments: serde_json::json!({"message": "the new task", "addressee": "coder"}),
+                arguments: serde_json::json!({"message": "the new task", "addressee": "worker"}),
             }],
             None,
         )
@@ -6779,7 +6779,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The leftover of an EARLIER frame: a launched coder round with a stored
+        // The leftover of an EARLIER frame: a launched worker round with a stored
         // outcome, backdated behind the frame row above.
         crate::jobs::spawn_job(
             conn,
@@ -6790,8 +6790,8 @@ mod tests {
             "telegram",
             crate::Role::Engineer,
             &[crate::jobs::NewAgent {
-                agent_id: "stale_frame_job_coder".to_string(),
-                kind: crate::jobs::AgentKind::Coder,
+                agent_id: "stale_frame_job_worker".to_string(),
+                kind: crate::jobs::AgentKind::Worker,
                 idx: Some(0),
                 task: "the old task".to_string(),
             }],
@@ -6805,7 +6805,7 @@ mod tests {
         crate::jobs::write_agent_outcome(
             conn,
             "stale_frame_job",
-            "stale_frame_job_coder",
+            "stale_frame_job_worker",
             crate::jobs::RowStatus::Done,
             Some("STALE_RESULT"),
         )
@@ -6832,7 +6832,7 @@ mod tests {
             let payload: crate::ToolResultPayload = serde_json::from_str(&msg.content).unwrap();
             per_call.insert(payload.tool_call_id, payload.content);
         }
-        let content = per_call.get("call_coder_now").expect("the call settles");
+        let content = per_call.get("call_worker_now").expect("the call settles");
         assert!(
             !content.contains("STALE_RESULT"),
             "the earlier frame's report must never become this call's result: {content}"

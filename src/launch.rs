@@ -1,10 +1,10 @@
-//! Launching and stopping a continuable branch: a custom role's, or a coder
+//! Launching and stopping a continuable branch: a custom role's, or a worker
 //! branch's.
 //!
 //! Both kinds are normal durable envelopes ([`crate::Launch`]) persisted BEFORE
 //! they are routed, so they survive a restart, and stopped through one path.
-//! A custom role runs the administrator's authored role; a coder branch runs a
-//! normal [`crate::Role::Coder`] agent on a continuation of its own conversation.
+//! A custom role runs the administrator's authored role; a worker branch runs a
+//! normal [`crate::Role::Worker`] agent on a continuation of its own conversation.
 
 use anyhow::Result;
 
@@ -108,29 +108,29 @@ pub(crate) async fn custom_role(
     ))
 }
 
-/// Launch (or continue) a coder branch — a normal [`crate::Role::Coder`] agent on
-/// the persistent conversation `coder_{branch}`.
+/// Launch (or continue) a worker branch — a normal [`crate::Role::Worker`] agent on
+/// the persistent conversation `worker_{branch}`.
 ///
 /// `place` is the folder the branch works in, already resolved by the same rule
-/// as a single coder run (so a registered project, anything inside one, the
+/// as a single worker run (so a registered project, anything inside one, the
 /// filesystem root and the product's data directory were refused before this is
 /// called); `None` runs in `caller_ws` — the caller's own workspace, where a
-/// coder runs today when none is given. A later use pointing at another folder
+/// worker runs today when none is given. A later use pointing at another folder
 /// runs it there; the branch name identifies the conversation and its history,
 /// so the same name resumes the same conversation. Returns a one-line
-/// acknowledgement with no job number — a coder branch's report arrives when its
+/// acknowledgement with no job number — a worker branch's report arrives when its
 /// turn finishes, not as a durable round.
 ///
 /// `asker` is the launch of the custom role that asked, when one did: it makes
 /// the report return into the asking role's branch rather than the admin's
-/// Assistant, addressed by the caller's own workspace. A coder branch has
+/// Assistant, addressed by the caller's own workspace. A worker branch has
 /// nothing to configure and no place in Settings.
 ///
 /// `answered_for` decides what a failed durable write means — see
 /// [`crate::agent::message_router::hand_over`]. An agent's producer keeps the
 /// best-effort route on a failed write; the command line's gets the failure back
 /// and the launch does NOT happen.
-pub(crate) async fn coder_branch(
+pub(crate) async fn worker_branch(
     caller_ws: &crate::Workspace,
     branch: &str,
     message: &str,
@@ -143,16 +143,16 @@ pub(crate) async fn coder_branch(
         "usage: the message must not be empty"
     );
     let branch = branch.trim();
-    crate::custom_role::validate_coder_branch(branch)?;
+    crate::custom_role::validate_worker_branch(branch)?;
 
     // The branch's folder ADDRESS: the caller's own workspace name when no
-    // folder was given (where a coder runs today when none is), otherwise the
+    // folder was given (where a worker runs today when none is), otherwise the
     // canonical folder path — the same durable address a custom role's launch
     // stores for a folder, so the next turn and a recovery resolve the branch
     // back into the same place.
     let workspace_name = place.map_or_else(|| caller_ws.name.clone(), |ws| ws.path.clone());
 
-    let agent_id = crate::session::coder_branch_agent_id(branch);
+    let agent_id = crate::session::worker_branch_agent_id(branch);
     // The report returns to the conversation that asked: this branch's own
     // address when a custom role asked (the launch carries the asker), the
     // admin's Assistant otherwise. The routed job's destination is read from the
@@ -163,7 +163,7 @@ pub(crate) async fn coder_branch(
         workspace: caller_ws.name.clone(),
     });
     let launch = crate::Launch {
-        role: crate::Role::Coder,
+        role: crate::Role::Worker,
         name: String::new(),
         identifier: Some(branch.to_string()),
         prompt: String::new(),
@@ -176,26 +176,26 @@ pub(crate) async fn coder_branch(
 
     // Durable delivery: the envelope is persisted BEFORE it is routed (and
     // BEFORE any session write), so a restart between the two replays it at boot.
-    crate::agent::message_router::hand_over(job, &agent_id, "coder branch launch", answered_for)
+    crate::agent::message_router::hand_over(job, &agent_id, "worker branch launch", answered_for)
         .await?;
 
     // The acknowledgement names the resolved folder path, exactly as the
-    // single-run coder's does (same trimmed spelling) — the branch's durable
+    // single-run worker's does (same trimmed spelling) — the branch's durable
     // address stays in `workspace_name`.
     let folder = place.map_or_else(|| caller_ws.path.clone(), |ws| ws.path.clone());
     let folder = folder.trim_end_matches(std::path::MAIN_SEPARATOR);
     Ok(format!(
-        "Coder branch '{branch}' is on it in {folder}; its report arrives as a <coder-report> message."
+        "Worker branch '{branch}' is on it in {folder}; its report arrives as a <worker-report> message."
     ))
 }
 
 /// How a branch is named in the lists: a custom role's name (plus its branch
-/// identifier when it was named), or a coder branch's own label.
+/// identifier when it was named), or a worker branch's own label.
 #[must_use]
 pub(crate) fn display_label(launch: &crate::Launch) -> String {
     let identifier = launch.identifier.as_deref();
     match launch.role {
-        crate::Role::Coder => format!("Coder branch \"{}\"", identifier.unwrap_or_default()),
+        crate::Role::Worker => format!("Worker branch \"{}\"", identifier.unwrap_or_default()),
         _ => match identifier {
             Some(id) => format!("Custom role \"{}\" — branch \"{id}\"", launch.name),
             None => format!("Custom role \"{}\"", launch.name),

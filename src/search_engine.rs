@@ -167,7 +167,7 @@ async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), String> {
     }
 
     // A completed scan may legitimately leave the index empty — an empty
-    // workspace, or an ephemeral run folder the coder hasn't written yet.
+    // workspace, or an ephemeral run folder the worker hasn't written yet.
     // The live filesystem watcher populates the index incrementally as
     // files appear, so we return empty results rather than erroring.
     //

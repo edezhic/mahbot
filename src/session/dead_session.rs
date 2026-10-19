@@ -341,7 +341,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         // User/Tool tails stay exempt: answering a pending user prompt matches
         // normal direct-chat behavior, which a workspace pause does not freeze.
         // A custom role is exempt too: a workspace pause freezes only launches
-        // tied to a ticket, never a continuable branch (a custom role's or a coder
+        // tied to a ticket, never a continuable branch (a custom role's or a worker
         // branch's).
         if needs_pause_guard && !is_continuable_branch(role, agent_id) {
             match crate::workspace::get_by_name(&ctx.workspace_name).await {
@@ -413,7 +413,7 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
 
     // A custom-role branch is resumable only while its record still exists: the
     // record owns the authorial prompt and the tool subset, so a deleted role
-    // leaves nothing to run. Abandon the branch permanently in that case. A coder
+    // leaves nothing to run. Abandon the branch permanently in that case. A worker
     // branch carries no record — its branch name is enough to rebuild the launch.
     let launch = if role == Role::Custom {
         let Some(name) = ctx.custom_role.as_deref() else {
@@ -453,15 +453,15 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
                 return true;
             }
         }
-    } else if role == Role::Coder && crate::session::is_coder_branch_agent_id(agent_id) {
+    } else if role == Role::Worker && crate::session::is_worker_branch_agent_id(agent_id) {
         // The branch name is the recorded identifier, or — when that write
         // failed — the agent id's own suffix, which is the same name.
         let branch = ctx
             .custom_identifier
             .clone()
-            .or_else(|| crate::session::coder_branch_name(agent_id).map(str::to_string));
+            .or_else(|| crate::session::worker_branch_name(agent_id).map(str::to_string));
         Some(crate::Launch {
-            role: Role::Coder,
+            role: Role::Worker,
             name: String::new(),
             identifier: branch,
             prompt: String::new(),
@@ -505,7 +505,7 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
         pending_job_id: None,
         originating_workspace: None,
         custom_role: launch,
-        // A recovered coder branch's asker travels on its launch above
+        // A recovered worker branch's asker travels on its launch above
         // (`Launch::reply_to`), read by the report path; this field's remaining
         // user is the Manager leg.
         reply_to_custom: None,
@@ -515,13 +515,13 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
     true
 }
 
-/// Whether a dead session is a continuable branch — a custom role's or a coder
+/// Whether a dead session is a continuable branch — a custom role's or a worker
 /// branch's. Such a session is exempt from the workspace-pause guard: a pause
 /// freezes only launches tied to a ticket, never a branch.
 fn is_continuable_branch(role: Role, agent_id: &str) -> bool {
     match role {
         Role::Custom => true,
-        Role::Coder => crate::session::is_coder_branch_agent_id(agent_id),
+        Role::Worker => crate::session::is_worker_branch_agent_id(agent_id),
         _ => false,
     }
 }
@@ -563,20 +563,20 @@ mod tests {
         );
     }
 
-    /// A coder branch survives a restart: the poller rebuilds its launch from the
+    /// A worker branch survives a restart: the poller rebuilds its launch from the
     /// recorded branch name — no role record is needed — and re-routes the
     /// unfinished turn with the conversation that asked restored, so the report
     /// returns there instead of the admin's Assistant.
     #[tokio::test]
-    async fn attempt_recovery_rebuilds_a_coder_branch_with_its_asker() {
+    async fn attempt_recovery_rebuilds_a_worker_branch_with_its_asker() {
         crate::util::test::init_management_test_stores().await;
-        let branch = crate::session::coder_branch_agent_id("night");
+        let branch = crate::session::worker_branch_agent_id("night");
         let asker_folder = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
         let ctx = SessionContext {
             channel: "gui".to_string(),
             user_name: crate::users::ADMIN_USER_NAME.to_string(),
             workspace_name: asker_folder.clone(),
-            role: Role::Coder.as_str().to_string(),
+            role: Role::Worker.as_str().to_string(),
             custom_role: None,
             custom_identifier: Some("night".to_string()),
             reply_to: Some(crate::agent::message_router::Asker {
@@ -594,16 +594,16 @@ mod tests {
         };
         let mut rx = crate::agent::message_router::register_agent(&branch);
         assert!(
-            attempt_recovery(&branch, &ctx, Role::Coder).await,
-            "a coder branch is recoverable"
+            attempt_recovery(&branch, &ctx, Role::Worker).await,
+            "a worker branch is recoverable"
         );
         let job = rx.try_recv().expect("the retry job is routed");
         assert_eq!(job.kind, MessageKind::RecoveryRetry);
-        assert_eq!(job.role, Role::Coder);
+        assert_eq!(job.role, Role::Worker);
         let launch = job
             .custom_role
-            .expect("a coder branch's job carries its launch");
-        assert_eq!(launch.role, Role::Coder);
+            .expect("a worker branch's job carries its launch");
+        assert_eq!(launch.role, Role::Worker);
         assert_eq!(launch.identifier.as_deref(), Some("night"));
         assert_eq!(
             launch

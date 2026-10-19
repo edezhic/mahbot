@@ -222,13 +222,13 @@ pub(crate) const CUSTOM_ROLE_AGENT_ID_PREFIX: &str = "role_";
 /// ordinary session lifetime.
 pub(crate) const CUSTOM_ROLE_RUN_AGENT_ID_PREFIX: &str = "rolerun_";
 
-/// Agent-id prefix of a coder branch — `coder_{branch}`. A coder branch is a
+/// Agent-id prefix of a worker branch — `worker_{branch}`. A worker branch is a
 /// continuable conversation like a custom role's branch: it is deliberately NOT
 /// in [`TRANSIENT_AGENT_ID_PREFIXES`] (never TTL-purged) and IS recovered by the
 /// dead-session poller, but it is in the wider [`reserved_agent_id_prefixes`]
 /// union so no direct user id can shadow it. It is NOT in
 /// [`non_user_facing_agent_id_prefixes`]: the branch is user-facing.
-pub(crate) const CODER_BRANCH_AGENT_ID_PREFIX: &str = "coder_";
+pub(crate) const WORKER_BRANCH_AGENT_ID_PREFIX: &str = "worker_";
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMetadata {
@@ -245,11 +245,11 @@ pub(crate) struct SessionMetadata {
     pub user_name: Option<String>,
     pub workspace_name: Option<String>,
     /// The custom role this session belongs to, when it is a custom-role
-    /// session; `None` for a coder branch (whose branch name is in
+    /// session; `None` for a worker branch (whose branch name is in
     /// `custom_identifier`).
     pub custom_role: Option<String>,
     /// The named branch this continuable session continues, when the branch was
-    /// named — a custom role's identifier, or a coder branch's name.
+    /// named — a custom role's identifier, or a worker branch's name.
     pub custom_identifier: Option<String>,
     /// Whether the launch was stopped before it produced anything.
     pub launch_stopped: bool,
@@ -278,14 +278,14 @@ pub(crate) struct SessionContext {
     /// Agent role (e.g. `"engineer"`, `"analyst"`, `"reviewer"`).
     pub role: String,
     /// The custom role this session belongs to, when it is a custom-role
-    /// session; `None` for a coder branch (whose branch name is in
+    /// session; `None` for a worker branch (whose branch name is in
     /// `custom_identifier`).
     pub custom_role: Option<String>,
     /// The named branch this continuable session continues, when the branch was
-    /// named — a custom role's identifier, or a coder branch's name.
+    /// named — a custom role's identifier, or a worker branch's name.
     pub custom_identifier: Option<String>,
     /// The conversation that asked for this branch's launch, when one did — the
-    /// asking custom role's branch and the folder its turn ran in, so a coder
+    /// asking custom role's branch and the folder its turn ran in, so a worker
     /// branch's report returns there (see [`crate::Launch::reply_to`]). `None`
     /// for an owner- or alarm-started launch, and for every session recorded
     /// before the `reply_to` column existed.
@@ -1479,7 +1479,7 @@ impl SessionStore {
     }
 
     /// Record this session's branch kind and address — a custom role's name and
-    /// the named branch it continues, or a coder branch's `None` role name and
+    /// the named branch it continues, or a worker branch's `None` role name and
     /// its branch name — plus the conversation that asked for it, so the session
     /// can be resumed as the same branch without parsing the agent ID. All three
     /// columns are written in ONE upsert, on every appending turn of a branch
@@ -1710,15 +1710,15 @@ pub(crate) fn non_user_facing_agent_id_prefixes() -> impl Iterator<Item = &'stat
 
 /// The union a **user-facing direct agent id** must never start with: every
 /// non-user-facing prefix ([`non_user_facing_agent_id_prefixes`]) plus
-/// [`CUSTOM_ROLE_AGENT_ID_PREFIX`] and [`CODER_BRANCH_AGENT_ID_PREFIX`], which a
+/// [`CUSTOM_ROLE_AGENT_ID_PREFIX`] and [`WORKER_BRANCH_AGENT_ID_PREFIX`], which a
 /// direct id must also not shadow.
 ///
 /// A real user whose name collides with any of these is escaped with a `user_`
 /// prefix by [`safe_user_segment`] — so a user literally named `role` becomes
-/// `user_role`, protecting the start of a custom-role or coder-branch address.
+/// `user_role`, protecting the start of a custom-role or worker-branch address.
 pub(crate) fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
     non_user_facing_agent_id_prefixes()
-        .chain([CUSTOM_ROLE_AGENT_ID_PREFIX, CODER_BRANCH_AGENT_ID_PREFIX])
+        .chain([CUSTOM_ROLE_AGENT_ID_PREFIX, WORKER_BRANCH_AGENT_ID_PREFIX])
 }
 
 /// Case-insensitive (ASCII) [`str::starts_with`], matching Turso's `LIKE`
@@ -1988,26 +1988,26 @@ pub(crate) fn custom_role_run_agent_id(name: &str) -> String {
     )
 }
 
-/// Construct the agent ID of a coder branch.
+/// Construct the agent ID of a worker branch.
 ///
-/// Format: `coder_{branch}` — deterministic, so the next message on the same
+/// Format: `worker_{branch}` — deterministic, so the next message on the same
 /// branch resumes the same session; the branch persists like a direct
-/// conversation (see [`CODER_BRANCH_AGENT_ID_PREFIX`]).
+/// conversation (see [`WORKER_BRANCH_AGENT_ID_PREFIX`]).
 #[must_use]
-pub(crate) fn coder_branch_agent_id(branch: &str) -> String {
-    format!("{CODER_BRANCH_AGENT_ID_PREFIX}{branch}")
+pub(crate) fn worker_branch_agent_id(branch: &str) -> String {
+    format!("{WORKER_BRANCH_AGENT_ID_PREFIX}{branch}")
 }
 
-/// Whether `agent_id` addresses a coder branch ([`CODER_BRANCH_AGENT_ID_PREFIX`]).
+/// Whether `agent_id` addresses a worker branch ([`WORKER_BRANCH_AGENT_ID_PREFIX`]).
 #[must_use]
-pub(crate) fn is_coder_branch_agent_id(agent_id: &str) -> bool {
-    agent_id.starts_with(CODER_BRANCH_AGENT_ID_PREFIX)
+pub(crate) fn is_worker_branch_agent_id(agent_id: &str) -> bool {
+    agent_id.starts_with(WORKER_BRANCH_AGENT_ID_PREFIX)
 }
 
-/// The branch name inside a coder branch's agent id, when the id is one.
+/// The branch name inside a worker branch's agent id, when the id is one.
 #[must_use]
-pub(crate) fn coder_branch_name(agent_id: &str) -> Option<&str> {
-    agent_id.strip_prefix(CODER_BRANCH_AGENT_ID_PREFIX)
+pub(crate) fn worker_branch_name(agent_id: &str) -> Option<&str> {
+    agent_id.strip_prefix(WORKER_BRANCH_AGENT_ID_PREFIX)
 }
 
 /// Whether a custom role's `name` may not be used: it IS a built-in
@@ -3243,9 +3243,9 @@ mod transient_prefix_tests {
             "ticket_agent_id('abc123', 'analyst')",
         );
         assert_transient_key(
-            &analyze_agent_id("ws", "coder"),
+            &analyze_agent_id("ws", "worker"),
             "analyze_",
-            "analyze_agent_id('ws', 'coder')",
+            "analyze_agent_id('ws', 'worker')",
         );
         assert_transient_key(
             &research_agent_id("ws", "decomposer"),

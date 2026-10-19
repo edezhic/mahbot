@@ -20,7 +20,7 @@ use crate::research_cleanup::COMMAND_DUMP_FILE;
 ///    orchestrator observes it at its next round/stage boundary and stops —
 ///    it must not spawn further rounds, synthesize, terminalize, or dispatch
 ///    a cleanup agent.
-/// 2. Cancel every agent of the run (analysts, verifier, coder, and the
+/// 2. Cancel every agent of the run (analysts, verifier, worker, and the
 ///    cleanup agent if one was already dispatched) as a group via the run's
 ///    parent key. Cancellation is cooperative: an in-flight tool or LLM call
 ///    may finish, but no further work happens and no new sub-agents spawn.
