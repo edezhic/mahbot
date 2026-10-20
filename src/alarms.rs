@@ -374,7 +374,11 @@ async fn validate_alarm_target(
         .filter(|w| !w.is_empty())
     {
         None => None,
-        Some(raw) => Some(crate::launch::resolve_launch_workspace(&raw).await?),
+        Some(raw) => Some(
+            crate::launch::launch_workspace(Some(raw.as_str()))
+                .await?
+                .name,
+        ),
     };
     anyhow::ensure!(
         !has_trigger,
@@ -714,15 +718,21 @@ async fn fire_custom_role_alarm(alarm: &Alarm) -> Result<()> {
     let (reason, removed) = if crate::custom_role::get(role).await?.is_none() {
         ("the custom role no longer exists".to_string(), true)
     } else {
-        match crate::launch::custom_role(
-            role,
-            &alarm.text,
-            alarm.identifier.as_deref(),
-            alarm.workspace.as_deref(),
-            crate::agent::message_router::AnsweredFor::Agent,
-        )
-        .await
-        {
+        // The launch runs in the folder the alarm was armed for; a folder that
+        // no longer resolves is a launch failure like any other.
+        let launched = async {
+            let workspace = crate::launch::launch_workspace(alarm.workspace.as_deref()).await?;
+            crate::launch::custom_role(
+                role,
+                &alarm.text,
+                alarm.identifier.as_deref(),
+                &workspace,
+                crate::agent::message_router::AnsweredFor::Agent,
+            )
+            .await
+        }
+        .await;
+        match launched {
             Ok(_) => {
                 // The launch is already persisted durably before it is routed
                 // (see `launch::custom_role`), so the state advance runs after,

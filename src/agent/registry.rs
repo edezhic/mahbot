@@ -17,6 +17,7 @@
 //! so the GUI re-renders — see the per-method broadcast points below.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -416,6 +417,23 @@ impl AgentRegistry {
                 handle
             })
             .collect()
+    }
+
+    /// The worker or custom-role agent working in `folder` right now, other
+    /// than `caller` (an agent id) — the roles that edit a folder's tree; a
+    /// worker branch is a [`crate::Role::Worker`] and counts like any other
+    /// worker.
+    ///
+    /// Path equality is component-based, so a registered workspace's stored
+    /// trailing separator is not a different folder.
+    #[must_use]
+    pub fn worker_in_folder(&self, folder: &Path, caller: Option<&str>) -> Option<AgentHandle> {
+        self.list().into_iter().find(|agent| {
+            let role = agent.role.as_str();
+            (role == crate::Role::Worker.as_str() || role == crate::Role::Custom.as_str())
+                && Some(agent.agent_id.as_str()) != caller
+                && Path::new(&agent.workspace_path) == folder
+        })
     }
 
     /// Check whether an agent with the given `agent_id` is registered.

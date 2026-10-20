@@ -33,11 +33,10 @@ fn launch_job(
 /// Launch `name`'s custom role with `message` as the launch message.
 ///
 /// `branch` selects a continuable named branch; without one the record's
-/// behaviour decides (one common branch, or a one-off run). `place` names a
-/// registered workspace, a `personal:{user}` workspace or any folder on the
-/// machine; `None` runs in the owner's personal folder, exactly as the owner's
-/// Assistant does. The launch is persisted as a durable envelope BEFORE it is
-/// routed, so it survives a restart. Returns a one-line confirmation for the caller.
+/// behaviour decides (one common branch, or a one-off run). `workspace` is the
+/// folder the launch runs in, already resolved by [`launch_workspace`]. The
+/// launch is persisted as a durable envelope BEFORE it is routed, so it survives
+/// a restart. Returns a one-line confirmation for the caller.
 ///
 /// `answered_for` decides what a failed durable write means — see
 /// [`crate::agent::message_router::hand_over`]. An agent's producer keeps the
@@ -47,7 +46,7 @@ pub(crate) async fn custom_role(
     name: &str,
     message: &str,
     branch: Option<&str>,
-    place: Option<&str>,
+    workspace: &crate::Workspace,
     answered_for: crate::agent::message_router::AnsweredFor,
 ) -> Result<String> {
     anyhow::ensure!(
@@ -63,14 +62,6 @@ pub(crate) async fn custom_role(
     if let Some(id) = identifier {
         crate::custom_role::validate_identifier(id)?;
     }
-
-    // Resolve the workspace address: `None` (or empty/whitespace) runs in the
-    // owner's personal folder; a named value must resolve to a registered
-    // workspace, a `personal:{user}` key or an absolute path.
-    let workspace_name = match place.map(str::trim).filter(|w| !w.is_empty()) {
-        None => crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-        Some(raw) => resolve_launch_workspace(raw).await?,
-    };
 
     // Resolve the branch address: an explicit identifier resumes/creates that
     // named branch; otherwise the record's behaviour picks between the one
@@ -96,7 +87,7 @@ pub(crate) async fn custom_role(
         agent_id: agent_id.clone(),
         reply_to: None,
     };
-    let job = launch_job(message.to_string(), workspace_name.clone(), launch);
+    let job = launch_job(message.to_string(), workspace.name.clone(), launch);
 
     // Durable delivery: the envelope is persisted BEFORE it is routed, so a
     // restart between the two replays it at boot.
@@ -104,7 +95,8 @@ pub(crate) async fn custom_role(
         .await?;
 
     Ok(format!(
-        "custom role '{name}' launched on branch {agent_id} in {workspace_name}"
+        "custom role '{name}' launched on branch {agent_id} in {}",
+        workspace.name
     ))
 }
 
@@ -237,19 +229,25 @@ pub(crate) async fn stop(agent_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a launch's `place` argument into the workspace ADDRESS stored with the
-/// launch — the resolved workspace's own name: a registered workspace keeps its
-/// name (whether the launch named it by name or by its folder), `personal:{user}`
-/// its key, and any other folder its canonical absolute path
-/// ([`crate::workspace::synthesize_from_path`] names a path workspace by the path
-/// itself, so all three are durable keys [`crate::users::resolve_workspace`] can
-/// resolve back).
-pub(crate) async fn resolve_launch_workspace(raw: &str) -> Result<String> {
-    let ws = crate::users::resolve_workspace(raw).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "usage: the place must be a registered workspace name or an absolute path \
-             to an existing directory"
-        )
-    })?;
-    Ok(ws.name)
+/// Resolve a launch's `place` into the workspace the launch runs in — the
+/// workspace ADDRESS stored with the launch is its `name`: a registered
+/// workspace keeps its name (whether the launch named it by name or by its
+/// folder), `personal:{user}` its key, and any other folder its canonical
+/// absolute path ([`crate::workspace::synthesize_from_path`] names a path
+/// workspace by the path itself, so all three are durable keys
+/// [`crate::users::resolve_workspace`] can resolve back). An absent, empty or
+/// whitespace `place` runs in the owner's personal folder, exactly as the
+/// owner's Assistant does.
+pub(crate) async fn launch_workspace(place: Option<&str>) -> Result<crate::Workspace> {
+    match place.map(str::trim).filter(|w| !w.is_empty()) {
+        None => Ok(crate::users::personal_workspace_struct(
+            crate::users::ADMIN_USER_NAME,
+        )),
+        Some(raw) => crate::users::resolve_workspace(raw).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: the place must be a registered workspace name or an absolute path \
+                 to an existing directory"
+            )
+        }),
+    }
 }

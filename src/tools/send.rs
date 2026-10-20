@@ -18,6 +18,9 @@
 //! asked, the Manager answers as an `<manager-message>`, and a custom role's
 //! answer arrives as a `<custom-role-message>`. Argument mechanics and refusals
 //! live in [`super::delegation`] and [`crate::launch`].
+//!
+//! Every call that would start a worker or a custom role first refuses a folder
+//! another one is already working in (see `refuse_busy_folder`).
 
 use crate::prompt::load_prompt;
 use crate::tools::Tool;
@@ -248,6 +251,39 @@ fn labelled(labels: &[&str], note: &str) -> String {
         .collect::<Vec<_>>()
         .join("/");
     format!("{names}: {note}")
+}
+
+/// Refuse to start a worker or a custom role in a folder another one is already
+/// working in — the one check `send` makes before anything is enqueued or
+/// dispatched, since two agents in one folder overwrite each other's edits.
+///
+/// It answers for what is running right now, so it needs nothing written down: a
+/// finished run is no longer in the registry and the very next call to that
+/// folder goes through. That also means a call racing another is deliberately
+/// missed — it catches the model that forgot, not a determined one.
+fn refuse_busy_folder(folder: &Workspace) -> Result<()> {
+    // The caller is not ANOTHER agent: its own run is the one dispatching, and a
+    // custom role handing a worker its own folder is the normal delegation. The
+    // command line has no session of its own.
+    let caller = crate::agent::tool_agent_id().ok();
+    let Some(running) = crate::agent::registry::AGENT_REGISTRY
+        .worker_in_folder(folder.as_path(), caller.as_deref())
+    else {
+        return Ok(());
+    };
+    let working = if running.role == Role::Worker.as_str() {
+        "a worker"
+    } else {
+        "a custom role"
+    };
+    // The folder as the acknowledgements spell it — the resolved path, one way.
+    let folder = folder.path.trim_end_matches(std::path::MAIN_SEPARATOR);
+    Err(anyhow::anyhow!(
+        "usage: {working} is already working in {folder}; the message was not sent, because two \
+         agents in one folder overwrite each other's edits and parallel agents that can collide \
+         must not be started in one folder — hint: split the work across different folders, or wait \
+         for the running one to finish, then send again."
+    ))
 }
 
 pub struct SendTool {
@@ -622,6 +658,7 @@ impl Tool for SendTool {
             Addressee::Worker => {
                 if !self.dispatch_mode.is_async() {
                     // The Engineer's sync worker run: the report returns inline.
+                    refuse_busy_folder(ws)?;
                     return super::SyncDurableCore::Worker
                         .run_sync_dispatch(ws, message, self.caller_role)
                         .await;
@@ -629,6 +666,7 @@ impl Tool for SendTool {
                 // A worker round writes outside the registered projects: only a
                 // durable background round can honour the optional `place`.
                 let place = self.optional_place(&args).await?;
+                refuse_busy_folder(place.as_ref().unwrap_or(ws))?;
                 let job_id = crate::generate_id();
                 if Self::command_line() {
                     // Answered and gone the moment this returns: the round's
@@ -665,6 +703,7 @@ impl Tool for SendTool {
                 // worker run — the branch may not be a way around the worker's
                 // refusals.
                 let place = self.optional_place(&args).await?;
+                refuse_busy_folder(place.as_ref().unwrap_or(ws))?;
                 // Read the asker before the launch: the report returns to the
                 // conversation that asked.
                 let asker = crate::agent::tool_custom_launch();
@@ -730,13 +769,16 @@ impl Tool for SendTool {
                 let name = super::get_str(&args, Argument::Name.as_str())?;
                 // Read through the declaring filter like every other optional
                 // argument. `place` here is NOT resolved the way a worker's is:
-                // `launch::custom_role` accepts the personal-workspace spelling
-                // too, which the worker's refusals do not.
+                // `launch::launch_workspace` accepts the personal-workspace
+                // spelling too, which the worker's refusals do not.
+                let workspace =
+                    crate::launch::launch_workspace(self.optional(&args, Argument::Place)?).await?;
+                refuse_busy_folder(&workspace)?;
                 crate::launch::custom_role(
                     name,
                     message,
                     self.optional(&args, Argument::Branch)?,
-                    self.optional(&args, Argument::Place)?,
+                    &workspace,
                     Self::answered_for(),
                 )
                 .await
@@ -1433,6 +1475,141 @@ mod tests {
                     .expect("delete the harness's own envelope");
             }
         }
+    }
+
+    /// One folder holds one worker: a `send` that would start a second one there
+    /// is refused before anything is dispatched, and the same call goes through
+    /// again the moment the running one is gone — the check is what is running
+    /// now, not what was sent earlier.
+    #[tokio::test]
+    #[serial_test::serial(provider, channel_registry, drain)]
+    async fn a_busy_folder_is_refused_until_the_running_worker_finishes() {
+        use std::sync::Arc;
+
+        crate::util::test::init_management_test_stores().await;
+        let _policy =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let _provider = crate::util::test::install_fake_provider(Arc::new(
+            crate::util::test::FakeProvider::new().ok("the work is done"),
+        ));
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+
+        let home = tempfile::tempdir().unwrap();
+        let caller = crate::workspace::test_ws_named(
+            home.path().to_str().unwrap(),
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let folder =
+            crate::util::strip_verbatim_prefix(&std::fs::canonicalize(dir.path()).unwrap())
+                .to_str()
+                .unwrap()
+                .to_string();
+
+        let send = SendTool::admin(Role::Assistant);
+
+        // A worker working in that folder, registered the way a running one is.
+        let running = format!("busy_folder_{}", crate::generate_suffix());
+        let generation = crate::agent::registry::AGENT_REGISTRY.register(
+            running.clone(),
+            Role::Worker.as_str().to_string(),
+            None,
+            &crate::Workspace::ephemeral_run(&running, dir.path()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        let jobs_before = job_ids_of_kind("implement", TURN_CHANNEL).await;
+        // The folder by its RAW temp path (on macOS behind the `/var` symlink):
+        // the guard compares what the product resolves a folder to, never the
+        // spelling a call happens to use.
+        let err = dispatch(
+            &send,
+            &caller,
+            json!({
+                "message": "write it",
+                "addressee": "worker",
+                "place": dir.path().to_str().unwrap(),
+            }),
+        )
+        .await
+        .expect_err("a worker is already working in that folder");
+        let err = err.to_string();
+        for expected in [
+            "usage: a worker is already working in",
+            folder.as_str(),
+            "the message was not sent",
+            "parallel agents that can collide must not be started in one folder",
+            "split the work across different folders",
+            "wait for the running one to finish",
+        ] {
+            assert!(
+                err.contains(expected),
+                "the refusal must say {expected:?}: {err}"
+            );
+        }
+        assert!(
+            !job_ids_of_kind("implement", TURN_CHANNEL)
+                .await
+                .iter()
+                .any(|id| !jobs_before.contains(id)),
+            "a refused call dispatches nothing: {err}"
+        );
+        // It is the folder that is busy, not the tool: another folder is fine.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(
+            refuse_busy_folder(&crate::Workspace::ephemeral_run(
+                "elsewhere",
+                elsewhere.path()
+            ))
+            .is_ok(),
+            "a folder nothing runs in is never refused"
+        );
+
+        // The run finishes — no release, no timeout: the entry is simply gone.
+        crate::agent::registry::AGENT_REGISTRY.deregister(&running, generation);
+
+        // What is left in the folder is the CALLER's own run, which is never the
+        // other agent: a custom role handing a worker its own folder is the
+        // normal delegation (see `refuse_busy_folder`).
+        let own = format!("busy_folder_own_{}", crate::generate_suffix());
+        let own_generation = crate::agent::registry::AGENT_REGISTRY.register(
+            own.clone(),
+            Role::Custom.as_str().to_string(),
+            None,
+            &crate::Workspace::ephemeral_run(&own, dir.path()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some(own.clone()), async {
+                refuse_busy_folder(&crate::Workspace::ephemeral_run("own", dir.path()))
+            })
+            .await
+            .expect("the caller's own run never blocks its own call");
+        crate::agent::registry::AGENT_REGISTRY.deregister(&own, own_generation);
+
+        // The very same call to that folder now goes through.
+        let mut spy = Spy::register(&crate::session::assistant_agent_id(
+            crate::users::ADMIN_USER_NAME,
+        ));
+        dispatch(
+            &send,
+            &caller,
+            json!({ "message": "write it", "addressee": "worker", "place": &folder }),
+        )
+        .await
+        .expect("an idle folder takes a worker");
+        let report = spy.report("<worker-report").await;
+        assert!(
+            report.content.contains(&folder),
+            "the worker really ran in that folder: {}",
+            report.content
+        );
     }
 
     /// A provider whose every call parks until the test opens the gate, so a
