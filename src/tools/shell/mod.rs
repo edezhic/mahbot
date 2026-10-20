@@ -55,7 +55,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use regex::RegexSet;
 use serde_json::json;
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -976,6 +976,226 @@ fn spawn_pipe_reader(
     })
 }
 
+/// A capture pipe that hands every byte it delivers to the run's [`CompleteOutput`]
+/// as well: the budget decides what stays inline, never what is kept at all.
+struct TeeReader<R> {
+    pipe: R,
+    output: Option<CompleteOutput>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for TeeReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let filled = buf.filled().len();
+        let result = std::pin::Pin::new(&mut this.pipe).poll_read(cx, buf);
+        if result.is_ready()
+            && let Some(output) = &this.output
+        {
+            output.write(&buf.filled()[filled..]);
+        }
+        result
+    }
+}
+
+/// Where a direct run's complete output goes once it outgrows the inline budget
+/// ([`TOOL_OUTPUT_BUDGET_BYTES`]): a file in the directory the caller named,
+/// holding every byte the program printed — both streams, as their readers take
+/// them — rather than the prefix the [`CaptureBudget`] keeps inline.
+///
+/// The product's one rule for such a file: it sits where the caller's own file
+/// tools can read it, is recorded in [`SPILL_OWNERS`] as it is created (a sweep
+/// asks [`is_live_spill_name`] again before deleting, for the instant between),
+/// and is deleted when the caller's run ends — a failed or dropped run included.
+/// Only a completed run's answer names the file; a run that could not complete
+/// reports its own error and the file goes with the run, unread.
+///
+/// Nothing is created until the budget is crossed: an output that fits is
+/// returned from the captured streams exactly as before. The budget counts the
+/// raw pipe bytes while the inline result is the decoded, ANSI-stripped string,
+/// so escape-heavy output can spill although its decoded form would have fit —
+/// the safe direction, since the file keeps what the inline result would drop.
+/// The file holds the raw streams (interleaved as their readers take them,
+/// neither ANSI-stripped nor credential-scrubbed) because keeping them
+/// byte-for-byte is the point; the summary built from it is scrubbed like any
+/// inline result, and a later `read` of the file is an ordinary read of a file on
+/// the user's disk, which needs no case of its own. What it cannot fix is the
+/// reader: past the read tool's own size cap the file is not openable through it,
+/// and a confined guest has no shell — an accepted limit.
+///
+/// The bytes are written from the reader's own task as they arrive, synchronously
+/// and under one lock the two streams share: a run that prints far faster than
+/// the disk takes it slows its readers (and so its own pipes), and each write
+/// holds the runtime thread for its duration — a few kilobytes at a time.
+#[derive(Clone)]
+struct CompleteOutput(std::sync::Arc<CompleteOutputInner>);
+
+struct CompleteOutputInner {
+    dir: PathBuf,
+    /// The [`SPILL_OWNERS`] key, resolved where the run is created: the file is
+    /// written from reader tasks of their own, where the tool's task-local
+    /// identity is not set.
+    owner: String,
+    state: std::sync::Mutex<SpillState>,
+}
+
+enum SpillState {
+    /// Below the budget: held in memory, no file yet.
+    Buffered(Vec<u8>),
+    /// Past it: the file holds the run's output from its first byte.
+    Spilling(Spilled),
+    /// No file: either one could not be kept — the run falls back to the
+    /// captured streams, which is the truncation this file exists to avoid — or
+    /// [`CompleteOutput::finish`] already built the answer from it.
+    Unavailable,
+}
+
+impl CompleteOutput {
+    fn new(dir: &Path) -> Self {
+        Self(std::sync::Arc::new(CompleteOutputInner {
+            dir: dir.to_path_buf(),
+            owner: spill_owner_key(),
+            state: std::sync::Mutex::new(SpillState::Buffered(Vec::new())),
+        }))
+    }
+
+    /// Take bytes a run's readers have just read, before the capture budget
+    /// charges them: they are the program's output whether or not they are kept
+    /// inline.
+    fn write(&self, bytes: &[u8]) {
+        let mut state = self.0.state.lock().unwrap_poison();
+        let mut next = None;
+        match &mut *state {
+            SpillState::Unavailable => {}
+            SpillState::Spilling(spilled) => {
+                if !spilled.append(bytes) {
+                    tracing::warn!(
+                        path = %spilled.path.display(),
+                        "complete-output file stopped taking the run's output",
+                    );
+                    let _ = std::fs::remove_file(&spilled.path);
+                    next = Some(SpillState::Unavailable);
+                }
+            }
+            SpillState::Buffered(buffered) => {
+                buffered.extend_from_slice(bytes);
+                if buffered.len() > TOOL_OUTPUT_BUDGET_BYTES {
+                    next = Some(
+                        if let Some(spilled) = Self::start_file(&self.0.dir, buffered) {
+                            record_spill_owner_as(&self.0.owner, spilled.path.clone());
+                            SpillState::Spilling(spilled)
+                        } else {
+                            tracing::warn!(
+                                dir = %self.0.dir.display(),
+                                "could not keep the run's complete output in a file",
+                            );
+                            SpillState::Unavailable
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(next) = next {
+            *state = next;
+        }
+    }
+
+    /// Start the run's file with the bytes buffered so far; `None` when it cannot
+    /// be kept (no create, or the first write failed).
+    fn start_file(dir: &Path, buffered: &[u8]) -> Option<Spilled> {
+        let mut spilled = Spilled::create(dir)?;
+        if spilled.append(buffered) {
+            return Some(spilled);
+        }
+        let _ = std::fs::remove_file(&spilled.path);
+        None
+    }
+
+    /// The caller's answer: once the run outgrew the budget, the product's spill
+    /// summary naming the file that now holds the output whole. Takes the state,
+    /// so bytes a straggling reader delivers after the summary is built are
+    /// dropped rather than appended to a file nobody will mention again.
+    fn finish(&self, output: String) -> String {
+        let state = std::mem::replace(
+            &mut *self.0.state.lock().unwrap_poison(),
+            SpillState::Unavailable,
+        );
+        match state {
+            SpillState::Spilling(spilled) => file_spill_preview(&spilled),
+            _ => output,
+        }
+    }
+}
+
+/// A direct run's complete output on disk.
+struct Spilled {
+    path: PathBuf,
+    file: std::fs::File,
+    bytes: usize,
+    newlines: usize,
+    last_newline: bool,
+}
+
+impl Spilled {
+    /// Reserve a fresh file in `dir`: create-new, so a name the caller already
+    /// has is never overwritten and two runs never share one.
+    fn create(dir: &Path) -> Option<Self> {
+        std::fs::create_dir_all(dir).ok()?;
+        for _ in 0..SPILL_NAME_ATTEMPTS {
+            let path = dir.join(crate::tools::path::format_spill_filename());
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Some(Self {
+                        path,
+                        file,
+                        bytes: 0,
+                        newlines: 0,
+                        last_newline: true,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// Append to the file; `false` when it can no longer take the run's output.
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        use std::io::Write as _;
+
+        if bytes.is_empty() {
+            return true;
+        }
+        if self.file.write_all(bytes).is_err() {
+            return false;
+        }
+        self.bytes += bytes.len();
+        self.newlines += bytes
+            .iter()
+            .fold(0, |lines, byte| lines + usize::from(*byte == b'\n'));
+        self.last_newline = bytes.last() == Some(&b'\n');
+        true
+    }
+
+    /// The line count `str::lines` would report for the file.
+    fn lines(&self) -> usize {
+        self.newlines + usize::from(!self.last_newline)
+    }
+}
+
+/// How many attempts a fresh complete-output name is given: `create_new`
+/// guarantees the name that succeeds is new, so the retries exist only for the
+/// random 16-bit identifier colliding with a file already there.
+const SPILL_NAME_ATTEMPTS: usize = 16;
+
 /// One capture reader of a run: the live buffer it fills, and the reading task or
 /// its end once it finished. A completed [`tokio::task::JoinHandle`] must never be
 /// awaited again (tokio panics on a re-poll), so its state is recorded in its place.
@@ -1425,6 +1645,10 @@ impl Drop for KillOnDrop {
 /// every run the same way — the process group the child leads — while Windows
 /// gives a job object only to an agent's run. A plan run's members get the same
 /// containment through [`plan::run`], which spawns them the same way.
+///
+/// `spill` keeps the run's complete output when a caller needs it whole: every
+/// byte read off both pipes goes there as well, so output past the capture cap
+/// is kept in a file instead of being read and discarded.
 async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
     timeout: Duration,
@@ -1432,6 +1656,7 @@ async fn run_command_with_timeout(
     memory_limit: Option<u64>,
     owner: RunOwner,
     leftovers: LeftoverPolicy,
+    spill: Option<CompleteOutput>,
 ) -> ShellRunResult {
     let start = std::time::Instant::now();
 
@@ -1467,13 +1692,19 @@ async fn run_command_with_timeout(
     let mut readers = Readers::default();
     readers.push(
         Captured::Stdout,
-        stdout_pipe,
+        TeeReader {
+            pipe: stdout_pipe,
+            output: spill.clone(),
+        },
         CaptureBudget::new(SHELL_PIPE_READ_CAP),
         cancel.clone(),
     );
     readers.push(
         Captured::Stderr,
-        stderr_pipe,
+        TeeReader {
+            pipe: stderr_pipe,
+            output: spill,
+        },
         CaptureBudget::new(SHELL_PIPE_READ_CAP),
         cancel.clone(),
     );
@@ -1686,8 +1917,9 @@ async fn run_program(
     program: &Path,
     args: &[String],
     owner: RunOwner,
+    spill: Option<CompleteOutput>,
 ) -> ShellRunResult {
-    run_bounded(build_program_command(program, args, cwd), owner).await
+    run_bounded(build_program_command(program, args, cwd), owner, spill).await
 }
 
 /// Perform one [`run_command_with_timeout`] call with the bounds every direct
@@ -1697,6 +1929,7 @@ async fn run_bounded_within(
     mut cmd: tokio::process::Command,
     owner: RunOwner,
     timeout: Duration,
+    spill: Option<CompleteOutput>,
 ) -> ShellRunResult {
     run_command_with_timeout(
         &mut cmd,
@@ -1705,14 +1938,25 @@ async fn run_bounded_within(
         mem::default_limit(),
         owner,
         LeftoverPolicy::End,
+        spill,
     )
     .await
 }
 
 /// [`run_bounded_within`] under the default ceiling every direct run is held to
 /// ([`DEFAULT_SHELL_TIMEOUT_SECS`]).
-async fn run_bounded(cmd: tokio::process::Command, owner: RunOwner) -> ShellRunResult {
-    run_bounded_within(cmd, owner, Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS)).await
+async fn run_bounded(
+    cmd: tokio::process::Command,
+    owner: RunOwner,
+    spill: Option<CompleteOutput>,
+) -> ShellRunResult {
+    run_bounded_within(
+        cmd,
+        owner,
+        Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
+        spill,
+    )
+    .await
 }
 
 /// Run `program` with `args` in `cwd` and report the run as an outcome instead
@@ -1750,6 +1994,7 @@ pub(crate) async fn run_program_outcome_within(
         build_program_command(program, args, cwd),
         RunOwner::Service,
         timeout,
+        None,
     )
     .await;
     match result {
@@ -1820,15 +2065,22 @@ pub(crate) async fn run_program_outcome_within(
 /// anything but a clean exit. `Err` is a run that could not complete — spawn
 /// failure, timeout, drain overrun or the memory ceiling — never a non-zero
 /// exit, so a script's own failure stays the script's output.
+///
+/// `spill_in` is the directory the run's complete-output file goes in
+/// ([`CompleteOutput`]); the captured streams stay the answer if no file could be
+/// written.
 pub(crate) async fn run_program_with_timeout(
     cwd: &Path,
     program: &Path,
     args: &[String],
     label: &str,
+    spill_in: &Path,
 ) -> anyhow::Result<String> {
+    let spill = CompleteOutput::new(spill_in);
     annotate_run(
-        run_program(cwd, program, args, RunOwner::Agent).await,
+        run_program(cwd, program, args, RunOwner::Agent, Some(spill.clone())).await,
         label,
+        Some(&spill),
     )
 }
 
@@ -1846,15 +2098,23 @@ pub(crate) async fn run_internal_program_with_timeout(
         run_bounded(
             build_internal_program_command(program, args, cwd),
             RunOwner::Agent,
+            None,
         )
         .await,
         label,
+        None,
     )
 }
 
 /// The one mapping behind both entry points above: a finished run turned into
-/// the caller's answer.
-fn annotate_run(run: ShellRunResult, label: &str) -> anyhow::Result<String> {
+/// the caller's answer. `spill` keeps a run that outgrows the inline budget in
+/// its file — applied to the output alone, so the `[exit status: …]` note still
+/// follows a spilled result the way it follows an inline one.
+fn annotate_run(
+    run: ShellRunResult,
+    label: &str,
+    spill: Option<&CompleteOutput>,
+) -> anyhow::Result<String> {
     match run {
         ShellRunResult::Completed {
             stdout,
@@ -1864,6 +2124,10 @@ fn annotate_run(run: ShellRunResult, label: &str) -> anyhow::Result<String> {
         } => {
             let code = status.code();
             let output = decode_raw_streams(&stdout, &stderr);
+            let output = match spill {
+                Some(spill) => spill.finish(output),
+                None => output,
+            };
             if code == Some(0) {
                 return Ok(output);
             }
@@ -2430,6 +2694,7 @@ impl ShellTool {
                 mem::default_limit(),
                 RunOwner::Agent,
                 LeftoverPolicy::Keep,
+                None,
             )
             .await
         };
@@ -2526,6 +2791,7 @@ impl ShellTool {
                     mem::default_limit(),
                     RunOwner::Agent,
                     LeftoverPolicy::Keep,
+                    None,
                 )
                 .await
             }
@@ -3398,23 +3664,31 @@ pub(crate) fn agent_temp_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Spill paths created during agent runs, keyed by the owning agent id: spill
-/// files plus the read tool's per-call document-conversion directories.
-/// Owner-deletes-at-end: [`cleanup_agent_spills`] removes them when the agent
-/// run ends. Entries for a dead agent id are removed on cleanup; a daemon
-/// crash leaves the files behind for the OS temp sweep and the periodic
-/// temp cleaner (the daemon performs no startup purge).
+/// files, a direct run's complete-output file and the read tool's per-call
+/// document-conversion directories. Owner-deletes-at-end:
+/// [`cleanup_agent_spills`] removes them when the agent run ends. A file created
+/// after that point (a reader still draining a leftover) or left by a daemon
+/// crash falls to the OS temp sweep and the periodic temp cleaner — and, for one
+/// inside a user's `generated/` folder, to the media sweep once no stored session
+/// mentions it (a crashed run whose result was stored keeps mentioning it, so
+/// only an unmentioned leftover is ever collected). [`is_live_spill_name`] is how
+/// that sweep spares a live run's file.
 static SPILL_OWNERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<std::path::PathBuf>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Record a spill path (file or the read tool's conversion directory) under the
-/// current tool's owning agent id (set during agent tool execution). Outside an
-/// agent run (tests, the verification round's project commands) it is recorded under
-/// [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`). Agent ids are
-/// always prefixed (`ticket_*`, `manager_*`, etc.) and never equal bare
-/// `"diagnostics"` so no collision. Tests outside an agent also bucket there
-/// (acceptable).
+/// current tool's owner, [`spill_owner_key`].
 pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
+    record_spill_owner_as(&spill_owner_key(), path);
+}
+
+/// The [`SPILL_OWNERS`] key of the current tool call — its owning agent id, or
+/// [`crate::agent::role::DIAGNOSTICS_ROLE`] outside an agent run. Resolved where
+/// the caller can still see the tool's task-local identity: a run's complete
+/// output reads this before it hands bytes to reader tasks, which are scopes of
+/// their own.
+fn spill_owner_key() -> String {
     let agent = crate::agent::CURRENT_TOOL_AGENT_ID
         .try_with(Clone::clone)
         .unwrap_or(None);
@@ -3425,9 +3699,30 @@ pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
             "agent id must not collide with diagnostics spill owner"
         );
     }
-    let key = agent.unwrap_or_else(|| crate::agent::role::DIAGNOSTICS_ROLE.to_string());
+    agent.unwrap_or_else(|| crate::agent::role::DIAGNOSTICS_ROLE.to_string())
+}
+
+/// [`record_spill_owner`] under an owner key resolved earlier, for a path that
+/// only exists inside a spawned reader (a direct run's complete-output file).
+fn record_spill_owner_as(owner: &str, path: std::path::PathBuf) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
-    map.entry(key).or_default().push(path);
+    map.entry(owner.to_string()).or_default().push(path);
+}
+
+/// Whether a live run owns a file named `name`. The media sweep walks the same
+/// `generated/` folder a complete-output file sits in and keeps only what stored
+/// session content mentions — but a running turn's file reaches that content only
+/// after its tool result is recorded, so it is not mentioned yet. The check
+/// matches by file name (the sweep's path and the caller's differ in
+/// canonicalization), may spare another user's same-named file for a tick — the
+/// safe direction — and is asked only for files about to be deleted.
+pub(crate) fn is_live_spill_name(name: &OsStr) -> bool {
+    SPILL_OWNERS
+        .lock()
+        .unwrap_poison()
+        .values()
+        .flatten()
+        .any(|owned| owned.file_name() == Some(name))
 }
 
 /// Delete the spill paths recorded for `agent_id` (owner-deletes-at-end): a
@@ -3445,6 +3740,9 @@ pub(crate) fn cleanup_agent_spills(agent_id: &str) {
         return;
     };
     for p in paths {
+        // Only the recorded path goes: its parent may be a directory other runs
+        // share (`uploads/`, the agent temp area), and removing one this run did
+        // not create would race them.
         let _ = if p.is_dir() {
             std::fs::remove_dir_all(&p)
         } else {
@@ -4422,16 +4720,19 @@ fn format_sandwich(output: &str, head: usize, tail: usize, marker_verb: &str) ->
 
     // Build the result directly from &str slices, avoiding intermediate Vec<String> copies.
     let mut result = lines[..head].join("\n");
-    if result.is_empty() {
-        // head=0: no leading newline before the omission marker
-        let _ = write!(result, "... ({omitted} lines {marker_verb})");
-    } else {
-        let _ = write!(result, "\n... ({omitted} lines {marker_verb})");
+    if !result.is_empty() {
+        result.push('\n');
     }
+    result.push_str(&omitted_lines_marker(omitted, marker_verb));
     if tail > 0 {
         let _ = write!(result, "\n{}", lines[total - tail..].join("\n"));
     }
     result
+}
+
+/// The line both sandwich builders put in place of the omitted middle.
+fn omitted_lines_marker(omitted: usize, verb: &str) -> String {
+    format!("... ({omitted} lines {verb})")
 }
 
 /// Apply line truncation: head/tail sandwich (byte-gated), `max_lines`-only absolute cap, or passthrough.
@@ -4655,12 +4956,109 @@ fn format_spill_header(path: &Path, byte_count: usize, line_count: usize) -> Str
     )
 }
 
-/// Build a head/tail preview for large output that was spilled to a file.
+/// Lines a spilled output's preview shows from each of its ends.
+const SPILL_PREVIEW_LINES: usize = 5;
+
+/// Bytes read from each end of a spilled file to fill those lines.
+const SPILL_PREVIEW_EDGE_BYTES: u64 = 8 * 1024;
+
+/// Widest line a summarised body keeps. Ten such lines plus their per-line notes
+/// and the marker stay inside [`TOOL_OUTPUT_BUDGET_BYTES`] with a normal workspace
+/// path in the header, so the summary is not truncated again downstream — which
+/// would cut away its own omitted-lines marker and head lines. The header is not
+/// counted: it is never bounded, since a clipped path would stop resolving.
+const SPILL_PREVIEW_LINE_BYTES: usize = 380;
+
+/// A spill summary: the header for `bytes`/`lines`, then `body` with each line
+/// kept to [`SPILL_PREVIEW_LINE_BYTES`]. The header is exempt — it is the path,
+/// printed twice, and the `view with` hint must resolve however deep the folder.
+fn bounded_body(path: &Path, bytes: usize, lines: usize, body: &str) -> String {
+    format!(
+        "{}{}",
+        format_spill_header(path, bytes, lines),
+        truncate_line_width(body, SPILL_PREVIEW_LINE_BYTES),
+    )
+}
+
+/// Build a head/tail preview for large output that was spilled to a file, counted
+/// and summed up as the output itself.
 fn format_spill_preview(output: &str, path: &Path) -> String {
-    let line_count = output.lines().count();
-    let byte_count = output.len();
-    let header = format_spill_header(path, byte_count, line_count);
-    format!("{header}{}", format_sandwich(output, 5, 5, "omitted"))
+    bounded_body(
+        path,
+        output.len(),
+        output.lines().count(),
+        &format_sandwich(output, SPILL_PREVIEW_LINES, SPILL_PREVIEW_LINES, "omitted"),
+    )
+}
+
+/// The inline summary for a run whose complete output is in [`Spilled`]: the
+/// header every spill uses, then the file's own first and last lines.
+///
+/// Read from the file, not from the captured streams: their tail stops at the
+/// capture cap, so a run that outgrew it would preview a middle as its end. The
+/// header counts are the file's raw bytes and lines in both branches, so the same
+/// file never reports two different sizes.
+fn file_spill_preview(spilled: &Spilled) -> String {
+    let bytes = spilled.bytes as u64;
+    if bytes <= SPILL_PREVIEW_EDGE_BYTES * 2 {
+        let Some(whole) = read_window(&spilled.path, 0, bytes) else {
+            return format_spill_header(&spilled.path, spilled.bytes, spilled.lines());
+        };
+        return bounded_body(
+            &spilled.path,
+            spilled.bytes,
+            spilled.lines(),
+            &format_sandwich(&whole, SPILL_PREVIEW_LINES, SPILL_PREVIEW_LINES, "omitted"),
+        );
+    }
+    let head = read_window(&spilled.path, 0, SPILL_PREVIEW_EDGE_BYTES).unwrap_or_default();
+    let tail = read_window(
+        &spilled.path,
+        bytes - SPILL_PREVIEW_EDGE_BYTES,
+        SPILL_PREVIEW_EDGE_BYTES,
+    )
+    .unwrap_or_default();
+    let head: String = head
+        .lines()
+        .take(SPILL_PREVIEW_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail_lines: Vec<&str> = tail.lines().collect();
+    let tail = tail_lines[tail_lines.len().saturating_sub(SPILL_PREVIEW_LINES)..].join("\n");
+    // The edges are byte windows, so a line can arrive partial at either seam:
+    // the count then treats that line as shown, and a seam line's "more chars"
+    // note counts only what the window holds. The file the header names is exact.
+    let omitted = spilled
+        .lines()
+        .saturating_sub(head.lines().count() + tail.lines().count());
+    // A file of a few very long lines has no whole line between the two edges,
+    // so there is no count to report — the gap is inside a line.
+    let marker = if omitted == 0 {
+        "...".to_string()
+    } else {
+        omitted_lines_marker(omitted, "omitted")
+    };
+    bounded_body(
+        &spilled.path,
+        spilled.bytes,
+        spilled.lines(),
+        &format!("{head}\n{marker}\n{tail}"),
+    )
+}
+
+/// Up to `len` bytes of `path` from `start`, read the way the shell reads a
+/// program's output, since the file is raw bytes off the same pipes. Scrubbed like
+/// the inline result this preview replaces, even though the tool-output pass over
+/// the finished result would scrub it again: the preview is right on its own, not
+/// because of which tool happens to own the run. The file stays byte-complete.
+fn read_window(path: &Path, start: u64, len: u64) -> Option<String> {
+    use std::io::{Read as _, Seek as _};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(std::io::SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(len).read_to_end(&mut bytes).ok()?;
+    Some(strip_and_scrub(&bytes))
 }
 
 /// Write content to the agent temp directory with the given filename.
@@ -5532,6 +5930,7 @@ mod tests {
     async fn run_program_with_timeout_passes_argv_and_annotates_exit() {
         let tmp = TempDir::new().expect("tempdir");
         let ws = crate::workspace::test_ws(tmp.path());
+        let spill_dir = ws.as_path().join("generated");
         let output = run_program_with_timeout(
             ws.as_path(),
             Path::new("/bin/sh"),
@@ -5544,6 +5943,7 @@ mod tests {
                 "a; echo pwned".to_string(),
             ],
             "the test program",
+            &spill_dir,
         )
         .await
         .expect("a completed run");
@@ -5554,6 +5954,107 @@ mod tests {
             output.lines().collect::<Vec<_>>(),
             ["a; echo pwned", "", "[exit status: 3]"]
         );
+        // An output that fits creates nothing.
+        assert_eq!(std::fs::read_dir(&spill_dir).map_or(0, Iterator::count), 0);
+    }
+
+    /// A direct run past the inline budget keeps every byte it printed in a file
+    /// under the directory its caller named — including output beyond the
+    /// capture cap — and shows only the product's spill summary; two runs never
+    /// share a file, and the run-end cleanup leaves nothing behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_program_with_timeout_spills_complete_output() {
+        /// A unique spill owner, so the run-end cleanup this test calls itself
+        /// can only reach files this test made.
+        const OWNER: &str = "test_spill_owner";
+
+        crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some(OWNER.to_string()), async {
+                let tmp = TempDir::new().expect("tempdir");
+                let ws = crate::workspace::test_ws(tmp.path());
+                let spill_dir = ws.as_path().join("generated");
+
+                let mut paths: Vec<String> = Vec::new();
+                for _ in 0..2 {
+                    // More than the per-stream capture cap, so the captured
+                    // streams alone could not hold it.
+                    let output = run_program_with_timeout(
+                        ws.as_path(),
+                        Path::new("/bin/sh"),
+                        &sh_args("seq 1 120000; exit 3"),
+                        "the test program",
+                        &spill_dir,
+                    )
+                    .await
+                    .expect("a completed run");
+                    assert!(output.contains("[Output saved to "));
+                    // The run's status still follows a spilled result, as it
+                    // follows an inline one.
+                    assert_eq!(output.lines().last(), Some("[exit status: 3]"));
+                    let path = output
+                        .lines()
+                        .find_map(|line| line.strip_prefix("[view with: read "))
+                        .and_then(|line| line.strip_suffix(']'))
+                        .expect("a view hint naming the file");
+                    assert!(Path::new(path).starts_with(&spill_dir));
+                    paths.push(path.to_string());
+                }
+
+                // One run's file never lands on another's path.
+                assert_ne!(paths[0], paths[1]);
+                for path in &paths {
+                    let file = std::fs::read_to_string(path).expect("the complete output");
+                    assert!(file.len() > SHELL_PIPE_READ_CAP);
+                    assert_eq!(file.lines().count(), 120_000);
+                    assert_eq!(file.lines().next(), Some("1"));
+                    assert_eq!(file.lines().last(), Some("120000"));
+                }
+
+                // A file of very long lines: the preview stays inside the inline
+                // budget it mirrors, so a later truncation cannot cut away its
+                // own omitted-lines marker.
+                let long = TempDir::new().expect("tempdir");
+                let long_ws = crate::workspace::test_ws(long.path());
+                let long_dir = long_ws.as_path().join("generated");
+                let output = run_program_with_timeout(
+                    long_ws.as_path(),
+                    Path::new("/bin/sh"),
+                    &sh_args(
+                        "awk 'BEGIN { line = \"\"; while (length(line) < 2000) line = line \"x\"; \
+                         for (i = 0; i < 20; i++) print line }'",
+                    ),
+                    "the test program",
+                    &long_dir,
+                )
+                .await
+                .expect("a completed run");
+                assert!(output.len() <= TOOL_OUTPUT_BUDGET_BYTES, "{}", output.len());
+                assert!(output.contains("10 lines omitted"), "{output}");
+                assert!(output.contains("more chars on this line"));
+                let path = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("[view with: read "))
+                    .and_then(|line| line.strip_suffix(']'))
+                    .expect("a view hint naming the file");
+                assert!(Path::new(path).starts_with(&long_dir));
+                let file = std::fs::read_to_string(path).expect("the complete output");
+                assert_eq!(file.lines().count(), 20);
+                assert_eq!(file.lines().next().map(str::len), Some(2000));
+                paths.push(path.to_string());
+
+                // Owner-deletes-at-end: the caller's workspace keeps no file
+                // (the product's own `generated/` folder stays, as it does for
+                // media).
+                cleanup_agent_spills(OWNER);
+                for path in &paths {
+                    assert!(!Path::new(path).exists());
+                }
+                for dir in [&spill_dir, &long_dir] {
+                    assert_eq!(std::fs::read_dir(dir).map_or(0, Iterator::count), 0);
+                }
+            })
+            .await;
     }
 
     /// A direct program run reported as an outcome: output is raw and
@@ -5961,6 +6462,7 @@ mod tests {
             mem::default_limit(),
             RunOwner::Agent,
             LeftoverPolicy::Keep,
+            None,
         )
         .await;
         match result {
@@ -5997,6 +6499,7 @@ mod tests {
             mem::default_limit(),
             RunOwner::Agent,
             LeftoverPolicy::Keep,
+            None,
         )
         .await;
         match result {
@@ -6035,6 +6538,7 @@ mod tests {
             mem::default_limit(),
             RunOwner::Agent,
             LeftoverPolicy::Keep,
+            None,
         )
         .await;
         let ShellRunResult::TimedOut {
@@ -6154,6 +6658,7 @@ mod tests {
             Some(CEILING),
             RunOwner::Agent,
             LeftoverPolicy::Keep,
+            None,
         )
         .await;
 
@@ -6210,6 +6715,7 @@ mod tests {
             mem::default_limit(),
             RunOwner::Agent,
             LeftoverPolicy::Keep,
+            None,
         )
         .await;
         assert!(
@@ -6239,6 +6745,7 @@ mod tests {
                 mem::default_limit(),
                 RunOwner::Agent,
                 LeftoverPolicy::Keep,
+                None,
             ),
         )
         .await;
@@ -6282,6 +6789,7 @@ mod tests {
             mem::default_limit(),
             RunOwner::Agent,
             LeftoverPolicy::Keep,
+            None,
         )
         .await;
         let ShellRunResult::ExitedWithLeftovers {
@@ -6395,6 +6903,7 @@ mod tests {
             mem::default_limit(),
             RunOwner::Agent,
             LeftoverPolicy::Keep,
+            None,
         )
         .await;
         let ShellRunResult::Completed { stdout, .. } = result else {
@@ -6420,6 +6929,7 @@ mod tests {
             mem::default_limit(),
             RunOwner::Agent,
             LeftoverPolicy::Keep,
+            None,
         )
         .await;
         let ShellRunResult::ExitedWithLeftovers { stdout, status, .. } = result else {
@@ -6451,6 +6961,7 @@ mod tests {
             mem::default_limit(),
             RunOwner::Agent,
             LeftoverPolicy::End,
+            None,
         )
         .await;
         let ShellRunResult::EndedWithLeftovers { stdout, .. } = result else {

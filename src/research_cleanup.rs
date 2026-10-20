@@ -39,13 +39,15 @@
 //!
 //! `sweep_media` deletes generated/uploads files in userspaces that no
 //! media-keeping session (the Assistant's or a custom role's) mentions
-//! (keep-detection is strictly session-based).
+//! (keep-detection is strictly session-based, except that a file a live run
+//! still owns is never a candidate).
 //! It is orthogonal to research-run cleanup and stays in the periodic
 //! cleanup loop.
 
 use crate::Workspace;
 use crate::config;
 use crate::db::params;
+use crate::tools::shell::is_live_spill_name;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1001,52 +1003,62 @@ async fn sweep_user_media(
         .iter()
         .all(|(id, activity)| cursor.scanned.get(id) == Some(activity));
 
-    // Deletion phase: only after FULL coverage AND a complete keep-set. The
-    // cursor is NOT reset after the pass — the keep-set grows incrementally
-    // (new/changed sessions extend it), so the full session base is never
-    // re-scanned per cycle and later users are never starved of the budget.
-    // Standing cost (design-accepted): the deletion pass itself is unbudgeted
-    // — it re-lists every generated/uploads file and runs one `contains` per
-    // file every 10-min tick for every covered user (~seconds of CPU for
-    // heavy users near the cap; tracked at rollout).
-    let mut deleted = 0u64;
-    if covered && !cursor.overflowed {
-        // Basename uniqueness across this user's generated+uploads UNION
-        // (exact, case-sensitive) — the only path for basename matching.
-        let mut base_counts: HashMap<String, usize> = HashMap::new();
-        let mut files: Vec<PathBuf> = Vec::new();
-        for dir in ["generated", "uploads"] {
-            let d = user_path.join(dir);
-            // `symlink_metadata` (no-follow): a top-level generated/uploads
-            // that is ITSELF a symlink must not be traversed — `read_dir`
-            // resolves the top-level path, so the per-entry no-follow inside
-            // `list_files` cannot catch it (files outside the userspace root
-            // could be collected and deleted).
-            let Ok(md) = tokio::fs::symlink_metadata(&d).await else {
-                continue;
-            };
-            if md.file_type().is_symlink() {
-                continue;
-            }
-            for f in list_files(&d).await {
-                if let Some(b) = f.file_name().and_then(|n| n.to_str()) {
-                    *base_counts.entry(b.to_string()).or_default() += 1;
-                }
-                files.push(f);
-            }
+    // Deletion phase: only after FULL coverage AND a complete keep-set.
+    if !covered || cursor.overflowed {
+        return 0;
+    }
+    sweep_unmentioned_files(user_path, &cursor.content).await
+}
+
+/// The deletion phase of a covered user's sweep: remove every generated/uploads
+/// file no stored session mentions and no live run still owns.
+///
+/// The cursor is NOT reset after the pass — the keep-set grows incrementally, so
+/// the session base is re-scanned only for changes. Standing cost
+/// (design-accepted): the pass is unbudgeted — a re-list of every
+/// generated/uploads file plus one `contains` per file, every 10-min tick, for
+/// every covered user (~seconds of CPU for heavy users near the cap).
+async fn sweep_unmentioned_files(user_path: &Path, content: &str) -> u64 {
+    // Basename uniqueness across this user's generated+uploads UNION (exact,
+    // case-sensitive) — the only path for basename matching.
+    let mut base_counts: HashMap<String, usize> = HashMap::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in ["generated", "uploads"] {
+        let d = user_path.join(dir);
+        // `symlink_metadata` (no-follow): a top-level generated/uploads that IS
+        // itself a symlink must not be traversed — `read_dir` resolves the
+        // top-level path, so the per-entry no-follow inside `list_files` cannot
+        // catch it (files outside the userspace root could be deleted).
+        let Ok(md) = tokio::fs::symlink_metadata(&d).await else {
+            continue;
+        };
+        if md.file_type().is_symlink() {
+            continue;
         }
-        // Lowercase the keep-set ONCE — the video case-insensitive fallback
-        // reuses it for every file (no O(files × content) re-allocation).
-        let content_lower = cursor.content.to_ascii_lowercase();
-        for f in files {
-            if is_mentioned(&f, &cursor.content, &content_lower, &base_counts) {
-                continue;
+        for f in list_files(&d).await {
+            if let Some(b) = f.file_name().and_then(|n| n.to_str()) {
+                *base_counts.entry(b.to_string()).or_default() += 1;
             }
-            match tokio::fs::remove_file(&f).await {
-                Ok(()) => deleted += 1,
-                Err(e) => {
-                    tracing::warn!(file = %f.display(), error = %e, "Media sweep: delete failed");
-                }
+            files.push(f);
+        }
+    }
+    // Lowercase the keep-set ONCE — the video case-insensitive fallback reuses it
+    // for every file (no O(files × content) re-allocation).
+    let content_lower = content.to_ascii_lowercase();
+    let mut deleted = 0u64;
+    for f in files {
+        if is_kept(&f, content, &content_lower, &base_counts) {
+            continue;
+        }
+        // A live run's file is named in no stored session yet; ask at the last
+        // moment before deleting it.
+        if f.file_name().is_some_and(is_live_spill_name) {
+            continue;
+        }
+        match tokio::fs::remove_file(&f).await {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                tracing::warn!(file = %f.display(), error = %e, "Media sweep: delete failed");
             }
         }
     }
@@ -1056,14 +1068,14 @@ async fn sweep_user_media(
 /// Keep-detection for one file: mentioned by basename when that basename is
 /// unique in the user's generated+uploads union. An AMBIGUOUS basename
 /// (duplicate across the union) is KEPT — the design's safe direction: a
-/// bare-basename mention cannot
-/// be attributed to one of the duplicates, so deleting either could destroy a
-/// mentioned file. Video extensions match case-insensitively (`content_lower`
-/// is the precomputed lowercase keep-set — shared by every file).
+/// bare-basename mention cannot be attributed to one of the duplicates, so
+/// deleting either could destroy a mentioned file. Video extensions match
+/// case-insensitively (`content_lower` is the precomputed lowercase keep-set —
+/// shared by every file).
 /// Absolute-path mentions need no separate check: any path mention contains
 /// the file's basename (subsumed by the basename check), and ambiguous
 /// basenames are always kept by the rule above.
-fn is_mentioned(
+fn is_kept(
     file: &Path,
     content: &str,
     content_lower: &str,
@@ -1164,6 +1176,31 @@ mod tests {
         let n = sweep_media_at(userspaces.path()).await.unwrap();
         assert_eq!(n, 1, "only the unmentioned image_3 deleted");
         assert!(orphan.exists(), "now-mentioned orphan kept");
+    }
+
+    /// A file a live run owns is kept even though no stored session mentions it:
+    /// the run's tool result is what puts the path into session content, and it
+    /// has not been recorded yet. Run-end cleanup then removes the file.
+    #[tokio::test]
+    #[serial_test::serial(media_sweep)] // shared MEDIA_CURSORS static + session store
+    async fn sweep_media_spares_a_live_runs_file() {
+        const OWNER: &str = "test_media_sweep_spill_owner";
+        let userspaces = media_fixture("live").await;
+        let files = write_gen_files(userspaces.path(), "live", &["spill_0abc.txt"]).await;
+        insert_assistant_session("assistant_live", "live", "no mention of the file").await;
+        let spill = files[0].clone();
+
+        crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some(OWNER.to_string()), async {
+                crate::tools::shell::record_spill_owner(spill.clone());
+                reset_media_cursors().await;
+                assert_eq!(sweep_media_at(userspaces.path()).await.unwrap(), 0);
+                assert!(spill.exists(), "a live run's file is not a candidate");
+                crate::tools::shell::cleanup_agent_spills(OWNER);
+            })
+            .await;
+
+        assert!(!spill.exists(), "run-end cleanup removes it");
     }
 
     #[tokio::test]

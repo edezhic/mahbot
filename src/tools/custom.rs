@@ -22,6 +22,11 @@
 //! its own personal workspace, so a custom call always runs in the caller's
 //! `userspaces/<user>` directory.
 //!
+//! Output that outgrows the inline budget is not cut: the run's complete output
+//! is kept in the caller's own `generated/` folder — inside the workspace, so
+//! even a confined guest's `read` may open it — and deleted when the run ends
+//! ([`crate::tools::shell`]'s complete-output file).
+//!
 //! Availability is per user: the admin may call anything, a guest only
 //! what is granted to them (`users.granted_tools`). The `<custom-tools>`
 //! context block is the model-facing catalogue and follows the same split; it
@@ -838,11 +843,13 @@ impl Tool for CustomTool {
                 &call.ignored,
             ));
         };
+        let spill_in = ws.as_path().join("generated");
         let run = crate::tools::shell::run_program_with_timeout(
             ws.as_path(),
             &bun,
             &[call.path.display().to_string(), call.payload()],
             &format!("custom tool \"{name}\""),
+            &spill_in,
         )
         .await;
         match run {
