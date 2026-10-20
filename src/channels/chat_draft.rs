@@ -2,10 +2,12 @@
 //!
 //! There is exactly one draft: the chat has a single composer, and what is
 //! typed in it is not tied to the workspace picked in the footer. The in-memory
-//! draft is mutated synchronously at capture time so it is always current; only
-//! the file write is debounced. Every write serializes the whole draft under the
-//! one mutex, so a stale debounce can never clobber newer data and the exit
-//! flush can't be overwritten by an in-flight write.
+//! draft is mutated synchronously at capture time so it is always current, and
+//! every write persists it immediately under the one mutex; the debounce lives
+//! in the GUI's draft-capture path (`home.rs`: `capture_draft` schedules
+//! `DraftSaveSettled` after `DRAFT_SETTLE_MS`). Because each write serializes the
+//! whole draft under that mutex, a late write can never clobber newer data and
+//! the exit flush can't be overwritten by an in-flight write.
 
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};

@@ -182,10 +182,10 @@ impl ToolFailuresState {
         widgets::page(content)
     }
 
-    /// Render a single error row with two-line layout:
-    ///   Line 1: HH:MM:SS timestamp | tool name badge | role badge | workspace
-    ///   Line 2: error message (selectable monospace text)
-    /// Build the metadata badge row for a tool error entry.
+    /// Build the metadata line for a tool error entry: the HH:MM:SS timestamp,
+    /// then tool name, duration and role badges, with the workspace as plain
+    /// text at the trailing edge. The error message is rendered by
+    /// [`Self::render_error_row`].
     fn render_metadata_row(entry: &ToolErrorEntry) -> iced::widget::Row<'_, ToolFailuresMessage> {
         let role_colors = theme::role_badge_color(&entry.role);
 
@@ -224,7 +224,7 @@ impl ToolFailuresState {
         .spacing(theme::SPACE_2)
     }
 
-    /// Compute an optional arguments preview string, truncated to 200 chars.
+    /// Compute an optional arguments preview string, truncated to 200 bytes.
     fn compute_args_preview(entry: &ToolErrorEntry) -> Option<String> {
         if entry.arguments.is_empty() || entry.arguments == "{}" {
             return None;

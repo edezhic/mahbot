@@ -42,8 +42,8 @@ const EXTENDED_WINDOW: Duration = Duration::from_secs(3);
 const CEILING: Duration = Duration::from_secs(5);
 /// Release the group as soon as it holds this many parts...
 const MAX_PARTS: usize = 6;
-/// ...or this many characters of raw part text, which keeps a burst that is
-/// still being typed from growing without bound. Enrichment (captions,
+/// ...or more than this many characters of raw part text, which keeps a burst
+/// that is still being typed from growing without bound. Enrichment (captions,
 /// transcriptions, native image parts) is added after this check, so this bounds
 /// the user's own text; a part's attachment payload is bounded by the inbound
 /// limits of one message, exactly as it is without grouping.
@@ -263,7 +263,7 @@ enum Release {
     Ceiling,
     /// The group reached [`MAX_PARTS`].
     PartCap,
-    /// The group reached [`MAX_CHARS`].
+    /// The group went over [`MAX_CHARS`].
     CharCap,
     /// Control input in that chat released the group ahead of itself.
     Control,

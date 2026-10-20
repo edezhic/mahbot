@@ -1003,17 +1003,18 @@ async fn read_body_idle(response: reqwest::Response, idle_timeout: Duration) -> 
     BodyReadOutcome::Complete(body)
 }
 
-/// Best-effort extraction of `finish_reason` from a possibly-truncated JSON
-/// body.
+/// Best-effort extraction of `finish_reason` from the response body.
 ///
-/// A full `ApiChatResponse` parse is attempted first; if the envelope is cut
-/// mid-body we fall back to lenient JSON value parsing so telemetry survives
-/// where possible.
+/// The typed `ApiChatResponse` parse is tried first. The `serde_json::Value`
+/// fallback is a last resort: it may still read `/choices/0/finish_reason` when
+/// a *complete* body's typed parse failed, since one field the typed shape
+/// rejects does not invalidate the rest of the JSON. It cannot help a body cut
+/// mid-JSON — that is not valid JSON, so the value parse fails as well.
 fn envelope_telemetry(body: &str) -> Option<String> {
     if let Ok(native) = serde_json::from_str::<ApiChatResponse>(body) {
         return native.choices.first().and_then(|c| c.finish_reason.clone());
     }
-    // Lenient fallback for truncated envelopes.
+    // Last resort: a complete body the typed parse rejected.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
         return value
             .pointer("/choices/0/finish_reason")
