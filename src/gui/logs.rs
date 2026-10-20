@@ -10,7 +10,7 @@
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
 use iced::advanced::text::Span;
-use iced::widget::{Column, Space, button, column, container, row, stack, text};
+use iced::widget::{Space, button, column, container, row, stack, text};
 use iced::{Alignment, Element, Length, Subscription, Task, window};
 use iced_anim::Animated;
 use iced_anim::transition::Easing;
@@ -793,69 +793,37 @@ impl LogsState {
                 .view()
                 .map(LogMessage::ToolFailures);
         };
-        let mut content = Column::new();
-
-        // Error display — inset to align with the vscroll-wrapped entries below.
-        content = widgets::push_error_banner_inset(content, data.load_state.error());
-
-        // Log entries
-        if data.load_state.loading() && !data.load_state.has_loaded() {
-            content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
-        } else if data.entries.is_empty() {
-            content = content.push(widgets::empty_state_placeholder(
-                lucide::activity::<iced::Theme, iced::Renderer>(),
-                "No log entries",
-                theme::TEXT_MUTED,
-            ));
-        } else {
-            let entries_view = {
-                let fade_progress = *self.fade_anim.value();
-                let newest_ts = self.newest_entry_timestamp.clone();
-                let scroll = widgets::vscroll(
-                    Column::with_children(
-                        data.entries
-                            .iter()
-                            .map(|entry| {
-                                let is_newest = newest_ts.as_deref() == Some(&entry.timestamp);
-                                let rendered = if is_newest && fade_progress < 1.0 {
-                                    // Fade-in: render with animated background opacity
-                                    LogsState::render_log_entry(entry, fade_progress)
-                                } else {
-                                    LogsState::render_log_entry(entry, 1.0)
-                                };
-                                // Per-row context menu: right-click copies the
-                                // full entry in formatted form. Wrapping only
-                                // the row — not the column — keeps the
-                                // inter-row spacing a fall-through (same
-                                // convention as the per-bubble menus on the
-                                // Home page). Left-click drag selection on the
-                                // row is unaffected: ContextMenu forwards all
-                                // non-right-click events to the underlay.
-                                let row: Element<'_, LogMessage> = ContextMenu::new(
-                                    rendered,
-                                    vec![MenuItem::new(
-                                        "Copy".into(),
-                                        LogMessage::CopyEntry(entry.clone()),
-                                    )],
-                                )
-                                .into();
-                                row
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .spacing(theme::SPACE_2),
-                );
-
-                // New live entries insert at position 0, so no scrolling is
-                // needed to keep the latest entry visible.
-
-                scroll
-            };
-
-            content = content.push(entries_view);
-        }
-
-        widgets::page(content)
+        // New live entries insert at position 0, so no scroll-to-newest logic
+        // is needed. The fade and the newest-entry timestamp are read per row,
+        // i.e. only when rows exist — never on the loading or empty paths.
+        widgets::tab_body(
+            data,
+            lucide::activity::<iced::Theme, iced::Renderer>(),
+            "No log entries",
+            |entry| {
+                let is_newest =
+                    self.newest_entry_timestamp.as_deref() == Some(entry.timestamp.as_str());
+                let fade_progress = if is_newest {
+                    *self.fade_anim.value()
+                } else {
+                    1.0
+                };
+                // Per-row context menu: right-click copies the full entry in
+                // formatted form. Wrapping only the row — not the column —
+                // keeps the inter-row spacing a fall-through (same convention
+                // as the per-bubble menus on the Home page). Left-click drag
+                // selection on the row is unaffected: ContextMenu forwards all
+                // non-right-click events to the underlay.
+                ContextMenu::new(
+                    LogsState::render_log_entry(entry, fade_progress),
+                    vec![MenuItem::new(
+                        "Copy".into(),
+                        LogMessage::CopyEntry(entry.clone()),
+                    )],
+                )
+                .into()
+            },
+        )
     }
 
     fn render_log_entry(entry: &LogEntry, fade_progress: f32) -> Element<'_, LogMessage> {

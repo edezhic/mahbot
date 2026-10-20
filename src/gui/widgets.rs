@@ -1,6 +1,7 @@
-//! Shared dashboard widgets: PickOption type, FileTree state struct
-//! and build_tree_panel for shared file-tree panel rendering.
+//! Shared dashboard widgets: page/scroll scaffolding, list bodies, and the
+//! reusable pieces (file tree, pick-list options, badges) used by GUI pages.
 
+use super::common::PaginatedTabState;
 use super::theme;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
@@ -318,6 +319,41 @@ pub fn empty_state_placeholder<'a, Message: 'a>(
     .center_x(Length::Fill)
     .center_y(Length::Fill)
     .into()
+}
+
+/// The body a paginated dashboard tab renders: the error banner, the first-read
+/// loading line, the tab's empty state, then its rows under one scroll — the
+/// shape the Logs and Tool Failures tabs share.
+///
+/// The [`page`] wrapper belongs inside: both callers sit in a [`page_bare`]
+/// chrome, so leaving it out would silently lose [`theme::PAGE_PADDING`]. A
+/// failed first read leaves `loading` and `has_loaded` false, so the body falls
+/// through to the empty state with the banner as the only error signal — the
+/// deliberate opposite of the Alarms/Sessions lists, which suppress the
+/// placeholder on error.
+#[must_use]
+pub fn tab_body<'a, T, Message: 'a>(
+    state: &'a PaginatedTabState<T>,
+    empty_icon: iced::widget::Text<'a, iced::Theme, iced::Renderer>,
+    empty_label: &'a str,
+    row: impl Fn(&'a T) -> Element<'a, Message>,
+) -> Element<'a, Message> {
+    let mut content = push_error_banner_inset(Column::new(), state.load_state.error());
+    if state.load_state.loading() && !state.load_state.has_loaded() {
+        content = content.push(scroll_h_inset(loading_text()));
+    } else if state.entries.is_empty() {
+        content = content.push(empty_state_placeholder(
+            empty_icon,
+            empty_label,
+            theme::TEXT_MUTED,
+        ));
+    } else {
+        content = content.push(vscroll(
+            Column::with_children(state.entries.iter().map(row).collect::<Vec<_>>())
+                .spacing(theme::SPACE_2),
+        ));
+    }
+    page(content)
 }
 
 /// Canonical pill metrics: two sizes only — compact inline badges and modal header badges.

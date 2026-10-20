@@ -7,7 +7,7 @@
 
 use crate::stats::{ToolErrorEntry, ToolErrorQuery};
 
-use iced::widget::{Column, Space, column, container, row, text};
+use iced::widget::{Space, column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
@@ -146,40 +146,12 @@ impl ToolFailuresState {
     }
 
     pub fn view(&self) -> Element<'_, ToolFailuresMessage> {
-        let state = &self.state;
-        let mut content = Column::new();
-
-        // Error display — inset to align with the vscroll-wrapped entries below.
-        content = widgets::push_error_banner_inset(content, state.load_state.error());
-
-        // The banner above reports errors; the placeholder below is this tab's
-        // ordinary empty state, so an unloaded failure is never a blank body.
-        if state.load_state.loading() && !state.load_state.has_loaded() {
-            content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
-        } else if state.entries.is_empty() {
-            content = content.push(widgets::empty_state_placeholder(
-                lucide::bug::<iced::Theme, iced::Renderer>(),
-                "No tool failures",
-                theme::TEXT_MUTED,
-            ));
-        } else {
-            let entries_view = {
-                widgets::vscroll(
-                    Column::with_children(
-                        state
-                            .entries
-                            .iter()
-                            .map(Self::render_error_row)
-                            .collect::<Vec<_>>(),
-                    )
-                    .spacing(theme::SPACE_2),
-                )
-            };
-
-            content = content.push(entries_view);
-        }
-
-        widgets::page(content)
+        widgets::tab_body(
+            &self.state,
+            lucide::bug::<iced::Theme, iced::Renderer>(),
+            "No tool failures",
+            Self::render_error_row,
+        )
     }
 
     /// Build the metadata line for a tool error entry: the HH:MM:SS timestamp,
