@@ -1347,31 +1347,19 @@ fn format_core_row(row: &turso::core::Row, column_count: usize) -> String {
     parts.join("|")
 }
 
-/// Convert a `turso::core` column value to its display representation.
-///
-/// - NULL → empty (no text between pipe delimiters → `||`)
-/// - Integer → decimal string
-/// - Real → default `f64::Display`
-/// - Text → verbatim (no escaping for pipes or newlines)
-/// - Blob → lowercase hex string
+/// Convert a `turso::core` column value to its display representation through
+/// [`crate::db::format_cell`], the one statement of the pipe-table rules. The
+/// cell is copied once into the owned [`crate::db::Value`] shape that formatter
+/// takes — the price of the shared rule on this path.
 fn format_core_value(val: &turso::core::Value) -> String {
-    match val {
-        turso::core::Value::Null => String::new(),
-        turso::core::Value::Numeric(turso::core::Numeric::Integer(i)) => i.to_string(),
-        turso::core::Value::Numeric(turso::core::Numeric::Float(fl)) => {
-            let f: f64 = (*fl).into();
-            f.to_string()
-        }
-        turso::core::Value::Text(t) => t.as_str().to_string(),
-        turso::core::Value::Blob(b) => crate::util::hex_string(b),
-    }
+    crate::db::format_cell(&crate::db::Value::from(val.clone()))
 }
 
 /// Assemble the canonical `mahbot debug` pipe-table output: a column-header
 /// line, one line per pre-formatted row, and a truncation sentinel when the
-/// row limit was hit. Callers format their own row values (the value types
-/// differ per path) and delegate the assembly here. An empty column list
-/// renders as empty output.
+/// row limit was hit. Callers spell their own cells through
+/// [`crate::db::format_cell`] (the value types differ per path) and delegate
+/// the assembly here. An empty column list renders as empty output.
 pub(crate) fn render_pipe_table(columns: &[String], rows: Vec<String>, truncated: bool) -> String {
     if columns.is_empty() {
         return String::new();

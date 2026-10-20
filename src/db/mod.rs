@@ -5,10 +5,11 @@
 //! users, config, chat history, alarms, custom roles, Telegram intake) and the
 //! logs store (`logs.db`) are the only files. This module owns the connection
 //! surface (`Connection`, `TxGuard`, `ReaderPool`, `Maintenance`), the
-//! transaction helpers, the timestamp and column conventions, and the
-//! store-facing pragmas. The schema lives in `migrations`, the change stream
-//! in `cdc`, and the store-lock, checkpoint and read-only debug rules in their
-//! own submodules.
+//! transaction helpers, the timestamp and column conventions, the store-facing
+//! pragmas, and the one display rule every pipe table prints its cells by
+//! ([`format_cell`]). The schema lives in `migrations`, the change stream in
+//! `cdc`, and the store-lock, checkpoint and read-only debug rules in their own
+//! submodules.
 //!
 //! Not the place to build a store handle: a database opened outside `store`
 //! has neither the experimental feature flags nor the per-statement timeout,
@@ -471,6 +472,24 @@ pub(crate) struct ReadonlyRows {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
     pub truncated: bool,
+}
+
+/// A cell as the debug pipe tables print it — display only, never a
+/// serialisation of the value. NULL empty (nothing between the delimiters reads
+/// `||`), integer decimal, real in the default float spelling, text verbatim,
+/// blob lowercase hex.
+///
+/// Text is not escaped, so a pipe or a newline inside a value breaks the row
+/// shape; that and the empty cell above are both visible to the model through
+/// the `mahbot_debug` tool's output.
+pub(crate) fn format_cell(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Text(t) => t.clone(),
+        Value::Blob(b) => crate::util::hex_string(b),
+    }
 }
 
 /// Message prefix of a Turso quick_check false positive, kept as a narrow

@@ -4,7 +4,6 @@
 //! `logs.db` via [`crate::logs::LOG_STORE`]) so the admin's Assistant can
 //! query them without a subprocess or a second store instance.
 
-use crate::db::Value;
 use crate::db::debug;
 use crate::db::ipc;
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
@@ -90,36 +89,29 @@ async fn run_read_only_query(conn: &crate::db::Connection, sql: &str) -> anyhow:
 
 /// Render [`crate::db::ReadonlyRows`] as pipe-delimited text (same format as
 /// `mahbot debug`): a column-header line, one line per row, and a truncation
-/// sentinel line when the row limit was hit. Values follow the CLI display
-/// rules (NULL→empty, Blob→lowercase hex).
+/// sentinel line when the row limit was hit. Cells are spelled by
+/// [`crate::db::format_cell`], the same rule the CLI prints by.
 fn format_readonly_rows(rows: &crate::db::ReadonlyRows) -> String {
     debug::render_pipe_table(
         &rows.columns,
         rows.rows
             .iter()
-            .map(|row| row.iter().map(format_value).collect::<Vec<_>>().join("|"))
+            .map(|row| {
+                row.iter()
+                    .map(crate::db::format_cell)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
             .collect(),
         rows.truncated,
     )
-}
-
-/// Convert a [`turso::Value`] to its pipe-delimited display representation,
-/// matching the `mahbot debug` CLI (NULL→empty, Integer→decimal,
-/// Real→default float, Text→verbatim, Blob→lowercase hex).
-fn format_value(v: &Value) -> String {
-    match v {
-        Value::Null => String::new(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(f) => f.to_string(),
-        Value::Text(s) => s.clone(),
-        Value::Blob(b) => crate::util::hex_string(b),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::ReadonlyRows;
+    use crate::db::Value;
 
     #[test]
     fn formats_columns_rows_and_truncation_sentinel() {

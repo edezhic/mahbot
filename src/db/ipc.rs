@@ -225,16 +225,11 @@ impl WireValue {
         }
     }
 
-    /// Pipe/format display (NULL→empty, Blob→lowercase hex).
+    /// The cell as [`crate::db::format_cell`] prints it in a pipe table —
+    /// delegates through [`Self::to_turso`], so the rules stay in one place.
     #[must_use]
     pub(crate) fn format(&self) -> String {
-        match self {
-            WireValue::Null => String::new(),
-            WireValue::Integer(i) => i.to_string(),
-            WireValue::Real(f) => f.to_string(),
-            WireValue::Text(s) => s.clone(),
-            WireValue::Blob(b) => crate::util::hex_string(&decode_blob(b)),
-        }
+        crate::db::format_cell(&self.to_turso())
     }
 }
 
