@@ -2942,9 +2942,9 @@ impl TelegramChannel {
     /// Parse a recorded batch and hand it to the collector.
     ///
     /// `fresh` are the events this call was the first to record; the rest are
-    /// skipped. An event nothing can be made of is settled here as the record's
-    /// own decision, so it neither comes back nor grows the record. Returns
-    /// `false` when the collector is gone.
+    /// skipped. An event nothing can be made of is settled by its taker rather than
+    /// left held (see [`Self::settle_or_hold`]). Returns `false` when the collector
+    /// is gone.
     ///
     /// The one thing parsed out of turn is an album (media group): its members are
     /// parsed together at the position of the album's first member, so an album is
@@ -3026,35 +3026,26 @@ impl TelegramChannel {
         fresh.remove(&id).then_some(id)
     }
 
-    /// Take one recorded event on: parse it, and settle it here when there is
-    /// nothing to hand on — an event nothing can be made of, or control input of
-    /// unknown age, which is not executed out of context.
+    /// The settle-or-hold rule the event path and the callback-press path share:
+    /// turn one recorded unit's parse into the message to hand on, or write the
+    /// record's decision about the unit.
     ///
-    /// Three things can come of the parse, and they are not the same decision. A
-    /// message is handed on. Nothing can be made of the event — `Ok(None)` — which
-    /// is the record's own decision: it is settled and neither comes back nor grows
-    /// the record. The read the decision needs failed — `Err` — which is no decision
-    /// at all: the event stays held, payload and all, exactly as one a crash left
-    /// behind, and a later run takes it up.
-    async fn take_event(
-        &self,
+    /// A unit nothing can be made of (`Ok(None)`) is settled, so it never comes back.
+    /// A parse whose read failed (`Err`) is no decision at all, so the unit stays held
+    /// — payload and all — exactly as one a crash left behind, and a later run takes
+    /// it up. Both are the record's own rules, stated in the intake module and in
+    /// [`Intake::settle`].
+    async fn settle_or_hold(
         intake: &Intake,
-        origin: BatchOrigin,
         update_id: i64,
-        update: &serde_json::Value,
+        parsed: anyhow::Result<Option<ChannelMessage>>,
     ) -> Option<ChannelMessage> {
-        let mut msg = match self.parse_incoming_update(update).await {
+        let mut msg = match parsed {
             Ok(Some(msg)) => msg,
-            // Nothing can be made of this event: that is a decision of the record's
-            // own, so it is settled and neither comes back nor grows the record.
             Ok(None) => {
                 intake.settle(&[update_id]).await;
                 return None;
             }
-            // The read this decision needs failed, so no decision was made: the
-            // event stays held, payload and all, and a later run takes it up — the
-            // same way what a crash left held is taken up. Refusing it here would
-            // drop it for good, and receiving it again is the side to err on.
             Err(err) => {
                 tracing::warn!(
                     update_id,
@@ -3065,6 +3056,21 @@ impl TelegramChannel {
             }
         };
         msg.update_ids.push(update_id);
+        Some(msg)
+    }
+
+    /// Take one recorded event on: parse it, hand it over or settle it
+    /// ([`Self::settle_or_hold`]), and refuse control input of unknown age
+    /// ([`BatchOrigin::Stale`]) instead of executing it out of context.
+    async fn take_event(
+        &self,
+        intake: &Intake,
+        origin: BatchOrigin,
+        update_id: i64,
+        update: &serde_json::Value,
+    ) -> Option<ChannelMessage> {
+        let msg = Self::settle_or_hold(intake, update_id, self.parse_incoming_update(update).await)
+            .await?;
         if origin == BatchOrigin::Stale && is_control_message(&msg) {
             self.refuse_unacted_control(intake, &msg).await;
             return None;
@@ -3099,9 +3105,7 @@ impl TelegramChannel {
     ///
     /// The spinner is dismissed only for a press this run polled — the answer of
     /// a press of unknown age expired just as long ago, so that would be a doomed
-    /// API call. A press nothing can be made of is settled here, so it is not
-    /// offered again; a press the intake cannot yet decide about stays held, and a
-    /// later run takes it up.
+    /// API call. What became of the parse is [`Self::settle_or_hold`]'s.
     async fn handle_callback_press(
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
@@ -3124,26 +3128,11 @@ impl TelegramChannel {
             self.answer_callback_query(id, None).await;
         }
 
-        let mut msg = match self.parse_callback_query(cq).await {
-            Ok(Some(msg)) => msg,
-            // Nothing can be made of this press: that is a decision of the record's
-            // own, so it is settled and neither comes back nor grows the record.
-            Ok(None) => {
-                intake.settle(&[update_id]).await;
-                return true;
-            }
-            // No decision was made, so none is written: the press stays held,
-            // payload and all, and a later run takes it up (see `take_event`).
-            Err(err) => {
-                tracing::warn!(
-                    update_id,
-                    %err,
-                    "Telegram intake: could not decide an event; it stays held for a later run"
-                );
-                return true;
-            }
+        let Some(msg) =
+            Self::settle_or_hold(intake, update_id, self.parse_callback_query(cq).await).await
+        else {
+            return true;
         };
-        msg.update_ids.push(update_id);
         // A press is control input by construction, so it is refused by the same
         // rule `take_event` applies.
         if origin == BatchOrigin::Stale {
