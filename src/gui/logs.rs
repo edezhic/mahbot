@@ -784,9 +784,8 @@ impl LogsState {
     /// Render the Logs/Issues tab content (entries list). Pagination lives in
     /// the shared bottom bar.
     fn logs_view(&self) -> Element<'_, LogMessage> {
-        // Only the log tabs reach this view (the caller routes Tool Failures
-        // separately); fall back to the Tool Failures view rather than panic
-        // if a future caller misroutes.
+        // The caller routes Tool Failures separately, so only the log tabs
+        // reach this view and `tab_data` answers for them.
         let Some(data) = self.tab_data(self.active_tab) else {
             return self
                 .tool_failures_state

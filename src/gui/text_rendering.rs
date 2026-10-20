@@ -3,8 +3,6 @@
 //! These utilities were extracted from [`super::editor_widget`] so that the diff
 //! widget can use the same font metrics, gutter geometry, colour conversion,
 //! and rich-span merging routines without depending on editor-internal code.
-//!
-//! All items are `pub(crate)` except [`font_metrics`] which is `pub`.
 
 use std::sync::Arc;
 

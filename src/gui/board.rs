@@ -298,9 +298,7 @@ impl BoardState {
 
     /// Reset all modal-related state fields (close detail modal).
     fn reset_modal(&mut self) {
-        // Dismiss any open cancel confirmation too. Unreachable today
-        // (Escape's first branch and the confirm backdrop guard it), but
-        // the reset contract should hold for any future caller.
+        // The cancel confirmation is modal state, so resetting the modal clears it.
         self.dismiss_pending_cancel();
         self.selected_ticket = None;
         self.selected_loading = false;

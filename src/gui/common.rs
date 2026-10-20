@@ -15,13 +15,6 @@ pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
 ///
 /// Groups `page`, `page_size`, and `total` into a single struct with helper
 /// methods for common operations (used by the Logs and Tool Failures pages).
-///
-/// # Structural benefits (not line savings)
-///
-/// The struct adds a few lines of definition, but the value is:
-/// - Centralised boundary logic in [`prev_page`](Self::prev_page) /
-///   [`next_page`](Self::next_page)
-/// - Reusable by any future page that needs pagination
 #[derive(Debug, Clone)]
 pub(crate) struct PaginationState {
     pub(crate) page: usize,

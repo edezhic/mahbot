@@ -3992,15 +3992,10 @@ struct DialogField<'a> {
     id: &'static str,
     /// Function pointer for the shared-editor `on_action` handler.
     ///
-    /// Uses `fn(EditorAction) -> SettingsMessage` (function pointer) rather
-    /// than `impl Fn(EditorAction) -> SettingsMessage + 'a` to keep the struct
-    /// simple, avoid boxing, and rely on monomorphization at the callsite. This
-    /// works because all current callers pass enum tuple-variant constructors
-    /// (e.g. [`SettingsMessage::AddWorkspaceName`]), which coerce to function
-    /// pointers.
-    ///
-    /// If a future caller needs to capture state in the closure, this field
-    /// must be changed to `Box<dyn Fn(EditorAction) -> SettingsMessage + 'a>`.
+    /// The fields of one dialog sit in a single `&[DialogField]`, so the
+    /// handler type cannot be a type parameter; a `fn` pointer keeps the slice
+    /// homogeneous without boxing. Message constructors and non-capturing
+    /// closures both coerce.
     on_input: fn(EditorAction) -> SettingsMessage,
 }
 
