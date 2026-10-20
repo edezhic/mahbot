@@ -691,10 +691,6 @@ struct MediaCursor {
     /// into the keep-set every tick — daemon memory growth plus a premature
     /// hit of the overflow cap that permanently disables the user's sweep.
     session_content: HashMap<String, String>,
-    /// Entire session base scanned (files become candidates only then).
-    /// Stays true after the deletion pass — the keep-set grows incrementally
-    /// and the sweep never forces a full re-scan cycle.
-    covered: bool,
     /// Rebuilt from `session_content` after each scan — the keep-set
     /// (paths/basenames are matched against it).
     content: String,
@@ -767,50 +763,37 @@ async fn list_files(dir: &Path) -> Vec<PathBuf> {
 /// upload media into the user's own folder — `assistant` and `custom`. A
 /// custom role launched in the owner's personal folder writes its media into
 /// that folder's `generated`/`uploads` tree, so its sessions must keep those
-/// files alive exactly like the Assistant's. A DB error is returned (NOT
-/// swallowed as empty — an empty list would trivially satisfy full coverage
-/// and trigger mass deletion against an empty keep-set).
+/// files alive exactly like the Assistant's. A DB error is returned, NOT
+/// swallowed as empty (an empty keep-set would trivially satisfy full coverage
+/// and delete every file); a row that fails to decode fails the whole read
+/// ([`crate::db::Connection::query_map_strict`]) for the same reason.
 async fn media_keeping_session_ids(user_name: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let rows = crate::session::store()
+    crate::session::store()
         .conn
-        .query(
+        .query_map_strict(
             "SELECT agent_id, last_activity FROM session_metadata \
              WHERE role IN ('assistant', 'custom') AND user_name = ?1 ORDER BY last_activity DESC",
             params![user_name],
+            |r| Ok::<_, ::turso::Error>((r.get::<String>(0)?, r.get::<String>(1)?)),
         )
-        .await?;
-    // Fail CLOSED on a malformed row: silently dropping it would let full
-    // coverage complete without scanning that session — its file mentions
-    // would be missed and its files deleted (the same deletion-safety class
-    // as the DB-error fail-open above).
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let agent_id = r.get::<String>(0)?;
-        let last_activity = r.get::<String>(1)?;
-        out.push((agent_id, last_activity));
-    }
-    Ok(out)
+        .await
 }
 
-/// One media-keeping session's message content (fail-open only via the `Result`
-/// — a DB read failure must not masquerade as an empty session: the sweep would
-/// advance coverage and delete files the unread session mentions). Fail
-/// CLOSED on a malformed row (same deletion-safety class as
-/// [`media_keeping_session_ids`]: a row failing to decode loses its mentions
-/// from the keep-set while the session still counts as scanned).
+/// One media-keeping session's message content. A read failure must not
+/// masquerade as an empty session — and neither may a silently dropped bad row
+/// ([`crate::db::Connection::query_map_strict`] fails the read instead): the
+/// session still counts as scanned, so coverage would complete without its
+/// mentions in the keep-set and its files would be deleted.
 async fn media_keeping_session_content(agent_id: &str) -> anyhow::Result<String> {
-    let rows = crate::session::store()
+    let contents = crate::session::store()
         .conn
-        .query(
+        .query_map_strict(
             "SELECT content FROM sessions WHERE agent_id = ?1 ORDER BY id ASC",
             params![agent_id],
+            |r| r.get::<String>(0),
         )
         .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        out.push(r.get::<String>(0)?);
-    }
-    Ok(out.join("\n"))
+    Ok(contents.join("\n"))
 }
 
 /// Sweep generated/uploads under the userspaces root — production entry.
@@ -896,7 +879,6 @@ async fn sweep_media_at_budgeted(userspaces_root: &Path, budget_bytes: usize) ->
     Ok(deleted)
 }
 
-#[expect(clippy::too_many_lines)] // per-phase guards (fail-open, empty-base, overflow, budget, coverage) are sequential and inline
 async fn sweep_user_media(
     user_name: &str,
     user_path: &Path,
@@ -928,7 +910,6 @@ async fn sweep_user_media(
         cursor.scanned.clear();
         cursor.session_content.clear();
         cursor.content.clear();
-        cursor.covered = false;
         cursor.overflowed = false;
     }
     // No assistant sessions → nothing was ever scanned → deleting everything
@@ -1013,9 +994,10 @@ async fn sweep_user_media(
     }
     // Full coverage only when EVERY session's stored activity matches the
     // current one — a session whose content grew but was not yet re-scanned
-    // (tick budget ran out) keeps `covered` false: the deletion pass must
-    // never run against a stale keep-set.
-    cursor.covered = session_ids
+    // (tick budget ran out) leaves this false: the deletion pass must never
+    // run against a stale keep-set. Derived, never stored: a persisted flag
+    // would let a later early-skip path delete on a stale keep-set.
+    let covered = session_ids
         .iter()
         .all(|(id, activity)| cursor.scanned.get(id) == Some(activity));
 
@@ -1028,7 +1010,7 @@ async fn sweep_user_media(
     // file every 10-min tick for every covered user (~seconds of CPU for
     // heavy users near the cap; tracked at rollout).
     let mut deleted = 0u64;
-    if cursor.covered && !cursor.overflowed {
+    if covered && !cursor.overflowed {
         // Basename uniqueness across this user's generated+uploads UNION
         // (exact, case-sensitive) — the only path for basename matching.
         let mut base_counts: HashMap<String, usize> = HashMap::new();
