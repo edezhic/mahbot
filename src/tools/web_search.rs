@@ -76,9 +76,17 @@ struct ExaContentsOptions {
     text: bool,
 }
 
+/// Exa's search mode, fixed to `lite` (the fast/cheap tier) for every request: speed
+/// and cost over quality. `lite` rejects any request field outside its allowlist with
+/// a 400, so a new `ExaSearchBody` field must be checked against that set, and it
+/// serves cached page text only — freshness cannot be requested.
+const EXA_SEARCH_MODE: &str = "lite";
+
 #[derive(Serialize)]
 struct ExaSearchBody {
     query: String,
+    #[serde(rename = "type")]
+    search_type: &'static str,
     #[serde(rename = "numResults")]
     num_results: usize,
     contents: ExaContentsOptions,
@@ -337,6 +345,7 @@ impl WebSearchTool {
             .header("x-api-key", key)
             .json(&ExaSearchBody {
                 query: query.to_string(),
+                search_type: EXA_SEARCH_MODE,
                 num_results: 10,
                 contents: ExaContentsOptions { text: true },
             })
