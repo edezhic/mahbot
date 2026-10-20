@@ -12,13 +12,8 @@ pub(crate) mod chrome_groups;
 pub mod chrome_release;
 pub(crate) mod chrome_tab_ledger;
 pub(crate) mod chrome_tabs;
-// Computer-use tool (GUI observe/act). Only Linux offers it: on macOS the
-// capability is withdrawn and the implementation is kept compiled but dormant
-// and private there (see `computer/macos.rs`), so nothing in the product can
-// reach it. Everywhere else the stub backend is never advertised.
-#[cfg(target_os = "macos")]
-mod computer;
-#[cfg(not(target_os = "macos"))]
+// Computer-use tool (GUI observe/act). Linux and macOS offer it; every other
+// platform reaches the stub backend, which is never advertised.
 pub mod computer;
 pub(crate) mod custom;
 pub(crate) mod delegation;
@@ -195,7 +190,6 @@ pub(crate) use alarms::{AddAlarmTool, ListAlarmsTool, RemoveAlarmTool};
 pub(crate) use analyze::{AnalyzeDepth, AnalyzeTool, DispatchMode};
 pub(crate) use archive::ArchiveTool;
 pub(crate) use chrome::ChromeTool;
-#[cfg(not(target_os = "macos"))]
 pub(crate) use computer::ComputerTool;
 pub(crate) use custom::CustomTool;
 pub(crate) use document::DocumentTool;
@@ -1459,12 +1453,7 @@ pub(crate) enum ImagePayloadSource {
     /// the agent's own visual analysis).
     Chrome,
     /// Screen capture from the computer tool (injected as a native image for
-    /// the agent's own visual analysis). Nothing produces it on macOS, where
-    /// computer use is withdrawn.
-    #[cfg_attr(
-        target_os = "macos",
-        expect(dead_code, reason = "computer use is withdrawn on macOS")
-    )]
+    /// the agent's own visual analysis).
     Computer,
 }
 

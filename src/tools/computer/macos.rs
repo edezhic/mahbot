@@ -1,18 +1,36 @@
 //! macOS [`Backend`] for the Computer tool: AX accessibility (observe/act),
 //! CGEvent raw input, and ScreenCaptureKit capture. Non-`Send` platform objects
-//! are created and dropped INSIDE `with_block_in_place` closures — never in
-//! struct state or across an await.
+//! are created and dropped inside the blocking closure of the call that uses them
+//! (`with_block_in_place`) — never in struct state or across an await. The one
+//! path outside such a closure is the grant diagnosis ([`permission_error`]),
+//! which resolves the responsible application's name synchronously, with no await
+//! in between.
 //!
-//! # Dormant — not enabled anywhere
+//! # Availability
 //!
-//! Computer use is offered on Linux only. This backend is kept compiled but
-//! nothing connects it to the product on macOS (see the module declaration in
-//! `tools/mod.rs`), because it performed poorly in its initial testing: on some
-//! Macs a missing screen-capture method raises a foreign Objective-C exception
-//! that aborts the whole process — daemon, window and every in-flight agent
-//! with it — instead of failing the call. It must be thoroughly reviewed and
-//! fixed before it is ever enabled again; until then nothing may advertise,
-//! invoke or probe it on macOS.
+//! macOS 14 is the product's floor, and the ScreenCaptureKit still API
+//! (`SCScreenshotManager` + `SCContentFilter.pointPixelScale`) is exactly that
+//! old, so [`sck_available`] guards every use of it: on a Mac below the floor
+//! capture degrades to an honest error while observe/act keep working. The guard
+//! is a runtime OS-version test in a build whose deployment target is lower and a
+//! compile-time constant in the published build, whose own floor is 14.0; the
+//! point of having it is that messaging a class or selector the running system
+//! lacks aborts the whole process instead of failing the call, so nothing newer
+//! than the floor may ever be called unguarded.
+//!
+//! # Privacy grants
+//!
+//! A bare binary has no privacy identity: macOS attributes every grant to the
+//! RESPONSIBLE PROCESS, which for this product is the terminal the daemon was
+//! started from — a detached daemon keeps it. The owner grants Accessibility
+//! (tree reads and element actions), input sending (synthesized clicks, typing
+//! and key chords) and Screen Recording (stills) to that terminal once, and the
+//! grants survive rebuilds and self-updates because the terminal's signature
+//! never changes. Accepted consequences: every process started from the same
+//! terminal — the shells the agent itself runs included — shares them, and a
+//! daemon started some other way has none until that other thing is granted
+//! them too. A missing grant is requested and, when still missing, reported by
+//! [`permission_error`]; nothing degrades silently.
 
 #![cfg(target_os = "macos")]
 // The many casts and raw-pointer borrows are inherent to the C ABI/geometry
@@ -40,25 +58,30 @@ use block2::RcBlock;
 use dispatch2::{DispatchRetained, DispatchSemaphore, DispatchTime};
 use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
 use objc2_application_services::{
-    self, AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType,
+    self, AXError, AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElement, AXValue,
+    AXValueType, kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
+    CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext, CGDirectDisplayID,
     CGDisplayBounds, CGError, CGEvent, CGEventField, CGEventFlags, CGEventSource,
     CGEventSourceStateID, CGEventTapLocation, CGEventType, CGGetActiveDisplayList, CGImage,
-    CGImageAlphaInfo, CGImageByteOrderInfo, CGMouseButton, CGScrollEventUnit,
+    CGImageAlphaInfo, CGImageByteOrderInfo, CGMouseButton, CGPreflightPostEventAccess,
+    CGPreflightScreenCaptureAccess, CGRequestPostEventAccess, CGRequestScreenCaptureAccess,
+    CGScrollEventUnit,
 };
-use objc2_foundation::{NSArray, NSError, NSInteger};
+use objc2_foundation::{NSArray, NSError, NSInteger, NSString};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCScreenshotConfiguration, SCScreenshotManager, SCScreenshotOutput,
-    SCShareableContent, SCStreamErrorCode, SCWindow,
+    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
+    SCStreamErrorCode, SCWindow,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub(crate) static MACOS_BACKEND: MacOsBackend = MacOsBackend;
 
@@ -76,11 +99,9 @@ const AX_VALUE: &str = "AXValue";
 const AX_SUBROLE: &str = "AXSubrole";
 const AX_POSITION: &str = "AXPosition";
 const AX_SIZE: &str = "AXSize";
-const AX_ACTIONS: &str = "AXActions";
 const AX_CHILDREN: &str = "AXChildren";
 const AX_WINDOWS: &str = "AXWindows";
 const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
-const AX_FOCUSED_APPLICATION: &str = "AXFocusedApplication";
 const AX_FOCUSED: &str = "AXFocused";
 const AX_PRESS: &str = "AXPress";
 const AX_OPEN: &str = "AXOpen";
@@ -89,6 +110,215 @@ const AX_RAISE: &str = "AXRaise";
 #[inline]
 fn axc(s: &'static str) -> CFRetained<CFString> {
     CFString::from_static_str(s)
+}
+
+// ── Privacy grants (TCC) ─────────────────────────────────────────────────
+//
+// See the module docs for the model. Each grant is probed cheaply, requested at
+// most once per process (the system's dialog is the owner's to answer, and a
+// retry loop must not re-open it), and reported through one actionable error
+// that names the terminal macOS holds the grant against.
+
+/// The three grants a computer-use action can need.
+#[derive(Clone, Copy)]
+enum Grant {
+    /// Reading the AX tree and acting on elements.
+    Accessibility,
+    /// Posting synthesized input events.
+    Input,
+    /// Capturing stills of windows and displays.
+    ScreenRecording,
+}
+
+impl Grant {
+    /// What the grant enables, as the error and the log name it.
+    fn what(self) -> &'static str {
+        match self {
+            Self::Accessibility => "Accessibility",
+            Self::Input => "permission to send input (clicks, typing and key chords)",
+            Self::ScreenRecording => "Screen Recording",
+        }
+    }
+
+    /// The privacy pane the owner grants it in.
+    fn pane(self) -> &'static str {
+        match self {
+            // macOS files synthesized input under the same grant that lets an
+            // application control others.
+            Self::Accessibility | Self::Input => "Accessibility",
+            Self::ScreenRecording => "Screen Recording",
+        }
+    }
+
+    /// Cheap, prompt-free check of this process's own grant.
+    fn held(self) -> bool {
+        // SAFETY: each call only reads this process's own privacy state.
+        unsafe {
+            match self {
+                Self::Accessibility => AXIsProcessTrusted(),
+                Self::Input => CGPreflightPostEventAccess(),
+                Self::ScreenRecording => CGPreflightScreenCaptureAccess(),
+            }
+        }
+    }
+
+    /// The flag recording that this process already asked for this grant.
+    fn asked(self) -> &'static AtomicBool {
+        match self {
+            Self::Accessibility => &ACCESSIBILITY_ASKED,
+            Self::Input => &INPUT_ASKED,
+            Self::ScreenRecording => &SCREEN_RECORDING_ASKED,
+        }
+    }
+
+    /// Ask the system to show its grant dialog, attributed to the responsible
+    /// process (the terminal) and not to this binary. The answer arrives outside
+    /// the call — the caller re-probes. The Accessibility variant returns at once;
+    /// the two CG requests wait for the owner, so the prompt runs on its own
+    /// thread and the caller waits at most [`PROMPT_WAIT`], which bounds how long
+    /// the computer-action lock is held while the dialog sits unanswered.
+    fn request(self) {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            self.prompt();
+            let _ = done.send(());
+        });
+        let _ = wait.recv_timeout(PROMPT_WAIT);
+    }
+
+    /// The blocking half of [`Grant::request`]; the answer is read by the caller's
+    /// re-probe, not from the return values here.
+    fn prompt(self) {
+        // SAFETY: each call only asks the system to prompt; nothing is granted
+        // behind the owner's back and no pointer outlives the call.
+        unsafe {
+            match self {
+                Self::Accessibility => {
+                    // `kAXTrustedCheckOptionPrompt: true` is what makes the call
+                    // show the system's grant dialog instead of only answering.
+                    let options = CFDictionary::<CFString, CFBoolean>::from_slices(
+                        &[kAXTrustedCheckOptionPrompt],
+                        &[CFBoolean::new(true)],
+                    );
+                    let _ = AXIsProcessTrustedWithOptions(Some(options.as_opaque()));
+                }
+                Self::Input => {
+                    let _ = CGRequestPostEventAccess();
+                }
+                Self::ScreenRecording => {
+                    let _ = CGRequestScreenCaptureAccess();
+                }
+            }
+        }
+    }
+}
+
+/// How long an unanswered grant dialog may hold the action that asked for it
+/// before the call reports the grant as missing; the dialog's late answer still
+/// applies to the next call.
+const PROMPT_WAIT: Duration = Duration::from_secs(20);
+
+/// Set once this process has asked the system for the grant, so the owner answers
+/// each dialog once instead of once per agent retry.
+static ACCESSIBILITY_ASKED: AtomicBool = AtomicBool::new(false);
+static INPUT_ASKED: AtomicBool = AtomicBool::new(false);
+static SCREEN_RECORDING_ASKED: AtomicBool = AtomicBool::new(false);
+
+/// Require `grant`, asking the system to prompt for it when this process has not
+/// asked yet. The error is the actionable diagnosis — never a silent fallback and
+/// never a retry behind the owner's back.
+fn ensure(grant: Grant) -> anyhow::Result<()> {
+    if grant.held() {
+        return Ok(());
+    }
+    if !grant.asked().swap(true, Ordering::Relaxed) {
+        // The log carries the same facts as the error the caller will see — the
+        // restart for Screen Recording and its periodic re-ask included.
+        tracing::warn!(
+            "computer use: asking the system to prompt — {}",
+            permission_error(grant)
+        );
+        grant.request();
+    }
+    if grant.held() {
+        return Ok(());
+    }
+    Err(permission_error(grant))
+}
+
+/// The actionable diagnosis for a grant this process does not hold: what is
+/// unavailable, which application the owner must authorize, where, and what the
+/// grant needs before it applies.
+fn permission_error(grant: Grant) -> anyhow::Error {
+    let app = responsible_app();
+    let consequence = match grant {
+        Grant::Accessibility => {
+            "Nothing was observed or acted on. The grant covers every process started from that \
+             terminal, this daemon's own shell commands included."
+        }
+        Grant::Input => {
+            "Clicks, typing and key chords stay unavailable; reading the accessibility tree does \
+             not need this grant."
+        }
+        Grant::ScreenRecording => {
+            "Restart mahbot before it applies — macOS gives this grant only to a newly started \
+             process. Stills stay unavailable meanwhile; observe and act keep working. macOS asks \
+             for this grant again periodically by design — grant it again the same way. Every \
+             process started from that terminal shares it."
+        }
+    };
+    core::permission_denied(format!(
+        "{} is not granted to {app}. macOS attributes privacy grants to the terminal this \
+         daemon was started from, not to the binary itself — open System Settings → Privacy & \
+         Security → {} and enable {app}. {consequence}",
+        grant.what(),
+        grant.pane(),
+    ))
+}
+
+/// The application macOS holds this daemon's grants against: the terminal it was
+/// started from. The process tree no longer reaches it once the daemon detaches,
+/// but the environment it inherited names it — terminal emulators export their
+/// own bundle identifier (`__CFBundleIdentifier`, set by AppKit) and program name
+/// (`TERM_PROGRAM`). The last fallback says what to look for rather than claiming
+/// a name it does not know.
+fn responsible_app() -> String {
+    let non_empty = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(bundle_id) = non_empty("__CFBundleIdentifier") {
+        // The running application's localized name is what System Settings shows.
+        let id = NSString::from_str(&bundle_id);
+        let name = NSRunningApplication::runningApplicationsWithBundleIdentifier(&id)
+            .iter()
+            .find_map(|app| {
+                app.localizedName()
+                    .map(|name| name.to_string())
+                    .filter(|name| !name.is_empty())
+            });
+        return name.unwrap_or(bundle_id);
+    }
+    non_empty("TERM_PROGRAM").unwrap_or_else(|| "the terminal you started mahbot from".to_string())
+}
+
+// ── Availability guards ──────────────────────────────────────────────────
+
+/// ScreenCaptureKit stills (`SCScreenshotManager`, `SCContentFilter`'s pixel
+/// scale) need macOS 14. Below it no SCK symbol is touched: capture reports
+/// [`screen_capture_needs_14`] and the AX channel stays fully usable.
+fn sck_available() -> bool {
+    objc2::available!(macos = 14.0, ..)
+}
+
+fn screen_capture_needs_14() -> anyhow::Error {
+    core::taxonomy_error(
+        core::ERR_UNSUPPORTED,
+        "screen capture needs macOS 14 or newer; observing and acting through the accessibility \
+         tree keep working",
+    )
 }
 
 // ── AX attribute readers ─────────────────────────────────────────────────
@@ -151,17 +381,27 @@ fn attribute_bool(el: &AXUIElement, attr: &CFString) -> Option<bool> {
     Some(val.downcast_ref::<CFBoolean>()?.value())
 }
 
-/// Raw (AX-prefixed) action names; empty on error.
-fn raw_action_names(el: &AXUIElement) -> Vec<String> {
-    let Ok(val) = attribute_value(el, &axc(AX_ACTIONS)) else {
-        return Vec::new();
+/// Raw (AX-prefixed) action names; the AX error is the caller's to report — a
+/// tree walk degrades to no actions, while acting on an element must not turn a
+/// failed read into "element has no press/open action".
+fn raw_action_names(el: &AXUIElement) -> Result<Vec<String>, AXError> {
+    let mut names: *const CFArray = std::ptr::null();
+    // SAFETY: `names` points to valid storage the binding fills on success.
+    let err = unsafe {
+        el.copy_action_names(std::ptr::NonNull::new(&mut names as *mut *const CFArray).unwrap())
     };
-    let Ok(array) = val.downcast::<CFArray>() else {
-        return Vec::new();
+    if err != AXError::Success {
+        return Err(err);
+    }
+    // SAFETY: AXUIElementCopyActionNames returns a +1 retained CFArray (Create
+    // rule); null indicates an element with no actions.
+    let Some(raw) = std::ptr::NonNull::new(names.cast_mut()) else {
+        return Ok(Vec::new());
     };
-    // SAFETY: AXActions is a CFArray of CFString objects.
+    let array = unsafe { CFRetained::from_raw(raw) };
+    // SAFETY: AX action names are a CFArray of CFString objects.
     let typed: CFRetained<CFArray<CFString>> = unsafe { CFRetained::cast_unchecked(array) };
-    typed.iter().map(|s| s.to_string()).collect()
+    Ok(typed.iter().map(|s| s.to_string()).collect())
 }
 
 fn attribute_children(el: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
@@ -192,10 +432,7 @@ fn ax_error_shared(err: AXError, ctx: impl std::fmt::Display) -> Option<anyhow::
             core::ERR_STALE_ELEMENT,
             format!("window closed or changed — re-enumerate: {ctx}"),
         )),
-        AXError::APIDisabled => Some(core::taxonomy_error(
-            core::ERR_PERMISSION_DENIED,
-            format!("Accessibility TCC grant missing: {ctx}"),
-        )),
+        AXError::APIDisabled => Some(permission_error(Grant::Accessibility)),
         _ => None,
     }
 }
@@ -274,6 +511,7 @@ fn walk_element(
         _ => None,
     };
     let actions = raw_action_names(element)
+        .unwrap_or_default()
         .iter()
         .map(|a| normalize_action_name(a))
         .collect();
@@ -318,11 +556,24 @@ fn build_tree(root: &AXUIElement, origin: (f64, f64)) -> (UiNode, Vec<CFRetained
 
 // ── Window resolution ────────────────────────────────────────────────────
 
-fn focused_app(system: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
-    attribute_value(system, &axc(AX_FOCUSED_APPLICATION))
-        .ok()?
-        .downcast::<AXUIElement>()
-        .ok()
+/// The frontmost application's AX element, resolved through `NSWorkspace`.
+///
+/// The system-wide AX element's own focus attributes are deliberately not used:
+/// a process that holds its grant through the terminal gets
+/// `kAXErrorCannotComplete` from them, which would make the DEFAULT surface (a
+/// call with no explicit target) fail while every per-application query works.
+fn frontmost_app() -> Result<CFRetained<AXUIElement>, anyhow::Error> {
+    let app = NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .ok_or_else(|| {
+            core::taxonomy_error(
+                core::ERR_NOT_MATCHED,
+                "no frontmost application — enumerate apps/windows first",
+            )
+        })?;
+    // SAFETY: AXUIElementCreateApplication never returns null; a pid that went
+    // away surfaces as InvalidUIElement on the first attribute read.
+    Ok(unsafe { AXUIElement::new_application(app.processIdentifier()) })
 }
 
 fn focused_window_of_app(app: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
@@ -429,16 +680,16 @@ fn resolve_window(
 ) -> Result<(CFRetained<AXUIElement>, CFRetained<AXUIElement>), anyhow::Error> {
     match target {
         TargetSpec::Focused => {
-            // SAFETY: AXUIElementCreateSystemWide never returns null.
-            let system = unsafe { AXUIElement::new_system_wide() };
-            let app = focused_app(&system).ok_or_else(|| {
+            let app = frontmost_app()?;
+            // Strictly the frontmost app's focused window: a coordinate action on
+            // a fallback surface would land on whatever is visible, which may not
+            // be that window (another Space, a minimized window).
+            let window = focused_window_of_app(&app).ok_or_else(|| {
                 core::taxonomy_error(
                     core::ERR_NOT_MATCHED,
-                    "no focused application — enumerate apps/windows first",
+                    "no focused window (desktop frontmost/screensaver) — use 'apps'/'windows' \
+                     to pick a surface",
                 )
-            })?;
-            let window = focused_window_of_app(&app).ok_or_else(|| {
-                core::taxonomy_error(core::ERR_NOT_MATCHED, "no focused window (desktop frontmost/screensaver) — use 'apps'/'windows' to pick a surface")
             })?;
             Ok((window, app))
         }
@@ -527,31 +778,65 @@ fn source() -> Option<CFRetained<CGEventSource>> {
     CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
 }
 
-fn click(point: CGPoint, button: MouseButton, double: bool, modifiers: &[Modifier]) {
+/// A mouse event of `kind` at `point`. A failed creation is an honest error: an
+/// action that posts nothing must never report success.
+fn mouse_event(
+    source: Option<&CGEventSource>,
+    kind: CGEventType,
+    point: CGPoint,
+    button: CGMouseButton,
+) -> Result<CFRetained<CGEvent>, anyhow::Error> {
+    CGEvent::new_mouse_event(source, kind, point, button)
+        .ok_or_else(|| anyhow!("failed to create a mouse event"))
+}
+
+/// A keyboard event for `code`; see [`mouse_event`] on the failure rule.
+fn keyboard_event(
+    source: Option<&CGEventSource>,
+    code: u16,
+    down: bool,
+) -> Result<CFRetained<CGEvent>, anyhow::Error> {
+    CGEvent::new_keyboard_event(source, code, down)
+        .ok_or_else(|| anyhow!("failed to create a keyboard event"))
+}
+
+fn click(
+    point: CGPoint,
+    button: MouseButton,
+    double: bool,
+    modifiers: &[Modifier],
+) -> Result<(), anyhow::Error> {
     let src = source();
     let flags = cg_flags(modifiers);
-    let flap = |down: bool, state: i64| {
-        if let Some(ev) = CGEvent::new_mouse_event(
+    let flap = |down: bool, state: i64| -> Result<CFRetained<CGEvent>, anyhow::Error> {
+        let ev = mouse_event(
             src.as_deref(),
             cg_type_for(button, down),
             point,
             cg_mouse_button(button),
-        ) {
-            CGEvent::set_flags(Some(&ev), flags);
-            CGEvent::set_integer_value_field(Some(&ev), CGEventField::MouseEventClickState, state);
-            post_event(&ev);
-        }
+        )?;
+        CGEvent::set_flags(Some(&ev), flags);
+        CGEvent::set_integer_value_field(Some(&ev), CGEventField::MouseEventClickState, state);
+        Ok(ev)
     };
-    if double {
-        // Both halves carry click-state 2; two down/up flaps make a double click.
-        flap(true, 2);
-        flap(false, 2);
-        flap(true, 2);
-        flap(false, 2);
-    } else {
-        flap(true, 1);
-        flap(false, 1);
+    // Both halves of a double click carry click-state 2.
+    let state = if double { 2 } else { 1 };
+    for _ in 0..if double { 2 } else { 1 } {
+        let down = flap(true, state)?;
+        post_event(&down);
+        release(flap(false, state))?;
     }
+    Ok(())
+}
+
+/// Post a created mouse-up event, or report why it could not be created. Once the
+/// matching down is posted the attempt is never skipped, so a failed action
+/// cannot leave the button held down and the desktop mid-drag.
+fn release(made: Result<CFRetained<CGEvent>, anyhow::Error>) -> Result<(), anyhow::Error> {
+    if let Ok(ev) = &made {
+        post_event(ev);
+    }
+    made.map(drop)
 }
 
 fn sleep_millis(ms: u64) {
@@ -656,81 +941,74 @@ const KNOWN_KEYS: &str = "return, enter, tab, space, delete, forwarddelete, esca
      pageup, pagedown, up, down, left, right, f1..f12, minus, equal, comma, period, slash, \
      semicolon, quote, backslash, backtick, leftbracket, rightbracket, capslock, a-z, 0-9";
 
+/// The virtual keycode for a parsed key name, with the one error message every
+/// caller — the argument pre-check included — reports.
+fn lookup_key(key: &str) -> Result<i64, anyhow::Error> {
+    key_code(key).ok_or_else(|| anyhow!("unknown key '{key}' — supported keys: {KNOWN_KEYS}"))
+}
+
 fn press_key(key: &str) -> Result<(), anyhow::Error> {
-    let Some(code) = key_code(key) else {
-        return Err(anyhow!(
-            "unknown key '{key}' — supported keys: {KNOWN_KEYS}"
-        ));
-    };
+    let code = lookup_key(key)?;
     let src = source();
-    if let Some(down) = CGEvent::new_keyboard_event(src.as_deref(), code as u16, true) {
-        post_event(&down);
-    }
-    if let Some(up) = CGEvent::new_keyboard_event(src.as_deref(), code as u16, false) {
-        post_event(&up);
-    }
+    let down = keyboard_event(src.as_deref(), code as u16, true)?;
+    post_event(&down);
+    let up = keyboard_event(src.as_deref(), code as u16, false)?;
+    post_event(&up);
     Ok(())
 }
 
-fn type_text(text: &str) {
+fn type_text(text: &str) -> Result<(), anyhow::Error> {
     let src = source();
     for ch in text.chars() {
         if ch == '\n' {
-            let _ = press_key("return");
+            press_key("return")?;
             continue;
         }
         let mut buf = [0u16; 2];
         let encoded = ch.encode_utf16(&mut buf);
-        if let Some(down) = CGEvent::new_keyboard_event(src.as_deref(), 0, true) {
-            // SAFETY: `encoded` is a valid UTF-16 buffer.
-            unsafe {
-                CGEvent::keyboard_set_unicode_string(
-                    Some(&down),
-                    encoded.len() as u64,
-                    encoded.as_ptr(),
-                )
-            };
-            post_event(&down);
-        }
-        if let Some(up) = CGEvent::new_keyboard_event(src.as_deref(), 0, false) {
-            // SAFETY: `encoded` is a valid UTF-16 buffer.
-            unsafe {
-                CGEvent::keyboard_set_unicode_string(
-                    Some(&up),
-                    encoded.len() as u64,
-                    encoded.as_ptr(),
-                )
-            };
-            post_event(&up);
-        }
+        let down = keyboard_event(src.as_deref(), 0, true)?;
+        // SAFETY: `encoded` is a valid UTF-16 buffer.
+        unsafe {
+            CGEvent::keyboard_set_unicode_string(
+                Some(&down),
+                encoded.len() as u64,
+                encoded.as_ptr(),
+            )
+        };
+        post_event(&down);
+        let up = keyboard_event(src.as_deref(), 0, false)?;
+        // SAFETY: `encoded` is a valid UTF-16 buffer.
+        unsafe {
+            CGEvent::keyboard_set_unicode_string(Some(&up), encoded.len() as u64, encoded.as_ptr())
+        };
+        post_event(&up);
         sleep_millis(1);
     }
+    Ok(())
 }
 
 fn key_chord(chord: &str) -> Result<(), anyhow::Error> {
     let (modifiers, key) = core::parse_key_chord(chord)?;
-    let Some(code) = key_code(&key) else {
-        return Err(anyhow!(
-            "unknown key '{key}' — supported keys: {KNOWN_KEYS}"
-        ));
-    };
+    let code = lookup_key(&key)?;
     let src = source();
     let flags = cg_flags(&modifiers);
-    if let Some(down) = CGEvent::new_keyboard_event(src.as_deref(), code as u16, true) {
-        CGEvent::set_flags(Some(&down), flags);
-        post_event(&down);
-    }
-    if let Some(up) = CGEvent::new_keyboard_event(src.as_deref(), code as u16, false) {
-        // Clear flags on key-up so the modifier doesn't stick.
-        CGEvent::set_flags(Some(&up), CGEventFlags::empty());
-        post_event(&up);
-    }
+    let down = keyboard_event(src.as_deref(), code as u16, true)?;
+    CGEvent::set_flags(Some(&down), flags);
+    post_event(&down);
+    let up = keyboard_event(src.as_deref(), code as u16, false)?;
+    // Clear flags on key-up so the modifier doesn't stick.
+    CGEvent::set_flags(Some(&up), CGEventFlags::empty());
+    post_event(&up);
     Ok(())
 }
 
 /// Scroll: wheel 1 = vertical (down positive), wheel 2 = horizontal (right
 /// positive). CGEvent deltas use +ve for down/right on macOS.
-fn scroll(point: Option<CGPoint>, direction: ScrollDirection, amount: u32) {
+fn scroll(
+    point: Option<CGPoint>,
+    direction: ScrollDirection,
+    amount: u32,
+) -> Result<(), anyhow::Error> {
     let src = source();
     let (w1, w2) = match direction {
         ScrollDirection::Down => (amount as i32, 0),
@@ -738,46 +1016,47 @@ fn scroll(point: Option<CGPoint>, direction: ScrollDirection, amount: u32) {
         ScrollDirection::Right => (0, amount as i32),
         ScrollDirection::Left => (0, -(amount as i32)),
     };
-    if let Some(ev) =
+    let ev =
         CGEvent::new_scroll_wheel_event2(src.as_deref(), CGScrollEventUnit::Line, 2, w1, w2, 0)
-    {
-        if let Some(p) = point {
-            CGEvent::set_location(Some(&ev), p);
-        }
-        post_event(&ev);
+            .ok_or_else(|| anyhow!("failed to create a scroll event"))?;
+    if let Some(p) = point {
+        CGEvent::set_location(Some(&ev), p);
     }
+    post_event(&ev);
+    Ok(())
 }
 
-fn drag(from: CGPoint, to: CGPoint) {
+fn drag(from: CGPoint, to: CGPoint) -> Result<(), anyhow::Error> {
     let src = source();
-    if let Some(down) = CGEvent::new_mouse_event(
+    let down = mouse_event(
         src.as_deref(),
         CGEventType::LeftMouseDown,
         from,
         CGMouseButton::Left,
-    ) {
-        post_event(&down);
-    }
-    for i in 1..=12 {
-        let t = i as f64 / 12.0;
-        if let Some(drag) = CGEvent::new_mouse_event(
-            src.as_deref(),
-            CGEventType::LeftMouseDragged,
-            CGPoint::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t),
-            CGMouseButton::Left,
-        ) {
-            post_event(&drag);
+    )?;
+    post_event(&down);
+    let moved = (|| -> Result<(), anyhow::Error> {
+        for i in 1..=12 {
+            let t = i as f64 / 12.0;
+            let step = mouse_event(
+                src.as_deref(),
+                CGEventType::LeftMouseDragged,
+                CGPoint::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t),
+                CGMouseButton::Left,
+            )?;
+            post_event(&step);
+            sleep_millis(2);
         }
-        sleep_millis(2);
-    }
-    if let Some(up) = CGEvent::new_mouse_event(
+        Ok(())
+    })();
+    let released = release(mouse_event(
         src.as_deref(),
         CGEventType::LeftMouseUp,
         to,
         CGMouseButton::Left,
-    ) {
-        post_event(&up);
-    }
+    ));
+    moved?;
+    released
 }
 
 // ── Surface geometry ─────────────────────────────────────────────────────
@@ -819,10 +1098,12 @@ fn screen_surface() -> Result<SurfaceGeometry, anyhow::Error> {
 }
 
 fn surface_geometry_blocking(target: &TargetSpec) -> Result<SurfaceGeometry, anyhow::Error> {
-    match target {
-        TargetSpec::Screen => screen_surface(),
-        _ => window_frame(&resolve_window(target)?.0),
+    if matches!(target, TargetSpec::Screen) {
+        return screen_surface();
     }
+    // A window's frame is an AX read, so the grant gate belongs here too.
+    ensure(Grant::Accessibility)?;
+    window_frame(&resolve_window(target)?.0)
 }
 
 fn activate_window(target: &TargetSpec) -> Result<(), anyhow::Error> {
@@ -834,7 +1115,10 @@ fn activate_window(target: &TargetSpec) -> Result<(), anyhow::Error> {
     let Ok((window, _app)) = resolve_window(target) else {
         return Ok(());
     };
-    if raw_action_names(&window).iter().any(|a| a == AX_RAISE) {
+    let Ok(names) = raw_action_names(&window) else {
+        return Ok(());
+    };
+    if names.iter().any(|a| a == AX_RAISE) {
         // SAFETY: AXRaise was verified to exist on the window.
         let err = unsafe { window.perform_action(&axc(AX_RAISE)) };
         if err != AXError::Success {
@@ -843,6 +1127,23 @@ fn activate_window(target: &TargetSpec) -> Result<(), anyhow::Error> {
         sleep_millis(80);
     }
     Ok(())
+}
+
+/// Reject an argument mistake before any grant is requested: a call that can
+/// never succeed must not raise a system permission dialog.
+fn check_input_arguments(input: &RawInput) -> Result<(), anyhow::Error> {
+    match input {
+        RawInput::Click { point, .. } => core::check_normalized(point.0, point.1),
+        RawInput::Scroll { point, .. } => {
+            point.map_or(Ok(()), |(x, y)| core::check_normalized(x, y))
+        }
+        RawInput::Drag { from, to } => {
+            core::check_normalized(from.0, from.1)?;
+            core::check_normalized(to.0, to.1)
+        }
+        RawInput::KeyChord { chord } => lookup_key(&core::parse_key_chord(chord)?.1).map(|_| ()),
+        RawInput::TypeText { .. } => Ok(()),
+    }
 }
 
 fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyhow::Error> {
@@ -858,9 +1159,9 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyho
         } => {
             let (x, y) =
                 core::normalized_to_surface(point.0, point.1, &surface_geometry_blocking(target)?)?;
-            click(CGPoint::new(x, y), *button, *double, modifiers);
+            click(CGPoint::new(x, y), *button, *double, modifiers)?;
         }
-        RawInput::TypeText { text } => type_text(text),
+        RawInput::TypeText { text } => type_text(text)?,
         RawInput::KeyChord { chord } => key_chord(chord)?,
         RawInput::Scroll {
             point,
@@ -874,13 +1175,13 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyho
             } else {
                 None
             };
-            scroll(p, *direction, *amount);
+            scroll(p, *direction, *amount)?;
         }
         RawInput::Drag { from, to } => {
             let geometry = surface_geometry_blocking(target)?;
             let (fx, fy) = core::normalized_to_surface(from.0, from.1, &geometry)?;
             let (tx, ty) = core::normalized_to_surface(to.0, to.1, &geometry)?;
-            drag(CGPoint::new(fx, fy), CGPoint::new(tx, ty));
+            drag(CGPoint::new(fx, fy), CGPoint::new(tx, ty))?;
         }
     }
     Ok(())
@@ -906,13 +1207,7 @@ impl From<ScErr> for anyhow::Error {
         if err.code == SCStreamErrorCode::UserDeclined.0
             || err.code == SCStreamErrorCode::MissingEntitlements.0
         {
-            core::taxonomy_error(
-                core::ERR_PERMISSION_DENIED,
-                format!(
-                    "Screen Recording permission is not granted — {}",
-                    err.message
-                ),
-            )
+            permission_error(Grant::ScreenRecording)
         } else if err.code == SCStreamErrorCode::NoWindowList.0 {
             core::taxonomy_error(
                 core::ERR_NOT_MATCHED,
@@ -978,61 +1273,71 @@ fn get_shareable_content() -> Result<Retained<SCShareableContent>, anyhow::Error
         *slot2.lock().unwrap_poison() = Some(result);
         sem2.signal();
     });
-    // SAFETY: block is valid; SCK does not retain the block across the call.
+    // SAFETY: `block` is a live stack block; the framework copies it for the
+    // asynchronous call, and the wait below keeps the original alive until the
+    // handler has run.
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(false, true, &block);
     }
     sc_wait::<SendShareable>(&slot, &semaphore, "shareable content").map(|SendShareable(c)| c)
 }
 
+/// A single still of `filter`'s content, at the pixel size the caller asked for.
+///
+/// Callers guarantee [`sck_available`]: the `SCScreenshotManager` class itself
+/// only exists from macOS 14 on, and messaging a missing class aborts the
+/// process.
 fn capture_filter_to_rgba(
     filter: &SCContentFilter,
     px_w: usize,
     px_h: usize,
     ignore_shadows: bool,
 ) -> Result<Capture, anyhow::Error> {
-    let config = unsafe { SCScreenshotConfiguration::new() };
+    let config = unsafe { SCStreamConfiguration::new() };
     // SAFETY: the config setters are ObjC messages against a live object.
-    // sourceRect is intentionally NOT set: SCK interprets it filter-locally and
-    // would crop off-content, so capture the full filter content and let
-    // `core::crop_rgba` do the zoom cropping instead.
+    // No source rect is set: SCK interprets one filter-locally and would crop
+    // off-content, so the full filter content is captured and `core::crop_rgba`
+    // does the zoom cropping instead.
     unsafe {
-        config.setWidth(px_w as NSInteger);
-        config.setHeight(px_h as NSInteger);
+        config.setWidth(px_w);
+        config.setHeight(px_h);
         config.setShowsCursor(false);
-        config.setIgnoreShadows(ignore_shadows);
+        config.setIgnoreShadowsSingleWindow(ignore_shadows);
+        config.setIgnoreShadowsDisplay(ignore_shadows);
     }
 
     let semaphore = Arc::new(DispatchSemaphore::new(0));
     let sem2 = Arc::clone(&semaphore);
     let slot: Arc<Mutex<Option<Result<SendImage, ScErr>>>> = Arc::new(Mutex::new(None));
     let slot2 = Arc::clone(&slot);
-    let block = RcBlock::new(move |output: *mut SCScreenshotOutput, err: *mut NSError| {
+    let block = RcBlock::new(move |image: *mut CGImage, err: *mut NSError| {
         let result = if !err.is_null() {
             // SAFETY: `err` is valid for the handler's duration.
             Err(sc_err_from_nserror(unsafe { &*err }))
-        } else if output.is_null() {
+        } else if image.is_null() {
             Err(ScErr {
                 code: 0,
-                message: "no screenshot output".to_string(),
+                message: "no image in the screenshot".to_string(),
             })
         } else {
-            // SAFETY: `output` is valid for the handler's duration.
-            let out = unsafe { &*output };
-            match unsafe { out.sdrImage() } {
+            // SAFETY: a +0 object the handler hands us; `retain` takes ownership
+            // beyond the callback, which ends when the waiter returns.
+            match unsafe { Retained::retain(image) } {
                 Some(img) => Ok(SendImage(img)),
                 None => Err(ScErr {
                     code: 0,
-                    message: "no SDR image in output".to_string(),
+                    message: "null screenshot image".to_string(),
                 }),
             }
         };
         *slot2.lock().unwrap_poison() = Some(result);
         sem2.signal();
     });
-    // SAFETY: filter/config/block are valid; SCK does not retain the block.
+    // SAFETY: filter/config/block are valid; the framework copies the block for
+    // the asynchronous call, and the wait below keeps the original alive until
+    // the handler has run.
     unsafe {
-        SCScreenshotManager::captureScreenshotWithFilter_configuration_completionHandler(
+        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
             filter,
             &config,
             Some(&block),
@@ -1196,20 +1501,35 @@ fn capture_screen_blocking() -> Result<Capture, anyhow::Error> {
 }
 
 fn capture_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error> {
-    match target {
+    if !sck_available() {
+        return Err(screen_capture_needs_14());
+    }
+    // A window still is resolved through AX (its frame and title) before SCK is
+    // asked for pixels, so the Accessibility grant is needed as well.
+    if !matches!(target, TargetSpec::Screen) {
+        ensure(Grant::Accessibility)?;
+    }
+    let result = match target {
         TargetSpec::Screen => capture_screen_blocking(),
         _ => capture_window_blocking(target),
-    }
+    };
+    // A failed still is diagnosed from the grant, never assumed: the attempt
+    // itself is the authority (a preflight answer is only a hint), so a
+    // grantless capture asks for the grant and reports the actionable error,
+    // while a transient failure keeps its own.
+    result.map_err(|e| ensure(Grant::ScreenRecording).err().unwrap_or(e))
 }
 
 fn capture_available_blocking() -> bool {
-    get_shareable_content().is_ok()
+    // Preflight only: the boot probe must never put a TCC dialog on the owner's
+    // screen, and fetching shareable content can raise one.
+    sck_available() && Grant::ScreenRecording.held()
 }
 
 // ── Element actions ──────────────────────────────────────────────────────
 
 fn press_element(element: &AXUIElement) -> Result<(), anyhow::Error> {
-    let names = raw_action_names(element);
+    let names = raw_action_names(element).map_err(|e| ax_error(e, "read element actions"))?;
     if names.iter().any(|a| a == AX_PRESS) {
         // SAFETY: AXPress was verified to exist on the element.
         map_action_err(
@@ -1265,10 +1585,7 @@ fn map_action_err(err: AXError, ctx: &str) -> Result<(), anyhow::Error> {
             core::ERR_STALE_ELEMENT,
             format!("{ctx} — window closed or changed — re-enumerate"),
         )),
-        AXError::APIDisabled => Err(core::taxonomy_error(
-            core::ERR_PERMISSION_DENIED,
-            format!("{ctx} — Accessibility TCC grant missing"),
-        )),
+        AXError::APIDisabled => Err(permission_error(Grant::Accessibility)),
         AXError::CannotComplete => Err(core::taxonomy_error(
             core::ERR_DEGRADED,
             format!("{ctx} — transient AX failure, retry"),
@@ -1281,9 +1598,9 @@ fn map_action_err(err: AXError, ctx: &str) -> Result<(), anyhow::Error> {
 
 #[async_trait::async_trait]
 impl Backend for MacOsBackend {
-    fn accessibility_available(&self) -> bool {
-        // SAFETY: AXIsProcessTrusted is a cheap sync query (no prompt variant).
-        unsafe { AXIsProcessTrusted() }
+    fn is_supported(&self) -> bool {
+        // macOS 14 is the floor, so the capability itself is always present.
+        true
     }
 
     async fn capture_available(&self) -> bool {
@@ -1291,13 +1608,11 @@ impl Backend for MacOsBackend {
     }
 
     fn capture_unavailable_error(&self) -> anyhow::Error {
-        core::taxonomy_error(
-            core::ERR_PERMISSION_DENIED,
-            "Screen Recording permission is not granted (System Settings → Privacy & Security → \
-             Screen Recording). On macOS a plain unbundled binary may not be grantable — wrapping \
-             the binary in a minimal .app bundle is the known workaround (provisioning is a \
-             separate follow-up). Accessibility observe/act remain available without this grant.",
-        )
+        if sck_available() {
+            permission_error(Grant::ScreenRecording)
+        } else {
+            screen_capture_needs_14()
+        }
     }
 
     async fn list_apps(&self) -> Result<Vec<AppInfo>, anyhow::Error> {
@@ -1323,6 +1638,7 @@ impl Backend for MacOsBackend {
 
     async fn list_windows(&self, app: Option<&AppInfo>) -> Result<Vec<WindowInfo>, anyhow::Error> {
         with_block_in_place(|| {
+            ensure(Grant::Accessibility)?;
             let app_infos: Vec<AppInfo> = if let Some(a) = app {
                 vec![a.clone()]
             } else {
@@ -1371,6 +1687,7 @@ impl Backend for MacOsBackend {
 
     async fn focused_window(&self) -> Result<WindowInfo, anyhow::Error> {
         with_block_in_place(|| {
+            ensure(Grant::Accessibility)?;
             let (window, app) = resolve_window(&TargetSpec::Focused)?;
             let pid = app_pid(&app)?;
             Ok(WindowInfo {
@@ -1392,6 +1709,7 @@ impl Backend for MacOsBackend {
 
     async fn observe(&self, target: &TargetSpec) -> Result<Observation, anyhow::Error> {
         with_block_in_place(|| {
+            ensure(Grant::Accessibility)?;
             let (window, app) = resolve_window(target)?;
             let origin = window_origin(&window)?;
             let surface = window_frame(&window)?;
@@ -1419,6 +1737,7 @@ impl Backend for MacOsBackend {
             if matches!(target, TargetSpec::Screen) {
                 return Err(core::screen_act_error());
             }
+            ensure(Grant::Accessibility)?;
             let (window, _app) = resolve_window(target)?;
             let (root, handles) = build_tree(&window, window_origin(&window)?);
             let matched = core::resolve_locator_checked(&root, locator)?;
@@ -1431,7 +1750,11 @@ impl Backend for MacOsBackend {
     }
 
     async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> Result<(), anyhow::Error> {
-        with_block_in_place(|| raw_input_blocking(target, &input))
+        with_block_in_place(|| {
+            check_input_arguments(&input)?;
+            ensure(Grant::Input)?;
+            raw_input_blocking(target, &input)
+        })
     }
 
     async fn cursor_position(&self) -> Result<(f64, f64), anyhow::Error> {

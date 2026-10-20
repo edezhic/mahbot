@@ -324,9 +324,9 @@ fn validate_segment(value: &str, max_chars: usize, what: &str) -> Result<()> {
 /// an unknown kind and a tool named twice are not.
 ///
 /// Names the record ALREADY holds are exempt from the catalog check: a tool the
-/// running installation cannot serve right now (e.g. `computer` on macOS) stays
-/// on the record — the launch simply omits it — so editing another field must
-/// never drop it.
+/// catalog lists but this installation cannot serve right now stays on the
+/// record — the launch simply omits it — so editing another field must never
+/// drop it.
 pub(crate) fn validate_tools_against(tools: &[String], held: &[String]) -> Result<()> {
     let catalog = crate::Role::custom_role_tool_catalog();
     // parse() validates the grammar: an unknown kind, a kind on a kindless tool,

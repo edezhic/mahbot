@@ -2695,9 +2695,9 @@ impl SettingsState {
     }
 
     /// The custom-role tool picker: the window's catalogue plus any stored name
-    /// this installation cannot serve right now (e.g. `computer` on macOS),
-    /// marked and labelled as unavailable. A catalog tool that has a kind
-    /// vocabulary ([`crate::tools::grants::kinds_of`]) renders one checkbox per
+    /// this installation cannot serve right now, marked and labelled as
+    /// unavailable. A catalog tool that has a kind vocabulary
+    /// ([`crate::tools::grants::kinds_of`]) renders one checkbox per
     /// kind — the tool is granted iff at least one kind is checked — while a
     /// kindless tool keeps its single checkbox. The record's validators re-check
     /// a newly marked entry on save, so "validated while marking" is structural —

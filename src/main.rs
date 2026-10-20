@@ -363,9 +363,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     // Warm the computer tool's capture-channel probe once at boot so the cached
     // availability result is ready before the first agent runs; the probe would
-    // otherwise run lazily on the first capture request. Not on macOS, where the
-    // computer tool does not exist.
-    #[cfg(not(target_os = "macos"))]
+    // otherwise run lazily on the first capture request.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

@@ -277,16 +277,14 @@ impl Role {
 use crate::Tool;
 use crate::Workspace;
 use crate::config::CONFIG;
-#[cfg(not(target_os = "macos"))]
-use crate::tools::ComputerTool;
 use crate::tools::path::PathAccess;
 use crate::tools::{
     AddAlarmTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ArchiveTool, ChromeTool,
-    CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, GetTicketTool,
-    ImageGenTool, ListAlarmsTool, ListTicketsTool, MahbotConfigTool, MahbotDebugTool,
-    RasterizeTool, ReadTool, RemoveAlarmTool, SearchArchivedTicketsTool, SearchTool, SendTool,
-    ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoEditTool, VideoGenTool,
-    WebSearchBackend, WebSearchTool, WorkspaceTool,
+    ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool,
+    GetTicketTool, ImageGenTool, ListAlarmsTool, ListTicketsTool, MahbotConfigTool,
+    MahbotDebugTool, RasterizeTool, ReadTool, RemoveAlarmTool, SearchArchivedTicketsTool,
+    SearchTool, SendTool, ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoEditTool,
+    VideoGenTool, WebSearchBackend, WebSearchTool, WorkspaceTool,
 };
 
 impl Role {
@@ -403,13 +401,11 @@ impl Role {
             // addressees — one tool, chosen per call.
             t.push(Box::new(SendTool::admin(Role::Assistant)));
             // The admin's session is a trusted local session, so the
-            // Assistant can also observe/act on the local GUI directly
-            // (gated per-run by the accessibility grant at agent
-            // construction). No structural authorization gate beyond
-            // `is_admin`, matching the full shell widening. Not on
-            // macOS, where computer use is withdrawn entirely
-            // (see `tools/computer/macos.rs`).
-            #[cfg(not(target_os = "macos"))]
+            // Assistant can also observe/act on the local GUI directly.
+            // No structural authorization gate beyond `is_admin`, matching
+            // the full shell widening; on macOS the three privacy grants
+            // belong to the terminal the daemon runs from and are requested
+            // per call (see `tools/computer/macos.rs`).
             t.push(Box::new(ComputerTool));
             // The admin config surface: the merged `mahbot_config`
             // setup tool and the read-only DB query tool. The admin's
@@ -436,9 +432,8 @@ impl Role {
     /// `computer`, `mahbot_config`, `mahbot_debug` and
     /// `workspace`, and removes the guest-only `archive`.
     /// Every other role's toolset is byte-identical regardless of its value.
-    /// `computer` exists only where the capability does: on macOS it is
-    /// withdrawn, so the admin's toolset there has no such tool (see
-    /// `tools/computer/macos.rs`).
+    /// `computer` is offered on the platforms that have the capability
+    /// (Linux and macOS); [`Tool::is_advertised`] decides the rest.
     ///
     /// `chrome_sessions` is the run-scoped tracker shared with the agent's
     /// `ChromeTool`: every session the run opens is handed to the run-end
@@ -975,14 +970,8 @@ mod tests {
         let guest = crate::Role::Assistant.tools(&ws, false, test_sessions());
         let admin = crate::Role::Assistant.tools(&ws, true, test_sessions());
 
-        // `computer` is admin-only where the capability exists at all; on macOS
-        // it is withdrawn entirely (see `tools/computer/macos.rs`).
-        let admin_only: &[&str] = if cfg!(target_os = "macos") {
-            &["shell", "send"]
-        } else {
-            &["shell", "send", "computer"]
-        };
-        for &name in admin_only {
+        // `computer` is admin-only wherever the platform can serve it.
+        for &name in &["shell", "send", "computer"] {
             assert!(
                 !guest.iter().any(|t| t.name() == name),
                 "a guest's Assistant toolset must not contain '{name}'"
@@ -1002,12 +991,6 @@ mod tests {
             !admin.iter().any(|t| t.name() == "archive"),
             "the admin's Assistant must not advertise `archive` — its shell already moves files"
         );
-        if cfg!(target_os = "macos") {
-            assert!(
-                !admin.iter().any(|t| t.name() == "computer"),
-                "the admin's Assistant must not advertise `computer` on macOS"
-            );
-        }
         // The read boundary is what the model is told — the tool's own
         // description, not a restatement in its parameter schema: a guest
         // (restricted) only reaches the personal workspace; the admin's names
@@ -1211,9 +1194,7 @@ mod tests {
         // guest's Assistant) relies on delegation (chrome/analyze/shell) rather
         // than direct local GUI access, so the tool must never leak into their
         // static toolset. (A custom role may choose `computer` from the
-        // catalogue derived from that admin set.) On macOS the capability is
-        // withdrawn entirely (see `tools/computer/macos.rs`), so no role
-        // advertises it there at all.
+        // catalogue derived from that admin set.)
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for is_admin in [false, true] {
@@ -1221,14 +1202,7 @@ mod tests {
                     .tools(&ws, is_admin, test_sessions())
                     .iter()
                     .any(|t| t.name() == "computer");
-                if cfg!(target_os = "macos") {
-                    assert!(
-                        !has,
-                        "{}{} must not advertise `computer` on macOS",
-                        role.as_str(),
-                        if is_admin { " (admin)" } else { "" }
-                    );
-                } else if role == crate::Role::Assistant && is_admin {
+                if role == crate::Role::Assistant && is_admin {
                     assert!(has, "the admin's Assistant must advertise `computer`");
                 } else {
                     assert!(

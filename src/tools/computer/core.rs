@@ -7,9 +7,7 @@
 //! Items carrying a platform-scoped `expect(dead_code)` are the ones only a real
 //! backend — or a test — calls: on a platform whose backend is the stub they
 //! have no caller, and they stay, as they are the real backends' contract. Per
-//! item, not module-wide, so `dead_code` stays armed everywhere else; the sole
-//! exception is the module-wide macOS dormancy `expect` on the `computer`
-//! module itself (see `macos.rs`).
+//! item, not module-wide, so `dead_code` stays armed everywhere else.
 
 use crate::util::UnwrapPoison;
 use anyhow::anyhow;
@@ -66,7 +64,6 @@ const INTERACTIVE_ROLES: &[&str] = &[
 // coordinates, unknown targets/keys, missing refs, wait caps) are plain and
 // self-describing — no taxonomy tag needed.
 
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
 pub(crate) const ERR_PERMISSION_DENIED: &str = "permission-denied";
 pub(crate) const ERR_UNSUPPORTED: &str = "unsupported";
 pub(crate) const ERR_DEGRADED: &str = "degraded";
@@ -81,6 +78,33 @@ pub(crate) const ERR_NOT_MATCHED: &str = "not-matched";
 pub(crate) fn taxonomy_error(kind: &str, msg: impl fmt::Display) -> anyhow::Error {
     anyhow!("{kind}: {msg}")
 }
+
+/// Build the `permission-denied` failure as a TYPED error: its text is the usual
+/// `"permission-denied: …"`, and [`is_permission_denied`] tells it apart from
+/// every other backend failure without reading that text.
+#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+pub(crate) fn permission_denied(msg: impl fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(PermissionDenied(taxonomy_error(ERR_PERMISSION_DENIED, msg)))
+}
+
+/// Whether `err` is the typed [`permission_denied`] failure — robust to a
+/// `.context()` layer added above it.
+pub(crate) fn is_permission_denied(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<PermissionDenied>().is_some()
+}
+
+/// The `permission-denied` category as a type, so a caller that must branch on it
+/// (see [`is_permission_denied`]) does not depend on the message's shape.
+#[derive(Debug)]
+struct PermissionDenied(anyhow::Error);
+
+impl fmt::Display for PermissionDenied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for PermissionDenied {}
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -371,6 +395,22 @@ pub(crate) fn parse_key_chord(chord: &str) -> anyhow::Result<(Vec<Modifier>, Str
 
 // ── Coordinate math ─────────────────────────────────────────────────────
 
+/// Reject a normalized point that is not a finite 0-1000 coordinate.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    expect(dead_code)
+)]
+pub(crate) fn check_normalized(nx: f64, ny: f64) -> anyhow::Result<()> {
+    if !nx.is_finite()
+        || !ny.is_finite()
+        || !(0.0..=NORMALIZED_MAX).contains(&nx)
+        || !(0.0..=NORMALIZED_MAX).contains(&ny)
+    {
+        anyhow::bail!("out-of-bounds coordinates ({nx}, {ny}) — expected normalized 0-1000");
+    }
+    Ok(())
+}
+
 /// Map a normalized 0-1000 point to absolute global logical points on the
 /// target surface.
 #[cfg_attr(
@@ -382,13 +422,7 @@ pub(crate) fn normalized_to_surface(
     ny: f64,
     geo: &SurfaceGeometry,
 ) -> anyhow::Result<(f64, f64)> {
-    if !nx.is_finite()
-        || !ny.is_finite()
-        || !(0.0..=NORMALIZED_MAX).contains(&nx)
-        || !(0.0..=NORMALIZED_MAX).contains(&ny)
-    {
-        anyhow::bail!("out-of-bounds coordinates ({nx}, {ny}) — expected normalized 0-1000");
-    }
+    check_normalized(nx, ny)?;
     Ok((
         geo.x + nx / NORMALIZED_MAX * geo.width,
         geo.y + ny / NORMALIZED_MAX * geo.height,
@@ -1032,11 +1066,15 @@ fn search_locator<'a>(root: &'a UiNode, locator: &Locator) -> LocatorMatch<'a> {
 
 #[async_trait::async_trait]
 pub(crate) trait Backend: Send + Sync {
-    /// Cheap synchronous accessibility-channel check (macOS: AX trust equivalent).
-    fn accessibility_available(&self) -> bool;
-    /// Slow capture-channel probe (screen-recording grant); caller caches with TTL.
+    /// Whether the platform can serve the tool at all — the advertisement gate,
+    /// not a grant check: macOS always can (its grants are requested per call),
+    /// Linux needs a GUI session with a reachable session bus.
+    fn is_supported(&self) -> bool;
+    /// Prompt-free capture-channel probe (the screen-recording grant on macOS);
+    /// the caller caches it with a TTL.
     async fn capture_available(&self) -> bool;
-    /// Actionable diagnosis for a missing capture grant.
+    /// Actionable diagnosis for an unavailable capture channel (missing grant,
+    /// or an OS too old for stills).
     fn capture_unavailable_error(&self) -> anyhow::Error;
     async fn list_apps(&self) -> anyhow::Result<Vec<AppInfo>>;
     async fn list_windows(&self, app: Option<&AppInfo>) -> anyhow::Result<Vec<WindowInfo>>;

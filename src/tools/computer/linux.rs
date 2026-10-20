@@ -1184,7 +1184,7 @@ async fn portal_response(
 
 #[async_trait::async_trait]
 impl Backend for LinuxBackend {
-    fn accessibility_available(&self) -> bool {
+    fn is_supported(&self) -> bool {
         let gui =
             std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
         let bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()

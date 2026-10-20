@@ -52,12 +52,12 @@ set -eu
 RELEASE_BASE="${MAHBOT_RELEASE_BASE_URL:-https://github.com/edezhic/mahbot}"
 
 # The floors the two published files are built against, and nothing is installed
-# below them: the macOS files carry a deployment target of 12.3, and the Linux ones
+# below them: the macOS files carry a deployment target of 14.0, and the Linux ones
 # are built on the release's own base (`ubuntu-22.04` in the workflow), which is
 # glibc 2.35. Below either, the file cannot load at all, which is the same refusal as
 # having none — and a loader error is not what the owner is told about it.
-MACOS_FLOOR_MAJOR=12
-MACOS_FLOOR_MINOR=3
+MACOS_FLOOR_MAJOR=14
+MACOS_FLOOR_MINOR=0
 GLIBC_FLOOR_MAJOR=2
 GLIBC_FLOOR_MINOR=35
 

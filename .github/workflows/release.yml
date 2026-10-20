@@ -12,8 +12,8 @@
 # image and then set in the build, so the files run on the widely used systems of
 # recent years and not on the newest ones only:
 #
-#   x86_64-apple-darwin       macos-15-intel    macOS 12.3 floor
-#   aarch64-apple-darwin      macos-14          macOS 12.3 floor
+#   x86_64-apple-darwin       macos-15-intel    macOS 14.0 floor
+#   aarch64-apple-darwin      macos-14          macOS 14.0 floor
 #   x86_64-unknown-linux-gnu  ubuntu-22.04      glibc 2.35
 #   aarch64-unknown-linux-gnu ubuntu-22.04-arm  glibc 2.35
 #   x86_64-pc-windows-msvc    windows-2022      C runtime inside the file
@@ -194,7 +194,7 @@ jobs:
           # to be present on the owner's machine.
           RUSTFLAGS: ${{ matrix.target_os == 'windows' && '-C target-feature=+crt-static' || '' }}
           # macOS: the floor is set in this build, not merely written down.
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target_os == 'macos' && '12.3' || '' }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target_os == 'macos' && '14.0' || '' }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       # Staged before archiving: the archive's single entry is `mahbot` at its root,

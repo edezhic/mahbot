@@ -88,10 +88,9 @@ impl RoleEditor {
         name_buffer.set_single_line(true);
         let catalog = crate::Role::custom_role_tool_catalog();
         // The stored names are kept as they are: a name this installation cannot
-        // serve right now (e.g. `computer` on macOS) stays marked — the launch
-        // omits it and the record keeps it, so a mere open-and-save never drops
-        // it. The picker renders it too, marked and labelled unavailable, so it
-        // can still be removed deliberately.
+        // serve right now stays marked — the launch omits it and the record keeps
+        // it, so a mere open-and-save never drops it. The picker renders it too,
+        // marked and labelled unavailable, so it can still be removed deliberately.
         Self {
             original,
             name: name_buffer,

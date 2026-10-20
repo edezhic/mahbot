@@ -426,7 +426,7 @@ fn asset_url(base: &str, version: &semver::Version, os: &str, arch: &str) -> Str
 /// x86_64, and Windows 11 on ARM — every Windows 10 on ARM is below the ARM64
 /// file). A system below its floor has no file that can load, so it has no file for
 /// it at all — the same refusal as an os/arch with no file published.
-const MACOS_FLOOR: (u32, u32) = (12, 3);
+const MACOS_FLOOR: (u32, u32) = (14, 0);
 const GLIBC_FLOOR: (u32, u32) = (2, 35);
 const WINDOWS_X86_64_FLOOR: u32 = 17_763;
 const WINDOWS_ARM64_FLOOR: u32 = 22_000;
@@ -2653,17 +2653,15 @@ mod tests {
         // A minor part is not a decimal: 2.4 is below 2.35, while 2.39 is not.
         assert!(version_below_floor("2.4", GLIBC_FLOOR));
         assert!(!version_below_floor("2.39", GLIBC_FLOOR));
-        // A version with no minor part counts as zero, and a trailing part is not
-        // part of the comparison.
-        assert!(version_below_floor("12", MACOS_FLOOR));
-        assert!(!version_below_floor("12.3", MACOS_FLOOR));
-        assert!(!version_below_floor("12.3.1", MACOS_FLOOR));
-        assert!(!version_below_floor("13", MACOS_FLOOR));
+        // A version with no minor part counts as zero (14 is not below 14.0), and a
+        // trailing part is not part of the comparison.
+        assert!(!version_below_floor("14", MACOS_FLOOR));
+        assert!(!version_below_floor("14.0", MACOS_FLOOR));
+        assert!(!version_below_floor("14.0.1", MACOS_FLOOR));
         // A part that is not there or not a whole number is not a version to accept,
         // in either position: the install script's check refuses both.
         assert!(version_below_floor("", MACOS_FLOOR));
-        assert!(version_below_floor("12.", MACOS_FLOOR));
-        assert!(version_below_floor("12.x", MACOS_FLOOR));
+        assert!(version_below_floor("14.", MACOS_FLOOR));
         assert!(version_below_floor("13.x", MACOS_FLOOR));
         // The glibc report is read the same way, and a report this does not
         // recognise is not a refusal.

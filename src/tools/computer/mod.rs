@@ -1,31 +1,21 @@
 //! Computer (GUI observe/act) tool for the admin's Assistant.
 //!
 //! The platform-agnostic core (types, coordinate math, ref lifecycle, backend
-//! trait) lives in [`core`]; [`linux`] and [`stub`] implement the backend per
-//! platform. All GUI actions are serialized through a process-wide lock so
-//! two concurrent agent runs can never race on the live GUI.
+//! trait) lives in [`core`]; [`linux`], [`macos`] and [`stub`] implement the
+//! backend per platform. All GUI actions are serialized through a process-wide
+//! lock so two concurrent agent runs can never race on the live GUI.
 //!
-//! The tool is offered on Linux only. The macOS backend is kept compiled but
-//! dormant and unreachable — see [`macos`] for why and for what must happen
-//! before it is ever enabled again, and the module declaration in
-//! `tools/mod.rs` for how the product is kept away from it.
-
-// Dormant on macOS: nothing in the product references this module there, so its
-// items are dead code. The expectation is scoped to that platform so that
-// bringing the capability back starts here — by deleting it together with the
-// review `macos.rs` asks for.
-#![cfg_attr(
-    target_os = "macos",
-    expect(dead_code, reason = "macOS computer use is dormant (see macos.rs)")
-)]
+//! The tool is offered on Linux and macOS. Linux has no grant model of its own
+//! (AT-SPI and the X11/portal channels are what decides); on macOS the three
+//! privacy grants belong to the terminal the daemon was started from, are asked
+//! for when first needed and reported on every action they block — see [`macos`].
 
 mod core;
 mod linux;
-// Compiled on macOS too, but unreachable there: see `macos.rs`.
 mod macos;
-// Also the backend on macOS, where the capability is withheld rather than
-// unsupported.
-#[cfg(not(target_os = "linux"))]
+// Every other platform: the capability is absent, so the stub is never
+// advertised.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod stub;
 
 use self::core::{
@@ -212,16 +202,17 @@ fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option
 
 // ── Backend factory ─────────────────────────────────────────────────────
 
-/// The backend for the running platform. macOS is absent on purpose: computer
-/// use is withdrawn there (see `macos.rs`), so a macOS build can only ever
-/// reach the stub — which also keeps the aborting screen-capture path out of
-/// reach if the tool is ever wired back in by mistake.
+/// The backend for the running platform.
 fn backend() -> &'static dyn Backend {
     #[cfg(target_os = "linux")]
     {
         &linux::LINUX_BACKEND
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        &macos::MACOS_BACKEND
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         &stub::STUB_BACKEND
     }
@@ -229,11 +220,10 @@ fn backend() -> &'static dyn Backend {
 
 // ── Capability probe ────────────────────────────────────────────────────
 
-/// Cheap, synchronous availability check: the tool is advertised only when the
-/// accessibility channel is trusted. Re-run at every agent construction, so a
-/// grant granted later is picked up by newly constructed agents.
+/// Cheap, synchronous availability check for advertisement — the platform
+/// contract behind it is [`Backend::is_supported`].
 pub(crate) fn is_advertised() -> bool {
-    backend().accessibility_available()
+    backend().is_supported()
 }
 
 type CaptureProbe = (Instant, bool);
@@ -837,13 +827,19 @@ async fn scroll(
 async fn cursor() -> anyhow::Result<String> {
     let target = resolve_action_target(None)?;
     let (ax, ay) = backend().cursor_position().await?;
-    // When the default (Focused) surface has no focused window (desktop
-    // frontmost/screensaver) its geometry is unavailable — report the absolute
-    // pointer with no normalization basis rather than failing not-matched.
-    let Ok(geo) = backend().surface_geometry(&target).await else {
-        return Ok(format!(
-            "cursor at absolute ({ax:.1}, {ay:.1}) — no focused window to normalize against"
-        ));
+    // A surface without usable geometry degrades to the absolute pointer, as it
+    // always has (no focused window, an unreachable AT-SPI bus, a Wayland portal
+    // failure). The one exception is a grant denial, which is a typed failure:
+    // it is actionable (its text names the terminal and the pane), and "no
+    // focused window" would misname it.
+    let geo = match backend().surface_geometry(&target).await {
+        Ok(geo) => geo,
+        Err(e) if !core::is_permission_denied(&e) => {
+            return Ok(format!(
+                "cursor at absolute ({ax:.1}, {ay:.1}) — no focused window to normalize against"
+            ));
+        }
+        Err(e) => return Err(e),
     };
     if core::contains_point(&geo, ax, ay) {
         let (nx, ny) = core::surface_to_normalized(ax, ay, &geo)?;

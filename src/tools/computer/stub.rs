@@ -1,7 +1,6 @@
-//! Stub [`Backend`] for platforms without a live computer-use implementation —
-//! every platform except Linux, macOS included: computer use is withheld there
-//! rather than unsupported (see `macos.rs`). Permanent — the tool is never
-//! advertised here.
+//! Stub [`Backend`] for platforms with no computer-use implementation — every
+//! platform except Linux and macOS. Permanent: the tool is never advertised
+//! here, because the capability itself is absent.
 
 use super::core::{
     self, AppInfo, Backend, Capture, ElementAct, Locator, Observation, RawInput, SurfaceGeometry,
@@ -14,7 +13,7 @@ pub(crate) struct StubBackend;
 
 #[async_trait::async_trait]
 impl Backend for StubBackend {
-    fn accessibility_available(&self) -> bool {
+    fn is_supported(&self) -> bool {
         false
     }
 
