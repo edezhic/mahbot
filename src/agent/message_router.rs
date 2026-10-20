@@ -106,7 +106,8 @@ pub enum MessageKind {
     /// Durable auto-delivery copy of a Manager's response, routed into the
     /// single admin's Assistant session (`<manager-message>`
     /// envelope; the job's workspace is the admin's personal one, the source
-    /// workspace travels only in the envelope's `workspace` attribute).
+    /// workspace rides in `originating_workspace` and in the envelope's
+    /// `workspace` attribute, so its file references stay authorized).
     /// Appended to the session like other result kinds; never
     /// broadcast/persisted to chat_history. Deliberately distinct from
     /// `UserMessage` so the failure-emoji gate (`== UserMessage`) structurally
@@ -1227,20 +1228,42 @@ async fn deliver_on_channel(
     }
 }
 
-/// Auto-delivery hook: EVERY Manager response is additionally routed as a
-/// durable `<manager-message>` envelope into the admin's Assistant session —
-/// the only manager→assistant delivery path. It always targets the single
-/// admin: the recipient is that constant identity rather than a lookup, so no
-/// account-store hiccup can silently drop a manager response. The job targets
-/// the admin's personal workspace so addressed routing resolves the admin's
-/// real assistant session; the SOURCE workspace travels only inside the
-/// envelope's `workspace` attribute. Empty responses deliver nothing
-/// (sleep-ended/failed turns never reach the delivery branch at all).
-async fn route_manager_notify(response: &str, source_workspace: &str) {
-    if response.is_empty() {
-        return;
+/// The one spelling of the admin-pinning rule every relay-to-the-owner route
+/// shares: a job addressed to the single admin's Assistant, in that admin's own
+/// personal workspace, on the `gui` channel, with no reply target and no branch.
+/// The admin is a constant identity rather than a lookup, so no account-store
+/// hiccup can drop an envelope, and the consumer re-validates the pinning
+/// invariant ([`crate::users::enforce_personal_pinning`]), so no site re-pins.
+/// `originating_workspace` is the folder the relayed content was produced in,
+/// when the kind grants its file references that root (see [`MessageKind`]).
+fn admin_assistant_job(
+    content: String,
+    kind: MessageKind,
+    originating_workspace: Option<&str>,
+) -> AgentJob {
+    AgentJob {
+        content,
+        workspace_name: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        user_name: crate::users::ADMIN_USER_NAME.to_string(),
+        channel: "gui".to_string(),
+        kind,
+        role: Role::Assistant,
+        reply_target: None,
+        pending_job_id: None,
+        originating_workspace: originating_workspace.map(str::to_string),
+        custom_role: None,
+        reply_to_custom: None,
     }
-    let content = crate::prompt::substitute(
+}
+
+/// The content of a `<manager-message>` envelope for `response` produced in
+/// `source_workspace`, or `None` for an empty response (a sleep-ended or failed
+/// turn delivers nothing).
+fn manager_message_content(response: &str, source_workspace: &str) -> Option<String> {
+    if response.is_empty() {
+        return None;
+    }
+    Some(crate::prompt::substitute(
         &crate::prompt::load_prompt("manager_message.md"),
         &[
             (
@@ -1249,22 +1272,21 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
             ),
             ("{{message}}", response),
         ],
-    );
-    let job = AgentJob {
-        content,
-        // The admin's own personal workspace; the consumer loop re-validates
-        // the pinning invariant, so no re-pinning is needed here.
-        workspace_name: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-        user_name: crate::users::ADMIN_USER_NAME.to_string(),
-        channel: "gui".to_string(),
-        kind: MessageKind::ManagerNotify,
-        role: Role::Assistant,
-        reply_target: None,
-        pending_job_id: None,
-        originating_workspace: Some(source_workspace.to_string()),
-        custom_role: None,
-        reply_to_custom: None,
+    ))
+}
+
+/// Auto-delivery hook: EVERY Manager response is additionally routed as a
+/// durable `<manager-message>` envelope into the admin's Assistant session —
+/// the only manager→assistant delivery path. `source_workspace` is the folder
+/// the response was produced in; it rides in the job's `originating_workspace`
+/// and in the envelope's `workspace` attribute, so a `[FILE:...]`/`[IMAGE:]`
+/// marker in the response stays authorized. Empty responses deliver nothing
+/// (sleep-ended/failed turns never reach the delivery branch at all).
+async fn route_manager_notify(response: &str, source_workspace: &str) {
+    let Some(content) = manager_message_content(response, source_workspace) else {
+        return;
     };
+    let job = admin_assistant_job(content, MessageKind::ManagerNotify, Some(source_workspace));
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "manager notify envelope").await;
 }
@@ -1294,51 +1316,18 @@ fn branch_job(content: String, asker: &Asker, kind: MessageKind) -> AgentJob {
 /// asking turn ran in, and is tagged `<manager-message>` because that is the
 /// shape `send`'s `manager` addressee promises its caller.
 async fn route_manager_reply_to_custom(response: &str, source_workspace: &str, asker: &Asker) {
-    if response.is_empty() {
+    let Some(content) = manager_message_content(response, source_workspace) else {
         return;
-    }
-    let content = crate::prompt::substitute(
-        &crate::prompt::load_prompt("manager_message.md"),
-        &[
-            (
-                "{{workspace}}",
-                crate::tools::envelope_attr(source_workspace).as_str(),
-            ),
-            ("{{message}}", response),
-        ],
-    );
+    };
     let job = branch_job(content, asker, MessageKind::ManagerNotify);
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "manager reply envelope").await;
 }
 
-/// The durable `<custom-role-message>` envelope addressed to the admin's
-/// Assistant — the shape both [`route_custom_role_notify`] and
-/// [`route_custom_role_failure`] share. The job targets the admin's personal
-/// workspace; the folder the launch ran in travels only in
-/// `originating_workspace`.
-fn custom_role_notify_job(content: String, source_workspace: &str) -> AgentJob {
-    AgentJob {
-        content,
-        // The admin's own personal workspace; the consumer loop re-validates
-        // the pinning invariant, so no re-pinning is needed here.
-        workspace_name: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-        user_name: crate::users::ADMIN_USER_NAME.to_string(),
-        channel: "gui".to_string(),
-        kind: MessageKind::CustomRoleNotify,
-        role: Role::Assistant,
-        reply_target: None,
-        pending_job_id: None,
-        originating_workspace: Some(source_workspace.to_string()),
-        custom_role: None,
-        reply_to_custom: None,
-    }
-}
-
 /// Deliver a finished custom role's answer into the admin Assistant's session
-/// (`<custom-role-message>` envelope, `MessageKind::CustomRoleNotify`), message
-/// kind durable. `source_workspace` is the folder the launch ran in and travels
-/// in `originating_workspace`, so a file/media reference in the answer is
+/// (the durable `<custom-role-message>` envelope, `MessageKind::CustomRoleNotify`).
+/// `source_workspace` is the folder the launch ran in and travels in
+/// `originating_workspace`, so a file/media reference in the answer is
 /// validated against the folder it was produced in. `identifier` names the
 /// branch when the launch ran on a named one. An empty answer delivers nothing.
 async fn route_custom_role_notify(
@@ -1365,7 +1354,11 @@ async fn route_custom_role_notify(
             ("{{message}}", response),
         ],
     );
-    let job = custom_role_notify_job(content, source_workspace);
+    let job = admin_assistant_job(
+        content,
+        MessageKind::CustomRoleNotify,
+        Some(source_workspace),
+    );
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "custom role notify envelope").await;
 }
@@ -1392,7 +1385,11 @@ async fn route_custom_role_failure(
             ),
         ],
     );
-    let job = custom_role_notify_job(content, source_workspace);
+    let job = admin_assistant_job(
+        content,
+        MessageKind::CustomRoleNotify,
+        Some(source_workspace),
+    );
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "custom role failure envelope").await;
 }
@@ -1441,21 +1438,7 @@ async fn route_worker_branch_failure(launch: &crate::Launch, folder: &str) {
 async fn route_worker_branch_envelope(content: String, asker: Option<&Asker>) {
     let job = match asker {
         Some(asker) => branch_job(content, asker, MessageKind::ImplementResult),
-        None => AgentJob {
-            content,
-            // The admin's own personal workspace; the consumer loop re-validates
-            // the pinning invariant, so no re-pinning is needed here.
-            workspace_name: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-            user_name: crate::users::ADMIN_USER_NAME.to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::ImplementResult,
-            role: Role::Assistant,
-            reply_target: None,
-            pending_job_id: None,
-            originating_workspace: None,
-            custom_role: None,
-            reply_to_custom: None,
-        },
+        None => admin_assistant_job(content, MessageKind::ImplementResult, None),
     };
     let target = crate::jobs::envelope_target(&job);
     stamp_and_route(job, &target, "worker branch report envelope").await;
@@ -2189,10 +2172,10 @@ mod tests {
 
     /// Auto-delivery round trip: a Manager response persists one durable
     /// `<manager-message>` envelope for the admin, addressed to the admin's
-    /// personal Assistant session, carrying the FULL untruncated response and
-    /// the source workspace only in the envelope attribute. Empty responses
-    /// persist nothing. Cleans up the row it created so other tests'
-    /// boot-replay paths never see it.
+    /// personal Assistant session, carrying the FULL untruncated response, with
+    /// the source workspace in `originating_workspace` and in the envelope
+    /// attribute. Empty responses persist nothing. Cleans up the row it created
+    /// so other tests' boot-replay paths never see it.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn manager_notify_delivers_to_admin_assistant() {
@@ -2428,20 +2411,69 @@ mod tests {
 
     /// A custom role's answer is an internal envelope addressed to the admin's
     /// personal Assistant — never the owner's channels and never Telegram —
-    /// carrying the folder the launch ran in so a `[FILE:]`/`[IMAGE:]` marker in
-    /// the answer can be relayed out of it.
-    #[test]
-    fn custom_role_notify_targets_the_admin_assistant() {
-        let job = custom_role_notify_job("<custom-role-message/>".to_string(), "/data/proj");
+    /// persisted as one durable `<custom-role-message>` row naming the folder the
+    /// launch ran in, so a `[FILE:]`/`[IMAGE:]` marker in the answer can be
+    /// relayed out of it. An empty answer delivers nothing. Cleans up the row it
+    /// created so other tests' boot-replay paths never see it.
+    #[tokio::test]
+    #[serial_test::serial(provider)]
+    async fn custom_role_notify_targets_the_admin_assistant() {
+        setup_response_test_infra().await;
+        let conn = &crate::session::store().conn;
+        let target = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+
+        let before: HashSet<String> = crate::jobs::list_pending_jobs(conn)
+            .await
+            .expect("list pending")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        // Empty answer: nothing persisted. Real answer: one durable envelope.
+        route_custom_role_notify("", "reviewer", "/data/proj", Some("feature")).await;
+        route_custom_role_notify("the answer", "reviewer", "/data/proj", Some("feature")).await;
+
+        let pending = crate::jobs::list_pending_jobs(conn)
+            .await
+            .expect("list pending");
+        let matching: Vec<_> = pending
+            .iter()
+            .filter(|r| r.target_agent_id == target && !before.contains(&r.id))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one notify row for the admin's assistant"
+        );
+        let job: AgentJob =
+            serde_json::from_str(&matching[0].envelope).expect("envelope deserializes to AgentJob");
         assert_eq!(job.kind, MessageKind::CustomRoleNotify);
         assert_eq!(job.role, Role::Assistant);
         assert_eq!(job.user_name, crate::users::ADMIN_USER_NAME);
-        assert_eq!(job.originating_workspace.as_deref(), Some("/data/proj"));
-        assert!(job.custom_role.is_none());
-        assert_eq!(
-            crate::jobs::envelope_target(&job),
-            crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+        assert!(
+            job.custom_role.is_none(),
+            "the notify job carries no branch launch of its own"
         );
+        assert_eq!(
+            job.originating_workspace.as_deref(),
+            Some("/data/proj"),
+            "the folder the launch ran in is the answer's file-delivery root"
+        );
+        assert_eq!(crate::jobs::envelope_target(&job), target);
+        assert!(
+            job.content.starts_with(
+                "<custom-role-message role=\"reviewer\" workspace=\"/data/proj\" branch=\"feature\">"
+            ) && job.content.contains("the answer"),
+            "the envelope names the role, the folder and the branch, and carries \
+             the answer: {}",
+            job.content
+        );
+
+        for row in pending.iter().filter(|r| !before.contains(&r.id)) {
+            crate::jobs::delete_pending_job(conn, &row.id)
+                .await
+                .expect("delete pending row");
+        }
     }
 
     /// A worker branch's report has the same shape as the single-run worker's: the
