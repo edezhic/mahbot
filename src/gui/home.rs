@@ -138,10 +138,11 @@ impl From<ChatHistoryEntry> for DisplayMessage {
     }
 }
 
-/// Broadcast a transient GUI chat event, wrapping
-/// [`crate::channels::broadcast_transient_event`] with the constants shared by
-/// every GUI call site: the `"gui"` channel, no reply reference, and a fresh
-/// timestamp. Callers pass the user and the conversation's own workspace.
+/// Broadcast a transient GUI chat event via
+/// [`crate::channels::broadcast_chat_event`] with the constants shared by
+/// every GUI call site: the `"gui"` channel, no reply reference, a fresh
+/// timestamp, and the transient flag set (shown live, never persisted).
+/// Callers pass the user and the conversation's own workspace.
 fn broadcast_gui_transient(
     user: &str,
     workspace: &str,
@@ -151,7 +152,7 @@ fn broadcast_gui_transient(
     agent_role: Option<String>,
     optimistic_id: Option<String>,
 ) {
-    crate::channels::broadcast_transient_event(
+    crate::channels::broadcast_chat_event(
         message_id,
         user,
         content,
@@ -162,6 +163,7 @@ fn broadcast_gui_transient(
         optimistic_id,
         None,
         &crate::db::now(),
+        true, // transient: shown live, never persisted
     );
 }
 

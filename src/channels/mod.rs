@@ -93,17 +93,18 @@ pub(crate) async fn broadcast_and_persist_agent_response(
 
 /// Send a [`ChatEvent::Message`] to the broadcast channel.
 ///
-/// This is the single shared entry point for all broadcast operations,
-/// ensuring consistent message construction across user messages, agent
-/// responses, and any future message types.  The caller is responsible
-/// for generating a stable [`message_id`] and [`timestamp`] if they need
-/// to correlate the broadcast event with a persist operation.
+/// This is the single shared entry point for every message broadcast (typing
+/// indicators go straight to the channel), ensuring consistent message
+/// construction across user messages, agent responses, and any future message
+/// types.  The caller is responsible for generating a stable [`message_id`]
+/// and [`timestamp`] if they need to correlate the broadcast event with a
+/// persist operation.
 ///
 /// `transient` marks an event destined for live GUI display only: it is
 /// never persisted to chat_history (e.g. the Phase-1 scripted onboarding
 /// exchange). Pass `false` for every persisted path.
 #[expect(clippy::too_many_arguments)]
-fn broadcast_chat_event(
+pub(crate) fn broadcast_chat_event(
     message_id: &str,
     user_name: &str,
     content: &str,
@@ -133,37 +134,6 @@ fn broadcast_chat_event(
             reply_reference,
         });
     }
-}
-
-/// Broadcast a transient (non-persisted) chat event for the GUI. Used by the
-/// Phase-1 scripted onboarding scenario; the event is shown live but never
-/// written to chat_history.
-#[expect(clippy::too_many_arguments)]
-pub(crate) fn broadcast_transient_event(
-    message_id: &str,
-    user_name: &str,
-    content: &str,
-    direction: ChatDirection,
-    channel: &str,
-    agent_role: Option<String>,
-    workspace: &str,
-    optimistic_id: Option<String>,
-    reply_reference: Option<crate::channels::ReplyReference>,
-    timestamp: &str,
-) {
-    broadcast_chat_event(
-        message_id,
-        user_name,
-        content,
-        direction,
-        channel,
-        agent_role,
-        workspace,
-        optimistic_id,
-        reply_reference,
-        timestamp,
-        true,
-    );
 }
 
 /// Chat-history content for an inbound message: normally the pre-enrichment
