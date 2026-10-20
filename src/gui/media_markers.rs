@@ -47,10 +47,13 @@
 use iced::advanced::{image as advanced_image, text};
 use iced::widget::{container, image, markdown};
 use iced::{ContentFit, Element, Font, Length, Pixels, padding};
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
 use crate::util::media_target;
 use crate::util::{
@@ -250,29 +253,12 @@ fn decode_data_uri_image(uri: &str) -> Option<(u32, u32, Vec<u8>)> {
     downscale_raster(width, height, rgba)
 }
 
-/// Outcome of a data-URI decode attempt, cached per URI string.
-#[derive(Debug)]
-enum CachedDataUriImage {
-    /// Successfully decoded; the stable handle is reused across frames.
-    Decoded(image::Handle),
-    /// Failed validation — cached so a corrupt payload isn't re-decoded on
-    /// every frame. Renders as the "🖼️ image" placeholder.
-    Failed,
-}
-
-/// Process-lifetime cache of data-URI decode outcomes, keyed by the full
-/// data-URI string. A bounded LRU shared with the local-image cache so both
-/// hold a stable iced [`image::Handle`] (whose [`Id`](image::Handle::id)
-/// keeps the wgpu texture stable across frames — re-building a handle in
-/// `view()` would decode every frame). Evicts the least-recently-used entry
-/// past [`MAX_CACHED_IMAGES`].
-static DATA_URI_IMAGE_CACHE: LazyLock<Mutex<BoundedLruCache<String, CachedDataUriImage>>> =
-    LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
+// ── Process-lifetime image caches ───────────────────────────────
 
 /// A bounded least-recently-used cache: `get` bumps recency so a recently-viewed
 /// entry survives eviction, `insert` evicts the oldest once the capacity cap is
-/// hit. Keys are looked up by [`Borrow`](std::borrow::Borrow) so callers can use
-/// an unowned key (e.g. a `&str` media marker).
+/// hit. Keys are looked up by [`Borrow`] so callers can use an unowned key (e.g.
+/// a `&str` media marker).
 struct BoundedLruCache<K, V> {
     entries: HashMap<K, V>,
     /// LRU order of `entries` keys; back = most recently used.
@@ -282,7 +268,7 @@ struct BoundedLruCache<K, V> {
 
 impl<K, V> BoundedLruCache<K, V>
 where
-    K: std::hash::Hash + Eq + Clone,
+    K: Hash + Eq + Clone,
 {
     fn with_capacity(cap: usize) -> Self {
         Self {
@@ -294,8 +280,8 @@ where
 
     fn get<Q>(&mut self, key: &Q) -> Option<&V>
     where
-        K: std::borrow::Borrow<Q>,
-        Q: std::hash::Hash + Eq + ?Sized,
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
     {
         let hit = self.entries.get(key);
         if hit.is_some() {
@@ -328,6 +314,75 @@ where
     }
 }
 
+/// Maximum decoded-image outcomes retained per process-lifetime cache (data-URI
+/// and local-path). Each `Decoded` entry holds up to
+/// `MAX_IMAGE_LONGEST_SIDE_PX² · 4` (16 MiB) of RGBA under the display budget,
+/// so this bound (32) caps worst-case retained pixels at ~512 MiB per cache.
+const MAX_CACHED_IMAGES: usize = 32;
+
+/// Outcome of one cached image decode attempt.
+#[derive(Debug)]
+enum CachedImage {
+    /// Successfully decoded; the stable handle is reused across frames, which
+    /// keeps the wgpu texture Id stable too (re-building a handle in `view()`
+    /// would decode every frame).
+    Decoded(image::Handle),
+    /// Failed validation — cached so a corrupt payload isn't re-decoded on
+    /// every frame; renders as the caller's placeholder.
+    Failed,
+}
+
+impl CachedImage {
+    fn from_raster(raster: Option<(u32, u32, Vec<u8>)>) -> Self {
+        match raster {
+            Some((width, height, rgba)) => {
+                Self::Decoded(image::Handle::from_rgba(width, height, rgba))
+            }
+            None => Self::Failed,
+        }
+    }
+
+    fn handle(&self) -> Option<image::Handle> {
+        match self {
+            Self::Decoded(handle) => Some(handle.clone()),
+            Self::Failed => None,
+        }
+    }
+}
+
+/// Process-lifetime cache of data-URI decode outcomes, keyed by the full
+/// data-URI string. Evicts the least-recently-used entry past
+/// [`MAX_CACHED_IMAGES`].
+static DATA_URI_IMAGE_CACHE: LazyLock<Mutex<BoundedLruCache<String, CachedImage>>> =
+    LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
+
+/// Return the cached outcome for `key`, decoding and caching it on a miss.
+///
+/// The cached entry is inspected under the lock and returned through
+/// [`CachedImage::handle`] — a cached [`CachedImage::Failed`] is a hit that
+/// yields `None`, never a miss (falling through would re-decode a corrupt
+/// payload on every frame). The decode itself runs with the lock released, so a
+/// raster decode never blocks a concurrent frame, and the owned key is cloned
+/// only when the outcome is inserted — a cache hit copies nothing.
+#[must_use]
+fn cached_image<K, Q>(
+    cache: &Mutex<BoundedLruCache<K, CachedImage>>,
+    key: &Q,
+    decode: impl FnOnce() -> Option<(u32, u32, Vec<u8>)>,
+) -> Option<image::Handle>
+where
+    K: Hash + Eq + Clone + Borrow<Q>,
+    Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+{
+    if let Some(cached) = cache.lock().unwrap_poison().get(key) {
+        return cached.handle();
+    }
+    let outcome = CachedImage::from_raster(decode());
+    let handle = outcome.handle();
+    cache.lock().unwrap_poison().insert(key.to_owned(), outcome);
+    handle
+}
+
 /// Return a stable, cached iced handle for the image in a `data:…` URI, or
 /// `None` when the payload is missing, over-cap, or undecodable — the caller
 /// renders the "🖼️ image" placeholder in that case (never raw base64 text,
@@ -339,55 +394,16 @@ where
 #[must_use]
 fn data_uri_image_handle(uri: &str) -> Option<image::Handle> {
     media_target::data_uri_base64_payload(uri)?;
-    {
-        let mut cache = DATA_URI_IMAGE_CACHE.lock().unwrap_poison();
-        match cache.get(uri) {
-            Some(CachedDataUriImage::Decoded(handle)) => return Some(handle.clone()),
-            Some(CachedDataUriImage::Failed) => return None,
-            None => {}
-        }
-    }
-    let outcome = match decode_data_uri_image(uri) {
-        Some((width, height, rgba)) => {
-            CachedDataUriImage::Decoded(image::Handle::from_rgba(width, height, rgba))
-        }
-        None => CachedDataUriImage::Failed,
-    };
-    let handle = match &outcome {
-        CachedDataUriImage::Decoded(handle) => Some(handle.clone()),
-        CachedDataUriImage::Failed => None,
-    };
-    DATA_URI_IMAGE_CACHE
-        .lock()
-        .unwrap_poison()
-        .insert(uri.to_string(), outcome);
-    handle
+    cached_image(&DATA_URI_IMAGE_CACHE, uri, || decode_data_uri_image(uri))
 }
 
 // ── Local-path image rendering (bounded, cached) ─────────────────
 
-/// Maximum decoded-image outcomes retained per process-lifetime cache (data-URI
-/// and local-path). Each `Decoded` entry holds up to
-/// `MAX_IMAGE_LONGEST_SIDE_PX² · 4` (16 MiB) of RGBA under the display budget,
-/// so this bound (32) caps worst-case retained pixels at ~512 MiB per cache.
-const MAX_CACHED_IMAGES: usize = 32;
-
-/// Outcome of a local-image decode attempt, cached per (canonical path, mtime).
-#[derive(Debug)]
-enum CachedLocalImage {
-    /// Successfully decoded; the stable handle is reused across frames.
-    Decoded(image::Handle),
-    /// Failed validation — cached so a corrupt file isn't re-decoded every frame.
-    Failed,
-}
-
 /// Process-lifetime cache of local-image decode outcomes, keyed by (canonical
-/// path, mtime). Same rationale as [`DATA_URI_IMAGE_CACHE`]: a stable iced
-/// handle keeps the texture Id — and the uploaded texture — stable across
-/// frames, and the result is bounded by an LRU.
-static LOCAL_IMAGE_CACHE: LazyLock<
-    Mutex<BoundedLruCache<(std::path::PathBuf, std::time::SystemTime), CachedLocalImage>>,
-> = LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
+/// path, mtime) — a modified file is a new entry. Evicts the least-recently-used
+/// entry past [`MAX_CACHED_IMAGES`].
+static LOCAL_IMAGE_CACHE: LazyLock<Mutex<BoundedLruCache<(PathBuf, SystemTime), CachedImage>>> =
+    LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
 
 /// Return a stable, cached iced handle for a local image file, or `None` when
 /// the file is missing, relative, over-cap, or undecodable — the caller renders
@@ -396,7 +412,7 @@ static LOCAL_IMAGE_CACHE: LazyLock<
 /// then cached at most once per (canonical path, mtime).
 #[must_use]
 fn local_path_image_handle(path: &str) -> Option<image::Handle> {
-    let p = std::path::Path::new(path);
+    let p = Path::new(path);
     if !p.is_absolute() {
         return None;
     }
@@ -408,37 +424,11 @@ fn local_path_image_handle(path: &str) -> Option<image::Handle> {
     }
     let mtime = meta.modified().ok()?;
     let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let key = (canonical.clone(), mtime);
-    {
-        let mut cache = LOCAL_IMAGE_CACHE.lock().unwrap_poison();
-        match cache.get(&key) {
-            Some(CachedLocalImage::Decoded(handle)) => return Some(handle.clone()),
-            Some(CachedLocalImage::Failed) => return None,
-            None => {}
-        }
-    }
-    // Blocking read + bounded decode on the render thread, deliberately OUTSIDE
-    // the cache lock so a concurrent caller isn't blocked for the whole decode;
-    // the size/dimension caps bound the work and the result is cached, so it
-    // happens once per (canonical path, mtime).
-    let outcome = match std::fs::read(&canonical)
-        .ok()
-        .and_then(|b| render_raster(&b))
-    {
-        Some((width, height, rgba)) => {
-            CachedLocalImage::Decoded(image::Handle::from_rgba(width, height, rgba))
-        }
-        None => CachedLocalImage::Failed,
-    };
-    let handle = match &outcome {
-        CachedLocalImage::Decoded(handle) => Some(handle.clone()),
-        CachedLocalImage::Failed => None,
-    };
-    LOCAL_IMAGE_CACHE
-        .lock()
-        .unwrap_poison()
-        .insert(key, outcome);
-    handle
+    cached_image(&LOCAL_IMAGE_CACHE, &(canonical.clone(), mtime), || {
+        std::fs::read(&canonical)
+            .ok()
+            .and_then(|b| render_raster(&b))
+    })
 }
 
 // ── Clickable file markers ──────────────────────────────────────
@@ -1129,7 +1119,7 @@ mod tests {
         {
             let cache = DATA_URI_IMAGE_CACHE.lock().unwrap_poison();
             assert!(
-                matches!(cache.entries.get(uri), Some(CachedDataUriImage::Failed)),
+                matches!(cache.entries.get(uri), Some(CachedImage::Failed)),
                 "failed decode must be cached, got {:?}",
                 cache.entries.get(uri)
             );
@@ -1186,5 +1176,37 @@ mod tests {
         assert_eq!(cache.get(&1), None, "oldest (1) must be evicted");
         assert_eq!(cache.get(&2), Some(&"b"));
         assert_eq!(cache.get(&3), Some(&"c"));
+    }
+
+    #[test]
+    fn cached_image_returns_a_cached_failure_without_decoding() {
+        let cache = Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES));
+        cache
+            .lock()
+            .unwrap_poison()
+            .insert(String::from("bad"), CachedImage::Failed);
+        // A cached failure is a hit: the decode must not run (a miss would
+        // re-decode a corrupt payload on every frame).
+        let handle = cached_image(&cache, "bad", || {
+            panic!("a cached failure must not be decoded again")
+        });
+        assert!(handle.is_none());
+    }
+
+    #[test]
+    fn cached_image_decodes_without_holding_the_cache_lock() {
+        let cache = Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES));
+        // The decode runs with the cache lock released so a raster decode never
+        // blocks a concurrent frame; `try_lock` fails — rather than hanging — if
+        // the guard is still held here.
+        let handle = cached_image(&cache, "raster", || {
+            assert!(cache.try_lock().is_ok(), "decode must run unlocked");
+            Some((1, 1, vec![0, 0, 0, 0]))
+        });
+        assert!(handle.is_some(), "the decoded handle is returned");
+        assert!(matches!(
+            cache.lock().unwrap_poison().get("raster"),
+            Some(CachedImage::Decoded(_))
+        ));
     }
 }
