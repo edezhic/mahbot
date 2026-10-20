@@ -76,6 +76,37 @@ const FORWARDED_DEADLINE_FLAG: &str = "condition deadline in seconds (default 8)
      stay under 45, chrome-use's own client tolerance — a value at or above it is refused, \
      because the tool would run out of tolerance instead of answering";
 
+/// The kinds an action that works through a chrome-use session can end as,
+/// `Ok` first as `CliHelp::kinds` requires: `Timeout` (its own deadline ran
+/// out), `Network`, `NotFound`, `Error` (the step failed otherwise),
+/// `Environment` (which rules it out), `Usage` (a malformed call). A row with
+/// a different vocabulary spells its own list out (`open` alone can emit
+/// `Redesign`).
+const STEP_KINDS: &[OutKind] = &[
+    OutKind::Ok,
+    OutKind::Timeout,
+    OutKind::Network,
+    OutKind::NotFound,
+    OutKind::Error,
+    OutKind::Environment,
+    OutKind::Usage,
+];
+
+/// [`STEP_KINDS`] plus `Empty`, kept second so `Ok` stays first, for the three
+/// actions that can answer with nothing found instead of a failure: a region
+/// no element matches, an extraction with no rows, and a `session status`
+/// whose session is not running.
+const STEP_KINDS_WITH_EMPTY: &[OutKind] = &[
+    OutKind::Ok,
+    OutKind::Empty,
+    OutKind::Timeout,
+    OutKind::Network,
+    OutKind::NotFound,
+    OutKind::Error,
+    OutKind::Environment,
+    OutKind::Usage,
+];
+
 pub(crate) static ACTIONS: LazyLock<Vec<ActionDesc>> = LazyLock::new(build_actions);
 
 /// Build the shared action registry (registry order = CLI help order).
@@ -154,16 +185,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 syntax: "<selector> [--timeout <secs>]",
                 flags: &[("--timeout <secs>", OWN_BOUND_FLAG)],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Empty,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS_WITH_EMPTY,
                 details: "A count of 0 reports kind empty (rc 0) — a legitimately empty region, not a failure.",
                 examples: &[
                     "mahbot chrome count \".card\"",
@@ -199,15 +221,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     ("--timeout <secs>", FORWARDED_DEADLINE_FLAG),
                 ],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS,
                 details: "Exactly one target: a selector positional, --url, or --text. A numeric first token (chrome-use's silent-sleep form) is rejected as usage. --timeout IS chrome-use's deadline, honoured in full — chrome-use's own timeout error surfaces at it, and the product kills only above it plus the relay-recovery window. --fn/--load are not exposed (the one internal --load use is open's post-navigation settle).",
                 examples: &[
                     "mahbot chrome wait \"#results\" --timeout 15",
@@ -255,15 +269,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 syntax: "(<selector> <visible|hidden|present> | count <sel> <op> <n> | text|value <sel> <equals|contains|matches> <value> | attr <sel> <name> <pred> <value> | url <pred> <pattern>) [--timeout <secs>]",
                 flags: &[("--timeout <secs>", FORWARDED_DEADLINE_FLAG)],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS,
                 details: "rc 0 when the condition holds. rc 1 when it does not: kind timeout when the condition never held within the deadline (chrome-use reports every failed expect as a deadline expiration), kind error for other step failures. The allowlist is the safe subset of chrome-use's grammar — gone/request/no-errors and the --not/--regex/--no-wait flags are not exposed.",
                 examples: &[
                     "mahbot chrome expect \"#main\" visible",
@@ -288,15 +294,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 syntax: "<js> [--timeout <secs>]",
                 flags: &[("--timeout <secs>", OWN_BOUND_FLAG)],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS,
                 details: "The result is emitted as a JSON value under the result key.",
                 examples: &["mahbot chrome eval 'document.title'"],
             }),
@@ -331,16 +329,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Empty,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS_WITH_EMPTY,
                 details: "The schema follows chrome-use's grammar: an optional \"rows\" selector plus a required \"fields\" object (field name → CSS selector or {sel, get, all}). Field getters: \"text\" (default), \"html\", \"value\", or \"@<attribute>\" (e.g. \"@href\"); attributes require the \"@\" prefix, and unknown getters are rejected kind usage (rc 3) instead of chrome-use's silent textContent fallback. When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3). If the count eval fails (e.g. an invalid CSS rows selector), the action errors explicitly — chrome-use's dominant-container auto-detect fallback is deliberately NOT used, because the gate exists to avoid phantom rows.",
                 examples: &["mahbot chrome extract --schema-file products.json --limit 20"],
             }),
@@ -367,15 +356,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS,
                 details: "The CLI has no snapshot refs — the selector is always CSS.",
                 examples: &[
                     "mahbot chrome click \"#submit\"",
@@ -410,15 +391,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS,
                 details: "Clears the field and fills it, replacing existing content; the written value is read back and verified before success — rich editors (CodeMirror, Monaco, ProseMirror, contenteditable) and framework inputs (React/Vue/Angular) are handled natively. Exactly one text source: the inline text (multi-word text is joined with spaces), --file <path>, or --stdin. A missing --file is kind usage; a target that does not exist is kind not-found; a read-back verification failure is kind error. A text beginning with '-' is taken as literal text (fill has no single-dash flags), so `fill \"#q\" -tail` fills `-tail`; `--` may still shield one (or use --file/--stdin).",
                 examples: &[
                     "mahbot chrome fill \"#email\" \"user@example.com\"",
@@ -456,15 +429,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS,
                 details: "Types character-by-character without clearing (appends to existing content). --key-events sends real per-character keyDown/keyUp for autocomplete/combobox fields. Embedded newlines press Enter — they can submit a form; use fill for multiline text. When the page rewrites or filters the typed text, chrome-use's warning makes the action kind error (rc 1) — never a silent success. A text beginning with '-' is taken as literal text (type has no single-dash flags); `--` may still shield one.",
                 examples: &[
                     "mahbot chrome type \"#search\" \"hello\"",
@@ -502,15 +467,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     ("--timeout <secs>", OWN_BOUND_FLAG),
                 ],
                 session: true,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS,
                 details: "Sends the key to the focused element. --selector tries to focus its target first (making kind not-found reachable), but focus moves only if the element is focusable (input, textarea, select, button, ...) — for a non-focusable selector (e.g. body) focus does not move and the key lands wherever focus currently is. data.target reports the element where the key actually landed (may differ from --selector, may be absent). For listener-dependent keys (Enter on a bare input, Escape, arrows/PageUp/PageDown in text fields) chrome-use probes for key listeners; with none found, chrome-use's warning makes the action kind error (rc 1) — never a silent success. Keys with browser defaults (e.g. Enter on a button) and command chords are never probed, so they can succeed even if the page ignores them; separately, an Enter that lands where nothing is focused (or on an iframe) also warns and makes the action kind error (rc 1).",
                 examples: &[
                     "mahbot chrome press Enter --selector \"textarea[name=q]\"",
@@ -529,16 +486,7 @@ fn build_actions() -> Vec<ActionDesc> {
                     "also stop protected agent-tab-* / link-enricher-* sessions",
                 )],
                 session: false,
-                kinds: &[
-                    OutKind::Ok,
-                    OutKind::Empty,
-                    OutKind::Timeout,
-                    OutKind::Network,
-                    OutKind::NotFound,
-                    OutKind::Error,
-                    OutKind::Environment,
-                    OutKind::Usage,
-                ],
+                kinds: STEP_KINDS_WITH_EMPTY,
                 details: "Manages named CLI sessions — a `<name>` takes letters, digits, '-' or '_' only (chrome-use's own alphabet: a '.' is refused, since chrome-use refuses to stop such a session). stop refuses protected sessions (agent-tab-* / link-enricher-*) unless --force; names are prefixed mahbot-chrome- unless already prefixed. status is an opt-in liveness probe (worst case ~30s: session-list preflight + a real bounded get-url against the session): a not-running session reports empty (rc 0); a wedged one reports environment (rc 2). The probe only reports — it mutates nothing, so a diagnosis never closes tabs on its own; the recovery itself is automatic everywhere the session is actually driven: every on-demand action verb recovers a session that stopped answering and says so in its error (only when mahbot's own bound ended the step, or chrome-use classified the session unresponsive — a step chrome-use timed out on its own, e.g. an expect whose condition was not met, is not a wedge and costs no session), `session stop <name>` clears it, and the background watchdog recovers one too. After a recovery, re-run the action with `--session <name>` to re-create the session — cookies persist in the profile, open tabs/tab-group identity do not. The global `status` action is session-unaware: it can report the connection ready while a named session is wedged.",
                 examples: &[
                     "mahbot chrome session stop docs",
