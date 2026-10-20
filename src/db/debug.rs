@@ -1442,6 +1442,7 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::UnwrapPoison;
 
     // Every test that lets a read start shares `serial(read_limit)`: a read takes
     // the process-global read-limit knob, and the read-limit tests below shrink it
@@ -2372,54 +2373,119 @@ mod tests {
     /// test instead of the suite's tests. Set only by the driver below.
     const WATCHDOG_CHILD_ENV: &str = "MAHBOT_DEBUG_READ_WATCHDOG_CHILD";
 
+    /// The read limit the child runs under: long enough that the timing assertions
+    /// sit nowhere near the handshake's jitter, short enough to keep the test quick.
+    const WATCHDOG_CHILD_LIMIT_SECS: u64 = 5;
+
+    /// The grace the watchdog promises, as this test expects it. Spelled out
+    /// rather than read from [`read_limit::WATCHDOG_GRACE_SECS`], because a bound
+    /// derived from that constant moves with it — a watchdog tuned to cut at
+    /// exactly the limit would still pass. Checked against it below.
+    const EXPECTED_WATCHDOG_GRACE_SECS: u64 = 1;
+
+    /// The child's fallback — the driver's only hang guard: a watchdog that never
+    /// fires leaves a child that wakes up, panics and exits 101, which fails the
+    /// driver's status assertion instead of hanging the suite. Derived from the
+    /// wait it stands in for, so it can never be shorter than it.
+    const WATCHDOG_CHILD_FALLBACK: std::time::Duration = std::time::Duration::from_secs(
+        WATCHDOG_CHILD_LIMIT_SECS + EXPECTED_WATCHDOG_GRACE_SECS + 24,
+    );
+
     /// The watchdog is the half of the read limit that does not depend on the
     /// read yielding: a read that never returns is ended by the process exiting
     /// with the limit's own failure. Proven across two processes — the only way
     /// to observe "the process is gone".
+    ///
+    /// The assertions are behaviour, not machine speed: the watchdog must still be
+    /// asleep until the limit plus its own grace has elapsed, and it must end the
+    /// child after that with its own status and sentence — which is what tells the
+    /// watchdog firing apart from a child that gave up before arming. The child
+    /// starts its budget only once released below, so this process's scheduling
+    /// cannot fake an early cut; the residue is the other way: the child's startup
+    /// before it reaches its read, plus this process's delay before the write, still
+    /// hide a cut of that size.
+    ///
+    /// Load still reaches the test through the spawn itself (an `EAGAIN`/`ENOMEM`
+    /// under memory pressure) and through a kill of the child; both fail here as
+    /// what they are rather than as a timing verdict.
+    ///
+    /// The filter below names [`debug_read_limit_watchdog_child`]; if that test is
+    /// renamed the child runs nothing, exits 0, and this driver fails on the
+    /// status.
     #[test]
     fn run_debug_read_limit_watchdog_ends_a_wedged_read() {
-        let started = std::time::Instant::now();
-        let child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        // The child inherits this process's environment, so hold the env lock for
+        // the whole run: `util::test::set_env_var` callers take that same lock,
+        // and a change set at the wrong instant would reach the child.
+        let _env = crate::util::test::env_lock().lock().unwrap_poison();
+        assert_eq!(
+            read_limit::WATCHDOG_GRACE_SECS,
+            EXPECTED_WATCHDOG_GRACE_SECS,
+            "the grace is part of what this test asserts — re-derive the lower bound \
+             before changing it"
+        );
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut child = std::process::Command::new(exe)
             .args([
                 "--ignored",
                 "--nocapture",
                 "debug_read_limit_watchdog_child",
             ])
             .env(WATCHDOG_CHILD_ENV, "1")
-            // 1s budget: the watchdog's own grace puts the cutoff at ~2s, far
-            // short of the child's 30s sleep.
-            .env(read_limit::ENV, "1")
-            .output()
+            .env(read_limit::ENV, WATCHDOG_CHILD_LIMIT_SECS.to_string())
+            // `spawn` inherits stdio (only `output` pipes it): the sentence is the
+            // evidence, and stdin releases the child.
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .expect("spawn the watchdog child");
+        let started = std::time::Instant::now();
+        let mut release = child.stdin.take().expect("the child's stdin is piped");
+        std::io::Write::write_all(&mut release, b"g").expect("release the watchdog child");
+        drop(release);
+        let output = child
+            .wait_with_output()
+            .expect("collect the watchdog child's output");
         let text = format!(
             "{}{}",
-            String::from_utf8_lossy(&child.stdout),
-            String::from_utf8_lossy(&child.stderr),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
-        assert!(
-            !child.status.success(),
+        assert_eq!(
+            output.status.code(),
+            Some(read_limit::WATCHDOG_EXIT_CODE),
             "the watchdog must end the child:\n{text}"
         );
         assert!(text.contains("'logs' was not read"), "got: {text}");
-        assert!(text.contains("1s read limit"), "got: {text}");
-        assert!(text.contains(read_limit::ENV), "got: {text}");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
-            "the watchdog must cut the read well before the child's own idle sleep: {:?}",
+            text.contains(&format!("{WATCHDOG_CHILD_LIMIT_SECS}s read limit")),
+            "got: {text}"
+        );
+        assert!(text.contains(read_limit::ENV), "got: {text}");
+        let earliest_cut = std::time::Duration::from_secs(
+            WATCHDOG_CHILD_LIMIT_SECS + EXPECTED_WATCHDOG_GRACE_SECS,
+        );
+        assert!(
+            started.elapsed() >= earliest_cut,
+            "the watchdog must not cut the read before the limit plus its grace \
+             ({earliest_cut:?}) has elapsed: {:?}",
             started.elapsed()
         );
     }
 
     /// Child mode for [`run_debug_read_limit_watchdog_ends_a_wedged_read`]: hold
-    /// a read that never yields and let the watchdog end the process. The 30s
-    /// sleep then panic is what fails the driver (instead of hanging it) when
-    /// the watchdog does not fire.
+    /// a read that never yields and let the watchdog end the process.
     #[test]
     #[ignore = "driven by run_debug_read_limit_watchdog_ends_a_wedged_read"]
     fn debug_read_limit_watchdog_child() {
         if std::env::var_os(WATCHDOG_CHILD_ENV).is_none() {
             return;
         }
+        // Released by the driver before its clock starts (see there). EOF — run by
+        // hand — only means no clock is waiting on this process.
+        let mut release = [0u8];
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut release);
         let budget = Budget::start();
         let read = Read::direct("logs", &budget);
         // A test binary's watchdog does not end the process (see
@@ -2427,7 +2493,7 @@ mod tests {
         // proves it does.
         read_limit::enable_process_exit();
         let _watchdog = read.arm().expect("the child's budget must be live");
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::thread::sleep(WATCHDOG_CHILD_FALLBACK);
         panic!("the read limit's watchdog did not end the process");
     }
 }

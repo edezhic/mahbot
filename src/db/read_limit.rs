@@ -68,7 +68,13 @@ const MAX_SECS: u64 = 86_400;
 /// the watchdog is here for the read that never returns to its loop — and the
 /// closer it fires to the limit, the closer the command ends to the limit it
 /// promised.
-const WATCHDOG_GRACE_SECS: u64 = 1;
+pub(crate) const WATCHDOG_GRACE_SECS: u64 = 1;
+
+/// What the process the watchdog ends exits with: the command's error output and
+/// its exit status are its only surface — it opens no log (an instance holds the
+/// stores) and has nothing durable to write to — and `1` is the failure status its
+/// other failures exit with.
+pub(crate) const WATCHDOG_EXIT_CODE: i32 = 1;
 
 /// The command's read limit.
 fn limit() -> Duration {
@@ -242,12 +248,10 @@ impl Watchdog {
             if rx.recv_timeout(cutoff.saturating_duration_since(Instant::now()))
                 == Err(RecvTimeoutError::Timeout)
             {
-                // The same shape and status the read's own failure would take.
-                // The command's error output and its exit status are its only
-                // surface: it opens no log (an instance holds the stores) and it
-                // has nothing durable to write to.
+                // The same shape and status the read's own failure would take
+                // (see [`WATCHDOG_EXIT_CODE`]).
                 crate::util::print_stderr(&format!("Error: {message}"));
-                std::process::exit(1);
+                std::process::exit(WATCHDOG_EXIT_CODE);
             }
         });
         Self { _armed: Some(tx) }
