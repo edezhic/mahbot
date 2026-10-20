@@ -736,7 +736,7 @@ struct LiveGroup {
 
 /// The bound for one spawn: the attempt's remaining budget, capped at `cap`, or
 /// `None` when the budget is already spent (nothing is spawned then).
-fn spawn_budget(deadline: Instant, cap: Duration) -> Option<Duration> {
+pub(crate) fn spawn_budget(deadline: Instant, cap: Duration) -> Option<Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     (!remaining.is_zero()).then(|| remaining.min(cap))
 }

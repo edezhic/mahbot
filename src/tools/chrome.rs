@@ -5,9 +5,10 @@ use crate::chrome::contract::{
     chrome_session_stop_command, chrome_use_warning, classify_call_failure, eval_count,
     expect_outcome, extract_output, extract_snapshot_text, is_daemon_unavailable_code,
     is_daemon_unavailable_error, is_self_launched_browser_error, is_session_unresponsive_error,
-    is_unreachable_tab_error, net_error_phrase, parse_first, sanitize_timeout_message,
-    self_launched_browser_error, self_launched_browser_note, truncated_output_error,
-    unreachable_tab_message, unreached_browser_error, with_condition_timeout_note,
+    is_unreachable_tab_error, net_error_phrase, never_dispatched_error, parse_first,
+    sanitize_timeout_message, self_launched_browser_error, self_launched_browser_note,
+    truncated_output_error, unreachable_tab_message, unreached_browser_error,
+    with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
 use crate::chrome::forms::{
@@ -189,8 +190,9 @@ const DEFAULT_TAB: &str = "default";
 
 /// The failure texts this module itself mints for a call that never left mahbot: no CLI
 /// ([`ChromeTool::ensure_available`] and the dispatch's own context), a CLI that could not be
-/// spawned, and the call cut off at mahbot's own bound. Consts so the per-agent tab record's
-/// classifier ([`ChromeTool::left_no_page`]) cannot drift from what the dispatch fails with.
+/// spawned, and the call cut off at mahbot's own bound. Consts so the failure classifiers
+/// ([`ChromeTool::never_reached_the_owner_browser`] and [`ChromeTool::left_no_page`]) cannot drift
+/// from what the dispatch fails with.
 const CLI_UNAVAILABLE: &str = "chrome-use CLI is not available";
 const CLI_SPAWN_FAILED: &str = "Failed to execute chrome-use CLI";
 const CLI_BOUND_EXCEEDED: &str = "chrome-use did not answer within";
@@ -669,6 +671,18 @@ impl ChromeTool {
         tab.strip_prefix(&self.session_prefix).unwrap_or(tab)
     }
 
+    /// Whether a failed dispatch never reached the owner's browser: no CLI (or one that could not
+    /// be spawned), a daemon or relay that never took the call ([`never_dispatched_error`]), or
+    /// work that went to a browser chrome-use launched itself. Shared by the tab record's
+    /// classifier ([`Self::left_no_page`]) and the step's collapse tail, which skips a step that
+    /// provably never used a tab.
+    fn never_reached_the_owner_browser(message: &str) -> bool {
+        never_dispatched_error(message)
+            || message.contains(CLI_UNAVAILABLE)
+            || message.contains(CLI_SPAWN_FAILED)
+            || is_self_launched_browser_error(message)
+    }
+
     /// Whether a failed dispatch left the page it was asked for nowhere in the browser — the one
     /// class of failure that must not create a tab, refresh a tab's recency, or bring a name the
     /// cap closed back. Every failure that answers for a page — a missing element, a failed
@@ -676,17 +690,14 @@ impl ChromeTool {
     /// has, and counts.
     fn left_no_page(error: &anyhow::Error) -> bool {
         let message = error.to_string();
-        // Nothing carried the call: the CLI is missing or could not be spawned, the daemon or the
-        // relay never took it, or it was cut off at mahbot's own bound with nothing to attribute.
+        // The browser's structural no-page classes, the texts this module mints, and the two
+        // page-level classes only this record counts as no page: a call cut off at mahbot's own
+        // bound, and a tab the session cannot drive. The collapse tail skips only the narrower
+        // [`Self::never_reached_the_owner_browser`] class — a cut-off step may still have opened
+        // its tab first.
         unreached_browser_error(&message)
-            || message.contains(CLI_UNAVAILABLE)
-            || message.contains(CLI_SPAWN_FAILED)
+            || Self::never_reached_the_owner_browser(&message)
             || message.contains(CLI_BOUND_EXCEEDED)
-            // The work went to a browser chrome-use started itself, so no page of the owner's
-            // exists for it.
-            || is_self_launched_browser_error(&message)
-            // The browser answered that the session has no page under this name at all (its tab
-            // is gone or unreachable) — nothing to count, and nothing to bring back.
             || is_unreachable_tab_error(&message)
     }
 
@@ -1522,77 +1533,16 @@ impl Tool for ChromeTool {
         // same tab. Different tabs run fully concurrently.
         let _guard = self.acquire_tab_lock(&tab).await;
 
-        // The workspace is carried onto the durable rows below, and the elapsed
-        // time is measured around the chrome-use dispatch this action runs (it
-        // may be several calls — `run_command` measures each call of its own).
+        // The workspace is carried onto the durable rows below.
         let workspace = ws.as_path().to_string_lossy().into_owned();
-        let started = Instant::now();
 
-        // Each action path reports whether the chrome-use call it drove exited
-        // while a process it left behind still held the call's output channel: the
-        // call finished either way, and that leftover is a note on the result
-        // below, never an error (see [`chrome_leftover_pipe_note`]).
-        let ActionOutput {
-            output: body,
-            leftover_pipes,
-        } = if let ChromeAction::GetInnerText { selector } = &action {
-            let ActionOutput {
-                output,
-                leftover_pipes,
-            } = self.get_inner_text(selector, &tab, &workspace).await?;
-            let body = if output.is_empty() {
-                format!("[Tab: {tab}] (no output)")
-            } else {
-                format!("[Tab: {tab}] {output}")
-            };
-            ActionOutput {
-                output: super::with_normalization_notes(body, &normalized_notes),
-                leftover_pipes,
-            }
-        } else if let ChromeAction::Screenshot { .. } = &action {
-            let ActionOutput {
-                output,
-                leftover_pipes,
-            } = self.capture_screenshot(&tab, &workspace).await?;
-            ActionOutput {
-                output: super::with_normalization_notes(output, &normalized_notes),
-                leftover_pipes,
-            }
-        } else if let ChromeAction::Extract { schema, limit } = &action {
-            let (schema, schema_note) = Self::normalize_extract_schema(schema)?;
-            let ActionOutput {
-                output,
-                leftover_pipes,
-            } = self.run_extract(&schema, *limit, &tab, &workspace).await?;
-            let mut notes = normalized_notes;
-            notes.extend(schema_note);
-            ActionOutput {
-                output: super::with_normalization_notes(output, &notes),
-                leftover_pipes,
-            }
-        } else {
-            let ActionOutput {
-                output: (response, snapshot),
-                leftover_pipes,
-            } = self.run_action(&action, &tab, &workspace).await?;
-            let body =
-                Self::format_action_output(&action, &tab, response, &snapshot, &normalized_notes);
-            ActionOutput {
-                output: body,
-                leftover_pipes,
-            }
-        };
-        if leftover_pipes {
-            let session = self.resolve_session(&tab);
-            // The durable record of the helper chrome-use left behind, in the
-            // same wording the agent's note carries (see [`Self::record_leftover`]).
-            Self::record_leftover(&session, &workspace, started.elapsed());
-            return Ok(crate::tools::with_note(
-                &body,
-                &chrome_leftover_pipe_note(&session),
-            ));
-        }
-        Ok(body)
+        let outcome = self
+            .run_step(&tab, action, &normalized_notes, &workspace)
+            .await;
+        // The cosmetic tail rides the step, inside the same per-tab lock: the
+        // step's own result is already decided and is never changed by it.
+        self.collapse_step_group(&tab, outcome.as_ref().err()).await;
+        outcome
     }
 
     async fn image_payload(
@@ -1631,6 +1581,109 @@ impl Tool for ChromeTool {
 }
 
 impl ChromeTool {
+    /// One browser step with the per-tab lock already held: the action's own
+    /// dispatch and its output formatting. The step's cosmetic tail is the
+    /// caller's ([`Self::collapse_step_group`]), so it runs on a failure too.
+    async fn run_step(
+        &self,
+        tab: &str,
+        action: ChromeAction,
+        normalized_notes: &[String],
+        workspace: &str,
+    ) -> anyhow::Result<String> {
+        // The elapsed time of the chrome-use dispatch this action runs (it may be
+        // several calls — `run_command` measures each call of its own).
+        let started = Instant::now();
+
+        // Each action path reports whether the chrome-use call it drove exited
+        // while a process it left behind still held the call's output channel: the
+        // call finished either way, and that leftover is a note on the result
+        // below, never an error (see [`chrome_leftover_pipe_note`]).
+        let ActionOutput {
+            output: body,
+            leftover_pipes,
+        } = if let ChromeAction::GetInnerText { selector } = &action {
+            let ActionOutput {
+                output,
+                leftover_pipes,
+            } = self.get_inner_text(selector, tab, workspace).await?;
+            let body = if output.is_empty() {
+                format!("[Tab: {tab}] (no output)")
+            } else {
+                format!("[Tab: {tab}] {output}")
+            };
+            ActionOutput {
+                output: super::with_normalization_notes(body, normalized_notes),
+                leftover_pipes,
+            }
+        } else if let ChromeAction::Screenshot { .. } = &action {
+            let ActionOutput {
+                output,
+                leftover_pipes,
+            } = self.capture_screenshot(tab, workspace).await?;
+            ActionOutput {
+                output: super::with_normalization_notes(output, normalized_notes),
+                leftover_pipes,
+            }
+        } else if let ChromeAction::Extract { schema, limit } = &action {
+            let (schema, schema_note) = Self::normalize_extract_schema(schema)?;
+            let ActionOutput {
+                output,
+                leftover_pipes,
+            } = self.run_extract(&schema, *limit, tab, workspace).await?;
+            let mut notes = normalized_notes.to_vec();
+            notes.extend(schema_note);
+            ActionOutput {
+                output: super::with_normalization_notes(output, &notes),
+                leftover_pipes,
+            }
+        } else {
+            let ActionOutput {
+                output: (response, snapshot),
+                leftover_pipes,
+            } = self.run_action(&action, tab, workspace).await?;
+            let body =
+                Self::format_action_output(&action, tab, response, &snapshot, normalized_notes);
+            ActionOutput {
+                output: body,
+                leftover_pipes,
+            }
+        };
+        if leftover_pipes {
+            let session = self.resolve_session(tab);
+            // The durable record of the helper chrome-use left behind, in the
+            // same wording the agent's note carries (see [`Self::record_leftover`]).
+            Self::record_leftover(&session, workspace, started.elapsed());
+            return Ok(crate::tools::with_note(
+                &body,
+                &chrome_leftover_pipe_note(&session),
+            ));
+        }
+        Ok(body)
+    }
+
+    /// Leave the tab groups this step's session used collapsed — see [`super::chrome_groups`].
+    /// Cosmetic and best-effort: the tail answers its trouble for this tool's logs, and it can
+    /// never turn the step into a failed one. Skipped when the step provably never reached the
+    /// owner's browser ([`Self::never_reached_the_owner_browser`]), for the shared non-agent
+    /// instance (link enrichment's sessions are out of scope), and when the CLI binary cannot be
+    /// resolved at all.
+    async fn collapse_step_group(&self, tab: &str, step: Option<&anyhow::Error>) {
+        if self.session_prefix.is_empty()
+            || step.is_some_and(|error| Self::never_reached_the_owner_browser(&error.to_string()))
+        {
+            return;
+        }
+        let Some(cli) = super::chrome_daemon::cli_path() else {
+            return;
+        };
+        if let Some(trouble) =
+            super::chrome_groups::collapse(&cli, &self.resolve_session(tab)).await
+        {
+            debug!(trouble, "the step's tab group was not left collapsed");
+        }
+    }
+
     /// Resolve the tab for a call. An explicit non-empty tab passes through as the
     /// logical name; missing/empty falls back to the per-run default logical session,
     /// which [`ChromeTool::resolve_session`] maps into this run's namespace (a function
@@ -4143,6 +4196,26 @@ mod tests {
             assert!(
                 !ChromeTool::left_no_page(&anyhow::anyhow!("{message}")),
                 "the session really has this page: {message}"
+            );
+        }
+    }
+
+    /// The collapse tail runs after a failed step unless the failure proves the owner's browser
+    /// was never reached: a step cut off at a clock may have opened its tab first, so its group
+    /// must still be put back.
+    #[test]
+    fn a_cut_off_step_still_owes_its_group_a_collapse() {
+        for message in [
+            "chrome-use did not answer within 45s for `open`",
+            "command timed out after 30000ms",
+            "event stream closed before the call was answered",
+            "session owns no resolvable tab. The chrome-use extension lost its debugger attach",
+            "Navigation to https://example.com failed — Chrome rendered its error page: \
+             ERR_NAME_NOT_RESOLVED (name not resolved). Verify the URL and network.",
+        ] {
+            assert!(
+                !ChromeTool::never_reached_the_owner_browser(message),
+                "the step may have opened its tab before this failure: {message}"
             );
         }
     }

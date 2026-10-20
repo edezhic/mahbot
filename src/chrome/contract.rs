@@ -527,23 +527,30 @@ pub(crate) fn is_daemon_unavailable_code(code: Option<&str>) -> bool {
     matches!(code, Some("browser_not_launched"))
 }
 
-/// Structural failures that provably never reached the browser — the mirror of the
-/// vendor's own structural error classes: the relay signature, the daemon
-/// signature (which already folds in the session-wedge texts, see
-/// [`is_daemon_unavailable_error`]), "browser not launched", "requires
-/// ab-connect", "only works over the extension relay", "event stream closed",
-/// "command timed out", "stale target" and "target closed". A caller uses this to
-/// keep such a failure from being read as the browser answering about the work it
-/// was asked to do; an extension ownership refusal relayed in the same error field
-/// is NOT one of these — that IS the browser's own answer, about a tab.
-pub(crate) fn unreached_browser_error(msg: &str) -> bool {
-    if is_relay_unavailable_error(msg) || is_daemon_unavailable_error(msg) {
-        return true;
-    }
+/// Structural failures of a call that never left the product for the owner's browser: the relay
+/// signature, the daemon signature (which already folds in the session-wedge texts, see
+/// [`is_daemon_unavailable_error`]), "browser not launched", "requires ab-connect" and "only works
+/// over the extension relay". Everything the browser may have run before the failure is NOT here —
+/// a call cut off at a clock, a stale or closed target, a stream that died mid-call
+/// ("event stream closed") — [`unreached_browser_error`] is that wider "holds no page" class, and a
+/// tab that became unreachable has its own predicate. An extension ownership refusal relayed in
+/// the same error field is not one of these either — that IS the browser's own answer, about a tab.
+pub(crate) fn never_dispatched_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    lower.contains("browser not launched")
+    is_relay_unavailable_error(msg)
+        || is_daemon_unavailable_error(msg)
+        || lower.contains("browser not launched")
         || lower.contains("requires ab-connect")
         || lower.contains("only works over the extension relay")
+}
+
+/// Structural failures that provably never reached the browser — the mirror of the vendor's own
+/// structural error classes: [`never_dispatched_error`] plus "event stream closed", "command timed
+/// out", "stale target" and "target closed". A caller uses this to keep such a failure from being
+/// read as the browser answering about the work it was asked to do.
+pub(crate) fn unreached_browser_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    never_dispatched_error(msg)
         || lower.contains("event stream closed")
         || lower.contains("command timed out")
         || lower.contains("stale target")

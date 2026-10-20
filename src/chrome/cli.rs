@@ -14,7 +14,10 @@
 //! clocks the [chrome policy](crate::chrome) defines — chrome-use's clock,
 //! declared to it, and the product's own kill above that — as [`StepClocks`]
 //! derives them for this surface. The wait action never exposes `--load`; its one
-//! raw-argv use is `open`'s internal best-effort post-navigation settle.
+//! raw-argv use is `open`'s internal best-effort post-navigation settle. A step in
+//! a NAMED session leaves the tab groups it used collapsed after the envelope is
+//! out ([`crate::tools::chrome_groups`]), reporting any trouble on stderr; an
+//! ephemeral session is closed right after its command and has nothing to leave.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -583,16 +586,31 @@ pub async fn run_cli(args: &[String]) -> i32 {
 
     let (envelope, session) = dispatch(&invocation).await;
     envelope.emit();
-    if let Some(s) = session.as_ref().filter(|s| s.ephemeral)
+    if let Some(s) = session.as_ref()
         && CHROME_USE_SPAWNED.load(Ordering::Relaxed)
     {
-        // The close runs after the envelope is emitted, so a helper it leaves
-        // behind cannot be noted in it — it is reported here, like every other
-        // diagnostic of that close.
-        CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
-        close_ephemeral(&s.name).await;
-        if CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed) {
-            eprintln!("mahbot chrome: {}", chrome_leftover_pipe_note(&s.name));
+        if s.ephemeral {
+            // The close runs after the envelope is emitted, so a helper it leaves
+            // behind cannot be noted in it — it is reported here, like every other
+            // diagnostic of that close.
+            CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
+            close_ephemeral(&s.name).await;
+            if CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed) {
+                eprintln!("mahbot chrome: {}", chrome_leftover_pipe_note(&s.name));
+            }
+        } else if envelope.kind != OutKind::Environment
+            && let Some(cli) = cli_path()
+        {
+            // A named session outlives the command, so the groups this step used are
+            // still there to leave collapsed — unless the step failed on its
+            // environment, where the tail cannot reach the browser either. An
+            // ephemeral session is closed just above and has nothing to leave, and a
+            // step that never spawned chrome-use attempted nothing in the browser.
+            // Cosmetic and best-effort: trouble is printed here, like the command's
+            // other post-step diagnostics — see `crate::tools::chrome_groups`.
+            if let Some(trouble) = crate::tools::chrome_groups::collapse(&cli, &s.name).await {
+                eprintln!("mahbot chrome: the step's tab group was not left collapsed: {trouble}");
+            }
         }
     }
     envelope.kind.exit_code()

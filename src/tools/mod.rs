@@ -8,6 +8,7 @@ pub(crate) mod archive;
 pub mod bun;
 pub mod chrome;
 pub mod chrome_daemon;
+pub(crate) mod chrome_groups;
 pub mod chrome_release;
 pub(crate) mod chrome_tab_ledger;
 pub(crate) mod chrome_tabs;
