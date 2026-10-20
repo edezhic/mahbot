@@ -176,73 +176,212 @@ async fn delete_results_archive(job_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::SpawnChild;
     use crate::util::test::JobRowBuilder;
+    use std::path::PathBuf;
+
+    // ── Fixture ───────────────────────────────────────────────────────────
+    // A cancelled run's durable state, stated once and never patched at the
+    // call site: the jobs row shape (one constructor each), the folder's
+    // contents, and whether the run left a persisted report. No `agents` roster
+    // rows are seeded — every path here names the run by id, and the one roster
+    // row the handoff test asserts is written by the handoff itself.
+
+    /// The run folder's contents — the axis that decides whether the sweep may
+    /// release the folder: a `commands.dump` is the cleanup intent.
+    enum Folder {
+        /// The folder exists and holds nothing.
+        Empty,
+        /// An unrelated scratch file and no dump.
+        Scratch,
+        /// The command dump.
+        Dump,
+    }
+
+    /// The report a run left for boot replay: the completion boundary writes a
+    /// `pending_jobs` envelope AND its results archive; a run cancelled before
+    /// that boundary has neither.
+    enum Report {
+        /// No envelope, no archive.
+        None,
+        /// The pending envelope plus the `results.md` archive.
+        Persisted,
+    }
+
+    /// A seeded run, handed back for the assertions.
+    struct Seeded {
+        id: &'static str,
+        root: PathBuf,
+        archive: PathBuf,
+    }
+
+    impl Seeded {
+        /// A research run mid-flight: `kind='research'` plus its `research_jobs`
+        /// child, written through the production dispatch — the sweep's jobs
+        /// DELETE is what cascades the child.
+        async fn research(id: &'static str, folder: Folder, report: Report) -> Self {
+            crate::util::test::init_management_test_stores().await;
+            crate::jobs::spawn_job(
+                &crate::session::store().conn,
+                id,
+                "question?",
+                "ws",
+                "u",
+                "telegram",
+                crate::Role::Assistant,
+                &[],
+                &SpawnChild::Research,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            Self::seed(id, folder, report).await
+        }
+
+        /// The same `kind='research'` row with NO `research_jobs` child:
+        /// `spawn_job` always writes the child, so this shape is seeded directly.
+        async fn research_without_child(id: &'static str, folder: Folder, report: Report) -> Self {
+            crate::util::test::init_management_test_stores().await;
+            JobRowBuilder::new(
+                &crate::session::store().conn,
+                id,
+                "research",
+                "assistant",
+                "ws",
+            )
+            .task("question?")
+            .user_name("u")
+            .channel("telegram")
+            .timestamps(crate::db::now())
+            .insert()
+            .await
+            .unwrap();
+            Self::seed(id, folder, report).await
+        }
+
+        /// A terminalized run: its `research_cleanup` row reuses the run id and
+        /// carries no child row — the cleanup prompt lives in its `task`.
+        async fn terminalized(id: &'static str, folder: Folder, report: Report) -> Self {
+            crate::util::test::init_management_test_stores().await;
+            crate::jobs::spawn_job(
+                &crate::session::store().conn,
+                id,
+                "cleanup prompt",
+                "ws",
+                "",
+                "",
+                crate::Role::Sanitation,
+                &[],
+                &SpawnChild::ResearchCleanup,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            Self::seed(id, folder, report).await
+        }
+
+        /// The rest of the run's state: the folder in the state under test, plus
+        /// the persisted report — the `pending_jobs` envelope boot replay would
+        /// deliver and its archive — when the run got that far.
+        ///
+        /// Every constructor reaches this only after the test stores are up:
+        /// `results_archive_path` falls back to the real `~/.mahbot` root while
+        /// `CONFIG` has none set, so resolving earlier would seed (and then
+        /// delete) a file in the owner's storage.
+        async fn seed(id: &'static str, folder: Folder, report: Report) -> Self {
+            let root = crate::research_cleanup::ensure_run_root(id).await;
+            match folder {
+                Folder::Empty => {}
+                Folder::Scratch => {
+                    tokio::fs::write(root.join("scratch.txt"), "scratch")
+                        .await
+                        .unwrap();
+                }
+                Folder::Dump => {
+                    tokio::fs::write(root.join(COMMAND_DUMP_FILE), "shell cmd")
+                        .await
+                        .unwrap();
+                }
+            }
+            let archive = crate::research_cleanup::results_archive_path(id).unwrap();
+            if matches!(report, Report::Persisted) {
+                // The router's own persist: the envelope is the production
+                // serialization, never a hand-written copy of it.
+                crate::agent::message_router::persist_pending(
+                    &crate::agent::message_router::AgentJob {
+                        content: "report".to_string(),
+                        workspace_name: "ws".to_string(),
+                        user_name: "u".to_string(),
+                        channel: "telegram".to_string(),
+                        kind: crate::agent::message_router::MessageKind::ResearchResult,
+                        role: crate::Role::Assistant,
+                        reply_target: None,
+                        pending_job_id: None,
+                        originating_workspace: None,
+                        custom_role: None,
+                        reply_to_custom: None,
+                    },
+                    id.to_string(),
+                )
+                .await
+                .unwrap();
+                tokio::fs::create_dir_all(archive.parent().unwrap())
+                    .await
+                    .unwrap();
+                tokio::fs::write(&archive, "archive").await.unwrap();
+            }
+            Self { id, root, archive }
+        }
+
+        /// How many rows `table` holds for this run: a count, not a presence
+        /// flag, because a leftover duplicate is one of the failures these
+        /// tests watch for. The three tables it serves are keyed by `id`; the
+        /// roster is keyed by `job_id` and its one assertion reads the row's
+        /// value, so it stays a bespoke query.
+        async fn rows(&self, table: &str) -> usize {
+            crate::session::store()
+                .conn
+                .query(
+                    &format!("SELECT id FROM {table} WHERE id = ?1"),
+                    crate::db::params![self.id],
+                )
+                .await
+                .unwrap()
+                .len()
+        }
+    }
 
     /// Mid-run cancel with NO command dump (no cleanup intent): jobs +
     /// research_jobs rows + pending row + folder + archive all removed;
     /// nothing is resumable or deliverable.
     #[tokio::test]
     async fn sweep_removes_rows_folder_and_archive_for_no_dump_run() {
-        crate::util::test::init_management_test_stores().await;
-        let job_id = "research_cancel_midrun_1";
-        let conn = &crate::session::store().conn;
-        let now = crate::db::now();
-        JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
-            .task("q")
-            .user_name("u")
-            .channel("telegram")
-            .timestamps(now.clone())
-            .insert()
-            .await
-            .unwrap();
-        conn.execute(
-            "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
-            crate::db::params![job_id],
+        let run = Seeded::research(
+            "research_cancel_midrun_1",
+            Folder::Scratch,
+            Report::Persisted,
         )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO pending_jobs (id, envelope, target_agent_id, created_at) \
-             VALUES (?1, ?2, 'manager_ws', ?3)",
-            crate::db::params![
-                job_id,
-                r#"{"content":"report","workspace_name":"ws","user_name":"u","channel":"telegram","kind":"ResearchResult","role":"assistant","reply_target":null,"pending_job_id":null}"#,
-                now
-            ],
-        )
-        .await
-        .unwrap();
-        // Run folder (scratch only, NO command dump) + archive.
-        let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        tokio::fs::write(run_root.join("scratch.txt"), "scratch")
-            .await
-            .unwrap();
-        let archive = crate::research_cleanup::results_archive_path(job_id).unwrap();
-        tokio::fs::create_dir_all(archive.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&archive, "archive").await.unwrap();
+        .await;
 
-        sweep_cancelled_run(job_id).await.unwrap();
+        sweep_cancelled_run(run.id).await.unwrap();
 
-        let jobs = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(jobs.is_empty(), "jobs row removed");
-        let pending = conn
-            .query(
-                "SELECT id FROM pending_jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(pending.is_empty(), "pending row removed — no boot replay");
-        assert!(!run_root.exists(), "run folder removed");
-        assert!(!archive.exists(), "results.md archive removed");
+        assert_eq!(run.rows("jobs").await, 0, "jobs row removed");
+        assert_eq!(
+            run.rows("research_jobs").await,
+            0,
+            "research_jobs child row removed by cascade"
+        );
+        assert_eq!(
+            run.rows("pending_jobs").await,
+            0,
+            "pending row removed — no boot replay"
+        );
+        assert!(!run.root.exists(), "run folder removed");
+        assert!(!run.archive.exists(), "results.md archive removed");
     }
 
     /// Cancel after terminalization (folder WITHOUT a command dump — no cleanup
@@ -251,56 +390,23 @@ mod tests {
     /// not resume), and the dump-less folder + archive are released.
     #[tokio::test]
     async fn sweep_removes_pending_and_cleanup_rows_for_terminalized_run() {
-        crate::util::test::init_management_test_stores().await;
-        let job_id = "research_cancel_terminal_1";
-        let conn = &crate::session::store().conn;
-        let now = crate::db::now();
-        JobRowBuilder::new(conn, job_id, "research_cleanup", "sanitation", "ws")
-            .task("cleanup prompt")
-            .user_name("")
-            .channel("")
-            .timestamps(now.clone())
-            .insert()
-            .await
-            .unwrap();
-        conn.execute(
-            "INSERT INTO pending_jobs (id, envelope, target_agent_id, created_at) \
-             VALUES (?1, ?2, 'manager_ws', ?3)",
-            crate::db::params![
-                job_id,
-                r#"{"content":"report","workspace_name":"ws","user_name":"u","channel":"telegram","kind":"ResearchResult","role":"assistant","reply_target":null,"pending_job_id":null}"#,
-                now
-            ],
+        let run = Seeded::terminalized(
+            "research_cancel_terminal_1",
+            Folder::Empty,
+            Report::Persisted,
         )
-        .await
-        .unwrap();
-        let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        let archive = crate::research_cleanup::results_archive_path(job_id).unwrap();
-        tokio::fs::create_dir_all(archive.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&archive, "archive").await.unwrap();
+        .await;
 
-        sweep_cancelled_run(job_id).await.unwrap();
+        sweep_cancelled_run(run.id).await.unwrap();
 
-        let jobs = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(jobs.is_empty(), "cleanup job row removed");
-        let pending = conn
-            .query(
-                "SELECT id FROM pending_jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(pending.is_empty(), "pending report row removed");
-        assert!(!run_root.exists());
-        assert!(!archive.exists());
+        assert_eq!(run.rows("jobs").await, 0, "cleanup job row removed");
+        assert_eq!(
+            run.rows("pending_jobs").await,
+            0,
+            "pending report row removed"
+        );
+        assert!(!run.root.exists());
+        assert!(!run.archive.exists());
     }
 
     /// A folder WITH a command dump is the run's cleanup intent: the sweep
@@ -309,66 +415,27 @@ mod tests {
     /// log is not asserted.
     #[tokio::test]
     async fn sweep_never_releases_folder_with_command_dump() {
-        crate::util::test::init_management_test_stores().await;
-        let job_id = "research_cancel_dump_guard_1";
-        let conn = &crate::session::store().conn;
-        let now = crate::db::now();
-        JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
-            .task("q")
-            .user_name("u")
-            .channel("telegram")
-            .timestamps(now.clone())
-            .insert()
-            .await
-            .unwrap();
-        conn.execute(
-            "INSERT INTO pending_jobs (id, envelope, target_agent_id, created_at) \
-             VALUES (?1, ?2, 'manager_ws', ?3)",
-            crate::db::params![
-                job_id,
-                r#"{"content":"report","workspace_name":"ws","user_name":"u","channel":"telegram","kind":"ResearchResult","role":"assistant","reply_target":null,"pending_job_id":null}"#,
-                now
-            ],
+        // No `research_jobs` child row: the dump guard does not depend on it.
+        let run = Seeded::research_without_child(
+            "research_cancel_dump_guard_1",
+            Folder::Dump,
+            Report::Persisted,
         )
-        .await
-        .unwrap();
-        let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        tokio::fs::write(run_root.join(COMMAND_DUMP_FILE), "shell cmd")
-            .await
-            .unwrap();
-        let archive = crate::research_cleanup::results_archive_path(job_id).unwrap();
-        tokio::fs::create_dir_all(archive.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&archive, "archive").await.unwrap();
+        .await;
 
-        sweep_cancelled_run(job_id).await.unwrap();
+        sweep_cancelled_run(run.id).await.unwrap();
 
-        let jobs = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(jobs.is_empty(), "jobs row removed");
-        let pending = conn
-            .query(
-                "SELECT id FROM pending_jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(pending.is_empty(), "pending row removed");
+        assert_eq!(run.rows("jobs").await, 0, "jobs row removed");
+        assert_eq!(run.rows("pending_jobs").await, 0, "pending row removed");
         assert!(
-            run_root.exists(),
+            run.root.exists(),
             "run folder held — cleanup intent present"
         );
         assert!(
-            run_root.join(COMMAND_DUMP_FILE).exists(),
+            run.root.join(COMMAND_DUMP_FILE).exists(),
             "command dump survives"
         );
-        assert!(!archive.exists(), "results.md archive removed");
+        assert!(!run.archive.exists(), "results.md archive removed");
     }
 
     /// The cancelled-run handoff with a live command dump: research + roster
@@ -376,55 +443,23 @@ mod tests {
     /// the pending envelope is dropped, and the archive removed — while the
     /// run folder AND its dump survive for the cleanup tail.
     #[tokio::test]
-    #[expect(clippy::too_many_lines)] // the transition asserts every row/fs side effect
     async fn cancel_handoff_transitions_rows_and_holds_folder() {
-        crate::util::test::init_management_test_stores().await;
-        let job_id = "research_handoff_transition_1";
+        let run = Seeded::research(
+            "research_handoff_transition_1",
+            Folder::Dump,
+            Report::Persisted,
+        )
+        .await;
         let conn = &crate::session::store().conn;
-        let now = crate::db::now();
-        JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
-            .task("question?")
-            .user_name("u")
-            .channel("telegram")
-            .timestamps(now.clone())
-            .insert()
-            .await
-            .unwrap();
-        conn.execute(
-            "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
-            crate::db::params![job_id],
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO pending_jobs (id, envelope, target_agent_id, created_at) \
-             VALUES (?1, ?2, 'manager_ws', ?3)",
-            crate::db::params![
-                job_id,
-                r#"{"content":"report","workspace_name":"ws","user_name":"u","channel":"telegram","kind":"ResearchResult","role":"assistant","reply_target":null,"pending_job_id":null}"#,
-                now
-            ],
-        )
-        .await
-        .unwrap();
-        let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        tokio::fs::write(run_root.join(COMMAND_DUMP_FILE), "shell cmd")
-            .await
-            .unwrap();
-        let archive = crate::research_cleanup::results_archive_path(job_id).unwrap();
-        tokio::fs::create_dir_all(archive.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&archive, "archive").await.unwrap();
-
         let ws = crate::workspace::test_ws("/tmp/test_ws_handoff_transition");
-        let prompt = hand_off_rows(job_id, &ws).await.unwrap();
+
+        let prompt = hand_off_rows(run.id, &ws).await.unwrap();
         let prompt = prompt.expect("handoff transitions to cleanup and returns the prompt");
 
         let row = conn
             .query(
                 "SELECT kind, role, task FROM jobs WHERE id = ?1",
-                crate::db::params![job_id],
+                crate::db::params![run.id],
             )
             .await
             .unwrap();
@@ -447,41 +482,32 @@ mod tests {
         let roster = conn
             .query(
                 "SELECT agent_id FROM agents WHERE job_id = ?1",
-                crate::db::params![job_id],
+                crate::db::params![run.id],
             )
             .await
             .unwrap();
         assert_eq!(roster.len(), 1, "single cleanup roster row");
         assert_eq!(
             roster[0].get::<String>(0).unwrap(),
-            format!("cleanup_{job_id}"),
+            format!("cleanup_{}", run.id),
             "cleanup agent roster row present"
         );
-        let pending = conn
-            .query(
-                "SELECT id FROM pending_jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(pending.is_empty(), "pending envelope dropped");
-        let child = conn
-            .query(
-                "SELECT id FROM research_jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(
-            child.is_empty(),
+        assert_eq!(
+            run.rows("pending_jobs").await,
+            0,
+            "pending envelope dropped"
+        );
+        assert_eq!(
+            run.rows("research_jobs").await,
+            0,
             "research_jobs child row removed by cascade"
         );
-        assert!(run_root.exists(), "run folder held for the cleanup tail");
+        assert!(run.root.exists(), "run folder held for the cleanup tail");
         assert!(
-            run_root.join(COMMAND_DUMP_FILE).exists(),
+            run.root.join(COMMAND_DUMP_FILE).exists(),
             "command dump survives — cleanup intent preserved"
         );
-        assert!(!archive.exists(), "results.md archive removed");
+        assert!(!run.archive.exists(), "results.md archive removed");
     }
 
     /// A cancelled-run handoff with NO command dump has nothing to clean: the
@@ -489,86 +515,38 @@ mod tests {
     /// the dump-less folder are gone.
     #[tokio::test]
     async fn cancel_handoff_without_dump_sweeps() {
-        crate::util::test::init_management_test_stores().await;
-        let job_id = "research_handoff_no_dump_1";
-        let conn = &crate::session::store().conn;
-        let now = crate::db::now();
-        JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
-            .task("question?")
-            .user_name("u")
-            .channel("telegram")
-            .timestamps(now.clone())
-            .insert()
-            .await
-            .unwrap();
-        conn.execute(
-            "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
-            crate::db::params![job_id],
-        )
-        .await
-        .unwrap();
-        let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        tokio::fs::write(run_root.join("scratch.txt"), "scratch")
-            .await
-            .unwrap();
-
+        let run =
+            Seeded::research("research_handoff_no_dump_1", Folder::Scratch, Report::None).await;
         let ws = crate::workspace::test_ws("/tmp/test_ws_handoff_no_dump");
-        let outcome = hand_off_rows(job_id, &ws).await.unwrap();
-        assert!(outcome.is_none(), "no dump → no cleanup prompt");
 
-        let jobs = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(jobs.is_empty(), "research row swept");
-        assert!(!run_root.exists(), "dump-less folder released");
+        assert!(
+            hand_off_rows(run.id, &ws).await.unwrap().is_none(),
+            "no dump → no cleanup prompt"
+        );
+        assert_eq!(run.rows("jobs").await, 0, "research row swept");
+        assert!(!run.root.exists(), "dump-less folder released");
     }
 
     /// The GUI/abandon path for a run with NO live orchestrator: firing the
     /// cancel signal sweeps the durable rows and the dump-less folder directly.
     #[tokio::test]
     async fn cancel_research_run_sweeps_unregistered_run() {
-        crate::util::test::init_management_test_stores().await;
-        let job_id = "research_cancel_unregistered_1";
-        let conn = &crate::session::store().conn;
-        let now = crate::db::now();
-        JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
-            .task("q")
-            .user_name("u")
-            .channel("telegram")
-            .timestamps(now.clone())
-            .insert()
-            .await
-            .unwrap();
-        conn.execute(
-            "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
-            crate::db::params![job_id],
+        let run = Seeded::research(
+            "research_cancel_unregistered_1",
+            Folder::Scratch,
+            Report::None,
         )
-        .await
-        .unwrap();
-        let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        tokio::fs::write(run_root.join("scratch.txt"), "scratch")
-            .await
-            .unwrap();
+        .await;
 
         // No register() → no orchestrator is alive to observe the signal.
-        crate::research_cancel::cancel_research_run(job_id).await;
+        cancel_research_run(run.id).await;
 
-        let jobs = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert!(
-            jobs.is_empty(),
+        assert_eq!(
+            run.rows("jobs").await,
+            0,
             "research row swept via the unregistered path"
         );
-        assert!(!run_root.exists(), "dump-less folder released");
+        assert!(!run.root.exists(), "dump-less folder released");
     }
 
     /// The sweep is idempotent; a double release (racing cleanup tail) is safe.
