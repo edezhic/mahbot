@@ -172,32 +172,19 @@ impl Tool for CreateTicketTool {
         let title = super::get_str(&args, "title")?;
         let description = super::get_str(&args, "description")?;
 
-        let prerequisites: Vec<String> = match args.get("prerequisites") {
-            Some(serde_json::Value::Array(arr)) => arr
-                .iter()
-                .map(|v| {
-                    let s = v.as_str().ok_or_else(|| {
-                        anyhow::anyhow!("prerequisites must contain ticket ID strings, got {v}")
-                    })?;
-                    resolve_ticket_id(&self.ws_name, s)
-                })
-                .collect::<Result<_>>()?,
-            Some(_) => {
-                anyhow::bail!("prerequisites must be an array of ticket ID strings");
-            }
-            None => Vec::new(),
-        };
+        let prerequisites = super::get_str_array(&args, "prerequisites")?
+            .iter()
+            .map(|s| resolve_ticket_id(&self.ws_name, s))
+            .collect::<Result<Vec<_>>>()?;
 
-        let supersede_id: Option<String> = match args.get("supersede") {
-            Some(serde_json::Value::String(s)) => Some(resolve_ticket_id(&self.ws_name, s)?),
-            Some(_) => anyhow::bail!("supersede must be a ticket ID string"),
-            None => None,
-        };
+        let supersede_id = super::get_opt_str_strict(&args, "supersede")?
+            .map(|s| resolve_ticket_id(&self.ws_name, s))
+            .transpose()?;
 
         // Priority: Manager can set explicitly; otherwise inherit from the
         // superseded ticket (if superseding) or use the role default.
-        let explicit_priority: Option<i64> = if self.reporter == "manager" {
-            args.get("priority").and_then(serde_json::Value::as_i64)
+        let explicit_priority = if self.reporter == "manager" {
+            super::get_opt_i64(&args, "priority")?
         } else {
             None
         };
@@ -589,10 +576,48 @@ mod tests {
             "description": "desc",
             "prerequisites": [123],
         });
-        let err = tool.execute(&ws, args).await.unwrap_err();
+        let msg = tool.execute(&ws, args).await.unwrap_err().to_string();
+        assert!(msg.starts_with("usage: "), "got: {msg}");
         assert!(
-            format!("{err}").contains("ticket ID strings"),
-            "non-string prerequisite should be rejected: {err}"
+            msg.contains(r#"argument "prerequisites" must be an array of strings"#),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_ticket_treats_null_optional_arguments_as_absent() {
+        crate::util::test::init_test_stores().await;
+
+        let ws = test_ws("/tmp/test_ws");
+        let tool = CreateTicketTool::new("manager", &ws);
+        let args = json!({
+            "title": "Null optionals",
+            "description": "desc",
+            "prerequisites": null,
+            "supersede": null,
+            "priority": null,
+        });
+        let result = tool.execute(&ws, args).await.expect("null is absent");
+        assert!(result.starts_with("Created ticket "), "got: {result}");
+        assert!(!result.contains("with prerequisites"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_create_ticket_rejects_non_integer_priority() {
+        crate::util::test::init_test_stores().await;
+
+        let ws = test_ws("/tmp/test_ws");
+        let tool = CreateTicketTool::new("manager", &ws);
+        let args = json!({
+            "title": "Bad priority",
+            "description": "desc",
+            "priority": "high",
+        });
+        let msg = tool.execute(&ws, args).await.unwrap_err().to_string();
+        assert!(msg.starts_with("usage: "), "got: {msg}");
+        assert!(
+            msg.contains(r#"argument "priority" must be an integer"#),
+            "got: {msg}"
         );
     }
 
