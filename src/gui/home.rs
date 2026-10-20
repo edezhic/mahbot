@@ -1399,19 +1399,12 @@ impl HomeState {
                 self.refresh_history()
             }
             HomeMessage::ScrollChanged(viewport) => {
-                // Determine if the user is at the bottom. Two checks:
-                // 1. Content is taller than viewport AND relative offset >= 0.99
-                // 2. Content fits entirely in viewport (no scrolling needed)
-                let at_bottom = {
-                    let bounds = viewport.bounds();
-                    let content = viewport.content_bounds();
-                    if content.height > bounds.height {
-                        viewport.relative_offset().y >= 0.99
-                    } else {
-                        content.height <= bounds.height
-                    }
-                };
-                self.auto_scroll_enabled = at_bottom;
+                // The fit check must stay first: `relative_offset` divides by
+                // the content/viewport height difference, so a fitting
+                // transcript reads as not-pinned there (exact fit is 0/0).
+                self.auto_scroll_enabled = viewport.content_bounds().height
+                    <= viewport.bounds().height
+                    || viewport.relative_offset().y >= 0.99;
                 Task::none()
             }
             HomeMessage::Toast(_) => {

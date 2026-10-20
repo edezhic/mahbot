@@ -116,13 +116,16 @@ pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
 
 /// Returns the badge (foreground, background) color for a role name string.
 ///
-/// Accepts canonical names (e.g. `"analyst"`), derivative names with a
-/// numeric suffix (e.g. `"analyst_1"`, `"analyst_2"`), and the joint-comment
-/// stage roles ("Analysis"/"Verification", plus the retired stages' "Review"/
-/// "QA" labels historical comments still carry — the comment role is the stage
-/// name, per the joint-verdict pipeline). Unknown strings (including LLM API
-/// roles like `"user"`, `"assistant"`, `"system"`, `"tool"`) fall back to a
-/// muted grey.
+/// Accepts canonical names (e.g. `"analyst"`), derivative names carrying a
+/// trailing `_<digits>` suffix (e.g. `"analyst_1"`, `"analyst_2"`; a bare
+/// trailing `_` strips too) and the joint-comment stage roles
+/// ("Analysis"/"Verification", plus the retired stages' "Review"/"QA" labels
+/// historical comments still carry — the comment role is the stage name, per
+/// the joint-verdict pipeline). The suffix is stripped by
+/// [`crate::channels::reply::strip_agent_role_suffix`], the same rule the reply
+/// author label uses, so a derivative name renders and labels as its base
+/// role. Unknown strings (including LLM API roles like `"user"`, `"assistant"`,
+/// `"system"`, `"tool"`) fall back to a muted grey.
 ///
 /// The background member is always the foreground at 0.1 alpha ([`badge_bg`]) —
 /// including the fallback, so consuming the second member directly (role pill,
@@ -139,20 +142,10 @@ pub fn role_badge_color(role: &str) -> (Color, Color) {
         return role_badge_color_for(&r);
     }
 
-    // Try exact match first (handles canonical names like "analyst")
-    if let Ok(r) = role.parse::<crate::Role>() {
+    // One path for canonical and derivative names: the shared suffix rule
+    // returns its input unchanged when there is no numeric suffix.
+    if let Ok(r) = crate::channels::reply::strip_agent_role_suffix(role).parse::<crate::Role>() {
         return role_badge_color_for(&r);
-    }
-
-    // Try stripping a trailing `_<digits>` suffix (handles "analyst_1" etc.)
-    if let Some(idx) = role.rfind('_')
-        && idx + 1 < role.len()
-        && role.as_bytes()[idx + 1..].iter().all(u8::is_ascii_digit)
-    {
-        let stripped = &role[..idx];
-        if let Ok(r) = stripped.parse::<crate::Role>() {
-            return role_badge_color_for(&r);
-        }
     }
 
     // The background member must stay `badge_bg(fg)` (not an independent
@@ -1052,6 +1045,11 @@ mod tests {
                 "derivative {name}_42 should match role_badge_color_for"
             );
         }
+        // A bare trailing `_` strips too, matching the reply author label.
+        assert_eq!(
+            role_badge_color("analyst_"),
+            role_badge_color_for(&Role::Analyst)
+        );
     }
 
     #[test]

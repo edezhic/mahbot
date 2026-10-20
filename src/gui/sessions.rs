@@ -418,14 +418,12 @@ impl SessionsState {
                 Task::none()
             }
             SessionsMessage::ScrollChanged(viewport) => {
-                let bounds = viewport.bounds();
-                let content = viewport.content_bounds();
-                let at_bottom = if content.height > bounds.height {
-                    viewport.relative_offset().y >= 0.99
-                } else {
-                    content.height <= bounds.height
-                };
-                self.auto_scroll_enabled = at_bottom;
+                // The fit check must stay first: `relative_offset` divides by
+                // the content/viewport height difference, so a fitting
+                // transcript reads as not-pinned there (exact fit is 0/0).
+                self.auto_scroll_enabled = viewport.content_bounds().height
+                    <= viewport.bounds().height
+                    || viewport.relative_offset().y >= 0.99;
                 Task::none()
             }
             SessionsMessage::ToggleExpand(i, j) => self.handle_toggle_expand(i, j),
