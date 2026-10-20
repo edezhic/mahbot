@@ -89,9 +89,10 @@ const DEFAULT_WRAP_UP_TIMEOUT_SECS: u64 = 5 * 60;
 
 /// Resume pointer for a durable research run: the 4-value stage
 /// enum (plus implicit Done).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum ResearchStage {
+    #[default]
     Decompose,
     Round1,
     GapRounds,
@@ -106,7 +107,7 @@ enum ResearchStage {
 /// to resume a run at the checkpointed stage. RunStats is NOT stored (see
 /// RunStats pin) — the resumed report's "Run Summary" undercounts the
 /// pre-crash segment and the report carries a one-line best-effort note.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ResearchState {
     stage: ResearchStage,
     plan: Option<MergedPlan>,
@@ -142,26 +143,6 @@ struct ResearchState {
     /// completed worker round (no duplicate prototypes / LLM spend).
     #[serde(default)]
     worker_rounds_done: Vec<usize>,
-}
-
-impl Default for ResearchState {
-    fn default() -> Self {
-        Self {
-            stage: ResearchStage::Decompose,
-            plan: None,
-            gap_list: None,
-            acc: AccumulatedEvidence::default(),
-            ledger: QueryLedger::default(),
-            markers: Vec::new(),
-            gap_outcome: GapRoundsOutcome::default(),
-            budget_spent: 0,
-            round_index: 0,
-            verification: Vec::new(),
-            commands: Vec::new(),
-            seen_commands: std::collections::HashSet::new(),
-            worker_rounds_done: Vec::new(),
-        }
-    }
 }
 
 impl ResearchState {
@@ -3162,10 +3143,7 @@ fn partial_report(
 
 // ── Orchestrator ─────────────────────────────────────────────────────────
 
-/// Exit of one `run_deep_research` invocation. Self-documenting where the old
-/// `(Result<String>, bool)` was subtle: `aborted` distinguished a real
-/// terminalization (artifacts + job completion in the caller) from a
-/// shutdown/drain abort (run stays alive, nothing written).
+/// Exit of one `run_deep_research` invocation.
 enum ResearchExit {
     /// Real terminalization (success, partial, or error) — the caller writes
     /// results.md + the command dump and completes the durable job.
@@ -3173,11 +3151,13 @@ enum ResearchExit {
     /// Shutdown/drain abort — the run stays alive for the next boot; nothing
     /// is written, terminalized, or routed (design pin).
     Aborted,
-    /// Manual cancel (Running Agents page): a PERMANENT stop. The caller
-    /// removes the run's durable rows, folder, and archive, and delivers
-    /// nothing — the run must never resume, re-dispatch, or deliver a report,
-    /// now or after any restart. Distinct from [`Aborted`](ResearchExit::Aborted)
-    /// (run stays alive for boot resume).
+    /// Manual cancel (Running Agents page): a PERMANENT stop — the run must
+    /// never resume, re-dispatch, or deliver a report, now or after any
+    /// restart. The caller hands the record to the cancelled-run handoff
+    /// ([`hand_off_cancelled_run`](crate::research_cancel::hand_off_cancelled_run)),
+    /// which decides what is held and what is removed; nothing is delivered
+    /// either way. Distinct from [`Aborted`](ResearchExit::Aborted) (run stays
+    /// alive for boot resume).
     Cancelled,
 }
 
