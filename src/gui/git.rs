@@ -522,23 +522,8 @@ impl GitState {
                         Task::none()
                     }
                     None => {
-                        // A newer event restarted the throttle window —
-                        // reschedule.
-                        let remaining = LOCAL_REFRESH_MIN_INTERVAL
-                            .saturating_sub(
-                                now.duration_since(
-                                    self.last_local_refresh
-                                        .expect("window not elapsed implies throttle set"),
-                                ),
-                            )
-                            .max(Duration::from_millis(1));
-                        Task::perform(
-                            // Sleep constructed lazily at first poll (inside
-                            // the async block) — creating it eagerly here
-                            // would panic off the tokio runtime context.
-                            async move { tokio::time::sleep(remaining).await },
-                            |()| GitMessage::DeferredLocalRefresh,
-                        )
+                        // A newer event restarted the throttle window — reschedule.
+                        self.arm_deferred_refresh(now)
                     }
                 }
             }
@@ -981,34 +966,42 @@ impl GitState {
 
     /// Handle a workspace file-change event: coalesce bursts into at most one
     /// local refresh per [`LOCAL_REFRESH_MIN_INTERVAL`]. If the throttle window
-    /// has elapsed, refresh now; otherwise mark the refresh as owed and arm a
-    /// scoped deferred-refresh timer to fire it once the window elapses.
+    /// has elapsed, refresh now; otherwise mark the refresh as owed and arm the
+    /// deferred-refresh timer.
     fn on_file_changed(&mut self) -> Task<GitMessage> {
         let now = Instant::now();
         match self.fire_local_refresh(now) {
             Some(task) => task,
             None if self.workspace_path.is_some() => {
-                // The throttle window has not elapsed — mark the refresh as owed
-                // and arm a scoped deferred-refresh timer to fire it once the
-                // window elapses.
+                // The window has not elapsed — mark the refresh as owed.
                 self.local_refresh_pending = true;
-                let remaining = LOCAL_REFRESH_MIN_INTERVAL
-                    .saturating_sub(
-                        now.duration_since(
-                            self.last_local_refresh
-                                .expect("window not elapsed implies throttle set"),
-                        ),
-                    )
-                    .max(Duration::from_millis(1));
-                Task::perform(
-                    // Sleep built lazily at first poll (eager construction
-                    // would panic off the tokio runtime context).
-                    async move { tokio::time::sleep(remaining).await },
-                    |()| GitMessage::DeferredLocalRefresh,
-                )
+                self.arm_deferred_refresh(now)
             }
             None => Task::none(),
         }
+    }
+
+    /// Arm the scoped timer that fires the owed local refresh once the remaining
+    /// throttle window (floored at 1 ms) elapses. A window that has not elapsed
+    /// implies the throttle was recorded; the fallback duration degrades a
+    /// violated invariant instead of panicking the GUI update loop.
+    fn arm_deferred_refresh(&self, now: Instant) -> Task<GitMessage> {
+        debug_assert!(
+            self.last_local_refresh.is_some(),
+            "window not elapsed implies throttle set"
+        );
+        let remaining = self
+            .last_local_refresh
+            .map_or(Duration::from_millis(1), |last| {
+                LOCAL_REFRESH_MIN_INTERVAL
+                    .saturating_sub(now.duration_since(last))
+                    .max(Duration::from_millis(1))
+            });
+        // Sleep constructed lazily at first poll (inside the async block) —
+        // creating it eagerly here would panic off the tokio runtime context.
+        Task::perform(async move { tokio::time::sleep(remaining).await }, |()| {
+            GitMessage::DeferredLocalRefresh
+        })
     }
 
     /// Fire an event-driven local refresh if the local-refresh throttle window
