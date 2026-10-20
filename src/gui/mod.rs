@@ -3313,11 +3313,7 @@ impl Dashboard {
     /// Returns `None` when no branch is known.
     fn render_git_branch(&self) -> Option<Element<'_, Message>> {
         let b = self.git_state.current_branch()?;
-        let truncated = if b.len() > 20 {
-            format!("{}…", crate::util::truncate_bytes(b, 19))
-        } else {
-            b.to_string()
-        };
+        let truncated = crate::util::truncate(b, 20);
         let branch_content = row![
             lucide::git_branch::<iced::Theme, iced::Renderer>()
                 .size(theme::TEXT_24)

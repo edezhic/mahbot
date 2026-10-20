@@ -1026,8 +1026,9 @@ fn extract_urls(text: &str) -> Vec<String> {
 /// Links are fetched concurrently using the shared `ChromeTool` — each URL
 /// gets its own isolated session tab that is closed after text extraction.
 pub async fn enrich_links(content: &str) -> Cow<'_, str> {
-    // Truncate very long snippets to keep messages manageable.
-    const MAX_TEXT_LEN: usize = 5000;
+    // Keep messages manageable: the cap is in bytes, and it is the only bound on
+    // page text reaching the model, so it must not grow with a page's character count.
+    const MAX_TEXT_BYTES: usize = 5000;
     let urls = extract_urls(content);
     if urls.is_empty() {
         return Cow::Borrowed(content);
@@ -1075,11 +1076,7 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
                     tracing::debug!(url, "Link enricher: page text is empty, skipping snippet");
                     continue;
                 }
-                let snippet = if body_text.len() > MAX_TEXT_LEN {
-                    format!("{}…", crate::util::truncate_bytes(&body_text, MAX_TEXT_LEN))
-                } else {
-                    body_text
-                };
+                let snippet = crate::util::cut_bytes(&body_text, MAX_TEXT_BYTES);
                 enrichments.push(format!("📄 [{url}]\n{snippet}"));
             }
             Ok((url, Err(e))) => {

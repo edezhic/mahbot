@@ -224,19 +224,16 @@ impl ToolFailuresState {
         .spacing(theme::SPACE_2)
     }
 
-    /// Compute an optional arguments preview string, truncated to 200 bytes.
+    /// Compute an optional arguments preview string, truncated to 200 characters.
+    ///
+    /// Characters, not bytes: the stored arguments are already capped at 500
+    /// bytes (`stats::MAX_STATS_ARG_LENGTH`), so a byte cap here would discard
+    /// most of a non-ASCII argument the store kept whole.
     fn compute_args_preview(entry: &ToolErrorEntry) -> Option<String> {
         if entry.arguments.is_empty() || entry.arguments == "{}" {
             return None;
         }
-        if entry.arguments.len() > 200 {
-            Some(format!(
-                "{}…",
-                crate::util::truncate_bytes(&entry.arguments, 200)
-            ))
-        } else {
-            Some(entry.arguments.clone())
-        }
+        Some(crate::util::truncate(&entry.arguments, 200))
     }
 
     fn render_error_row(entry: &ToolErrorEntry) -> iced::Element<'_, ToolFailuresMessage> {
