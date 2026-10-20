@@ -151,20 +151,23 @@ pub(super) fn physical_memory() -> Option<u64> {
 
 // ── Resident usage of a process tree ──────────────────────────────────
 
-/// Resident bytes `root` and every live descendant hold, or `None` when the
-/// platform's helper cannot answer (fail open). The root's own reading is
-/// required; a descendant that cannot be read — it exited mid-walk — is
-/// skipped rather than failing the whole sample.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub(super) fn tree_rss(root: u32) -> Option<u64> {
-    // macOS has no whole-table snapshot to walk: descend from `root` with the
-    // kernel's own child listing, one level at a time.
+/// Sum [`process_rss`] over `root` and every pid `children` reaches from it, or
+/// `None` when the root's own reading cannot be had (fail open). The root's own
+/// reading is required; a descendant that cannot be read — it exited mid-walk —
+/// is skipped rather than failing the whole sample, and a pid reached twice is
+/// measured once.
+///
+/// Only the discovery of `children` is per platform, and so is what its failure
+/// costs: the Linux `/proc` table degrades to a root-only measurement, the
+/// Windows Toolhelp snapshot yields no total at all, and macOS has nothing that
+/// could fail on its own.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn sum_tree_rss(root: u32, children: impl Fn(u32) -> Vec<u32>) -> Option<u64> {
     let mut total = process_rss(root)?;
     let mut seen = HashSet::from([root]);
     let mut queue = vec![root];
     while let Some(pid) = queue.pop() {
-        for child in children_of(pid) {
+        for child in children(pid) {
             if !seen.insert(child) {
                 continue;
             }
@@ -177,22 +180,31 @@ pub(super) fn tree_rss(root: u32) -> Option<u64> {
     Some(total)
 }
 
-/// Resident bytes `root` and every live descendant hold — the same contract
-/// and fail-open rule as the macOS arm above, walked from this platform's
-/// process table.
+/// Resident bytes `root` and every live descendant hold, descended one level at
+/// a time with the kernel's own child listing — macOS has no whole-table
+/// snapshot to walk.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(super) fn tree_rss(root: u32) -> Option<u64> {
+    sum_tree_rss(root, children_of)
+}
+
+/// Resident bytes `root` and every live descendant hold, from the `/proc`
+/// parent index.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(super) fn tree_rss(root: u32) -> Option<u64> {
-    sum_descendants(root, &children_map())
+    let children = children_map();
+    sum_tree_rss(root, |pid| children.get(&pid).cloned().unwrap_or_default())
 }
 
-/// Resident bytes `root` and every live descendant hold — the same contract
-/// and fail-open rule as the macOS arm above, walked from this platform's
-/// process table.
+/// Resident bytes `root` and every live descendant hold, from one Toolhelp
+/// snapshot.
 #[cfg(windows)]
 #[must_use]
 pub(super) fn tree_rss(root: u32) -> Option<u64> {
-    sum_descendants(root, &children_map()?)
+    let children = children_map()?;
+    sum_tree_rss(root, |pid| children.get(&pid).cloned().unwrap_or_default())
 }
 
 /// No resident-memory reading on a platform that is neither macOS, Linux nor
@@ -201,29 +213,6 @@ pub(super) fn tree_rss(root: u32) -> Option<u64> {
 #[must_use]
 pub(super) fn tree_rss(_root: u32) -> Option<u64> {
     None
-}
-
-/// Sum [`process_rss`] over `root` and every pid `children` reaches from it.
-/// Shared by the two platforms that discover the tree from a whole-process
-/// table; macOS descends with `proc_listchildpids` instead and does its own
-/// walk.
-#[cfg(any(target_os = "linux", windows))]
-fn sum_descendants(root: u32, children: &HashMap<u32, Vec<u32>>) -> Option<u64> {
-    let mut total = process_rss(root)?;
-    let mut seen = HashSet::from([root]);
-    let mut queue = vec![root];
-    while let Some(pid) = queue.pop() {
-        for &child in children.get(&pid).into_iter().flatten() {
-            if !seen.insert(child) {
-                continue;
-            }
-            if let Some(rss) = process_rss(child) {
-                total = total.saturating_add(rss);
-            }
-            queue.push(child);
-        }
-    }
-    Some(total)
 }
 
 // ── Per-process resident memory ───────────────────────────────────────
