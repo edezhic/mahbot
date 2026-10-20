@@ -25,13 +25,15 @@
 //! readers print it through one module and the model-facing description of a
 //! reading names it.
 //!
-//! The PowerPoint marks — `(title)`, `(hidden slide)`, `(diagram text)`,
-//! `(diagram text could not be read)`, `(no text)` — are deliberately *not*
-//! here: they live in `assets/docgen/rules.json` because the document kit's
-//! refusals name them too (see [`crate::docgen::ppt_marks`]), and `(no text)`
-//! in particular must be read from there by whoever prints it. [`slide_header`]
-//! composes the slide's number with that same hidden-slide mark, so it reads
-//! the mark from the kit rather than spelling it here.
+//! The words of the PowerPoint marks — `(title)`, `(hidden slide)`,
+//! `(diagram text)`, `(diagram text could not be read)`, `(no text)` — are
+//! stated in `assets/docgen/rules.json` rather than here, because the document
+//! kit's refusals name them too (see [`crate::docgen::ppt_marks`]), and
+//! `(no text)` in particular must be read from there by whoever prints it.
+//! [`slide_header`] composes the slide's number with that same hidden-slide mark,
+//! and [`ppt_description_substitutions`] binds those marks and the three slide
+//! labels to the `{{ppt_…}}` keys the model-facing texts naming a reading's marks
+//! spell.
 
 use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
@@ -185,6 +187,33 @@ pub(crate) fn slide_comments_header(number: usize) -> String {
 /// the reader prints without spelling it a second time.
 pub(crate) fn slide_label(template: &str, number: &str) -> String {
     template.replace("{n}", number)
+}
+
+/// The `{{ppt_…}}` pairs a model-facing text spells for a reading's marks: the
+/// kit's five marks and the three slide labels, with `<n>` where a description
+/// leaves the slide's number to the reader — a reading prints a real number
+/// through [`slide_header`], [`slide_notes_header`] and [`slide_comments_header`]
+/// instead. The chart keys stay bound in the `read` description alone, which is
+/// their only consumer.
+pub(crate) fn ppt_description_substitutions() -> Vec<(&'static str, String)> {
+    let marks = crate::docgen::ppt_marks();
+    let labels = crate::docgen::ppt_slide_labels();
+    vec![
+        ("{{ppt_title_mark}}", marks.title.clone()),
+        ("{{ppt_hidden_slide_mark}}", marks.hidden_slide.clone()),
+        ("{{ppt_diagram_text_mark}}", marks.diagram_text.clone()),
+        (
+            "{{ppt_diagram_text_lost_mark}}",
+            marks.diagram_text_lost.clone(),
+        ),
+        ("{{ppt_no_text_mark}}", marks.no_text.clone()),
+        ("{{ppt_slide_label}}", slide_label(&labels.slide, "<n>")),
+        ("{{ppt_notes_label}}", slide_label(&labels.notes, "<n>")),
+        (
+            "{{ppt_comments_label}}",
+            slide_label(&labels.comments, "<n>"),
+        ),
+    ]
 }
 
 /// The mark a text box is printed as, by both Word readers: a `[text box]`

@@ -329,22 +329,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> String {
-        // The slide marks and labels this description names are rendered from the
-        // same statements the reader prints them from, so renaming one cannot
-        // leave a model-facing sentence stale (see `crate::docgen::ppt_marks` and
-        // `ppt_slide_labels`); the legacy `.doc` story names, the text-box mark,
-        // the chart-sheet mark and the report of what a reading did not show come
-        // from `crate::reader_output`, which states each once, and the chart
-        // block's header, its field labels and the marks standing in for values
-        // from the chart vocabulary beside them.
-        let marks = crate::docgen::ppt_marks();
-        // The reader prints a slide's number where these spell `<n>`, so the
-        // description names the label the reader prints without reading like a
-        // substitution of its own.
-        let labels = crate::docgen::ppt_slide_labels();
-        let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
-        let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
-        let comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
+        let ppt = crate::reader_output::ppt_description_substitutions();
         // The chart block prints the kind it read where this spells `<kind>`, a
         // series its own name where this spells `<name>` — or its number — and a
         // bubble's size where this spells `<size>`.
@@ -365,56 +350,45 @@ impl Tool for ReadTool {
             PathAccess::Allowlisted => "tool/read_paths_allowlisted.md",
             PathAccess::Unrestricted => "tool/read_paths_admin.md",
         });
-        crate::prompt::substitute(
-            &crate::prompt::load_prompt("tool/read.md"),
-            &[
-                ("{{path_policy}}", &path_policy),
-                ("{{ppt_title_mark}}", &marks.title),
-                ("{{ppt_hidden_slide_mark}}", &marks.hidden_slide),
-                ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
-                ("{{ppt_diagram_text_lost_mark}}", &marks.diagram_text_lost),
-                ("{{ppt_no_text_mark}}", &marks.no_text),
-                ("{{ppt_slide_label}}", &slide_label),
-                ("{{ppt_notes_label}}", &notes_label),
-                ("{{ppt_comments_label}}", &comments_label),
-                (
-                    "{{doc_headers_footers}}",
-                    crate::reader_output::DOC_HEADERS_FOOTERS,
-                ),
-                ("{{doc_footnotes}}", crate::reader_output::DOC_FOOTNOTES),
-                ("{{doc_endnotes}}", crate::reader_output::DOC_ENDNOTES),
-                ("{{doc_comments}}", crate::reader_output::DOC_COMMENTS),
-                ("{{text_box_mark}}", crate::reader_output::TEXT_BOX),
-                ("{{chart_sheet_mark}}", crate::reader_output::CHART_SHEET),
-                ("{{chart_header}}", &chart_header),
-                ("{{chart_none}}", &chart_none),
-                ("{{chart_series_numbered}}", &chart_series_numbered),
-                ("{{chart_title}}", crate::reader_output::CHART_TITLE),
-                ("{{chart_text}}", crate::reader_output::CHART_TEXT),
-                ("{{chart_label}}", crate::reader_output::CHART_LABEL),
-                ("{{chart_series}}", &chart_series),
-                ("{{chart_size}}", &chart_size),
-                ("{{pdf_field_kinds}}", &pdf_field_kinds),
-                ("{{pdf_form_fields}}", &form_words.fields),
-                ("{{pdf_no_value}}", &form_words.no_value),
-                ("{{pdf_not_fillable}}", &form_words.not_fillable),
-                ("{{mark_stored}}", crate::reader_output::MARK_STORED.trim()),
-                ("{{chart_no_values}}", crate::reader_output::CHART_NO_VALUES),
-                (
-                    "{{chart_attached}}",
-                    crate::reader_output::CHART_VALUES_ATTACHED,
-                ),
-                (
-                    "{{chart_unreadable}}",
-                    crate::reader_output::CHART_UNREADABLE,
-                ),
-                ("{{chart_extended}}", crate::reader_output::CHART_EXTENDED),
-                (
-                    "{{unshown_report}}",
-                    &crate::reader_output::unshown_report_examples(),
-                ),
-            ],
-        )
+        let unshown_report = crate::reader_output::unshown_report_examples();
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("{{path_policy}}", &path_policy),
+            (
+                "{{doc_headers_footers}}",
+                crate::reader_output::DOC_HEADERS_FOOTERS,
+            ),
+            ("{{doc_footnotes}}", crate::reader_output::DOC_FOOTNOTES),
+            ("{{doc_endnotes}}", crate::reader_output::DOC_ENDNOTES),
+            ("{{doc_comments}}", crate::reader_output::DOC_COMMENTS),
+            ("{{text_box_mark}}", crate::reader_output::TEXT_BOX),
+            ("{{chart_sheet_mark}}", crate::reader_output::CHART_SHEET),
+            ("{{chart_header}}", &chart_header),
+            ("{{chart_none}}", &chart_none),
+            ("{{chart_series_numbered}}", &chart_series_numbered),
+            ("{{chart_title}}", crate::reader_output::CHART_TITLE),
+            ("{{chart_text}}", crate::reader_output::CHART_TEXT),
+            ("{{chart_label}}", crate::reader_output::CHART_LABEL),
+            ("{{chart_series}}", &chart_series),
+            ("{{chart_size}}", &chart_size),
+            ("{{pdf_field_kinds}}", &pdf_field_kinds),
+            ("{{pdf_form_fields}}", &form_words.fields),
+            ("{{pdf_no_value}}", &form_words.no_value),
+            ("{{pdf_not_fillable}}", &form_words.not_fillable),
+            ("{{mark_stored}}", crate::reader_output::MARK_STORED.trim()),
+            ("{{chart_no_values}}", crate::reader_output::CHART_NO_VALUES),
+            (
+                "{{chart_attached}}",
+                crate::reader_output::CHART_VALUES_ATTACHED,
+            ),
+            (
+                "{{chart_unreadable}}",
+                crate::reader_output::CHART_UNREADABLE,
+            ),
+            ("{{chart_extended}}", crate::reader_output::CHART_EXTENDED),
+            ("{{unshown_report}}", &unshown_report),
+        ];
+        pairs.extend(ppt.iter().map(|(key, value)| (*key, value.as_str())));
+        crate::prompt::substitute(&crate::prompt::load_prompt("tool/read.md"), &pairs)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

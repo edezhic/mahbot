@@ -564,37 +564,22 @@ impl Tool for DocumentTool {
     /// text, and the losses and refusals no argument carries. Every bound lives in
     /// the schema beside the argument that carries it, so the two cannot drift.
     fn description(&self) -> String {
-        let marks = crate::docgen::ppt_marks();
-        // The reader prints a slide's number where these spell `<n>`, so the
-        // description names the label the reader prints rather than a
-        // substitution of its own.
-        let labels = crate::docgen::ppt_slide_labels();
-        let ppt_slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
-        let ppt_notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
-        let ppt_comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
+        let ppt = crate::reader_output::ppt_description_substitutions();
         let input_mb = megabytes(crate::util::FILE_MAX_BYTES).to_string();
         let edit_text_max = RULES.edit_text_max.to_string();
-        crate::prompt::substitute(
-            &crate::prompt::load_prompt("tool/document.md"),
-            &[
-                ("{{input_location}}", self.input_location()),
-                ("{{input_mb}}", &input_mb),
-                ("{{edit_text_max}}", &edit_text_max),
-                // The Word marks are quoted from the shared list: the ones a
-                // reading prints in brackets and the labels it adds without them
-                // (see `spelled_docx_marks`).
-                ("{{docx_inline_marks}}", &spelled_docx_marks(true)),
-                ("{{docx_label_marks}}", &spelled_docx_marks(false)),
-                ("{{ppt_slide_label}}", &ppt_slide_label),
-                ("{{ppt_notes_label}}", &ppt_notes_label),
-                ("{{ppt_comments_label}}", &ppt_comments_label),
-                ("{{ppt_title_mark}}", &marks.title),
-                ("{{ppt_hidden_slide_mark}}", &marks.hidden_slide),
-                ("{{ppt_diagram_text_mark}}", &marks.diagram_text),
-                ("{{ppt_diagram_text_lost_mark}}", &marks.diagram_text_lost),
-                ("{{ppt_no_text_mark}}", &marks.no_text),
-            ],
-        )
+        // The Word marks are quoted from the shared list: the ones a reading
+        // prints in brackets and the labels it adds without them.
+        let docx_inline_marks = spelled_docx_marks(true);
+        let docx_label_marks = spelled_docx_marks(false);
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("{{input_location}}", self.input_location()),
+            ("{{input_mb}}", &input_mb),
+            ("{{edit_text_max}}", &edit_text_max),
+            ("{{docx_inline_marks}}", &docx_inline_marks),
+            ("{{docx_label_marks}}", &docx_label_marks),
+        ];
+        pairs.extend(ppt.iter().map(|(key, value)| (*key, value.as_str())));
+        crate::prompt::substitute(&crate::prompt::load_prompt("tool/document.md"), &pairs)
     }
 
     /// The machine-readable per-action contract, in the shape the other
