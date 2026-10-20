@@ -232,42 +232,37 @@ fn find_split_boundary(text: &str, hard_split: usize) -> usize {
         .map_or(hard_split, |p| p + 1)
 }
 
-/// If `pos` is inside an HTML tag (the last `<` before `pos` has no matching `>`),
-/// return the byte offset just past the closing `>`. Otherwise return `None`.
+/// Absolute byte offset in `s` of the first unquoted `>` at or after `from`, or
+/// `None` when the tag opened at `from` never closes. A `>` inside a single- or
+/// double-quoted attribute value is not a closer, and a quote opened in one tag
+/// cannot leak into a later one.
 ///
-/// Handles `>` inside quoted attribute values correctly — a `>` inside a
-/// single- or double-quoted string is not treated as a tag closer.
-fn extend_past_open_tag(text: &str, pos: usize) -> Option<usize> {
-    let prefix = &text[..pos];
-    let last_open = prefix.rfind('<')?;
-
-    // Scan forward from last_open in one pass, tracking quote state,
-    // to find the first unquoted '>' (the real tag closer).
+/// Both HTML readers in this module share this scan.
+fn tag_end(s: &str, from: usize) -> Option<usize> {
     let mut in_quote = false;
     let mut quote_char = '"';
-
-    for (i, c) in text[last_open..].char_indices() {
+    for (i, c) in s[from..].char_indices() {
         match c {
             '"' | '\'' if !in_quote => {
                 in_quote = true;
                 quote_char = c;
             }
-            '"' | '\'' if in_quote && c == quote_char => {
-                in_quote = false;
-            }
-            '>' if !in_quote => {
-                let gt_absolute = last_open + i;
-                if gt_absolute < pos {
-                    return None; // tag properly closed before pos
-                }
-                return Some(gt_absolute + 1); // past the closing '>'
-            }
+            '"' | '\'' if in_quote && c == quote_char => in_quote = false,
+            '>' if !in_quote => return Some(from + i),
             _ => {}
         }
     }
-
-    // No unquoted '>' found at all.
     None
+}
+
+/// If `pos` is inside an HTML tag (the last `<` before `pos` has no matching `>`),
+/// return the byte offset just past the closing `>`. Otherwise return `None`.
+///
+/// An unterminated tag scans to the end of `text` and so also yields `None`.
+fn extend_past_open_tag(text: &str, pos: usize) -> Option<usize> {
+    let open = text[..pos].rfind('<')?;
+    let gt = tag_end(text, open)?;
+    (gt >= pos).then_some(gt + 1)
 }
 
 fn extract_sender_user_name(message: &serde_json::Value) -> String {
@@ -1507,29 +1502,18 @@ fn markdown_to_telegram_html(text: &str) -> String {
 /// Used when falling back from HTML `parse_mode` to plain text so users
 /// don't see raw tags like `<b>`, `<code>`, `<pre>` etc.
 ///
-/// Correctly handles `>` inside quoted attribute values — a `>` inside a
-/// single- or double-quoted string is not treated as a tag closer.
+/// Text from an unterminated `<` to the end is dropped.
 fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    let mut in_quote = false;
-    let mut quote_char = '"';
-    for c in s.chars() {
-        match c {
-            '<' if !in_tag => in_tag = true,
-            '>' if in_tag && !in_quote => in_tag = false,
-            '"' | '\'' if in_tag => {
-                if in_quote && c == quote_char {
-                    in_quote = false;
-                } else if !in_quote {
-                    in_quote = true;
-                    quote_char = c;
-                }
-            }
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
+    let mut i = 0;
+    while let Some(open) = s[i..].find('<').map(|o| i + o) {
+        out.push_str(&s[i..open]);
+        let Some(gt) = tag_end(s, open) else {
+            return out;
+        };
+        i = gt + 1;
     }
+    out.push_str(&s[i..]);
     out
 }
 

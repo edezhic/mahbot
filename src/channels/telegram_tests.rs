@@ -2705,6 +2705,19 @@ fn test_extend_past_open_tag() {
     }
 }
 
+/// Both readers report offsets in bytes, so multi-byte text around and inside
+/// a tag must not shift them.
+#[test]
+fn test_html_tag_scans_are_byte_offsets() {
+    let text = "héllo <b x=\"ü>ö\">täil";
+    assert_eq!(strip_html_tags(text), "héllo täil");
+    // Byte 15 is the `>` inside the quoted attribute; 16 is just past it.
+    assert_eq!(extend_past_open_tag(text, 16), Some(20));
+    assert_eq!(extend_past_open_tag(text, text.find('t').unwrap()), None);
+
+    assert_eq!(strip_html_tags("ä <b x=\"ö>ü"), "ä ");
+}
+
 // ── decode_action ─────────────────────────────────────────────────────
 
 #[test]
