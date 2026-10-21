@@ -37,7 +37,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::chrome::actions;
+use crate::chrome::actions::{self, CliFlag};
 use crate::chrome::cli_sessions;
 use crate::chrome::contract::{
     ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, ErrorPageProbe, ExpectOutcome,
@@ -306,17 +306,10 @@ fn action_help(name: &str) -> String {
         let _ = writeln!(out, "  mahbot chrome {} {}", d.name, cli.syntax);
     }
 
-    let mut flag_rows: Vec<(&str, &str)> = cli.flags.to_vec();
-    if cli.session {
-        flag_rows.push((
-            "--session <name>",
-            "use/name a session — letters, digits, '-' or '_' only (not valid for status / session subcommands)",
-        ));
-        flag_rows.push((
-            "--keep",
-            "keep the session open until 'mahbot chrome session stop <name>' — only with --session, and only on the call that creates the session",
-        ));
-    }
+    let flag_rows: Vec<(&str, &str)> = cli
+        .flags()
+        .map(|f| (f.spelling, f.description.as_str()))
+        .collect();
     if !flag_rows.is_empty() {
         let width = flag_rows.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
         out.push_str("\nFlags:\n");
@@ -346,14 +339,20 @@ fn action_help(name: &str) -> String {
 }
 
 /// A per-action help request: the first positional token names a CLI action
-/// and any token after it is `-h`/`--help`. Flags/session values before the
-/// action word are skipped. Returns the action's registry name.
+/// and a token after it is `-h`/`--help`. Flags/session values before the
+/// action word are skipped. Within the tokens after the action word everything
+/// from `--` on is literal text, never help. Returns the action's registry name.
 fn action_help_request(args: &[String]) -> Option<&'static str> {
     let (i, word) = first_positional(args)?;
     let d = actions::desc(word)?;
     d.cli
         .as_ref()
-        .is_some_and(|_| args[i + 1..].iter().any(|t| t == "-h" || t == "--help"))
+        .is_some_and(|_| {
+            args[i + 1..]
+                .iter()
+                .take_while(|t| *t != "--")
+                .any(|t| t == "-h" || t == "--help")
+        })
         .then_some(d.name)
 }
 
@@ -450,16 +449,11 @@ enum Action {
 
 impl Action {
     /// Whether this action drives the browser in a session. The verbs that report and
-    /// repair (`status`, `session …`) run in none: they own no throwaway session and are
-    /// answered by [`dispatch`] without the pre-flight.
-    const fn runs_in_session(&self) -> bool {
-        !matches!(
-            self,
-            Self::Status
-                | Self::SessionStop { .. }
-                | Self::SessionStatus { .. }
-                | Self::SessionList
-        )
+    /// repair (`status`, `session …`) run in none — the same declaration field
+    /// ([`CliHelp::session_refusal`]) that decides whether their help prints the
+    /// session-wide rows and whether the parser takes them.
+    fn runs_in_session(&self) -> bool {
+        session_refusal_for(self.name()).is_none()
     }
 
     /// The shared-registry name of this action — the envelope's `action` field
@@ -623,12 +617,15 @@ pub async fn run_cli(args: &[String]) -> i32 {
         print!("{}", top_help());
         return 0;
     }
-    // A `-h`/`--help` after the action word is per-action help — anywhere in
-    // the tail, not just immediately after it (so `open <url> --help` and
-    // `--session x open -h` work too). A `-h` before any action word falls
-    // through to top-level help / normal parsing: no valid invocation starts
-    // with a `-h`-looking token, parse_flags rejects those as usage errors, so
-    // per-action help only turns would-be usage errors into help.
+    // A `-h`/`--help` after the action word is per-action help — anywhere before
+    // the first `--`, not just immediately after the action word (so
+    // `open <url> --help` and `--session x open -h` work too). From that `--` on
+    // the tokens are the action's text, never help (`type '#q' -- --help` types
+    // it); on a verb with no literal text such a token stays the usage error it
+    // always was. A `-h` before any action word falls through to top-level help /
+    // normal parsing: no valid invocation starts with a `-h`-looking token, and
+    // parse_flags rejects those as usage errors, so per-action help only turns
+    // would-be usage errors into help.
     if let Some(action) = action_help_request(args) {
         print!("{}", action_help(action));
         return 0;
@@ -821,32 +818,17 @@ async fn close_ephemeral_unless_interrupted(name: &str) -> bool {
 
 // ── Parsing ──────────────────────────────────────────────────────
 
-/// Flag sets for one action: `(value flags, boolean flags)`.
-type FlagSet = (&'static [&'static str], &'static [&'static str]);
+/// The flags `word` declares — the same rows its help prints. The session-wide
+/// pair is not here: [`session_refusal_for`] carries that decision.
+fn declared_flags(word: &str) -> &'static [CliFlag] {
+    actions::desc(word)
+        .and_then(|d| d.cli.as_ref())
+        .map_or(&[], |c| c.declared.as_slice())
+}
 
-/// Per-action accepted flags — the single source for both the parser and the
-/// CliHelp lockstep test. `(action word, value flags, boolean flags)`.
-const ACTION_FLAGS: &[(&str, &[&str], &[&str])] = &[
-    ("status", &[], &[]),
-    ("open", &["expect", "timeout"], &["structural"]),
-    ("count", &["timeout"], &[]),
-    ("wait", &["timeout", "url", "text"], &[]),
-    ("expect", &["timeout"], &[]),
-    ("eval", &["timeout"], &[]),
-    ("extract", &["schema-file", "limit", "timeout"], &[]),
-    ("click", &["timeout"], &["if-present"]),
-    ("fill", &["file", "timeout"], &["stdin"]),
-    ("type", &["timeout"], &["key-events"]),
-    ("press", &["selector", "hold", "timeout"], &[]),
-    ("session", &[], &["force"]),
-];
-
-/// Accepted flags for `word`: `(value flags, boolean flags)`.
-fn action_flags(word: &str) -> FlagSet {
-    ACTION_FLAGS
-        .iter()
-        .find(|(name, ..)| *name == word)
-        .map_or((&[], &[]), |(_, v, b)| (*v, *b))
+/// Why `word`'s action refuses the session-wide pair, or `None` when it takes them.
+fn session_refusal_for(word: &str) -> Option<&'static str> {
+    actions::desc(word)?.cli.as_ref()?.session_refusal
 }
 
 /// Parse one command line into the action invocation and the global `--keep` request
@@ -857,20 +839,27 @@ fn parse_invocation(args: &[String]) -> Result<(Invocation, bool), String> {
         .first()
         .ok_or_else(|| "no action given".to_string())?;
     let rest = &remaining[1..];
-    let allowed = action_flags(action_word);
+    let allowed: Vec<&CliFlag> = declared_flags(action_word).iter().collect();
+    // The declaration is the one decision on which actions take the session-wide
+    // pair: the help renders their rows from the same field.
+    if session.is_some()
+        && let Some(refusal) = session_refusal_for(action_word)
+    {
+        return Err(refusal.to_string());
+    }
     let invocation = match action_word.as_str() {
-        "status" => parse_status(session.as_deref(), rest, allowed),
-        "open" => parse_open(session.as_deref(), rest, allowed),
-        "count" => parse_count(session.as_deref(), rest, allowed),
-        "wait" => parse_wait(session.as_deref(), rest, allowed),
-        "expect" => parse_expect(session.as_deref(), rest, allowed),
-        "eval" => parse_eval(session.as_deref(), rest, allowed),
-        "extract" => parse_extract(session.as_deref(), rest, allowed),
-        "click" => parse_click(session.as_deref(), rest, allowed),
-        "fill" => parse_fill(session.as_deref(), rest, allowed),
-        "type" => parse_type(session.as_deref(), rest, allowed),
-        "press" => parse_press(session.as_deref(), rest, allowed),
-        "session" => parse_session(session.as_deref(), rest, allowed),
+        "status" => parse_status(rest, &allowed),
+        "open" => parse_open(session.as_deref(), rest, &allowed),
+        "count" => parse_count(session.as_deref(), rest, &allowed),
+        "wait" => parse_wait(session.as_deref(), rest, &allowed),
+        "expect" => parse_expect(session.as_deref(), rest, &allowed),
+        "eval" => parse_eval(session.as_deref(), rest, &allowed),
+        "extract" => parse_extract(session.as_deref(), rest, &allowed),
+        "click" => parse_click(session.as_deref(), rest, &allowed),
+        "fill" => parse_fill(session.as_deref(), rest, &allowed),
+        "type" => parse_type(session.as_deref(), rest, &allowed),
+        "press" => parse_press(session.as_deref(), rest, &allowed),
+        "session" => parse_session(rest, &allowed),
         other => Err(format!("unknown action '{other}'")),
     }?;
     if keep {
@@ -959,14 +948,10 @@ fn recognized_action(args: &[String]) -> String {
 }
 
 /// Split action args into positional tokens and a `--flag` map, handling both
-/// `--flag value` and `--flag=value`. `value_flags` name flags that take a
-/// value; `bool_flags` name boolean flags.
-fn parse_flags(
-    args: &[String],
-    value_flags: &[&str],
-    bool_flags: &[&str],
-) -> Result<(Vec<String>, Flags), String> {
-    parse_flags_impl(args, value_flags, bool_flags, false)
+/// `--flag value` and `--flag=value`. `accepted` is the action's declaration:
+/// each flag's `takes_value` decides whether a value is read.
+fn parse_flags(args: &[String], accepted: &[&CliFlag]) -> Result<(Vec<String>, Flags), String> {
+    parse_flags_impl(args, accepted, false)
 }
 
 /// [`parse_flags`] for the fill/type text actions: a single-dash token is
@@ -975,16 +960,14 @@ fn parse_flags(
 /// demanding the `--` shield). Unknown `--flags` are still rejected.
 fn parse_flags_text(
     args: &[String],
-    value_flags: &[&str],
-    bool_flags: &[&str],
+    accepted: &[&CliFlag],
 ) -> Result<(Vec<String>, Flags), String> {
-    parse_flags_impl(args, value_flags, bool_flags, true)
+    parse_flags_impl(args, accepted, true)
 }
 
 fn parse_flags_impl(
     args: &[String],
-    value_flags: &[&str],
-    bool_flags: &[&str],
+    accepted: &[&CliFlag],
     single_dash_is_text: bool,
 ) -> Result<(Vec<String>, Flags), String> {
     let mut positionals = Vec::new();
@@ -1003,7 +986,10 @@ fn parse_flags_impl(
                 Some((n, v)) => (n, Some(v)),
                 None => (body, None),
             };
-            if value_flags.contains(&name) {
+            let Some(flag) = accepted.iter().find(|f| f.name() == name) else {
+                return Err(format!("unknown flag --{name}"));
+            };
+            if flag.takes_value {
                 let value = match eq_value {
                     Some(v) if !v.is_empty() => v.to_string(),
                     Some(_) => return Err(format!("missing value for --{name}")),
@@ -1015,16 +1001,13 @@ fn parse_flags_impl(
                     }
                 };
                 flags.values.insert(name.to_string(), value);
-                i += 1;
-            } else if bool_flags.contains(&name) {
+            } else {
                 if eq_value.is_some() {
                     return Err(format!("flag --{name} does not take a value"));
                 }
                 flags.bools.insert(name.to_string());
-                i += 1;
-            } else {
-                return Err(format!("unknown flag --{name}"));
             }
+            i += 1;
             continue;
         }
         if a.starts_with('-') && a.len() > 1 && !single_dash_is_text {
@@ -1055,18 +1038,9 @@ impl Flags {
     }
 }
 
-fn parse_status(
-    session: Option<&str>,
-    rest: &[String],
-    allowed: FlagSet,
-) -> Result<Invocation, String> {
-    if session.is_some() {
-        return Err("--session is not valid for status".to_string());
-    }
-    // The registry row is the parser's own flag set here too, so `status` cannot accept a
-    // flag its help row does not list ([`ACTION_FLAGS`]).
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, _) = parse_flags(rest, value_flags, bool_flags)?;
+fn parse_status(rest: &[String], allowed: &[&CliFlag]) -> Result<Invocation, String> {
+    // `status` declares no flag of its own, so anything flag-shaped here is refused.
+    let (positionals, _) = parse_flags(rest, allowed)?;
     reject_extra_positionals(&positionals, 0)?;
     Ok(Invocation {
         action: Action::Status,
@@ -1077,10 +1051,9 @@ fn parse_status(
 fn parse_open(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags(rest, allowed)?;
     let url = take_positional(&positionals, 0, "url")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -1097,10 +1070,9 @@ fn parse_open(
 fn parse_count(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags(rest, allowed)?;
     let selector = take_positional(&positionals, 0, "selector")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -1115,10 +1087,9 @@ fn parse_count(
 fn parse_wait(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags(rest, allowed)?;
     let target = wait_target(
         positionals.first().map(String::as_str),
         flags.value("url"),
@@ -1137,10 +1108,9 @@ fn parse_wait(
 fn parse_expect(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags(rest, allowed)?;
     let cond = parse_expect_cond(&positionals)?;
     Ok(Invocation {
         action: Action::Expect {
@@ -1267,10 +1237,9 @@ fn parse_expect_cond(ps: &[String]) -> Result<ExpectCond, String> {
 fn parse_eval(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags(rest, allowed)?;
     let js = take_positional(&positionals, 0, "js")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -1285,10 +1254,9 @@ fn parse_eval(
 fn parse_extract(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags(rest, allowed)?;
     if !positionals.is_empty() {
         return Err(format!("unexpected argument '{}'", positionals[0]));
     }
@@ -1309,10 +1277,9 @@ fn parse_extract(
 fn parse_click(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags(rest, allowed)?;
     let selector = take_positional(&positionals, 0, "selector")?;
     reject_extra_positionals(&positionals, 1)?;
     Ok(Invocation {
@@ -1328,10 +1295,9 @@ fn parse_click(
 fn parse_fill(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags_text(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags_text(rest, allowed)?;
     let usage = "fill <selector> <text | --file <path> | --stdin>";
     let selector = match positionals.first() {
         Some(s) => s.clone(),
@@ -1359,10 +1325,9 @@ fn parse_fill(
 fn parse_type(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags_text(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags_text(rest, allowed)?;
     let usage = "type <selector> <text> [--key-events]";
     let selector = match positionals.first() {
         Some(s) => s.clone(),
@@ -1386,10 +1351,9 @@ fn parse_type(
 fn parse_press(
     session: Option<&str>,
     rest: &[String],
-    allowed: FlagSet,
+    allowed: &[&CliFlag],
 ) -> Result<Invocation, String> {
-    let (value_flags, bool_flags) = allowed;
-    let (positionals, flags) = parse_flags(rest, value_flags, bool_flags)?;
+    let (positionals, flags) = parse_flags(rest, allowed)?;
     let usage = "press <key> [--selector <sel>] [--hold <ms>]";
     let key = match positionals.first() {
         Some(s) => s.clone(),
@@ -1414,30 +1378,22 @@ fn parse_press(
     })
 }
 
-fn parse_session(
-    session: Option<&str>,
-    rest: &[String],
-    allowed: FlagSet,
-) -> Result<Invocation, String> {
-    if session.is_some() {
-        return Err("--session is not valid for session stop/status/list".to_string());
-    }
+fn parse_session(rest: &[String], allowed: &[&CliFlag]) -> Result<Invocation, String> {
     let sub = rest.first().map(String::as_str).ok_or_else(|| {
         "usage: session stop <name> | session status <name> | session list".to_string()
     })?;
-    // The registry's flags for `session` are `stop`'s alone: the other subcommands accept
-    // none, so a flag they do not take is refused as unknown. The parser and the help row
-    // both read that one table.
-    let accepted: FlagSet = match sub {
-        "stop" => allowed,
-        "status" | "list" => (&[], &[]),
-        other => {
-            return Err(format!(
-                "unknown session subcommand '{other}' (expected 'stop', 'status' or 'list')"
-            ));
-        }
-    };
-    let (positionals, flags) = parse_flags(&rest[1..], accepted.0, accepted.1)?;
+    if !matches!(sub, "stop" | "status" | "list") {
+        return Err(format!(
+            "unknown session subcommand '{sub}' (expected 'stop', 'status' or 'list')"
+        ));
+    }
+    // A flag scoped to one subcommand belongs to that subcommand alone.
+    let accepted: Vec<&CliFlag> = allowed
+        .iter()
+        .copied()
+        .filter(|f| f.scope.is_none_or(|scope| scope == sub))
+        .collect();
+    let (positionals, flags) = parse_flags(&rest[1..], &accepted)?;
     let action = match sub {
         "stop" => {
             let name = take_positional(&positionals, 0, "name")?;
@@ -3372,11 +3328,127 @@ mod tests {
     // from it instead of repeating its literals.
     use crate::chrome::kill_bound;
 
+    /// Command-line arguments for a test.
+    fn argv(s: &[&str]) -> Vec<String> {
+        s.iter().copied().map(String::from).collect()
+    }
+
     /// [`parse_invocation`] for a test that only cares about the action (the keep
     /// request has its own test).
     fn parse_action(args: &[String]) -> Result<Invocation, String> {
         parse_invocation(args).map(|(invocation, _)| invocation)
     }
+
+    /// The rows `help` prints under `Flags:` — `(spelling, description)`, in order.
+    /// An action whose help has no flags block yields no rows.
+    fn printed_flag_rows(help: &str) -> Vec<(&str, &str)> {
+        let Some((_, tail)) = help.split_once("\nFlags:\n") else {
+            return Vec::new();
+        };
+        tail.lines()
+            .take_while(|l| !l.is_empty())
+            .filter_map(|l| l.strip_prefix("  ")?.split_once("  "))
+            .collect()
+    }
+
+    /// The machine names of the flag rows a rendered help prints, in row order.
+    fn printed_flag_names(help: &str) -> Vec<&str> {
+        printed_flag_rows(help)
+            .into_iter()
+            .filter_map(|(spelling, _)| flag_name_in(spelling))
+            .collect()
+    }
+
+    /// The flag a printed spelling or usage/example token names: `--expect <sel>` →
+    /// `expect`, `[--force]` → `force`, `--limit=5` → `limit`.
+    fn flag_name_in(token: &str) -> Option<&str> {
+        let t = token.trim_matches(['[', '(', ')', ']', ',', '|']);
+        let name = t
+            .trim_start_matches('-')
+            .split([' ', '='])
+            .next()
+            .unwrap_or_default();
+        (t.starts_with('-') && !name.is_empty()).then_some(name)
+    }
+
+    /// The `Usage:` line of a rendered action help, without its
+    /// `mahbot chrome <action>` prefix.
+    fn printed_usage(help: &str) -> String {
+        let line = help
+            .split_once("\nUsage:\n")
+            .and_then(|(_, tail)| tail.lines().find(|l| !l.trim().is_empty()))
+            .unwrap_or_default()
+            .trim();
+        let rest = line.strip_prefix("mahbot chrome ").unwrap_or(line);
+        rest.split_once(' ')
+            .map_or(String::new(), |(_, after)| after.to_string())
+    }
+
+    /// The example command lines a rendered action help prints (one per line).
+    fn printed_examples(help: &str) -> Vec<String> {
+        let Some((_, tail)) = help.split_once("\nExamples:\n") else {
+            return Vec::new();
+        };
+        tail.lines()
+            .filter_map(|l| l.strip_prefix("  ").map(str::to_string))
+            .collect()
+    }
+
+    /// Rough shell-word split of a documented example: the examples are short quoted
+    /// lines (`"#main"`, `'document.title'`), not scripts.
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        let mut in_word = false;
+        for c in line.chars() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => cur.push(c),
+                None if c == '\'' || c == '"' => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                None if c.is_whitespace() => {
+                    if in_word {
+                        out.push(std::mem::take(&mut cur));
+                        in_word = false;
+                    }
+                }
+                None => {
+                    cur.push(c);
+                    in_word = true;
+                }
+            }
+        }
+        if in_word {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// The action words the top-level help advertises, in printed order.
+    ///
+    /// An action's line is indented two spaces; its purpose line, four more, so
+    /// only the shallower lines name actions.
+    fn advertised_actions(help: &str) -> Vec<String> {
+        let Some((_, tail)) = help.split_once("\nActions:\n") else {
+            return Vec::new();
+        };
+        let body = tail
+            .split_once("\nGlobal flags:")
+            .map_or(tail, |(body, _)| body);
+        body.lines()
+            .filter_map(|l| l.strip_prefix("  "))
+            .filter(|rest| !rest.starts_with(' '))
+            .filter_map(|rest| rest.split_whitespace().next().map(str::to_string))
+            .collect()
+    }
+
+    /// The session-wide pair — handled outside the common flag path
+    /// (`extract_global_flags`), so it has its own guard below rather than a shape
+    /// probe.
+    const SESSION_PAIR: [&str; 2] = ["session", "keep"];
 
     #[test]
     fn eval_count_unwraps_chrome_use_result_envelope() {
@@ -3613,26 +3685,19 @@ mod tests {
         .expect("--session must be rejected for session subcommands");
         assert_eq!(err, "--session is not valid for session stop/status/list");
 
-        // `--force` is `stop`'s flag alone (the registry row the parser reads): the other
+        // `--force` is `stop`'s flag alone (the declaration the parser reads): the other
         // subcommands accept no flags.
+        let allowed: Vec<&CliFlag> = declared_flags("session").iter().collect();
         let err = parse_session(
-            None,
             &["status".into(), "docs".into(), "--force".into()],
-            (&[], &["force"]),
+            &allowed,
         )
         .err()
         .expect("--force must be rejected for session status");
         assert_eq!(err, "unknown flag --force");
 
         // Extra positionals are rejected for status.
-        assert!(
-            parse_session(
-                None,
-                &["status".into(), "a".into(), "b".into()],
-                (&[], &["force"]),
-            )
-            .is_err()
-        );
+        assert!(parse_session(&["status".into(), "a".into(), "b".into()], &allowed).is_err());
 
         // An unknown sub names both verbs.
         let err = parse_action(&["session".into(), "destroy".into(), "docs".into()])
@@ -5058,26 +5123,25 @@ mod tests {
 
     #[test]
     fn keep_requires_a_session_and_only_applies_to_action_calls() {
-        let arg = |s: &[&str]| s.iter().copied().map(String::from).collect::<Vec<_>>();
-        let err = parse_invocation(&arg(&["--keep", "open", "https://x"]))
+        let err = parse_invocation(&argv(&["--keep", "open", "https://x"]))
             .err()
             .expect("keep without a session must be refused");
         assert!(err.contains("--session"), "{err}");
         let (inv, keep) =
-            parse_invocation(&arg(&["--keep", "--session", "docs", "open", "https://x"]))
+            parse_invocation(&argv(&["--keep", "--session", "docs", "open", "https://x"]))
                 .expect("keep with a session parses");
         assert!(keep);
         assert_eq!(inv.session.as_deref(), Some("docs"));
         assert!(
-            !parse_invocation(&arg(&["open", "https://x"]))
+            !parse_invocation(&argv(&["open", "https://x"]))
                 .expect("open parses")
                 .1
         );
         // The mark is not offered to the report/repair verbs: they refuse `--session`
         // outright, and a bare `--keep` on one is refused for the action itself rather
         // than told to pass a flag the action forbids.
-        assert!(parse_invocation(&arg(&["--keep", "--session", "docs", "status"])).is_err());
-        let err = parse_invocation(&arg(&["--keep", "status"]))
+        assert!(parse_invocation(&argv(&["--keep", "--session", "docs", "status"])).is_err());
+        let err = parse_invocation(&argv(&["--keep", "status"]))
             .err()
             .expect("keep on a session-less action must be refused");
         assert!(err.contains("--keep is not valid for status"), "{err}");
@@ -5106,73 +5170,268 @@ mod tests {
     }
 
     #[test]
-    fn action_flags_match_the_cli_help_flag_sets() {
-        // ACTION_FLAGS must cover exactly the CLI action words.
-        let mut table: Vec<&str> = ACTION_FLAGS.iter().map(|(name, ..)| *name).collect();
-        table.sort_unstable();
-        let mut cli: Vec<&str> = actions::ACTIONS
-            .iter()
-            .filter(|a| a.cli.is_some())
-            .map(|a| a.name)
-            .collect();
-        cli.sort_unstable();
-        assert_eq!(table, cli, "ACTION_FLAGS must cover the CLI action words");
-
-        for &(word, value_flags, bool_flags) in ACTION_FLAGS {
-            let help = actions::desc(word)
-                .and_then(|d| d.cli.as_ref())
-                .expect("ACTION_FLAGS word should have a CliHelp");
-            // Machine name of each declared flag: `--expect <sel>` → `expect`,
-            // `--structural` → `structural`.
-            let mut expected: Vec<&str> = help
-                .flags
-                .iter()
-                .map(|(flag, _)| {
-                    flag.strip_prefix("--")
-                        .unwrap_or(flag)
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or(flag)
-                })
-                .collect();
-            let mut actual: Vec<&str> = value_flags
-                .iter()
-                .chain(bool_flags.iter())
-                .copied()
-                .collect();
-            if help.session {
-                // The global `--session` and `--keep` flags are rendered for and
-                // accepted by every session-enabled action, so they are on both sides.
-                expected.push("session");
-                actual.push("session");
-                expected.push("keep");
-                actual.push("keep");
-            }
-            expected.sort_unstable();
-            actual.sort_unstable();
+    fn printed_flag_rows_match_the_declaration() {
+        let mut compared = 0;
+        for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            let cli = d.cli.as_ref().expect("filtered above");
+            let help = action_help(d.name);
+            let mut printed = printed_flag_names(&help);
+            let mut declared: Vec<&str> = cli.flags().map(CliFlag::name).collect();
+            printed.sort_unstable();
+            declared.sort_unstable();
             assert_eq!(
-                actual, expected,
-                "flag set mismatch for action {word}: ACTION_FLAGS vs CliHelp"
+                printed, declared,
+                "{}: printed flag rows vs the declaration",
+                d.name
             );
+            compared += declared.len();
+        }
+        assert!(compared > 0, "the guard must have seen flags to compare");
+    }
+
+    #[test]
+    fn printed_flags_have_the_shape_the_parser_enforces() {
+        let mut probed = 0;
+        for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            let cli = d.cli.as_ref().expect("filtered above");
+            let help = action_help(d.name);
+            for (spelling, _) in printed_flag_rows(&help) {
+                let name = flag_name_in(spelling).expect("a printed row spells a flag");
+                if SESSION_PAIR.contains(&name) {
+                    continue; // its own guard: it never reaches the common flag path
+                }
+                // The printed placeholder is the shape a reader is promised; the
+                // declaration's `takes_value` must agree with it, and the parser must
+                // enforce that shape through its own shape error alone.
+                let printed_takes_value = spelling
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|p| p.starts_with('<'));
+                let flag = cli
+                    .flags()
+                    .find(|f| f.name() == name)
+                    .expect("printed rows are declared");
+                assert_eq!(
+                    printed_takes_value, flag.takes_value,
+                    "{}/--{name}: printed shape vs declared arity",
+                    d.name
+                );
+                let mut argv = vec![d.name.to_string()];
+                if let Some(scope) = flag.scope {
+                    argv.push(scope.to_string());
+                }
+                let expected = if printed_takes_value {
+                    argv.push(format!("--{name}"));
+                    format!("missing value for --{name}")
+                } else {
+                    argv.push(format!("--{name}=1"));
+                    format!("flag --{name} does not take a value")
+                };
+                assert_eq!(
+                    parse_invocation(&argv).err().as_deref(),
+                    Some(expected.as_str()),
+                    "{}/--{name}: the parser must enforce the printed shape",
+                    d.name
+                );
+                probed += 1;
+            }
+        }
+        assert!(probed > 0, "the guard must have probed flags");
+    }
+
+    #[test]
+    fn session_flags_are_printed_exactly_where_the_parser_takes_them() {
+        let mut checked = [0usize; 2]; // takes them, refuses them
+        for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            let help = action_help(d.name);
+            let printed = printed_flag_names(&help);
+            let prints_session = printed.contains(&"session");
+            let prints_keep = printed.contains(&"keep");
+            assert_eq!(
+                prints_session, prints_keep,
+                "{}: the pair is printed as a pair",
+                d.name
+            );
+            // A documented example is a valid invocation, so it proves acceptance
+            // without this guard inventing positionals of its own.
+            let example = printed_examples(&help).first().map_or_else(
+                || panic!("{}: no documented example to probe the pair with", d.name),
+                |example| shell_words(example),
+            );
+            assert_eq!(
+                &example[..2],
+                &["mahbot", "chrome"],
+                "{}: example is a chrome command",
+                d.name
+            );
+            let tail = &example[2..];
+            let with = |prefix: &[&str]| {
+                let mut line: Vec<String> = prefix.iter().map(|s| (*s).to_string()).collect();
+                line.extend_from_slice(tail);
+                line
+            };
+            if prints_session {
+                checked[0] += 1;
+                assert!(
+                    parse_invocation(&with(&["--session", "docs"])).is_ok(),
+                    "{}: prints --session so it must take it",
+                    d.name
+                );
+                assert!(
+                    parse_invocation(&with(&["--keep", "--session", "docs"])).is_ok(),
+                    "{}: prints --keep so it must take it",
+                    d.name
+                );
+            } else {
+                checked[1] += 1;
+                let err = parse_invocation(&with(&["--session", "docs"]))
+                    .err()
+                    .expect("refuses --session");
+                assert!(
+                    err.starts_with("--session is not valid for "),
+                    "{}: --session refusal message: {err}",
+                    d.name
+                );
+                let err = parse_invocation(&with(&["--keep"]))
+                    .err()
+                    .expect("refuses --keep");
+                assert_eq!(
+                    err,
+                    format!("--keep is not valid for {}", d.name),
+                    "{}: --keep refusal message",
+                    d.name
+                );
+            }
+        }
+        assert!(
+            checked.iter().all(|side| *side > 0),
+            "the guard must have seen both sides: {checked:?} (takes, refuses)"
+        );
+    }
+
+    #[test]
+    fn documented_examples_parse() {
+        let mut ran = 0;
+        for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            for example in printed_examples(&action_help(d.name)) {
+                let words = shell_words(&example);
+                assert_eq!(&words[..2], &["mahbot", "chrome"], "{}: {example}", d.name);
+                let (invocation, _) = parse_invocation(&words[2..]).unwrap_or_else(|err| {
+                    panic!("{}: documented example refuses: {example}: {err}", d.name)
+                });
+                // The parsed action's name is also the declaration key the
+                // session-wide decision and the envelope read.
+                assert_eq!(
+                    invocation.action.name(),
+                    d.name,
+                    "{}: parsed action",
+                    d.name
+                );
+                ran += 1;
+            }
+        }
+        assert!(ran > 0, "the guard must have run examples");
+    }
+
+    #[test]
+    fn usage_and_examples_name_only_declared_flags() {
+        let mut seen = 0;
+        for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            let cli = d.cli.as_ref().expect("filtered above");
+            let help = action_help(d.name);
+            let declared: Vec<&str> = cli.flags().map(CliFlag::name).collect();
+            let usage = printed_usage(&help);
+            for token in usage.split_whitespace() {
+                if let Some(name) = flag_name_in(token) {
+                    assert!(
+                        declared.contains(&name),
+                        "{}: usage names --{name}, which is not declared",
+                        d.name
+                    );
+                    seen += 1;
+                }
+            }
+            for example in printed_examples(&help) {
+                let words = shell_words(&example);
+                for token in words[2..].iter().take_while(|t| *t != "--") {
+                    if let Some(name) = flag_name_in(token) {
+                        assert!(
+                            declared.contains(&name),
+                            "{}: example names --{name}, which is not declared",
+                            d.name
+                        );
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        // Description prose is deliberately NOT scanned; `session`'s and `wait`'s
+        // details mention flags of other actions or of none, and this guard passes.
+        assert!(
+            seen > 0,
+            "the guard must have seen flags in usage lines and examples"
+        );
+    }
+
+    #[test]
+    fn every_advertised_action_is_accepted_by_the_parser() {
+        let advertised = advertised_actions(&top_help());
+        assert!(!advertised.is_empty(), "top help advertises actions");
+        for word in advertised {
+            if let Err(err) = parse_invocation(std::slice::from_ref(&word)) {
+                assert!(
+                    !err.starts_with("unknown action"),
+                    "the help advertises '{word}' but the parser rejects it: {err}"
+                );
+            }
         }
     }
 
     #[test]
     fn action_help_request_intercepts_per_action_help() {
-        let arg = |s: &[&str]| s.iter().copied().map(String::from).collect::<Vec<_>>();
-        assert_eq!(action_help_request(&arg(&["open", "-h"])), Some("open"));
+        assert_eq!(action_help_request(&argv(&["open", "-h"])), Some("open"));
         assert_eq!(
-            action_help_request(&arg(&["open", "https://x", "--help"])),
+            action_help_request(&argv(&["open", "https://x", "--help"])),
             Some("open")
         );
         assert_eq!(
-            action_help_request(&arg(&["--session", "docs", "open", "-h"])),
+            action_help_request(&argv(&["--session", "docs", "open", "-h"])),
             Some("open")
         );
-        assert_eq!(action_help_request(&arg(&["open"])), None);
-        assert_eq!(action_help_request(&arg(&["snapshot", "-h"])), None);
-        assert_eq!(action_help_request(&arg(&["frobnicate", "-h"])), None);
-        assert_eq!(action_help_request(&arg(&["--timeout", "5"])), None);
+        assert_eq!(action_help_request(&argv(&["open"])), None);
+        assert_eq!(action_help_request(&argv(&["snapshot", "-h"])), None);
+        assert_eq!(action_help_request(&argv(&["frobnicate", "-h"])), None);
+        assert_eq!(action_help_request(&argv(&["--timeout", "5"])), None);
+        // A `--` after the action word ends help lookup: what follows it is text,
+        // while the unshielded form stays help.
+        assert_eq!(
+            action_help_request(&argv(&["type", "#q", "-h"])),
+            Some("type")
+        );
+        assert_eq!(
+            action_help_request(&argv(&["type", "#q", "--", "--help"])),
+            None
+        );
+        assert_eq!(
+            action_help_request(&argv(&["fill", "#q", "--", "-h"])),
+            None
+        );
+        assert_eq!(
+            action_help_request(&argv(&["count", ".x", "--", "--help"])),
+            None
+        );
+        // A `--` before the action word changes nothing.
+        assert_eq!(
+            action_help_request(&argv(&["--", "open", "-h"])),
+            Some("open")
+        );
+        // And the shielded token really is the text.
+        let inv =
+            parse_action(&argv(&["type", "#q", "--", "--help"])).expect("shielded text parses");
+        match inv.action {
+            Action::Type { text, .. } => assert_eq!(text, "--help"),
+            _ => panic!("expected Type"),
+        }
     }
 
     #[test]

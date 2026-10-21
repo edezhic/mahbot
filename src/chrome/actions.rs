@@ -1,11 +1,14 @@
 //! Single shared source of chrome action descriptions: one table rendered
 //! into BOTH the interactive `chrome` tool's LLM-facing parameter schema and
-//! the `mahbot chrome` CLI help, so the two consumers cannot drift.
+//! the `mahbot chrome` CLI help, so the two consumers cannot drift. Each CLI
+//! action declares its flags once ([`CliFlag`]), and both the help renderer and
+//! the parser read that declaration.
 
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};
 
+use crate::chrome::CHROME_USE_DECLARED_BUDGET;
 use crate::chrome::contract::OutKind;
 
 /// Tool-schema parameter block for one action.
@@ -14,15 +17,68 @@ pub(crate) struct ToolParams {
     pub(crate) properties: Value,
 }
 
+/// One CLI flag an action accepts — the single declaration the rendered help row
+/// and the parser both read.
+pub(crate) struct CliFlag {
+    /// Printed spelling with its value placeholder (`--expect <sel>`), exactly as
+    /// the help row shows it.
+    pub(crate) spelling: &'static str,
+    /// Whether the flag takes a value. Declared here, never derived from
+    /// `spelling`: the placeholder and this field disagreeing is drift.
+    pub(crate) takes_value: bool,
+    /// The printed description of the row.
+    pub(crate) description: String,
+    /// The `session` subcommand the flag belongs to (`--force` → `Some("stop")`);
+    /// `None` for a flag every invocation of the action accepts.
+    pub(crate) scope: Option<&'static str>,
+}
+
+impl CliFlag {
+    /// The machine name the parser matches (`--expect <sel>` → `expect`).
+    #[must_use]
+    pub(crate) fn name(&self) -> &str {
+        self.spelling
+            .trim_start_matches('-')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+    }
+}
+
+/// A flag that takes a value; `spelling` carries its printed placeholder.
+fn value_flag(spelling: &'static str, description: impl Into<String>) -> CliFlag {
+    CliFlag {
+        spelling,
+        takes_value: true,
+        description: description.into(),
+        scope: None,
+    }
+}
+
+/// A switch (no value).
+fn switch_flag(spelling: &'static str, description: impl Into<String>) -> CliFlag {
+    CliFlag {
+        spelling,
+        takes_value: false,
+        description: description.into(),
+        scope: None,
+    }
+}
+
 /// CLI-help data for one action.
 pub(crate) struct CliHelp {
     /// Invocation syntax after the action word, e.g. `<url> [--expect <sel>]`.
     pub(crate) syntax: &'static str,
-    /// Per-flag one-liners (flag incl. value placeholder → description).
-    pub(crate) flags: &'static [(&'static str, &'static str)],
-    /// Whether the global `--session <name>` flag is accepted (renderer adds
-    /// its standard row).
-    pub(crate) session: bool,
+    /// This action's own flag rows, in printed order, each carrying the
+    /// subcommand it belongs to (see [`CliFlag::scope`]). The session-wide pair
+    /// is not here: [`CliHelp::session_refusal`] decides whether [`Self::flags`]
+    /// appends it.
+    pub(crate) declared: Vec<CliFlag>,
+    /// `None` while the action takes the session-wide `--session`/`--keep` pair;
+    /// `Some(message)` on the actions that refuse it, with the message the parser
+    /// returns. This one field is what the help renders the pair's rows from and
+    /// what the parser accepts them by, so the two cannot disagree.
+    pub(crate) session_refusal: Option<&'static str>,
     /// Kinds this action's dispatch can emit (`Ok` first) — rendered into
     /// per-action CLI help and enforced by the CLI's `out_env` debug assertion.
     pub(crate) kinds: &'static [OutKind],
@@ -31,6 +87,35 @@ pub(crate) struct CliHelp {
     /// Shell invocation examples (1-2 per action).
     pub(crate) examples: &'static [&'static str],
 }
+
+impl CliHelp {
+    /// Every flag this action accepts and its help prints, in row order: the
+    /// declared rows, then the session-wide pair when the action takes them.
+    pub(crate) fn flags(&self) -> impl Iterator<Item = &CliFlag> {
+        let session: &[CliFlag] = if self.session_refusal.is_none() {
+            &SESSION_FLAGS[..]
+        } else {
+            &[]
+        };
+        self.declared.iter().chain(session.iter())
+    }
+}
+
+/// The session-wide flags: taken (and printed as rows) by every action whose
+/// [`CliHelp::session_refusal`] is `None`, refused by the rest. The top-level
+/// help words them its own way; these are the per-action rows.
+static SESSION_FLAGS: LazyLock<[CliFlag; 2]> = LazyLock::new(|| {
+    [
+        value_flag(
+            "--session <name>",
+            "use/name a session — letters, digits, '-' or '_' only (not valid for status / session subcommands)",
+        ),
+        switch_flag(
+            "--keep",
+            "keep the session open until 'mahbot chrome session stop <name>' — only with --session, and only on the call that creates the session",
+        ),
+    ]
+});
 
 pub(crate) struct ActionDesc {
     pub(crate) name: &'static str,
@@ -41,26 +126,24 @@ pub(crate) struct ActionDesc {
     pub(crate) cli: Option<CliHelp>,
 }
 
-/// The `--timeout` description shared by the verbs that forward no `--timeout`
-/// chrome-use honours (click, count, eval, extract, fill, type, press): such a
-/// call's clock is the one mahbot declares to chrome-use — chrome-use's own
-/// client tolerance less mahbot's 2 s margin — and the product's kill
-/// rides the relay-recovery window + slack above it — mahbot never cuts the call
-/// off before that clock, so chrome-use's own reason, not a synthetic mahbot
-/// timeout, is what the caller sees. chrome-use takes no per-call deadline for
-/// these verbs, so the product cannot make the call give up earlier: a `--timeout`
-/// below that declared clock is REFUSED (rc 3) instead of accepted and silently
-/// discarded. A larger one widens the bound mahbot itself kills at — never the
-/// clock chrome-use works to, which nothing can raise (declaring a larger deadline
-/// to chrome-use would make it run out of its own client tolerance instead of
-/// reporting its own reason), so it is a bound the call really runs to. Only
-/// `wait`/`expect` forward a deadline chrome-use honours in full, so only there
-/// does the `--timeout` become the call's own clock.
-const OWN_BOUND_FLAG: &str = "your own bound on the step (default: none — the clock mahbot \
-     declares to chrome-use is the call's clock and the product never cuts the call off before it; \
-     a value above that clock raises only the bound mahbot itself kills at, by the relay-recovery \
-     window and slack, and anything below it is refused as a usage error because chrome-use takes \
-     no per-call deadline for this verb — a --timeout is honoured in full by wait/expect only)";
+/// The `--timeout` row for the seven verbs chrome-use takes no per-call deadline
+/// for (click, count, eval, extract, fill, type, press). Their call runs to the
+/// clock mahbot declares to chrome-use and the product kills only above it, so a
+/// bound below that clock cannot be honoured — it is refused (rc 3) rather than
+/// silently discarded — and a larger one widens only mahbot's own kill. The
+/// printed floor is [`CHROME_USE_DECLARED_BUDGET`], the same number
+/// [`parse_bound_timeout`](crate::chrome::cli) enforces.
+fn own_bound_flag() -> String {
+    let floor = CHROME_USE_DECLARED_BUDGET.as_secs();
+    format!(
+        "your own bound on the step (default: none — the clock mahbot declares to chrome-use is the \
+         call's clock and the product never cuts the call off before it; a value above that clock \
+         raises only the bound mahbot itself kills at, by the relay-recovery window and slack, and \
+         anything below it is refused as a usage error because chrome-use takes no per-call \
+         deadline for this verb — {floor} is the smallest accepted value; a --timeout is honoured \
+         in full by wait/expect only)"
+    )
+}
 
 /// The `--timeout` description for the verbs chrome-use honours a `--timeout`
 /// on (wait, expect): the declared value IS the chrome-use-side deadline, so
@@ -119,10 +202,10 @@ fn build_actions() -> Vec<ActionDesc> {
             tool: None,
             cli: Some(CliHelp {
                 syntax: "",
-                flags: &[],
-                session: false,
+                declared: vec![],
+                session_refusal: Some("--session is not valid for status"),
                 kinds: &[OutKind::Ok, OutKind::Environment, OutKind::Usage],
-                details: "Pure preflight — reports what was established (chrome-use, the native host, the extension relay, the real profile being driven, a real browser reachable through the relay, a running Chrome, a usable display), never a file/process health check. Exits 2 (environment) only for a chrome-use that cannot state its version or a fact that rules the connection out; a not-proven report exits 0 with `verdict: not-proven` and an action is still attempted. Never launches Chrome, never recovers, never mutates the environment. Rejects --session.",
+                details: "Pure preflight — reports what was established (chrome-use, the native host, the extension relay, the real profile being driven, a real browser reachable through the relay, a running Chrome, a usable display), never a file/process health check. Exits 2 (environment) only for a chrome-use that cannot state its version or a fact that rules the connection out; a not-proven report exits 0 with `verdict: not-proven` and an action is still attempted. Never launches Chrome, never recovers, never mutates the environment. Rejects --session and --keep.",
                 examples: &["mahbot chrome status"],
             }),
         },
@@ -140,13 +223,13 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "<url> [--expect <sel>] [--structural] [--timeout <secs>]",
-                flags: &[
-                    ("--expect <sel>", "wait for this selector after navigation"),
-                    (
+                declared: vec![
+                    value_flag("--expect <sel>", "wait for this selector after navigation"),
+                    switch_flag(
                         "--structural",
                         "with --expect: a wait timeout is classified as redesign (suspected DOM redesign) instead of timeout",
                     ),
-                    (
+                    value_flag(
                         "--timeout <secs>",
                         "the condition deadline for the --expect wait, in seconds (default 20) — \
                          the wait declares what REMAINS of it when it starts, and chrome-use \
@@ -159,7 +242,7 @@ fn build_actions() -> Vec<ActionDesc> {
                          tolerance instead of answering",
                     ),
                 ],
-                session: true,
+                session_refusal: None,
                 kinds: &[
                     OutKind::Ok,
                     OutKind::Network,
@@ -183,8 +266,8 @@ fn build_actions() -> Vec<ActionDesc> {
             tool: None,
             cli: Some(CliHelp {
                 syntax: "<selector> [--timeout <secs>]",
-                flags: &[("--timeout <secs>", OWN_BOUND_FLAG)],
-                session: true,
+                declared: vec![value_flag("--timeout <secs>", own_bound_flag())],
+                session_refusal: None,
                 kinds: STEP_KINDS_WITH_EMPTY,
                 details: "A count of 0 reports kind empty (rc 0) — a legitimately empty region, not a failure.",
                 examples: &[
@@ -215,12 +298,12 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "(<selector> | --url <pattern> | --text <text>) [--timeout <secs>]",
-                flags: &[
-                    ("--url <pattern>", "wait until the URL matches this pattern"),
-                    ("--text <text>", "wait until this text appears in the page"),
-                    ("--timeout <secs>", FORWARDED_DEADLINE_FLAG),
+                declared: vec![
+                    value_flag("--url <pattern>", "wait until the URL matches this pattern"),
+                    value_flag("--text <text>", "wait until this text appears in the page"),
+                    value_flag("--timeout <secs>", FORWARDED_DEADLINE_FLAG),
                 ],
-                session: true,
+                session_refusal: None,
                 kinds: STEP_KINDS,
                 details: "Exactly one target: a selector positional, --url, or --text. A numeric first token (chrome-use's silent-sleep form) is rejected as usage. --timeout IS chrome-use's deadline, honoured in full — chrome-use's own timeout error surfaces at it, and the product kills only above it plus the relay-recovery window. --fn/--load are not exposed (the one internal --load use is open's post-navigation settle).",
                 examples: &[
@@ -267,8 +350,8 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "(<selector> <visible|hidden|present> | count <sel> <op> <n> | text|value <sel> <equals|contains|matches> <value> | attr <sel> <name> <pred> <value> | url <pred> <pattern>) [--timeout <secs>]",
-                flags: &[("--timeout <secs>", FORWARDED_DEADLINE_FLAG)],
-                session: true,
+                declared: vec![value_flag("--timeout <secs>", FORWARDED_DEADLINE_FLAG)],
+                session_refusal: None,
                 kinds: STEP_KINDS,
                 details: "rc 0 when the condition holds. rc 1 when it does not: kind timeout when the condition never held within the deadline (chrome-use reports every failed expect as a deadline expiration), kind error for other step failures. The allowlist is the safe subset of chrome-use's grammar — gone/request/no-errors and the --not/--regex/--no-wait flags are not exposed.",
                 examples: &[
@@ -292,8 +375,8 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "<js> [--timeout <secs>]",
-                flags: &[("--timeout <secs>", OWN_BOUND_FLAG)],
-                session: true,
+                declared: vec![value_flag("--timeout <secs>", own_bound_flag())],
+                session_refusal: None,
                 kinds: STEP_KINDS,
                 details: "The result is emitted as a JSON value under the result key.",
                 examples: &["mahbot chrome eval 'document.title'"],
@@ -317,18 +400,18 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "--schema-file <path> [--limit <n>] [--timeout <secs>]",
-                flags: &[
-                    (
+                declared: vec![
+                    value_flag(
                         "--schema-file <path>",
                         "JSON schema file for the extraction (required)",
                     ),
-                    (
+                    value_flag(
                         "--limit <n>",
                         "trim rows mahbot-side; total still reports the honest count",
                     ),
-                    ("--timeout <secs>", OWN_BOUND_FLAG),
+                    value_flag("--timeout <secs>", own_bound_flag()),
                 ],
-                session: true,
+                session_refusal: None,
                 kinds: STEP_KINDS_WITH_EMPTY,
                 details: "The schema follows chrome-use's grammar: an optional \"rows\" selector plus a required \"fields\" object (field name → CSS selector or {sel, get, all}). Field getters: \"text\" (default), \"html\", \"value\", or \"@<attribute>\" (e.g. \"@href\"); attributes require the \"@\" prefix, and unknown getters are rejected kind usage (rc 3) instead of chrome-use's silent textContent fallback. When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3). If the count eval fails (e.g. an invalid CSS rows selector), the action errors explicitly — chrome-use's dominant-container auto-detect fallback is deliberately NOT used, because the gate exists to avoid phantom rows.",
                 examples: &["mahbot chrome extract --schema-file products.json --limit 20"],
@@ -348,14 +431,14 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "<selector> [--if-present] [--timeout <secs>]",
-                flags: &[
-                    (
+                declared: vec![
+                    switch_flag(
                         "--if-present",
                         "a missed click is a no-op success (chrome-use semantics)",
                     ),
-                    ("--timeout <secs>", OWN_BOUND_FLAG),
+                    value_flag("--timeout <secs>", own_bound_flag()),
                 ],
-                session: true,
+                session_refusal: None,
                 kinds: STEP_KINDS,
                 details: "The CLI has no snapshot refs — the selector is always CSS.",
                 examples: &[
@@ -382,17 +465,17 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "<selector> <text> [--file <path>] [--stdin] [--timeout <secs>]",
-                flags: &[
-                    (
+                declared: vec![
+                    value_flag(
                         "--file <path>",
                         "read the fill value from a UTF-8 file (large/multiline text — chrome-use reads the file)",
                     ),
-                    ("--stdin", "read the fill value from this process's stdin"),
-                    ("--timeout <secs>", OWN_BOUND_FLAG),
+                    switch_flag("--stdin", "read the fill value from this process's stdin"),
+                    value_flag("--timeout <secs>", own_bound_flag()),
                 ],
-                session: true,
+                session_refusal: None,
                 kinds: STEP_KINDS,
-                details: "Clears the field and fills it, replacing existing content; the written value is read back and verified before success — rich editors (CodeMirror, Monaco, ProseMirror, contenteditable) and framework inputs (React/Vue/Angular) are handled natively. Exactly one text source: the inline text (multi-word text is joined with spaces), --file <path>, or --stdin. A missing --file is kind usage; a target that does not exist is kind not-found; a read-back verification failure is kind error. A text beginning with '-' is taken as literal text (fill has no single-dash flags), so `fill \"#q\" -tail` fills `-tail`; `--` may still shield one (or use --file/--stdin).",
+                details: "Clears the field and fills it, replacing existing content; the written value is read back and verified before success — rich editors (CodeMirror, Monaco, ProseMirror, contenteditable) and framework inputs (React/Vue/Angular) are handled natively. Exactly one text source: the inline text (multi-word text is joined with spaces), --file <path>, or --stdin. A missing --file is kind usage; a target that does not exist is kind not-found; a read-back verification failure is kind error. A text beginning with '-' is taken as literal text (fill has no single-dash flags), so `fill \"#q\" -tail` fills `-tail`; `--` shields a leading-dash text (or use --file/--stdin), but an unshielded `-h`/`--help` in the tail is still this help page, not text — and chrome-use answers a help-looking value with its own help, so such a fill fails instead of writing it.",
                 examples: &[
                     "mahbot chrome fill \"#email\" \"user@example.com\"",
                     "mahbot chrome fill \".editor\" --file ./post.md",
@@ -421,16 +504,16 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "<selector> <text> [--key-events] [--timeout <secs>]",
-                flags: &[
-                    (
+                declared: vec![
+                    switch_flag(
                         "--key-events",
                         "send real per-character keyDown/keyUp — for autocomplete/combobox fields",
                     ),
-                    ("--timeout <secs>", OWN_BOUND_FLAG),
+                    value_flag("--timeout <secs>", own_bound_flag()),
                 ],
-                session: true,
+                session_refusal: None,
                 kinds: STEP_KINDS,
-                details: "Types character-by-character without clearing (appends to existing content). --key-events sends real per-character keyDown/keyUp for autocomplete/combobox fields. Embedded newlines press Enter — they can submit a form; use fill for multiline text. When the page rewrites or filters the typed text, chrome-use's warning makes the action kind error (rc 1) — never a silent success. A text beginning with '-' is taken as literal text (type has no single-dash flags); `--` may still shield one.",
+                details: "Types character-by-character without clearing (appends to existing content). --key-events sends real per-character keyDown/keyUp for autocomplete/combobox fields. Embedded newlines press Enter — they can submit a form; use fill for multiline text. When the page rewrites or filters the typed text, chrome-use's warning makes the action kind error (rc 1) — never a silent success. A text beginning with '-' is taken as literal text (type has no single-dash flags); `--` shields one, but an unshielded `-h`/`--help` in the tail is still this help page, not text — and chrome-use answers a help-looking value with its own help, so such a type fails instead of typing it.",
                 examples: &[
                     "mahbot chrome type \"#search\" \"hello\"",
                     "mahbot chrome type \"#zip\" \"201-0001\" --key-events",
@@ -455,18 +538,18 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
             cli: Some(CliHelp {
                 syntax: "<key> [--selector <sel>] [--hold <ms>] [--timeout <secs>]",
-                flags: &[
-                    (
+                declared: vec![
+                    value_flag(
                         "--selector <sel>",
                         "try to focus this element before pressing (no-op if not focusable)",
                     ),
-                    (
+                    value_flag(
                         "--hold <ms>",
                         "hold the key down for this long before releasing",
                     ),
-                    ("--timeout <secs>", OWN_BOUND_FLAG),
+                    value_flag("--timeout <secs>", own_bound_flag()),
                 ],
-                session: true,
+                session_refusal: None,
                 kinds: STEP_KINDS,
                 details: "Sends the key to the focused element. --selector tries to focus its target first (making kind not-found reachable), but focus moves only if the element is focusable (input, textarea, select, button, ...) — for a non-focusable selector (e.g. body) focus does not move and the key lands wherever focus currently is. data.target reports the element where the key actually landed (may differ from --selector, may be absent). For listener-dependent keys (Enter on a bare input, Escape, arrows/PageUp/PageDown in text fields) chrome-use probes for key listeners; with none found, chrome-use's warning makes the action kind error (rc 1) — never a silent success. Keys with browser defaults (e.g. Enter on a button) and command chords are never probed, so they can succeed even if the page ignores them; separately, an Enter that lands where nothing is focused (or on an iframe) also warns and makes the action kind error (rc 1).",
                 examples: &[
@@ -481,11 +564,14 @@ fn build_actions() -> Vec<ActionDesc> {
             tool: None,
             cli: Some(CliHelp {
                 syntax: "stop <name> [--force] | status <name> | list",
-                flags: &[(
-                    "--force",
-                    "also stop protected agent-tab-* / link-enricher-* sessions",
-                )],
-                session: false,
+                declared: vec![CliFlag {
+                    scope: Some("stop"),
+                    ..switch_flag(
+                        "--force",
+                        "also stop protected agent-tab-* / link-enricher-* sessions — 'session stop' only",
+                    )
+                }],
+                session_refusal: Some("--session is not valid for session stop/status/list"),
                 kinds: STEP_KINDS_WITH_EMPTY,
                 details: "Manages named CLI sessions — a `<name>` takes letters, digits, '-' or '_' only (chrome-use's own alphabet: a '.' is refused, since chrome-use refuses to stop such a session). stop refuses protected sessions (agent-tab-* / link-enricher-*) unless --force; names are prefixed mahbot-chrome- unless already prefixed. list shows the sessions this CLI created — their names, keep marks, and seconds since last use. A session this CLI creates lives 10 minutes after its last use and is then closed; --keep (only with --session, and only on the call that creates the session) keeps it until session stop, which is also the only thing that ends a kept session. Stopping, restarting or updating mahbot closes no browser tabs. status is an opt-in liveness probe (worst case ~30s: session-list preflight + a real bounded get-url against the session): a not-running session reports empty (rc 0); a wedged one reports environment (rc 2). The probe closes nothing on its own, and for a session this CLI recorded it is still a later call with the same name: it restarts the 10-minute clock, so a diagnosis keeps a session's tabs open rather than closing them; the recovery itself is automatic everywhere the session is actually driven: every on-demand action verb recovers a session that stopped answering and says so in its error (only when mahbot's own bound ended the step, or chrome-use classified the session unresponsive — a step chrome-use timed out on its own, e.g. an expect whose condition was not met, is not a wedge and costs no session), `session stop <name>` clears it, and the background watchdog recovers one too. After a recovery, re-run the action with `--session <name>` to re-create the session — cookies persist in the profile, open tabs/tab-group identity do not. The global `status` action is session-unaware: it can report the connection ready while a named session is wedged.",
                 examples: &[
