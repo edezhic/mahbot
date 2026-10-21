@@ -189,7 +189,7 @@ impl Session {
             // turn's machine change-info (a first turn's system prompt holds the
             // models instead, so the snapshot write below stays on its first-turn
             // path), then the personal-workspace report at the very head, ahead of it.
-            // The session-start `<personal-files>` block cannot stand in for the
+            // The session-start `<workspace-structure>` block cannot stand in for the
             // report: it is a shape — folder names with counts, never a path — so it
             // cannot say what the user just touched, and a session truncated from
             // the Sessions page takes this path with its baseline intact.
@@ -1361,7 +1361,7 @@ fn role_prompt_excerpt(prompt: &str) -> String {
     )
 }
 
-/// The session-start `<personal-files>` picture for the user's personal folder:
+/// The session-start `<workspace-structure>` picture for the user's personal folder:
 /// the folder's immediate child folders with the number of files beneath each
 /// plus the files sitting directly in the folder — the same file material the
 /// change report watches (see [`crate::session::personal_changes`]), rendered
@@ -1997,7 +1997,7 @@ mod tests {
     }
 
     /// Pure gating of the Assistant context blocks: a guest's Assistant gets
-    /// the alarms, personal-files and custom-tool blocks (the workspace list and
+    /// the alarms, workspace-structure and custom-tool blocks (the workspace list and
     /// the custom-role listing are the admin's only); the admin's Assistant gets
     /// the first three in alarms → personal files → workspaces order plus the
     /// custom-tool block last; empty data omits the conditional blocks, while
@@ -2039,7 +2039,7 @@ mod tests {
         );
         assert_eq!(blocks.len(), 3);
         assert!(blocks[0].contains("<user-alarms>"));
-        assert!(blocks[1].contains("<personal-files>"));
+        assert!(blocks[1].contains("<workspace-structure>"));
         assert!(!blocks[1].contains("<managed-workspaces>"));
         assert_eq!(blocks[2], custom);
 
@@ -2055,7 +2055,7 @@ mod tests {
         );
         assert_eq!(blocks.len(), 4);
         assert!(blocks[0].contains("<user-alarms>"));
-        assert!(blocks[1].contains("<personal-files>"));
+        assert!(blocks[1].contains("<workspace-structure>"));
         assert!(blocks[2].contains("<managed-workspaces>"));
         assert_eq!(blocks[3], custom);
 

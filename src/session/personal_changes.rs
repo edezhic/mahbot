@@ -27,7 +27,7 @@
 //! path never enters the delta in the first place — and never reads as removed,
 //! however it came to be ignored.
 //!
-//! The session-start `<personal-files>` picture ([`personal_folder_picture`]) is
+//! The session-start `<workspace-structure>` picture ([`personal_folder_picture`]) is
 //! built from the same walk predicate ([`is_skipped`]) and the same rules
 //! ([`Rules`]) as the report, so the two blocks can never describe different
 //! material; it costs one metadata-only walk and never reads a file's contents.
