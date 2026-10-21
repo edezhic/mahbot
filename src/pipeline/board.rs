@@ -321,6 +321,13 @@ pub struct Ticket {
 }
 
 impl Ticket {
+    /// Whether the maintainer filed this ticket — the workspace-cleanup tickets
+    /// only the maintainer creates.
+    #[must_use]
+    pub(crate) fn filed_by_maintainer(&self) -> bool {
+        self.reporter == crate::Role::Maintainer.as_str()
+    }
+
     /// Short single-line display for listing tickets in agent-facing output.
     ///
     /// Returns `"  [{reporter}] [{phase}] {id}: {title}"` (note the leading

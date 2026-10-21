@@ -295,14 +295,16 @@ jobs:
           )"
 
           # The machine's own version bumps are what the release does, not what it
-          # says changed; every other title is kept exactly as it is written and
-          # becomes one bullet. A commit with no title at all (`NF` zero) becomes no
-          # bullet, so the list cannot pick up a blank entry. `%s` is the title folded
-          # onto a single line, so a title written over several lines is still one
-          # bullet here. With nothing kept the file stays empty: the heading belongs
-          # to the list, not to the release.
+          # says changed, and the maintainer's `[maintenance] ` commits are code
+          # tidying rather than product changes (that prefix is written by the
+          # sanitation commit path); every other title is kept exactly as it is
+          # written and becomes one bullet. A commit with no title at all (`NF`
+          # zero) becomes no bullet, so the list cannot pick up a blank entry.
+          # `%s` is the title folded onto a single line, so a title written over
+          # several lines is still one bullet here. With nothing kept the file
+          # stays empty: the heading belongs to the list, not to the release.
           git log --reverse --pretty=format:%s "$base..$TAG" \
-            | awk '!/^Bump version to / && NF { item[kept++] = "* " $0 }
+            | awk '!/^Bump version to / && !/^\[maintenance\] / && NF { item[kept++] = "* " $0 }
                    END {
                      if (kept == 0) exit
                      print "### Changelog\n"

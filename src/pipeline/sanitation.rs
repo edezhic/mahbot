@@ -14,6 +14,12 @@ use super::{
     sync_phase_job_task, warn, with_comment_and_transition,
 };
 
+/// Fixed commit-message prefix for the tickets the maintainer filed — their
+/// work is code cleanup, so the commit is recognisable from its first
+/// characters. The release changelog filters every subject that starts with
+/// it; the ticket title itself is never changed.
+pub(crate) const MAINTENANCE_COMMIT_PREFIX: &str = "[maintenance] ";
+
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if guard_job_phase(&ticket.id, TicketPhase::InSanitation, &job_id).await {
         return;
@@ -62,6 +68,14 @@ async fn missing_repo_reason(ws: &Workspace) -> Option<&'static str> {
     None
 }
 
+fn commit_message(ticket: &Ticket) -> String {
+    if ticket.filed_by_maintainer() {
+        format!("{MAINTENANCE_COMMIT_PREFIX}{}", ticket.title)
+    } else {
+        ticket.title.clone()
+    }
+}
+
 /// Shared sanitation finalize tail: clear the implementation roster and
 /// finalize the ticket at Done via its git status. A Done transition that
 /// declines — the ticket was moved externally (a cancel), or the transition
@@ -99,7 +113,7 @@ async fn finalize_sanitation_ticket(
         return Ok(());
     }
 
-    match crate::git::commands::run_git_commit(ws.as_path(), &ticket.title).await {
+    match crate::git::commands::run_git_commit(ws.as_path(), &commit_message(ticket)).await {
         Ok(commit_info) => {
             // A pipeline auto-commit is a ref-only change the file watcher
             // never reports, so notify the GUI to refresh the footer promptly
@@ -376,5 +390,27 @@ async fn process_sanitation_verdict(
             job_id,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::test::TicketFixture;
+
+    /// The commit path uses the prefix only for maintainer-filed tickets.
+    #[test]
+    fn only_a_maintainer_ticket_gets_the_maintenance_prefix() {
+        let manager_filed = TicketFixture::new("t1", TicketPhase::InSanitation)
+            .title("Remove the dead helper")
+            .build();
+        assert_eq!(commit_message(&manager_filed), "Remove the dead helper");
+
+        let mut maintainer_filed = manager_filed.clone();
+        maintainer_filed.reporter = Role::Maintainer.as_str().to_string();
+        assert_eq!(
+            commit_message(&maintainer_filed),
+            "[maintenance] Remove the dead helper"
+        );
     }
 }

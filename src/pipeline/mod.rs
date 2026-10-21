@@ -449,7 +449,7 @@ fn phase_task(ticket: &Ticket, phase: TicketPhase) -> (String, Role) {
 /// The Analysis phase task prompt: maintainer-reported tickets get the
 /// maintainer variant, everything else the manager one.
 fn analyst_task_prompt(ticket: &Ticket) -> String {
-    if ticket.reporter == Role::Maintainer.as_str() {
+    if ticket.filed_by_maintainer() {
         crate::prompt::load_prompt("analyze/maintainer_ticket.md")
     } else {
         crate::prompt::load_prompt("analyze/manager_ticket.md")
