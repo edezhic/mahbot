@@ -367,7 +367,6 @@ fn temp_sibling(dest: &Path) -> PathBuf {
 ///
 /// [`download_verified`] runs this on a blocking thread: it walks a directory and
 /// probes pids, and every download in the process pays for it.
-#[cfg(unix)]
 fn sweep_abandoned_parts(dest: &Path) {
     let (Some(dir), Some(prefix)) = (
         dest.parent(),
@@ -385,34 +384,15 @@ fn sweep_abandoned_parts(dest: &Path) {
             .and_then(|name| name.strip_prefix(prefix))
             .and_then(|rest| rest.strip_prefix(".part-"))
             .and_then(|rest| rest.split_once('-'))
-            .and_then(|(pid, _seq)| pid.parse::<i32>().ok());
+            .and_then(|(pid, _seq)| pid.parse::<u32>().ok());
         if let Some(pid) = pid
-            && pid != std::process::id().cast_signed()
-            && !process_exists(pid)
+            && pid != std::process::id()
+            && !crate::util::process_alive(pid)
         {
             let _ = std::fs::remove_file(entry.path());
         }
     }
 }
-
-/// Whether a process with this id is still there.
-///
-/// A process this one may not signal is a process that is there, so only a pid
-/// the system reports no such process for counts as gone.
-#[cfg(unix)]
-fn process_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 sends nothing — it asks the system whether the process
-    // exists, and touches no memory.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Nothing is swept where the process table cannot be asked about: a leftover
-/// stays, inert — see [`temp_sibling`].
-#[cfg(not(unix))]
-fn sweep_abandoned_parts(_dest: &Path) {}
 
 /// A temp file a download owns until it is renamed into place: dropped without
 /// [`disarm`](Self::disarm), it removes whatever is at its path.

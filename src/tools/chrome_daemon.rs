@@ -114,8 +114,8 @@ use crate::chrome::contract::{
     ChromeResponse, is_daemon_unavailable_error, is_relay_unavailable_error,
     is_session_unresponsive_error, is_unreachable_tab_error, parse_first,
 };
-use crate::chrome::spawn::{CliOutput, CliRun, CliSpawn, CliTimeout, ensure_chrome_env, spawn_cli};
-use crate::chrome::{CliRecovery, probe_clocks};
+use crate::chrome::spawn::{CliOutput, CliRun, CliSpawn, ensure_chrome_env, spawn_cli};
+use crate::chrome::{CliRecovery, SESSION_STOP_TIMEOUT, probe_clocks};
 use crate::util::UnwrapPoison;
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -770,7 +770,7 @@ pub(crate) async fn run_cli_bounded_at(
         session,
         json: true,
         capture_stderr: false,
-        timeout: CliTimeout::Bounded(clocks.kill),
+        timeout: clocks.kill,
         cancel_kills: true,
         input: None,
         chrome_side: clocks.chrome_side,
@@ -1980,30 +1980,30 @@ async fn session_stop_via(path: &Path, session: &str, bound: Duration) -> Sessio
     recovered
 }
 
-/// The recovery stop's envelope verdict: [`run_cli_json_at`]'s judgement of the
-/// same `--json` contract, on the same clocks ([`probe_clocks`], the ONE formula
-/// for a product probe: `bound` is the kill, and that same bound — capped at the
-/// longest declaration mahbot makes for a verb it forwards no `--timeout` to — is
-/// what chrome-use is given), but
-/// spawned so the call is never killed — the only difference is
-/// [`CliSpawn::cancel_kills`], which the fail-fast probes need and this stop must
-/// not have (see [`session_stop_via`]). The answer distinguishes a stop that was
-/// issued and confirmed from one issued but not confirmed (the child ran) and
-/// from one that never started.
+/// The bounded, never-killed `session stop` spawn the session-level paths use (wedge
+/// recovery, the rasterize drop, the command line's lifetime close — the CLI's own
+/// end-of-call close spawns its stop itself, so it can bound and interrupt it as part of
+/// that call): [`run_cli_json_at`]'s judgement of the same `--json` contract, on the same
+/// clocks ([`probe_clocks`], the ONE formula for a product probe: `bound` is the kill, and
+/// that same bound — capped at the longest declaration mahbot makes for a verb it
+/// forwards no `--timeout` to — is what chrome-use is given), but spawned so the call
+/// is never killed — the only difference is [`CliSpawn::cancel_kills`], which the
+/// fail-fast probes need and this stop must not have (see [`session_stop_via`]). The
+/// answer distinguishes a stop that was issued and confirmed from one issued but not
+/// confirmed (the child ran) and from one that never started.
 pub(super) async fn session_stop_outcome(
     path: &Path,
     session: &str,
     bound: Duration,
 ) -> SessionRecovery {
-    let args = ["session", "stop"];
     let clocks = probe_clocks(bound);
     match spawn_cli(CliSpawn {
         path,
-        args: &args,
+        args: &["session", "stop"],
         session: Some(session),
         json: true,
         capture_stderr: false,
-        timeout: CliTimeout::Bounded(clocks.kill),
+        timeout: clocks.kill,
         cancel_kills: false,
         input: None,
         chrome_side: clocks.chrome_side,
@@ -2015,6 +2015,16 @@ pub(super) async fn session_stop_outcome(
         CliRun::Output(_) | CliRun::TimedOut => SessionRecovery::Unanswered,
         CliRun::SpawnFailure => SessionRecovery::NotStarted,
     }
+}
+
+/// Close one session this product's command line created, for the CLI session
+/// lifetime ([`crate::chrome::cli_sessions`]): [`session_stop_outcome`] with the
+/// product's own stop bound.
+pub(crate) async fn stop_session_by_name(session: &str) -> SessionRecovery {
+    let Some(path) = cli_path() else {
+        return SessionRecovery::NotStarted;
+    };
+    session_stop_outcome(&path, session, SESSION_STOP_TIMEOUT).await
 }
 
 /// The shared recovery for a session that stopped answering: record the wedge
@@ -2349,6 +2359,12 @@ pub async fn run_watchdog() {
                     attempt_recovery(failure).await;
                 }
             }
+            // The command-line sessions' own lifetime tick (crate::chrome::cli_sessions):
+            // one session nobody has used for its lifetime is closed per pass. It rides the
+            // health pass, so a host where the CLI probe stood the watchdog down runs no tick
+            // at all — harmless, since the CLI's own pre-parse sweep still covers it and there
+            // is no browser here to close anything in.
+            crate::chrome::cli_sessions::sweep_expired().await;
         }
         // Wait for the next interval or an early wake from the fail-fast path.
         // `woken` resets on every timeout, so a wake that is not consumed
@@ -2627,14 +2643,23 @@ pub async fn run_chrome_use_management() {
 /// ever closes the target session's own tabs — sessions owned by other agents
 /// or the user (explicit tabs, `default`, any non-mahbot name) are never
 /// touched, and neither are run-owned `agent-tab-*` ones, which are not mahbot
-/// names at all (`chrome.rs`'s `AGENT_TAB_PREFIX`). Dead link-enricher orphans stay
-/// until the tab is closed by hand — a documented residual limit.
+/// names at all (`chrome.rs`'s `AGENT_TAB_PREFIX`). A NAMED command-line session
+/// never reaches this sweep ([`is_mahbot_session_name`] matches only throwaway
+/// `mahbot-chrome-ephemeral-*` and link-enricher names), so the record guard can
+/// only protect a call that is in flight right now: a start-up sweep must not close
+/// the tabs of a call that has recorded its use — and recording happens when the call
+/// marks itself in flight, so that mark is honoured here too. It reads the record per
+/// candidate rather than once up front, so a call that records itself while the sweep
+/// runs is covered as well. Dead link-enricher orphans stay until the tab is closed by
+/// hand — a documented residual limit.
 async fn cleanup_stale_sessions() {
     let Some(sessions) = registered_sessions().await else {
         return;
     };
     for name in sessions {
-        if is_mahbot_session_name(&name) {
+        if is_mahbot_session_name(&name)
+            && !crate::chrome::cli_sessions::recorded_names().contains(&name)
+        {
             sweep_session(&name).await;
         }
     }

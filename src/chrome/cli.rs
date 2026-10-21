@@ -10,7 +10,8 @@
 //! stdout is exactly ONE line of JSON (the [`OutEnvelope`]); stderr carries
 //! human-readable diagnostics. Exit codes follow the contract: 0 success,
 //! 1 site/data step failure (schedulable), 2 environment failure (fix the
-//! environment, don't blind-retry), 3 usage error. Every step runs to the two
+//! environment, don't blind-retry), 3 usage error — and 128+signal when the call was
+//! interrupted or terminated, in which case no envelope is emitted. Every step runs to the two
 //! clocks the [chrome policy](crate::chrome) defines — chrome-use's clock,
 //! declared to it, and the product's own kill above that — as [`StepClocks`]
 //! derives them for this surface. The wait action never exposes `--load`; its one
@@ -18,6 +19,17 @@
 //! a NAMED session leaves the tab groups it used collapsed after the envelope is
 //! out ([`crate::tools::chrome_groups`]), reporting any trouble on stderr; an
 //! ephemeral session is closed right after its command and has nothing to leave.
+//!
+//! ## Session lifetime
+//!
+//! Without `--session` a call runs in a throwaway session, closed right after the
+//! envelope and, if the call is interrupted or terminated, before it exits (a hard kill
+//! is covered by the lifetime). A named session's lifetime, the `--keep` mark and the
+//! sweeps that enforce them are [`crate::chrome::cli_sessions`]'s; this module records
+//! each call's use, adds the session's in-flight mark while the call runs — which is what
+//! keeps every sweep away from it, for as long as the mark holds (an hour; a call running
+//! longer than that falls back to the ordinary lifetime) — and hands
+//! chrome-use the same number as its cleanup backstop.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -26,6 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::chrome::actions;
+use crate::chrome::cli_sessions;
 use crate::chrome::contract::{
     ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, ErrorPageProbe, ExpectOutcome,
     OutEnvelope, OutKind, chrome_leftover_pipe_note, chrome_use_warning, classify_call_failure,
@@ -40,7 +53,9 @@ use crate::chrome::forms::{
     parse_count_op, parse_predicate, parse_state, text_value_argv, validate_extract_getters,
     wait_args, wait_target,
 };
-use crate::chrome::spawn::{CliRun, CliSpawn, CliTimeout, spawn_cli};
+use crate::chrome::spawn::{
+    CliRun, CliSpawn, clear_group_cleanup_backstop, set_group_cleanup_backstop, spawn_cli,
+};
 use crate::chrome::{
     CHROME_USE_DECLARED_BUDGET, CHROME_USE_OWN_BUDGET, CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX,
     ChromeCallClocks, CliRecovery, DEFAULT_OPEN_TIMEOUT, DEFAULT_STEP_TIMEOUT, KILL_SLACK,
@@ -245,7 +260,16 @@ fn top_help() -> String {
     }
     out.push_str("\nGlobal flags:\n");
     out.push_str(
-        "  --session <name>   use/name a session — letters, digits, '-' or '_' only (not valid for status / session subcommands)\n\n",
+        "  --session <name>   use/name a session — letters, digits, '-' or '_' only (not valid for status / session subcommands)\n",
+    );
+    out.push_str(
+        "  --keep             keep the named session open until it is stopped — only with --session, and only on the call that creates the session (not valid for status / session subcommands)\n\n",
+    );
+    out.push_str("Sessions:\n");
+    let minutes = cli_sessions::LIFETIME_MINUTES;
+    let _ = write!(
+        out,
+        "  Without --session a call runs in a throwaway session whose tabs are closed right after the call.\n  With --session <name> the session's tabs live {minutes} minutes after its last use and are then closed;\n  any later call with the same name starts those {minutes} minutes again. With --keep the session never\n  expires: it stays until 'mahbot chrome session stop <name>'. 'mahbot chrome session list' shows the\n  sessions this CLI created, whether each is kept, and how long since it was last used.\n  Stopping, restarting or updating mahbot closes no browser tabs.\n\n"
     );
     out.push_str("Output (stdout, one JSON line):\n");
     out.push_str(
@@ -255,7 +279,8 @@ fn top_help() -> String {
     out.push_str("  0  ok / empty (including a legitimately empty region)\n");
     out.push_str("  1  site/data step failure (timeout, network, redesign, not-found, error)\n");
     out.push_str("  2  environment failure (no chrome-use CLI/relay/Chrome/display)\n");
-    out.push_str("  3  usage error\n\n");
+    out.push_str("  3  usage error\n");
+    out.push_str("  128+N  interrupted by signal N (a throwaway session is closed first)\n\n");
     out.push_str("Help:\n");
     out.push_str("  mahbot chrome -h            this help\n");
     out.push_str("  mahbot chrome <action> -h   per-action help (flags, kinds, examples)\n");
@@ -286,6 +311,10 @@ fn action_help(name: &str) -> String {
         flag_rows.push((
             "--session <name>",
             "use/name a session — letters, digits, '-' or '_' only (not valid for status / session subcommands)",
+        ));
+        flag_rows.push((
+            "--keep",
+            "keep the session open until 'mahbot chrome session stop <name>' — only with --session, and only on the call that creates the session",
         ));
     }
     if !flag_rows.is_empty() {
@@ -329,9 +358,15 @@ fn action_help_request(args: &[String]) -> Option<&'static str> {
 }
 
 /// A session the CLI resolved for an action that runs in one.
+#[derive(Clone)]
 struct CliSession {
     name: String,
+    /// `true` when the call owns a throwaway session — anonymous and browser-driving —
+    /// whose tabs are closed when the call ends (or, interrupted, before it exits).
     ephemeral: bool,
+    /// The global `--keep` request: mark the session as having no lifetime. Only the
+    /// call that creates the record can set it ([`cli_sessions::note_use`]).
+    keep: bool,
 }
 
 /// Parsed CLI invocation.
@@ -350,7 +385,7 @@ struct Invocation {
 /// their clock is the one mahbot declares to chrome-use (its own client tolerance
 /// less the 2 s margin), a bound below that clock is REFUSED as a usage error
 /// (nothing could honour it) and a longer one widens only the product's own kill
-/// (see [`StepClocks`]).
+/// (see [`StepClocks`], [`parse_bound_timeout`]).
 enum Action {
     Status,
     Open {
@@ -409,9 +444,24 @@ enum Action {
     SessionStatus {
         name: String,
     },
+    /// The sessions this CLI created, their mark and time since last use.
+    SessionList,
 }
 
 impl Action {
+    /// Whether this action drives the browser in a session. The verbs that report and
+    /// repair (`status`, `session …`) run in none: they own no throwaway session and are
+    /// answered by [`dispatch`] without the pre-flight.
+    const fn runs_in_session(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status
+                | Self::SessionStop { .. }
+                | Self::SessionStatus { .. }
+                | Self::SessionList
+        )
+    }
+
     /// The shared-registry name of this action — the envelope's `action` field
     /// and the help lookup key. The `session` subcommands emit under
     /// `"session"`, the word the owner typed.
@@ -428,7 +478,9 @@ impl Action {
             Action::Fill { .. } => "fill",
             Action::Type { .. } => "type",
             Action::Press { .. } => "press",
-            Action::SessionStop { .. } | Action::SessionStatus { .. } => "session",
+            Action::SessionStop { .. } | Action::SessionStatus { .. } | Action::SessionList => {
+                "session"
+            }
         }
     }
 }
@@ -526,7 +578,7 @@ static CHROME_USE_SPAWNED: AtomicBool = AtomicBool::new(false);
 /// ([`CliOutput::leftover_pipes`]) — including the ephemeral close's own spawn,
 /// whose envelope is already out, so [`run_cli`] reports that leftover on stderr.
 /// The CLI handles ONE invocation per process, so this is the invocation's whole
-/// record; `dispatch` turns a step's leftover into a note on the envelope
+/// record; [`run_action`] turns a step's leftover into a note on the envelope
 /// ([`chrome_leftover_pipe_note`]) — on a failure too — and never into a failure.
 /// Never read before `run_cli` resets it.
 static CHROME_USE_LEFTOVER_PIPES: AtomicBool = AtomicBool::new(false);
@@ -544,18 +596,27 @@ static CHROME_USE_LEFTOVER_PIPES: AtomicBool = AtomicBool::new(false);
 /// above that `chrome_side`. The product's own probes and the operation's
 /// best-effort sub-steps are [`CliRecovery::Suppressed`] — the product bounds
 /// them on purpose and their outcome never becomes the envelope — so they can
-/// never attribute. [`dispatch`] resets the mark before the action and reads it
-/// right after the action returns; a later step of a composite operation cannot
+/// never attribute. [`run_action`] resets the mark before the step and reads it
+/// right after it returns; a later step of a composite operation cannot
 /// erase an earlier decisive step's mark, and the wedge probe's own steps cannot
 /// leak into it.
 static CLI_STEP_KILLED_BY_CLOCK: AtomicBool = AtomicBool::new(false);
+
+/// Whether this call created the session's record (rather than restarting one that
+/// already existed). Read through [`record_materialized`] by everything that ends the call
+/// early — the interrupt path and a pre-flight refusal — to drop a record whose session
+/// never reached the browser, exactly as the normal tail does, so a kept or interrupted
+/// session cannot leave a row nothing will ever reap. Never read before `run_cli` resets it.
+static SESSION_RECORD_CREATED: AtomicBool = AtomicBool::new(false);
 
 /// `mahbot chrome` CLI entry — returns the process exit code.
 pub async fn run_cli(args: &[String]) -> i32 {
     // Re-enterable pub API: clear the previous call's spawn bookkeeping.
     CHROME_USE_SPAWNED.store(false, Ordering::Relaxed);
+    SESSION_RECORD_CREATED.store(false, Ordering::Relaxed);
     CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
     CLI_STEP_KILLED_BY_CLOCK.store(false, Ordering::Relaxed);
+    clear_group_cleanup_backstop();
     if let Some(a) = args.first()
         && (a == "-h" || a == "--help")
     {
@@ -573,8 +634,11 @@ pub async fn run_cli(args: &[String]) -> i32 {
         return 0;
     }
 
-    let invocation = match parse_invocation(args) {
-        Ok(inv) => inv,
+    // The lifetime's CLI-side trigger: it works where no service process runs.
+    crate::chrome::cli_sessions::sweep_expired().await;
+
+    let (invocation, keep) = match parse_invocation(args) {
+        Ok(parsed) => parsed,
         Err(msg) => {
             let action = recognized_action(args);
             eprintln!("mahbot chrome: {msg}");
@@ -584,9 +648,43 @@ pub async fn run_cli(args: &[String]) -> i32 {
         }
     };
 
-    let (envelope, session) = dispatch(&invocation).await;
-    envelope.emit();
-    if let Some(s) = session.as_ref()
+    let session = call_session(&invocation, keep);
+    // The action's own call races the platform's interruption signals, so an
+    // interrupted call still closes the throwaway session it created.
+    let mut call = Box::pin(dispatch(&invocation, &session));
+    let mut interrupted = Box::pin(wait_for_interruption());
+    let outcome = tokio::select! {
+        biased;
+        outcome = &mut call => outcome,
+        code = &mut interrupted => {
+            // Drop the in-flight call first so its chrome-use child cannot race the close.
+            drop(call);
+            close_throwaway_then_exit(&session, code).await
+        }
+    };
+    outcome.envelope.emit();
+    // The action is answered and its envelope is out: the tail is best-effort cleanup, and
+    // its closes are raced against a second interruption, which must end the process at
+    // once instead of waiting one out. A record left by an aborted close is durable and the
+    // lifetime sweep closes it.
+    //
+    // A record this call created that no session-scoped chrome-use spawn was ever
+    // attempted for describes nothing: drop it rather than let it linger — especially a
+    // kept one, which has no lifetime to expire it.
+    let materialized = record_materialized();
+    if !materialized && let Some(s) = outcome.session.as_ref() {
+        cli_sessions::forget(&s.name);
+    }
+    if outcome.marked
+        && materialized
+        && let Some(s) = outcome.session.as_ref()
+    {
+        let display = cli_sessions::display_name(&s.name);
+        eprintln!(
+            "mahbot chrome: session '{display}' is kept open — stop it with 'mahbot chrome session stop {display}'"
+        );
+    }
+    if let Some(s) = outcome.session.as_ref()
         && CHROME_USE_SPAWNED.load(Ordering::Relaxed)
     {
         if s.ephemeral {
@@ -594,11 +692,13 @@ pub async fn run_cli(args: &[String]) -> i32 {
             // behind cannot be noted in it — it is reported here, like every other
             // diagnostic of that close.
             CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
-            close_ephemeral(&s.name).await;
-            if CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed) {
-                eprintln!("mahbot chrome: {}", chrome_leftover_pipe_note(&s.name));
+            if close_ephemeral_unless_interrupted(&s.name).await
+                && CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed)
+            {
+                let display = cli_sessions::display_name(&s.name);
+                eprintln!("mahbot chrome: {}", chrome_leftover_pipe_note(display));
             }
-        } else if envelope.kind != OutKind::Environment
+        } else if outcome.envelope.kind != OutKind::Environment
             && let Some(cli) = cli_path()
         {
             // A named session outlives the command, so the groups this step used are
@@ -613,7 +713,110 @@ pub async fn run_cli(args: &[String]) -> i32 {
             }
         }
     }
-    envelope.kind.exit_code()
+    // The call is over: its in-flight mark goes, so the session is idle from here — and a
+    // sweep that waited the whole call out may now close it on the ordinary clock. A
+    // session that was just forgotten (an unmaterialized record, a closed throwaway) has
+    // nothing to clear.
+    if let Some(s) = outcome.session.as_ref() {
+        cli_sessions::note_end(&s.name);
+    }
+    outcome.envelope.kind.exit_code()
+}
+
+/// The session this call runs in, resolved once for the interrupt path and the action
+/// alike. Only an action that drives the browser owns a throwaway session: the verbs
+/// that report and repair run in none, so an interrupted one has nothing to close.
+fn call_session(invocation: &Invocation, keep: bool) -> CliSession {
+    let (name, ephemeral) = resolve_session(invocation.session.as_deref());
+    CliSession {
+        name,
+        ephemeral: ephemeral && invocation.action.runs_in_session(),
+        keep,
+    }
+}
+
+/// What `dispatch` produced: the envelope, the session the action ran in (for the
+/// close/collapse tail) and whether this call set the keep mark.
+struct DispatchOutcome {
+    envelope: OutEnvelope,
+    session: Option<CliSession>,
+    marked: bool,
+}
+
+impl DispatchOutcome {
+    /// An envelope from a verb that runs in no session and records nothing.
+    fn plain(envelope: OutEnvelope) -> Self {
+        Self {
+            envelope,
+            session: None,
+            marked: false,
+        }
+    }
+}
+
+/// The wait an action's own call races against: Ctrl-C, a closed terminal or a
+/// parent's kill ends the CLI, whose throwaway session must still be closed first.
+/// Resolves to the conventional 128+signal exit code; a failed registration leaves
+/// the platform's own handling in place (and this waits forever).
+async fn wait_for_interruption() -> i32 {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return std::future::pending::<i32>().await;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => 130,
+            _ = terminate.recv() => 143,
+            _ = hangup.recv() => 129,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        130
+    }
+}
+
+/// An interrupted call still closes the throwaway session it created (a named one is
+/// not the call's to close), then exits with the interruption's `128+signal` code. A
+/// second interruption ends the process at once instead of waiting the close out — the
+/// close is raced against it ([`close_ephemeral_unless_interrupted`]). A record this call
+/// created whose session never reached the browser describes nothing and is dropped, as
+/// it is without an interruption.
+async fn close_throwaway_then_exit(session: &CliSession, code: i32) -> ! {
+    if session.ephemeral && CHROME_USE_SPAWNED.load(Ordering::Relaxed) {
+        CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
+        close_ephemeral_unless_interrupted(&session.name).await;
+    } else if !record_materialized() {
+        cli_sessions::forget(&session.name);
+    }
+    // The process is going: its mark must not outlive it, even though a sweep would call
+    // the mark stale as soon as this pid is gone (a named session is unaffected by the
+    // interruption and stays alive on the ordinary clock).
+    cli_sessions::note_end(&session.name);
+    std::process::exit(code);
+}
+
+/// Whether this call's record describes a session that actually reached the browser: no
+/// record was created (a later call's record already described one), or a session-scoped
+/// step of this call was attempted ([`CHROME_USE_SPAWNED`]).
+fn record_materialized() -> bool {
+    !SESSION_RECORD_CREATED.load(Ordering::Relaxed) || CHROME_USE_SPAWNED.load(Ordering::Relaxed)
+}
+
+/// [`close_ephemeral`], abandoned when a second interruption arrives first: the call is
+/// already answered (or already interrupted), so a close the user interrupted again must
+/// not keep the process alive for its bound. `true` when the close ran to completion.
+async fn close_ephemeral_unless_interrupted(name: &str) -> bool {
+    tokio::select! {
+        () = close_ephemeral(name) => true,
+        _ = wait_for_interruption() => false,
+    }
 }
 
 // ── Parsing ──────────────────────────────────────────────────────
@@ -646,15 +849,17 @@ fn action_flags(word: &str) -> FlagSet {
         .map_or((&[], &[]), |(_, v, b)| (*v, *b))
 }
 
-fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
-    let (session, remaining) = extract_global_session(args)?;
+/// Parse one command line into the action invocation and the global `--keep` request
+/// (which needs a session name and is applied when the call resolves its session).
+fn parse_invocation(args: &[String]) -> Result<(Invocation, bool), String> {
+    let (session, keep, remaining) = extract_global_flags(args)?;
     let action_word = remaining
         .first()
         .ok_or_else(|| "no action given".to_string())?;
     let rest = &remaining[1..];
     let allowed = action_flags(action_word);
-    match action_word.as_str() {
-        "status" => parse_status(session.as_deref(), rest),
+    let invocation = match action_word.as_str() {
+        "status" => parse_status(session.as_deref(), rest, allowed),
         "open" => parse_open(session.as_deref(), rest, allowed),
         "count" => parse_count(session.as_deref(), rest, allowed),
         "wait" => parse_wait(session.as_deref(), rest, allowed),
@@ -667,14 +872,30 @@ fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
         "press" => parse_press(session.as_deref(), rest, allowed),
         "session" => parse_session(session.as_deref(), rest, allowed),
         other => Err(format!("unknown action '{other}'")),
+    }?;
+    if keep {
+        // The mark is a property of a named session the call drives, so it needs both a
+        // browser-driving action and a name — checked once the action is known, so the
+        // refusal never names a flag the action itself forbids.
+        if !invocation.action.runs_in_session() {
+            return Err(format!("--keep is not valid for {action_word}"));
+        }
+        if invocation.session.is_none() {
+            return Err(
+                "--keep needs a session name: an unnamed call closes its session when it ends — pass --session <name>"
+                    .to_string(),
+            );
+        }
     }
+    Ok((invocation, keep))
 }
 
-/// Pull the global `--session` flag out of anywhere before the `--`
-/// end-of-options marker, returning the session value (last occurrence wins)
-/// and the remaining tokens (everything from `--` on kept verbatim).
-fn extract_global_session(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+/// Pull the global `--session` and `--keep` flags out of anywhere before the `--`
+/// end-of-options marker, returning the session value (last occurrence wins), the
+/// keep request, and the remaining tokens (everything from `--` on kept verbatim).
+fn extract_global_flags(args: &[String]) -> Result<(Option<String>, bool, Vec<String>), String> {
     let mut session: Option<String> = None;
+    let mut keep = false;
     let mut remaining = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -700,12 +921,15 @@ fn extract_global_session(args: &[String]) -> Result<(Option<String>, Vec<String
             validate_session_name(val)?;
             session = Some(val.to_string());
             i += 1;
+        } else if a == "--keep" {
+            keep = true;
+            i += 1;
         } else {
             remaining.push(a.clone());
             i += 1;
         }
     }
-    Ok((session, remaining))
+    Ok((session, keep, remaining))
 }
 
 /// Index and token of the first positional argument: skips `--session <name>`
@@ -831,13 +1055,19 @@ impl Flags {
     }
 }
 
-fn parse_status(session: Option<&str>, rest: &[String]) -> Result<Invocation, String> {
+fn parse_status(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: FlagSet,
+) -> Result<Invocation, String> {
     if session.is_some() {
         return Err("--session is not valid for status".to_string());
     }
-    if !rest.is_empty() {
-        return Err("unexpected arguments for status".to_string());
-    }
+    // The registry row is the parser's own flag set here too, so `status` cannot accept a
+    // flag its help row does not list ([`ACTION_FLAGS`]).
+    let (value_flags, bool_flags) = allowed;
+    let (positionals, _) = parse_flags(rest, value_flags, bool_flags)?;
+    reject_extra_positionals(&positionals, 0)?;
     Ok(Invocation {
         action: Action::Status,
         session: None,
@@ -1190,45 +1420,49 @@ fn parse_session(
     allowed: FlagSet,
 ) -> Result<Invocation, String> {
     if session.is_some() {
-        return Err("--session is not valid for session stop/status".to_string());
+        return Err("--session is not valid for session stop/status/list".to_string());
     }
-    let sub = rest
-        .first()
-        .map(String::as_str)
-        .ok_or_else(|| "usage: session stop <name> | session status <name>".to_string())?;
-    match sub {
+    let sub = rest.first().map(String::as_str).ok_or_else(|| {
+        "usage: session stop <name> | session status <name> | session list".to_string()
+    })?;
+    // The registry's flags for `session` are `stop`'s alone: the other subcommands accept
+    // none, so a flag they do not take is refused as unknown. The parser and the help row
+    // both read that one table.
+    let accepted: FlagSet = match sub {
+        "stop" => allowed,
+        "status" | "list" => (&[], &[]),
+        other => {
+            return Err(format!(
+                "unknown session subcommand '{other}' (expected 'stop', 'status' or 'list')"
+            ));
+        }
+    };
+    let (positionals, flags) = parse_flags(&rest[1..], accepted.0, accepted.1)?;
+    let action = match sub {
         "stop" => {
-            let (value_flags, bool_flags) = allowed;
-            let (positionals, flags) = parse_flags(&rest[1..], value_flags, bool_flags)?;
             let name = take_positional(&positionals, 0, "name")?;
             validate_session_name(&name)?;
             reject_extra_positionals(&positionals, 1)?;
-            Ok(Invocation {
-                action: Action::SessionStop {
-                    name,
-                    force: flags.has("force"),
-                },
-                session: None,
-            })
+            Action::SessionStop {
+                name,
+                force: flags.has("force"),
+            }
         }
         "status" => {
-            let (value_flags, bool_flags) = allowed;
-            let (positionals, flags) = parse_flags(&rest[1..], value_flags, bool_flags)?;
-            if flags.has("force") {
-                return Err("--force is not valid for session status".to_string());
-            }
             let name = take_positional(&positionals, 0, "name")?;
             validate_session_name(&name)?;
             reject_extra_positionals(&positionals, 1)?;
-            Ok(Invocation {
-                action: Action::SessionStatus { name },
-                session: None,
-            })
+            Action::SessionStatus { name }
         }
-        other => Err(format!(
-            "unknown session subcommand '{other}' (expected 'stop' or 'status')"
-        )),
-    }
+        _ => {
+            reject_extra_positionals(&positionals, 0)?;
+            Action::SessionList
+        }
+    };
+    Ok(Invocation {
+        action,
+        session: None,
+    })
 }
 
 fn take_positional(positionals: &[String], idx: usize, name: &str) -> Result<String, String> {
@@ -1276,10 +1510,11 @@ fn parse_forwarded_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
 /// chrome-use give up earlier on those, so a bound below the clock the product
 /// declares to chrome-use ([`CHROME_USE_DECLARED_BUDGET`]) CANNOT be honoured: it
 /// is refused as a usage error rather than accepted and silently discarded. A
-/// bound at or above that clock is accepted — the call is never cut off below it,
-/// and above the clock it widens the product's own kill
-/// ([`StepClocks::tool_clock`]) — and `None` (no flag) leaves the call at the
-/// declared clock.
+/// bound at or above that clock is accepted: the call is never cut off below it,
+/// and above the clock it widens the product's own kill ([`StepClocks::tool_clock`]).
+/// There is no upper limit here: while the call runs, its session is not closed — the call
+/// says so through `cli_sessions`' in-flight mark, honoured for an hour (a call longer than
+/// that falls back to the session's ordinary lifetime).
 fn parse_bound_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
     let Some(secs) = parse_timeout_secs(flags)? else {
         return Ok(None);
@@ -1338,7 +1573,7 @@ fn parse_limit_flag(flags: &Flags) -> Result<Option<usize>, String> {
 /// becomes `mahbot-chrome-<name>` (idempotent for an already-prefixed name);
 /// no flag yields an ephemeral `mahbot-chrome-ephemeral-<suffix>` session.
 ///
-/// The flag's own value is validated at extraction ([`extract_global_session`]),
+/// The flag's own value is validated at extraction ([`extract_global_flags`]),
 /// so a name reaching here is already a plain identifier.
 fn resolve_session(flag: Option<&str>) -> (String, bool) {
     match flag {
@@ -1430,158 +1665,235 @@ fn validate_action_args(action: &Action) -> Option<OutEnvelope> {
     open_args(url, expect.as_deref()).err()
 }
 
-async fn dispatch(invocation: &Invocation) -> (OutEnvelope, Option<CliSession>) {
-    match &invocation.action {
-        Action::Status => (stamped(status()).await, None),
-        Action::SessionStop { name, force } => (stamped(session_stop(name, *force)).await, None),
-        Action::SessionStatus { name } => (stamped(session_status(name)).await, None),
-        action => {
-            // The action's own clock: every envelope this arm returns — refusals
-            // included — is stamped with it (see [`stamp_elapsed`]).
-            let started = Instant::now();
-            // The session this action runs in, resolved first so the argument
-            // refusal below carries it like every other action envelope.
-            let (name, ephemeral) = resolve_session(invocation.session.as_deref());
-            // Pure argument checks come next: a malformed URL or `--expect`
-            // selector is a usage error whatever the environment looks like, so
-            // it is answered as one, without a readiness probe that could bury
-            // the precise usage error under an environment refusal (see
-            // [`validate_action_args`]).
-            if let Some(mut refusal) = validate_action_args(action) {
-                surface_session(&mut refusal, &name);
-                stamp_elapsed(&mut refusal, started);
-                return (refusal, None);
-            }
-            // The pre-action gate: no action is dispatched until the connection
-            // to the owner's REAL browser is established, so the work can never
-            // quietly land in a browser chrome-use launches itself. The
-            // probe/cleanup verbs (`status`, `session …`) run before this arm and
-            // are deliberately not gated — they are what reports and repairs.
-            //
-            // A missing helper is its own case, checked BEFORE the gate: the
-            // gate's refusal is about a connection it cannot even probe, so
-            // running it (and its recovery pass) would answer an absent helper
-            // with the long speculative readiness refusal instead of this
-            // precise missing-install report — the same envelope `require_cli`
-            // builds.
-            if cli_path().is_none() {
-                let error = "chrome-use CLI not found";
-                eprintln!("mahbot chrome: {error}");
-                let mut env = env_failure(action.name(), json!({}), error);
-                // As in the readiness refusal below, the resolved session is
-                // surfaced like every other action envelope's.
-                surface_session(&mut env, &name);
-                stamp_elapsed(&mut env, started);
-                return (env, None);
-            }
-            if let Err(refusal) = ensure_ready_for_actions().await {
-                eprintln!("mahbot chrome: {refusal}");
-                let mut env = out_env(
-                    action.name(),
-                    false,
-                    OutKind::Environment,
-                    json!({ "error": refusal }),
-                );
-                // The refused action's session is surfaced like every other
-                // action envelope's, so a swallowed or defaulted `--session` is
-                // observable here too.
-                surface_session(&mut env, &name);
-                stamp_elapsed(&mut env, started);
-                return (env, None);
-            }
-            CLI_STEP_KILLED_BY_CLOCK.store(false, Ordering::Relaxed);
-            let mut env = match action {
-                Action::Open {
-                    url,
-                    expect,
-                    structural,
-                    timeout,
-                } => open(url, expect.as_deref(), *structural, *timeout, &name).await,
-                Action::Count { selector, bound } => count(selector, *bound, &name).await,
-                Action::Wait { target, timeout } => wait(target, *timeout, &name).await,
-                Action::Expect { cond, timeout } => expect(cond, *timeout, &name).await,
-                Action::Eval { js, bound } => eval(js, *bound, &name).await,
-                Action::Extract {
-                    schema_file,
-                    limit,
-                    bound,
-                } => extract(schema_file, *limit, *bound, &name).await,
-                Action::Click {
-                    selector,
-                    if_present,
-                    bound,
-                } => click(selector, *if_present, *bound, &name).await,
-                Action::Fill {
-                    selector,
-                    source,
-                    bound,
-                } => fill(selector, source, *bound, &name).await,
-                Action::Type {
-                    selector,
-                    text,
-                    key_events,
-                    bound,
-                } => r#type(selector, text, *key_events, *bound, &name).await,
-                Action::Press {
-                    key,
-                    selector,
-                    hold,
-                    bound,
-                } => press(key, selector.as_deref(), *hold, *bound, &name).await,
-                Action::Status | Action::SessionStop { .. } | Action::SessionStatus { .. } => {
-                    unreachable!("handled by the outer match")
-                }
-            };
-            // Read the kill attribution before ANY recovery call — hygiene
-            // only: the wedge probe's own steps are probes
-            // ([`CliRecovery::Suppressed`]), so they cannot re-attribute this
-            // action's ending.
-            let killed_by_clock = CLI_STEP_KILLED_BY_CLOCK.load(Ordering::Relaxed);
-            // Surface the resolved session (named or defaulted ephemeral) so
-            // a swallowed or silently defaulted `--session` is always
-            // observable in the envelope.
-            surface_session(&mut env, &name);
-            // The call's own wall time rides every envelope this arm returns — a
-            // failing call's duration is read straight off it — while
-            // `timeout_ms` (the declared/kill bound) stays a separate fact.
-            stamp_elapsed(&mut env, started);
-            // A process chrome-use left behind still holding a step's output
-            // channel is a NOTE whatever the call's own outcome — also on a
-            // failure: the call finished, its exit status and output are the
-            // answer, and the leftover was started deliberately and is left
-            // running. It sits alongside `error` and never changes the kind or
-            // the exit code.
-            if CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed) {
-                surface_leftover_note(&mut env, &name);
-            }
-            // A session that stopped answering is RECOVERED here — the one place
-            // the resolved session name is in scope — and the envelope's error
-            // text says what was done ([`recover_session_wedge`]). `named` is the
-            // resolution's own answer, not re-derived from the name.
-            recover_session_wedge(&mut env, &name, !ephemeral, killed_by_clock).await;
-            (env, Some(CliSession { name, ephemeral }))
-        }
+/// One parsed call: the verbs that run in no session (they report and repair) are answered
+/// as they are; every other action drives the browser in the call's session through
+/// [`run_action`].
+async fn dispatch(invocation: &Invocation, session: &CliSession) -> DispatchOutcome {
+    if invocation.action.runs_in_session() {
+        run_action(&invocation.action, session).await
+    } else {
+        // These calls run no step, but they are still clocked for their envelope.
+        let started = Instant::now();
+        let mut env = execute(&invocation.action, &session.name).await;
+        stamp_elapsed(&mut env, started);
+        DispatchOutcome::plain(env)
     }
+}
+
+/// One action that drives the browser in its session: the pre-flight, the record of this
+/// call's use, the step itself, and the envelope's post-step facts.
+async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
+    // The action's own clock: every envelope it returns — refusals included — is stamped
+    // with it (see [`stamp_elapsed`]).
+    let started = Instant::now();
+    let use_outcome = match preflight(action, session, started).await {
+        Ok(outcome) => outcome,
+        Err(refused) => return refused,
+    };
+    // The session exists from here on: chrome-use is handed the lifetime as its cleanup
+    // backstop, or the cleanup switched off for a kept one.
+    set_group_cleanup_backstop(cli_sessions::backstop_ms(use_outcome.kept));
+    CLI_STEP_KILLED_BY_CLOCK.store(false, Ordering::Relaxed);
+    let mut env = execute(action, &session.name).await;
+    // Read the kill attribution before ANY recovery call — hygiene only: the wedge
+    // probe's own steps are probes ([`CliRecovery::Suppressed`]), so they cannot
+    // re-attribute this action's ending.
+    let killed_by_clock = CLI_STEP_KILLED_BY_CLOCK.load(Ordering::Relaxed);
+    // The resolved session (named or defaulted ephemeral) and the call's own wall time ride
+    // every envelope (see [`situate`]).
+    situate(&mut env, &session.name, started);
+    // A process chrome-use left behind still holding a step's output channel is a NOTE
+    // whatever the call's own outcome — also on a failure: the call finished, its exit
+    // status and output are the answer, and the leftover was started deliberately and is
+    // left running. It sits alongside `error` and never changes the kind or the exit
+    // code.
+    if CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed) {
+        surface_leftover_note(&mut env, &session.name);
+    }
+    // A session that stopped answering is RECOVERED here — the one place the resolved
+    // session name is in scope — and the envelope's error text says what was done
+    // ([`recover_session_wedge`]). Whether the session is named is the resolution's own
+    // answer ([`CliSession::ephemeral`]), not re-derived from the name.
+    recover_session_wedge(&mut env, &session.name, !session.ephemeral, killed_by_clock).await;
+    DispatchOutcome {
+        envelope: env,
+        session: Some(session.clone()),
+        marked: use_outcome.marked,
+    }
+}
+
+/// Every action's own work, in one place: the report/repair verbs [`dispatch`] answers
+/// session-unscoped, and the browser actions it wraps in the pre-flight and the tail.
+async fn execute(action: &Action, name: &str) -> OutEnvelope {
+    match action {
+        Action::Status => status().await,
+        Action::SessionStop { name, force } => session_stop(name, *force).await,
+        Action::SessionStatus { name } => session_status(name).await,
+        Action::SessionList => session_list(),
+        Action::Open {
+            url,
+            expect,
+            structural,
+            timeout,
+        } => open(url, expect.as_deref(), *structural, *timeout, name).await,
+        Action::Count { selector, bound } => count(selector, *bound, name).await,
+        Action::Wait { target, timeout } => wait(target, *timeout, name).await,
+        Action::Expect { cond, timeout } => expect(cond, *timeout, name).await,
+        Action::Eval { js, bound } => eval(js, *bound, name).await,
+        Action::Extract {
+            schema_file,
+            limit,
+            bound,
+        } => extract(schema_file, *limit, *bound, name).await,
+        Action::Click {
+            selector,
+            if_present,
+            bound,
+        } => click(selector, *if_present, *bound, name).await,
+        Action::Fill {
+            selector,
+            source,
+            bound,
+        } => fill(selector, source, *bound, name).await,
+        Action::Type {
+            selector,
+            text,
+            key_events,
+            bound,
+        } => r#type(selector, text, *key_events, *bound, name).await,
+        Action::Press {
+            key,
+            selector,
+            hold,
+            bound,
+        } => press(key, selector.as_deref(), *hold, *bound, name).await,
+    }
+}
+
+/// The action's pre-flight: the pure argument checks, the keep contract, the helper's
+/// presence, this call's own record of use, and the pre-action readiness gate. An `Err` is
+/// the refusal envelope to return; the usage and missing-helper refusals come before anything
+/// is recorded, so such a call never restarts a lifetime, while a readiness refusal ends the
+/// use it recorded a moment earlier.
+async fn preflight(
+    action: &Action,
+    session: &CliSession,
+    started: Instant,
+) -> Result<cli_sessions::UseOutcome, DispatchOutcome> {
+    let name = session.name.as_str();
+    // A malformed URL or `--expect` selector is a usage error whatever the environment
+    // looks like, so it is answered without a readiness probe that could bury the precise
+    // usage error under an environment refusal (see [`validate_action_args`]).
+    if let Some(mut refused) = validate_action_args(action) {
+        situate(&mut refused, name, started);
+        return Err(DispatchOutcome::plain(refused));
+    }
+    // A session's lifetime contract is fixed when it is created: a keep request on a
+    // session that already exists without the mark is a usage error, answered before any
+    // environment probe.
+    let recorded = match cli_sessions::check_keep(name, session.keep) {
+        Ok(recorded) => recorded,
+        Err(error) => return Err(refusal(action, name, OutKind::Usage, &error, started)),
+    };
+    // The pre-action gate: no action is dispatched until the connection to the owner's
+    // REAL browser is established, so the work can never quietly land in a browser
+    // chrome-use launches itself. The probe/cleanup verbs (`status`, `session …`) are
+    // answered before this and are deliberately not gated — they are what reports and
+    // repairs.
+    //
+    // A missing helper is its own case, checked BEFORE the gate: the gate's refusal is
+    // about a connection it cannot even probe, so running it (and its recovery pass)
+    // would answer an absent helper with the long speculative readiness refusal instead of
+    // this precise missing-install report — the same envelope `require_cli` builds.
+    let Some(path) = cli_path() else {
+        return Err(refusal(
+            action,
+            name,
+            OutKind::Environment,
+            "chrome-use CLI not found",
+            started,
+        ));
+    };
+    // A keep request on a session this record has never seen is a creating call only if
+    // chrome-use is not already running it: a session that predates the record (or came
+    // from elsewhere) already carries the idle cleanup its daemon started with, and the `0`
+    // this call hands its own spawns cannot reach it — the stop-and-restart refusal applies
+    // to it as much as to a recorded one.
+    if session.keep && !recorded && session_running(&path, name).await {
+        return Err(refusal(
+            action,
+            name,
+            OutKind::Usage,
+            &cli_sessions::mark_refusal(name),
+            started,
+        ));
+    }
+    // This call's use restarts the session's lifetime, applies the keep request and adds
+    // this call's in-flight mark — from here no sweep closes the session, including one that
+    // runs during the readiness gate below.
+    let use_outcome = match cli_sessions::note_use(name, session.keep) {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(refusal(action, name, OutKind::Usage, &error, started)),
+    };
+    SESSION_RECORD_CREATED.store(use_outcome.created, Ordering::Relaxed);
+    if let Err(why) = ensure_ready_for_actions().await {
+        // The call ends without a step, so it ends its use itself: the mark goes, and a
+        // record it created for a session that never reached the browser is dropped (the
+        // same cleanup `run_cli`'s tail does after a step).
+        if record_materialized() {
+            cli_sessions::note_end(name);
+        } else {
+            cli_sessions::forget(name);
+        }
+        return Err(refusal(action, name, OutKind::Environment, &why, started));
+    }
+    Ok(use_outcome)
+}
+
+/// An action's refusal envelope: printed on stderr, carrying the resolved session (so a
+/// swallowed or defaulted `--session` is observable) and the action's own clock.
+fn refusal(
+    action: &Action,
+    name: &str,
+    kind: OutKind,
+    error: &str,
+    started: Instant,
+) -> DispatchOutcome {
+    eprintln!("mahbot chrome: {error}");
+    let mut env = out_env(action.name(), false, kind, json!({ "error": error }));
+    situate(&mut env, name, started);
+    DispatchOutcome::plain(env)
+}
+
+/// The facts every action's envelope carries: the resolved session (so a swallowed or
+/// silently defaulted `--session` is always observable) and the call's own wall time — a
+/// failing call's duration is read straight off it, while `timeout_ms` (the declared/kill
+/// bound) stays a separate fact.
+fn situate(env: &mut OutEnvelope, name: &str, started: Instant) {
+    surface_session(env, name);
+    stamp_elapsed(env, started);
 }
 
 /// Insert the leftover-helper note as a top-level envelope field on the result —
 /// success or failure (the payload is flattened, so a payload key is a top-level
-/// stdout key, sitting alongside `error`). The note names the chrome-use session
-/// the call drove, so it is built from the resolved session name
-/// ([`chrome_leftover_pipe_note`]).
+/// stdout key, sitting alongside `error`). The note carries a `session stop` recipe,
+/// so it names the session the way a person writes it ([`cli_sessions::display_name`]),
+/// exactly like the envelope's own `session` field: `session stop` resolves a bare name
+/// into the record's, so the recipe works as written.
 fn surface_leftover_note(env: &mut OutEnvelope, name: &str) {
     if let Some(obj) = env.payload.as_object_mut() {
+        let name = cli_sessions::display_name(name);
         obj.insert("leftover".into(), json!(chrome_leftover_pipe_note(name)));
     }
 }
 
-/// Insert the resolved session name as a top-level envelope field (the
-/// payload is flattened, so a payload key is a top-level stdout key). The
-/// `session` subcommand envelopes carry their own `session` key and skip
-/// this — they run session-unscoped.
+/// Insert the session's name as a top-level envelope field (the payload is flattened, so
+/// a payload key is a top-level stdout key): the name a person reads
+/// ([`cli_sessions::display_name`]), never the record's own key. The `session` subcommand
+/// envelopes carry their own `session` key and skip this — they run session-unscoped.
 fn surface_session(env: &mut OutEnvelope, name: &str) {
     if let Some(obj) = env.payload.as_object_mut() {
-        obj.insert("session".into(), json!(name));
+        obj.insert("session".into(), json!(cli_sessions::display_name(name)));
     }
 }
 
@@ -1597,15 +1909,6 @@ fn stamp_elapsed(env: &mut OutEnvelope, started: Instant) {
     if let Some(obj) = env.payload.as_object_mut() {
         obj.insert("elapsed_ms".into(), json!(started.elapsed().as_millis()));
     }
-}
-
-/// [`stamp_elapsed`] around one of the diagnostic/control verbs, whose calls the
-/// dispatch arm does not clock itself.
-async fn stamped<F: std::future::Future<Output = OutEnvelope>>(f: F) -> OutEnvelope {
-    let started = Instant::now();
-    let mut env = f.await;
-    stamp_elapsed(&mut env, started);
-    env
 }
 
 // ── Step runner ──────────────────────────────────────────────────
@@ -1739,7 +2042,7 @@ async fn spawn_step(
         session,
         json: true,
         capture_stderr: true,
-        timeout: CliTimeout::Bounded(clocks.call.kill),
+        timeout: clocks.call.kill,
         cancel_kills: true,
         input: input.map(<[u8]>::to_vec),
         chrome_side: clocks.call.chrome_side,
@@ -1914,22 +2217,8 @@ fn out_env(action: &str, ok: bool, kind: OutKind, payload: Value) -> OutEnvelope
     }
 }
 
-/// Construct an environment-failure envelope from the action params.
-#[must_use]
-fn env_failure(action: &str, params: Value, error: &str) -> OutEnvelope {
-    let mut obj = match params {
-        Value::Object(m) => m,
-        other => {
-            let mut m = serde_json::Map::new();
-            m.insert("error".into(), other);
-            m
-        }
-    };
-    obj.insert("error".into(), json!(error));
-    out_env(action, false, OutKind::Environment, Value::Object(obj))
-}
-
-/// Resolve the chrome-use CLI path, or build the environment-failure envelope.
+/// Resolve the chrome-use CLI path, or build the environment-failure envelope that
+/// carries the action's own params plus the reason.
 ///
 /// The standalone `mahbot chrome` CLI deliberately resolves ONLY the product's
 /// own copy ([`crate::tools::chrome_daemon::cli_path`], the location the
@@ -1938,8 +2227,27 @@ fn env_failure(action: &str, params: Value, error: &str) -> OutEnvelope {
 /// run. A host whose product-owned install has not happened yet therefore
 /// reports `chrome-use CLI not found` even when some other `chrome-use` is on
 /// PATH.
-fn require_cli(action: &str, params: Value) -> Result<std::path::PathBuf, OutEnvelope> {
-    cli_path().ok_or_else(|| env_failure(action, params, "chrome-use CLI not found"))
+fn require_cli(
+    action: &str,
+    request: serde_json::Map<String, Value>,
+) -> Result<std::path::PathBuf, OutEnvelope> {
+    cli_path().ok_or_else(|| {
+        let mut payload = request;
+        payload.insert("error".into(), json!("chrome-use CLI not found"));
+        out_env(action, false, OutKind::Environment, Value::Object(payload))
+    })
+}
+
+/// The request fields an action reports when its own envelope cannot be built, as the
+/// object a refusal extends with its reason. Taking them as pairs is what makes the
+/// payload an object by construction, so a refusal can never lose either half.
+fn request(
+    fields: impl IntoIterator<Item = (&'static str, Value)>,
+) -> serde_json::Map<String, Value> {
+    fields
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
 }
 
 /// `status` — pure preflight: the readiness report and RAW probes only (never
@@ -2099,7 +2407,7 @@ fn settle_budget(remaining: Duration) -> Option<Duration> {
     (budget >= MIN_SETTLE_BUDGET).then_some(budget)
 }
 
-/// The pure argument checks of `open`, run both by [`dispatch`] (before the
+/// The pure argument checks of `open`, run both by [`preflight`] (before the
 /// readiness gate) and by [`open`] itself. The URL must be one this product may
 /// navigate to, and the `--expect` selector goes through the shared wait-target
 /// policy (so the numeric silent-sleep form is rejected here too) — both checked
@@ -2148,7 +2456,7 @@ async fn open(
         Ok(wait_for) => wait_for,
         Err(refusal) => return refusal,
     };
-    let path = match require_cli("open", json!({ "url": url })) {
+    let path = match require_cli("open", request([("url", json!(url))])) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -2401,7 +2709,7 @@ async fn count_via_eval(
 
 /// `count` — eval shim over `querySelectorAll` (chrome-use has no `count` verb).
 async fn count(selector: &str, bound: Option<Duration>, session: &str) -> OutEnvelope {
-    let path = match require_cli("count", json!({ "selector": selector })) {
+    let path = match require_cli("count", request([("selector", json!(selector))])) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -2426,7 +2734,7 @@ async fn count(selector: &str, bound: Option<Duration>, session: &str) -> OutEnv
 /// the declared clock; the product's kill rides the relay-recovery window +
 /// [`crate::chrome::KILL_SLACK`] above it (see [`StepClocks::forwarded`]).
 async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvelope {
-    let base = json!({ "target": target.describe() });
+    let base = request([("target", json!(target.describe()))]);
     let path = match require_cli("wait", base.clone()) {
         Ok(p) => p,
         Err(e) => return e,
@@ -2443,7 +2751,7 @@ async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvel
         ),
         Err(mut f) => {
             with_condition_timeout_note("wait", f.kind, &mut f.message);
-            f.envelope("wait", base, clocks)
+            f.envelope("wait", Value::Object(base), clocks)
         }
     }
 }
@@ -2481,7 +2789,7 @@ fn expect_envelope(condition: &str, outcome: ExpectOutcome) -> OutEnvelope {
 /// parses (see [`spawn_step`]).
 async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvelope {
     let condition = describe(cond);
-    let base = json!({ "condition": condition });
+    let base = request([("condition", json!(condition))]);
     let path = match require_cli("expect", base.clone()) {
         Ok(p) => p,
         Err(e) => return e,
@@ -2503,7 +2811,7 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
         },
         Err(mut f) => {
             with_condition_timeout_note("expect", f.kind, &mut f.message);
-            f.envelope("expect", base, clocks)
+            f.envelope("expect", Value::Object(base), clocks)
         }
     }
 }
@@ -2511,7 +2819,7 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
 /// `eval` — run JS and emit the unwrapped result as a JSON value (number,
 /// string, object, or null).
 async fn eval(js: &str, bound: Option<Duration>, session: &str) -> OutEnvelope {
-    let path = match require_cli("eval", json!({ "js": js })) {
+    let path = match require_cli("eval", request([("js", json!(js))])) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -2560,7 +2868,7 @@ async fn extract(
         return out_env("extract", false, OutKind::Usage, json!({ "error": err }));
     }
 
-    let path = match require_cli("extract", json!({})) {
+    let path = match require_cli("extract", serde_json::Map::new()) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -2613,7 +2921,7 @@ async fn click(
     bound: Option<Duration>,
     session: &str,
 ) -> OutEnvelope {
-    let path = match require_cli("click", json!({ "selector": selector })) {
+    let path = match require_cli("click", request([("selector", json!(selector))])) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -2685,7 +2993,7 @@ async fn fill(
     session: &str,
 ) -> OutEnvelope {
     let action = "fill";
-    let base = json!({ "selector": selector });
+    let base = request([("selector", json!(selector))]);
     let path = match require_cli(action, base.clone()) {
         Ok(p) => p,
         Err(e) => return e,
@@ -2720,8 +3028,8 @@ async fn fill(
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
     match spawn_step(&path, &refs, Some(session), clocks, input.as_deref()).await {
-        Ok(resp) => text_input_ok_envelope(action, &base, resp),
-        Err(f) => f.envelope(action, base, clocks),
+        Ok(resp) => text_input_ok_envelope(action, &Value::Object(base.clone()), resp),
+        Err(f) => f.envelope(action, Value::Object(base), clocks),
     }
 }
 
@@ -2734,7 +3042,7 @@ async fn r#type(
     session: &str,
 ) -> OutEnvelope {
     let action = "type";
-    let base = json!({ "selector": selector, "text": text });
+    let base = request([("selector", json!(selector)), ("text", json!(text))]);
     let path = match require_cli(action, base.clone()) {
         Ok(p) => p,
         Err(e) => return e,
@@ -2749,8 +3057,8 @@ async fn r#type(
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
     match spawn_step(&path, &refs, Some(session), clocks, None).await {
-        Ok(resp) => text_input_ok_envelope(action, &base, resp),
-        Err(f) => f.envelope(action, base, clocks),
+        Ok(resp) => text_input_ok_envelope(action, &Value::Object(base.clone()), resp),
+        Err(f) => f.envelope(action, Value::Object(base), clocks),
     }
 }
 
@@ -2773,7 +3081,7 @@ async fn press(
     if let Some(h) = hold {
         base_obj.insert("hold_ms".into(), json!(h));
     }
-    let base = Value::Object(base_obj);
+    let base = base_obj;
     let path = match require_cli(action, base.clone()) {
         Ok(p) => p,
         Err(e) => return e,
@@ -2788,13 +3096,14 @@ async fn press(
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
     match spawn_step(&path, &refs, Some(session), clocks, None).await {
-        Ok(resp) => text_input_ok_envelope(action, &base, resp),
-        Err(f) => f.envelope(action, base, clocks),
+        Ok(resp) => text_input_ok_envelope(action, &Value::Object(base.clone()), resp),
+        Err(f) => f.envelope(action, Value::Object(base), clocks),
     }
 }
 
 /// `session stop` — name-gated stop of a CLI session (protects the interactive
-/// tool's `agent-tab-*` sessions unless `--force`).
+/// tool's `agent-tab-*` sessions unless `--force`). The envelope echoes the name the
+/// owner wrote ([`cli_sessions::display_name`]), which is also what `session list` shows.
 async fn session_stop(name: &str, force: bool) -> OutEnvelope {
     let target = match resolve_stop_target(name, force) {
         Ok(t) => t,
@@ -2808,7 +3117,8 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
             );
         }
     };
-    let path = match require_cli("session", json!({ "session": target })) {
+    let shown = cli_sessions::display_name(&target);
+    let path = match require_cli("session", request([("session", json!(shown))])) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -2819,9 +3129,54 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
     // (chrome-use forwards no `--timeout` to `session stop`).
     let clocks = StepClocks::probe(SESSION_STOP_TIMEOUT);
     match spawn_step(&path, &["session", "stop", &target], None, clocks, None).await {
-        Ok(_) => out_env("session", true, OutKind::Ok, json!({ "session": target })),
-        Err(f) => f.envelope("session", json!({ "session": target }), clocks),
+        Ok(_) => {
+            // The mark holds only until an explicit stop.
+            cli_sessions::forget(&target);
+            out_env("session", true, OutKind::Ok, json!({ "session": shown }))
+        }
+        Err(f) => f.envelope("session", json!({ "session": shown }), clocks),
     }
+}
+
+/// Whether chrome-use is running this session right now: the same daemon-free
+/// `session list` read `session status` starts with. `false` when the list cannot be
+/// read — an unknown answer must not turn a creating call into a refusal.
+async fn session_running(path: &std::path::Path, name: &str) -> bool {
+    match spawn_step(
+        path,
+        &["session", "list"],
+        None,
+        StepClocks::probe(SESSION_LIST_TIMEOUT),
+        None,
+    )
+    .await
+    {
+        Ok(resp) => session_listed(&resp, name),
+        Err(_) => false,
+    }
+}
+
+/// `session list` — the sessions this CLI created: name, keep mark, and how long
+/// since each was last used. The listing itself reads the local record only, never
+/// the browser.
+fn session_list() -> OutEnvelope {
+    let rows = cli_sessions::list();
+    let sessions: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "session": row.name,
+                "kept": row.kept,
+                "idle_seconds": row.idle_seconds,
+            })
+        })
+        .collect();
+    out_env(
+        "session",
+        true,
+        OutKind::Ok,
+        json!({ "sessions": sessions }),
+    )
 }
 
 /// `session status <name>` — opt-in liveness probe for a named session. A
@@ -2837,10 +3192,18 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
 /// does it automatically. An honest non-wedge cause passes through unnamed.
 async fn session_status(name: &str) -> OutEnvelope {
     let target = resolve_session_target(name);
-    let path = match require_cli("session", json!({ "session": target })) {
+    // What the envelopes echo: the name the owner wrote, as `session list` shows it.
+    let shown = cli_sessions::display_name(&target);
+    let path = match require_cli("session", request([("session", json!(shown))])) {
         Ok(p) => p,
         Err(e) => return e,
     };
+    // A diagnostic is still a later call with the same name: it restarts the lifetime,
+    // and it must spawn the session's daemon with the same cleanup backstop its mark asks
+    // for. A session this CLI did not create is left to chrome-use's own defaults.
+    if let Some(kept) = cli_sessions::touch(&target) {
+        set_group_cleanup_backstop(cli_sessions::backstop_ms(kept));
+    }
     // Both steps are the product's own probes — the probe exception: bounded by
     // the product, with chrome-use's relay self-heal suppressed
     // ([`StepClocks::probe`]).
@@ -2850,7 +3213,7 @@ async fn session_status(name: &str) -> OutEnvelope {
         Err(f) => {
             return f.envelope(
                 "session",
-                json!({ "session": target, "stage": "enumerate" }),
+                json!({ "session": shown, "stage": "enumerate" }),
                 enumerate,
             );
         }
@@ -2860,7 +3223,7 @@ async fn session_status(name: &str) -> OutEnvelope {
             "session",
             true,
             OutKind::Empty,
-            json!({ "session": target, "detail": "session is not running — nothing to probe" }),
+            json!({ "session": shown, "detail": "session is not running — nothing to probe" }),
         );
     }
     let probe = StepClocks::probe(SESSION_PROBE_TIMEOUT);
@@ -2876,7 +3239,7 @@ async fn session_status(name: &str) -> OutEnvelope {
                 "session",
                 true,
                 OutKind::Ok,
-                json!({ "session": target, "status": "usable", "url": url }),
+                json!({ "session": shown, "status": "usable", "url": url }),
             )
         }
         Err(mut f) => {
@@ -2906,7 +3269,7 @@ async fn session_status(name: &str) -> OutEnvelope {
             // guidance), and only protected ones (an ordinary session's stop
             // needs no --force).
             append_protected_stop_note(&mut f.message, &target);
-            f.envelope("session", json!({ "session": target }), probe)
+            f.envelope("session", json!({ "session": shown }), probe)
         }
     }
 }
@@ -2955,11 +3318,15 @@ fn session_listed(resp: &ChromeResponse, target: &str) -> bool {
 
 /// Best-effort close of an ephemeral session AFTER the action envelope is
 /// emitted — never changes the action's exit code; its diagnostics, including
-/// the report of a helper it leaves behind, go to stderr.
+/// the report of a helper it leaves behind, go to stderr. A successful close
+/// forgets the session's record; a failed one leaves it for the lifetime sweep.
 async fn close_ephemeral(name: &str) {
+    // Every line below is read by a person, so the session is named the way its owner
+    // would name it, not by the record's own key.
+    let display = cli_sessions::display_name(name);
     let Some(path) = cli_path() else {
         eprintln!(
-            "mahbot chrome: could not close ephemeral session '{name}' (chrome-use CLI not found)"
+            "mahbot chrome: could not close ephemeral session '{display}' (chrome-use CLI not found)"
         );
         return;
     };
@@ -2979,17 +3346,19 @@ async fn close_ephemeral(name: &str) {
             // is recorded here for the caller ([`run_cli`]) to report — the
             // action envelope went out before this ran, so it cannot carry it.
             CHROME_USE_LEFTOVER_PIPES.fetch_or(out.leftover_pipes, Ordering::Relaxed);
-            if !out.status.success() {
-                eprintln!("mahbot chrome: failed to close ephemeral session '{name}'");
+            if out.status.success() {
+                cli_sessions::forget(name);
+            } else {
+                eprintln!("mahbot chrome: failed to close ephemeral session '{display}'");
             }
         }
         CliRun::SpawnFailure => {
             eprintln!(
-                "mahbot chrome: could not spawn chrome-use to close ephemeral session '{name}'"
+                "mahbot chrome: could not spawn chrome-use to close ephemeral session '{display}'"
             );
         }
         CliRun::TimedOut => {
-            eprintln!("mahbot chrome: timed out closing ephemeral session '{name}'");
+            eprintln!("mahbot chrome: timed out closing ephemeral session '{display}'");
         }
     }
 }
@@ -3002,6 +3371,12 @@ mod tests {
     // The clock arithmetic has one home; tests here derive their expectations
     // from it instead of repeating its literals.
     use crate::chrome::kill_bound;
+
+    /// [`parse_invocation`] for a test that only cares about the action (the keep
+    /// request has its own test).
+    fn parse_action(args: &[String]) -> Result<Invocation, String> {
+        parse_invocation(args).map(|(invocation, _)| invocation)
+    }
 
     #[test]
     fn eval_count_unwraps_chrome_use_result_envelope() {
@@ -3082,7 +3457,7 @@ mod tests {
             );
         }
         assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "session".into(),
                 "stop".into(),
                 "qa.2933".into(),
@@ -3219,7 +3594,7 @@ mod tests {
     #[test]
     fn session_status_parses_and_rejects() {
         // status parses into SessionStatus.
-        let inv = parse_invocation(&["session".into(), "status".into(), "docs".into()])
+        let inv = parse_action(&["session".into(), "status".into(), "docs".into()])
             .expect("session status parses");
         match inv.action {
             Action::SessionStatus { name } => assert_eq!(name, "docs"),
@@ -3227,7 +3602,7 @@ mod tests {
         }
 
         // The global --session flag is rejected for session subcommands.
-        let err = parse_invocation(&[
+        let err = parse_action(&[
             "session".into(),
             "status".into(),
             "docs".into(),
@@ -3236,9 +3611,10 @@ mod tests {
         ])
         .err()
         .expect("--session must be rejected for session subcommands");
-        assert_eq!(err, "--session is not valid for session stop/status");
+        assert_eq!(err, "--session is not valid for session stop/status/list");
 
-        // --force is rejected for status.
+        // `--force` is `stop`'s flag alone (the registry row the parser reads): the other
+        // subcommands accept no flags.
         let err = parse_session(
             None,
             &["status".into(), "docs".into(), "--force".into()],
@@ -3246,7 +3622,7 @@ mod tests {
         )
         .err()
         .expect("--force must be rejected for session status");
-        assert_eq!(err, "--force is not valid for session status");
+        assert_eq!(err, "unknown flag --force");
 
         // Extra positionals are rejected for status.
         assert!(
@@ -3259,11 +3635,13 @@ mod tests {
         );
 
         // An unknown sub names both verbs.
-        let err = parse_invocation(&["session".into(), "destroy".into(), "docs".into()])
+        let err = parse_action(&["session".into(), "destroy".into(), "docs".into()])
             .err()
             .expect("unknown sub must be rejected");
         assert!(
-            err.contains("unknown session subcommand 'destroy' (expected 'stop' or 'status')"),
+            err.contains(
+                "unknown session subcommand 'destroy' (expected 'stop', 'status' or 'list')"
+            ),
             "unexpected error: {err}"
         );
     }
@@ -3909,7 +4287,7 @@ mod tests {
     /// is one the call really runs to.
     #[test]
     fn timeout_flag_is_capped_below_chrome_use_client_tolerance() {
-        let err = parse_invocation(&["wait".into(), "#x".into(), "--timeout".into(), "45".into()])
+        let err = parse_action(&["wait".into(), "#x".into(), "--timeout".into(), "45".into()])
             .err()
             .expect("a deadline at the tolerance must be refused");
         assert!(
@@ -3918,8 +4296,7 @@ mod tests {
         );
 
         assert!(
-            parse_invocation(&["wait".into(), "#x".into(), "--timeout".into(), "44".into(),])
-                .is_ok(),
+            parse_action(&["wait".into(), "#x".into(), "--timeout".into(), "44".into(),]).is_ok(),
             "one second below the tolerance must parse"
         );
 
@@ -3929,7 +4306,7 @@ mod tests {
         ] {
             let mut argv = args.to_vec();
             argv.extend(["--timeout".into(), "45".into()]);
-            let err = parse_invocation(&argv)
+            let err = parse_action(&argv)
                 .err()
                 .unwrap_or_else(|| panic!("{argv:?} must refuse a deadline at the tolerance"));
             // The tolerance refusal itself, not another rejection of the line: it
@@ -3955,7 +4332,7 @@ mod tests {
         ] {
             let mut argv = action.to_vec();
             argv.extend(["--timeout".into(), "5".into()]);
-            let err = parse_invocation(&argv)
+            let err = parse_action(&argv)
                 .err()
                 .unwrap_or_else(|| panic!("{argv:?} must refuse an unhonourable bound"));
             assert!(
@@ -3964,7 +4341,7 @@ mod tests {
             );
         }
         // At the declared clock it parses, and it is the bound the call runs to.
-        let at_the_clock = parse_invocation(&[
+        let at_the_clock = parse_action(&[
             "eval".into(),
             "1+1".into(),
             "--timeout".into(),
@@ -3976,19 +4353,17 @@ mod tests {
             Action::Eval { bound: Some(b), .. } if b == CHROME_USE_DECLARED_BUDGET
         ));
 
-        let wide = parse_invocation(&[
+        let wide = parse_action(&[
             "eval".into(),
             "1+1".into(),
             "--timeout".into(),
             "300".into(),
         ])
         .expect("a verb that forwards no deadline takes any bound");
-        match wide.action {
-            Action::Eval { bound, .. } => {
-                assert_eq!(bound, Some(Duration::from_secs(300)));
-            }
-            _ => panic!("expected Eval with the user's bound"),
-        }
+        assert!(matches!(
+            wide.action,
+            Action::Eval { bound: Some(b), .. } if b == Duration::from_secs(300)
+        ));
     }
 
     #[expect(clippy::too_many_lines)]
@@ -3996,14 +4371,14 @@ mod tests {
     fn parse_happy_paths_support_both_flag_forms() {
         // status takes no args.
         assert!(matches!(
-            parse_invocation(&["status".into()])
+            parse_action(&["status".into()])
                 .expect("status parses")
                 .action,
             Action::Status
         ));
 
         // open with `--flag value`.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "open".into(),
             "https://example.com".into(),
             "--expect".into(),
@@ -4029,7 +4404,7 @@ mod tests {
         }
 
         // open with `--flag=value`.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "open".into(),
             "https://example.com".into(),
             "--expect=.btn".into(),
@@ -4049,7 +4424,7 @@ mod tests {
         // open without --timeout defaults to the whole-operation budget (20 s);
         // the navigation itself runs to the clock mahbot declares to chrome-use.
         let inv =
-            parse_invocation(&["open".into(), "https://example.com".into()]).expect("open parses");
+            parse_action(&["open".into(), "https://example.com".into()]).expect("open parses");
         match inv.action {
             Action::Open { timeout, .. } => assert_eq!(timeout, DEFAULT_OPEN_TIMEOUT),
             _ => panic!("expected Open"),
@@ -4061,7 +4436,7 @@ mod tests {
         // `timeout_flag_is_capped_below_chrome_use_client_tolerance`), while
         // wait/expect forward their value as chrome-use's clock.
         for (action, sel) in [("count", ".x"), ("eval", "1+1")] {
-            let inv = parse_invocation(&[action.into(), sel.into(), "--timeout=60".into()])
+            let inv = parse_action(&[action.into(), sel.into(), "--timeout=60".into()])
                 .expect("action parses");
             match inv.action {
                 Action::Count { bound, .. } | Action::Eval { bound, .. } => {
@@ -4072,22 +4447,22 @@ mod tests {
         }
         // Without --timeout a forwarding-less verb carries no bound at all:
         // the clock mahbot declares to chrome-use is its clock.
-        let inv = parse_invocation(&["count".into(), ".x".into()]).expect("count parses");
+        let inv = parse_action(&["count".into(), ".x".into()]).expect("count parses");
         assert!(matches!(inv.action, Action::Count { bound: None, .. }));
-        let inv = parse_invocation(&["eval".into(), "1+1".into()]).expect("eval parses");
+        let inv = parse_action(&["eval".into(), "1+1".into()]).expect("eval parses");
         assert!(matches!(inv.action, Action::Eval { bound: None, .. }));
 
         // wait / expect default to the condition deadline they declare AND
         // forward as their `--timeout`, well under chrome-use's own client
         // tolerance so the tool's own verdict always fires first.
-        let inv = parse_invocation(&["wait".into(), ".x".into()]).expect("wait parses");
+        let inv = parse_action(&["wait".into(), ".x".into()]).expect("wait parses");
         match inv.action {
             Action::Wait { timeout, .. } => assert_eq!(timeout, DEFAULT_STEP_TIMEOUT),
             _ => panic!("expected Wait"),
         }
 
         // wait with --url / --text targets.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "wait".into(),
             "--url".into(),
             "dashboard".into(),
@@ -4101,7 +4476,7 @@ mod tests {
             }
             _ => panic!("expected Wait"),
         }
-        let inv = parse_invocation(&["wait".into(), "--text".into(), "Loaded".into()])
+        let inv = parse_action(&["wait".into(), "--text".into(), "Loaded".into()])
             .expect("wait text parses");
         match inv.action {
             Action::Wait { target, timeout } => {
@@ -4112,7 +4487,7 @@ mod tests {
         }
 
         // expect conditions via the forms grammar.
-        let inv = parse_invocation(&["expect".into(), "#main".into(), "visible".into()])
+        let inv = parse_action(&["expect".into(), "#main".into(), "visible".into()])
             .expect("expect state parses");
         match inv.action {
             Action::Expect { cond, timeout } => {
@@ -4124,7 +4499,7 @@ mod tests {
             }
             _ => panic!("expected Expect"),
         }
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "expect".into(),
             "count".into(),
             ".card".into(),
@@ -4143,7 +4518,7 @@ mod tests {
             }
             _ => panic!("expected Expect"),
         }
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "expect".into(),
             "text".into(),
             "h1".into(),
@@ -4163,7 +4538,7 @@ mod tests {
             }
             _ => panic!("expected Expect"),
         }
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "expect".into(),
             "url".into(),
             "contains".into(),
@@ -4183,7 +4558,7 @@ mod tests {
         }
 
         // extract requires --schema-file.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "extract".into(),
             "--schema-file=rows.json".into(),
             "--limit=3".into(),
@@ -4203,7 +4578,7 @@ mod tests {
         }
 
         // click with --if-present.
-        let inv = parse_invocation(&["click".into(), ".btn".into(), "--if-present".into()])
+        let inv = parse_action(&["click".into(), ".btn".into(), "--if-present".into()])
             .expect("click parses");
         match inv.action {
             Action::Click {
@@ -4218,7 +4593,7 @@ mod tests {
         }
 
         // global --session anywhere, including before the action.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "--session".into(),
             "run-1".into(),
             "count".into(),
@@ -4229,7 +4604,7 @@ mod tests {
         assert!(matches!(inv.action, Action::Count { .. }));
 
         // session stop with --force.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "session".into(),
             "stop".into(),
             "foo".into(),
@@ -4248,7 +4623,7 @@ mod tests {
     #[test]
     fn parse_text_input_happy_paths() {
         // fill inline multi-word text.
-        let inv = parse_invocation(&["fill".into(), "#q".into(), "hello".into(), "world".into()])
+        let inv = parse_action(&["fill".into(), "#q".into(), "hello".into(), "world".into()])
             .expect("fill inline parses");
         match inv.action {
             Action::Fill {
@@ -4261,7 +4636,7 @@ mod tests {
         }
 
         // fill with `--file=<path>`.
-        let inv = parse_invocation(&["fill".into(), "#q".into(), "--file=post.md".into()])
+        let inv = parse_action(&["fill".into(), "#q".into(), "--file=post.md".into()])
             .expect("fill --file parses");
         match inv.action {
             Action::Fill { source, .. } => {
@@ -4271,7 +4646,7 @@ mod tests {
         }
 
         // fill with a separate `--file <path>` value.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "fill".into(),
             "#q".into(),
             "--file".into(),
@@ -4286,7 +4661,7 @@ mod tests {
         }
 
         // fill --stdin.
-        let inv = parse_invocation(&["fill".into(), "#q".into(), "--stdin".into()])
+        let inv = parse_action(&["fill".into(), "#q".into(), "--stdin".into()])
             .expect("fill --stdin parses");
         match inv.action {
             Action::Fill { source, .. } => {
@@ -4296,8 +4671,7 @@ mod tests {
         }
 
         // type with and without --key-events.
-        let inv =
-            parse_invocation(&["type".into(), "#q".into(), "hi".into()]).expect("type parses");
+        let inv = parse_action(&["type".into(), "#q".into(), "hi".into()]).expect("type parses");
         match inv.action {
             Action::Type {
                 selector,
@@ -4311,7 +4685,7 @@ mod tests {
             }
             _ => panic!("expected Type"),
         }
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "type".into(),
             "#q".into(),
             "hi".into(),
@@ -4324,7 +4698,7 @@ mod tests {
         }
 
         // press with selector, hold and timeout.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "press".into(),
             "Enter".into(),
             "--selector".into(),
@@ -4357,7 +4731,7 @@ mod tests {
     /// terminator behavior itself is unchanged.)
     #[test]
     fn parse_dash_separator_takes_text_verbatim() {
-        let inv = parse_invocation(&["fill".into(), "#q".into(), "--".into(), "--foo".into()])
+        let inv = parse_action(&["fill".into(), "#q".into(), "--".into(), "--foo".into()])
             .expect("fill -- separator parses");
         match inv.action {
             Action::Fill { source, .. } => {
@@ -4366,7 +4740,7 @@ mod tests {
             _ => panic!("expected Fill"),
         }
 
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "type".into(),
             "#q".into(),
             "--".into(),
@@ -4389,8 +4763,7 @@ mod tests {
     /// actions keep rejecting it as an unknown flag.
     #[test]
     fn fill_type_accept_single_dash_text() {
-        let inv =
-            parse_invocation(&["fill".into(), "#q".into(), "-tail".into()]).expect("fill parses");
+        let inv = parse_action(&["fill".into(), "#q".into(), "-tail".into()]).expect("fill parses");
         match inv.action {
             Action::Fill { source, .. } => {
                 assert!(matches!(source, TextInput::Inline(t) if t == "-tail"));
@@ -4399,7 +4772,7 @@ mod tests {
         }
 
         // A `--session` after the text still binds globally.
-        let inv = parse_invocation(&[
+        let inv = parse_action(&[
             "fill".into(),
             "#q".into(),
             "-tail".into(),
@@ -4415,8 +4788,8 @@ mod tests {
             _ => panic!("expected Fill"),
         }
 
-        let inv = parse_invocation(&["type".into(), "#q".into(), "-dashprobe".into()])
-            .expect("type parses");
+        let inv =
+            parse_action(&["type".into(), "#q".into(), "-dashprobe".into()]).expect("type parses");
         match inv.action {
             Action::Type { text, .. } => assert_eq!(text, "-dashprobe"),
             _ => panic!("expected Type"),
@@ -4424,19 +4797,20 @@ mod tests {
 
         // Other actions still reject single-dash tokens as unknown flags, and
         // fill/type still reject unknown double-dash flags.
-        assert!(parse_invocation(&["count".into(), ".x".into(), "-bogus".into()]).is_err());
-        assert!(parse_invocation(&["open".into(), "https://x".into(), "-bogus".into()]).is_err());
-        assert!(parse_invocation(&["fill".into(), "#q".into(), "--bogus".into()]).is_err());
+        assert!(parse_action(&["count".into(), ".x".into(), "-bogus".into()]).is_err());
+        assert!(parse_action(&["open".into(), "https://x".into(), "-bogus".into()]).is_err());
+        assert!(parse_action(&["fill".into(), "#q".into(), "--bogus".into()]).is_err());
     }
 
-    /// The resolved session lands as a top-level stdout field.
+    /// The resolved session lands as a top-level stdout field, under the name a person
+    /// reads (the record's namespace prefix is not part of it).
     #[test]
     fn surface_session_adds_top_level_field() {
         let mut env = out_env("fill", true, OutKind::Ok, json!({ "selector": "#q" }));
         surface_session(&mut env, "mahbot-chrome-abc");
-        assert_eq!(env.payload["session"], json!("mahbot-chrome-abc"));
+        assert_eq!(env.payload["session"], json!("abc"));
         let wire: Value = serde_json::from_str(&env.to_json()).expect("wire json");
-        assert_eq!(wire["session"], json!("mahbot-chrome-abc"));
+        assert_eq!(wire["session"], json!("abc"));
         assert_eq!(wire["kind"], json!("ok"));
     }
 
@@ -4452,15 +4826,15 @@ mod tests {
 
     #[test]
     fn parse_rejects_usage_errors() {
-        assert!(parse_invocation(&["bogus".into()]).is_err());
-        assert!(parse_invocation(&["open".into()]).is_err()); // missing url
-        assert!(parse_invocation(&["open".into(), "https://x".into(), "--bogus".into()]).is_err());
-        assert!(parse_invocation(&["count".into()]).is_err()); // missing selector
-        assert!(parse_invocation(&["extract".into()]).is_err()); // missing --schema-file
-        assert!(parse_invocation(&["status".into(), "--session".into(), "x".into()]).is_err());
-        assert!(parse_invocation(&["session".into(), "stop".into()]).is_err()); // missing name
+        assert!(parse_action(&["bogus".into()]).is_err());
+        assert!(parse_action(&["open".into()]).is_err()); // missing url
+        assert!(parse_action(&["open".into(), "https://x".into(), "--bogus".into()]).is_err());
+        assert!(parse_action(&["count".into()]).is_err()); // missing selector
+        assert!(parse_action(&["extract".into()]).is_err()); // missing --schema-file
+        assert!(parse_action(&["status".into(), "--session".into(), "x".into()]).is_err());
+        assert!(parse_action(&["session".into(), "stop".into()]).is_err()); // missing name
         assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "open".into(),
                 "https://x".into(),
                 "--timeout".into(),
@@ -4468,14 +4842,12 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(
-            parse_invocation(&["open".into(), "https://x".into(), "--timeout=0".into()]).is_err()
-        );
-        assert!(parse_invocation(&["session".into(), "destroy".into(), "x".into()]).is_err());
+        assert!(parse_action(&["open".into(), "https://x".into(), "--timeout=0".into()]).is_err());
+        assert!(parse_action(&["session".into(), "destroy".into(), "x".into()]).is_err());
         // wait must reject the numeric silent-sleep form and mixed targets.
-        assert!(parse_invocation(&["wait".into(), "5000".into()]).is_err());
+        assert!(parse_action(&["wait".into(), "5000".into()]).is_err());
         assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "wait".into(),
                 "--url".into(),
                 "a".into(),
@@ -4484,16 +4856,14 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(
-            parse_invocation(&["wait".into(), "--url".into(), "a".into(), ".x".into()]).is_err()
-        );
+        assert!(parse_action(&["wait".into(), "--url".into(), "a".into(), ".x".into()]).is_err());
         // wait rejects extra positionals (previously silently ignored).
-        assert!(parse_invocation(&["wait".into(), "#main".into(), "extra".into()]).is_err());
+        assert!(parse_action(&["wait".into(), "#main".into(), "extra".into()]).is_err());
         // expect rejects missing / off-allowlist conditions.
-        assert!(parse_invocation(&["expect".into()]).is_err());
-        assert!(parse_invocation(&["expect".into(), "#a".into(), "gone".into()]).is_err());
+        assert!(parse_action(&["expect".into()]).is_err());
+        assert!(parse_action(&["expect".into(), "#a".into(), "gone".into()]).is_err());
         assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "expect".into(),
                 "count".into(),
                 ".c".into(),
@@ -4503,7 +4873,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "expect".into(),
                 "count".into(),
                 ".c".into(),
@@ -4513,7 +4883,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "expect".into(),
                 "text".into(),
                 "h1".into(),
@@ -4523,7 +4893,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            parse_invocation(&["expect".into(), "count".into(), ".c".into(), "==".into()]).is_err()
+            parse_action(&["expect".into(), "count".into(), ".c".into(), "==".into()]).is_err()
         );
     }
 
@@ -4531,9 +4901,9 @@ mod tests {
     #[test]
     fn parse_rejects_text_input_usage_errors() {
         // fill: exactly one text source.
-        assert!(parse_invocation(&["fill".into(), "#q".into()]).is_err()); // none
+        assert!(parse_action(&["fill".into(), "#q".into()]).is_err()); // none
         assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "fill".into(),
                 "#q".into(),
                 "a".into(),
@@ -4542,11 +4912,9 @@ mod tests {
             ])
             .is_err()
         ); // inline + --file
+        assert!(parse_action(&["fill".into(), "#q".into(), "a".into(), "--stdin".into()]).is_err()); // inline + --stdin
         assert!(
-            parse_invocation(&["fill".into(), "#q".into(), "a".into(), "--stdin".into()]).is_err()
-        ); // inline + --stdin
-        assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "fill".into(),
                 "#q".into(),
                 "--stdin".into(),
@@ -4555,10 +4923,10 @@ mod tests {
             ])
             .is_err()
         ); // --stdin + --file
-        assert!(parse_invocation(&["type".into(), "#q".into()]).is_err()); // missing text
-        assert!(parse_invocation(&["press".into(), "Enter".into(), "extra".into()]).is_err()); // extra positional
+        assert!(parse_action(&["type".into(), "#q".into()]).is_err()); // missing text
+        assert!(parse_action(&["press".into(), "Enter".into(), "extra".into()]).is_err()); // extra positional
         assert!(
-            parse_invocation(&[
+            parse_action(&[
                 "press".into(),
                 "Enter".into(),
                 "--hold".into(),
@@ -4566,7 +4934,7 @@ mod tests {
             ])
             .is_err()
         ); // non-numeric hold
-        assert!(parse_invocation(&["press".into(), "Enter".into(), "--selector".into()]).is_err()); // missing value
+        assert!(parse_action(&["press".into(), "Enter".into(), "--selector".into()]).is_err()); // missing value
     }
 
     #[test]
@@ -4672,6 +5040,47 @@ mod tests {
                 d.name
             );
         }
+        assert!(help.contains("--keep"), "top help must name --keep");
+        let lifetime = format!("{} minutes", cli_sessions::LIFETIME_MINUTES);
+        assert!(
+            help.contains(&lifetime),
+            "top help must state the session lifetime, from the constant"
+        );
+        assert!(
+            action_help("session").contains(&lifetime),
+            "the session action's own help must state the same lifetime"
+        );
+        assert!(
+            help.contains("session list"),
+            "top help must name the session list verb"
+        );
+    }
+
+    #[test]
+    fn keep_requires_a_session_and_only_applies_to_action_calls() {
+        let arg = |s: &[&str]| s.iter().copied().map(String::from).collect::<Vec<_>>();
+        let err = parse_invocation(&arg(&["--keep", "open", "https://x"]))
+            .err()
+            .expect("keep without a session must be refused");
+        assert!(err.contains("--session"), "{err}");
+        let (inv, keep) =
+            parse_invocation(&arg(&["--keep", "--session", "docs", "open", "https://x"]))
+                .expect("keep with a session parses");
+        assert!(keep);
+        assert_eq!(inv.session.as_deref(), Some("docs"));
+        assert!(
+            !parse_invocation(&arg(&["open", "https://x"]))
+                .expect("open parses")
+                .1
+        );
+        // The mark is not offered to the report/repair verbs: they refuse `--session`
+        // outright, and a bare `--keep` on one is refused for the action itself rather
+        // than told to pass a flag the action forbids.
+        assert!(parse_invocation(&arg(&["--keep", "--session", "docs", "status"])).is_err());
+        let err = parse_invocation(&arg(&["--keep", "status"]))
+            .err()
+            .expect("keep on a session-less action must be refused");
+        assert!(err.contains("--keep is not valid for status"), "{err}");
     }
 
     #[test]
@@ -4732,10 +5141,12 @@ mod tests {
                 .copied()
                 .collect();
             if help.session {
-                // The global `--session` flag is rendered for and accepted by
-                // every session-enabled action, so it is on both sides.
+                // The global `--session` and `--keep` flags are rendered for and
+                // accepted by every session-enabled action, so they are on both sides.
                 expected.push("session");
                 actual.push("session");
+                expected.push("keep");
+                actual.push("keep");
             }
             expected.sort_unstable();
             actual.sort_unstable();

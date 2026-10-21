@@ -663,7 +663,7 @@ async fn shutdown_after_dashboard() {
     // path that drops the runtime without firing the token belongs on that list.
     mahbot::agent::registry::AGENT_REGISTRY.shutdown_all();
 
-    let release = mahbot::tools::chrome_release::flush_and_close_all_chrome_sessions();
+    let release = mahbot::tools::chrome_release::flush_ended_run_chrome_releases();
     match mahbot::shutdown::urgent_release_budget() {
         // Only a stop the platform gave a kill deadline to (a Windows console close or
         // session end) bounds the stage before the checkpoint; a cut is best-effort and

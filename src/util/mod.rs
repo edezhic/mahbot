@@ -320,6 +320,43 @@ pub(crate) fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Whether a process with this id is still there.
+///
+/// A process this one may not ask about counts as there on unix (only a pid the system
+/// reports no such process for is gone); on Windows a handle that cannot be opened for a
+/// plain existence query is likewise read as gone, which for this product's own user's
+/// processes is the same answer.
+#[must_use]
+#[cfg(unix)]
+pub(crate) fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing — it asks the system whether the process exists,
+    // and touches no memory.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// See the unix definition: [`OpenProcess`] with a query-only access right answers
+/// existence without touching the process.
+#[must_use]
+#[cfg(windows)]
+pub(crate) fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: a plain open by pid, asking only to query; no code in the target runs.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process == 0 {
+        return false;
+    }
+    // SAFETY: `process` came from the `OpenProcess` above and is not used again.
+    unsafe { CloseHandle(process) };
+    true
+}
+
 /// Elapsed time as the saturating millisecond count a durable row's
 /// `duration_ms` field holds (a 64-bit field, so nothing realistic saturates).
 #[must_use]

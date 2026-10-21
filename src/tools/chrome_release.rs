@@ -173,9 +173,9 @@ const MAX_PENDING_RELEASES: usize = 256;
 /// ever read for one that survived a sweep or two; an hour covers the browser side being
 /// brought back by hand without keeping the map alive for the whole process.
 const EVICTED_RUN_TTL: Duration = Duration::from_hours(1);
-/// Last-chance release budget on the shutdown/self-update path, in the spirit of the
-/// chrome-side `SHUTDOWN_CLEANUP_TIMEOUT`: a degraded browser side cannot be waited out while
-/// the process is going down. It sits below what one close pass may legitimately need (see
+/// Last-chance release budget on the shutdown/self-update path: a degraded browser side
+/// cannot be waited out while the process is going down. It sits below what one close pass
+/// may legitimately need (see
 /// [`crate::chrome::SESSION_STOP_TIMEOUT`]), so a slow but working pass is cut off here and its
 /// record left for the next boot — whose pass owns the charging rules (see
 /// [`flush_pending_run_releases`]).
@@ -1702,8 +1702,7 @@ async fn flush_pending_run_releases(budget: Duration) {
         close_unprotected(cli.as_deref(), &names, &session, &mut protected, deadline).await;
     if let Some(cli) = cli.as_deref() {
         // This product's own session, if the pass used it, goes before the process does; the
-        // closing sweep after this one owns the name's family, but its own route is
-        // endpoint-bound.
+        // name's family is only left alone if this flush itself settles it.
         let_go_own_session(cli, deadline).await;
         // And the let-go queue is reached here rather than left to the next start: an
         // unconfirmed let-go just queued that scratch session, and only a graceful stop closes
@@ -1738,14 +1737,12 @@ async fn flush_pending_run_releases(budget: Duration) {
     );
 }
 
-/// The chrome half of a shutdown, as one entry point: release what ended runs left
-/// queued, then run the closing sweep. Both shutdown paths (GUI exit, self-update)
-/// call this, so neither can do half of it — and an exit with a registered record
-/// can spend both budgets back to back (`SHUTDOWN_RELEASE_FLUSH_BUDGET` here, the
-/// sweep's own `SHUTDOWN_CLEANUP_TIMEOUT` after it).
-pub async fn flush_and_close_all_chrome_sessions() {
+/// The chrome half of a shutdown: release what ended runs left queued, and close nothing
+/// else — a session ends by its own lifetime or an explicit `session stop`
+/// (see [`crate::chrome::cli_sessions`]). Both shutdown paths (GUI exit, self-update) call
+/// this.
+pub async fn flush_ended_run_chrome_releases() {
     flush_pending_run_releases(SHUTDOWN_RELEASE_FLUSH_BUDGET).await;
-    crate::tools::chrome::close_all_chrome_sessions().await;
 }
 
 /// Names of the live agent tab groups the sweep owns this pass: every group the browser

@@ -24,12 +24,13 @@
 //!
 //! This module provides the canonical checkpoint entry points:
 //! [`checkpoint_all_databases`] (TRUNCATE, for exit-time paths — self-update
-//! restart is single-writer (agents cancelled, chrome sessions closed, shutdown
-//! signaled before the checkpoint); GUI exit runs after the runtime drops, and
-//! both call sites release the store's readers before the round, so a reader's
-//! reading position cannot be in the way of the truncate — and what a reader
-//! still in flight can do is make the attempt answer blocked, which is a warn,
-//! never a filed failure) and
+//! restart is single-writer: agents are cancelled and shutdown is signaled before
+//! the checkpoint, and browser sessions are not closed on the way out, since they
+//! end by their own lifetime or an explicit stop, see `chrome::cli_sessions`; GUI
+//! exit runs after the runtime drops; both call sites release the store's readers
+//! before the round, so a reader's reading position cannot be in the way of the
+//! truncate — and what a reader still in flight can do is make the attempt answer
+//! blocked, which is a warn, never a filed failure) and
 //! [`periodic_checkpoint_and_verify`] (non-truncating below the WAL-size cap,
 //! TRUNCATE above it, plus an independent per-store integrity verification —
 //! the auto-checkpoint loop spawned by the binary's background task set).

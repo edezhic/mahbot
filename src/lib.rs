@@ -112,8 +112,8 @@ pub(crate) mod telemetry;
 // ── GUI and desktop ──────────────────────────────────────────────────────
 // The product's artwork, and every surface outside the window that needs it.
 pub mod app_icon;
-// Spawning chrome-use and keeping its tolerant envelope, forms and action
-// registry in one place.
+// Spawning chrome-use and keeping its tolerant envelope, forms, action
+// registry and the command-line surface's session record in one place.
 pub(crate) mod chrome;
 // Every page and widget of the dashboard, plus the iced application entry.
 pub mod gui;

@@ -335,7 +335,9 @@ async fn release_instance_lock() {
 /// alive and must re-claim the lock.
 ///
 /// This is a recoverable path: it runs during self-update after all agents
-/// have been cancelled, chrome sessions closed, and shutdown signaled.
+/// have been cancelled and shutdown signaled — no browser session is closed on the way
+/// out (a session ends by its own lifetime or an explicit `session stop`; see
+/// [`crate::chrome::cli_sessions`]).
 async fn reacquire_instance_lock() -> Result<()> {
     let mutex = INSTANCE_LOCK
         .get()
@@ -1688,8 +1690,8 @@ async fn finalize_source_tree_update(
 ///    quit or SIGINT racing the checkpoint. No failure transitions with 'service
 ///    shutting down' comments fire — agents that cannot finish stay
 ///    status='launched' and boot-resume. The drain semantics are unchanged; then
-///    `crate::tools::chrome_release::flush_and_close_all_chrome_sessions` releases
-///    the sessions ended runs left queued and closes the rest.
+///    `crate::tools::chrome_release::flush_ended_run_chrome_releases` releases
+///    the sessions ended runs left queued.
 /// 2. Checkpoint all databases BEFORE releasing the instance lock and spawning
 ///    the replacement. The round releases each store's reader connections first
 ///    (see `checkpoint_all_databases`); `exit(0)` below bypasses Rust
@@ -1735,7 +1737,7 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
     crate::shutdown::drain_begin();
     let token = crate::shutdown::shutdown_token();
     token.cancelled().await;
-    crate::tools::chrome_release::flush_and_close_all_chrome_sessions().await;
+    crate::tools::chrome_release::flush_ended_run_chrome_releases().await;
 
     // 2. Checkpoint all databases BEFORE releasing the instance lock and
     //    spawning the replacement (see doc comment above).

@@ -10,15 +10,16 @@
 //! notes ([`contract`]) are the one other agent-facing text owned here. It
 //! also holds the chrome-use CLI spawning
 //! ([`spawn`]), the tolerant `--json` response envelope parser ([`contract`]),
-//! and the session-name/URL rules the tool and CLI share.
+//! and the session-name/URL rules the tool and CLI share. The command-line
+//! surface's own session record — its sessions' lifetime and keep mark — lives
+//! here too ([`cli_sessions`]).
 //!
 //! ## The two clocks
 //!
 //! Every call the product bounds runs to a clock chrome-use itself works to, and
 //! the product's own kill rides above it — save for the product's OWN bounded extra
 //! work below (a probe, or a composite operation's best-effort sub-step), which the
-//! product ends itself, and for the tool's shutdown sweep (session list/close),
-//! which carries no product kill at all. That chrome-side clock is DECLARED to
+//! product ends itself. That chrome-side clock is DECLARED to
 //! chrome-use up front (the `AGENT_BROWSER_DEFAULT_TIMEOUT` it is spawned with):
 //! the verb's own forwarded `--timeout` for the verbs chrome-use honours one on
 //! (`wait`, `expect`), and [`CHROME_USE_DECLARED_BUDGET`] for every verb the
@@ -85,6 +86,7 @@ use url::Host;
 
 pub(crate) mod actions;
 pub(crate) mod cli;
+pub(crate) mod cli_sessions;
 pub(crate) mod contract;
 pub(crate) mod forms;
 pub(crate) mod spawn;
@@ -272,9 +274,10 @@ pub(crate) const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Prefix of per-invocation ephemeral CLI sessions — the ONLY CLI prefix the
-/// daemon-side sweep may close (orphan protection after crashes); named
-/// `mahbot-chrome-<name>` sessions are never swept (cookie persistence is a
-/// feature).
+/// daemon-side start-up sweep may close (orphan protection after crashes), and
+/// only for names [`cli_sessions`] does not hold: a recorded session belongs to
+/// its own lifetime. Named `mahbot-chrome-<name>` sessions are never swept
+/// (cookie persistence is a feature).
 pub(crate) const CLI_EPHEMERAL_PREFIX: &str = "mahbot-chrome-ephemeral-";
 
 /// IP networks [`validate_url`] refuses to navigate to — the unambiguous

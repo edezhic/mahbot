@@ -1,8 +1,7 @@
 //! The single chrome-use CLI spawn path.
 //!
 //! A wedged daemon hangs inside the CLI's own ~152 s retry loop, so every
-//! health/watchdog/sweep call is deadline-bounded (the shutdown close path is
-//! instead bounded by its outer total-budget timeout); the interactive tool
+//! health/watchdog/sweep call is deadline-bounded; the interactive tool
 //! bounds its dispatch itself per call through [`crate::chrome::clocks`] (the
 //! derivation of the pair for a step that declares its own chrome-side clock),
 //! and on a timeout runs a bounded health
@@ -29,6 +28,7 @@
 //! timeout.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
@@ -36,21 +36,6 @@ use tracing::debug;
 
 use crate::chrome::{CliRecovery, RELAY_RECOVERY_BUDGET};
 use crate::util::UnwrapPoison;
-
-/// Per-call timeout policy for a chrome-use CLI call. The deadline bounds the
-/// CHILD's lifetime — spawning and waiting for its exit — only: collecting the
-/// bytes it wrote is a separate step bounded by one [`PIPE_DRAIN_MAX`] window
-/// over BOTH pipes together, renewed while bytes keep arriving, so an answer the
-/// child already produced is never cut off by this clock.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum CliTimeout {
-    /// No per-call bound — only the shutdown close path uses it (its own outer
-    /// total-budget timeout bounds the whole cleanup sequence; see module doc).
-    Unbounded,
-    /// Kill the child after the deadline (`kill_on_drop` makes dropping the
-    /// child fatal). See the type doc: only the child's lifetime is bounded.
-    Bounded(Duration),
-}
 
 /// Everything one chrome-use CLI invocation needs. The binary path is
 /// resolved by the caller so call-site-specific missing-CLI handling (and,
@@ -68,23 +53,25 @@ pub(crate) struct CliSpawn<'a> {
     /// Pipe stderr (needed when the caller reads failure details from it);
     /// otherwise null it.
     pub(crate) capture_stderr: bool,
-    /// Kill the child when the awaiting future is dropped (task cancellation
-    /// or a `Bounded` timeout) instead of letting it run to completion: letting a
-    /// timed-out call's chrome-use child keep retrying in the background has no
-    /// upside. Every caller passes `true` except the session-recovery stop, which
+    /// Kill the child when the awaiting future is dropped (task cancellation,
+    /// or the caller's deadline dropping the future) instead of letting it run to
+    /// completion: letting a timed-out call's chrome-use child keep retrying in the
+    /// background has no upside. Every caller passes `true` except the session-recovery stop, which
     /// passes `false` so a stop nothing is waiting on any more still runs on and
     /// reclaims the session's tabs (`chrome_daemon::session_stop_via`).
     pub(crate) cancel_kills: bool,
     /// Optional stdin payload (e.g. `fill --stdin`). When set, stdin is piped
     /// and the payload is written concurrently with output collection.
     pub(crate) input: Option<Vec<u8>>,
-    /// The product's own bound on this call: `Bounded(kill)` is the caller's own
-    /// kill — computed with [`crate::chrome::kill_bound`] so it rides above the
-    /// declared `chrome_side` plus whatever recovery the call allows, or with
+    /// The product's own kill for this call — computed with
+    /// [`crate::chrome::kill_bound`] so it rides above the declared `chrome_side`
+    /// plus whatever recovery the call allows, or with
     /// [`crate::chrome::probe_clocks`], where the one bound IS both the kill and the
-    /// declaration — while `Unbounded` leaves the child with no product kill at all
-    /// (a lifecycle call bounded only by the caller's outer budget).
-    pub(crate) timeout: CliTimeout,
+    /// declaration. It bounds the CHILD's lifetime — spawning and waiting for its
+    /// exit — only: collecting the bytes it wrote is a separate step bounded by one
+    /// [`PIPE_DRAIN_MAX`] window over BOTH pipes together, renewed while bytes keep
+    /// arriving, so an answer the child already produced is never cut off by it.
+    pub(crate) timeout: Duration,
     /// The chrome-side deadline this call DECLARES to chrome-use (always
     /// applied as `AGENT_BROWSER_DEFAULT_TIMEOUT`, in ms) — the clock
     /// chrome-use itself works to.
@@ -158,6 +145,35 @@ pub(crate) fn ensure_chrome_env(cmd: &mut Command) {
     cmd.env("CHROME_USE_NO_UPDATE_CHECK", "1");
     cmd.env("AGENT_BROWSER_NO_UPDATE_CHECK", "1");
     pin_real_browser_env(cmd);
+    if let Some(ms) = group_cleanup_backstop() {
+        cmd.env("AGENT_BROWSER_GROUP_CLEANUP_MS", ms.to_string());
+    }
+}
+
+/// The helper's own group-cleanup backstop the command-line surface hands it
+/// (`AGENT_BROWSER_GROUP_CLEANUP_MS`), in milliseconds. [`NOT_SET`] leaves chrome-use's
+/// own default in place, which is what the agent tool — running in the service — and
+/// every other spawn keep; only the `mahbot chrome` CLI's process sets a value, and `0`
+/// (the keep mark) means no idle cleanup at all.
+static GROUP_CLEANUP_MS: AtomicU64 = AtomicU64::new(NOT_SET);
+
+const NOT_SET: u64 = u64::MAX;
+
+pub(crate) fn set_group_cleanup_backstop(ms: u64) {
+    GROUP_CLEANUP_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Re-entry reset for [`crate::chrome::cli::run_cli`]: an in-process second invocation
+/// must not inherit the first call's backstop.
+pub(crate) fn clear_group_cleanup_backstop() {
+    GROUP_CLEANUP_MS.store(NOT_SET, Ordering::Relaxed);
+}
+
+fn group_cleanup_backstop() -> Option<u64> {
+    match GROUP_CLEANUP_MS.load(Ordering::Relaxed) {
+        NOT_SET => None,
+        ms => Some(ms),
+    }
 }
 
 /// Clear the WHOLE inherited browser-control namespace from the child's
@@ -321,7 +337,7 @@ pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
 /// the grace keeps its read end open — the leftover is never blocked by a full
 /// pipe nor faulted by a closed read end, so the call is reported with a leftover
 /// holder rather than allowed to turn a finished command into a timeout.
-async fn run_child(cmd: &mut Command, input: Option<Vec<u8>>, timeout: CliTimeout) -> CliRun {
+async fn run_child(cmd: &mut Command, input: Option<Vec<u8>>, deadline: Duration) -> CliRun {
     let Ok(mut child) = cmd.spawn() else {
         return CliRun::SpawnFailure;
     };
@@ -354,19 +370,13 @@ async fn run_child(cmd: &mut Command, input: Option<Vec<u8>>, timeout: CliTimeou
     // before exiting is already in its pipes, so a child that answers at the very
     // end of its deadline would otherwise be reported as a timeout with its answer
     // thrown away. The collection bounds itself ([`PipeDrain::held_after_exit`]).
-    let status = match timeout {
-        CliTimeout::Unbounded => match child.wait().await {
-            Ok(s) => s,
-            Err(_) => return CliRun::SpawnFailure,
-        },
-        CliTimeout::Bounded(deadline) => match tokio::time::timeout(deadline, child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(_)) => return CliRun::SpawnFailure,
-            // The child is dropped as this returns (`kill_on_drop`), and the drains
-            // with it — a pipe a leftover holds stays readable for it (see
-            // [`crate::util::leftover_channels`]).
-            Err(_) => return CliRun::TimedOut,
-        },
+    let status = match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => return CliRun::SpawnFailure,
+        // The child is dropped as this returns (`kill_on_drop`), and the drains
+        // with it — a pipe a leftover holds stays readable for it (see
+        // [`crate::util::leftover_channels`]).
+        Err(_) => return CliRun::TimedOut,
     };
     // The command's own answer is already written by the time it exits, so the
     // wait below only covers the last bytes of a pipe still being closed, and a
@@ -889,7 +899,7 @@ mod tests {
             capture_stderr: true,
             cancel_kills: true,
             input: None,
-            timeout: CliTimeout::Bounded(Duration::from_secs(10)),
+            timeout: Duration::from_secs(10),
             chrome_side: Duration::from_secs(8),
             recovery: CliRecovery::Suppressed,
         })
@@ -910,7 +920,7 @@ mod tests {
             capture_stderr: true,
             cancel_kills: true,
             input: None,
-            timeout: CliTimeout::Bounded(Duration::from_secs(10)),
+            timeout: Duration::from_secs(10),
             chrome_side: Duration::from_secs(8),
             recovery: CliRecovery::Suppressed,
         })

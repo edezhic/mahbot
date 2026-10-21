@@ -280,7 +280,7 @@ fn stage_budget(deadline: Instant, now: Instant) -> Duration {
 /// path the stage starts, the less it gets. The checkpoint that follows is never bounded —
 /// it is the durable step the exit path exists for — so the rest of the grace is left for
 /// it. What the bound cuts loses nothing durable: the browser releases a cut flush did not
-/// settle are durable records retried at boot, and its closing sweep is best-effort by
+/// settle are durable records retried at boot, and the flush itself is best-effort by
 /// design.
 #[must_use]
 pub fn urgent_release_budget() -> Option<Duration> {

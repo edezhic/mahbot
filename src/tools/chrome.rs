@@ -15,13 +15,12 @@ use crate::chrome::forms::{
     ExpectCond, ExtractGate, count_eval_js, expect_args, extract_gate, parse_count_op,
     parse_predicate, parse_state, validate_extract_getters, wait_args, wait_target,
 };
-use crate::chrome::spawn::{CliOutput, CliRun, CliSpawn, CliTimeout, spawn_cli};
-use crate::chrome::{CHROME_USE_DECLARED_BUDGET, ChromeCallClocks, CliRecovery, clocks};
+use crate::chrome::spawn::{CliOutput, CliRun, CliSpawn, spawn_cli};
+use crate::chrome::{ChromeCallClocks, CliRecovery, clocks};
 use crate::util::{UnwrapPoison, is_http_url};
 use crate::{Tool, Workspace};
 use anyhow::Context;
 use async_trait::async_trait;
-use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -600,9 +599,10 @@ impl ChromeTool {
     /// chrome-use honours in full — the declared value IS their chrome-side
     /// clock. Every other verb forwards no deadline (`open`'s navigate included:
     /// chrome-use does not bound it by the forwarded env value), so the clock
-    /// declared to chrome-use is [`CHROME_USE_DECLARED_BUDGET`] — one kill margin
-    /// under the tool's own client tolerance, so chrome-use always gives up with
-    /// its own verdict first. Every action takes [`Self::ACTION_RECOVERY`]: the
+    /// declared to chrome-use is
+    /// [`CHROME_USE_DECLARED_BUDGET`](crate::chrome::CHROME_USE_DECLARED_BUDGET) — one
+    /// kill margin under the tool's own client tolerance, so chrome-use always gives
+    /// up with its own verdict first. Every action takes [`Self::ACTION_RECOVERY`]: the
     /// tool's actions are exactly the work chrome-use's self-heal is meant to
     /// protect.
     fn call_clocks(args: &[&str]) -> ChromeCallClocks {
@@ -888,7 +888,7 @@ impl ChromeTool {
             session: Some(session),
             json: true,
             capture_stderr: true,
-            timeout: CliTimeout::Bounded(clocks.kill),
+            timeout: clocks.kill,
             // A timed-out/cancelled call must not leave the chrome-use child
             // running its retry loop in the background.
             cancel_kills: true,
@@ -1293,173 +1293,6 @@ impl ChromeTool {
                 "invalid expect condition '{other}' — use visible | hidden | present | count | text | value | attr | url"
             ),
         })
-    }
-}
-
-/// Close all running chrome sessions at shutdown, leaving the run-owned
-/// `agent-tab-*` ones alone (`AGENT_TAB_PREFIX` owns that rule). Called through
-/// `chrome_release::flush_and_close_all_chrome_sessions`, the one chrome shutdown
-/// entry point.
-///
-/// The chrome-use child process does not always get reaped on process exit — its
-/// sessions hold open ports and lingering instances that can interfere with the next
-/// daemon startup.
-pub(crate) async fn close_all_chrome_sessions() {
-    if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, close_all_chrome_sessions_inner())
-        .await
-        .is_err()
-    {
-        tracing::warn!("chrome-use session cleanup timed out — daemon wedged, skipping");
-    }
-}
-
-/// Bound on the whole session-cleanup sequence at shutdown. A wedged daemon
-/// hangs each CLI call in its internal ~152 s retry loop, so without this cap
-/// shutdown would stall; cleanup is best-effort anyway (a dead daemon cannot
-/// be cleaned up, and the watchdog recovers it after restart).
-const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Session names from a `session list --json` payload. Tolerant across
-/// chrome-use envelopes: latest returns `{"ok":true,"sessions":[{"name":..}]}`;
-/// older builds return `{"success":true,"data":{"sessions":["name",..]}}`.
-/// Entries may be objects (keyed by `name`) or plain strings. Callers gate on
-/// `ChromeResponse::verdict` first — this only extracts the names and returns
-/// an empty list when no session array is present.
-fn parse_session_list(v: &Value) -> Vec<String> {
-    let array = v
-        .get("sessions")
-        .or_else(|| v.get("data").and_then(|d| d.get("sessions")))
-        .and_then(Value::as_array);
-    array
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|entry| match entry {
-                    Value::String(s) => Some(s.clone()),
-                    Value::Object(_) => {
-                        entry.get("name").and_then(|v| v.as_str()).map(String::from)
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-async fn close_all_chrome_sessions_inner() {
-    let Some(cmd) = super::chrome_daemon::cli_path() else {
-        tracing::debug!("chrome-use not available, skipping chrome cleanup");
-        return;
-    };
-
-    // List active sessions — a lifecycle probe, not agent work: chrome-use's own
-    // declared budget is the only clock that ends it (this call passes no product
-    // kill of its own), and its relay self-heal is suppressed.
-    let list_output = match spawn_cli(CliSpawn {
-        path: &cmd,
-        args: &["session", "list"],
-        session: None,
-        json: true,
-        capture_stderr: true,
-        timeout: CliTimeout::Unbounded,
-        cancel_kills: true,
-        input: None,
-        chrome_side: CHROME_USE_DECLARED_BUDGET,
-        recovery: CliRecovery::Suppressed,
-    })
-    .await
-    {
-        CliRun::Output(o) => o,
-        CliRun::SpawnFailure => {
-            tracing::debug!("chrome-use not available, skipping chrome cleanup: spawn failed");
-            return;
-        }
-        CliRun::TimedOut => {
-            tracing::debug!("chrome-use session list timed out, skipping chrome cleanup");
-            return;
-        }
-    };
-
-    let Some(v) = parse_first::<Value>(&list_output.stdout) else {
-        // No JSON value at all: the answer was empty, or the product cut the
-        // collection off. Both are named from facts already in hand — a second
-        // parse of the same bytes could only re-derive them.
-        tracing::warn!(
-            bytes = list_output.stdout.len(),
-            truncated = list_output.truncated,
-            "chrome-use session list answered no JSON value; skipping chrome cleanup"
-        );
-        return;
-    };
-    // Gate only on an explicit failure verdict; a payload with neither
-    // verdict key proceeds (tolerance-first — unknown future envelopes
-    // still get their sessions closed if they carry a sessions array).
-    if ChromeResponse::from_value(&v).verdict() == Some(false) {
-        tracing::warn!(
-            "chrome-use session list failed: {}",
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown error")
-        );
-        return;
-    }
-    let mut sessions: Vec<String> = parse_session_list(&v);
-
-    if sessions.is_empty() {
-        tracing::debug!("No open chrome-use sessions to close");
-        return;
-    }
-
-    // Agent-run sessions belong to their run and are never closed here
-    // (see `chrome_release`).
-    let before = sessions.len();
-    sessions.retain(|s| !s.starts_with(AGENT_TAB_PREFIX));
-    let agent_sessions = before - sessions.len();
-    if agent_sessions > 0 {
-        tracing::debug!(agent_sessions, "left agent-run chrome session(s) open");
-    }
-
-    let close_futures: Vec<_> = sessions
-        .iter()
-        .map(|session_id| close_chrome_session(&cmd, session_id))
-        .collect();
-
-    join_all(close_futures).await;
-}
-
-/// Best-effort close of one chrome-use session — a lifecycle probe, not agent
-/// work: chrome-use's own declared budget is the only clock that ends it (this
-/// call passes no product kill of its own), and its relay self-heal is
-/// suppressed.
-async fn close_chrome_session(cmd: &Path, session_id: &str) {
-    match spawn_cli(CliSpawn {
-        path: cmd,
-        args: &["--session", session_id, "close"],
-        session: None,
-        json: false,
-        capture_stderr: false,
-        cancel_kills: true,
-        timeout: CliTimeout::Unbounded,
-        input: None,
-        chrome_side: CHROME_USE_DECLARED_BUDGET,
-        recovery: CliRecovery::Suppressed,
-    })
-    .await
-    {
-        CliRun::Output(out) if out.status.success() => {
-            tracing::debug!("Closed chrome-use session: {session_id}");
-        }
-        CliRun::Output(out) => {
-            tracing::warn!(
-                "chrome-use close session '{session_id}' exited with status: {}",
-                out.status
-            );
-        }
-        CliRun::SpawnFailure => {
-            tracing::warn!("failed to close chrome-use session '{session_id}': spawn failed");
-        }
-        CliRun::TimedOut => {
-            tracing::warn!("failed to close chrome-use session '{session_id}': timed out");
-        }
     }
 }
 
@@ -4117,47 +3950,6 @@ mod tests {
             payload.is_none(),
             "non-screenshot action must yield no payload"
         );
-    }
-
-    // ── parse_session_list: chrome-use envelope tolerance ───────────────
-
-    #[test]
-    fn parse_session_list_extracts_names_from_all_envelope_shapes() {
-        // Latest chrome-use object envelope.
-        let latest = serde_json::json!({
-            "ok": true,
-            "sessions": [{"name": "default", "pid": 1, "owner": "me"}]
-        });
-        assert_eq!(parse_session_list(&latest), vec!["default"]);
-
-        // Legacy data-strings envelope.
-        let legacy = serde_json::json!({
-            "success": true,
-            "data": {"sessions": ["default", "docs"]}
-        });
-        assert_eq!(parse_session_list(&legacy), vec!["default", "docs"]);
-
-        // Object entries under data mix with plain strings.
-        let mixed = serde_json::json!({
-            "success": true,
-            "data": {"sessions": [{"name": "docs", "pid": 2}, "default"]}
-        });
-        assert_eq!(parse_session_list(&mixed), vec!["docs", "default"]);
-
-        // Envelope-verdict gating lives in the caller (close_all_chrome_sessions_inner);
-        // this helper only extracts names.
-        let failed = serde_json::json!({"ok": false, "error": "boom"});
-        assert!(parse_session_list(&failed).is_empty());
-        let failed_legacy =
-            serde_json::json!({"success": false, "data": {"sessions": ["default"]}});
-        assert_eq!(parse_session_list(&failed_legacy), vec!["default"]);
-
-        // Garbage and missing keys yield empty.
-        assert!(
-            parse_session_list(&serde_json::json!({"ok": true, "sessions": "nope"})).is_empty()
-        );
-        assert!(parse_session_list(&serde_json::json!(null)).is_empty());
-        assert!(parse_session_list(&serde_json::json!({"ok": true, "data": {}})).is_empty());
     }
 
     // ── the per-agent tab cap: what counts as a tab, and what a closed tab says ─────

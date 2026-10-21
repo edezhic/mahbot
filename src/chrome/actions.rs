@@ -477,20 +477,21 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "session",
-            purpose: "manage named CLI sessions (session stop / session status)",
+            purpose: "manage named CLI sessions (session stop / session status / session list)",
             tool: None,
             cli: Some(CliHelp {
-                syntax: "stop <name> [--force] | status <name>",
+                syntax: "stop <name> [--force] | status <name> | list",
                 flags: &[(
                     "--force",
                     "also stop protected agent-tab-* / link-enricher-* sessions",
                 )],
                 session: false,
                 kinds: STEP_KINDS_WITH_EMPTY,
-                details: "Manages named CLI sessions — a `<name>` takes letters, digits, '-' or '_' only (chrome-use's own alphabet: a '.' is refused, since chrome-use refuses to stop such a session). stop refuses protected sessions (agent-tab-* / link-enricher-*) unless --force; names are prefixed mahbot-chrome- unless already prefixed. status is an opt-in liveness probe (worst case ~30s: session-list preflight + a real bounded get-url against the session): a not-running session reports empty (rc 0); a wedged one reports environment (rc 2). The probe only reports — it mutates nothing, so a diagnosis never closes tabs on its own; the recovery itself is automatic everywhere the session is actually driven: every on-demand action verb recovers a session that stopped answering and says so in its error (only when mahbot's own bound ended the step, or chrome-use classified the session unresponsive — a step chrome-use timed out on its own, e.g. an expect whose condition was not met, is not a wedge and costs no session), `session stop <name>` clears it, and the background watchdog recovers one too. After a recovery, re-run the action with `--session <name>` to re-create the session — cookies persist in the profile, open tabs/tab-group identity do not. The global `status` action is session-unaware: it can report the connection ready while a named session is wedged.",
+                details: "Manages named CLI sessions — a `<name>` takes letters, digits, '-' or '_' only (chrome-use's own alphabet: a '.' is refused, since chrome-use refuses to stop such a session). stop refuses protected sessions (agent-tab-* / link-enricher-*) unless --force; names are prefixed mahbot-chrome- unless already prefixed. list shows the sessions this CLI created — their names, keep marks, and seconds since last use. A session this CLI creates lives 10 minutes after its last use and is then closed; --keep (only with --session, and only on the call that creates the session) keeps it until session stop, which is also the only thing that ends a kept session. Stopping, restarting or updating mahbot closes no browser tabs. status is an opt-in liveness probe (worst case ~30s: session-list preflight + a real bounded get-url against the session): a not-running session reports empty (rc 0); a wedged one reports environment (rc 2). The probe closes nothing on its own, and for a session this CLI recorded it is still a later call with the same name: it restarts the 10-minute clock, so a diagnosis keeps a session's tabs open rather than closing them; the recovery itself is automatic everywhere the session is actually driven: every on-demand action verb recovers a session that stopped answering and says so in its error (only when mahbot's own bound ended the step, or chrome-use classified the session unresponsive — a step chrome-use timed out on its own, e.g. an expect whose condition was not met, is not a wedge and costs no session), `session stop <name>` clears it, and the background watchdog recovers one too. After a recovery, re-run the action with `--session <name>` to re-create the session — cookies persist in the profile, open tabs/tab-group identity do not. The global `status` action is session-unaware: it can report the connection ready while a named session is wedged.",
                 examples: &[
                     "mahbot chrome session stop docs",
                     "mahbot chrome session status docs",
+                    "mahbot chrome session list",
                 ],
             }),
         },
