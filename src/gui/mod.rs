@@ -10,6 +10,7 @@
 )]
 
 pub(crate) mod alarms;
+pub(crate) mod attachment;
 pub(crate) mod board;
 pub(crate) mod common;
 pub(crate) mod custom_roles;
@@ -26,11 +27,14 @@ pub(crate) mod logs;
 pub(crate) mod markdown_breaks;
 pub(crate) mod media_markers;
 pub(crate) mod menus;
+pub(crate) mod pasteboard;
 pub(crate) mod running;
+pub(crate) mod selectable;
 pub(crate) mod session_view;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod shell;
+pub(crate) mod shortcut_keys;
 pub(crate) mod spinner;
 pub(crate) mod text_rendering;
 pub(crate) mod theme;
@@ -344,7 +348,9 @@ pub enum Message {
     /// included; the system's asks during a log-out, restart or shut-down are not delivered here
     /// (see `shutdown`).
     QuitRequested,
-    /// Window geometry event (move/resize) — tracks state for persist-on-close.
+    /// A window event delivered to the dashboard: geometry (move/resize), which
+    /// is tracked for persist-on-close, and file drops, which attach to the
+    /// chat composer while the Home page is showing.
     WindowEvent(window::Id, window::Event),
     /// The dashboard window was created, carrying the id of the new window.
     /// Windows only: the icons the taskbar and Alt-Tab show have to be attached to
@@ -604,6 +610,57 @@ pub(crate) fn parse_key_press(
         return None;
     };
     Some((key, modifiers, physical_key))
+}
+
+/// One of the dashboard's own shortcuts — the keys that still work while a page
+/// holds the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DashboardShortcut {
+    /// Close the open overlay, or clear the page's own transient state.
+    Escape,
+    /// Focus the page's search.
+    Search,
+    /// Navigate to the n-th sidebar page, 1-based.
+    Page(usize),
+}
+
+/// The dashboard shortcut a key press stands for, or `None`: Escape, Cmd+F
+/// (Ctrl+F elsewhere) and Cmd+digit, all matched on the physical key so any
+/// keyboard layout produces them.
+///
+/// A focused input leaves exactly these uncaptured, because
+/// [`keyboard::listen`] only delivers events no widget captured — and the chat
+/// composer holds the keyboard from the moment Home is drawn, so capturing
+/// them would take the dashboard's own shortcuts away from the whole page.
+pub(crate) fn dashboard_shortcut(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    physical_key: keyboard::key::Physical,
+) -> Option<DashboardShortcut> {
+    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+        return Some(DashboardShortcut::Escape);
+    }
+    let km = detect_keyboard_mods(modifiers);
+    if km.altgr_active || !km.is_cmd {
+        return None;
+    }
+    match key.to_latin(physical_key)? {
+        'f' if !modifiers.shift() => Some(DashboardShortcut::Search),
+        digit if digit.is_ascii_digit() => {
+            Some(DashboardShortcut::Page(digit.to_digit(10)? as usize))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a focused input must leave this key press uncaptured, so the shortcut
+/// it stands for still reaches [`keyboard::listen`].
+pub(crate) fn is_dashboard_shortcut(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    physical_key: keyboard::key::Physical,
+) -> bool {
+    dashboard_shortcut(key, modifiers, physical_key).is_some()
 }
 
 // ── Dashboard state ──────────────────────────────────────────────
@@ -996,6 +1053,9 @@ impl Dashboard {
             Page::Logs | Page::Shell | Page::Editor | Page::RunningAgents => Task::none(),
             Page::Home => {
                 let snap = iced::widget::operation::snap_to_end::<Message>(home::CHAT_SCROLL_ID);
+                // The composer takes the keyboard once this page is on screen,
+                // so a paste lands in the input without a click first.
+                self.home_state.arm_composer_focus();
                 let board_refresh = self.board_state.refresh().map(Message::Board);
                 Task::batch([snap, board_refresh])
             }
@@ -1376,6 +1436,26 @@ impl Dashboard {
                 window::Event::Moved(new_pos) => {
                     self.last_position = new_pos;
                     Task::none()
+                }
+                // A dropped file attaches to the next chat message: the whole
+                // Home page is the target, while every other page (and a
+                // dashboard overlay drawn above Home) ignores drops. Several
+                // files arrive as several events, and a folder is not an
+                // attachment.
+                window::Event::FileDropped(path) => {
+                    if self.page != Page::Home || self.overlay_modal_open() {
+                        return Task::none();
+                    }
+                    let (attachments, refused) = attachment::intake([path]);
+                    if attachments.is_empty() && refused.is_empty() {
+                        return Task::none();
+                    }
+                    self.home_state
+                        .update(home::HomeMessage::Attach {
+                            attachments,
+                            refused,
+                        })
+                        .map(Message::Home)
                 }
                 _ => Task::none(),
             },
@@ -2602,7 +2682,9 @@ impl Dashboard {
             window::resize_events()
                 .map(|(id, size)| Message::WindowEvent(id, window::Event::Resized(size))),
             window::events().filter_map(|(id, event)| match &event {
-                window::Event::Moved(_) => Some(Message::WindowEvent(id, event)),
+                window::Event::Moved(_) | window::Event::FileDropped(_) => {
+                    Some(Message::WindowEvent(id, event))
+                }
                 // The window is created after this subscription is registered, so
                 // its first `Opened` event arrives here. Windows needs the id it
                 // carries: it is the window's handle, and the taskbar/Alt-Tab icon
@@ -2620,31 +2702,14 @@ impl Dashboard {
         iced::Subscription::batch([
             always_on,
             keyboard::listen().filter_map(|event| {
-                use keyboard::Key;
                 let (key, modifiers, physical_key) = parse_key_press(event)?;
-                let km = detect_keyboard_mods(modifiers);
-
-                let latin = key.to_latin(physical_key);
-                // Cmd+F (macOS) / Ctrl+F (other) → focus search.
-                if !km.altgr_active && km.is_cmd && !modifiers.shift() && latin == Some('f') {
-                    return Some(Message::FocusSearch);
-                }
-                if let Key::Named(iced::keyboard::key::Named::Escape) = key {
-                    Some(Message::EscapePressed)
-                } else if km.is_cmd && !km.altgr_active {
-                    // Cmd+number → navigate to page.
-                    if let Some(digit) = latin.and_then(|c| c.to_digit(10)) {
-                        let idx = digit as usize;
-                        if idx >= 1 {
-                            let pages = Page::sidebar_pages();
-                            if let Some(page) = pages.get(idx - 1).copied() {
-                                return Some(Message::Navigation(page));
-                            }
-                        }
-                    }
-                    None
-                } else {
-                    None
+                match dashboard_shortcut(&key, modifiers, physical_key)? {
+                    DashboardShortcut::Escape => Some(Message::EscapePressed),
+                    DashboardShortcut::Search => Some(Message::FocusSearch),
+                    DashboardShortcut::Page(index) => Page::sidebar_pages()
+                        .get(index.checked_sub(1)?)
+                        .copied()
+                        .map(Message::Navigation),
                 }
             }),
             self.shell_state.subscription().map(Message::Shell),

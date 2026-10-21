@@ -101,6 +101,14 @@ pub enum EditorAction {
     Delete,
     /// Insert a string at the cursor (paste).
     Paste(String),
+    /// Attach files or images read from the clipboard (the chat composer's
+    /// paste with attachments enabled); `refused` names what the paste could
+    /// not attach, phrased for the user. Not an edit action — the page owns the
+    /// attachment list.
+    PasteAttachments {
+        attachments: Vec<super::attachment::Attachment>,
+        refused: Vec<String>,
+    },
     /// Move the cursor to an absolute (line, column).
     MoveTo {
         /// Target line.
@@ -503,12 +511,14 @@ impl EditorBuffer {
             | EditorAction::Undo
             | EditorAction::Redo
             | EditorAction::FocusNext
-            | EditorAction::FocusPrevious => {
+            | EditorAction::FocusPrevious
+            | EditorAction::PasteAttachments { .. } => {
                 // Submit is handled by the parent (send). Undo/Redo are
                 // handled at the undo-stack level in
                 // `common::apply_editor_action`; the buffer itself never
                 // restores them. FocusNext/FocusPrevious are focus-only and
-                // never touch the buffer.
+                // never touch the buffer. Pasted attachments belong to the
+                // page's own list, never to the text.
             }
             EditorAction::Backspace => self.do_backspace(),
             EditorAction::Delete => self.do_delete(),
@@ -2266,6 +2276,15 @@ pub struct EditorWidget<'a> {
     /// gates the keyboard through [`EditorWidget::ignore_keyboard`] instead
     /// (the tree / modal / find-bar overlay toggles it).
     focus_id: Option<iced::widget::Id>,
+    /// Paste can attach the clipboard's copied files or image data; text pastes
+    /// as it always does when the clipboard carries no attachment. Set by the
+    /// chat composer alone.
+    attachments_on_paste: bool,
+    /// Which key presses a focused field still lets through to the page instead
+    /// of capturing them — the page names its own shortcuts, so the widget keeps
+    /// no list of them. Everything else is captured, so a field over another
+    /// widget (a modal over the code editor) owns the keyboard.
+    passthrough: fn(&keyboard::Key, keyboard::Modifiers, key::Physical) -> bool,
 }
 
 impl<'a> EditorWidget<'a> {
@@ -2289,6 +2308,8 @@ impl<'a> EditorWidget<'a> {
             max_height: None,
             background: Some(theme::BG_BASE),
             focus_id: None,
+            attachments_on_paste: false,
+            passthrough: |_, _, _| false,
         }
     }
 
@@ -2309,6 +2330,76 @@ impl<'a> EditorWidget<'a> {
     pub fn id(mut self, id: impl Into<iced::widget::Id>) -> Self {
         self.focus_id = Some(id.into());
         self
+    }
+
+    /// Read clipboard files or images as attachments on paste. A paste that
+    /// finds none falls back to the text clipboard, and one that attaches
+    /// nothing still says why ([`EditorAction::PasteAttachments`]'s `refused`).
+    #[must_use]
+    pub const fn attachments_on_paste(mut self, on: bool) -> Self {
+        self.attachments_on_paste = on;
+        self
+    }
+
+    /// Keys a focused field still leaves uncaptured, so the page's own
+    /// shortcuts reach its `keyboard::listen`. Every field the dashboard builds
+    /// passes [`super::is_dashboard_shortcut`] — the same predicate the listener
+    /// filters on, so the two cannot drift; a page that owns its own keyboard
+    /// (the code editor) leaves the default, which captures everything.
+    #[must_use]
+    pub const fn keyboard_passthrough(
+        mut self,
+        passthrough: fn(&keyboard::Key, keyboard::Modifiers, key::Physical) -> bool,
+    ) -> Self {
+        self.passthrough = passthrough;
+        self
+    }
+
+    /// Publish what a paste should do, for a field that accepts attachments:
+    /// copied files first, then text, then image data. Text outranks an image
+    /// because a spreadsheet cell or a word-processor selection puts both on the
+    /// pasteboard and the text is what was meant, while a screenshot carries no
+    /// text at all and still arrives as an image. A paste that attaches nothing
+    /// still says why when there is nothing to paste.
+    fn paste_clipboard(
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, EditorAction>,
+    ) {
+        use iced::advanced::clipboard::Kind;
+
+        // Copied files are unambiguous: nothing else on the pasteboard competes
+        // with them, and reading them costs no decoding.
+        let (files, refused) = super::pasteboard::read_files();
+        if !files.is_empty() || !refused.is_empty() {
+            shell.publish(EditorAction::PasteAttachments {
+                attachments: files,
+                refused,
+            });
+            return;
+        }
+        if let Some(text) = clipboard
+            .read(Kind::Standard)
+            .filter(|text| !text.is_empty())
+        {
+            shell.publish(EditorAction::Paste(text));
+            return;
+        }
+        let refused = match super::pasteboard::read_image() {
+            Ok(Some(image)) => {
+                shell.publish(EditorAction::PasteAttachments {
+                    attachments: vec![image],
+                    refused: Vec::new(),
+                });
+                return;
+            }
+            Ok(None) if super::pasteboard::can_read() => return,
+            Ok(None) => vec![super::pasteboard::UNSUPPORTED.to_string()],
+            Err(warning) => vec![warning],
+        };
+        shell.publish(EditorAction::PasteAttachments {
+            attachments: Vec::new(),
+            refused,
+        });
     }
 
     /// Set the padding.
@@ -2970,7 +3061,13 @@ where
                 // click elsewhere unfocuses it (each widget in the view does
                 // the same check against its own bounds).
                 if self.focus_id.is_some() {
-                    state.is_focused = cursor.position_in(layout.bounds()).is_some();
+                    let inside = cursor.position_in(layout.bounds()).is_some();
+                    state.is_focused = inside;
+                    if inside {
+                        // The field takes the text-selection shortcuts over:
+                        // a transcript block must not also select or copy.
+                        super::selectable::deactivate();
+                    }
                 }
                 // Re-shape the buffer with the current scroll BEFORE hit-test
                 // (see `with_viewport_shaped`).
@@ -3166,8 +3263,12 @@ where
                 }
                 // A focused input owns the keyboard exclusively: capture the event so
                 // it never reaches other widgets beneath it in a stack (e.g. the
-                // full-page code editor under a modal's commit field).
-                if self.focus_id.is_some() {
+                // full-page code editor under a modal's commit field). The page's
+                // own shortcuts stay uncaptured so they still reach
+                // `keyboard::listen`.
+                if self.focus_id.is_some()
+                    && !(self.passthrough)(key_press, *modifiers, *physical_key)
+                {
                     shell.capture_event();
                 }
                 // While an IME composition is active the IME owns the
@@ -3202,6 +3303,12 @@ where
                                 return;
                             }
                             'v' => {
+                                if self.attachments_on_paste {
+                                    Self::paste_clipboard(clipboard, shell);
+                                    shell.invalidate_layout();
+                                    shell.request_redraw();
+                                    return;
+                                }
                                 if let Some(text) =
                                     clipboard.read(iced::advanced::clipboard::Kind::Standard)
                                 {

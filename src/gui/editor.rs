@@ -1761,7 +1761,8 @@ impl EditorState {
             .placeholder("")
             .padding(theme::PAD_2)
             .background(Some(iced::Color::TRANSPARENT))
-            .id(Id::from(format!("rename_input_{}", node.full_path)));
+            .id(Id::from(format!("rename_input_{}", node.full_path)))
+            .keyboard_passthrough(super::is_dashboard_shortcut);
         let input: Element<'a, EditorMessage> =
             iced::Element::new(editor).map(|action| match action {
                 super::editor_widget::EditorAction::Submit => EditorMessage::RenameSubmit,

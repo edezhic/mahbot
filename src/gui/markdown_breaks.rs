@@ -2,11 +2,11 @@
 //! line breaks so they render as visible line breaks, without touching code.
 //!
 //! A chat message entered with Shift+Enter stores a literal newline. The
-//! markdown renderer (iced_widget, via `iced_selection`) treats a single
-//! newline within a paragraph as a *soft break*, which it renders as a single
-//! space — so multi-line messages lose their intended line breaks. Injecting
-//! two trailing spaces before that newline turns it into a *hard break*, which
-//! the renderer displays as a visible line break.
+//! markdown renderer (iced_widget, via the selectable markdown viewer) treats a
+//! single newline within a paragraph as a *soft break*, which it renders as a
+//! single space — so multi-line messages lose their intended line breaks.
+//! Injecting two trailing spaces before that newline turns it into a *hard
+//! break*, which the renderer displays as a visible line break.
 //!
 //! The conversion is code-aware. It reuses pulldown-cmark (the same parser
 //! iced_widget's markdown renderer drives) to locate exactly the `SoftBreak`

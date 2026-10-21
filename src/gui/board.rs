@@ -1091,16 +1091,20 @@ impl BoardState {
             }
             BoardMessage::SendComment => {
                 let text = self.comment_input.text();
-                let trimmed =
-                    match super::common::send_guard(&text, self.sending_comment, false, |count| {
+                let trimmed = match super::common::send_guard(
+                    &text,
+                    self.sending_comment,
+                    super::common::SendRules::Board,
+                    |count| {
                         Task::done(BoardMessage::Toast(super::ToastMessage::Warning(format!(
                             "Comment too long: {count} characters (maximum {MAX_INPUT_CHARS}). \
                                  Please shorten your comment."
                         ))))
-                    }) {
-                        Ok(t) => t.to_string(),
-                        Err(task) => return task,
-                    };
+                    },
+                ) {
+                    Ok(t) => t.to_string(),
+                    Err(task) => return task,
+                };
 
                 let Some(ticket_id) = self.selected_ticket.as_ref().map(|t| t.id.clone()) else {
                     return Task::none();
@@ -1985,7 +1989,7 @@ impl BoardState {
 
         Some(if let Some(items) = description_md {
             container(widgets::vscroll_sized(
-                iced_selection::markdown::view(items, theme::markdown_settings())
+                super::selectable::markdown::view(items, theme::markdown_settings())
                     .map(BoardMessage::LinkClicked),
                 Length::Fill,
                 Length::Shrink,
@@ -2029,6 +2033,7 @@ impl BoardState {
                 grey_on_empty: false,
                 send_tooltip: "send comment",
                 id: Some(iced::widget::Id::new("board_comment_composer")),
+                attachments_on_paste: false,
             },
         ))
         .width(Length::Fill)
@@ -2070,7 +2075,7 @@ impl BoardState {
                 .size(theme::TEXT_13)
                 .into()
             } else if let Some((_, items)) = comments_md.iter().find(|(idx, _)| *idx == i) {
-                iced_selection::markdown::view(items, theme::markdown_settings())
+                super::selectable::markdown::view(items, theme::markdown_settings())
                     .map(BoardMessage::LinkClicked)
             } else {
                 selectable_text(&comment.content, theme::TEXT_PRIMARY)

@@ -22,10 +22,12 @@
 //! A marker is in scope only when it names a file inside one of those
 //! directories; everything else — another chat's or message's attachment, a
 //! hand-typed `[IMAGE:...]` / `[AUDIO:...]` / `[VIDEO:...]` / `[FILE:...]`
-//! annotation, or an off-chat (gui/voice) message, which carries no Telegram
-//! identity and no attachments — is inert text: IMAGE/AUDIO/VIDEO degrade to a
-//! plain annotation and `[FILE:...]` stays verbatim, so it is never read,
-//! transcribed, copied into workspace uploads, or deleted.
+//! annotation, or a message that owns no directory at all (a voice message, or
+//! any message whose producer staged nothing) — is inert text: IMAGE/AUDIO/VIDEO
+//! degrade to a plain annotation and `[FILE:...]` stays verbatim, so it is never
+//! read, transcribed, copied into workspace uploads, or deleted. The desktop
+//! chat's composer stages its attachments the same way (`gui::attachment`), so a
+//! GUI message is enriched exactly like a Telegram one.
 //!
 //! The entry points are [`enrich_message`] and [`enrich_links`], re-exported
 //! from [`crate::channels`], and [`has_inbound_temp_marker`], which
@@ -374,9 +376,9 @@ async fn canonical_telegram_files_root() -> Option<std::path::PathBuf> {
 /// copying and deleting, so it demands the exact owning directory. A marker
 /// naming anything else — another chat's attachment, another message's
 /// attachment, or a hand-typed `[FILE:/etc/passwd]` — is inert text and must
-/// never be read, copied into a workspace, or deleted. Off-chat messages
-/// (gui/voice) carry no Telegram identity and so own nothing, and neither does a
-/// message without an attachment.
+/// never be read, copied into a workspace, or deleted. A message without an
+/// attachment owns no directory — that is all this predicate asks of the channel
+/// it came from (a GUI message's directories are staged by its composer).
 async fn is_inbound_attachment(path: &std::path::Path, staging_dirs: &[String]) -> bool {
     if staging_dirs.is_empty() {
         return false;
@@ -871,8 +873,9 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
     let mut batch = EnrichmentBatch::default();
     let mut result = msg.content.clone();
     let uploads_dir = workspace_path.map(|p| p.join("uploads"));
-    // The staging directories the receive path created for this message; empty
-    // for an off-chat (gui/voice) message, which owns no attachments.
+    // The staging directories this message's producer created for it: the
+    // Telegram receive path, or the desktop composer (`gui::attachment`). Empty
+    // when it has no attachment.
     let staging_dirs = msg.attachment_dirs.clone();
 
     for caps in MEDIA_MARKER_RE.captures_iter(&msg.content) {

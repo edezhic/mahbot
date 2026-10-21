@@ -604,9 +604,10 @@ pub struct ChannelMessage {
     pub message_id: Option<i64>,
     /// Names of the staging directories this message owns inbound attachments
     /// for: one for a single message, several for an album merged into one
-    /// message. The receive path downloads each attachment into its own
-    /// directory named by `util::telegram_staging_dir_name`, so this is the set
-    /// of directories the message may read, copy from and delete.
+    /// message. The producer — the Telegram receive path, or the desktop
+    /// composer — stages a message's attachments into directories named by
+    /// `util::telegram_staging_dir_name`, so this is the set of directories the
+    /// message may read, copy from and delete.
     pub attachment_dirs: Vec<String>,
     /// The individual messages a collected burst is composed of, in send order,
     /// when the Telegram channel merged several into one request (see

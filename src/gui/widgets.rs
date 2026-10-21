@@ -6,6 +6,7 @@ use super::theme;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer;
+use iced::advanced::text::{IntoFragment, Span};
 use iced::advanced::widget::Operation;
 use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::{Clipboard, Shell, Widget};
@@ -18,7 +19,6 @@ use iced::{
     Alignment, Color, Element, Event, Length, Padding, Point, Rectangle, Size, Task, Vector,
 };
 use iced_fonts::lucide;
-use iced_selection;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
@@ -113,7 +113,8 @@ fn editor_field<'a, M: 'a>(
         .enter(enter)
         .placeholder(placeholder)
         .padding(theme::PAD_5)
-        .background(Some(theme::BG_ELEVATED));
+        .background(Some(theme::BG_ELEVATED))
+        .keyboard_passthrough(super::is_dashboard_shortcut);
     if let Some(id) = id {
         editor = editor.id(id);
     }
@@ -527,13 +528,15 @@ pub fn ghost_icon_button<Message: 'static + Clone>() -> Element<'static, Message
 /// Create a selectable text widget with the given color.
 ///
 /// Accepts both borrowed (`&str`) and owned (`String`) text content.
-pub fn selectable_text<'a>(
-    content: impl iced_selection::text::IntoFragment<'a>,
+pub fn selectable_text<'a, Message: 'a>(
+    content: impl IntoFragment<'a>,
     color: Color,
-) -> iced_selection::text::Text<'a, iced::Theme, iced::Renderer> {
-    iced_selection::text::Text::new(content).style(move |_theme| iced_selection::text::Style {
-        color: Some(color),
-        selection: theme::ACCENT_DIM,
+) -> super::selectable::Selectable<'a, (), Message, iced::Theme, iced::Renderer> {
+    super::selectable::rich_text([Span::new(content)]).style(move |_theme| {
+        super::selectable::Style {
+            color: Some(color),
+            selection: theme::ACCENT_DIM,
+        }
     })
 }
 
@@ -722,9 +725,9 @@ pub struct ChatComposerOptions<'a, M> {
     /// input surface (Home's composer controls; empty for the plain Board
     /// composer).
     pub controls: Vec<Element<'a, M>>,
-    /// Grey the send button while the input is empty/whitespace-only.
-    /// Home enables this (empty-input affordance); Board keeps its legacy
-    /// always-active look.
+    /// Grey the send button while the surface has nothing to send. Home passes
+    /// `attachments.is_empty()`, since an attachment sends on its own; Board
+    /// keeps its legacy always-active look.
     pub grey_on_empty: bool,
     /// Tooltip text for the send button — surface-specific wording
     /// ("send text message" on Home, "send comment" on the Board ticket
@@ -734,6 +737,10 @@ pub struct ChatComposerOptions<'a, M> {
     /// and gating keyboard processing on focus so keystrokes don't leak when
     /// it is not focused.
     pub id: Option<iced::widget::Id>,
+    /// Paste can attach clipboard files or images, with text still pasted when
+    /// the clipboard carries none (the Home chat composer; the Board comment
+    /// box keeps plain text).
+    pub attachments_on_paste: bool,
 }
 
 /// Shared chat composer: a full-width bubble-styled input surface that
@@ -761,7 +768,9 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         .min_height(options.min_height)
         .max_height(options.max_height)
         .padding(theme::PAD_5)
-        .background(Some(theme::BG_ELEVATED));
+        .background(Some(theme::BG_ELEVATED))
+        .attachments_on_paste(options.attachments_on_paste)
+        .keyboard_passthrough(super::is_dashboard_shortcut);
     if let Some(id) = options.id {
         editor = editor.id(id);
     }
@@ -1849,12 +1858,13 @@ enum ClickKind {
 }
 
 /// Max cursor travel (px) between press and release for the pair to count as
-/// a click rather than a drag selection. Matches iced_selection's 6 px click
-/// slop so both widgets classify a sloppy press the same way.
-const CLICK_DRAG_MAX_DISTANCE: f32 = 6.0;
-/// Max gap between consecutive clicks for the second+ click to be a
-/// double/triple click (word/line selection, not a toggle).
-const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
+/// a click rather than a drag. Shared with [`super::selectable`], so both read
+/// a sloppy press the same way.
+pub(crate) const CLICK_DRAG_MAX_DISTANCE: f32 = 6.0;
+/// Max gap between consecutive presses for the second+ one to be a
+/// double/triple click (word/line selection, not a toggle). Shared with
+/// [`super::selectable`].
+pub(crate) const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
 
 /// Classify a press+release pair by cursor travel and time since the last click.
 ///

@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
+use super::selectable;
 use crate::util::media_target;
 use crate::util::{
     MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, file_name_or_path, parse_media_marker,
@@ -512,9 +513,9 @@ pub(crate) fn reveal_file_marker(target: &str, workspace: Option<&Path>) -> Resu
     super::reveal_in_file_manager(&path)
 }
 
-// ── Selectable markdown Viewer (iced_selection + inline images) ────
+// ── Selectable markdown Viewer (selectable text + inline images) ───
 
-/// A markdown `Viewer` rendering text through `iced_selection` (selectable,
+/// A markdown `Viewer` rendering text through [`super::selectable`] (selectable,
 /// copyable) while keeping the inline-image rendering of the previous viewer.
 struct SelectableMediaViewer<'a> {
     files: &'a [FileMarker],
@@ -625,7 +626,7 @@ fn span_with_text(
 impl<'a, Theme, Renderer> markdown::Viewer<'a, markdown::Uri, Theme, Renderer>
     for SelectableMediaViewer<'a>
 where
-    Theme: markdown::Catalog + iced_selection::text::Catalog + 'a,
+    Theme: markdown::Catalog + 'a,
     Renderer: text::Renderer<Paragraph = iced::advanced::graphics::text::Paragraph, Font = Font>
         + advanced_image::Renderer<Handle = image::Handle>
         + 'a,
@@ -689,7 +690,7 @@ where
             markdown::HeadingLevel::H6 => settings.h6_size,
         };
         let spans = text.spans(settings.style);
-        let rich = iced_selection::rich_text(self.marker_spans(&spans)).size(size);
+        let rich = selectable::rich_text(self.marker_spans(&spans)).size(size);
         container(rich.on_link_click(|url| url))
             .padding(padding::top(if index > 0 {
                 settings.text_size / 2.0
@@ -705,7 +706,7 @@ where
         text: &markdown::Text,
     ) -> Element<'a, markdown::Uri, Theme, Renderer> {
         let spans = text.spans(settings.style);
-        iced_selection::rich_text(self.marker_spans(&spans))
+        selectable::rich_text(self.marker_spans(&spans))
             .size(settings.text_size)
             .on_link_click(|url| url)
             .into()
@@ -718,7 +719,7 @@ where
         _code: &'a str,
         lines: &'a [markdown::Text],
     ) -> Element<'a, markdown::Uri, Theme, Renderer> {
-        iced_selection::markdown::code_block(settings, lines, |url| url)
+        selectable::markdown::code_block(settings, lines, |url| url)
     }
 
     fn unordered_list(
@@ -726,7 +727,7 @@ where
         settings: markdown::Settings,
         bullets: &'a [markdown::Bullet],
     ) -> Element<'a, markdown::Uri, Theme, Renderer> {
-        iced_selection::markdown::unordered_list(self, settings, bullets)
+        selectable::markdown::unordered_list(self, settings, bullets)
     }
 
     fn ordered_list(
@@ -735,7 +736,7 @@ where
         start: u64,
         bullets: &'a [markdown::Bullet],
     ) -> Element<'a, markdown::Uri, Theme, Renderer> {
-        iced_selection::markdown::ordered_list(self, settings, start, bullets)
+        selectable::markdown::ordered_list(self, settings, start, bullets)
     }
 }
 

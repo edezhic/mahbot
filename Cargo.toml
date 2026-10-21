@@ -65,7 +65,6 @@ iced_fonts = { version = "0.3", default-features = false, features = ["lucide", 
 # text instead of being dropped at parse time.
 pulldown-cmark = "0.12"
 iced_anim = "0.3"
-iced_selection = { version = "0.5", features = ["markdown"] }
 iced_term = "0.8.0"
 
 # HTTP / WebSocket client
@@ -329,7 +328,10 @@ objc2-core-graphics = "0.3"
 # App enumeration (NSWorkspace/NSRunningApplication) for the `apps` action, and
 # the running application's own icon ([`crate::app_icon`]): NSImage built from the
 # embedded artwork's pixels, with NSBitmapImageRep as its representation.
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSBitmapImageRep", "NSGraphics", "NSImage", "NSImageRep", "NSRunningApplication", "NSWorkspace"] }
+# `NSPasteboard` serves the chat composer's clipboard attachments
+# (`gui::pasteboard`): copied file URLs and image data, neither of which iced's
+# text-only clipboard exposes.
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSBitmapImageRep", "NSGraphics", "NSImage", "NSImageRep", "NSPasteboard", "NSRunningApplication", "NSWorkspace"] }
 objc2-application-services = "0.3"
 objc2-screen-capture-kit = "0.3"
 block2 = "0.6"

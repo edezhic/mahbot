@@ -473,12 +473,13 @@ impl TelegramAttachmentKind {
     }
 }
 
-/// Recognized image file extensions for Telegram receive-path routing.
-/// PNG/JPEG/WebP only — gif/bmp are deliberately NOT routed as images
-/// anywhere (codec support is trimmed; see the image dependency's feature
-/// list). GIF-picker animations arrive as `video`-kind attachments and take
-/// the video path instead.
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+/// Recognized image file extensions for Telegram receive-path routing — the one
+/// list that decides whether an attachment arrives as an image, so the chat
+/// composer's own intake asks this. PNG/JPEG/WebP only — gif/bmp are
+/// deliberately NOT routed as images anywhere (codec support is trimmed; see the
+/// image dependency's feature list). GIF-picker animations arrive as
+/// `video`-kind attachments and take the video path instead.
+pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
 /// MIME prefixes routed as images by the MIME fallback in
 /// [`format_attachment_content`]. Mirrors [`IMAGE_EXTENSIONS`]: only the

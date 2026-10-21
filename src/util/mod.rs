@@ -1231,7 +1231,8 @@ pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "he
 /// lives in `telegram.rs`.
 pub(crate) const FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
-/// The daemon-owned temp root for inbound Telegram attachments, one staging
+/// The daemon-owned temp root for inbound attachments — the Telegram receive
+/// path's downloads and the desktop composer's staged files — one staging
 /// subdirectory per message.
 pub(crate) const TELEGRAM_FILES_DIR: &str = "mahbot_telegram_files";
 
@@ -1256,9 +1257,10 @@ pub(crate) fn telegram_files_root() -> std::path::PathBuf {
 }
 
 /// Name of the per-message subdirectory of `telegram_files_root` holding one
-/// message's inbound attachments. The receive path names the directory with it
-/// and records it on the message, so the containment check compares against
-/// exactly the name that was created.
+/// message's inbound attachments. The producer — the Telegram receive path or
+/// the desktop composer — names the directory with it and records it on the
+/// message, so the containment check compares against exactly the name that was
+/// created.
 #[must_use]
 pub(crate) fn telegram_staging_dir_name(chat_id: &str, message_id: i64) -> String {
     format!("msg_{chat_id}_{message_id}")

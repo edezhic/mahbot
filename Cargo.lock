@@ -3412,16 +3412,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iced_selection"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ab7ead659318b8eea8f864bafe96f761e244c32e11d55035b99dcf0c56ba757"
-dependencies = [
- "iced_widget",
- "unicode-segmentation",
-]
-
-[[package]]
 name = "iced_term"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4371,7 +4361,6 @@ dependencies = [
  "iced",
  "iced_anim",
  "iced_fonts",
- "iced_selection",
  "iced_term",
  "ignore",
  "image",

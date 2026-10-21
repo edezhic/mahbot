@@ -897,9 +897,9 @@ impl LogsState {
             }
         }
 
-        let rich: iced_selection::text::Rich<'_, (), LogMessage, iced::Theme, iced::Renderer> =
-            iced_selection::text::Rich::from_iter(spans)
-                .style(|_t| iced_selection::text::Style {
+        let rich: super::selectable::Selectable<'_, (), LogMessage, iced::Theme, iced::Renderer> =
+            super::selectable::rich_text(spans)
+                .style(|_t| super::selectable::Style {
                     color: None,
                     selection: theme::ACCENT_DIM,
                 })

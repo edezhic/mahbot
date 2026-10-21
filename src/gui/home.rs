@@ -38,12 +38,16 @@ const DEDUP_RETAIN: usize = 200;
 /// persisted to disk.
 const DRAFT_SETTLE_MS: u64 = 700;
 
+/// How soon after the page is drawn the composer takes the keyboard: long
+/// enough for the frame that shows it, short enough to be imperceptible.
+const FOCUS_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Scrollable ID for the chat message list, used for snap-to-end after
 /// history loads.
 pub(super) const CHAT_SCROLL_ID: Id = Id::new("home_chat_scroll");
 
 /// Focus id for the chat composer editor, used to refocus it after selecting
-/// a reply target.
+/// a reply target and when the page opens or is navigated to.
 const CHAT_COMPOSER_ID: Id = Id::new("home_chat_composer");
 
 /// A displayed chat message in the scroll view.
@@ -136,6 +140,26 @@ impl From<ChatHistoryEntry> for DisplayMessage {
             false,
         )
     }
+}
+
+/// The toast naming what an intake could not attach; nothing when it refused
+/// nothing.
+fn refused_toast(refused: &[String]) -> Task<HomeMessage> {
+    if refused.is_empty() {
+        return Task::none();
+    }
+    Task::done(HomeMessage::Toast(ToastMessage::Warning(
+        refused.join("\n"),
+    )))
+}
+
+/// Remove a send's staged copy on the runtime: a discard can land while a large
+/// staging copy is still running, so it must not hold the update thread.
+fn discard_staged(dirs: Vec<String>) {
+    if dirs.is_empty() {
+        return;
+    }
+    tokio::spawn(async move { super::attachment::discard(&dirs).await });
 }
 
 /// Broadcast a transient GUI chat event via
@@ -354,8 +378,28 @@ pub enum HomeMessage {
     WorkspaceChanged(String),
     /// Text editor content changed.
     InputChanged(super::editor_widget::EditorAction),
+    /// Attachments joined the message being composed — pasted into the composer
+    /// or dropped anywhere over this page — and the names of the files the size
+    /// cap turned away, which the composer reports.
+    Attach {
+        attachments: Vec<super::attachment::Attachment>,
+        refused: Vec<String>,
+    },
+    /// Remove the attachment at this index from the composer.
+    RemoveAttachment(usize),
+    /// The page has been drawn — hand the keyboard to the composer.
+    FocusComposerOnce,
     /// Send button pressed or Enter key in editor.
     SendMessage,
+    /// The composer's attachments are staged (or the copy failed) and the send
+    /// continues here, off the update thread. `generation` names the send, so a
+    /// result for one that was cleared meanwhile delivers nothing.
+    Staged {
+        generation: u64,
+        text: String,
+        attachments: Vec<super::attachment::Attachment>,
+        result: Result<super::attachment::Staged, String>,
+    },
     /// The whole conversation loaded from the store — what the cap keeps for it
     /// and nothing else, in one read. `generation` is the load counter the read
     /// was issued under: a result whose generation is no longer current belongs
@@ -449,6 +493,13 @@ pub struct HomeState {
     seen_ids: HashSet<String>,
     /// Text editor content.
     editor_content: super::editor_widget::EditorBuffer,
+    /// Files and images attached to the next send. Not persisted with the
+    /// draft — a draft is text and its reply only.
+    attachments: Vec<super::attachment::Attachment>,
+    /// The composer is to take the keyboard once this page has been drawn. A
+    /// focus operation applies to the frame that is already on screen, so it is
+    /// sent one tick later, never in the task that switched the page.
+    pending_focus: bool,
     /// Whether a message is currently being sent / agent is responding.
     sending: bool,
     /// Whether a typing indicator is active.
@@ -458,7 +509,8 @@ pub struct HomeState {
     /// Whether the Phase-1 scripted onboarding scenario is active (shown while
     /// `provider_configured() == false`).
     onboarding_script_active: bool,
-    /// Generation counter for stale sending timeout detection.
+    /// Names the send in flight, so a stale result is ignored: bumped when a
+    /// timeout guard is armed and when the conversation is cleared.
     sending_gen: u64,
     /// Whether auto-scroll is enabled (user is scrolled to the bottom).
     auto_scroll_enabled: bool,
@@ -499,6 +551,8 @@ impl HomeState {
                 "",
                 Some(super::highlight::HighlightLanguage::Markdown),
             ),
+            attachments: Vec::new(),
+            pending_focus: false,
             sending: false,
             typing: false,
             typing_tick_state: 0,
@@ -533,7 +587,17 @@ impl HomeState {
     /// hangs off the screen opening, never off a selection arriving.
     pub fn open(&mut self) -> Task<HomeMessage> {
         self.restore_draft();
+        self.arm_composer_focus();
         self.refresh_history()
+    }
+
+    /// Give the composer the keyboard on the next frame — its focus is what lets
+    /// a paste land in the input without a click first.
+    pub(super) fn arm_composer_focus(&mut self) {
+        // The field is about to own the text-selection shortcuts; a transcript
+        // block left active by an earlier press must not also take them.
+        super::selectable::deactivate();
+        self.pending_focus = true;
     }
 
     /// The load counter: a load was issued exactly when it advanced. Read by the
@@ -1093,7 +1157,7 @@ impl HomeState {
         // the 8px horizontal padding matches the chat scrollable wrapper's inset,
         // and the bottom padding matches the shared chat vertical rhythm.
         // The bubble itself keeps its own elevated styling.
-        let input_area: Element<'_, HomeMessage> = container(super::widgets::chat_composer(
+        let composer: Element<'_, HomeMessage> = super::widgets::chat_composer(
             &self.editor_content,
             HomeMessage::InputChanged,
             HomeMessage::SendMessage,
@@ -1107,17 +1171,40 @@ impl HomeState {
                 min_height: 44.0,
                 max_height: 330.0,
                 controls,
-                grey_on_empty: true,
+                // An attachment-only message still sends: keep the button live
+                // when something is attached.
+                grey_on_empty: self.attachments.is_empty(),
                 send_tooltip: "send text message",
                 id: Some(CHAT_COMPOSER_ID),
+                attachments_on_paste: true,
             },
-        ))
-        .style(theme::base_container_style)
-        .padding(
-            iced::Padding::from([0.0, theme::PAD_8]).bottom(super::widgets::CHAT_VERTICAL_RHYTHM),
-        )
-        .width(Length::Fill)
-        .into();
+        );
+
+        // Attachment chips sit above the input bubble, in the same strip, and
+        // only while the message has something attached.
+        let composer: Element<'_, HomeMessage> = if self.attachments.is_empty() {
+            composer
+        } else {
+            let chips = row(self
+                .attachments
+                .iter()
+                .enumerate()
+                .map(|(index, attachment)| {
+                    super::attachment::chip(attachment, HomeMessage::RemoveAttachment(index))
+                }))
+            .spacing(theme::SPACE_6)
+            .wrap();
+            column![chips, composer].spacing(theme::SPACE_6).into()
+        };
+
+        let input_area: Element<'_, HomeMessage> = container(composer)
+            .style(theme::base_container_style)
+            .padding(
+                iced::Padding::from([0.0, theme::PAD_8])
+                    .bottom(super::widgets::CHAT_VERTICAL_RHYTHM),
+            )
+            .width(Length::Fill)
+            .into();
 
         // ── Recording popup (stop + send / stop + discard) ───────
         #[cfg(target_os = "macos")]
@@ -1151,6 +1238,11 @@ impl HomeState {
             subs.push(iced::Subscription::run(typing_tick));
         }
 
+        // The focus tick exists only until the composer has taken the keyboard.
+        if self.pending_focus {
+            subs.push(iced::time::every(FOCUS_TICK).map(|_| HomeMessage::FocusComposerOnce));
+        }
+
         iced::Subscription::batch(subs)
     }
 
@@ -1164,20 +1256,71 @@ impl HomeState {
                 self.selected_workspace = Some(ws_name);
                 Task::none()
             }
-            HomeMessage::InputChanged(action) => {
-                let changes_text = action.changes_text();
-                super::common::apply_editor_action(
-                    &mut self.editor_content,
-                    &mut self.undo_stack,
-                    action,
-                );
-                if changes_text {
-                    self.capture_draft(DRAFT_SETTLE_MS)
-                } else {
-                    Task::none()
+            HomeMessage::InputChanged(action) => match action {
+                super::editor_widget::EditorAction::PasteAttachments {
+                    attachments,
+                    refused,
+                } => self.attach(attachments, &refused),
+                action => {
+                    let changes_text = action.changes_text();
+                    super::common::apply_editor_action(
+                        &mut self.editor_content,
+                        &mut self.undo_stack,
+                        action,
+                    );
+                    if changes_text {
+                        self.capture_draft(DRAFT_SETTLE_MS)
+                    } else {
+                        Task::none()
+                    }
                 }
+            },
+            HomeMessage::Attach {
+                attachments,
+                refused,
+            } => self.attach(attachments, &refused),
+            HomeMessage::RemoveAttachment(index) => {
+                if index < self.attachments.len() {
+                    self.attachments.remove(index);
+                }
+                Task::none()
+            }
+            HomeMessage::FocusComposerOnce => {
+                if !self.pending_focus {
+                    return Task::none();
+                }
+                self.pending_focus = false;
+                iced::widget::operation::focus(CHAT_COMPOSER_ID)
             }
             HomeMessage::SendMessage => self.send_message(),
+            HomeMessage::Staged {
+                generation,
+                text,
+                attachments,
+                result,
+            } => {
+                if generation != self.sending_gen {
+                    // A send cleared while its copy ran: nothing will deliver
+                    // it, so the staged copy goes back and the files with it.
+                    if let Ok(staged) = &result {
+                        discard_staged(staged.dirs.clone());
+                    }
+                    self.restore_attachments(attachments);
+                    return Task::none();
+                }
+                match result {
+                    Ok(staged) => self.deliver(&text, staged, attachments),
+                    Err(error) => {
+                        // Nothing of this send reached the transcript, so no
+                        // bubble to remove.
+                        let restored = self.restore_send(&text, attachments, None);
+                        Task::batch([
+                            restored,
+                            Task::done(HomeMessage::Toast(ToastMessage::Warning(error))),
+                        ])
+                    }
+                }
+            }
             HomeMessage::HistoryLoaded {
                 entries,
                 generation,
@@ -1205,6 +1348,9 @@ impl HomeState {
                 self.messages.clear();
                 self.seen_ids.clear();
                 self.sending = false;
+                // A copy staged for the conversation being cleared must not
+                // deliver into the fresh one; its generation no longer matches.
+                self.sending_gen = self.sending_gen.wrapping_add(1);
                 self.typing = false;
                 self.typing_tick_state = 0;
                 self.pending_reply = None;
@@ -1302,7 +1448,9 @@ impl HomeState {
                 let draft = self.capture_draft(DRAFT_SETTLE_MS);
                 // Refocus the composer so the user can type the reply
                 // immediately, matching the select-to-focus affordance
-                // established by the composer's `Id`.
+                // established by the composer's `Id`. The field takes the
+                // text-selection shortcuts with the keyboard.
+                super::selectable::deactivate();
                 Task::batch([
                     iced::widget::operation::focus::<HomeMessage>(CHAT_COMPOSER_ID),
                     draft,
@@ -1489,27 +1637,153 @@ impl HomeState {
         }
     }
 
-    /// Construct and send the user's message through the GUI channel.
+    /// Validate the composer and send it through the GUI channel. Staging the
+    /// attachments copies up to the product's file cap, so it runs as a task
+    /// and the send continues in [`HomeMessage::Staged`].
     fn send_message(&mut self) -> Task<HomeMessage> {
         let text = self.editor_content.text();
-        let trimmed = match super::common::send_guard(&text, self.sending, true, |count| {
-            Task::done(HomeMessage::Toast(ToastMessage::Warning(format!(
-                "Message too long: {count} characters (maximum {MAX_INPUT_CHARS}). Please shorten your message and try again."
-            ))))
-        }) {
+        let trimmed = match super::common::send_guard(
+            &text,
+            self.sending,
+            // Attachments alone are a message; the length limit applies to the
+            // typed text only.
+            super::common::SendRules::Chat {
+                has_attachments: !self.attachments.is_empty(),
+            },
+            |count| {
+                Task::done(HomeMessage::Toast(ToastMessage::Warning(format!(
+                    "Message too long: {count} characters (maximum {MAX_INPUT_CHARS}). Please shorten your message and try again."
+                ))))
+            },
+        ) {
             Ok(t) => t,
             Err(task) => return task,
         };
-
-        let content = trimmed.to_string();
-
-        let sender = crate::users::ADMIN_USER_NAME.to_string();
 
         // Guard against sending without a selected workspace.
         if self.selected_workspace.is_none() {
             tracing::warn!("Home: attempted to send message without a workspace selected");
             return Task::none();
         }
+
+        // The scripted setup exchange reads the provider's settings and never
+        // reaches the pipeline, so nothing attached could be delivered from it.
+        if self.onboarding_script_active && !self.attachments.is_empty() {
+            return Task::done(HomeMessage::Toast(ToastMessage::Warning(
+                "Attachments cannot be sent during setup. Remove them to continue.".to_string(),
+            )));
+        }
+
+        // A command is read from the message's first character, so an
+        // attachment's marker block must not be put in front of one.
+        if !self.attachments.is_empty() && trimmed.starts_with('/') {
+            return Task::done(HomeMessage::Toast(ToastMessage::Warning(
+                "A command cannot carry attachments. Send them in a message of their own."
+                    .to_string(),
+            )));
+        }
+
+        // The send owns its text and files from here on: clearing the composer
+        // now means anything typed or attached while a copy runs is new, and a
+        // failed copy cannot lose it.
+        self.editor_content.clear();
+        self.undo_stack.clear();
+        self.drop_draft();
+        self.sending = true;
+        let trimmed = trimmed.to_string();
+        let attachments = std::mem::take(&mut self.attachments);
+
+        if attachments.is_empty() {
+            return self.deliver(&trimmed, super::attachment::Staged::default(), attachments);
+        }
+
+        // Up to the attachment size cap is copied here: stage it off the update
+        // thread so the window keeps painting. The timeout guard is armed for
+        // the copy too, and names this send so a result that arrives after it
+        // was cleared does not deliver anything.
+        let timeout = self.sending_timeout_task();
+        let generation = self.sending_gen;
+        let staging = attachments.clone();
+        Task::batch([
+            timeout,
+            Task::perform(
+                async move { super::attachment::stage(&staging).await },
+                move |result| HomeMessage::Staged {
+                    generation,
+                    text: trimmed,
+                    attachments,
+                    result,
+                },
+            ),
+        ])
+    }
+
+    /// Put a send's attachments back in front of anything attached since.
+    fn restore_attachments(&mut self, mut attachments: Vec<super::attachment::Attachment>) {
+        attachments.append(&mut self.attachments);
+        self.attachments = attachments;
+    }
+
+    /// Give a send that never reached the pipeline back to the composer: the
+    /// attachments, the typed text when nothing has been typed since — put back
+    /// as a draft too, since sending cleared it — and no optimistic bubble left
+    /// behind.
+    fn restore_send(
+        &mut self,
+        text: &str,
+        attachments: Vec<super::attachment::Attachment>,
+        optimistic_id: Option<&str>,
+    ) -> Task<HomeMessage> {
+        self.sending = false;
+        self.restore_attachments(attachments);
+        if let Some(id) = optimistic_id {
+            self.messages
+                .retain(|message| !(message.is_optimistic && message.message_id == id));
+        }
+        if !self.editor_content.text().is_empty() {
+            return Task::none();
+        }
+        self.editor_content.set_text(text);
+        self.capture_draft(DRAFT_SETTLE_MS)
+    }
+
+    /// Take in what an intake produced: the attachments join the message being
+    /// composed, and the names it refused are reported.
+    fn attach(
+        &mut self,
+        attachments: Vec<super::attachment::Attachment>,
+        refused: &[String],
+    ) -> Task<HomeMessage> {
+        self.attachments.extend(attachments);
+        refused_toast(refused)
+    }
+
+    /// Hand a validated message to the pipeline: markers plus text as the
+    /// content, an optimistic bubble, and the pending reply cleared once it is
+    /// queued. The composer was cleared when the send started, so every way out
+    /// of here that is not a queued send gives the text and the attachments back
+    /// ([`Self::restore_send`]).
+    fn deliver(
+        &mut self,
+        trimmed: &str,
+        staged: super::attachment::Staged,
+        attachments: Vec<super::attachment::Attachment>,
+    ) -> Task<HomeMessage> {
+        let sender = crate::users::ADMIN_USER_NAME.to_string();
+        // The message is in flight from here, even if the copy outlived the
+        // send's own timeout.
+        self.sending = true;
+
+        // Telegram's own marker-then-caption shape: the markers first, then a
+        // blank line and the typed text.
+        let super::attachment::Staged { dirs, markers } = staged;
+        let content = if markers.is_empty() {
+            trimmed.to_string()
+        } else if trimmed.is_empty() {
+            markers
+        } else {
+            format!("{markers}\n\n{trimmed}")
+        };
 
         // Generate an optimistic ID for non-command messages so the Home page
         // can display the user's message immediately and replace it when the
@@ -1523,11 +1797,6 @@ impl HomeState {
         } else {
             Some(crate::generate_id())
         };
-
-        // Clear the editor.
-        self.editor_content.clear();
-        self.undo_stack.clear();
-        self.sending = true;
 
         // Push optimistic message immediately so the user sees their own
         // message without waiting for the pipeline round-trip. The pending
@@ -1561,6 +1830,11 @@ impl HomeState {
         // pending reply is dropped with the send — scripted messages never
         // carry one, and a stale reference must not attach to a later send.
         if self.onboarding_script_active {
+            // The exchange takes the text, but nothing of a staged copy reaches
+            // it: a copy that started before the exchange did gives its files
+            // back to the composer.
+            discard_staged(dirs);
+            self.restore_attachments(attachments);
             self.pending_reply = None;
             return self.send_scripted_message(content, optimistic_id);
         }
@@ -1577,31 +1851,38 @@ impl HomeState {
             content,
             channel: "gui".to_string(),
             workspace: self.selected_workspace.clone().unwrap_or_default(),
+            attachment_dirs: dirs,
             optimistic_id,
             reply_reference: reply,
             ..Default::default()
         };
 
-        // Push to GUI_MESSAGE_TX.
-        if let Some(tx) = crate::GUI_MESSAGE_TX.get() {
-            if let Err(e) = tx.send(msg) {
-                tracing::error!("Home: failed to send message via GUI_MESSAGE_TX: {e}");
-                self.sending = false;
-                self.drop_draft();
-                return Task::none();
-            }
-        } else {
+        // Push to GUI_MESSAGE_TX. A send that never reaches the pipeline gives
+        // its staged copy back, so a retry does not leave it in the temp root,
+        // and gives the composer back what it cleared.
+        let Some(tx) = crate::GUI_MESSAGE_TX.get() else {
             tracing::error!("Home: GUI_MESSAGE_TX not initialized");
-            self.sending = false;
-            self.drop_draft();
-            return Task::none();
+            discard_staged(msg.attachment_dirs);
+            return Task::batch([
+                self.restore_send(trimmed, attachments, msg.optimistic_id.as_deref()),
+                Task::done(HomeMessage::Toast(ToastMessage::Error(
+                    "The message could not be sent. Try again.".to_string(),
+                ))),
+            ]);
+        };
+        if let Err(error) = tx.send(msg) {
+            tracing::error!("Home: failed to send message via GUI_MESSAGE_TX: {error}");
+            discard_staged(error.0.attachment_dirs);
+            return Task::batch([
+                self.restore_send(trimmed, attachments, error.0.optimistic_id.as_deref()),
+                Task::done(HomeMessage::Toast(ToastMessage::Error(
+                    "The message could not be sent. Try again.".to_string(),
+                ))),
+            ]);
         }
 
-        // The send was queued — drop the pending reply so the preview clears.
+        // The send was queued: drop the pending reply so the preview clears.
         self.pending_reply = None;
-        // The composer is cleared: remove the persisted draft so it cannot
-        // resurrect on a later restore.
-        self.drop_draft();
 
         // Snap to end on optimistic push if auto-scroll enabled.
         Task::batch([self.sending_timeout_task(), self.maybe_snap()])
@@ -2756,23 +3037,23 @@ mod tests {
     }
 
     #[test]
-    fn test_send_message_within_limit_clears_editor() {
+    fn test_send_message_within_limit_keeps_the_text_when_nothing_takes_it() {
         let mut state = make_home_state("ws1");
         state.editor_content =
             EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
         let _task = state.send_message();
-        // Editor must be cleared before the GUI_MESSAGE_TX send attempt.
-        assert!(
-            state.editor_content.text().is_empty(),
-            "editor should be cleared after accepting a within-limit message"
+        // Accepted: no length rejection, and the composer was cleared at send
+        // time. With no pipeline in a test the enqueue is refused, so the send
+        // comes back whole — text, and no optimistic bubble left behind.
+        assert_eq!(
+            state.editor_content.text(),
+            "hello world",
+            "an unsent message returns to the composer"
         );
-        // Assert the optimistic push, not `sending` — GUI_MESSAGE_TX is uninitialized in tests.
+        assert!(!state.sending);
         assert!(
-            state
-                .messages
-                .iter()
-                .any(|m| m.is_optimistic && m.content == "hello world"),
-            "optimistic message should be pushed for accepted non-command text"
+            !state.messages.iter().any(|m| m.is_optimistic),
+            "a send that never reached the pipeline leaves no optimistic bubble"
         );
     }
 }

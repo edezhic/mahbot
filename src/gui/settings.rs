@@ -2014,6 +2014,7 @@ impl SettingsState {
                         .code_mode(false)
                         .enter(super::editor_widget::EnterBehavior::Newline)
                         .id(iced::widget::Id::from(format!("workspace_notes:{}", ws_item.name)))
+                        .keyboard_passthrough(super::is_dashboard_shortcut)
                         .placeholder(
                             format!("Add manual context notes for all agents… (max {MAX_WORKSPACE_NOTES_CHARS} characters)"),
                         )
@@ -2120,13 +2121,12 @@ impl SettingsState {
                         );
                     } else {
                         let md: Element<'_, SettingsMessage> =
-                            iced_selection::markdown::view(items, theme::markdown_settings()).map(
-                                |url| {
+                            super::selectable::markdown::view(items, theme::markdown_settings())
+                                .map(|url| {
                                     SettingsMessage::WorkspaceMsg(
                                         workspaces::WorkspacesMessage::LinkClicked(url),
                                     )
-                                },
-                            );
+                                });
                         view_col = view_col.push(
                             container(widgets::vscroll_sized(md, Length::Fill, Length::Shrink))
                                 .padding([theme::PAD_4, 0.0])
@@ -2662,6 +2662,7 @@ impl SettingsState {
             .code_mode(false)
             .enter(super::editor_widget::EnterBehavior::Newline)
             .id(iced::widget::Id::from("custom_role_prompt"))
+            .keyboard_passthrough(super::is_dashboard_shortcut)
             .placeholder("The authorial text that fully defines the role…")
             .min_height(120.0)
             .max_height(280.0)

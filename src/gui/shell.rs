@@ -268,7 +268,9 @@ impl ShellState {
 
         // Terminal area — shows the active tab's terminal.
         let terminal_area = if let Some(tab) = ws_state.tabs.get(ws_state.active_idx) {
-            let term_view = TerminalView::show(&tab.terminal).map(ShellMessage::TerminalEvent);
+            let term_view = super::shortcut_keys::latin_shortcuts(
+                TerminalView::show(&tab.terminal).map(ShellMessage::TerminalEvent),
+            );
             let term_container = container(term_view)
                 .width(Length::Fill)
                 .height(Length::Fill)

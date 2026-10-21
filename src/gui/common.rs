@@ -709,18 +709,34 @@ impl SingleLineEditorState {
     }
 }
 
-/// Guard a chat send: trim-empty noop, then the in-flight noop and the
-/// over-limit toast in per-page order (`in_flight_first` — home checks
-/// in-flight before the limit, board after). Returns the trimmed text when
-/// the send may proceed.
+/// Which page's send rules apply, beyond the shared length limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendRules {
+    /// The chat composer: an attachment alone is a message, and an in-flight
+    /// send is refused before the length limit is reported.
+    Chat { has_attachments: bool },
+    /// The board comment box: text is required, and the length limit is
+    /// reported before an in-flight send.
+    Board,
+}
+
+/// Guard a chat send: a silent noop for empty text (unless the chat composer
+/// has something attached), then the page's own pair of checks. Returns the
+/// trimmed text when the send may proceed.
 pub(crate) fn send_guard<M: 'static>(
     text: &str,
     sending: bool,
-    in_flight_first: bool,
+    rules: SendRules,
     over_limit: impl Fn(usize) -> Task<M>,
 ) -> Result<&str, Task<M>> {
     let trimmed = text.trim();
-    if trimmed.is_empty() {
+    let allows_empty = matches!(
+        rules,
+        SendRules::Chat {
+            has_attachments: true
+        }
+    );
+    if trimmed.is_empty() && !allows_empty {
         return Err(Task::none());
     }
     let over_limit_task = || {
@@ -731,7 +747,7 @@ pub(crate) fn send_guard<M: 'static>(
             None
         }
     };
-    if in_flight_first {
+    if matches!(rules, SendRules::Chat { .. }) {
         if sending {
             return Err(Task::none());
         }
@@ -836,13 +852,9 @@ mod tests {
     }
 
     /// Run `send_guard`, recording whether `over_limit` fired (task never run).
-    fn run_guard(
-        text: &str,
-        sending: bool,
-        in_flight_first: bool,
-    ) -> (bool, Result<&str, Task<()>>) {
+    fn run_guard(text: &str, sending: bool, rules: SendRules) -> (bool, Result<&str, Task<()>>) {
         let fired = Cell::new(false);
-        let result = send_guard(text, sending, in_flight_first, |_| {
+        let result = send_guard(text, sending, rules, |_| {
             fired.set(true);
             Task::none()
         });
@@ -851,28 +863,46 @@ mod tests {
 
     #[test]
     fn send_guard_rejects_empty_and_trims() {
-        let (fired, result) = run_guard(" \t ", false, true);
+        let (fired, result) = run_guard(" \t ", false, SendRules::Board);
         assert!(result.is_err() && !fired, "empty input is a silent noop");
-        let (_, result) = run_guard("  hello  ", false, true);
+        let (_, result) = run_guard("  hello  ", false, SendRules::Board);
         assert_eq!(result.unwrap(), "hello");
+        let (_, result) = run_guard(
+            "  ",
+            false,
+            SendRules::Chat {
+                has_attachments: true,
+            },
+        );
+        assert_eq!(
+            result.expect("attachment-only send"),
+            "",
+            "attachments allow an empty text"
+        );
     }
 
     #[test]
     fn send_guard_limit_boundary() {
         let at_limit = "a".repeat(MAX_INPUT_CHARS);
-        let (fired, result) = run_guard(&at_limit, false, true);
+        let (fired, result) = run_guard(&at_limit, false, SendRules::Board);
         assert!(result.is_ok() && !fired, "at-limit text is accepted");
         let over_limit = "a".repeat(MAX_INPUT_CHARS + 1);
-        let (fired, result) = run_guard(&over_limit, false, true);
+        let (fired, result) = run_guard(&over_limit, false, SendRules::Board);
         assert!(result.is_err() && fired, "over-limit text is rejected");
     }
 
     #[test]
     fn send_guard_combined_in_flight_and_over_limit() {
         let text = "a".repeat(MAX_INPUT_CHARS + 1);
-        let (fired, result) = run_guard(&text, true, true);
+        let (fired, result) = run_guard(
+            &text,
+            true,
+            SendRules::Chat {
+                has_attachments: false,
+            },
+        );
         assert!(result.is_err() && !fired, "in-flight first: silent noop");
-        let (fired, result) = run_guard(&text, true, false);
+        let (fired, result) = run_guard(&text, true, SendRules::Board);
         assert!(result.is_err() && fired, "toast fires over-limit first");
     }
 
