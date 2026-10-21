@@ -48,7 +48,7 @@ pub(crate) const SUMMARIZATION_THRESHOLD: u64 = 200_000;
 /// payload may be counted too. `>=` deliberately differs from the strict
 /// token threshold: images are a hard floor on context quality regardless
 /// of how a provider tokenizes them.
-pub(crate) const SUMMARIZATION_IMAGE_COUNT: usize = 10;
+pub(crate) const SUMMARIZATION_IMAGE_COUNT: usize = 20;
 
 /// Number of latest user messages / assistant answers retained per side
 /// after summarization compaction.

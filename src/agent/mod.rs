@@ -5327,9 +5327,9 @@ mod tests {
                 "the next turn must compact nothing again"
             );
 
-            // The second trigger fires here on the same terms: this session is
-            // still over the image count (the compaction above kept every image),
-            // and the delivery call carries no "already compacted" clause.
+            // The second trigger fires on its own terms: the images are pushed
+            // after the compaction above, so this session is over the image
+            // count, and the delivery call carries no "already compacted" clause.
             agent.session.push_messages_unpersisted(
                 &(0..crate::session::SUMMARIZATION_IMAGE_COUNT)
                     .map(|i| ChatMessage::user(format!("[IMAGE:data:image/jpeg;base64,img{i}]")))
@@ -5612,8 +5612,8 @@ mod tests {
     #[test]
     fn summarization_trigger_decides_reason() {
         use crate::session::{SUMMARIZATION_IMAGE_COUNT, SUMMARIZATION_THRESHOLD};
-        let nine = SUMMARIZATION_IMAGE_COUNT - 1;
-        assert_eq!(summarization_trigger(None, nine), None);
+        let just_below = SUMMARIZATION_IMAGE_COUNT - 1;
+        assert_eq!(summarization_trigger(None, just_below), None);
         assert_eq!(
             summarization_trigger(None, SUMMARIZATION_IMAGE_COUNT),
             Some("image count")
@@ -5630,7 +5630,7 @@ mod tests {
             summarization_trigger(Some(SUMMARIZATION_THRESHOLD + 1), SUMMARIZATION_IMAGE_COUNT,),
             Some("token threshold")
         );
-        assert_eq!(summarization_trigger(Some(1), nine), None);
+        assert_eq!(summarization_trigger(Some(1), just_below), None);
         assert_eq!(
             summarization_trigger(Some(1), SUMMARIZATION_IMAGE_COUNT),
             Some("image count")
