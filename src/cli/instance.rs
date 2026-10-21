@@ -363,7 +363,7 @@ mod tests {
 
         let partial = reply(
             Ok(ToolAnswer::partial(
-                "registered, but the activation write failed",
+                "added, but the activation write failed",
             )),
             &secrets,
         );

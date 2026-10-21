@@ -510,8 +510,8 @@ impl Tool for SearchTool {
         ws: &crate::Workspace,
         mut args: serde_json::Value,
     ) -> anyhow::Result<String> {
-        // Personal workspaces are not registered in the workspaces table and
-        // may lack a git repo (the indexer scans normal content fine without
+        // Personal workspaces have no `workspaces` row and may lack a git repo
+        // (the indexer scans normal content fine without
         // one, but a repo ensures hidden/dot-prefixed content is indexed).
         // Ensure the directory exists and is git-initialized before the search
         // engine scans it.

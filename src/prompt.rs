@@ -125,7 +125,7 @@ const WORKSPACE_FILES: &[&str] = &[
 ///
 /// `personal_memory` admits the [`MEMORY_FILE`] section. Only the Assistant of
 /// the account whose personal folder this is passes `true`; every other
-/// session — another role in that folder, any role in a project workspace, and
+/// session — another role in that folder, any role in a managed workspace, and
 /// every non-agent model call — passes `false`, so this builder never renders
 /// an account's continuity record for anyone else.
 pub(crate) async fn build_workspace_context(workspace: &Path, personal_memory: bool) -> String {

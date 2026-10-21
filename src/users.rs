@@ -28,7 +28,7 @@
 //! ## Personal workspaces
 //!
 //! When `selected_workspace` is NULL, the account has a personal workspace at
-//! `~/.mahbot/userspaces/<name>/`. It is NOT registered in the `workspaces` table —
+//! `~/.mahbot/userspaces/<name>/`. It has no `workspaces` row — it is
 //! computed on the fly. Personal workspaces have no board pipeline, no
 //! maintainer, no diagnostics discovery.
 
@@ -713,10 +713,10 @@ impl UserStore {
         self.list_users_where("", db::params![]).await
     }
 
-    /// Set the account's selected shared workspace, beside
+    /// Set the account's selected managed workspace, beside
     /// [`Self::set_image_gen_model`] / [`Self::set_video_model`]. `None` clears
     /// the column — the account's personal workspace (computed on the fly);
-    /// `Some(name)` selects that shared workspace.
+    /// `Some(name)` selects that managed workspace.
     pub(crate) async fn set_selected_workspace(
         &self,
         name: &str,
@@ -960,7 +960,7 @@ pub struct UserRecord {
     /// The canonical account name. When it is [`ADMIN_USER_NAME`], this is the
     /// admin account.
     pub name: String,
-    /// Selected shared workspace name, NULL = personal workspace.
+    /// Selected managed workspace name, NULL = personal workspace.
     pub selected_workspace: Option<String>,
     /// The custom tools granted to this account (the `users.granted_tools` JSON
     /// array column), byte-sorted; empty when none. A grant recorded for the
@@ -1136,8 +1136,8 @@ pub(crate) fn is_valid_personal_user_name(user_name: &str) -> bool {
 /// Return the filesystem path for a user's personal workspace:
 /// `<storage_root>/userspaces/<name>/`.
 ///
-/// This path is computed on the fly — personal workspaces are NOT registered
-/// in the `workspaces` table.
+/// This path is computed on the fly — personal workspaces have no `workspaces`
+/// row.
 #[must_use]
 pub fn personal_workspace_path(user_name: &str) -> PathBuf {
     userspaces_root().join(user_name)
@@ -1145,7 +1145,7 @@ pub fn personal_workspace_path(user_name: &str) -> PathBuf {
 
 /// The prefix of a personal workspace's synthetic name (`personal:{user}`).
 /// Personal workspaces are not `workspaces` rows, so a row carrying this prefix
-/// is a legacy leftover rather than a shared workspace.
+/// is a legacy leftover rather than a managed workspace.
 const PERSONAL_WORKSPACE_PREFIX: &str = "personal:";
 
 /// The canonical GUI-wide workspace name for a user's personal workspace:
@@ -1245,7 +1245,7 @@ async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<Stri
 /// Workspace membership is admin-only: the admin gets their stored selection
 /// (a legacy stored personal value normalizes to the canonical
 /// `personal:{user}` name); a guest ALWAYS yields their `personal:{user}`
-/// name, never a shared workspace (a shared selection is clamped, with a
+/// name, never a managed workspace (a managed selection is clamped, with a
 /// warning — defense in depth against rogue re-attachment). A NULL
 /// `selected_workspace` and a missing account row both yield the canonical
 /// `personal:{user}` name; `None` is reserved for a failed read (warned) — the
@@ -1270,13 +1270,13 @@ pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<S
         warn!(
             user_name = %user_name,
             workspace = %ws,
-            "guest has a shared selected_workspace — clamping to their personal workspace"
+            "guest has a managed selected_workspace — clamping to their personal workspace"
         );
     }
     Some(personal_workspace_name(user_name))
 }
 
-/// The registered workspaces — every `workspaces` row except a personal space,
+/// The managed workspaces — every `workspaces` row except a personal space,
 /// in the order the desktop footer picker lists them (`workspaces.name`, already
 /// ordered by the store). A personal workspace is never included: those are not
 /// `workspaces` rows, and a legacy row carrying a `personal:{user}` name is
@@ -1285,8 +1285,8 @@ pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<S
 /// Two consumers: the Assistant's `workspace` tool (the whole set for `list`
 /// / `board` / `pause` / `resume`, and the set a ticket id's workspace prefix
 /// must belong to), and the path tool's admin write policy, which refuses a
-/// write inside any registered project.
-pub async fn registered_workspaces() -> Result<Vec<Workspace>> {
+/// write inside any managed workspace.
+pub async fn managed_workspaces() -> Result<Vec<Workspace>> {
     let store = crate::workspace::WORKSPACES
         .get()
         .ok_or_else(|| anyhow::anyhow!("the workspace store is not open"))?;
@@ -1301,7 +1301,7 @@ pub async fn registered_workspaces() -> Result<Vec<Workspace>> {
 /// Get the current active workspace for an account, admin-aware.
 ///
 /// Resolves through [`resolve_selected_workspace_name`]: the admin gets their
-/// stored workspace (shared or personal), a guest always resolves to their
+/// stored workspace (managed or personal), a guest always resolves to their
 /// personal workspace. `None` (a read failure) yields the personal workspace.
 async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
     match resolve_selected_workspace_name(user_name).await {
@@ -1319,11 +1319,11 @@ async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
 ///
 /// An absolute path to an existing directory is also a legal workspace name
 /// (`crate::workspace::synthesize_from_path`): a custom-role launch may name
-/// any folder on the machine. A path that is a *registered* workspace's own
-/// folder resolves to that registered workspace, so the launch runs with its
+/// any folder on the machine. A path that is a *managed* workspace's own
+/// folder resolves to that managed workspace, so the launch runs with its
 /// notes, its pause state and its search engine instead of a second, path-named
 /// area over the same tree. Any other path is addressed by the canonical path
-/// itself (its `name` and `path` are the same string); a registered workspace
+/// itself (its `name` and `path` are the same string); a managed workspace
 /// with that name (checked first) still wins.
 ///
 /// Returns `Ok(Some(ws))` when the workspace is found or constructed,
@@ -1334,14 +1334,14 @@ async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
 /// synthetic personal workspaces identically.
 pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>> {
     if let Some(ws) = crate::workspace::get_by_name(workspace_name).await? {
-        // A shared workspace row whose name looks like a personal workspace can
+        // A managed workspace row whose name looks like a personal workspace can
         // only be a legacy row (validate_name rejects ':'), so `personal:{user}`
         // shadows the personal-workspace key. Log it so the operator can clean
         // it up — the personal key wins the registry elsewhere.
         if is_personal_workspace(&ws.name) {
             warn!(
                 workspace_name = %ws.name,
-                "Shared workspace name shadows the personal workspace key 'personal:{{user}}'"
+                "Managed workspace name shadows the personal workspace key 'personal:{{user}}'"
             );
         }
         Ok(Some(ws))
@@ -1351,7 +1351,7 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
         Ok(Some(personal_workspace_struct(user_name)))
     } else if let Some(ws) = crate::workspace::synthesize_from_path(workspace_name) {
         match crate::workspace::store().get_by_path(&ws.path).await? {
-            Some(registered) => Ok(Some(registered)),
+            Some(managed) => Ok(Some(managed)),
             None => Ok(Some(ws)),
         }
     } else {
@@ -1432,7 +1432,7 @@ pub(crate) fn enforce_personal_pinning(
 /// so callers must pass a resolvable user (the voice path passes
 /// [`ADMIN_USER_NAME`]).
 /// Accepted user decision (no migration): media written before pinning to a
-/// project workspace's `uploads/`/`generated/` stays there and is no longer
+/// managed workspace's `uploads/`/`generated/` stays there and is no longer
 /// reachable by Assistant tools (e.g. video_edit path confinement).
 #[must_use]
 pub fn effective_workspace_for_role(role: Role, ws: Workspace, user_name: &str) -> Workspace {
@@ -2226,7 +2226,7 @@ mod tests {
             "the personal workspace must use the userspaces path, got: {}",
             personal.path
         );
-        // Non-pinned roles keep the project workspace; already-personal passes through.
+        // Non-pinned roles keep the managed workspace; already-personal passes through.
         let kept = effective_workspace_for_role(Role::Engineer, project.clone(), "alice");
         assert_eq!(kept.name, "ws1");
         let already = effective_workspace_for_role(Role::Assistant, personal.clone(), "alice");
@@ -2296,14 +2296,14 @@ mod tests {
         let store = store();
 
         crate::users::test_util::with_admin_workspace_restored(async {
-            // The admin + a shared selection → keeps the shared workspace.
+            // The admin + a managed selection → keeps the managed workspace.
             store
-                .set_selected_workspace(ADMIN_USER_NAME, Some("ws_shared"))
+                .set_selected_workspace(ADMIN_USER_NAME, Some("ws_managed"))
                 .await
                 .unwrap();
             assert_eq!(
                 resolve_selected_workspace_name(ADMIN_USER_NAME).await,
-                Some("ws_shared".to_string())
+                Some("ws_managed".to_string())
             );
             // The admin + a stored personal value → normalized to the canonical name.
             store
@@ -2326,14 +2326,14 @@ mod tests {
         })
         .await;
 
-        // A guest + a shared selection → clamped to personal.
+        // A guest + a managed selection → clamped to personal.
         store
-            .set_selected_workspace("u_shared", Some("ws_shared"))
+            .set_selected_workspace("u_managed", Some("ws_managed"))
             .await
             .unwrap();
         assert_eq!(
-            resolve_selected_workspace_name("u_shared").await,
-            Some("personal:u_shared".to_string())
+            resolve_selected_workspace_name("u_managed").await,
+            Some("personal:u_managed".to_string())
         );
         // A guest + NULL selection → personal.
         store.set_selected_workspace("u_null", None).await.unwrap();
@@ -2356,16 +2356,16 @@ mod tests {
         crate::util::test::create_test_workspace("/tmp/resolve_admin_aware_ws", "ws_admin_aware")
             .await;
 
-        // A guest with a shared selection that exists in the table is still
-        // clamped to the personal workspace (never a shared one).
+        // A guest with a managed selection that exists in the table is still
+        // clamped to the personal workspace (never a managed one).
         store
-            .set_selected_workspace("u_shared", Some("ws_admin_aware"))
+            .set_selected_workspace("u_managed", Some("ws_admin_aware"))
             .await
             .unwrap();
-        let ws = resolve_workspace_for_user_name("u_shared").await;
-        assert_eq!(ws.name, "personal:u_shared");
+        let ws = resolve_workspace_for_user_name("u_managed").await;
+        assert_eq!(ws.name, "personal:u_managed");
 
-        // The admin with a shared selection that exists keeps the shared workspace.
+        // The admin with a managed selection that exists keeps the managed workspace.
         crate::users::test_util::with_admin_workspace_restored(async {
             store
                 .set_selected_workspace(ADMIN_USER_NAME, Some("ws_admin_aware"))

@@ -232,13 +232,13 @@ pub(crate) fn remove_engine(workspace_name: &str) {
 ///
 /// A path-named workspace is one named by an absolute path — a synthetic
 /// workspace created on demand (the folder a custom role was launched into),
-/// never a registered name (`validate_name` allows only letters and underscores)
+/// never a managed name (`validate_name` allows only letters and underscores)
 /// and never a `dir-…` delegation key. Its engine is the only one whose lifetime
 /// is owned by the callers that create it, and it is keyed by the folder rather
 /// than by the launch: it is kept while a launch works there and released as
 /// soon as one launch leaves, is stopped, or has its session end (deleted, or
 /// purged when a one-off run expires) — a sibling still working in the same
-/// folder simply re-creates it. A registered workspace's engine is the
+/// folder simply re-creates it. A managed workspace's engine is the
 /// workspace's own and is left alone.
 pub(crate) fn release_path_named_engine(workspace_name: &str) {
     if registry_initialized() && std::path::Path::new(workspace_name).is_absolute() {
@@ -246,7 +246,7 @@ pub(crate) fn release_path_named_engine(workspace_name: &str) {
     }
 }
 
-/// Initiate eager scanning for all registered workspaces.
+/// Initiate eager scanning for all managed workspaces.
 ///
 /// Should be called once after bootstrap, in a background task. Errors for
 /// individual workspaces are logged but don't prevent other workspaces from

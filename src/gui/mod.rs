@@ -375,7 +375,7 @@ pub enum Message {
     UpdateResult(Result<String, String>),
     /// Toggle the selected workspace's pipeline pause or maintainer state.
     Toggle(ToggleKind),
-    /// Footer workspace picker: switch the admin's workspace (shared
+    /// Footer workspace picker: switch the admin's workspace (managed
     /// workspaces only).
     WorkspacePick(String),
     /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
@@ -707,7 +707,7 @@ pub struct Dashboard {
     /// staying the same — still re-pushes (see [`Self::sync_workspace_surfaces`]).
     pushed_workspace: Option<(String, String)>,
     /// Currently selected workspace name. `Some("personal:admin")` = the
-    /// admin's "Personal" workspace; `Some("ws")` = a shared workspace;
+    /// admin's "Personal" workspace; `Some("ws")` = a managed workspace;
     /// `None` = nothing selected.
     selected_workspace_name: Option<String>,
     /// True when a genuine exit request — the window's close or a platform quit — arrived
@@ -861,7 +861,7 @@ impl Dashboard {
             .and_then(|name| self.workspaces.get(name))
     }
 
-    /// The workspace resolved for the current selection: a registered workspace
+    /// The workspace resolved for the current selection: a managed workspace
     /// present in the loaded map with a non-empty path. A personal name, a name
     /// missing from the map and an empty path resolve to nothing.
     fn resolved_workspace(&self) -> Option<(&str, &str)> {
@@ -1028,7 +1028,7 @@ impl Dashboard {
             self.apply_boot_workspace_map(workspaces);
         }
 
-        // The boot read always yields a name — a shared workspace or the
+        // The boot read always yields a name — a managed workspace or the
         // admin's `personal:admin` fallback.
         self.selected_workspace_name = Some(restored_name.to_owned());
         self.propagate_workspace_selection(restored_name)
@@ -1065,7 +1065,7 @@ impl Dashboard {
             Page::Alarms => self.alarms_state.refresh().map(Message::Alarms),
             Page::Settings => {
                 self.settings_state.refresh();
-                // Workspace list comes from the shared map; only the users
+                // Workspace list comes from the managed-workspace map; only the users
                 // list, the custom-tools area and the custom-roles list need a
                 // DB / folder read on navigation.
                 self.sync_settings_workspaces_from_map();
@@ -1080,7 +1080,7 @@ impl Dashboard {
     }
 
     /// Refresh the Settings users list. The workspace list is not read here —
-    /// it is synced from the dashboard's shared workspace map. Does not absorb
+    /// it is synced from the dashboard's managed-workspace map. Does not absorb
     /// the config snapshot (`settings_state.refresh()`).
     fn refresh_settings_users(&self) -> Task<Message> {
         self.settings_state
@@ -1107,7 +1107,7 @@ impl Dashboard {
             .map(|msg| Message::Settings(settings::SettingsMessage::CustomRolesMsg(msg)))
     }
 
-    /// Sync the Settings workspaces section list from the shared workspace map
+    /// Sync the Settings workspaces section list from the managed-workspace map
     /// (sorted by name, matching the store's `ORDER BY name`). No DB read — the
     /// map is the single source of truth.
     fn sync_settings_workspaces_from_map(&mut self) {
@@ -1248,8 +1248,8 @@ impl Dashboard {
         if let settings::SettingsMessage::ActivateWorkspace(name) = msg {
             return self.activate_workspace(&name);
         }
-        // Registering activates the new workspace on every path (the `workspace`
-        // tool's own `add` does the same). The row is seeded into the shared map
+        // Adding activates the new workspace on every path (the `workspace`
+        // tool's own `add` does the same). The row is seeded into the workspace map
         // so the picker renders it at once and the activation's own map-guard
         // sees the workspace it just created; the reload this message already
         // triggers below is what confirms it.
@@ -1260,7 +1260,7 @@ impl Dashboard {
             None
         };
         // Any successful Settings-side workspace mutation (add, delete,
-        // reanalyze, diagnostics/notes edits) refreshes the shared
+        // reanalyze, diagnostics/notes edits) refreshes the managed
         // workspace map from one full DB read — the map is the single source
         // of truth, and syncing the Settings workspace list from it (see
         // [`Self::sync_settings_workspaces_from_map`]) gives the page its immediate
@@ -1740,7 +1740,7 @@ impl Dashboard {
 
                 // A selection this map does not contain is NOT re-resolved to
                 // "Personal": the map can lag the stored choice (a workspace
-                // registered and selected in one go is missing from a read that
+                // added and selected in one go is missing from a read that
                 // started before its insert), and resolving here would leave the
                 // desktop on the personal space while the DB keeps the project
                 // active. The DB owns the choice and its read-back applies it
@@ -1782,7 +1782,7 @@ impl Dashboard {
             }
             // A users-table / user_channels-table row changed (or the stream
             // lagged) — the event does not say which column changed, so the
-            // read-back is the authority on the shared selection. Full re-list
+            // read-back is the authority on the managed selection. Full re-list
             // is its own recovery.
             Message::UsersCdcChanged => {
                 self.active_workspace_gen += 1;
@@ -2001,12 +2001,12 @@ impl Dashboard {
         Task::batch(std::iter::once(propagate).chain(write))
     }
 
-    /// Whether a pick may be written to the DB: a shared name only when the
+    /// Whether a pick may be written to the DB: a managed name only when the
     /// loaded map carries it — the map can drop one between render and click, and
     /// the DB must not gain a dangling value (the in-memory selection still
     /// applies; the read-back decides if it stands). A personal space is always
-    /// writable: the map holds registered workspaces only and so never carries
-    /// one, and the write stores NULL — the product's own "no shared workspace
+    /// writable: the map holds managed workspaces only and so never carries
+    /// one, and the write stores NULL — the product's own "no managed workspace
     /// selected", from which it computes the personal workspace on the fly.
     fn selection_persistable(&self, name: &str) -> bool {
         crate::users::is_personal_workspace(name) || self.workspaces.contains_key(name)
@@ -2197,8 +2197,8 @@ impl Dashboard {
         self.sync_settings_workspaces_from_map();
     }
 
-    /// Return the selected shared-workspace name, or `None` if the "Personal"
-    /// workspace is selected (no shared workspace).
+    /// Return the selected managed-workspace name, or `None` if the "Personal"
+    /// workspace is selected (no managed workspace).
     fn active_workspace_name(&self) -> Option<String> {
         self.active_workspace_name_ref().map(str::to_string)
     }
@@ -2211,7 +2211,7 @@ impl Dashboard {
             .filter(|n| !crate::users::is_personal_workspace(n))
     }
 
-    /// Returns `true` when a shared (non-Personal) workspace is selected.
+    /// Returns `true` when a managed (non-Personal) workspace is selected.
     fn has_active_workspace(&self) -> bool {
         self.active_workspace_name_ref().is_some()
     }
@@ -3203,19 +3203,19 @@ impl Dashboard {
         }
     }
 
-    /// Footer workspace picker: shared workspaces only, persists via
-    /// [`Self::select_workspace`]. With a single shared workspace the
+    /// Footer workspace picker: managed workspaces only, persists via
+    /// [`Self::select_workspace`]. With a single managed workspace the
     /// dropdown degrades to a static label (that workspace's display name,
     /// or the "Select workspace" placeholder when nothing is selected —
     /// including a Personal/unset selection). When a failed workspace-map read
     /// leaves nothing to pick, a static, non-selectable "Workspaces
     /// unavailable" pill replaces it in the same footprint. Returns `None` for
-    /// the zero-shared-workspaces state.
+    /// the zero-managed-workspaces state.
     fn render_workspace_picker(&self) -> Option<Element<'_, Message>> {
         // Nothing left to pick: the failed read renders a static, non-selectable
         // failure pill in the picker's footprint. The error text lives only in
         // the tooltip — it must never become an option of the dropdown.
-        let options = shared_workspace_options(&self.workspaces);
+        let options = managed_workspace_options(&self.workspaces);
         if let Some(err) = self.picker_failure(&options) {
             return Some(widgets::tooltip_hint(
                 container(
@@ -3230,7 +3230,7 @@ impl Dashboard {
             ));
         }
         if options.is_empty() {
-            // No shared workspaces exist — an inert placeholder dropdown would
+            // No managed workspaces exist — an inert placeholder dropdown would
             // suggest a choice that isn't there; hide the picker instead.
             return None;
         }
@@ -3964,12 +3964,12 @@ async fn read_active_workspace() -> Option<String> {
     crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME).await
 }
 
-/// Build the footer workspace picker options from the shared workspace map:
+/// Build the footer workspace picker options from the managed-workspace map:
 /// values sorted by name, labeled by each workspace's display name. A personal
 /// workspace is never an option — a lingering `personal:{user}` row is filtered
 /// out.
 #[must_use]
-fn shared_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
+fn managed_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
     let mut values: Vec<&Workspace> = map
         .values()
         .filter(|ws| !crate::users::is_personal_workspace(&ws.name))
@@ -4284,8 +4284,8 @@ mod tests {
         });
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
 
-        // A stored shared name the loaded map does not hold is still adopted:
-        // the map can simply be a reload behind (a workspace registered and
+        // A stored managed name the loaded map does not hold is still adopted:
+        // the map can simply be a reload behind (a workspace added and
         // selected at once) and the DB is authoritative about the choice, so the
         // read-back must not pin Personal here.
         assert!(!dash.workspaces.contains_key("late"));
@@ -4340,9 +4340,9 @@ mod tests {
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
         assert_eq!(dash.active_workspace_gen, generation + 2);
 
-        // What may be written: a shared name only when the map carries it, a
+        // What may be written: a managed name only when the map carries it, a
         // personal space always (the map never carries one, and it is stored as
-        // NULL — the product's own "no shared workspace selected").
+        // NULL — the product's own "no managed workspace selected").
         assert!(dash.selection_persistable("personal:admin"));
         assert!(dash.selection_persistable("ws2"));
         assert!(!dash.selection_persistable("late"));
@@ -4393,12 +4393,12 @@ mod tests {
         );
     }
 
-    /// Only a registered workspace present in the loaded map with a usable path
+    /// Only a managed workspace present in the loaded map with a usable path
     /// resolves; everything else — a personal selection however it arose, a
     /// name missing from the map, an entry without a path, no selection —
     /// resolves to nothing.
     #[test]
-    fn only_a_registered_workspace_with_a_path_resolves() {
+    fn only_a_managed_workspace_with_a_path_resolves() {
         let mut dash = ready_dashboard();
         dash.workspaces = HashMap::from([
             ("ws1".to_string(), ws("ws1")),
@@ -4623,19 +4623,19 @@ mod tests {
     /// A personal workspace is never a picker option — a lingering
     /// `personal:{user}` row in the map is filtered out.
     #[test]
-    fn shared_workspace_options_never_offer_a_personal_workspace() {
+    fn managed_workspace_options_never_offer_a_personal_workspace() {
         let map = HashMap::from([
             ("personal:admin".to_string(), ws("personal:admin")),
             ("ws2".to_string(), ws("ws2")),
             ("ws1".to_string(), ws("ws1")),
         ]);
 
-        let options = shared_workspace_options(&map);
+        let options = managed_workspace_options(&map);
 
         assert_eq!(
             options.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
             vec!["ws1", "ws2"],
-            "shared workspaces only, ordered by name"
+            "managed workspaces only, ordered by name"
         );
     }
 
@@ -4675,7 +4675,7 @@ mod tests {
             "a failed reload must preserve the current map"
         );
         assert!(
-            dash.picker_failure(&shared_workspace_options(&dash.workspaces))
+            dash.picker_failure(&managed_workspace_options(&dash.workspaces))
                 .is_none(),
             "a preserved map keeps the picker working — the pill is for a read that left nothing to pick"
         );
@@ -4698,7 +4698,7 @@ mod tests {
         assert_eq!(dash.workspaces_error.as_deref(), Some("boot read failed"));
         assert!(dash.workspaces.is_empty());
         assert_eq!(
-            dash.picker_failure(&shared_workspace_options(&dash.workspaces)),
+            dash.picker_failure(&managed_workspace_options(&dash.workspaces)),
             Some("boot read failed"),
             "a read that left nothing to pick must show the failure in the picker"
         );
@@ -4730,7 +4730,7 @@ mod tests {
         );
     }
 
-    /// The DB-sourced boot resolution: the seeded admin with a shared stored
+    /// The DB-sourced boot resolution: the seeded admin with a managed stored
     /// workspace present in the map restores it; a stored value missing from
     /// the map falls back to the "Personal" default.
     #[tokio::test]
@@ -4752,7 +4752,7 @@ mod tests {
         // The guard restores the shared seeded admin row even when an assertion
         // below panics.
         crate::users::test_util::with_admin_workspace_restored(async {
-            // A shared stored workspace present in the map → restored.
+            // A managed stored workspace present in the map → restored.
             store
                 .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some("boot_ws_gui"))
                 .await

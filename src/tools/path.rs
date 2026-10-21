@@ -8,9 +8,9 @@
 //!
 //! Two product rules hold whatever the level. The service's own live stores are
 //! refused by location ([`StoreFile`]) for every read and every write. A write
-//! is refused inside a registered project workspace too — but that second rule
-//! binds only the unrestricted writer ([`unrestricted_write_refusal`]): a
-//! confined write is inside its own workspace, where the case never arises.
+//! is refused inside a managed workspace too — but that second rule binds only
+//! the unrestricted writer ([`unrestricted_write_refusal`]): a confined write
+//! is inside its own workspace, where the case never arises.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -219,7 +219,7 @@ async fn refuse_non_regular_target(resolved_target: &Path, requested: &str) -> a
 }
 
 /// Resolve a write for the admin's Assistant: any path the shell could name,
-/// minus two places — the product's own store files, and the registered project
+/// minus two places — the product's own store files, and the managed
 /// workspaces, whose work belongs to their own Manager.
 ///
 /// The decision is made on the file the write would really land in: the deepest
@@ -242,12 +242,12 @@ async fn resolve_unrestricted_write(
     // file through the link.
     let resolved = follow_final_links(resolved).await?;
 
-    // The list is read before anything is judged, so an unreadable registry is
+    // The list is read before anything is judged, so an unreadable list is
     // a refusal rather than a silently empty one.
-    let projects = registered_projects(requested).await?;
+    let managed = managed_workspace_paths(requested).await?;
     // Only the resolved file is judged: the file the write really lands in is
     // what decides, never the spelling it came in as.
-    if let Some(err) = unrestricted_write_refusal(own_workspace, &resolved, requested, &projects) {
+    if let Some(err) = unrestricted_write_refusal(own_workspace, &resolved, requested, &managed) {
         return Err(err);
     }
 
@@ -265,15 +265,15 @@ async fn resolve_unrestricted_write(
 /// The refusal a write of the admin's Assistant meets, or `None` when the write
 /// is allowed. Both refusals are by location and neither by content: the
 /// product's own store files (never opened to find out what they are), and the
-/// registered project workspaces, whose work belongs to their own manager.
+/// managed workspaces, whose work belongs to their own manager.
 /// `own_workspace` — the admin's own working folder — outranks the second rule,
-/// so a personal folder that happens to sit inside a registered project area
+/// so a personal folder that happens to sit inside a managed workspace
 /// stays writable.
 fn unrestricted_write_refusal(
     own_workspace: &Path,
     candidate: &Path,
     requested: &str,
-    projects: &[(String, PathBuf)],
+    managed: &[(String, PathBuf)],
 ) -> Option<anyhow::Error> {
     match product_store_file(candidate) {
         Some(StoreFile::Live) => return Some(live_store_refusal("write to", requested)),
@@ -289,43 +289,43 @@ fn unrestricted_write_refusal(
     if is_within_ignoring_case(candidate, &crate::util::canonical_or_self(own_workspace)) {
         return None;
     }
-    projects
+    managed
         .iter()
         .find(|(_, path)| is_within_ignoring_case(candidate, path))
         .map(|(name, _)| {
             anyhow::anyhow!(
-                "forbidden: cannot write to {requested}: it is inside the registered project \
-                 workspace '{name}' — hint: work in a project belongs to that project's manager; \
-                 the admin's own workspace and any unregistered directory stay writable"
+                "forbidden: cannot write to {requested}: it is inside the managed workspace \
+                 '{name}' — hint: work in a project belongs to that project's manager; \
+                 the admin's own workspace and any other folder stay writable"
             )
         })
 }
 
-/// The registered project workspaces, by name and path.
+/// The managed workspaces, by name and path.
 ///
 /// An unreadable list is an error, never an empty one: a write that cannot see
-/// which areas belong to projects is refused rather than guessed at. The
-/// consequence is accepted — while the product's stores are unavailable, the
-/// admin cannot write into its own memory either.
-async fn registered_projects(requested: &str) -> anyhow::Result<Vec<(String, PathBuf)>> {
-    registered_projects_from(crate::users::registered_workspaces().await, requested)
+/// which areas belong to managed workspaces is refused rather than guessed at.
+/// The consequence is accepted — while the product's stores are unavailable,
+/// the admin cannot write into its own memory either.
+async fn managed_workspace_paths(requested: &str) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    managed_workspace_paths_from(crate::users::managed_workspaces().await, requested)
 }
 
-/// [`registered_projects`] over an already-read registry, so the refusal an
+/// [`managed_workspace_paths`] over an already-read list, so the refusal an
 /// unreadable one meets is decided without the store.
-fn registered_projects_from(
+fn managed_workspace_paths_from(
     read: anyhow::Result<Vec<crate::Workspace>>,
     requested: &str,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
-    read.map(|projects| {
-        projects
+    read.map(|managed| {
+        managed
             .into_iter()
             .map(|ws| (ws.name, PathBuf::from(ws.path)))
             .collect()
     })
     .map_err(|e| {
         anyhow::anyhow!(
-            "forbidden: cannot write to {requested}: the registered project workspaces cannot be \
+            "forbidden: cannot write to {requested}: the managed workspaces cannot be \
              read ({e}) — hint: the refusal is the safe answer for a write; retry once the \
              product's own stores are available"
         )
@@ -741,7 +741,7 @@ enum StoreFile {
 /// still answers as if they were one, which over-refuses where it backs a
 /// refusal (accepted — a rule that limits rather than fences the shell) and
 /// over-permits where it backs the admin's own-folder exemption (a case-varied
-/// sibling of that folder inside a registered project stays writable). The
+/// sibling of that folder inside a managed workspace stays writable). The
 /// supported volumes cannot tell the two apart.
 #[must_use]
 fn is_within_ignoring_case(candidate: &Path, base: &Path) -> bool {
@@ -1311,7 +1311,7 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     if expanded_path.is_absolute() {
         // Lexical prefix check — no sync I/O.
         //
-        // Note: workspace_root is pre-canonicalized at workspace registration
+        // Note: workspace_root is pre-canonicalized when the workspace is added
         // (see canonicalize_workspace_path in workspace.rs). The lexical check
         // may reject absolute paths whose prefix is a symlink into the workspace
         // (e.g. /tmp/… when the real workspace is /private/tmp/… on macOS), but
@@ -2293,16 +2293,16 @@ mod tests {
     }
 
     /// The admin's write refusals, which are the only two: the product's own
-    /// store files, and the registered project workspaces — with the admin's
+    /// store files, and the managed workspaces — with the admin's
     /// own folder outranking the second rule.
     #[test]
     fn unrestricted_write_refusals() {
         let own = Path::new("/storage/userspaces/admin");
         let project = PathBuf::from("/work/proj");
-        let projects = vec![("proj".to_string(), project.clone())];
+        let managed = vec![("proj".to_string(), project.clone())];
 
         let err =
-            unrestricted_write_refusal(own, &project.join("src/main.rs"), "src/main.rs", &projects)
+            unrestricted_write_refusal(own, &project.join("src/main.rs"), "src/main.rs", &managed)
                 .expect("a write inside a project must be refused");
         assert!(err.to_string().contains("'proj'"), "{err}");
         assert!(
@@ -2317,7 +2317,7 @@ mod tests {
             own,
             &PathBuf::from("/WORK/Proj/src/main.rs"),
             "src/main.rs",
-            &projects,
+            &managed,
         )
         .expect("a differently-cased project spelling must be refused");
         assert!(err.to_string().contains("'proj'"), "{err}");
@@ -2332,25 +2332,25 @@ mod tests {
             "/var/lib/postgresql/data/base.db",
         ] {
             assert!(
-                unrestricted_write_refusal(own, Path::new(allowed), "x", &projects).is_none(),
+                unrestricted_write_refusal(own, Path::new(allowed), "x", &managed).is_none(),
                 "{allowed} must be writable"
             );
         }
 
         // The admin's own folder outranks the project rule, even when it sits
-        // inside a registered area.
+        // inside a managed workspace.
         let nested = project.join("personal");
         assert!(
-            unrestricted_write_refusal(&nested, &nested.join("MEMORY.md"), "MEMORY.md", &projects)
+            unrestricted_write_refusal(&nested, &nested.join("MEMORY.md"), "MEMORY.md", &managed)
                 .is_none(),
-            "the admin's own workspace stays writable inside a registered area"
+            "the admin's own workspace stays writable inside a managed workspace"
         );
         assert!(
             unrestricted_write_refusal(
                 &nested,
                 &project.join("shared.txt"),
                 "shared.txt",
-                &projects
+                &managed
             )
             .is_some(),
             "a sibling of the admin's own folder is still the project's"
@@ -2369,31 +2369,26 @@ mod tests {
         std::fs::create_dir_all(project.join("admin")).unwrap();
         let link = base.join("link");
         std::os::unix::fs::symlink(&project, &link).unwrap();
-        let projects = vec![("proj".to_string(), project.clone())];
+        let managed = vec![("proj".to_string(), project.clone())];
 
         // The folder kept under the link's spelling, the candidate resolved.
         let own = link.join("admin");
         assert!(
-            unrestricted_write_refusal(
-                &own,
-                &project.join("admin/notes.md"),
-                "notes.md",
-                &projects
-            )
-            .is_none(),
+            unrestricted_write_refusal(&own, &project.join("admin/notes.md"), "notes.md", &managed)
+                .is_none(),
             "the admin's own folder stays writable"
         );
         assert!(
-            unrestricted_write_refusal(&own, &project.join("shared.md"), "shared.md", &projects)
+            unrestricted_write_refusal(&own, &project.join("shared.md"), "shared.md", &managed)
                 .is_some(),
             "a sibling of the admin's own folder is still the project's"
         );
     }
 
-    /// The project rule end to end, through the store the registry is read
-    /// from: the wiring a pure-helper test cannot reach.
+    /// The project rule end to end, through the store the managed workspaces
+    /// are read from: the wiring a pure-helper test cannot reach.
     #[tokio::test]
-    async fn unrestricted_write_consults_the_registered_projects() {
+    async fn unrestricted_write_consults_the_managed_workspaces() {
         crate::util::test::init_test_stores().await;
         let (dir, own) = test_workspace().await;
         let project_dir = TempDir::new().expect("tempdir");
@@ -2413,7 +2408,7 @@ mod tests {
             PathAccess::Unrestricted,
         )
         .await
-        .expect_err("a write inside a registered project must be refused");
+        .expect_err("a write inside a managed workspace must be refused");
         assert!(err.to_string().contains("path-policy-project"), "{err}");
         assert!(err.to_string().contains("manager"), "{err}");
         assert!(
@@ -2437,14 +2432,14 @@ mod tests {
         drop((dir, project_dir));
     }
 
-    /// An unreadable project registry refuses the write with a plain message
-    /// rather than an accident — the accepted price is that the admin's own
-    /// memory is closed with it.
+    /// An unreadable managed workspace list refuses the write with a plain
+    /// message rather than an accident — the accepted price is that the admin's
+    /// own memory is closed with it.
     #[test]
-    fn an_unreadable_project_registry_refuses_the_write() {
+    fn an_unreadable_managed_workspace_list_refuses_the_write() {
         let read = Err(anyhow::anyhow!("the workspace store is not open"));
-        let err = registered_projects_from(read, "notes/todo.md")
-            .expect_err("an unreadable registry must refuse the write");
+        let err = managed_workspace_paths_from(read, "notes/todo.md")
+            .expect_err("an unreadable list must refuse the write");
         let message = err.to_string();
         assert!(
             message.starts_with("forbidden: cannot write to notes/todo.md"),
@@ -2464,7 +2459,7 @@ mod tests {
         };
         let own = TempDir::new().expect("tempdir");
         let own = own.path();
-        let projects: Vec<(String, PathBuf)> = Vec::new();
+        let managed: Vec<(String, PathBuf)> = Vec::new();
 
         for name in [
             "core.db",
@@ -2475,7 +2470,7 @@ mod tests {
             "LOGS.DB",
         ] {
             let candidate = root.join("db").join(name);
-            let err = unrestricted_write_refusal(own, &candidate, name, &projects)
+            let err = unrestricted_write_refusal(own, &candidate, name, &managed)
                 .expect("a live store must be refused");
             assert!(err.to_string().contains("live databases"), "{name}: {err}");
         }
@@ -2488,7 +2483,7 @@ mod tests {
             "board.db.quarantine-20260101T101010Z-42",
         ] {
             let candidate = root.join("db").join(name);
-            let err = unrestricted_write_refusal(own, &candidate, name, &projects)
+            let err = unrestricted_write_refusal(own, &candidate, name, &managed)
                 .expect("a copy the service keeps must be refused");
             assert!(
                 err.to_string().contains("a copy the service keeps"),

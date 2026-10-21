@@ -291,7 +291,7 @@ mod tests {
             "a refusal archives nothing — not even the day's folder"
         );
 
-        // A project workspace is not a personal one: no pathway between accounts.
+        // A managed workspace is not a personal one: no pathway between accounts.
         let project = workspace_at(&root, "my-project");
         let err = archive(&project, "notes.md").await.unwrap_err().to_string();
         assert!(err.contains("personal workspace"), "{err}");

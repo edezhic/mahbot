@@ -1,7 +1,7 @@
 //! SendTool — hand one message to exactly one addressee.
 //!
 //! The addressees are the worker (a single worker run), a worker branch (a
-//! continuable worker conversation), a project workspace's Manager, and an
+//! continuable worker conversation), a managed workspace's Manager, and an
 //! administrator-defined custom role. Every holder declares the `addressee`
 //! choice and every call states it — including a holder that can address only
 //! one agent — and a value outside its set is refused.
@@ -93,7 +93,7 @@ pub enum Addressee {
     Worker,
     /// A continuable worker conversation: continue (or create) a named branch.
     WorkerBranch,
-    /// The Manager of one registered project workspace.
+    /// The Manager of one managed workspace.
     Manager,
     /// An administrator-defined custom role.
     Role,
@@ -178,19 +178,19 @@ impl Addressee {
     fn requirements(self) -> &'static [Requirement] {
         /// The worker's folder rule, shared by both worker kinds so their `place`
         /// text stays one entry.
-        const OUTSIDE_PROJECTS: &str = "any directory outside the registered projects";
+        const OUTSIDE_MANAGED_WORKSPACES: &str = "any directory outside the managed workspaces";
         match self {
             // The message is all it takes.
             Self::Assistant => &[],
             Self::Worker => &[Requirement {
                 arg: Argument::Place,
-                note: OUTSIDE_PROJECTS,
+                note: OUTSIDE_MANAGED_WORKSPACES,
                 required: false,
             }],
             Self::WorkerBranch => &[
                 Requirement {
                     arg: Argument::Place,
-                    note: OUTSIDE_PROJECTS,
+                    note: OUTSIDE_MANAGED_WORKSPACES,
                     required: false,
                 },
                 Requirement {
@@ -202,13 +202,13 @@ impl Addressee {
             ],
             Self::Manager => &[Requirement {
                 arg: Argument::Place,
-                note: "the project to message, by its registered name or its own folder",
+                note: "the managed workspace to message, by its managed name or its own folder",
                 required: true,
             }],
             Self::Role => &[
                 Requirement {
                     arg: Argument::Place,
-                    note: "a registered project, a folder path, or `personal:<user>`",
+                    note: "a managed workspace, a folder path, or `personal:<user>`",
                     required: false,
                 },
                 Requirement {
@@ -663,7 +663,7 @@ impl Tool for SendTool {
                         .run_sync_dispatch(ws, message, self.caller_role)
                         .await;
                 }
-                // A worker round writes outside the registered projects: only a
+                // A worker round writes outside the managed workspaces: only a
                 // durable background round can honour the optional `place`.
                 let place = self.optional_place(&args).await?;
                 refuse_busy_folder(place.as_ref().unwrap_or(ws))?;
@@ -737,7 +737,7 @@ impl Tool for SendTool {
                 // this arm — and such a holder always declares it (pinned by the
                 // holder sweep). `get_str` still refuses a call that omits it.
                 let place = super::get_str(&args, Argument::Place.as_str())?;
-                let project = super::delegation::resolve_project(place).await?;
+                let project = super::delegation::resolve_managed_workspace(place).await?;
                 // Envelope wrapping happens only on the routed Manager-bound job.
                 let envelope = crate::prompt::substitute(
                     &crate::prompt::load_prompt("assistant_message.md"),

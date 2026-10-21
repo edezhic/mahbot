@@ -378,7 +378,7 @@ struct SavedTabData {
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)]
 pub enum EditorMessage {
-    /// The workspace resolved for the current selection (registered name plus
+    /// The workspace resolved for the current selection (managed name plus
     /// filesystem path), pushed only by the dashboard's
     /// `sync_workspace_surfaces` — never a substitution for an unresolved one.
     WorkspaceSelected(String, String),

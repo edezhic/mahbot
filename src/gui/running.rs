@@ -54,10 +54,10 @@
 //!
 //! The page is DB-free by design: everything it shows is derived from the
 //! live in-memory registries and the live transcript snapshots, plus the
-//! dashboard's registered-workspace map (only for the "(external)" marker on
-//! unregistered/ephemeral workspace sections). All header labels (ticket
-//! titles, analyze/research questions) are captured observationally at spawn —
-//! never read from the DB.
+//! dashboard's managed-workspace map (only for the "(external)" marker on
+//! sections for workspaces outside the managed set — personal and ephemeral
+//! ones). All header labels (ticket titles, analyze/research questions) are
+//! captured observationally at spawn — never read from the DB.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -132,10 +132,10 @@ pub(crate) enum RunningMessage {
 /// renders directly into the dashboard's [`Message`] type; its only
 /// self-emitted messages are the manual-stop flow for research runs and
 /// branch launches ([`RunningMessage`]) and the card expand/collapse
-/// toggle. `workspaces` is the dashboard's registered-workspace map (name →
-/// info) — used only to mark unregistered/ephemeral workspace sections with the
-/// "(external)" suffix. Everything else comes from the live in-memory
-/// registries.
+/// toggle. `workspaces` is the dashboard's managed-workspace map (name →
+/// info) — used only to mark sections for workspaces outside the managed set
+/// — personal and ephemeral ones — with the "(external)" suffix. Everything
+/// else comes from the live in-memory registries.
 ///
 /// `expanded` is the dashboard's set of expanded agent cards, keyed by
 /// (agent_id, generation). Stale keys are pruned by the dashboard's
@@ -241,9 +241,9 @@ struct DisplayGroup {
 struct WorkspaceSection {
     /// Raw workspace name — the grouping key.
     workspace: String,
-    /// Resolved display label: the bare name for registered workspaces, the
-    /// "(external)"-suffixed form for unregistered/ephemeral ones, and
-    /// "workspace" for an empty name.
+    /// Resolved display label: the bare name for managed workspaces, the
+    /// "(external)"-suffixed form for workspaces outside the managed set
+    /// (personal and ephemeral ones), and "workspace" for an empty name.
     label: String,
     groups: Vec<DisplayGroup>,
 }
@@ -641,7 +641,7 @@ fn stop_confirm_dialog(target: &StopTarget) -> Element<'static, RunningMessage> 
     )
 }
 
-/// Fallback label for workspaces outside the dashboard's registered set
+/// Fallback label for workspaces outside the dashboard's managed set
 /// (personal user spaces, ephemeral run-scoped workspaces).
 fn fallback_workspace_label(workspace: &str) -> String {
     if workspace.is_empty() {
@@ -652,9 +652,9 @@ fn fallback_workspace_label(workspace: &str) -> String {
 }
 
 /// Resolve a workspace's display label, used for deterministic section
-/// ordering: the bare name for registered workspaces, the fallback label
-/// (with the "(external)" marker) for unregistered/ephemeral ones, and
-/// "workspace" for an empty name.
+/// ordering: the bare name for managed workspaces, the fallback label
+/// (with the "(external)" marker) for workspaces outside the managed set
+/// (personal and ephemeral ones), and "workspace" for an empty name.
 fn workspace_label_for(
     name: &str,
     workspaces: &std::collections::HashMap<String, Workspace>,
@@ -1629,7 +1629,7 @@ mod tests {
         // ws1: ticket group before singleton (kind order).
         assert_eq!(sections[0].groups[0].kind, GroupKind::Ticket);
         assert_eq!(sections[0].groups[1].kind, GroupKind::Singleton);
-        // ws2 is registered → bare name; ws1 is unregistered → "(external)".
+        // ws2 is a managed workspace → bare name; ws1 is outside the managed set → "(external)".
         assert_eq!(sections[1].label, "ws2");
         assert_eq!(sections[0].label, "ws1 (external)");
     }

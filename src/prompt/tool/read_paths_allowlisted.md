@@ -1,4 +1,4 @@
-Path restrictions: paths must be within the project workspace, or within common dependency source directories (see below). Absolute paths are allowed for temp files (e.g. spill files from shell output under `$TMPDIR` on unix, `%TMP%`/`%TEMP%` on Windows) and dependency sources.
+Path restrictions: paths must be within the workspace, or within common dependency source directories (see below). Absolute paths are allowed for temp files (e.g. spill files from shell output under `$TMPDIR` on unix, `%TMP%`/`%TEMP%` on Windows) and dependency sources.
 
 ## Dependency source access
 

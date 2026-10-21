@@ -5,17 +5,16 @@
 //!
 //! Resolution is exact and every refusal is explicit — a place that resolves
 //! to nothing usable never falls back to the caller's own workspace. A value is
-//! either a registered workspace named exactly (case-sensitively) or an
-//! absolute existing directory; an absolute path that IS a registered
-//! workspace is that workspace, with its identity and its stored context, never
-//! a bare directory.
+//! either a managed workspace named exactly (case-sensitively) or an absolute
+//! existing directory; an absolute path that IS a managed workspace is that
+//! workspace, with its identity and its stored context, never a bare directory.
 //!
 //! The resolved directory becomes the round's EXECUTION workspace (the
 //! sub-agents' root, context and search key) while the round's durable delivery
 //! key stays the caller's own workspace name (`jobs.workspace_name`), so the
 //! result always lands in the conversation that asked.
 //!
-//! A worker round additionally refuses a registered workspace, anything inside
+//! A worker round additionally refuses a managed workspace, anything inside
 //! one, the filesystem root and the product's own data directory: a ticket-less
 //! worker must never write into a tree whose workspace pipeline owns it. These
 //! are guardrails, not a security boundary — the worker's shell is unchanged.
@@ -30,45 +29,45 @@ use std::path::{Path, PathBuf};
 /// refuse.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DelegationKind {
-    /// The read-only analyst round: a registered workspace and a plain
+    /// The read-only analyst round: a managed workspace and a plain
     /// directory are both legitimate places.
     Analyze,
-    /// The worker round: refuses registered workspaces (and anything inside
+    /// The worker round: refuses managed workspaces (and anything inside
     /// them) and the product's own data directory.
     Worker,
 }
 
-/// The registered workspace occupying exactly `dir` — "this path IS that
+/// The managed workspace occupying exactly `dir` — "this path IS that
 /// workspace, with its identity and its stored context". `Path` equality is
-/// component-based, so it tolerates the trailing separator a registered
-/// `workspaces.path` carries.
-fn registered_at(registered: &[Workspace], dir: &Path) -> Option<Workspace> {
-    registered.iter().find(|ws| dir == ws.as_path()).cloned()
+/// component-based, so it tolerates the trailing separator a managed
+/// workspace's `workspaces.path` carries.
+fn managed_at(managed: &[Workspace], dir: &Path) -> Option<Workspace> {
+    managed.iter().find(|ws| dir == ws.as_path()).cloned()
 }
 
-/// Resolve a `place` that must address a registered project — by its exact
-/// registered name or by that project's own folder. Any other folder (a personal
-/// workspace included) is refused: the Manager exists only for registered
-/// projects.
-pub(crate) async fn resolve_project(raw: &str) -> Result<Workspace> {
+/// Resolve a `place` that must address a managed workspace — by its exact
+/// managed name or by its own folder. Any other folder (a personal
+/// workspace included) is refused: the Manager exists only for managed
+/// workspaces.
+pub(crate) async fn resolve_managed_workspace(raw: &str) -> Result<Workspace> {
     let raw = raw.trim();
     if !raw.is_empty() {
         let expanded = crate::util::expand_tilde(raw);
         if expanded.is_absolute() {
             let dir = canonical_dir(raw, &expanded)?;
-            if let Some(ws) = registered_at(&registered_workspaces().await?, &dir) {
+            if let Some(ws) = managed_at(&stored_workspaces().await?, &dir) {
                 return Ok(ws);
             }
         } else if let Some(ws) = crate::workspace::get_by_name(raw).await? {
             return Ok(ws);
         }
     }
-    Err(refuse_project(raw))
+    Err(refuse_not_managed(raw))
 }
 
-fn refuse_project(raw: &str) -> anyhow::Error {
+fn refuse_not_managed(raw: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "usage: place \"{raw}\" is not a registered project — hint: pass a registered project's \
+        "usage: place \"{raw}\" is not a managed workspace — hint: pass a managed workspace's \
          name or its own folder; personal workspaces have no Manager"
     )
 }
@@ -84,27 +83,27 @@ pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option
         return Ok(None);
     };
 
-    // A value that is not an absolute path can only be a registered workspace
-    // name: registered names are letters and underscores, never a path.
+    // A value that is not an absolute path can only be a managed workspace
+    // name: managed names are letters and underscores, never a path.
     let expanded = crate::util::expand_tilde(raw);
     if !expanded.is_absolute() {
         let Some(ws) = crate::workspace::get_by_name(raw).await? else {
             return Err(refuse_unresolvable(kind, raw));
         };
         if kind == DelegationKind::Worker {
-            return Err(refuse_registered(raw, &ws.name));
+            return Err(refuse_managed_workspace(raw, &ws.name));
         }
         return Ok(Some(ws));
     }
 
     let dir = canonical_dir(raw, &expanded)?;
-    let registered = registered_workspaces().await?;
-    let exact = registered_at(&registered, &dir);
+    let managed = stored_workspaces().await?;
+    let exact = managed_at(&managed, &dir);
     if kind == DelegationKind::Worker {
         if let Some(ws) = exact {
-            return Err(refuse_registered(raw, &ws.name));
+            return Err(refuse_managed_workspace(raw, &ws.name));
         }
-        if let Some(ws) = registered
+        if let Some(ws) = managed
             .iter()
             .find(|ws| crate::util::is_within(&dir, ws.as_path()))
         {
@@ -115,7 +114,7 @@ pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option
         }
         return Ok(Some(dir_workspace(&dir)));
     }
-    // The analyst may be pointed at a registered workspace: it then carries
+    // The analyst may be pointed at a managed workspace: it then carries
     // that workspace's identity and stored context, never a bare directory.
     match exact {
         Some(ws) => Ok(Some(ws)),
@@ -124,7 +123,7 @@ pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option
 }
 
 /// The execution workspace for a directory recorded on a round that already
-/// started (`jobs.exec_dir`): the registered workspace at that path when one
+/// started (`jobs.exec_dir`): the managed workspace at that path when one
 /// exists now, else a directory-scoped synthetic one. `Err` when the directory
 /// is gone or unusable — that failure ends the resumed round instead of leaving
 /// it hanging. A recorded directory is never re-refused: the refusals are the
@@ -136,19 +135,21 @@ pub(crate) async fn workspace_at_dir(dir: &str) -> Result<Workspace> {
         bail!("the place directory {dir} is no longer available");
     }
     let canonical = crate::stored_workspace_path(path);
-    match registered_at(&registered_workspaces().await?, &canonical) {
+    match managed_at(&stored_workspaces().await?, &canonical) {
         Some(ws) => Ok(ws),
         None => Ok(dir_workspace(&canonical)),
     }
 }
 
-/// The registered workspaces — nothing else in the product looks a workspace up
-/// by its path, so the path-identity rules read the (small) table here.
-async fn registered_workspaces() -> Result<Vec<Workspace>> {
+/// Every stored `workspaces` row — nothing else in the product looks a
+/// workspace up by its path, so the path-identity rules read the (small) table
+/// here. Unlike [`crate::users::managed_workspaces`], a legacy `personal:` row
+/// is not filtered out.
+async fn stored_workspaces() -> Result<Vec<Workspace>> {
     crate::workspace::store()
         .list()
         .await
-        .context("list registered workspaces")
+        .context("list managed workspaces")
 }
 
 /// Canonicalize an existing directory place, refusing the filesystem root (it
@@ -217,8 +218,8 @@ fn data_dir(dir: &Path) -> Option<PathBuf> {
 /// Drop the search engine a delegated round created for its synthetic `dir-…`
 /// workspace: its lifetime is bounded by the run that served it, exactly like a
 /// research run root — a one-off directory must never keep a picker and a file
-/// watcher alive forever. A round in a registered folder uses that workspace's
-/// own engine and is left alone.
+/// watcher alive forever. A round in a managed workspace's folder uses that
+/// workspace's own engine and is left alone.
 ///
 /// Accepted trade-off: two rounds placed in the same directory share one
 /// `dir-…` name, so releasing while another such round is still running only
@@ -239,7 +240,7 @@ pub(crate) fn release_exec_engine(exec: &Workspace) {
 /// directory alone: the synthetic name is a pure function of the canonical path,
 /// so this reaches the engine even when the directory is no longer there — which
 /// is exactly the state a cancel can leave (its rows are gone too, so the round's
-/// own exit never runs and nothing else will release it). A registered folder's
+/// own exit never runs and nothing else will release it). A managed workspace's
 /// engine is not touched: the derivation only ever names a `dir-…` workspace, and
 /// a name nothing handed an engine releases nothing.
 pub(crate) fn release_placed_engine(dir: &str) {
@@ -248,16 +249,16 @@ pub(crate) fn release_placed_engine(dir: &str) {
 }
 
 /// The name prefix of a directory-scoped synthetic workspace — impossible in a
-/// registered name (`validate_name` allows only letters and underscores), so it
+/// managed name (`validate_name` allows only letters and underscores), so it
 /// identifies one unambiguously.
 const DIR_WORKSPACE_PREFIX: &str = "dir-";
 
 /// A directory-scoped execution workspace for a delegation round placed in a
 /// folder. The name is `dir-<basename>-<hash of the canonical path>`: the
-/// embedded `-` is impossible in a registered workspace name (`validate_name`
+/// embedded `-` is impossible in a managed workspace name (`validate_name`
 /// allows only letters and underscores), so a name-keyed surface — the
 /// per-workspace search index above all — can never hand this directory a
-/// registered workspace's state, and the path hash keeps two directories apart.
+/// managed workspace's state, and the path hash keeps two directories apart.
 /// The derivation is deterministic, so a resumed round re-derives the same
 /// agent/session/search identity.
 ///
@@ -281,31 +282,31 @@ fn dir_workspace(canonical: &Path) -> Workspace {
 fn refuse_unresolvable(kind: DelegationKind, raw: &str) -> anyhow::Error {
     match kind {
         DelegationKind::Analyze => anyhow::anyhow!(
-            "usage: place \"{raw}\" is not a registered workspace and is not an absolute path — \
-             hint: pass the exact name of a registered workspace, or an absolute path to an \
+            "usage: place \"{raw}\" is not a managed workspace and is not an absolute path — \
+             hint: pass the exact name of a managed workspace, or an absolute path to an \
              existing directory"
         ),
         DelegationKind::Worker => anyhow::anyhow!(
             "usage: place \"{raw}\" is not an absolute path — hint: this tool only runs in a \
-             directory outside the registered workspaces (a registered workspace name never works \
+             directory outside the managed workspaces (a managed workspace name never works \
              here); pass an absolute path to an existing directory"
         ),
     }
 }
 
-fn refuse_registered(raw: &str, workspace: &str) -> anyhow::Error {
+fn refuse_managed_workspace(raw: &str, workspace: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "usage: place \"{raw}\" is the registered workspace \"{workspace}\" — hint: work in a \
-         registered workspace goes through that workspace's board and its Manager, never through \
-         this tool; pass an absolute path to a directory outside the registered workspaces"
+        "usage: place \"{raw}\" is the managed workspace \"{workspace}\" — hint: work in a \
+         managed workspace goes through that workspace's board and its Manager, never through \
+         this tool; pass an absolute path to a directory outside the managed workspaces"
     )
 }
 
 fn refuse_inside(raw: &str, workspace: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "usage: place path \"{raw}\" is inside the registered workspace \"{workspace}\" — hint: \
-         work in a registered workspace goes through that workspace's board and its Manager, never \
-         through this tool; pass an absolute path to a directory outside the registered workspaces"
+        "usage: place path \"{raw}\" is inside the managed workspace \"{workspace}\" — hint: \
+         work in a managed workspace goes through that workspace's board and its Manager, never \
+         through this tool; pass an absolute path to a directory outside the managed workspaces"
     )
 }
 
@@ -330,9 +331,9 @@ mod tests {
         crate::util::strip_verbatim_prefix(&std::fs::canonicalize(path).unwrap())
     }
 
-    /// Register a workspace the way production rows are stored: the canonical
+    /// Add a workspace the way production rows are stored: the canonical
     /// path with the platform's trailing separator appended.
-    async fn register_workspace(dir: &Path, name: &str) -> String {
+    async fn add_managed_workspace(dir: &Path, name: &str) -> String {
         let stored = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
         create_test_workspace(&stored, name).await;
         stored
@@ -383,11 +384,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_workspace_resolves_by_name_and_by_path() {
+    async fn managed_workspace_resolves_by_name_and_by_path() {
         init_management_test_stores().await;
         let dir = tempfile::tempdir().unwrap();
         let canonical = canon(dir.path());
-        let stored = register_workspace(&canonical, "ws_delegation_alpha").await;
+        let stored = add_managed_workspace(&canonical, "ws_delegation_alpha").await;
         let plain = canonical.to_str().unwrap();
 
         // By exact name — the analyst round accepts it.
@@ -399,10 +400,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(by_name.name, "ws_delegation_alpha");
-        assert_eq!(by_name.path, stored, "the registered spelling is kept");
+        assert_eq!(by_name.path, stored, "the managed spelling is kept");
 
         // The same directory by its separator-less absolute path is that
-        // workspace — the path match tolerates the registered row's trailing
+        // workspace — the path match tolerates the managed row's trailing
         // separator — identity and stored context included.
         let by_path = resolve(DelegationKind::Analyze, &json!({ "place": plain }))
             .await
@@ -411,14 +412,14 @@ mod tests {
         assert_eq!(by_path.name, "ws_delegation_alpha");
         assert_eq!(by_path.path, stored);
 
-        // A worker round refuses a registered workspace, by name and by path.
+        // A worker round refuses a managed workspace, by name and by path.
         for args in [
             json!({ "place": "ws_delegation_alpha" }),
             json!({ "place": plain }),
         ] {
             let err = resolve(DelegationKind::Worker, &args)
                 .await
-                .expect_err("the worker refuses a registered workspace")
+                .expect_err("the worker refuses a managed workspace")
                 .to_string();
             assert!(err.starts_with("usage:"), "{err}");
             assert!(err.contains("ws_delegation_alpha"), "{err}");
@@ -426,36 +427,38 @@ mod tests {
         }
     }
 
-    /// The Manager addressee's `place` is one registered project — by its
-    /// registered name or by that project's own folder; a plain directory (a
+    /// The Manager addressee's `place` is one managed workspace — by its
+    /// managed name or by that workspace's own folder; a plain directory (a
     /// personal workspace included) is refused.
     #[tokio::test]
-    async fn project_place_resolves_by_name_and_folder_only() {
+    async fn managed_place_resolves_by_name_and_folder_only() {
         init_management_test_stores().await;
         let dir = tempfile::tempdir().unwrap();
         let canonical = canon(dir.path());
         let plain = canonical.to_str().unwrap();
-        register_workspace(&canonical, "ws_project_alpha").await;
+        add_managed_workspace(&canonical, "ws_project_alpha").await;
 
         for place in ["ws_project_alpha", plain] {
-            let ws = resolve_project(place).await.expect("a registered project");
+            let ws = resolve_managed_workspace(place)
+                .await
+                .expect("a managed workspace");
             assert_eq!(ws.name, "ws_project_alpha", "{place}");
         }
 
         let other = tempfile::tempdir().unwrap();
-        let err = resolve_project(other.path().to_str().unwrap())
+        let err = resolve_managed_workspace(other.path().to_str().unwrap())
             .await
             .expect_err("a plain directory has no Manager")
             .to_string();
-        assert!(err.contains("not a registered project"), "{err}");
+        assert!(err.contains("not a managed workspace"), "{err}");
     }
 
     #[tokio::test]
-    async fn directory_inside_a_registered_workspace_is_synthetic_for_analysts_only() {
+    async fn directory_inside_a_managed_workspace_is_synthetic_for_analysts_only() {
         init_management_test_stores().await;
         let dir = tempfile::tempdir().unwrap();
         let canonical = canon(dir.path());
-        register_workspace(&canonical, "ws_delegation_nested").await;
+        add_managed_workspace(&canonical, "ws_delegation_nested").await;
         let nested = canonical.join("inner");
         std::fs::create_dir(&nested).unwrap();
         let target = nested.to_str().unwrap();
@@ -469,7 +472,7 @@ mod tests {
 
         let err = resolve(DelegationKind::Worker, &json!({ "place": target }))
             .await
-            .expect_err("the worker refuses anything inside a registered workspace")
+            .expect_err("the worker refuses anything inside a managed workspace")
             .to_string();
         assert!(err.starts_with("usage:"), "{err}");
         assert!(err.contains("ws_delegation_nested"), "{err}");
@@ -482,34 +485,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let canonical = canon(dir.path());
 
-        let unregistered = resolve(DelegationKind::Analyze, &json!({ "place": "no_such_ws" }))
+        let not_managed = resolve(DelegationKind::Analyze, &json!({ "place": "no_such_ws" }))
             .await
-            .expect_err("unregistered name")
+            .expect_err("a name that is not a managed workspace")
             .to_string();
-        assert!(unregistered.starts_with("usage:"), "{unregistered}");
+        assert!(not_managed.starts_with("usage:"), "{not_managed}");
         assert!(
-            unregistered.contains("not a registered workspace"),
-            "{unregistered}"
+            not_managed.contains("not a managed workspace"),
+            "{not_managed}"
         );
 
-        // The worker's variant must not send the caller down the registered-name
+        // The worker's variant must not send the caller down the managed-name
         // form it always refuses.
-        let worker_unregistered =
-            resolve(DelegationKind::Worker, &json!({ "place": "no_such_ws" }))
-                .await
-                .expect_err("unregistered name for the worker")
-                .to_string();
+        let worker_not_managed = resolve(DelegationKind::Worker, &json!({ "place": "no_such_ws" }))
+            .await
+            .expect_err("a workspace name that is not managed, for the worker")
+            .to_string();
         assert!(
-            worker_unregistered.starts_with("usage:"),
-            "{worker_unregistered}"
+            worker_not_managed.starts_with("usage:"),
+            "{worker_not_managed}"
         );
         assert!(
-            worker_unregistered.contains("never works here"),
-            "{worker_unregistered}"
+            worker_not_managed.contains("never works here"),
+            "{worker_not_managed}"
         );
         assert!(
-            !worker_unregistered.contains("not a registered workspace"),
-            "the worker's hint must not offer the registered-name form: {worker_unregistered}"
+            !worker_not_managed.contains("not a managed workspace"),
+            "the worker's hint must not offer the managed-name form: {worker_not_managed}"
         );
 
         let relative = resolve(DelegationKind::Analyze, &json!({ "place": "sub/dir" }))
@@ -606,16 +608,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_at_dir_matches_registered_or_derives() {
+    async fn workspace_at_dir_matches_managed_or_derives() {
         init_management_test_stores().await;
 
-        let registered_dir = tempfile::tempdir().unwrap();
-        let registered_canonical = canon(registered_dir.path());
-        let registered_path = registered_canonical.to_str().unwrap();
-        create_test_workspace(registered_path, "ws_delegation_resume").await;
-        let ws = workspace_at_dir(registered_path).await.unwrap();
+        let managed_dir = tempfile::tempdir().unwrap();
+        let managed_canonical = canon(managed_dir.path());
+        let managed_path = managed_canonical.to_str().unwrap();
+        create_test_workspace(managed_path, "ws_delegation_resume").await;
+        let ws = workspace_at_dir(managed_path).await.unwrap();
         assert_eq!(ws.name, "ws_delegation_resume");
-        assert_eq!(ws.path, registered_path);
+        assert_eq!(ws.path, managed_path);
 
         let plain_dir = tempfile::tempdir().unwrap();
         let plain_canonical = canon(plain_dir.path());

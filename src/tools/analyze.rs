@@ -11,7 +11,7 @@
 //! Holders: the Engineer, Manager and Maintainer run `quick` (sync for the
 //! Engineer/Maintainer, async for the Manager); a guest Assistant runs `quick`
 //! async; the admin Assistant runs both depths async and additionally accepts an
-//! optional `place` argument (a registered workspace name, or an absolute
+//! optional `place` argument (a managed workspace name, or an absolute
 //! directory path) for `quick` that moves the round's execution root for that
 //! call only. `deep` ignores `place`.
 //! Argument mechanics and refusals live in [`super::delegation`].
@@ -3001,7 +3001,7 @@ mod tests {
         let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
         // A value the admin's tool refuses (a bogus name) must not become a new
         // error for the guest.
-        for place in ["not_a_registered_workspace", place_path.as_str()] {
+        for place in ["not_a_managed_workspace", place_path.as_str()] {
             let ack = tool
                 .execute(&caller, json!({ "message": "q", "place": place }))
                 .await

@@ -346,7 +346,7 @@ pub(crate) enum SpawnChild {
     /// A periodic temp cleaner Sanitation agent (see `crate::temp`).
     /// No child row: the jobs row's `task` holds the cleanup prompt. Leftover
     /// rows are terminalized at boot (never resumed) — the cleaner's
-    /// ephemeral workspace is never registered.
+    /// ephemeral workspace is never a managed workspace.
     TempCleanup,
     /// A per-phase ticket job: `jobs.kind` = `phase.as_ref()` (the single
     /// state-machine authority), `jobs.ticket_id` = the ticket. One short-lived
@@ -2020,9 +2020,9 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             // A periodic temp cleaner interrupted by a crash. The
             // cleanup is best-effort and the next due pass re-runs it, so a
             // leftover row is terminalized (never resumed). The cleaner's
-            // workspace is a synthetic ephemeral name that is never registered
-            // in the `workspaces` table — resuming would hit run_management's
-            // unresolvable-workspace path; terminalizing here keeps that
+            // workspace is a synthetic ephemeral name that has no `workspaces`
+            // row — resuming would hit run_management's unresolvable-workspace
+            // path; terminalizing here keeps that
             // explicit and skips the catch-all warning.
             info!(
                 job = %job.id,
@@ -2326,7 +2326,7 @@ mod tests {
         let conn = &crate::session::store().conn;
         let ws_name = "boot_recovery_ws";
         // Binding 3: boot recovery skips (not terminalizes) a resume-eligible
-        // job whose workspace is unresolvable — so the spawns need a registered
+        // job whose workspace is unresolvable — so the spawns need a managed
         // workspace for the async analyze to be check-pointed.
         crate::util::test::create_test_workspace("/tmp/boot_recovery_ws", ws_name).await;
 

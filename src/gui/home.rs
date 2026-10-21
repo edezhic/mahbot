@@ -2388,7 +2388,7 @@ mod tests {
                 true,
             ),
             (
-                "a project workspace",
+                "a managed workspace",
                 ChatDirection::Agent,
                 crate::users::ADMIN_USER_NAME,
                 "ws1",
@@ -2471,7 +2471,7 @@ mod tests {
         assert_eq!(
             state.messages.len(),
             0,
-            "a project workspace's message is not the conversation's and must never be appended"
+            "a managed workspace's message is not the conversation's and must never be appended"
         );
     }
 

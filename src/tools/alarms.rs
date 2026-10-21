@@ -97,7 +97,7 @@ impl Tool for AddAlarmTool {
             "workspace".to_string(),
             json!({
                 "type": "string",
-                "description": "Optional folder the role works in — a registered workspace name or an absolute path; omit for your own personal folder"
+                "description": "Optional folder the role works in — a managed workspace name or an absolute path; omit for your own personal folder"
             }),
         );
         super::tool_params_schema(&json!(properties), &["text"])

@@ -3,7 +3,7 @@
 //! (`setup_telegram_bot`, `bind_telegram`, `add_user`, `setup_web_search`) plus
 //! the per-user custom-tool grants (`grant_tool` / `revoke_tool` /
 //! `list_grants`). It is now the admin's Assistant's sole configuration surface
-//! (the Support role is gone). Registering a workspace is not one of its
+//! (the Support role is gone). Adding a managed workspace is not one of its
 //! actions — that lives in the `workspace` tool.
 use crate::config::{
     CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,

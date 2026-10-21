@@ -1,10 +1,10 @@
-//! The admin's own view into the registered workspaces: list them, register one
+//! The admin's own view into the managed workspaces: list them, add one
 //! (which activates it), freeze/unfreeze their pipelines, read a board and a
 //! single ticket, and leave a clarification note on a ticket.
 //!
-//! It manages no board. Registering a project is the only write here that can
-//! change the desktop's active workspace; the desktop's own project list is the
-//! other surface that selects one.
+//! It manages no board. Adding a managed workspace is the only write here that
+//! can change the desktop's active workspace; the desktop's own project list is
+//! the other surface that selects one.
 use anyhow::anyhow;
 use async_trait::async_trait;
 use serde_json::json;
@@ -25,9 +25,9 @@ use crate::{Role, Tool, Workspace, WorkspaceStatus};
 const OUTPUT_BYTE_LIMIT: usize = 24_000;
 const BOARD_LINE_LIMIT: usize = 100;
 
-/// What an action that covers the whole registered set answers when there is
+/// What an action that covers the whole managed set answers when there is
 /// none — one wording, so `list` and a fleet-wide pause say the same thing.
-const NO_WORKSPACE: &str = "No workspace is registered.";
+const NO_WORKSPACE: &str = "No managed workspaces exist.";
 
 /// The `workspace` tool: the admin's project view — list / add / board / ticket
 /// / comment / pause / resume.
@@ -49,7 +49,7 @@ impl Tool for WorkspaceTool {
                 },
                 "workspace": {
                     "type": "string",
-                    "description": "(list / board / pause / resume) The registered workspace to act on, spelled exactly as the `<registered-workspaces>` block or `list` spells it — matching is exact, never approximate. Omit it to cover every registered workspace, which for `pause` / `resume` is a fleet-wide freeze, so name the workspace whenever one was named to you."
+                    "description": "(list / board / pause / resume) The managed workspace to act on, spelled exactly as the `<managed-workspaces>` block or `list` spells it — matching is exact, never approximate. Omit it to cover every managed workspace, which for `pause` / `resume` is a fleet-wide freeze, so name the workspace whenever one was named to you."
                 },
                 "name": {
                     "type": "string",
@@ -57,7 +57,7 @@ impl Tool for WorkspaceTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "(add) Absolute path to the software project directory to register."
+                    "description": "(add) Absolute path to the software project directory to add."
                 },
                 "phase": {
                     "type": "string",
@@ -145,7 +145,7 @@ impl WorkspaceTool {
 // ── Shared resolution ────────────────────────────────────────────
 
 /// The workspace a `pause` / `resume` was pointed at: the `workspace` argument,
-/// or `None` for every registered workspace when none is named.
+/// or `None` for every managed workspace when none is named.
 ///
 /// The one action pair that can act on a single workspace or on all of them must
 /// never widen because the address was spelled some other way — a folder path, a
@@ -168,25 +168,25 @@ fn write_address<'a>(args: &'a serde_json::Value, action: &str) -> anyhow::Resul
             .any(|(key, value)| key.as_str() != "action" && !value.is_null())
     }) {
         return Err(anyhow!(
-            "usage: with no \"workspace\" this `{action}` covers every registered workspace, so \
+            "usage: with no \"workspace\" this `{action}` covers every managed workspace, so \
              the call may name nothing else — hint: pass \"workspace\" to act on one workspace, or \
-             drop the extra field to really cover every registered workspace"
+             drop the extra field to really cover every managed workspace"
         ));
     }
     Ok(None)
 }
 
-/// Resolve `name` to a registered workspace — never a personal space, including
+/// Resolve `name` to a managed workspace — never a personal space, including
 /// a legacy `personal:*` row. Matching is exact, and a miss names the live set
 /// because the admin names workspaces from a session-start context block that
 /// may predate an add or a delete.
-async fn registered_workspace(name: &str) -> anyhow::Result<Workspace> {
+async fn managed_workspace(name: &str) -> anyhow::Result<Workspace> {
     let name = name.trim();
-    let workspaces = crate::users::registered_workspaces().await?;
+    let workspaces = crate::users::managed_workspaces().await?;
     if let Some(ws) = workspaces.iter().find(|ws| ws.name == name) {
         return Ok(ws.clone());
     }
-    let registered = if workspaces.is_empty() {
+    let managed = if workspaces.is_empty() {
         "none".to_string()
     } else {
         workspaces
@@ -197,18 +197,20 @@ async fn registered_workspace(name: &str) -> anyhow::Result<Workspace> {
     };
     Err(if crate::users::is_personal_workspace(name) {
         anyhow!(
-            "'{name}' is a personal space, not a registered workspace — personal spaces have \
-             no pipeline and no board; registered: {registered}"
+            "'{name}' is a personal space, not a managed workspace — personal spaces have \
+             no pipeline and no board; managed workspaces: {managed}"
         )
     } else {
-        anyhow!("No workspace is registered under the name '{name}' — registered: {registered}")
+        anyhow!(
+            "No managed workspace exists under the name '{name}' — managed workspaces: {managed}"
+        )
     })
 }
 
 /// Resolve a full `<workspace>-<number>` ticket id, refusing every other
 /// spelling with the expected form, and an id whose workspace prefix is not
-/// registered.
-async fn registered_ticket_id(raw: &str) -> anyhow::Result<String> {
+/// a managed workspace.
+async fn managed_ticket_id(raw: &str) -> anyhow::Result<String> {
     // Only the full spelling addresses a ticket here: the project manager's
     // own ticket tools resolve a bare number against the workspace they are
     // bound to, and this tool is bound to none.
@@ -219,23 +221,24 @@ async fn registered_ticket_id(raw: &str) -> anyhow::Result<String> {
             raw.trim()
         ));
     };
-    // An id naming an unregistered workspace is refused as an unknown workspace,
-    // with the registered set named.
-    registered_workspace(prefix).await?;
+    // An id naming a workspace that is not managed is refused as an unknown
+    // workspace, with the managed set named.
+    managed_workspace(prefix).await?;
     Ok(full.to_string())
 }
 
 // ── list ─────────────────────────────────────────────────────────
 
-/// The registered workspaces, one line each, with the admin's active one marked.
+/// The managed workspaces, one line each, with the admin's active one marked.
 ///
 /// The active workspace resolves exactly as the desktop does and counts only
-/// when it is one of the registered names: a personal value, or a name no longer
-/// registered, means nothing is active — while the resolver's `None` is a failed
-/// read, which is reported as such rather than as nothing being active. A
-/// narrowed listing still uses the full registered set to decide all this.
+/// when it is one of the managed names: a personal value, or a name no longer
+/// a managed workspace, means nothing is active — while the resolver's `None`
+/// is a failed read, which is reported as such rather than as nothing being
+/// active. A narrowed listing still uses the full managed set to decide all
+/// this.
 async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
-    let workspaces = crate::users::registered_workspaces().await?;
+    let workspaces = crate::users::managed_workspaces().await?;
     if workspaces.is_empty() {
         return Ok(NO_WORKSPACE.to_string());
     }
@@ -245,10 +248,10 @@ async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
         .as_deref()
         .filter(|name| workspaces.iter().any(|ws| &ws.name == name));
     let listed = match only {
-        Some(name) => vec![registered_workspace(name).await?],
+        Some(name) => vec![managed_workspace(name).await?],
         None => workspaces,
     };
-    let mut listing = String::from("Registered workspaces:\n");
+    let mut listing = String::from("Managed workspaces:\n");
     for ws in &listed {
         let paused = if ws.paused { ", paused" } else { "" };
         let maintenance = if ws.maintenance_enabled {
@@ -277,31 +280,31 @@ async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
 
 // ── add ──────────────────────────────────────────────────────────
 
-/// Register a workspace and make it the admin's active one — registering and
+/// Add a managed workspace and make it the admin's active one — adding and
 /// activating are one rule on every path (the desktop's own add form does the
-/// same), so a newly registered project is the one the desktop works with.
+/// same), so a newly added project is the one the desktop works with.
 ///
-/// PARTIAL exactly when the registration succeeded but the activation write did
-/// not: the workspace is registered either way, and the answer already says
-/// which half happened.
+/// PARTIAL exactly when the add succeeded but the activation write did not: the
+/// workspace is added either way, and the answer already says which half
+/// happened.
 async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<ToolAnswer> {
     let name = super::get_str(args, "name")?;
     let path = super::get_str(args, "path")?;
     crate::workspace::store().add(name, path).await?;
-    // Registering activates: the row exists by now, so a failed selection write
-    // is reported as the partial outcome it is rather than as a registration
-    // that did not happen.
+    // Adding activates: the row exists by now, so a failed selection write is
+    // reported as the partial outcome it is rather than as an add that did not
+    // happen.
     match crate::users::store()
         .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some(name))
         .await
     {
         Ok(()) => Ok(ToolAnswer::done(format!(
-            "Registered workspace '{name}' at {path} and made it your active workspace. \
+            "Added managed workspace '{name}' at {path} and made it your active workspace. \
              The workspace is being picked up — if the model provider is configured its first \
              discovery pass will start shortly."
         ))),
         Err(e) => Ok(ToolAnswer::partial(format!(
-            "Registered workspace '{name}' at {path}, but making it your active workspace \
+            "Added managed workspace '{name}' at {path}, but making it your active workspace \
              failed: {e} — activate it from the desktop's own workspace list."
         ))),
     }
@@ -334,7 +337,7 @@ fn pipeline_change(ws: &Workspace, paused: bool) -> PipelineChange {
     }
 }
 
-/// Pause or resume the named workspace's pipeline, or every registered
+/// Pause or resume the named workspace's pipeline, or every managed
 /// workspace at once when no name was given.
 async fn pause_or_resume(name: Option<&str>, paused: bool) -> anyhow::Result<ToolAnswer> {
     match name {
@@ -347,7 +350,7 @@ async fn pause_or_resume(name: Option<&str>, paused: bool) -> anyhow::Result<Too
 
 /// Pause or resume one workspace's pipeline.
 async fn set_one_pipeline_paused(name: &str, paused: bool) -> anyhow::Result<String> {
-    let ws = registered_workspace(name).await?;
+    let ws = managed_workspace(name).await?;
     match pipeline_change(&ws, paused) {
         PipelineChange::NotReady => Err(anyhow!(
             "Workspace '{}' is {} — only a ready workspace has a pipeline to pause or resume.",
@@ -378,7 +381,7 @@ async fn set_one_pipeline_paused(name: &str, paused: bool) -> anyhow::Result<Str
 ///
 /// Takes the store the writes go to and the set they cover, so the fleet-wide
 /// form is not hardwired to the process-global store: production passes that one
-/// with the registered workspaces, the test its own store with rows of its own,
+/// with the managed workspaces, the test its own store with rows of its own,
 /// and a fleet-wide write can then never reach a row another test created.
 ///
 /// Never [`WorkspaceStore::pause_all`](crate::workspace::WorkspaceStore::pause_all):
@@ -406,15 +409,15 @@ async fn set_pipelines_paused(
         return Ok(ToolAnswer::done(NO_WORKSPACE));
     }
     let header = if paused {
-        "Paused every registered workspace where possible:"
+        "Paused every managed workspace where possible:"
     } else {
-        "Resumed every registered workspace where possible:"
+        "Resumed every managed workspace where possible:"
     };
     let mut out = format!("{header}\n");
     let mut incomplete = false;
     for ws in workspaces {
         let line = match pipeline_change(ws, paused) {
-            // The caller asked for every registered workspace; this one was left
+            // The caller asked for every managed workspace; this one was left
             // untouched, so the call is not the whole of what was asked.
             PipelineChange::NotReady => {
                 incomplete = true;
@@ -443,19 +446,19 @@ async fn set_pipelines_paused(
     })
 }
 
-/// Every registered workspace at once: the global store and the set it must
+/// Every managed workspace at once: the global store and the set it must
 /// cover.
 async fn set_all_pipelines_paused(paused: bool) -> anyhow::Result<ToolAnswer> {
-    let workspaces = crate::users::registered_workspaces().await?;
+    let workspaces = crate::users::managed_workspaces().await?;
     set_pipelines_paused(crate::workspace::store(), &workspaces, paused).await
 }
 
 // ── board ────────────────────────────────────────────────────────
 
-/// List the live tickets of the registered workspaces, optionally narrowed to
+/// List the live tickets of the managed workspaces, optionally narrowed to
 /// one workspace and/or one phase.
 async fn list_board(only: Option<&str>, phase: Option<&str>) -> anyhow::Result<String> {
-    let workspaces = crate::users::registered_workspaces().await?;
+    let workspaces = crate::users::managed_workspaces().await?;
     let phase_filter = match phase {
         Some(s) if s.eq_ignore_ascii_case("archived") => {
             anyhow::bail!(
@@ -467,7 +470,7 @@ async fn list_board(only: Option<&str>, phase: Option<&str>) -> anyhow::Result<S
         None => None,
     };
     let only = match only {
-        Some(name) => Some(registered_workspace(name).await?.name),
+        Some(name) => Some(managed_workspace(name).await?.name),
         None => None,
     };
     let mut tickets = board_store().list_all_tickets(None, phase_filter).await?;
@@ -516,7 +519,7 @@ async fn list_board(only: Option<&str>, phase: Option<&str>) -> anyhow::Result<S
 /// Read one ticket by its full id. The default is the shortened form for every
 /// ticket, whoever filed it.
 async fn show_ticket(ticket_id: &str, full: bool) -> anyhow::Result<String> {
-    let id = registered_ticket_id(ticket_id).await?;
+    let id = managed_ticket_id(ticket_id).await?;
     let Some(ticket) = board_store().get_ticket(&id).await? else {
         return Err(anyhow!("Ticket {id} not found."));
     };
@@ -546,7 +549,7 @@ async fn add_note(ticket_id: &str, content: &str) -> anyhow::Result<String> {
         !content.trim().is_empty(),
         "usage: \"content\" is empty — hint: pass the note's text to leave on the ticket"
     );
-    let id = registered_ticket_id(ticket_id).await?;
+    let id = managed_ticket_id(ticket_id).await?;
     if board_store().get_ticket_phase(&id).await?.is_none() {
         return Err(anyhow!("Ticket {id} not found — no note was left."));
     }
@@ -579,7 +582,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("No workspace is registered"), "got: {err}");
+        assert!(err.contains("No managed workspace exists"), "got: {err}");
 
         let err = tool
             .execute(&ws, tool_args("resume", Some("personal:admin")))
@@ -588,11 +591,11 @@ mod tests {
             .to_string();
         // A personal space is refused as such and still names the live set.
         assert!(
-            err.contains("personal space") && err.contains("registered:"),
+            err.contains("personal space") && err.contains("managed workspaces:"),
             "got: {err}"
         );
 
-        // A freshly registered workspace is `pending` — it has no pipeline yet,
+        // A freshly added workspace is `pending` — it has no pipeline yet,
         // so nothing may be frozen or resumed.
         crate::util::test::create_test_workspace("/tmp/ws_pending", "ws_pending").await;
         let err = tool
@@ -680,13 +683,13 @@ mod tests {
         );
     }
 
-    /// Every registered workspace at once: the ready one is written, the
+    /// Every managed workspace at once: the ready one is written, the
     /// not-ready one is skipped and reported as skipped.
     ///
     /// Driven against the test's own store, so the fleet-wide write can only ever
     /// reach rows this test created.
     #[tokio::test]
-    async fn pause_every_registered_workspace_skips_not_ready() {
+    async fn pause_every_managed_workspace_skips_not_ready() {
         let (store, _dir) = crate::open_test_store!(WorkspaceStore, "workspace");
         let root = crate::util::test::test_root();
         let ready = root.join("ws_fleet");
@@ -770,7 +773,7 @@ mod tests {
             reply.text
         );
 
-        // Nothing registered: the same plain wording `list` uses.
+        // Nothing managed: the same plain wording `list` uses.
         let reply = set_pipelines_paused(&store, &[], true)
             .await
             .expect("empty set");
@@ -851,7 +854,7 @@ mod tests {
         ] {
             let listing = tool.execute(&ws, args.clone()).await.expect("list");
             assert!(
-                listing.starts_with("Registered workspaces:\n- ws_address ("),
+                listing.starts_with("Managed workspaces:\n- ws_address ("),
                 "for {args}: {listing}"
             );
         }
@@ -892,10 +895,10 @@ mod tests {
         assert!(err.contains("<workspace>-<number>"), "got: {err}");
     }
 
-    /// `ticket` refuses an id whose workspace is not registered and an id with
+    /// `ticket` refuses an id whose workspace is not managed and an id with
     /// no such ticket.
     #[tokio::test]
-    async fn ticket_refuses_unregistered_workspace_and_missing_ticket() {
+    async fn ticket_refuses_a_not_managed_workspace_and_missing_ticket() {
         crate::util::test::init_test_stores().await;
         let ws = crate::workspace::test_ws("/tmp/ws_ticket");
         let tool = WorkspaceTool;
@@ -908,7 +911,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("No workspace is registered"), "got: {err}");
+        assert!(err.contains("No managed workspace exists"), "got: {err}");
 
         crate::util::test::create_test_workspace("/tmp/ws_ticket", "ws_ticket").await;
         let err = tool
@@ -962,10 +965,10 @@ mod tests {
         );
     }
 
-    /// `board` refuses the archived phase, lists finished tickets of registered
-    /// workspaces and never a ticket of an unregistered one.
+    /// `board` refuses the archived phase, lists finished tickets of managed
+    /// workspaces and never a ticket of one that is not managed.
     #[tokio::test]
-    async fn board_refuses_archived_and_skips_unregistered_workspaces() {
+    async fn board_refuses_archived_and_skips_workspaces_that_are_not_managed() {
         crate::util::test::init_test_stores().await;
         let tool = WorkspaceTool;
         let ws = crate::util::test::create_test_workspace("/tmp/ws_board", "ws_board").await;
@@ -976,7 +979,7 @@ mod tests {
             TicketPhase::Done,
         )
         .await;
-        // A ticket of a workspace that was never registered.
+        // A ticket of a workspace that is not managed.
         let ghost = crate::workspace::test_ws_named("/tmp/ws_ghost", "ws_ghost");
         let ghost_id =
             crate::util::test::make_ticket(board_store(), &ghost, "ghost done", TicketPhase::Done)
@@ -998,11 +1001,11 @@ mod tests {
             .expect("board");
         assert!(
             listing.contains(&done_id),
-            "a done ticket of a registered workspace must be listed: {listing}"
+            "a done ticket of a managed workspace must be listed: {listing}"
         );
         assert!(
             !listing.contains(&ghost_id),
-            "a ticket of an unregistered workspace must never be listed: {listing}"
+            "a ticket of a workspace that is not managed must never be listed: {listing}"
         );
         // The default listing keeps finished tickets — deliberately unlike the
         // manager's own listing, which hides them.
@@ -1041,7 +1044,7 @@ mod tests {
                     "got: {listing}"
                 );
 
-                // A personal selection is not a registered workspace, so
+                // A personal selection is not a managed workspace, so
                 // nothing is active.
                 crate::users::store()
                     .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some("personal:admin"))

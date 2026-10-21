@@ -907,10 +907,10 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Append the platform's separator to a registered root unless it already ends
-/// with one, so a registered root reads the way it always has. A drive or volume
-/// root already carries one, and that separator is what keeps it absolute rather
-/// than drive-relative (`C:\`, not `C:`).
+/// Append the platform's separator to a managed workspace's root unless it
+/// already ends with one, so the stored root reads the way it always has. A
+/// drive or volume root already carries one, and that separator is what keeps it
+/// absolute rather than drive-relative (`C:\`, not `C:`).
 fn ensure_trailing_separator(mut path: String) -> String {
     if !path.ends_with(std::path::MAIN_SEPARATOR) {
         path.push(std::path::MAIN_SEPARATOR);
@@ -923,7 +923,8 @@ fn ensure_trailing_separator(mut path: String) -> String {
 /// Expands `~` to the user's home directory, resolves the path with
 /// [`std::fs::canonicalize`] (relative segments and symlinks), drops the
 /// platform's verbatim prefix via [`crate::util::strip_verbatim_prefix`], and
-/// appends the trailing separator a registered root has always been shown with.
+/// appends the trailing separator a managed workspace's root has always been
+/// shown with.
 /// Returns a clear error message on failure so callers can surface it
 /// to the user (e.g. "Path does not exist" or "Not a directory").
 fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
@@ -952,7 +953,7 @@ fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
 
 /// Synthesize a workspace from an absolute path to an existing directory — the
 /// way a custom-role launch can name *any* folder on the machine as its
-/// workspace, without it being registered.
+/// workspace, without it being a managed workspace.
 ///
 /// `None` unless `name` is an absolute path that exists and is a directory (the
 /// two syscalls run on the blocking-friendly path, like the delegation target
@@ -962,8 +963,8 @@ fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
 /// (`session_metadata.workspace_name`, `jobs.workspace_name`, the sub-round
 /// envelopes), and [`crate::users::resolve_workspace`] accepts an absolute
 /// path, so the address must be the folder itself for the launch to resolve
-/// back after a restart. A registered workspace with that name is resolved by
-/// the caller first and still wins — as does the registered workspace whose
+/// back after a restart. A managed workspace with that name is resolved by
+/// the caller first and still wins — as does the managed workspace whose
 /// folder this path is (`WorkspaceStore::get_by_path`).
 #[must_use]
 pub(crate) fn synthesize_from_path(name: &str) -> Option<Workspace> {
@@ -1029,7 +1030,7 @@ impl WorkspaceStore {
         Ok(self.conn.execute(&sql, params).await?)
     }
 
-    /// Insert a new workspace and register it for analysis.
+    /// Insert a new workspace and mark it for analysis.
     ///
     /// The workspace is written with status `pending` (paused=1) and the
     /// discovery spawn is deferred to the management poll's pickup step:
@@ -1092,9 +1093,9 @@ impl WorkspaceStore {
             .await
     }
 
-    /// Look up the registered workspace whose folder is `path` — a caller may
-    /// name a registered workspace by its path instead of its name
-    /// ([`crate::users::resolve_workspace`]). Registered rows store the
+    /// Look up the managed workspace whose folder is `path` — a caller may
+    /// name a managed workspace by its path instead of its name
+    /// ([`crate::users::resolve_workspace`]). Managed rows store the
     /// canonical path with a trailing separator
     /// ([`canonicalize_workspace_path`]), so the candidate is normalized the
     /// same way before the comparison.
@@ -1259,7 +1260,7 @@ impl WorkspaceStore {
             .await?;
         anyhow::ensure!(
             affected > 0,
-            "No workspace is registered under the name '{name}'."
+            "No managed workspace exists under the name '{name}'."
         );
         if paused {
             // Keyed to the user/operator/failure pause — the one place that
@@ -1287,12 +1288,12 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Pause every registered workspace — the `mahbot paused` startup mode,
+    /// Pause every managed workspace — the `mahbot paused` startup mode,
     /// which must leave no workspace able to pick work up. Each row goes through
     /// [`Self::set_paused`], so the pause is the ordinary one. Rows already
     /// paused (a `pending`/`analyzing` one already carries the discovery
     /// analysis-pause) are left untouched rather than rewritten. Returns the
-    /// number of registered workspaces, all of them now paused. Personal
+    /// number of managed workspaces, all of them now paused. Personal
     /// workspaces have no row here.
     pub async fn pause_all(&self) -> Result<usize> {
         let workspaces = self.list().await?;
@@ -2067,13 +2068,13 @@ mod tests {
             .await
             .expect_err("an unknown workspace must be refused");
         assert!(
-            err.to_string().contains("No workspace is registered"),
+            err.to_string().contains("No managed workspace exists"),
             "got: {err}"
         );
     }
 
     #[tokio::test]
-    async fn pause_all_pauses_every_registered_workspace() {
+    async fn pause_all_pauses_every_managed_workspace() {
         let (store, _tmp) = test_store().await;
         insert_direct(&store, "all_ready", "/tmp/all_ready", false, false, 0, 0).await;
         insert_direct(&store, "all_paused", "/tmp/all_paused", true, false, 0, 0).await;
@@ -2466,15 +2467,15 @@ mod tests {
         );
 
         // Judged through the OS, not against the constructor that produced it:
-        // the platform must resolve the stored root back to the registered
-        // directory, keep the separator a registered root is shown with, and
+        // the platform must resolve the stored root back to the managed
+        // directory, keep the separator a managed root is shown with, and
         // never hand a consumer the verbatim form. Only the no-verbatim check
         // needs a Windows host to fail: a verbatim root still resolves, separator
         // and all, so the other two see nothing there.
         assert_eq!(
             std::fs::canonicalize(&ws.path).expect("the platform must resolve the stored root"),
-            std::fs::canonicalize(dir.path()).expect("canonicalize the registered dir"),
-            "the stored root must resolve to the registered directory"
+            std::fs::canonicalize(dir.path()).expect("canonicalize the managed dir"),
+            "the stored root must resolve to the managed directory"
         );
         assert!(
             !ws.path.contains(r"\\?\"),
@@ -2483,7 +2484,7 @@ mod tests {
         );
         assert!(
             ws.path.ends_with(std::path::MAIN_SEPARATOR),
-            "a registered root keeps the trailing separator it has always been \
+            "a managed root keeps the trailing separator it has always been \
              shown with: {:?}",
             ws.path
         );

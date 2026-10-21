@@ -424,7 +424,7 @@ impl AgentRegistry {
     /// worker branch is a [`crate::Role::Worker`] and counts like any other
     /// worker.
     ///
-    /// Path equality is component-based, so a registered workspace's stored
+    /// Path equality is component-based, so a managed workspace's stored
     /// trailing separator is not a different folder.
     #[must_use]
     pub fn worker_in_folder(&self, folder: &Path, caller: Option<&str>) -> Option<AgentHandle> {

@@ -104,7 +104,7 @@ pub(crate) async fn custom_role(
 /// the persistent conversation `worker_{branch}`.
 ///
 /// `place` is the folder the branch works in, already resolved by the same rule
-/// as a single worker run (so a registered project, anything inside one, the
+/// as a single worker run (so a managed workspace, anything inside one, the
 /// filesystem root and the product's data directory were refused before this is
 /// called); `None` runs in `caller_ws` — the caller's own workspace, where a
 /// worker runs today when none is given. A later use pointing at another folder
@@ -230,7 +230,7 @@ pub(crate) async fn stop(agent_id: &str) -> Result<()> {
 }
 
 /// Resolve a launch's `place` into the workspace the launch runs in — the
-/// workspace ADDRESS stored with the launch is its `name`: a registered
+/// workspace ADDRESS stored with the launch is its `name`: a managed
 /// workspace keeps its name (whether the launch named it by name or by its
 /// folder), `personal:{user}` its key, and any other folder its canonical
 /// absolute path ([`crate::workspace::synthesize_from_path`] names a path
@@ -245,7 +245,7 @@ pub(crate) async fn launch_workspace(place: Option<&str>) -> Result<crate::Works
         )),
         Some(raw) => crate::users::resolve_workspace(raw).await?.ok_or_else(|| {
             anyhow::anyhow!(
-                "usage: the place must be a registered workspace name or an absolute path \
+                "usage: the place must be a managed workspace name or an absolute path \
                  to an existing directory"
             )
         }),

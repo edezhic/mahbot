@@ -82,8 +82,8 @@ pub(crate) async fn cancel_round(job_id: &str, caller: &str) -> anyhow::Result<C
         .map_err(|e| e.context(not_discarded(job_id)))?;
     // A cancelled round never resumes, so its placed engine goes now — by the
     // directory the row recorded, which names the engine whether or not the
-    // directory is still there. A round in a registered folder releases nothing:
-    // that name is never the folder's own workspace.
+    // directory is still there. A round in a managed workspace's folder releases
+    // nothing: that name is never the folder's own workspace.
     if let Some(dir) = place {
         crate::tools::delegation::release_placed_engine(&dir);
     }

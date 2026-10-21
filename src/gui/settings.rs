@@ -322,7 +322,7 @@ pub enum SettingsMessage {
     SubmitAddWorkspace,
     /// Result of workspace add.
     AddWorkspaceResult(Result<Workspace, String>),
-    /// Make a registered workspace the account's active one (see
+    /// Make a managed workspace the account's active one (see
     /// `Dashboard::activate_workspace`).
     ActivateWorkspace(String),
     // ── User management (sub-messages) ──────────────────────────
@@ -1483,9 +1483,9 @@ impl SettingsState {
                 let name = self.add_workspace_name.text();
                 let path = self.add_workspace_path.text();
                 Task::perform(
-                    // Registering activates the new workspace: the Dashboard
+                    // Adding activates the new workspace: the Dashboard
                     // turns this result into the active one (see
-                    // `process_settings_message`), so the registration is all
+                    // `process_settings_message`), so the addition is all
                     // this task does.
                     async move {
                         crate::workspace::store()

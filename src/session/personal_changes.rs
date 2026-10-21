@@ -489,7 +489,7 @@ fn under_userspaces(path: &Path) -> Option<PathBuf> {
 
 /// The account whose personal folder `path` is or lies in — the folder itself or
 /// anything under it (a delegated round, a targeted project round and a
-/// custom-role launch all work below it, and a registered workspace placed inside
+/// custom-role launch all work below it, and a managed workspace placed inside
 /// one counts too): the first component below the userspaces root, which is the
 /// name [`crate::users::personal_workspace_path`] builds every personal folder
 /// from.
@@ -566,9 +566,9 @@ fn freeze(previous: Option<&Snapshot>, rel: &str, out: &mut Snapshot) {
 /// `workspace`'s personal account, when the turn ran in a personal folder —
 /// the folder itself, or anything under it (a delegated round, a targeted
 /// project round and a custom-role launch all work under a path-derived
-/// workspace, and a registered workspace placed inside one counts too). `None`
+/// workspace, and a managed workspace placed inside one counts too). `None`
 /// for a workspace that is neither inside the userspaces root nor named after a
-/// personal workspace, which is what leaves an ordinary project workspace
+/// personal workspace, which is what leaves an ordinary managed workspace
 /// untouched.
 ///
 /// Where the turn actually worked decides first — that is where its writes
@@ -935,7 +935,7 @@ pub(crate) async fn refresh_after_turn(role: &Role, workspace: &Workspace, recor
 /// The account a turn's change report and baseline concern: the owner of the
 /// personal folder that turn ran in ([`personal_user_of`]), refused when the name
 /// cannot address a folder. `None` for a turn that ran in no personal folder,
-/// which is what leaves an ordinary project workspace untouched.
+/// which is what leaves an ordinary managed workspace untouched.
 fn personal_account_of(workspace: &Workspace) -> Option<String> {
     let user_name = personal_user_of(workspace)?;
     crate::users::is_valid_personal_user_name(&user_name).then_some(user_name)
@@ -2006,7 +2006,7 @@ mod tests {
         assert_eq!(
             personal_user_of(&project),
             None,
-            "a registered project workspace is not watched"
+            "a managed workspace is not watched"
         );
 
         // A personal workspace whose folder the product reaches through a

@@ -1966,7 +1966,7 @@ pub(crate) async fn report_update_failure(err: &anyhow::Error) {
 pub fn back_online_message(started_paused: bool) -> String {
     let message = format!("✅ MahBot is back online — running v{VERSION}");
     if started_paused {
-        format!("{message}\nStarted paused — every registered workspace is on pause.")
+        format!("{message}\nStarted paused — every managed workspace is on pause.")
     } else {
         message
     }

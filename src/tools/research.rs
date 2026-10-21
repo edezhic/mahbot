@@ -3656,10 +3656,11 @@ mod tests {
         resume_research_run(job_id, &ws).await;
 
         // Terminalized into the durable envelope addressed to the stored
-        // caller (the consumer skips it — the workspace is not registered, so
-        // the pending row survives for the assertion). The surviving jobs row
-        // is the research_cleanup durability row (id == run_id == folder
-        // name) — the cleanup's resume marker, held until it completes.
+        // caller (the consumer skips it — the workspace is not a managed
+        // workspace, so the pending row survives for the assertion). The
+        // surviving jobs row is the research_cleanup durability row (id ==
+        // run_id == folder name) — the cleanup's resume marker, held until it
+        // completes.
         let job_rows = conn
             .query(
                 "SELECT kind FROM jobs WHERE id = ?1",

@@ -932,10 +932,10 @@ fn render_temp_cleanup_prompt(roots: &[CleanupRoot]) -> String {
     )
 }
 
-/// Synthetic workspace name for the cleaner. Never registered in the
-/// `workspaces` table — ephemeral, like research run roots. Explicit name: the
-/// pinned temp root's last path component is "mahbot", which would collide
-/// with the registered repo workspace via `Workspace::from_path`.
+/// Synthetic workspace name for the cleaner. No `workspaces` row — ephemeral,
+/// like research run roots. Explicit name: the pinned temp root's last path
+/// component is "mahbot", which would collide with the managed repo workspace
+/// via `Workspace::from_path`.
 const TEMP_CLEANUP_WORKSPACE_NAME: &str = "tmp";
 
 /// Dispatch the cleaner and run it to completion (Sanitation role).

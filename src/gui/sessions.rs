@@ -182,11 +182,11 @@ impl CachedSessionItem {
     /// is titled `Worker · <branch>` so it is distinguishable from a single worker
     /// run.
     ///
-    /// A workspace's manager and maintainer belong to exactly one registered
-    /// workspace, so their rows are titled by its registered name (`mahbot_rlx`,
+    /// A workspace's manager and maintainer belong to exactly one managed
+    /// workspace, so their rows are titled by its managed name (`mahbot_rlx`,
     /// never the folder basename and never the account name). When that
-    /// workspace is no longer registered the row shows the role alone rather
-    /// than a stale name.
+    /// workspace is no longer a managed workspace the row shows the role
+    /// alone rather than a stale name.
     fn display_title(&self, workspaces: &HashMap<String, Workspace>) -> String {
         match (self.role, self.custom_role.as_deref()) {
             (Some(crate::Role::Custom), Some(name)) => {
@@ -1690,7 +1690,7 @@ mod tests {
         assert_eq!(
             workspace_root_for("mahbot_rlx", &map),
             Some(PathBuf::from("/tmp/ws/mahbot_rlx")),
-            "a registered workspace resolves to its path"
+            "a managed workspace resolves to its path"
         );
         assert_eq!(
             workspace_root_for("/tmp/ws/stored", &map),
@@ -1705,7 +1705,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_scoped_cards_are_titled_by_their_registered_workspace() {
+    fn workspace_scoped_cards_are_titled_by_their_managed_workspace() {
         let map = workspace_map(&["mahbot_rlx"]);
 
         for role in [crate::Role::Manager, crate::Role::Maintainer] {
@@ -1714,7 +1714,7 @@ mod tests {
             // The last turn's user never decides a workspace-scoped title.
             let no_user = cached_item(role, None, Some("mahbot_rlx"));
             assert_eq!(no_user.display_title(&map), "mahbot_rlx");
-            // A workspace no longer registered leaves the role alone.
+            // A workspace no longer in the managed set leaves the role alone.
             let orphaned = cached_item(role, Some("admin"), Some("deleted_ws"));
             assert_eq!(orphaned.display_title(&map), role.display_label());
             // A session with no recorded workspace is equally "not known".

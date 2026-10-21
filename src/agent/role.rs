@@ -311,7 +311,7 @@ impl Role {
     /// A guest's Assistant is pinned to `personal:<user>`, so its analysts
     /// must lose the shell: that shell has no reading restriction and would be
     /// a direct route into the admin's `shared` folder the per-user grants
-    /// exist to gate. Anything else — a project workspace (the pipeline's own
+    /// exist to gate. Anything else — a managed workspace (the pipeline's own
     /// analysts), or the admin's own personal workspace — keeps it; an
     /// unrecognised `personal:` name falls to the stricter side.
     fn analyst_shell_allowed(ws: &Workspace) -> bool {
@@ -414,7 +414,7 @@ impl Role {
             t.push(Box::new(MahbotConfigTool));
             t.push(Box::new(MahbotDebugTool));
             // The admin's own project view: list / add / board / ticket /
-            // comment / pause / resume over the registered workspaces.
+            // comment / pause / resume over the managed workspaces.
             t.push(Box::new(WorkspaceTool));
         }
         t
@@ -1022,7 +1022,7 @@ mod tests {
             .map(|t| t.description())
             .unwrap_or_default();
         assert!(
-            admin_edit_desc.contains("registered project workspaces")
+            admin_edit_desc.contains("managed workspaces")
                 && admin_edit_desc.contains("home directory"),
             "the admin's Assistant edit must name what stays closed, got: {admin_edit_desc}"
         );
@@ -1157,7 +1157,7 @@ mod tests {
 
     #[test]
     fn analyst_shell_follows_the_summoning_session() {
-        // The pipeline's own analysts (project workspaces) and the owner
+        // The pipeline's own analysts (managed workspaces) and the owner
         // admin's Assistant keep the read-only shell; every other user's
         // Assistant summons shell-less analysts, including an unresolvable
         // personal name (fail closed).

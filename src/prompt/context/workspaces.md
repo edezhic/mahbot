@@ -1,4 +1,4 @@
-<registered-workspaces>
-Registered workspaces:
+<managed-workspaces>
+Managed workspaces:
 {{workspaces}}
-</registered-workspaces>
+</managed-workspaces>

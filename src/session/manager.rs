@@ -760,7 +760,7 @@ impl Session {
     /// alarms                 — Assistant only, when the user has active alarms
     /// personal_files         — Assistant only, when the personal folder shows
     ///                          something of the user's
-    /// workspaces             — the admin's Assistant only, when workspaces are registered
+    /// workspaces             — the admin's Assistant only, when managed workspaces exist
     /// custom_tools           — Assistant only, always (the catalogue, or the
     ///                          brief "nothing available" form)
     /// custom_roles           — the admin's Assistant only, when roles are defined
@@ -901,7 +901,7 @@ impl Session {
         }
         // Assistant sessions carry the user's alarm snapshot, the personal
         // folder's shape (its immediate child folders with their file counts —
-        // never a path), the registered workspace list (the admin's Assistant
+        // never a path), the managed workspace list (the admin's Assistant
         // only), the custom-tool catalogue and the custom-role listing (the
         // admin's Assistant only) — the same snapshot-at-session-start contract
         // as the board block below.
@@ -1158,14 +1158,14 @@ async fn fetch_assistant_context(
         let Ok(all) = workspaces.list().await else {
             return Vec::new();
         };
-        // Defensive: personal workspaces are never registered rows, but never
+        // Defensive: personal workspaces are never managed rows, but never
         // let one leak into the block (or pay a context read for it).
-        let registered: Vec<Workspace> = all
+        let managed: Vec<Workspace> = all
             .into_iter()
             .filter(|w| !w.name.starts_with("personal:"))
             .collect();
         let summaries = join_all(
-            registered
+            managed
                 .iter()
                 .map(|w| workspaces.get_general_context(&w.name)),
         )
@@ -1173,7 +1173,7 @@ async fn fetch_assistant_context(
         .into_iter()
         .map(|res| res.ok().flatten())
         .collect::<Vec<_>>();
-        registered.into_iter().zip(summaries).collect()
+        managed.into_iter().zip(summaries).collect()
     };
     let custom_roles = async {
         if !is_admin {
@@ -1197,8 +1197,8 @@ async fn fetch_assistant_context(
 /// Whether the file-derived workspace context for this session carries the
 /// account's personal memory (`MEMORY.md`): only the Assistant of the account
 /// whose personal workspace it is. No other role — in a personal folder or a
-/// project workspace — and no other account's Assistant receives it; a
-/// `MEMORY.md` sitting in a project workspace is nobody's continuity record.
+/// managed workspace — and no other account's Assistant receives it; a
+/// `MEMORY.md` sitting in a managed workspace is nobody's continuity record.
 fn carries_personal_memory(ws: &Workspace, role: Role, user_name: &str) -> bool {
     matches!(role, Role::Assistant)
         && crate::users::is_valid_personal_user_name(user_name)
@@ -1293,7 +1293,7 @@ fn render_alarm_lines(alarms: &[Alarm]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-/// Render one entry per registered workspace — name, status (strum Display),
+/// Render one entry per managed workspace — name, status (strum Display),
 /// path, plus a one-line collapsed discovery summary when one exists. A
 /// workspace without a summary (Pending/Failed, discovery not run) is still
 /// listed, just without the summary line. Personal rows are filtered upstream
@@ -1965,7 +1965,7 @@ mod tests {
             !admin.contains("outside the workspace"),
             "the admin's frame must not read as confinement: {admin}"
         );
-        for named in ["registered project workspaces", "live databases"] {
+        for named in ["managed workspaces", "live databases"] {
             assert!(
                 admin.contains(named),
                 "the admin's frame must name what stays closed ({named}): {admin}"
@@ -2040,7 +2040,7 @@ mod tests {
         assert_eq!(blocks.len(), 3);
         assert!(blocks[0].contains("<user-alarms>"));
         assert!(blocks[1].contains("<personal-files>"));
-        assert!(!blocks[1].contains("<registered-workspaces>"));
+        assert!(!blocks[1].contains("<managed-workspaces>"));
         assert_eq!(blocks[2], custom);
 
         // The admin's Assistant: the workspace list joins them, and the
@@ -2056,7 +2056,7 @@ mod tests {
         assert_eq!(blocks.len(), 4);
         assert!(blocks[0].contains("<user-alarms>"));
         assert!(blocks[1].contains("<personal-files>"));
-        assert!(blocks[2].contains("<registered-workspaces>"));
+        assert!(blocks[2].contains("<managed-workspaces>"));
         assert_eq!(blocks[3], custom);
 
         // Empty data omits the conditional blocks but never the custom tools.
@@ -2409,7 +2409,7 @@ mod tests {
     /// The personal memory (`MEMORY.md`) is the owning account's
     /// Assistant-only continuity record: another role in that folder gets none
     /// of it, another account's Assistant gets none of it, a `MEMORY.md` in a
-    /// project workspace reaches nobody, and a non-agent model call carries
+    /// managed workspace reaches nobody, and a non-agent model call carries
     /// none either. Everything else in the context block still renders.
     #[tokio::test]
     #[serial_test::serial(active_models)] // seeds the process-global catalog caches
@@ -2475,7 +2475,7 @@ mod tests {
         let stranger = context(&personal, crate::Role::Assistant, "memory_gate_other").await;
         assert!(!stranger.contains(MEMORY));
 
-        // A project workspace's MEMORY.md is nobody's continuity record, while
+        // A managed workspace's MEMORY.md is nobody's continuity record, while
         // its other context files still reach the prompt.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("MEMORY.md"), MEMORY).unwrap();
@@ -2486,7 +2486,7 @@ mod tests {
             let rendered = context(&project, role, user).await;
             assert!(
                 !rendered.contains(MEMORY),
-                "{role:?} in a project workspace received its MEMORY.md"
+                "{role:?} in a managed workspace received its MEMORY.md"
             );
             assert!(rendered.contains(SHARED));
         }

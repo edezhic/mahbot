@@ -89,7 +89,7 @@ async fn bootstrap_mahbot_safe(
 /// Async startup for `MahBot` — runs on Iced's Tokio runtime via a boot
 /// [`iced::Task`].
 ///
-/// `start_paused` is the `mahbot paused` startup mode: every registered
+/// `start_paused` is the `mahbot paused` startup mode: every managed
 /// workspace is put on pause before the poll loop that claims work starts.
 ///
 /// `slowdown` is what the platform answered when the daemon path asked for the
@@ -147,7 +147,7 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
         }
     }
 
-    // `mahbot paused`: put every registered workspace on pause here. The stores
+    // `mahbot paused`: put every managed workspace on pause here. The stores
     // are up and the poll loop that claims work is not spawned yet, so its first
     // round already finds them paused and nothing gets claimed. This is the
     // ordinary workspace pause — the same persisted flag and the same `set_paused`
@@ -162,7 +162,7 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
             .map_err(|e| mahbot::boot::record_startup_failure("workspace::pause_all", e))?;
         info!(
             workspaces,
-            "Started with the paused argument: all registered workspaces are on pause"
+            "Started with the paused argument: all managed workspaces are on pause"
         );
     }
 
@@ -838,7 +838,7 @@ fn main() -> Result<()> {
         }
 
         // A startup mode, not a command line: the launch continues into the normal
-        // GUI startup with the flag that pauses every registered workspace before
+        // GUI startup with the flag that pauses every managed workspace before
         // any background task starts (see `bootstrap_mahbot`).
         EntryPoint::Paused => true,
         // A bare `mahbot`: the daemon.

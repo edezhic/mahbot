@@ -1843,13 +1843,13 @@ mod tests {
         );
     }
 
-    /// A path that is a registered workspace's own folder resolves to that
+    /// A path that is a managed workspace's own folder resolves to that
     /// workspace — not to a separate path-named area over the same tree — so a
     /// launch addressed by path still runs with the workspace's notes, its pause
     /// state and its search engine.
     #[tokio::test]
     #[serial_test::serial(provider)]
-    async fn test_resolve_workspace_path_of_registered_workspace() {
+    async fn test_resolve_workspace_path_of_managed_workspace() {
         crate::util::test::init_management_test_stores().await;
         let dir = tempfile::tempdir().expect("create temp dir");
         let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize temp dir");
@@ -1864,7 +1864,7 @@ mod tests {
         let resolved = crate::users::resolve_workspace(&dir.path().to_string_lossy())
             .await
             .expect("resolve should succeed")
-            .expect("a folder that is a registered workspace resolves");
+            .expect("a folder that is a managed workspace resolves");
 
         assert_eq!(resolved.name, "path_resolved_ws");
     }

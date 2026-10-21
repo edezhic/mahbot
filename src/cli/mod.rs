@@ -68,7 +68,7 @@ mahbot — autonomous agentic engineering system with a GUI dashboard daemon
 
 Usage:
   mahbot                 Launch the GUI dashboard daemon
-  mahbot paused          Launch the daemon with every registered workspace
+  mahbot paused          Launch the daemon with every managed workspace
                          paused (no ticket is claimed or advanced)
   mahbot audio <operation> [flags]
                          Speech on the command line (macOS): a recording into
@@ -708,18 +708,18 @@ pub(crate) const FAMILIES: &[Family] = &[
             Operation {
                 tool: "workspace",
                 action: Some("list"),
-                purpose: "List the registered workspaces",
+                purpose: "List the managed workspaces",
                 flags: &[Flag {
                     arg: "workspace",
                     kind: FlagKind::Value,
                     secret: false,
-                    purpose: "One registered workspace; omit it to list every one",
+                    purpose: "One managed workspace; omit it to list every one",
                 }],
             },
             Operation {
                 tool: "workspace",
                 action: Some("add"),
-                purpose: "Register a software project directory as a workspace",
+                purpose: "Add a software project directory as a managed workspace",
                 flags: &[
                     Flag {
                         arg: "name",
@@ -732,7 +732,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                         arg: "path",
                         kind: FlagKind::Value,
                         secret: false,
-                        purpose: "Absolute path to the project directory to register",
+                        purpose: "Absolute path to the project directory to add",
                     },
                 ],
             },
@@ -748,13 +748,13 @@ pub(crate) const FAMILIES: &[Family] = &[
             Operation {
                 tool: "workspace",
                 action: Some("pause"),
-                purpose: "Freeze one registered workspace, or every one when none is named",
+                purpose: "Freeze one managed workspace, or every one when none is named",
                 flags: &[Flag {
                     arg: "workspace",
                     kind: FlagKind::Value,
                     secret: false,
-                    purpose: "The registered workspace to freeze; omit it to freeze EVERY \
-                              registered workspace (the fleet-wide pause — a workspace that is \
+                    purpose: "The managed workspace to freeze; omit it to freeze EVERY \
+                              managed workspace (the fleet-wide pause — a workspace that is \
                               not ready is skipped and left untouched, which makes that result \
                               a partial one)",
                 }],
@@ -763,13 +763,13 @@ pub(crate) const FAMILIES: &[Family] = &[
             Operation {
                 tool: "workspace",
                 action: Some("resume"),
-                purpose: "Resume one registered workspace, or every one when none is named",
+                purpose: "Resume one managed workspace, or every one when none is named",
                 flags: &[Flag {
                     arg: "workspace",
                     kind: FlagKind::Value,
                     secret: false,
-                    purpose: "The registered workspace to resume; omit it to resume EVERY \
-                              registered workspace (the fleet-wide resume — a workspace that is \
+                    purpose: "The managed workspace to resume; omit it to resume EVERY \
+                              managed workspace (the fleet-wide resume — a workspace that is \
                               not ready is skipped and left untouched, which makes that result \
                               a partial one)",
                 }],
@@ -783,7 +783,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                         arg: "workspace",
                         kind: FlagKind::Value,
                         secret: false,
-                        purpose: "One registered workspace; omit it to cover every one",
+                        purpose: "One managed workspace; omit it to cover every one",
                     },
                     Flag {
                         arg: "phase",
@@ -866,11 +866,12 @@ pub(crate) const FAMILIES: &[Family] = &[
                 arg: "place",
                 kind: FlagKind::Value,
                 secret: false,
-                purpose: "The folder the addressee works in: for 'manager', the project to \
-                          message, by its registered name or its own folder; for 'role', a \
-                          registered project, a folder path, or 'personal:<user>'; a worker or \
-                          a worker branch works in a directory outside the registered projects \
-                          (one inside is refused), and in your own workspace when it names none",
+                purpose: "The folder the addressee works in: for 'manager', the managed \
+                          workspace to message, by its managed name or its own folder; for \
+                          'role', a managed workspace, a folder path, or 'personal:<user>'; a \
+                          worker or a worker branch works in a directory outside the managed \
+                          workspaces (one inside is refused), and in your own workspace when it \
+                          names none",
             },
             Flag {
                 arg: "branch",
@@ -1628,7 +1629,7 @@ fn family(word: &str) -> Option<Cli> {
 pub enum EntryPoint {
     /// `mahbot` with no first word: the dashboard daemon.
     Daemon,
-    /// `mahbot paused`: the daemon, with every registered workspace paused before
+    /// `mahbot paused`: the daemon, with every managed workspace paused before
     /// the poll loop starts.
     Paused,
     /// `-h`/`--help`.

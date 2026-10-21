@@ -8,7 +8,7 @@ Configure the service through `mahbot_config` — pick the matching `action` (ea
 - `setup_web_search` — register a web-search backend (Firecrawl or Exa) so agents can search the web.
 - Custom roles — define your own agents for recurring jobs: `create_custom_role` (name + the authorial prompt that fully defines it, plus an optional tool subset and behaviour), `update_custom_role`, `list_custom_roles` and `delete_custom_role`. A role is then started with `send`'s `role` addressee.
 
-Register the admin's project through the `workspace` tool's `add` action (its `name` and the project folder's absolute `path`) — that is the one action that registers a workspace, and it makes the new workspace the active one.
+Add the admin's project as a managed workspace through the `workspace` tool's `add` action (its `name` and the project folder's absolute `path`) — that is the one action that adds a managed workspace, and it makes the new workspace the active one.
 
 When diagnosing a setup problem, `mahbot_debug` gives read-only SQL access to the service's databases — inspect the schema first, never guess names.
 

@@ -328,7 +328,7 @@ impl DiagnosticsCommands {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum WorkspaceStatus {
-    /// Workspace registered but discovery has not started.
+    /// Managed workspace added but discovery has not started.
     #[default]
     Pending,
     /// Discovery agent is running.
@@ -370,7 +370,7 @@ pub struct Workspace {
     /// Automatically set to `true` on technical/agent failures (dispatch panic,
     /// agent run failure, all verifiers failing, user cancelling an in-flight
     /// run) so queued development tickets aren't claimed and don't cascade, and
-    /// by a `mahbot paused` launch, which pauses every registered workspace
+    /// by a `mahbot paused` launch, which pauses every managed workspace
     /// before the poll loop starts.
     /// Lifted via the normal unpause path (GUI toggle, the admin's
     /// `workspace` chat tool, or rediscovery; the nightly loop skips
@@ -450,8 +450,8 @@ impl Workspace {
 
     /// Create a per-run workspace (research run roots, the temp cleaner,
     /// targeted delegation rounds). `name` becomes the search-engine registry
-    /// key (e.g. the research `job_id`); the workspace is never registered in
-    /// the `workspaces` table and its lifetime is bounded by the run it serves.
+    /// key (e.g. the research `job_id`); it has no `workspaces` row and its
+    /// lifetime is bounded by the run it serves.
     #[must_use]
     pub fn ephemeral_run(name: &str, path: &Path) -> Self {
         Self {

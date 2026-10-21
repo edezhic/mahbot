@@ -87,7 +87,7 @@ struct WorkspaceShellState {
 pub enum ShellMessage {
     /// Terminal event forwarded from an embedded terminal widget.
     TerminalEvent(iced_term::Event),
-    /// The workspace resolved for the current selection (registered name plus
+    /// The workspace resolved for the current selection (managed name plus
     /// filesystem path), pushed only by the dashboard's
     /// `sync_workspace_surfaces` — never a substitution for an unresolved one.
     WorkspaceSelected(String, String),

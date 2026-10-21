@@ -23,7 +23,7 @@ pub(crate) async fn set_selected_workspace_field(
     workspace: String,
 ) -> Result<(), String> {
     let store = user_store()?;
-    // Empty and personal-workspace values both mean "no shared workspace
+    // Empty and personal-workspace values both mean "no managed workspace
     // selected" → NULL.
     let val = if workspace.is_empty() || crate::users::is_personal_workspace(&workspace) {
         None

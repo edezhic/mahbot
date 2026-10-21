@@ -71,7 +71,7 @@ pub(crate) struct Alarm {
     pub role: Option<String>,
     /// The custom role branch identifier, when one was given.
     pub identifier: Option<String>,
-    /// The folder the role's launch runs in (a registered workspace name, a
+    /// The folder the role's launch runs in (a managed workspace name, a
     /// `personal:{user}` key, or an absolute path); `None` = the owner's
     /// personal folder.
     pub workspace: Option<String>,

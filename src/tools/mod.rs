@@ -482,7 +482,7 @@ pub(crate) async fn caught_round<T>(
 }
 
 /// Gives back a synthetic `dir-…` exec engine when it is dropped, so a round that
-/// unwinds releases it exactly as one that returns does. A registered
+/// unwinds releases it exactly as one that returns does. A managed
 /// workspace's own engine is never touched (see
 /// [`delegation::release_exec_engine`]).
 struct ExecEngineGuard<'a>(&'a crate::Workspace);
@@ -983,7 +983,7 @@ impl SyncDurableCore {
             Err(e) => Err(e),
         };
         // The round is over: drop the synthetic `dir-…` engine it may have
-        // created (a registered place's own engine is left alone). The
+        // created (a managed workspace's own engine is left alone). The
         // drain-cut early return above deliberately skips this — that job
         // resumes in the same directory.
         if let Some(place) = place {
@@ -1295,7 +1295,7 @@ pub(crate) fn build_async_result_envelope(
     tag: &str,
     exec_dir: Option<&str>,
 ) -> String {
-    // A registered workspace's stored path carries a trailing separator; the
+    // A managed workspace's stored path carries a trailing separator; the
     // reply names the directory in its bare spelling either way.
     let dir_line = exec_dir.map_or_else(String::new, |dir| {
         format!(
