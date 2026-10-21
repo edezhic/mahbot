@@ -75,6 +75,13 @@ pub(crate) const ERR_STALE_ELEMENT: &str = "stale-element";
 )]
 pub(crate) const ERR_AMBIGUOUS_LOCATOR: &str = "ambiguous-locator";
 pub(crate) const ERR_NOT_MATCHED: &str = "not-matched";
+/// The target is mahbot's own interface and this platform cannot perform the
+/// operation on itself from inside the process. Deliberately distinct from
+/// `unsupported`, whose prompt guidance ("take another route … or coordinates")
+/// would keep the model spinning on a class the platform refuses for that
+/// operation.
+#[cfg_attr(not(target_os = "windows"), expect(dead_code))]
+pub(crate) const ERR_SELF_TARGET: &str = "self-target";
 
 /// Build a taxonomy-prefixed error: `"<kind>: <msg>"`. The message MUST start
 /// with the taxonomy word so the model can branch on the category.

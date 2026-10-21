@@ -12,6 +12,14 @@
 //! [`macos`]. Windows needs no grant at all, but refuses to actuate on windows of
 //! elevated processes and cannot reach the secure desktop — see [`windows`].
 //!
+//! Mahbot's own windows are targets like any other — listed, readable and
+//! capturable — but the system answers accessibility requests addressed to them
+//! inside this process, so each backend handles them deliberately: on macOS their
+//! exchanges run on the main thread under a bounded wait (so they stay
+//! actionable), on Windows element actions are refused because there is no way
+//! onto the interface thread, and Linux never sees our window at all (no AT-SPI
+//! surface).
+//!
 //! The agent-facing description is the shared `src/prompt/tool/computer.md` plus
 //! only the running platform's own file ([`PLATFORM_DESCRIPTION`]): one
 //! installation is one platform, so no agent is handed another's caveats.
@@ -869,14 +877,15 @@ async fn cursor() -> anyhow::Result<String> {
     let (ax, ay) = backend().cursor_position().await?;
     // A surface without usable geometry degrades to the absolute pointer, as it
     // always has (no focused window, an unreachable AT-SPI bus, a Wayland portal
-    // failure). The one exception is a grant denial, which is a typed failure:
-    // it is actionable (its text names the terminal and the pane), and "no
-    // focused window" would misname it.
+    // failure, a self-target read the main thread did not answer), and the reason
+    // is passed on rather than guessed. The one exception is a grant denial, which
+    // is a typed failure: it is actionable (its text names the terminal and the
+    // pane), and "no surface" would misname it.
     let geo = match backend().surface_geometry(&target).await {
         Ok(geo) => geo,
         Err(e) if !core::is_permission_denied(&e) => {
             return Ok(format!(
-                "cursor at absolute ({ax:.1}, {ay:.1}) — no focused window to normalize against"
+                "cursor at absolute ({ax:.1}, {ay:.1}) — no surface to normalize against: {e}"
             ));
         }
         Err(e) => return Err(e),

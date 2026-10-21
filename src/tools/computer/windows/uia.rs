@@ -104,6 +104,7 @@ pub(super) fn act_on_element(
 ) -> anyhow::Result<()> {
     let resolved = window::resolve(target)?;
     window::ensure_actuation_allowed(Some(resolved.hwnd))?;
+    window::ensure_not_own_window(resolved.hwnd)?;
     let element = window_element(uia, &resolved)?;
     let tree = build_tree(uia, &element, resolved.surface)?;
     let node = core::resolve_locator_checked(&tree.root, locator)?;

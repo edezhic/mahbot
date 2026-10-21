@@ -8,3 +8,4 @@
 * No streaming in v1.
 * Offered only when a GUI session with a reachable session D-Bus exists; an accessibility stack that starts later is picked up by newly constructed sessions.
 * `permission-denied` means a D-Bus call was not authorized.
+* mahbot's own window publishes no AT-SPI surface, so it is not in `apps`/`windows`, cannot be observed or acted on by `ref`, and has no window still. `target: "screen"` input, key chords and `type` still reach it.

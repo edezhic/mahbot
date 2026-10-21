@@ -37,7 +37,7 @@
 //!
 //! # Actuation limits, stated rather than worked around
 //!
-//! [`window::ensure_actuation_allowed`] owns both refusals and names which one fired:
+//! [`window::ensure_actuation_allowed`] owns these two refusals and names which one fired:
 //!
 //! * A window owned by a process running elevated cannot be driven by this
 //!   non-elevated one: Windows blocks both synthetic input (UIPI) and accessibility
@@ -45,6 +45,14 @@
 //!   compositor, not its owner, serves the frame. Starting elevated is out of scope.
 //! * The UAC secure desktop and the lock screen live on another desktop. When either
 //!   is up, nothing can be read or actuated there and no workaround is attempted.
+//!
+//! [`window::ensure_not_own_window`] adds the one refusal that is ours alone: an
+//! ELEMENT ACTION on a window of mahbot itself. UI Automation answers our own
+//! process in-process, and this backend has no path onto the interface thread the
+//! dashboard owns (iced's event loop exposes no way to run a closure on itself),
+//! so a press or a value write could freeze the dashboard or kill the service. It
+//! is refused as `self-target`; our windows stay listed, readable and capturable,
+//! and raw input still reaches them.
 //!
 //! `cmd` in a key chord is the Windows key here (it is Super on Linux and Command on
 //! macOS); `win` is accepted as a key name for a plain Windows-key tap.

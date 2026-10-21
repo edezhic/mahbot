@@ -6,6 +6,11 @@
 //! Surface geometry is PIXELS on Linux: X11 has no stable logical-point space and
 //! mixed-DPI makes physical↔logical translation unreliable — this is precisely
 //! why the tool is accessibility-first here.
+//!
+//! Mahbot's own window publishes no AT-SPI surface, so it never appears in an
+//! enumeration, has no element tree and no window still; screen-target input, key
+//! chords and typing still reach it. Nothing here needs to know which process owns
+//! a window.
 
 #![cfg(target_os = "linux")]
 // A handful of pedantic cast lints are inherent to the C ABI-style integer

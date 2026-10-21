@@ -252,8 +252,7 @@ pub(super) fn ensure_actuation_allowed(hwnd: Option<HWND>) -> anyhow::Result<()>
         return Ok(());
     }
     let pid = pid_of(hwnd);
-    // SAFETY: `GetCurrentProcessId` takes no arguments and has no failure mode.
-    if pid == 0 || pid == unsafe { GetCurrentProcessId() } || !process_is_elevated(pid) {
+    if is_own_process(pid) || !process_is_elevated(pid) {
         return Ok(());
     }
     let title = title_of(hwnd);
@@ -264,6 +263,32 @@ pub(super) fn ensure_actuation_allowed(hwnd: Option<HWND>) -> anyhow::Result<()>
          a capture of the window may still work — ask the owner to run that application without \
          elevation"
     )))
+}
+
+/// Refuse an accessibility ACTION aimed at a window of mahbot itself.
+///
+/// UI Automation answers a call addressed to our own process in-process, and this
+/// backend has no path onto the interface thread the dashboard owns (iced's event
+/// loop exposes no way to run a closure on itself), so an element action issued
+/// from the accessibility thread can freeze the dashboard or abort the process —
+/// and a trap cannot be caught. The action is refused rather than risk the
+/// product. Listing, reading and capturing our own windows, and raw input that
+/// reaches them, are unaffected.
+pub(super) fn ensure_not_own_window(hwnd: HWND) -> anyhow::Result<()> {
+    if !is_own_process(pid_of(hwnd)) {
+        return Ok(());
+    }
+    let title = title_of(hwnd);
+    Err(core::taxonomy_error(
+        core::ERR_SELF_TARGET,
+        format!(
+            "window \"{title}\" belongs to mahbot itself: this process cannot drive its own \
+             accessibility elements safely, because a same-process element action is answered \
+             in-process and there is no way onto the interface thread — it could freeze the \
+             dashboard or kill the service, so it is refused instead. Our windows stay listed, \
+             readable and capturable, and coordinate input still reaches them"
+        ),
+    ))
 }
 
 /// Refuse while the secure desktop or the lock screen owns the input desktop.
@@ -671,6 +696,13 @@ fn pid_of(hwnd: HWND) -> u32 {
         GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
     }
     pid
+}
+
+/// Whether `pid` is this very process. A window that vanished before the query
+/// reports pid 0, which does not count as ours.
+fn is_own_process(pid: u32) -> bool {
+    // SAFETY: `GetCurrentProcessId` takes no arguments and has no failure mode.
+    pid != 0 && pid == unsafe { GetCurrentProcessId() }
 }
 
 fn title_of(hwnd: HWND) -> String {

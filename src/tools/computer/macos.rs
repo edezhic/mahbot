@@ -31,6 +31,17 @@
 //! daemon started some other way has none until that other thing is granted
 //! them too. A missing grant is requested and, when still missing, reported by
 //! [`permission_error`]; nothing degrades silently.
+//!
+//! # Our own windows
+//!
+//! An accessibility request addressed to mahbot's own window is answered inside
+//! this very process, on its main thread. From a worker thread it is not a clean
+//! failure: raising the window or acting on an element traps the process with
+//! SIGTRAP (uncatchable, and fatal on current macOS), while writing a value waits
+//! forever. Every AX exchange aimed at our own process therefore runs on the main
+//! queue and is awaited for a bounded time — see [`on_ax_thread`] — and our
+//! windows stay listed, readable, actionable and capturable like any other
+//! application's.
 
 #![cfg(target_os = "macos")]
 // The many casts and raw-pointer borrows are inherent to the C ABI/geometry
@@ -321,6 +332,105 @@ fn screen_capture_needs_14() -> anyhow::Error {
     )
 }
 
+// ── Our own process ─────────────────────────────────────────────────────
+//
+// The thread decision (see the module header) is taken where the target
+// process becomes known, never earlier from NSWorkspace state: the frontmost app
+// can change between that decision and the exchange. Target-addressed exchanges
+// get the pid from [`resolve_window`], the one place a target becomes a platform
+// handle, which raises [`NeedsAxThread`] before its first AX call; the window
+// listing knows the pid up front and enters through [`on_ax_thread`] directly.
+// [`with_target`] turns the marker into a re-run on the main queue.
+
+/// The longest a self-targeted AX exchange waits for the main queue.
+const SELF_AX_WAIT: Duration = Duration::from_secs(5);
+
+/// Marker for "this exchange resolved to mahbot itself while off the main
+/// thread". Never reaches the caller: [`with_target`] catches it and re-runs the
+/// exchange on the main queue.
+#[derive(Debug)]
+struct NeedsAxThread;
+
+impl std::fmt::Display for NeedsAxThread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("mahbot's own window is answered on the main thread")
+    }
+}
+
+impl std::error::Error for NeedsAxThread {}
+
+/// Whether `err` is the main-thread marker (robust to a `.context()` layer).
+fn is_ax_thread(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NeedsAxThread>().is_some()
+}
+
+/// Raise [`NeedsAxThread`] when `pid` is our own process and this is not the main
+/// thread. `pid` must come from the resolved target — for an app element that is a
+/// local getter, not an AX exchange.
+fn ensure_ax_thread(pid: u32) -> Result<(), anyhow::Error> {
+    if pid == std::process::id() && objc2::MainThreadMarker::new().is_none() {
+        return Err(anyhow::Error::new(NeedsAxThread));
+    }
+    Ok(())
+}
+
+/// Run one accessibility exchange where the system requires it: on the main
+/// thread when `pid` is mahbot itself, on the calling thread otherwise. A main
+/// thread that stays busy past [`SELF_AX_WAIT`] fails the call honestly instead
+/// of hanging it; the request itself may still be applied afterwards.
+fn on_ax_thread<T: Send + 'static>(
+    pid: u32,
+    f: impl FnOnce() -> Result<T, anyhow::Error> + Send + 'static,
+) -> Result<T, anyhow::Error> {
+    if pid != std::process::id() || objc2::MainThreadMarker::new().is_some() {
+        return f();
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    dispatch2::DispatchQueue::main().exec_async(move || {
+        // A Rust panic must not unwind across the dispatch FFI boundary — that
+        // aborts the process — so it becomes an honest error. (An Objective-C
+        // exception raised through the AX C API is not catchable at all; routing
+        // the exchange here is what keeps that class from being reached.)
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+                Err(anyhow!(
+                    "access to mahbot's own window panicked: {}",
+                    crate::util::panic_message(payload.as_ref())
+                ))
+            });
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(SELF_AX_WAIT) {
+        Ok(result) => result,
+        Err(_) => Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "mahbot's own window did not answer within {}s — its main thread is busy, so the \
+                 call gave up instead of hanging; the request may still be applied once that \
+                 thread catches up, so re-observe before repeating a mutation",
+                SELF_AX_WAIT.as_secs()
+            ),
+        )),
+    }
+}
+
+/// Run an exchange aimed at `target`, on the main thread when it resolves to
+/// mahbot's own process. The exchange reports that by raising
+/// [`NeedsAxThread`] before it does anything, so the discarded first attempt has
+/// performed nothing.
+fn with_target<T: Send + 'static>(
+    target: &TargetSpec,
+    f: impl Fn(&TargetSpec) -> Result<T, anyhow::Error> + Send + 'static,
+) -> Result<T, anyhow::Error> {
+    match f(target) {
+        Err(e) if is_ax_thread(&e) => {
+            let owned = target.clone();
+            on_ax_thread(std::process::id(), move || f(&owned))
+        }
+        other => other,
+    }
+}
+
 // ── AX attribute readers ─────────────────────────────────────────────────
 
 fn attribute_value(el: &AXUIElement, attr: &CFString) -> Result<CFRetained<CFType>, AXError> {
@@ -554,6 +664,23 @@ fn build_tree(root: &AXUIElement, origin: (f64, f64)) -> (UiNode, Vec<CFRetained
     (node, handles)
 }
 
+fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
+    let (window, app) = resolve_window(target)?;
+    let origin = window_origin(&window)?;
+    let surface = window_frame(&window)?;
+    let app_name = match target {
+        TargetSpec::Window { app_name, .. } => app_name.clone(),
+        _ => attribute_string(&app, &axc(AX_TITLE)).unwrap_or_default(),
+    };
+    let (root, _handles) = build_tree(&window, origin);
+    Ok(Observation {
+        app_name,
+        window_title: window_title(&window),
+        surface,
+        root,
+    })
+}
+
 // ── Window resolution ────────────────────────────────────────────────────
 
 /// The frontmost application's AX element, resolved through `NSWorkspace`.
@@ -634,6 +761,36 @@ fn read_windows(app: &AXUIElement) -> Result<Vec<CFRetained<AXUIElement>>, anyho
     Ok(typed.iter().collect())
 }
 
+/// One application's listed windows: the AX window array plus each window's frame
+/// and title. A window with neither is not a surface and is dropped.
+///
+/// The listing is the one path that knows the target process without resolving a
+/// `TargetSpec`, so it calls [`on_ax_thread`] itself with the app's pid.
+fn windows_of_app(pid: u32, app_name: &str) -> Result<Vec<WindowInfo>, anyhow::Error> {
+    // SAFETY: `pid` is a running app (or stale); AXUIElementCreateApplication
+    // always returns a non-null element — attribute reads surface InvalidUIElement.
+    let app = unsafe { AXUIElement::new_application(pid as libc::pid_t) };
+    let windows = read_windows(&app)?;
+    let mut out = Vec::new();
+    for (index, window) in windows.iter().enumerate() {
+        let Ok(frame) = window_frame(window) else {
+            continue;
+        };
+        let title = window_title(window).unwrap_or_default();
+        if title.is_empty() && (frame.width <= 0.0 || frame.height <= 0.0) {
+            continue;
+        }
+        out.push(WindowInfo {
+            app_pid: Some(pid),
+            app_name: app_name.to_string(),
+            title,
+            index,
+            surface: frame,
+        });
+    }
+    Ok(out)
+}
+
 fn resolve_window_in_app(
     app: &AXUIElement,
     title: &str,
@@ -675,12 +832,20 @@ fn resolve_window_in_app(
     ))
 }
 
+/// Resolve a target to its AX window and application element.
+///
+/// The only place a target becomes a platform handle, and therefore the one place
+/// the "our own process off the main thread" check belongs ([`ensure_ax_thread`]):
+/// it runs after the app element exists but before the first AX exchange, so a
+/// worker attempt stops here with nothing performed. An app element's pid is a
+/// local getter, not an exchange.
 fn resolve_window(
     target: &TargetSpec,
 ) -> Result<(CFRetained<AXUIElement>, CFRetained<AXUIElement>), anyhow::Error> {
     match target {
         TargetSpec::Focused => {
             let app = frontmost_app()?;
+            ensure_ax_thread(app_pid(&app)?)?;
             // Strictly the frontmost app's focused window: a coordinate action on
             // a fallback surface would land on whatever is visible, which may not
             // be that window (another Space, a minimized window).
@@ -694,12 +859,13 @@ fn resolve_window(
             Ok((window, app))
         }
         TargetSpec::Window {
-            app_pid,
+            app_pid: pinned,
             app_name,
             title,
             index,
         } => {
-            let app = app_element(*app_pid, app_name)?;
+            let app = app_element(*pinned, app_name)?;
+            ensure_ax_thread(app_pid(&app)?)?;
             Ok((resolve_window_in_app(&app, title, *index)?, app))
         }
         TargetSpec::Screen => Err(core::taxonomy_error(
@@ -1097,36 +1263,51 @@ fn screen_surface() -> Result<SurfaceGeometry, anyhow::Error> {
     })
 }
 
+/// The target's surface. A window frame is an AX read, so the grant gate belongs
+/// to [`surface_geometry_routed`], which keeps it on the calling thread: a missing
+/// grant is requested there, never from the main queue.
 fn surface_geometry_blocking(target: &TargetSpec) -> Result<SurfaceGeometry, anyhow::Error> {
     if matches!(target, TargetSpec::Screen) {
         return screen_surface();
     }
-    // A window's frame is an AX read, so the grant gate belongs here too.
-    ensure(Grant::Accessibility)?;
     window_frame(&resolve_window(target)?.0)
 }
 
-fn activate_window(target: &TargetSpec) -> Result<(), anyhow::Error> {
+/// [`surface_geometry_blocking`] with the grant gate hoisted and the read routed
+/// to the thread the system answers a self target on.
+fn surface_geometry_routed(target: &TargetSpec) -> Result<SurfaceGeometry, anyhow::Error> {
+    if !matches!(target, TargetSpec::Screen) {
+        ensure(Grant::Accessibility)?;
+    }
+    with_target(target, surface_geometry_blocking)
+}
+
+/// Raise a window target so raw input aimed at it lands there. Best-effort: no
+/// focused window (e.g. desktop frontmost) is fine for key chords/typing — the
+/// geometry is only required by the point-based actions. Returns whether a raise
+/// was actually performed, so the caller can let it settle off the main thread.
+fn activate_window(target: &TargetSpec) -> Result<bool, anyhow::Error> {
     let (TargetSpec::Focused | TargetSpec::Window { .. }) = target else {
-        return Ok(());
+        return Ok(false);
     };
-    // Best-effort raise: no focused window (e.g. desktop frontmost) is fine for
-    // key chords/typing — geometry is only required by the point-based actions.
-    let Ok((window, _app)) = resolve_window(target) else {
-        return Ok(());
+    let (window, _app) = match resolve_window(target) {
+        Ok(resolved) => resolved,
+        // Nothing to raise, but the main-thread marker must reach [`with_target`].
+        Err(e) if !is_ax_thread(&e) => return Ok(false),
+        Err(e) => return Err(e),
     };
     let Ok(names) = raw_action_names(&window) else {
-        return Ok(());
+        return Ok(false);
     };
-    if names.iter().any(|a| a == AX_RAISE) {
-        // SAFETY: AXRaise was verified to exist on the window.
-        let err = unsafe { window.perform_action(&axc(AX_RAISE)) };
-        if err != AXError::Success {
-            return Err(ax_error(err, "raise window"));
-        }
-        sleep_millis(80);
+    if !names.iter().any(|a| a == AX_RAISE) {
+        return Ok(false);
     }
-    Ok(())
+    // SAFETY: AXRaise was verified to exist on the window.
+    let err = unsafe { window.perform_action(&axc(AX_RAISE)) };
+    if err != AXError::Success {
+        return Err(ax_error(err, "raise window"));
+    }
+    Ok(true)
 }
 
 /// Reject an argument mistake before any grant is requested: a call that can
@@ -1147,8 +1328,10 @@ fn check_input_arguments(input: &RawInput) -> Result<(), anyhow::Error> {
 }
 
 fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyhow::Error> {
-    if !matches!(target, TargetSpec::Screen) {
-        activate_window(target)?;
+    // The 80 ms settle after a raise runs here, on the worker: only the raise
+    // itself needs the target's own thread.
+    if with_target(target, activate_window)? {
+        sleep_millis(80);
     }
     match input {
         RawInput::Click {
@@ -1158,7 +1341,7 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyho
             modifiers,
         } => {
             let (x, y) =
-                core::normalized_to_surface(point.0, point.1, &surface_geometry_blocking(target)?)?;
+                core::normalized_to_surface(point.0, point.1, &surface_geometry_routed(target)?)?;
             click(CGPoint::new(x, y), *button, *double, modifiers)?;
         }
         RawInput::TypeText { text } => type_text(text)?,
@@ -1170,7 +1353,7 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyho
         } => {
             let p = if let Some((nx, ny)) = point {
                 let (x, y) =
-                    core::normalized_to_surface(*nx, *ny, &surface_geometry_blocking(target)?)?;
+                    core::normalized_to_surface(*nx, *ny, &surface_geometry_routed(target)?)?;
                 Some(CGPoint::new(x, y))
             } else {
                 None
@@ -1178,7 +1361,7 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyho
             scroll(p, *direction, *amount)?;
         }
         RawInput::Drag { from, to } => {
-            let geometry = surface_geometry_blocking(target)?;
+            let geometry = surface_geometry_routed(target)?;
             let (fx, fy) = core::normalized_to_surface(from.0, from.1, &geometry)?;
             let (tx, ty) = core::normalized_to_surface(to.0, to.1, &geometry)?;
             drag(CGPoint::new(fx, fy), CGPoint::new(tx, ty))?;
@@ -1422,11 +1605,23 @@ fn find_sc_window(
     })
 }
 
-fn capture_window_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error> {
+/// The AX half of a window still: which process owns the window, its title and
+/// its frame — the facts ScreenCaptureKit is then matched against.
+fn window_capture_facts(
+    target: &TargetSpec,
+) -> Result<(u32, Option<String>, SurfaceGeometry), anyhow::Error> {
     let (window, app) = resolve_window(target)?;
-    let pid = app_pid(&app)?;
-    let title = window_title(&window);
-    let frame = window_frame(&window)?;
+    Ok((
+        app_pid(&app)?,
+        window_title(&window),
+        window_frame(&window)?,
+    ))
+}
+
+fn capture_window_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error> {
+    // The window is resolved through AX (pid, title, frame) before SCK is asked
+    // for pixels; only that half belongs on the AX thread, never the capture.
+    let (pid, title, frame) = with_target(target, window_capture_facts)?;
     let content = get_shareable_content()?;
     let sc_window = find_sc_window(&content, pid, title.as_deref(), frame).ok_or_else(|| {
         core::taxonomy_error(
@@ -1572,6 +1767,21 @@ fn set_element_value(element: &AXUIElement, text: &str) -> Result<(), anyhow::Er
     )
 }
 
+fn act_on_element_blocking(
+    target: &TargetSpec,
+    locator: &Locator,
+    act: &ElementAct,
+) -> Result<(), anyhow::Error> {
+    let (window, _app) = resolve_window(target)?;
+    let (root, handles) = build_tree(&window, window_origin(&window)?);
+    let matched = core::resolve_locator_checked(&root, locator)?;
+    let element = &handles[core::pre_order_index(&root, matched)];
+    match act {
+        ElementAct::Press => press_element(element),
+        ElementAct::SetValue { text } => set_element_value(element, text),
+    }
+}
+
 fn map_action_err(err: AXError, ctx: &str) -> Result<(), anyhow::Error> {
     match err {
         AXError::Success => Ok(()),
@@ -1660,25 +1870,19 @@ impl Backend for MacOsBackend {
             let mut out = Vec::new();
             for ai in app_infos {
                 let Some(pid) = ai.pid else { continue };
-                let app_el = unsafe { AXUIElement::new_application(pid as libc::pid_t) };
-                let Ok(windows) = read_windows(&app_el) else {
-                    continue;
-                };
-                for (idx, window) in windows.iter().enumerate() {
-                    let Ok(frame) = window_frame(window) else {
-                        continue;
-                    };
-                    let title = window_title(window).unwrap_or_default();
-                    if title.is_empty() && (frame.width <= 0.0 || frame.height <= 0.0) {
-                        continue;
-                    }
-                    out.push(WindowInfo {
-                        app_pid: Some(pid),
-                        app_name: ai.name.clone(),
-                        title,
-                        index: idx,
-                        surface: frame,
-                    });
+                let name = ai.name;
+                // An app whose accessibility is unavailable is skipped, as
+                // before; the AX thread only makes our OWN window's reads
+                // possible at all. A listing of ONE app is the caller's whole
+                // request, so its failure is reported instead.
+                match on_ax_thread(pid, move || windows_of_app(pid, &name)) {
+                    Ok(rows) => out.extend(rows),
+                    // A single-app listing of our OWN window says why it is
+                    // missing; every other failure keeps the old "answer what
+                    // was read" shape, and the unfiltered listing must never
+                    // fail as a whole because of one app.
+                    Err(e) if app.is_some() && pid == std::process::id() => return Err(e),
+                    Err(_) => {}
                 }
             }
             Ok(out)
@@ -1688,14 +1892,16 @@ impl Backend for MacOsBackend {
     async fn focused_window(&self) -> Result<WindowInfo, anyhow::Error> {
         with_block_in_place(|| {
             ensure(Grant::Accessibility)?;
-            let (window, app) = resolve_window(&TargetSpec::Focused)?;
-            let pid = app_pid(&app)?;
-            Ok(WindowInfo {
-                app_pid: Some(pid),
-                app_name: app_display_name(pid, &app),
-                title: window_title(&window).unwrap_or_default(),
-                index: 0,
-                surface: window_frame(&window)?,
+            with_target(&TargetSpec::Focused, |target| {
+                let (window, app) = resolve_window(target)?;
+                let pid = app_pid(&app)?;
+                Ok(WindowInfo {
+                    app_pid: Some(pid),
+                    app_name: app_display_name(pid, &app),
+                    title: window_title(&window).unwrap_or_default(),
+                    index: 0,
+                    surface: window_frame(&window)?,
+                })
             })
         })
     }
@@ -1704,26 +1910,13 @@ impl Backend for MacOsBackend {
         &self,
         target: &TargetSpec,
     ) -> Result<SurfaceGeometry, anyhow::Error> {
-        with_block_in_place(|| surface_geometry_blocking(target))
+        with_block_in_place(|| surface_geometry_routed(target))
     }
 
     async fn observe(&self, target: &TargetSpec) -> Result<Observation, anyhow::Error> {
         with_block_in_place(|| {
             ensure(Grant::Accessibility)?;
-            let (window, app) = resolve_window(target)?;
-            let origin = window_origin(&window)?;
-            let surface = window_frame(&window)?;
-            let app_name = match target {
-                TargetSpec::Window { app_name, .. } => app_name.clone(),
-                _ => attribute_string(&app, &axc(AX_TITLE)).unwrap_or_default(),
-            };
-            let (root, _handles) = build_tree(&window, origin);
-            Ok(Observation {
-                app_name,
-                window_title: window_title(&window),
-                surface,
-                root,
-            })
+            with_target(target, observe_blocking)
         })
     }
 
@@ -1738,14 +1931,10 @@ impl Backend for MacOsBackend {
                 return Err(core::screen_act_error());
             }
             ensure(Grant::Accessibility)?;
-            let (window, _app) = resolve_window(target)?;
-            let (root, handles) = build_tree(&window, window_origin(&window)?);
-            let matched = core::resolve_locator_checked(&root, locator)?;
-            let element = &handles[core::pre_order_index(&root, matched)];
-            match act {
-                ElementAct::Press => press_element(element),
-                ElementAct::SetValue { text } => set_element_value(element, &text),
-            }
+            let locator = locator.clone();
+            with_target(target, move |target| {
+                act_on_element_blocking(target, &locator, &act)
+            })
         })
     }
 
