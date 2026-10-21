@@ -256,7 +256,7 @@ pub(crate) fn resolve_git_top_level(repo_path: &Path) -> Option<PathBuf> {
 /// value is scoped to the single resolved repo top-level. On git < 2.38 the env
 /// form is silently ignored by git, which is acceptable for the supported
 /// target as long as the repo is owned by the running user.
-fn inject_safe_directory(cmd: &mut tokio::process::Command, repo_path: &Path) {
+fn inject_safe_directory(cmd: &mut std::process::Command, repo_path: &Path) {
     let Some(top_level) = resolve_git_top_level(repo_path) else {
         return;
     };
@@ -265,15 +265,15 @@ fn inject_safe_directory(cmd: &mut tokio::process::Command, repo_path: &Path) {
     cmd.env("GIT_CONFIG_VALUE_0", top_level.as_path());
 }
 
-/// Create a [`tokio::process::Command`] for `git` with the product's own
-/// internal environment.
+/// Create a [`std::process::Command`] for `git` with the product's own internal
+/// environment — the shared setup of every git subprocess in this module.
 ///
 /// The subprocess environment is cleared and re-populated with the reduced
 /// variable set the product uses for its own work (see [`internal_env_pairs`])
 /// to prevent credential leakage (CWE-200). `LC_ALL=C` is set for consistent
-/// locale behavior across all git invocations. This is the only entry point for
-/// production git subprocess creation in this module — all callers must use this
-/// helper.
+/// locale behavior across all git invocations. [`git_command`] wraps this for
+/// async callers; [`tracked_paths`] runs it directly because it answers in the
+/// middle of a blocking directory walk.
 ///
 /// `repo_root` is the workspace/`current_dir` path for repo-bound invocations;
 /// when present, the resolved repo top-level is injected as `safe.directory`
@@ -283,17 +283,58 @@ fn inject_safe_directory(cmd: &mut tokio::process::Command, repo_path: &Path) {
 ///
 /// Callers should add further configuration (args, current_dir, stdio, etc.)
 /// and then spawn or execute the command.
-fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
+fn git_std_command(repo_root: Option<&Path>) -> std::process::Command {
     // `program_command` applies the pairs it names `git` under. No directory is
     // passed: the internal list is absolute, so the `current_dir` callers set
     // afterwards cannot change which program it resolves to.
-    let mut cmd: tokio::process::Command =
-        program_command("git", &internal_env_pairs(), None).into();
+    let mut cmd = program_command("git", &internal_env_pairs(), None);
     cmd.env("LC_ALL", "C");
     if let Some(path) = repo_root {
         inject_safe_directory(&mut cmd, path);
     }
     cmd
+}
+
+/// Create a [`tokio::process::Command`] for `git` — the async form of
+/// [`git_std_command`], and the only entry point for production async git
+/// subprocess creation in this module.
+fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
+    git_std_command(repo_root).into()
+}
+
+/// Every UTF-8 path `repo`'s index holds, repository-relative and `/`-separated as
+/// git spells them — git's own answer to "is this path tracked?", which no ignore
+/// rule overrides. An entry whose name is not UTF-8 is left out, as a walked path
+/// that is not UTF-8 never reaches the snapshot either.
+///
+/// `None` when git cannot answer: not installed, not a repository, an unreadable
+/// index, or a failed run. A caller reads that as "git cannot say", never as an
+/// error — the paths the rules would hide then stay visible. Synchronous on purpose
+/// — its only caller asks the question in the middle of a directory walk on the
+/// blocking pool — and `GIT_OPTIONAL_LOCKS=0` keeps the read from taking the index
+/// lock, so the inspected repository is left untouched.
+pub(crate) fn tracked_paths(repo: &Path) -> Option<Vec<String>> {
+    let mut cmd = git_std_command(Some(repo));
+    cmd.current_dir(repo)
+        // `core.fsmonitor` would run a command this repository's own config
+        // names; a passive read of the index never needs that.
+        .args(["-c", "core.fsmonitor=false", "ls-files", "-z", "--cached"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|&byte| byte == 0)
+            .filter_map(|path| std::str::from_utf8(path).ok())
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Run a git command without any interpretation of the exit code.

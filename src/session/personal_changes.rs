@@ -22,18 +22,24 @@
 //! first observation, which does read every file once, does not ([`establish`]),
 //! and while it runs the account gets no block at all.
 //!
+//! What the folder's own git rules exclude is not the user's material at all:
+//! [`Rules`] answers that question while the change set is gathered, so an ignored
+//! path never enters the delta in the first place — and never reads as removed,
+//! however it came to be ignored.
+//!
 //! The session-start `<personal-files>` picture ([`personal_folder_picture`]) is
-//! built from the same walk predicate ([`is_skipped`]) as the report, so the two
-//! blocks can never describe different material; it costs one metadata-only walk
-//! and never reads a file's contents.
+//! built from the same walk predicate ([`is_skipped`]) and the same rules
+//! ([`Rules`]) as the report, so the two blocks can never describe different
+//! material; it costs one metadata-only walk and never reads a file's contents.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use ignore::WalkBuilder;
+use ignore::{IncrementalIgnore, WalkBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -104,17 +110,18 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 /// subtree). Only what the product or the OS keeps in the personal folder is
 /// pruned at any depth: the `.git` repository metadata, the `.compaction` store
 /// and macOS's `.DS_Store`. A user's own dotfile — `.env`, `.gitignore`,
-/// `.config/` — is the user's material and a hand edit to it must be reported;
-/// the product's own things at the workspace root (`MEMORY.md` and the
-/// `generated/`, `uploads/`, `notes/` and `archive/` directories) are never
-/// watched either. `archive/` holds only what the assistant retired with its
-/// `archive` tool, so a move into it is the assistant's own bookkeeping rather
-/// than a change to the user's material — and the picture stays a sketch of what
-/// the user has, not of what was put aside.
+/// `.config/` — is the user's material and a hand edit to it must be reported
+/// unless the folder's own git rules hide it ([`Rules`], the other half of the
+/// walk predicate); the product's own things at the workspace root (`MEMORY.md`
+/// and the `generated/`, `uploads/`, `notes/` and `archive/` directories) are
+/// never watched either. `archive/` holds only what the assistant retired with
+/// its `archive` tool, so a move into it is the assistant's own bookkeeping
+/// rather than a change to the user's material — and the picture stays a sketch
+/// of what the user has, not of what was put aside.
 ///
-/// This predicate is the single definition of the user's file material inside a
-/// personal folder — the report ([`scan`]) and the session-start picture
-/// ([`personal_folder_picture`]) both walk through it, so the two can never
+/// This predicate and [`Rules`] together are the definition of the user's file
+/// material inside a personal folder — the report ([`scan`]) and the session-start
+/// picture ([`personal_folder_picture`]) both walk through it, so the two can never
 /// describe different material. The `shared/` catalogue
 /// ([`is_owner_personal_folder`]) is product material only in the folder that
 /// holds it, and the sibling enumerations ([`crate::tools::custom`],
@@ -156,16 +163,226 @@ fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
 /// are summarized as a count, so the block never grows with the folder's size.
 const MAX_PICTURED_FOLDERS: usize = 40;
 
+/// A folder's own git ignore rules, for one observation — a cheap clonable handle,
+/// since [`scan`] hands a clone to its walk's entry filter (which must own what it
+/// captures) and still asks the same cached answers for the delta afterwards.
+///
+/// What is hidden is what git itself would ignore inside this folder, judged by
+/// the rules that live in it: every repository the folder holds (itself included)
+/// contributes its `.gitignore` files and its `.git/info/exclude`, at the
+/// boundaries git applies them — a nested repository's rules replace the outer
+/// one's for the paths inside it, which is why each repository gets a matcher of
+/// its own rather than one rooted at the folder. Nothing above the folder is
+/// applied (no parent `.gitignore`, no `core.excludesFile`, no global or system
+/// excludes), `.ignore` files are not git rules, and hidden files are not an
+/// ignored class. A folder holding no repository therefore hides nothing.
+///
+/// The one thing that outranks a rule is the index: a path git still tracks is
+/// never hidden. Hiding also fails open — when the index cannot be read, the paths
+/// its rules would hide stay visible rather than risk dropping a tracked one. That
+/// index is the only git this module runs, and only for a path a rule would hide.
+///
+/// Everything is built on first use and cached for this one observation: a matcher
+/// never notices an ignore file edited mid-observation, and the next starts clean.
+#[derive(Clone)]
+struct Rules {
+    root: PathBuf,
+    state: Arc<Mutex<RulesState>>,
+}
+
+#[derive(Default)]
+struct RulesState {
+    /// Repository (folder-relative) → the matcher over its own rules.
+    matchers: HashMap<PathBuf, IncrementalIgnore>,
+    /// Folder-relative directory → the repository governing it; `None` outside
+    /// every repository. A walk asks this once per directory, not per entry.
+    governing: HashMap<PathBuf, Option<PathBuf>>,
+    /// Repository → the paths its index tracks, repository-relative and
+    /// `/`-separated as git spells them. `None` when git could not answer.
+    tracked: HashMap<PathBuf, Option<BTreeSet<String>>>,
+}
+
+impl Rules {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            state: Arc::new(Mutex::new(RulesState::default())),
+        }
+    }
+
+    /// Whether the walk should hide `entry` — [`RulesState::hidden`] on the
+    /// entry's folder-relative path. Every walk prunes through this, so the report
+    /// and the picture can never disagree about material. An entry outside the
+    /// folder (or the folder itself) is never hidden.
+    fn hides(&self, entry: &ignore::DirEntry) -> bool {
+        let Ok(rel) = entry.path().strip_prefix(&self.root) else {
+            return false;
+        };
+        if rel.as_os_str().is_empty() {
+            return false;
+        }
+        self.hidden(rel, entry.file_type().is_some_and(|t| t.is_dir()))
+    }
+
+    /// Whether `rel` (folder-relative) is hidden by the folder's own rules.
+    fn hidden(&self, rel: &Path, is_dir: bool) -> bool {
+        self.state
+            .lock()
+            .unwrap_poison()
+            .hidden(&self.root, rel, is_dir)
+    }
+}
+
+impl RulesState {
+    /// Whether `rel` (folder-relative) is hidden: a path some repository's rules
+    /// exclude and git does not track. A path git could not be asked about stays
+    /// visible (see [`Rules`]).
+    fn hidden(&mut self, root: &Path, rel: &Path, is_dir: bool) -> bool {
+        if self.excluded(root, rel, is_dir) && self.tracked(root, rel, is_dir) == Some(false) {
+            return true;
+        }
+        // A directory above `rel` can be hidden by a different repository than the
+        // one governing `rel` — a nested repository inside a folder its enclosing
+        // repository ignores — and the walk prunes there, so everything below is
+        // gone from the change set for the same reason. Only a directory whose
+        // repository differs is asked: within one repository the matcher has
+        // already weighed every ancestor, and outside every repository there is
+        // nothing to ask.
+        let Some(governing) = self.repository(root, rel) else {
+            return false;
+        };
+        let mut above = rel.parent();
+        while let Some(dir) = above.filter(|dir| !dir.as_os_str().is_empty()) {
+            if self.repository(root, dir).as_deref() != Some(governing.as_path())
+                && self.excluded(root, dir, true)
+                && self.tracked(root, dir, true) == Some(false)
+            {
+                return true;
+            }
+            above = dir.parent();
+        }
+        false
+    }
+
+    /// Whether the rules alone exclude `rel` — no index consulted, so a path the
+    /// folder no longer holds is judged by the same rules that hid it.
+    fn excluded(&mut self, root: &Path, rel: &Path, is_dir: bool) -> bool {
+        let Some(repo) = self.repository(root, rel) else {
+            return false;
+        };
+        let in_repo = rel.strip_prefix(&repo).unwrap_or(rel);
+        self.matchers
+            .entry(repo.clone())
+            .or_insert_with(|| build_matcher(&root.join(&repo)))
+            .matched(in_repo, is_dir)
+            .is_ignore()
+    }
+
+    /// Whether git tracks `rel` (or, for a directory, any path beneath it), or
+    /// `None` when the repository's index cannot be read.
+    fn tracked(&mut self, root: &Path, rel: &Path, is_dir: bool) -> Option<bool> {
+        let repo = self.repository(root, rel)?;
+        let tracked = self
+            .tracked
+            .entry(repo.clone())
+            .or_insert_with(|| load_tracked(&root.join(&repo)))
+            .as_ref()?;
+        let key = slash_path(rel.strip_prefix(&repo).unwrap_or(rel))?;
+        if tracked.contains(&key) {
+            return Some(true);
+        }
+        if !is_dir {
+            return Some(false);
+        }
+        // A directory is kept when anything beneath it is tracked: its own entry
+        // is not in the index, the files under it are.
+        let prefix = format!("{key}/");
+        Some(
+            tracked
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&prefix)),
+        )
+    }
+
+    /// The repository governing `rel` (folder-relative): the closest directory at
+    /// or above its parent that holds a `.git` entry, never above `root` itself —
+    /// `None` outside every repository. Each level's answer is cached, so the walk
+    /// asks once per directory it enters.
+    fn repository(&mut self, root: &Path, rel: &Path) -> Option<PathBuf> {
+        let dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+        if let Some(known) = self.governing.get(&dir) {
+            return known.clone();
+        }
+        let found = if crate::git::commands::is_git_repo(&root.join(&dir)) {
+            Some(dir.clone())
+        } else if dir.as_os_str().is_empty() {
+            None
+        } else {
+            self.repository(root, &dir)
+        };
+        self.governing.insert(dir, found.clone());
+        found
+    }
+}
+
+/// The matcher for the rules in force inside one repository.
+///
+/// `standard_filters(false)` settles every default the walk needs — parents,
+/// global excludes, `.ignore` files and the hidden class are all off — and the
+/// two git sources of a repository's own rules are switched back on:
+/// `require_git` stays at its default, so `.gitignore` files and
+/// `.git/info/exclude` apply exactly where git applies them, a nested
+/// repository's rules replacing these for the paths inside that nested one.
+fn build_matcher(repo: &Path) -> IncrementalIgnore {
+    let mut builder = WalkBuilder::new(repo);
+    builder
+        .standard_filters(false)
+        .git_ignore(true)
+        .git_exclude(true);
+    builder
+        .build_matchers()
+        .pop()
+        .expect("a walk root always yields its matcher")
+}
+
+/// The paths `repo`'s index tracks, repository-relative as git spells them, or
+/// `None` when git cannot answer (its own doc says what that covers).
+fn load_tracked(repo: &Path) -> Option<BTreeSet<String>> {
+    let Some(tracked) = crate::git::commands::tracked_paths(repo) else {
+        tracing::debug!(
+            repo = %repo.display(),
+            "personal-workspace repository index unreadable — its ignored paths stay visible"
+        );
+        return None;
+    };
+    Some(tracked.into_iter().collect())
+}
+
+/// `path`'s components joined by `/` — the spelling git prints and always uses,
+/// so a tracked set and a walked path compare the same on every platform.
+/// `None` for a path that is not UTF-8.
+fn slash_path(path: &Path) -> Option<String> {
+    let mut out = String::new();
+    for component in path.components() {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(component.as_os_str().to_str()?);
+    }
+    Some(out)
+}
+
 /// The session-start picture of `root`: the folders sitting directly inside it,
 /// each with the number of files it holds at any depth, plus how many files sit
 /// directly in the folder itself. No path is ever named, and the walk reads no
 /// file's contents — metadata alone.
 ///
 /// The material counted is exactly what the change report watches: the same
-/// walk, the same predicate ([`is_skipped`]) and the same settings as [`scan`].
-/// `None` when `root` does not exist yet (personal folders are created lazily),
-/// when it cannot be opened, or when it holds nothing of the user's — so the
-/// block is silent rather than empty. A walk error deeper inside warns and
+/// walk, the same predicate ([`is_skipped`]) and the same rules ([`Rules`]) as
+/// [`scan`]. `None` when `root` does not exist yet (personal folders are created
+/// lazily), when it cannot be opened, or when it holds nothing of the user's — so
+/// the block is silent rather than empty. A walk error deeper inside warns and
 /// continues, leaving the counts what could be counted.
 pub(crate) fn personal_folder_picture(root: &Path) -> Option<String> {
     if let Err(e) = std::fs::read_dir(root) {
@@ -176,12 +393,13 @@ pub(crate) fn personal_folder_picture(root: &Path) -> Option<String> {
         return None;
     }
     let owner_folder = is_owner_personal_folder(root);
+    let rules = Rules::new(root);
     let mut folders: BTreeMap<String, usize> = BTreeMap::new();
     let mut root_files = 0usize;
     for result in WalkBuilder::new(root)
         .standard_filters(false)
         .follow_links(false)
-        .filter_entry(move |entry| !is_skipped(entry, owner_folder))
+        .filter_entry(move |entry| !is_skipped(entry, owner_folder) && !rules.hides(entry))
         .build()
     {
         let entry = match result {
@@ -397,10 +615,13 @@ impl Scan {
 /// the snapshot: replacing a real directory with a link to one therefore reports
 /// the files that were there as removed.
 ///
-/// `mode` decides what is read ([`Scan`]) and nothing else. The ignore machinery
-/// is deliberately DISABLED (`standard_filters(false)`) so a user's own
-/// `.gitignore` or global ignore file can never hide their files.
-fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan) -> Option<Snapshot> {
+/// Entries the walk must not see are pruned by its entry filter: the product's own
+/// material ([`is_skipped`]) and whatever the folder's own git rules hide
+/// ([`Rules`]) — the filter [`personal_folder_picture`] walks through too, so the
+/// two blocks describe the same material. Filtering there is what keeps an ignored
+/// path out of the delta instead of merely out of its rendering. `mode` decides what
+/// is read ([`Scan`]) and nothing else.
+fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan, rules: &Rules) -> Option<Snapshot> {
     let stores = mode.stores();
     if std::fs::read_dir(root).is_err() {
         // Fail open — no report, no baseline, and never a blocked turn.
@@ -410,13 +631,14 @@ fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan) -> Option<Snapshot
     let mut out = Snapshot::new();
     let whole_walk = mode == Scan::Whole;
     let owner_folder = is_owner_personal_folder(root);
+    let walk_rules = rules.clone();
     // Cloned once: the loop below runs per entry, and a whole-folder walk on a
     // large folder would clone the token tens of thousands of times.
     let stop = crate::shutdown::shutdown_token();
     for result in WalkBuilder::new(root)
         .standard_filters(false)
         .follow_links(false)
-        .filter_entry(move |entry| !is_skipped(entry, owner_folder))
+        .filter_entry(move |entry| !is_skipped(entry, owner_folder) && !walk_rules.hides(entry))
         .build()
     {
         // A forced stop gives up a whole-folder walk rather than hold the exit for
@@ -541,7 +763,14 @@ struct Changes {
 /// is the one case with neither evidence to compare, and it follows the same
 /// preference: reported, because missing a real edit is the worse failure.
 /// Iterating the `BTreeMap`s keeps each list sorted.
-fn diff(previous: &Snapshot, current: &Snapshot) -> Changes {
+///
+/// A recorded path the walk no longer produces is `removed` unless the folder's
+/// own rules hide it ([`Rules::hidden`]): an ignored path leaves the report
+/// silently, whether a rule was added since the baseline or the baseline itself
+/// predates this filtering. A tracked path is never hidden, so deleting one is
+/// still reported, and a path that stopped being ignored is absent from the
+/// baseline — it comes back as `added`.
+fn diff(previous: &Snapshot, current: &Snapshot, rules: &Rules) -> Changes {
     let mut changes = Changes::default();
     for (path, cur) in current {
         match previous.get(path) {
@@ -561,7 +790,7 @@ fn diff(previous: &Snapshot, current: &Snapshot) -> Changes {
         }
     }
     for path in previous.keys() {
-        if !current.contains_key(path) {
+        if !current.contains_key(path) && !rules.hidden(Path::new(path), false) {
             changes.removed.push(path.clone());
         }
     }
@@ -667,8 +896,11 @@ pub(crate) async fn prepend_changes(msg: &str, workspace: &Workspace, role: &Rol
                 return None;
             }
         };
-        let current = scan(&root, Some(&previous), Scan::Report)?;
-        Some(diff(&previous, &current))
+        // One `Rules` for the whole observation: the walk and the removal filter
+        // judge by the same rules, and the index is read at most once.
+        let rules = Rules::new(&root);
+        let current = scan(&root, Some(&previous), Scan::Report, &rules)?;
+        Some(diff(&previous, &current, &rules))
     })
     .await;
     let Some(Some(changes)) = scanned.ok() else {
@@ -947,7 +1179,7 @@ async fn observe(root: PathBuf, stored: Option<String>, mode: Scan) -> Observati
             },
         };
         // `None` is an unwalkable folder (already warned about inside `scan`).
-        let Some(current) = scan(&root, Some(&previous), mode) else {
+        let Some(current) = scan(&root, Some(&previous), mode, &Rules::new(&root)) else {
             return Observation::Settled;
         };
         let json = match serde_json::to_string(&current) {
@@ -985,6 +1217,35 @@ async fn store_baseline(user_name: &str, agent_id: &str, json: &str) {
 mod tests {
     use super::*;
     use crate::db::params;
+    use crate::util::test::{init_git_repo, init_temp_repo};
+
+    /// The rendered picture read back: its folder counts and its direct-file count.
+    /// The parity test reads the block the assistant sees rather than the map behind
+    /// it.
+    fn pictured_folders(picture: &str) -> (BTreeMap<String, usize>, usize) {
+        let count_of = |rest: &str| {
+            rest.split_once(' ')
+                .expect("a count and a noun")
+                .0
+                .parse::<usize>()
+                .expect("a number")
+        };
+        let mut folders = BTreeMap::new();
+        let mut direct = 0;
+        for line in picture.lines() {
+            if let Some(rest) = line.strip_prefix("- ") {
+                let (name, count) = rest.split_once("/ — ").expect("a folder line");
+                folders.insert(name.to_string(), count_of(count));
+            } else {
+                direct = count_of(
+                    line.split_once(" directly in the folder")
+                        .expect("the direct-file line")
+                        .0,
+                );
+            }
+        }
+        (folders, direct)
+    }
 
     /// The folder's first observation runs off the reply path, so its baseline
     /// lands a moment after the refresh that started it returns — and until that
@@ -1025,7 +1286,7 @@ mod tests {
         ] {
             std::fs::write(root.join(name), body).unwrap();
         }
-        let before = scan(root, None, Scan::Refresh).unwrap();
+        let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
 
         // Let the mtime clock advance so a rewrite is observable even on a
         // coarse filesystem.
@@ -1037,8 +1298,8 @@ mod tests {
         std::fs::rename(root.join("c.txt"), root.join("c2.txt")).unwrap(); // rename
         std::fs::remove_file(root.join("d.txt")).unwrap(); // delete
 
-        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
-        let changes = diff(&before, &after);
+        let after = scan(root, Some(&before), Scan::Refresh, &Rules::new(root)).unwrap();
+        let changes = diff(&before, &after, &Rules::new(root));
         assert_eq!(
             changes.added,
             vec!["c2.txt".to_string(), "e.txt".to_string()]
@@ -1052,8 +1313,8 @@ mod tests {
         // The report's scan stores nothing, so it reads only what `diff`
         // consults: a size change decides on the size alone, while the one
         // identical-size rewrite (b.txt) is read to tell a touch from an edit.
-        let report = scan(root, Some(&before), Scan::Report).unwrap();
-        let report_changes = diff(&before, &report);
+        let report = scan(root, Some(&before), Scan::Report, &Rules::new(root)).unwrap();
+        let report_changes = diff(&before, &report, &Rules::new(root));
         assert_eq!(report_changes.changed, vec!["a.txt".to_string()]);
         assert_eq!(
             report["a.txt"].digest, None,
@@ -1066,7 +1327,15 @@ mod tests {
 
         // A folder the walk cannot even open is fail-open: no report, no
         // baseline, never a blocked turn.
-        assert!(scan(&root.join("gone"), None, Scan::Refresh).is_none());
+        assert!(
+            scan(
+                &root.join("gone"),
+                None,
+                Scan::Refresh,
+                &Rules::new(&root.join("gone"))
+            )
+            .is_none()
+        );
     }
 
     /// A stamp the platform will not report can never decide a comparison, so
@@ -1089,7 +1358,7 @@ mod tests {
         if handle.set_modified(before_epoch).is_err() {
             return;
         }
-        let before = scan(root, None, Scan::Refresh).unwrap();
+        let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
         if before["old.txt"].mtime_ns != STAMP_UNKNOWN {
             return; // the platform would not store a pre-epoch stamp
         }
@@ -1097,10 +1366,10 @@ mod tests {
         // Same size, same (unreportable) stamp, different bytes.
         std::fs::write(&file, "two").unwrap();
         handle.set_modified(before_epoch).unwrap();
-        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
+        let after = scan(root, Some(&before), Scan::Refresh, &Rules::new(root)).unwrap();
         assert_eq!(after["old.txt"].mtime_ns, STAMP_UNKNOWN);
         assert_eq!(
-            diff(&before, &after).changed,
+            diff(&before, &after, &Rules::new(root)).changed,
             vec!["old.txt".to_string()],
             "content must decide when the stamp cannot"
         );
@@ -1147,7 +1416,7 @@ mod tests {
             std::fs::write(root.join(path), "one").unwrap();
         }
 
-        let before = scan(root, None, Scan::Refresh).unwrap();
+        let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
         assert_eq!(
             before.keys().cloned().collect::<Vec<_>>(),
             vec![
@@ -1165,19 +1434,209 @@ mod tests {
             std::fs::write(root.join(path), "two-longer").unwrap();
         }
 
-        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
+        let after = scan(root, Some(&before), Scan::Refresh, &Rules::new(root)).unwrap();
         assert_eq!(
             after.keys().cloned().collect::<Vec<_>>(),
             before.keys().cloned().collect::<Vec<_>>(),
             "skipped entries must never enter the snapshot"
         );
-        let changes = diff(&before, &after);
+        let changes = diff(&before, &after, &Rules::new(root));
         assert!(changes.added.is_empty());
         assert!(changes.removed.is_empty());
         assert_eq!(changes.changed.len(), watched.len(), "{changes:?}");
         for path in watched {
             assert!(changes.changed.contains(&path.to_string()), "missed {path}");
         }
+    }
+
+    /// The rules come from repositories inside the folder and nowhere else: the
+    /// folder's own `.gitignore` is inert while it holds no repository (even with
+    /// a repository above it), a nested repository's rules govern the paths inside
+    /// it, and no rule from above the folder reaches any of them.
+    #[test]
+    fn rules_come_from_repositories_inside_the_folder_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // An outer repository with its own rules: above the folder, so never
+        // applied — and its presence must not switch the folder's own
+        // `.gitignore` on either.
+        let outer = tmp.path();
+        init_git_repo(outer);
+        std::fs::write(outer.join(".gitignore"), "*.log\n").unwrap();
+        let root = outer.join("inner");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.join("a.log"), "one").unwrap();
+        std::fs::write(root.join("b.txt"), "one").unwrap();
+
+        let no_repo = scan(&root, None, Scan::Refresh, &Rules::new(&root)).unwrap();
+        assert_eq!(
+            no_repo.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                ".gitignore".to_string(),
+                "a.log".to_string(),
+                "b.txt".to_string()
+            ],
+            "a folder holding no repository hides nothing"
+        );
+
+        // A repository inside the folder: its rules count, and only inside it.
+        init_git_repo(&nested);
+        std::fs::write(nested.join(".gitignore"), "*.tmp\n").unwrap();
+        // `.git/info/exclude` is a local rule and counts; a `.ignore` file is not
+        // a git rule at all.
+        std::fs::create_dir_all(nested.join(".git/info")).unwrap();
+        std::fs::write(nested.join(".git/info/exclude"), "*.exe\n").unwrap();
+        std::fs::write(nested.join(".ignore"), "*.lock\n").unwrap();
+        std::fs::write(nested.join("c.tmp"), "one").unwrap();
+        std::fs::write(nested.join("d.log"), "one").unwrap();
+        std::fs::write(nested.join("e.exe"), "one").unwrap();
+        std::fs::write(nested.join("f.lock"), "one").unwrap();
+
+        let nested_repo = scan(&root, None, Scan::Refresh, &Rules::new(&root)).unwrap();
+        assert!(!nested_repo.contains_key("nested/c.tmp"), "{nested_repo:?}");
+        assert!(!nested_repo.contains_key("nested/e.exe"), "{nested_repo:?}");
+        assert!(
+            nested_repo.contains_key("nested/f.lock"),
+            "a `.ignore` file is not a git rule: {nested_repo:?}"
+        );
+        assert!(
+            nested_repo.contains_key("nested/d.log"),
+            "rules above the nested repository must not reach it: {nested_repo:?}"
+        );
+        assert!(nested_repo.contains_key("a.log"), "{nested_repo:?}");
+    }
+
+    /// A nested repository inside a folder its enclosing repository ignores is gone
+    /// as a whole: the walk prunes at the ignored folder, so nothing beneath it is
+    /// reported as removed even though the nested repository's own rules never hid
+    /// those paths.
+    #[test]
+    fn a_nested_repository_inside_an_ignored_folder_is_not_reported_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        init_git_repo(root);
+        let inner = root.join("vendor/inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("keep.txt"), "one").unwrap();
+        init_git_repo(&inner);
+        let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
+        assert!(before.contains_key("vendor/inner/keep.txt"), "{before:?}");
+
+        std::fs::write(root.join(".gitignore"), "vendor/\n").unwrap();
+        let after = scan(root, Some(&before), Scan::Report, &Rules::new(root)).unwrap();
+        assert!(!after.contains_key("vendor/inner/keep.txt"), "{after:?}");
+        assert!(
+            diff(&before, &after, &Rules::new(root)).removed.is_empty(),
+            "an ignored folder takes the nested repository inside it with it"
+        );
+    }
+
+    /// Adding an ignore rule is invisible: a recorded path the rules now exclude
+    /// is not reported as removed, and a path that stops being ignored comes back
+    /// as added — new to the world the report describes.
+    #[test]
+    fn a_new_ignore_rule_never_reports_a_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        init_git_repo(root);
+        std::fs::write(root.join(".gitignore"), "# no rules yet\n").unwrap();
+        std::fs::write(root.join("kept.txt"), "kept").unwrap();
+        std::fs::write(root.join("noise.log"), "noise").unwrap();
+        std::fs::create_dir(root.join("build")).unwrap();
+        std::fs::write(root.join("build/a.o"), "noise").unwrap();
+        std::fs::write(root.join("build/b.o"), "noise").unwrap();
+        let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
+        assert!(before.contains_key("noise.log"), "{before:?}");
+
+        // The rule is added: the paths it covers leave the change set silently.
+        std::fs::write(root.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        let after = scan(root, Some(&before), Scan::Report, &Rules::new(root)).unwrap();
+        assert!(!after.contains_key("noise.log"), "{after:?}");
+        assert!(!after.contains_key("build/a.o"), "{after:?}");
+        let changes = diff(&before, &after, &Rules::new(root));
+        assert!(
+            changes.removed.is_empty(),
+            "an ignored path may never read as removed: {changes:?}"
+        );
+
+        // A baseline recorded under the rule does not carry those paths, so
+        // lifting the rule reports them as new — never as a resurrection.
+        let under_rule = scan(root, Some(&before), Scan::Refresh, &Rules::new(root)).unwrap();
+        std::fs::write(root.join(".gitignore"), "# rule lifted\n").unwrap();
+        let lifted = scan(root, Some(&under_rule), Scan::Report, &Rules::new(root)).unwrap();
+        assert_eq!(
+            diff(&under_rule, &lifted, &Rules::new(root)).added,
+            vec![
+                "build/a.o".to_string(),
+                "build/b.o".to_string(),
+                "noise.log".to_string()
+            ]
+        );
+    }
+
+    /// A tracked path is never hidden by a pattern: the index is git's own answer
+    /// to the ignore question, and a tracked file keeps its directory in the walk.
+    #[test]
+    fn rules_never_hide_a_tracked_path() {
+        let (_dir, root) = init_temp_repo();
+        std::fs::write(root.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        std::fs::write(root.join("keep.log"), "tracked").unwrap();
+        std::fs::write(root.join("skip.log"), "untracked").unwrap();
+        std::fs::create_dir(root.join("build")).unwrap();
+        std::fs::write(root.join("build/keep.txt"), "tracked").unwrap();
+        std::fs::write(root.join("build/skip.txt"), "untracked").unwrap();
+        for path in ["keep.log", "build/keep.txt"] {
+            let status = std::process::Command::new("git")
+                .args(["add", "-f", path])
+                .current_dir(&root)
+                .status()
+                .expect("git add");
+            assert!(status.success(), "git add -f {path}");
+        }
+
+        let snapshot = scan(&root, None, Scan::Refresh, &Rules::new(&root)).unwrap();
+        assert!(snapshot.contains_key("keep.log"), "{snapshot:?}");
+        assert!(
+            snapshot.contains_key("build/keep.txt"),
+            "a tracked file keeps its ignored directory: {snapshot:?}"
+        );
+        assert!(!snapshot.contains_key("skip.log"), "{snapshot:?}");
+        assert!(!snapshot.contains_key("build/skip.txt"), "{snapshot:?}");
+
+        // A tracked file that is deleted is reported: it is not ignored, it is
+        // gone, and the pattern it matches never overrides the index.
+        std::fs::remove_file(root.join("keep.log")).unwrap();
+        let after = scan(&root, Some(&snapshot), Scan::Report, &Rules::new(&root)).unwrap();
+        assert_eq!(
+            diff(&snapshot, &after, &Rules::new(&root)).removed,
+            vec!["keep.log".to_string()]
+        );
+    }
+
+    /// The tracked exemption holds inside a nested repository as well: its index
+    /// is asked about its own paths, spelled the way git spells them, not at the
+    /// folder's prefix.
+    #[test]
+    fn rules_never_hide_a_tracked_path_inside_a_nested_repository() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let inner = root.join("project");
+        std::fs::create_dir(&inner).unwrap();
+        init_git_repo(&inner);
+        std::fs::write(inner.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(inner.join("keep.log"), "tracked").unwrap();
+        std::fs::write(inner.join("skip.log"), "untracked").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["add", "-f", "keep.log"])
+            .current_dir(&inner)
+            .status()
+            .expect("git add");
+        assert!(status.success(), "git add -f keep.log");
+
+        let snapshot = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
+        assert!(snapshot.contains_key("project/keep.log"), "{snapshot:?}");
+        assert!(!snapshot.contains_key("project/skip.log"), "{snapshot:?}");
     }
 
     /// The catalogue decision ([`is_owner_personal_folder`]): `shared/` is product
@@ -1209,7 +1668,7 @@ mod tests {
         std::fs::write(&catalogue_probe.0, "one").unwrap();
         std::fs::write(&personal_probe.0, "one").unwrap();
 
-        let owner_snapshot = scan(&owner, None, Scan::Refresh).unwrap();
+        let owner_snapshot = scan(&owner, None, Scan::Refresh, &Rules::new(&owner)).unwrap();
         assert!(
             owner_snapshot.contains_key("personal_changes_probe.txt"),
             "the owner's own material stays watched: {owner_snapshot:?}"
@@ -1225,7 +1684,7 @@ mod tests {
         let guest = crate::users::userspaces_root().join("pc_shared_guest");
         std::fs::create_dir_all(guest.join("shared")).unwrap();
         std::fs::write(guest.join("shared/own.txt"), "one").unwrap();
-        let guest_snapshot = scan(&guest, None, Scan::Refresh).unwrap();
+        let guest_snapshot = scan(&guest, None, Scan::Refresh, &Rules::new(&guest)).unwrap();
         assert_eq!(
             guest_snapshot.keys().cloned().collect::<Vec<_>>(),
             vec!["shared/own.txt".to_string()],
@@ -1237,7 +1696,8 @@ mod tests {
         let lookalike = outside.path().join(crate::users::ADMIN_USER_NAME);
         std::fs::create_dir_all(lookalike.join("shared")).unwrap();
         std::fs::write(lookalike.join("shared/own.txt"), "one").unwrap();
-        let lookalike_snapshot = scan(&lookalike, None, Scan::Refresh).unwrap();
+        let lookalike_snapshot =
+            scan(&lookalike, None, Scan::Refresh, &Rules::new(&lookalike)).unwrap();
         assert_eq!(
             lookalike_snapshot.keys().cloned().collect::<Vec<_>>(),
             vec!["shared/own.txt".to_string()],
@@ -1318,7 +1778,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("gone.txt"), "here").unwrap();
-        let before = scan(root, None, Scan::Refresh).unwrap();
+        let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
         assert!(before.contains_key("gone.txt"));
 
         // Replaced by a dangling symlink: `metadata` (which follows the link)
@@ -1328,12 +1788,12 @@ mod tests {
         std::fs::remove_file(root.join("gone.txt")).unwrap();
         std::os::unix::fs::symlink("x", root.join("gone.txt")).unwrap();
 
-        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
+        let after = scan(root, Some(&before), Scan::Refresh, &Rules::new(root)).unwrap();
         assert_eq!(
             after["gone.txt"].digest, None,
             "a broken link is never followed"
         );
-        let changes = diff(&before, &after);
+        let changes = diff(&before, &after, &Rules::new(root));
         assert_eq!(changes.changed, vec!["gone.txt".to_string()]);
     }
 
@@ -1354,7 +1814,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            let _ = tx.send(scan(&root, None, Scan::Refresh));
+            let _ = tx.send(scan(&root, None, Scan::Refresh, &Rules::new(&root)));
         });
         let snapshot = rx
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -1498,7 +1958,7 @@ mod tests {
             .set_len(HASH_MAX_BYTES + 1)
             .unwrap();
 
-        let before = scan(root, None, Scan::Refresh).unwrap();
+        let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
         assert_eq!(
             before["big.bin"].digest, None,
             "an oversized file is never read"
@@ -1510,8 +1970,11 @@ mod tests {
         file.seek(SeekFrom::Start(HASH_MAX_BYTES / 2)).unwrap();
         file.write_all(b"x").unwrap();
 
-        let after = scan(root, Some(&before), Scan::Refresh).unwrap();
-        assert_eq!(diff(&before, &after).changed, vec!["big.bin".to_string()]);
+        let after = scan(root, Some(&before), Scan::Refresh, &Rules::new(root)).unwrap();
+        assert_eq!(
+            diff(&before, &after, &Rules::new(root)).changed,
+            vec!["big.bin".to_string()]
+        );
     }
 
     /// The refresh gate: a turn's workspace resolves to the personal account
@@ -1618,8 +2081,8 @@ mod tests {
         // Not the owner's own folder, so `shared/` here is the user's own
         // material: the catalogue name is pruned in the owner's folder alone.
         assert!(!is_owner_personal_folder(root));
+        init_git_repo(root);
         for dir in [
-            ".git",
             ".compaction",
             "generated",
             "uploads",
@@ -1631,6 +2094,7 @@ mod tests {
             ".config",
             "empty",
             "shared",
+            "cache/deep",
         ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
@@ -1648,9 +2112,10 @@ mod tests {
         ] {
             std::fs::write(root.join(path), "one").unwrap();
         }
-        // The user's own material — dotfiles and dotfolders included, and the
-        // `.gitignore` hides nothing because the walk ignores ignore rules.
-        std::fs::write(root.join(".gitignore"), "secret.txt\n").unwrap();
+        // The user's own material — dotfiles included unless the folder's own
+        // rules exclude them: this is a repository, so `secret.txt` and the whole
+        // `cache/` folder are gone from both blocks, while `.env` stays.
+        std::fs::write(root.join(".gitignore"), "secret.txt\ncache/\n").unwrap();
         for path in [
             "album/one.jpg",
             "album/deep/two.jpg",
@@ -1659,6 +2124,7 @@ mod tests {
             "top.txt",
             ".env",
             "secret.txt",
+            "cache/one.bin",
         ] {
             std::fs::write(root.join(path), "one").unwrap();
         }
@@ -1668,7 +2134,8 @@ mod tests {
         std::os::unix::fs::symlink(root.join("album"), root.join("linked")).unwrap();
 
         let picture = personal_folder_picture(root).expect("picture");
-        let snapshot = scan(root, None, Scan::Refresh).expect("the report's own walk");
+        let snapshot =
+            scan(root, None, Scan::Refresh, &Rules::new(root)).expect("the report's own walk");
         let mut watched: BTreeMap<String, usize> = BTreeMap::new();
         let mut watched_direct = 0usize;
         for key in snapshot.keys() {
@@ -1678,28 +2145,11 @@ mod tests {
             }
         }
 
-        let count_of = |rest: &str| {
-            rest.split_once(' ')
-                .expect("a count and a noun")
-                .0
-                .parse::<usize>()
-                .expect("a number")
-        };
-        let mut pictured: BTreeMap<String, usize> = BTreeMap::new();
-        let mut pictured_direct = 0usize;
-        for line in picture.lines() {
-            if let Some(rest) = line.strip_prefix("- ") {
-                let (name, count) = rest.split_once("/ — ").expect("a folder line");
-                pictured.insert(name.to_string(), count_of(count));
-            } else {
-                let direct = line
-                    .split_once(" directly in the folder")
-                    .expect("the direct-file line");
-                pictured_direct = count_of(direct.0);
-            }
-        }
+        let (pictured, pictured_direct) = pictured_folders(&picture);
 
-        assert_eq!(watched_direct, 4, "{snapshot:?}");
+        assert_eq!(watched_direct, 3, "{snapshot:?}");
+        assert!(!snapshot.contains_key("secret.txt"), "{snapshot:?}");
+        assert!(snapshot.contains_key(".env"), "{snapshot:?}");
         assert_eq!(pictured_direct, watched_direct);
         // The empty folder is the user's folder although the report records no
         // material in it (directories are implied by the paths below them).
@@ -1717,6 +2167,7 @@ mod tests {
             ".compaction",
             "MEMORY.md",
             "linked",
+            "cache", // an ignored folder is pruned whole by both blocks
         ] {
             assert!(!picture.contains(hidden), "{hidden} in {picture}");
         }

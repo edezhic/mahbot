@@ -1203,6 +1203,21 @@ pub(crate) async fn seed_session_row(
     .unwrap();
 }
 
+/// Make `dir` a repository git answers for, with no commit of its own — for the
+/// nested repositories a test builds inside a folder it created itself.
+///
+/// # Panics
+///
+/// Panics if `git` is not available or refuses to initialize.
+pub(crate) fn init_git_repo(dir: &Path) {
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .expect("git init");
+    assert!(status.success());
+}
+
 /// Create a temporary directory initialized as a git repository with a
 /// committed file named `test.txt` (containing `"line1\nline2\nline3\n"`)
 /// and a single commit titled `"Initial commit"`.
@@ -1216,14 +1231,7 @@ pub(crate) async fn seed_session_row(
 pub(crate) fn init_temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let repo_path = dir.path().to_path_buf();
-
-    // git init
-    let status = std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(&repo_path)
-        .status()
-        .expect("git init");
-    assert!(status.success());
+    init_git_repo(&repo_path);
 
     // Set user config (required for commit)
     for (key, value) in [("user.name", "Test"), ("user.email", "test@test.com")] {
