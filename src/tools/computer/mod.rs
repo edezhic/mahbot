@@ -11,6 +11,10 @@
 //! asked for when first needed and reported on every action they block — see
 //! [`macos`]. Windows needs no grant at all, but refuses to actuate on windows of
 //! elevated processes and cannot reach the secure desktop — see [`windows`].
+//!
+//! The agent-facing description is the shared `src/prompt/tool/computer.md` plus
+//! only the running platform's own file ([`PLATFORM_DESCRIPTION`]): one
+//! installation is one platform, so no agent is handed another's caveats.
 
 mod core;
 mod linux;
@@ -287,6 +291,21 @@ pub(crate) fn cleanup_agent_state(agent_key: &str) {
     core::clear_agent_state(agent_key);
 }
 
+// ── Description ────────────────────────────────────────────────────────
+
+/// The asset holding this platform's own half of the description, appended to
+/// the shared `tool/computer.md`. `None` where the tool is never advertised (the
+/// stub backend), which leaves the shared text alone.
+const PLATFORM_DESCRIPTION: Option<&str> = if cfg!(target_os = "linux") {
+    Some("tool/computer_linux.md")
+} else if cfg!(target_os = "macos") {
+    Some("tool/computer_macos.md")
+} else if cfg!(target_os = "windows") {
+    Some("tool/computer_windows.md")
+} else {
+    None
+};
+
 /// Tool for observing and acting on the local GUI via the OS accessibility
 /// channel. Every action is serialized through [`ACTION_LOCK`].
 #[derive(Default)]
@@ -296,6 +315,20 @@ pub(crate) struct ComputerTool;
 impl Tool for ComputerTool {
     fn name(&self) -> &'static str {
         "computer"
+    }
+
+    /// The shared contract plus this platform's own half — an installation is one
+    /// platform, so the other platforms' caveats never reach an agent.
+    fn description(&self) -> String {
+        let mut sections = vec![crate::prompt::load_prompt("tool/computer.md")];
+        if let Some(asset) = PLATFORM_DESCRIPTION {
+            sections.push(crate::prompt::load_prompt(asset));
+        }
+        sections
+            .iter()
+            .map(|s| s.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// Every computer output is credential-scrubbed inside the tool: `observe`
