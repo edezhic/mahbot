@@ -2,7 +2,8 @@
 //!
 //! Owns the shared types, coordinate math, the element-ref/observation lifecycle,
 //! the target registry, tree rendering, and the [`Backend`] trait. Contains no
-//! platform imports — `macos.rs`/`linux.rs`/`stub.rs` implement [`Backend`].
+//! platform imports — `macos.rs`/`linux.rs`/`windows`/`stub.rs` implement
+//! [`Backend`].
 //!
 //! Items carrying a platform-scoped `expect(dead_code)` are the ones only a real
 //! backend — or a test — calls: on a platform whose backend is the stub they
@@ -68,7 +69,10 @@ pub(crate) const ERR_PERMISSION_DENIED: &str = "permission-denied";
 pub(crate) const ERR_UNSUPPORTED: &str = "unsupported";
 pub(crate) const ERR_DEGRADED: &str = "degraded";
 pub(crate) const ERR_STALE_ELEMENT: &str = "stale-element";
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    expect(dead_code)
+)]
 pub(crate) const ERR_AMBIGUOUS_LOCATOR: &str = "ambiguous-locator";
 pub(crate) const ERR_NOT_MATCHED: &str = "not-matched";
 
@@ -82,7 +86,10 @@ pub(crate) fn taxonomy_error(kind: &str, msg: impl fmt::Display) -> anyhow::Erro
 /// Build the `permission-denied` failure as a TYPED error: its text is the usual
 /// `"permission-denied: …"`, and [`is_permission_denied`] tells it apart from
 /// every other backend failure without reading that text.
-#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    expect(dead_code)
+)]
 pub(crate) fn permission_denied(msg: impl fmt::Display) -> anyhow::Error {
     anyhow::Error::new(PermissionDenied(taxonomy_error(ERR_PERMISSION_DENIED, msg)))
 }
@@ -108,9 +115,10 @@ impl std::error::Error for PermissionDenied {}
 
 // ── Types ───────────────────────────────────────────────────────────────
 
-/// Surface extent in GLOBAL logical points (top-left origin). For a window this
-/// is the window's frame; for the screen target it is the virtual-desktop
-/// bounding rect across all displays (origin at its min corner).
+/// Surface extent in global surface points (top-left origin): logical points on
+/// macOS, physical pixels on Linux and Windows. For a window this is the window's
+/// frame; for the screen target it is the virtual-desktop bounding rect across all
+/// displays (origin at its min corner).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SurfaceGeometry {
     pub x: f64,
@@ -211,8 +219,9 @@ pub(crate) struct Locator {
     pub name: Option<String>,
 }
 
-/// A node in the accessibility tree. `frame` is surface-local `(x, y, w, h)`
-/// in global logical points; `children` mirrors the AX hierarchy.
+/// A node in the accessibility tree. `frame` is surface-local `(x, y, w, h)` in
+/// the surface's own points (see [`SurfaceGeometry`]); `children` mirrors the AX
+/// hierarchy.
 #[derive(Debug, Clone)]
 pub(crate) struct UiNode {
     pub role: String,
@@ -359,7 +368,7 @@ pub(crate) enum RawInput {
 /// `alt`/`option`, `shift`. The non-modifier segment is the key name and is
 /// returned lowercased (e.g. `"return"`, `"a"`, `"f5"`, `"5"`).
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", test)),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
 )]
 pub(crate) fn parse_key_chord(chord: &str) -> anyhow::Result<(Vec<Modifier>, String)> {
@@ -397,7 +406,7 @@ pub(crate) fn parse_key_chord(chord: &str) -> anyhow::Result<(Vec<Modifier>, Str
 
 /// Reject a normalized point that is not a finite 0-1000 coordinate.
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", test)),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
 )]
 pub(crate) fn check_normalized(nx: f64, ny: f64) -> anyhow::Result<()> {
@@ -411,10 +420,10 @@ pub(crate) fn check_normalized(nx: f64, ny: f64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Map a normalized 0-1000 point to absolute global logical points on the
-/// target surface.
+/// Map a normalized 0-1000 point to absolute global surface points on the target
+/// surface.
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", test)),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
 )]
 pub(crate) fn normalized_to_surface(
@@ -429,8 +438,8 @@ pub(crate) fn normalized_to_surface(
     ))
 }
 
-/// Map an absolute global logical point to normalized 0-1000 coordinates
-/// against the target surface, clamped to the surface extent.
+/// Map an absolute global surface point to normalized 0-1000 coordinates against
+/// the target surface, clamped to the surface extent.
 pub(crate) fn surface_to_normalized(
     ax: f64,
     ay: f64,
@@ -444,7 +453,7 @@ pub(crate) fn surface_to_normalized(
     Ok((nx, ny))
 }
 
-/// True when an absolute global logical point lies inside the surface extent.
+/// True when an absolute global surface point lies inside the surface extent.
 /// Top-left corner is inclusive; the bottom-right edge is exclusive.
 #[must_use]
 pub(crate) fn contains_point(geo: &SurfaceGeometry, ax: f64, ay: f64) -> bool {
@@ -522,7 +531,7 @@ pub(crate) fn crop_rgba(cap: &Capture, rect: (u32, u32, u32, u32)) -> anyhow::Re
 /// clipping to the destination bounds. Platform-free; shared by the capture
 /// composite backends.
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", test)),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
 )]
 pub(crate) fn blit_rgba(
@@ -641,7 +650,10 @@ pub(crate) fn portal_uri_to_path(uri: &str) -> Result<PathBuf, anyhow::Error> {
 /// intersection in buffer space (buffer origin = screen origin, size =
 /// screen size). `crop_rgba` clamps the far edge, so w/h are rounded up to
 /// `>= 1` (mirror `region_to_pixels` style).
-#[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows", test)),
+    expect(dead_code)
+)] // the Linux and Windows backends call this; tests exercise it everywhere
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn window_capture_rect(
     win: &SurfaceGeometry,
@@ -931,7 +943,10 @@ fn render_node(
 /// Pre-order DFS index of `target` in `root` — maps a matched node back to its
 /// handle slot (the handles are kept in the same pre-order as the tree).
 /// Platform-free; shared by the backends in `act_on_element`.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    expect(dead_code)
+)]
 #[must_use]
 pub(crate) fn pre_order_index(root: &UiNode, target: &UiNode) -> usize {
     fn rec(node: &UiNode, target: &UiNode, counter: &mut usize, found: &mut Option<usize>) {
@@ -952,7 +967,10 @@ pub(crate) fn pre_order_index(root: &UiNode, target: &UiNode) -> usize {
 }
 
 /// Outcome of resolving a locator against a tree.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    expect(dead_code)
+)]
 pub(crate) enum LocatorMatch<'a> {
     /// The recorded child-index path reached a node matching the role+name —
     /// the aligned element (the path is load-bearing even when the search would
@@ -972,7 +990,7 @@ pub(crate) enum LocatorMatch<'a> {
 /// tree is searched for role+name matches: exactly one is unique, more than one
 /// is ambiguous, and none is not-found.
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", test)),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
 )]
 #[must_use]
@@ -991,9 +1009,12 @@ pub(crate) fn resolve_locator<'a>(root: &'a UiNode, locator: &Locator) -> Locato
 }
 
 /// Resolve a locator, mapping the ambiguous/not-found outcomes to their
-/// taxonomy errors — the shared failure contract of both backends'
+/// taxonomy errors — the shared failure contract of every backend's
 /// `act_on_element`.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    expect(dead_code)
+)]
 pub(crate) fn resolve_locator_checked<'a>(
     root: &'a UiNode,
     locator: &Locator,
@@ -1011,9 +1032,13 @@ pub(crate) fn resolve_locator_checked<'a>(
     }
 }
 
-/// Shared refusal for acting on the `screen` target: acting addresses an
-/// element of a window, so both backends pre-check this before resolving one.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), expect(dead_code))]
+/// Shared refusal for acting on the `screen` target: acting addresses an element
+/// of a window. Linux and macOS pre-check it; Windows lets its own target
+/// resolution raise it, so the wording is the same everywhere.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    expect(dead_code)
+)]
 pub(crate) fn screen_act_error() -> anyhow::Error {
     taxonomy_error(
         ERR_UNSUPPORTED,
@@ -1022,7 +1047,7 @@ pub(crate) fn screen_act_error() -> anyhow::Error {
 }
 
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", test)),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
 )]
 fn node_matches(node: &UiNode, locator: &Locator) -> bool {
@@ -1036,7 +1061,7 @@ fn node_matches(node: &UiNode, locator: &Locator) -> bool {
 }
 
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", test)),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
 )]
 fn search_locator<'a>(root: &'a UiNode, locator: &Locator) -> LocatorMatch<'a> {
@@ -1068,7 +1093,8 @@ fn search_locator<'a>(root: &'a UiNode, locator: &Locator) -> LocatorMatch<'a> {
 pub(crate) trait Backend: Send + Sync {
     /// Whether the platform can serve the tool at all — the advertisement gate,
     /// not a grant check: macOS always can (its grants are requested per call),
-    /// Linux needs a GUI session with a reachable session bus.
+    /// Windows always can (no grant exists; the refusals are per window and per
+    /// call), Linux needs a GUI session with a reachable session bus.
     fn is_supported(&self) -> bool;
     /// Prompt-free capture-channel probe (the screen-recording grant on macOS);
     /// the caller caches it with a TTL.
@@ -1091,7 +1117,8 @@ pub(crate) trait Backend: Send + Sync {
         act: ElementAct,
     ) -> anyhow::Result<()>;
     async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<()>;
-    /// Pointer position in ABSOLUTE global logical points.
+    /// Pointer position in ABSOLUTE global surface points (logical points on
+    /// macOS, physical pixels on Linux and Windows).
     async fn cursor_position(&self) -> anyhow::Result<(f64, f64)>;
     /// RGBA pixels of a target surface (window capture, or full virtual desktop for Screen).
     async fn capture(&self, target: &TargetSpec) -> anyhow::Result<Capture>;

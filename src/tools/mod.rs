@@ -12,8 +12,8 @@ pub(crate) mod chrome_groups;
 pub mod chrome_release;
 pub(crate) mod chrome_tab_ledger;
 pub(crate) mod chrome_tabs;
-// Computer-use tool (GUI observe/act). Linux and macOS offer it; every other
-// platform reaches the stub backend, which is never advertised.
+// Computer-use tool (GUI observe/act). Linux, macOS and Windows offer it; every
+// other platform reaches the stub backend, which is never advertised.
 pub mod computer;
 pub(crate) mod custom;
 pub(crate) mod delegation;

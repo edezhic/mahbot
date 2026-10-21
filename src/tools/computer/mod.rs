@@ -1,21 +1,24 @@
 //! Computer (GUI observe/act) tool for the admin's Assistant.
 //!
 //! The platform-agnostic core (types, coordinate math, ref lifecycle, backend
-//! trait) lives in [`core`]; [`linux`], [`macos`] and [`stub`] implement the
-//! backend per platform. All GUI actions are serialized through a process-wide
-//! lock so two concurrent agent runs can never race on the live GUI.
+//! trait) lives in [`core`]; [`linux`], [`macos`], [`windows`] and [`stub`]
+//! implement the backend per platform. All GUI actions are serialized through a
+//! process-wide lock so two concurrent agent runs can never race on the live GUI.
 //!
-//! The tool is offered on Linux and macOS. Linux has no grant model of its own
-//! (AT-SPI and the X11/portal channels are what decides); on macOS the three
-//! privacy grants belong to the terminal the daemon was started from, are asked
-//! for when first needed and reported on every action they block — see [`macos`].
+//! The tool is offered on Linux, macOS and Windows. Linux has no grant model of
+//! its own (AT-SPI and the X11/portal channels are what decides); on macOS the
+//! three privacy grants belong to the terminal the daemon was started from, are
+//! asked for when first needed and reported on every action they block — see
+//! [`macos`]. Windows needs no grant at all, but refuses to actuate on windows of
+//! elevated processes and cannot reach the secure desktop — see [`windows`].
 
 mod core;
 mod linux;
 mod macos;
+mod windows;
 // Every other platform: the capability is absent, so the stub is never
 // advertised.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod stub;
 
 use self::core::{
@@ -212,7 +215,11 @@ fn backend() -> &'static dyn Backend {
     {
         &macos::MACOS_BACKEND
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        &windows::WINDOWS_BACKEND
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         &stub::STUB_BACKEND
     }

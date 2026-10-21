@@ -411,6 +411,7 @@ impl TestLedgerGuard {
     }
 
     /// Whether the durable record still holds `namespace` — the view a restart reads back.
+    #[cfg(unix)]
     pub(crate) fn holds(&self, namespace: &str) -> bool {
         let Ok(json) = std::fs::read_to_string(&self.path) else {
             return false;

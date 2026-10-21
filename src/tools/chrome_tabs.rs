@@ -342,7 +342,7 @@ pub(crate) fn reset_unreadable_answer() {
 /// test can reach the deferral a call of ours in flight causes without running a real call.
 /// The calls-and-releases marker is deliberately untouched: this is not a call, and moving it
 /// would make a later pass owe a teardown nothing asked for.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn hold_door_call_in_flight() -> impl Drop {
     DOOR_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
     DoorCallInFlight

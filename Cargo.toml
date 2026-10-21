@@ -288,6 +288,33 @@ libc = "0.2"
 # the update path's host check (`self_update::windows_build`).
 windows-sys = { version = "0.52", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_Environment", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
 
+# Computer Use tool (GUI observe/act): UI Automation for observe/act, SendInput
+# for pointer and keyboard synthesis, and Windows.Graphics.Capture with a GDI
+# fallback for stills. The crate is already in the lock at 0.62 (pulled by the
+# cross-platform GUI/audio dependencies), so this adds no new version — only the
+# features below, and only for this target. `Win32_System_WinRT_Graphics_Capture`
+# carries the capture item's activation interop.
+windows = { version = "0.62", features = [
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Acceleration-carrying candle for the embedder and the TTS ONNX runtime.
 candle-nn = { version = "0.11.0", features = ["accelerate"] }

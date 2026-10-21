@@ -1215,6 +1215,8 @@ fn path_io_error(path: &Path, err: &std::io::Error, context: &str) -> anyhow::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the `#[cfg(unix)]` FIFO test drives the write side of a refused read.
+    #[cfg(unix)]
     use crate::tools::EditTool;
     use crate::workspace::test_ws;
     use std::path::PathBuf;

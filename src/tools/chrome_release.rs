@@ -2528,8 +2528,8 @@ pub(crate) fn clear_pending_releases() {
 }
 
 /// Test-only: the sessions waiting for the next pass to let them go, with the passes that
-/// have failed to let each one go.
-#[cfg(test)]
+/// have failed to let each one go. Read only by the unix-gated release tests.
+#[cfg(all(test, unix))]
 fn pending_forget_snapshot() -> Vec<(String, u32)> {
     pending_forget().lock().unwrap_poison().clone()
 }

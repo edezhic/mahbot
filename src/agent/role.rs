@@ -433,7 +433,7 @@ impl Role {
     /// `workspace`, and removes the guest-only `archive`.
     /// Every other role's toolset is byte-identical regardless of its value.
     /// `computer` is offered on the platforms that have the capability
-    /// (Linux and macOS); [`Tool::is_advertised`] decides the rest.
+    /// (Linux, macOS and Windows); [`Tool::is_advertised`] decides the rest.
     ///
     /// `chrome_sessions` is the run-scoped tracker shared with the agent's
     /// `ChromeTool`: every session the run opens is handed to the run-end

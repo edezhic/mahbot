@@ -4429,6 +4429,7 @@ dependencies = [
  "unicase",
  "unicode-normalization",
  "url",
+ "windows 0.62.2",
  "windows-sys 0.52.0",
  "winresource",
  "x11rb",

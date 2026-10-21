@@ -23425,6 +23425,7 @@ mod tests {
     /// on an existing one, and a reading marks it either way. Merging never clears
     /// what the covered cells hold, `unmerge_cells` takes exactly the range that is
     /// merged, and a merge that overlaps one already there is refused naming it.
+    #[expect(clippy::too_many_lines)] // one end-to-end kit round trip, kept whole
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     async fn xlsx_merges_are_written_read_back_and_unmerged() {
@@ -23623,6 +23624,7 @@ mod tests {
     /// indices follow their sheets. A rename or a removal that leaves a reference
     /// naming a sheet that is no longer there is reported as a partial answer, with
     /// the reference itself untouched.
+    #[expect(clippy::too_many_lines)] // one end-to-end kit round trip, kept whole
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     async fn xlsx_sheets_are_added_renamed_moved_and_removed() {

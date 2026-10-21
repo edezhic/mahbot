@@ -1,0 +1,267 @@
+//! Windows [`Backend`] for the Computer tool: UI Automation for observe/act,
+//! `SendInput` for pointer and keyboard synthesis, and Windows.Graphics.Capture
+//! with GDI fallbacks for stills.
+//!
+//! # One dedicated apartment thread
+//!
+//! Every accessibility and capture call runs as a job on ONE thread of its own,
+//! created lazily (the boot capture probe warms it) and initialized into a
+//! multithreaded apartment — `RoInitialize(RO_INIT_MULTITHREADED)` plus the
+//! `CUIAutomation8` client with bounded provider timeouts. Nothing in this module
+//! touches the agent's thread or the interface thread: the [`Backend`] methods
+//! only build a plain-data [`thread::Call`] and await its reply, so no COM
+//! interface ever crosses a thread boundary and the GUI cannot be blocked by a
+//! slow provider.
+//!
+//! # No call may hang
+//!
+//! Two bounds stack. Each provider call is bounded client-side by the UI
+//! Automation timeouts this thread sets (3 s connection, 10 s transaction), and the
+//! whole job is awaited under a per-call deadline sized for what that shape actually
+//! pays (see the deadline constants below). A provider that stalls on several calls
+//! inside one job can still reach a job deadline: that call is then abandoned with an
+//! honest `degraded` timeout and the thread is marked dead — the next call starts a
+//! fresh MTA thread and the wedged one is left to the OS (Windows offers no safe way to
+//! interrupt a thread blocked inside a provider). The abandoned action may still land
+//! afterwards, which is what the timeout message tells the model. At most one thread is
+//! leaked per hang, and the action lock, the agent and the daemon all stay responsive.
+//!
+//! # Coordinates and DPI
+//!
+//! Everything here is PHYSICAL pixels: UI Automation rectangles, window frames,
+//! the virtual desktop rect and pointer positions all agree once the process is
+//! per-monitor DPI aware. iced's winit event loop makes it so at startup; the
+//! thread additionally asks for per-monitor-v2 awareness once, eagerly, before any
+//! read — a `cargo`-launched CLI run has no event loop, and a lazily-set awareness
+//! would mix physical UIA bounds with virtualized window metrics.
+//!
+//! # Actuation limits, stated rather than worked around
+//!
+//! [`window::ensure_actuation_allowed`] owns both refusals and names which one fired:
+//!
+//! * A window owned by a process running elevated cannot be driven by this
+//!   non-elevated one: Windows blocks both synthetic input (UIPI) and accessibility
+//!   actions into it. A CAPTURE of that window may still work, because the
+//!   compositor, not its owner, serves the frame. Starting elevated is out of scope.
+//! * The UAC secure desktop and the lock screen live on another desktop. When either
+//!   is up, nothing can be read or actuated there and no workaround is attempted.
+//!
+//! `cmd` in a key chord is the Windows key here (it is Super on Linux and Command on
+//! macOS); `win` is accepted as a key name for a plain Windows-key tap.
+//!
+//! # Capture
+//!
+//! [`capture`] owns the route order: Windows.Graphics.Capture first (a window item,
+//! or every monitor stitched into the virtual-desktop rect), then a desktop `BitBlt`.
+//! [`capture::take_route`] is the one statement of the frame rule every route obeys.
+//! Consequences accepted rather than engineered around:
+//!
+//! * The platform's capture facility draws its own visible capture indicator around
+//!   what is being captured, on its route; the GDI fallback is a plain read of the
+//!   screen and has none. Removing the indicator needs a packaged, specially
+//!   entitled application, which this product deliberately is not.
+//! * The facility needs Windows 10 1903. Older builds fall through to the GDI
+//!   route, so observation degrades instead of failing.
+//! * Some applications hand that facility black frames for their own reasons
+//!   (protected content, a hardware-accelerated surface that refuses readback);
+//!   that is reported honestly.
+//! * A frame is expressed against the window's surface whatever extent the
+//!   compositor reports (see [`capture::align_to_surface`]); one that matches
+//!   neither convention means the window changed size during the grab and is
+//!   refused.
+//! * Availability is per target and per route, never cached per window: one window's
+//!   failure says nothing about the channel, so [`Backend::capture_available`] answers
+//!   for the desk itself (the input desktop is the ordinary one), not for a window.
+//!   The tool layer caches that desk answer for a minute (see the capture probe in
+//!   `tools::computer`), so a capture failure while it is positive keeps its own
+//!   per-route diagnosis instead of being relabelled.
+//!
+//! # Manual check (run once on a real Windows machine)
+//!
+//! Build with `cargo build --release`, then run the bare executable from a normal
+//! (non-elevated) Command Prompt with `set HOME=C:\Users\<you>\mahbot-check` so a
+//! live instance elsewhere is not disturbed. Sign in to the dashboard as the
+//! admin and talk to the Assistant.
+//!
+//! 1. Launch: the dashboard starts, and step 2 works. (The boot probe only warms
+//!    this thread, so it proves itself by the first call succeeding; with
+//!    `RUST_LOG=mahbot::tools::computer=debug` each action logs its arguments.)
+//! 2. Tool offered: ask the Assistant to `observe` with no target. The reply is a
+//!    `[Surface: app=… window=…]` tree — not "unknown tool" and not the stub's
+//!    "not supported on this platform".
+//! 3. Read a stock application: open Notepad, type a sentence by hand, then ask the
+//!    Assistant for `apps`, `windows { app: "notepad" }` and `observe { target:
+//!    "w1" }`. The tree contains an `[eN] textfield` carrying the sentence as its
+//!    `value` (Windows 11 Notepad exposes its editor as a `document`, which gets a
+//!    ref the same way), and the header's node/interactive counts are non-zero.
+//! 4. Click a control: open Calculator and ask for `observe`; find the `1` button's
+//!    ref and `click { ref: "eN" }`. The display shows 1. Then click `+`, `2`, `=`
+//!    by ref and check for 3.
+//! 5. Type: `click { ref: "<the Notepad edit ref>" }` then `type { text: "hello" }`
+//!    appends visible text. With the ref on a text field (`textfield` or
+//!    `document`), `type { text: … }` replaces its value.
+//! 6. Press a key: `press { keys: "ctrl+a" }` selects all the text, `press { keys:
+//!    "backspace" }` clears it, `press { keys: "win" }` opens the Start menu, and
+//!    `press { keys: "cmd+e" }` opens File Explorer (`cmd` is the Windows key on
+//!    this platform; a lone `cmd` is a modifier with no key and is rejected).
+//! 7. Take a capture: `screenshot { target: "w1" }` returns an image that shows the
+//!    window (the OS capture indicator appears around it — expected, keep it), and
+//!    `zoom { target: "w1", region: [0,0,500,500] }` returns the top-left quarter.
+//!    Minimize that window: the next action on it is refused with `degraded: … is
+//!    minimized — restore it first`. An app that only renders protected content
+//!    instead reports the all-black failure, naming every route it tried.
+//! 8. The honest elevated-window failure: open an Administrator Command Prompt
+//!    yourself (accept the UAC prompt) and start `notepad` from it. In the
+//!    Assistant, list ALL windows (`windows` with no `app`) — the elevated Notepad
+//!    is a second process with its own `wN` — then click it by COORDINATES
+//!    (`click { target: "wN", x: 500, y: 500 }`) — the refusal is
+//!    `permission-denied: window "…" belongs to notepad (pid N), which runs
+//!    elevated …`. `observe { target: "wN" }` on the same window comes back thin or
+//!    `permission-denied` (Windows blocks accessibility reads into elevated
+//!    processes too — an honest answer, not a bug), while `screenshot { target:
+//!    "wN" }` still returns its frame. Finally lock the workstation (Win+L) and try
+//!    any action: `degraded: … secure desktop, the lock screen or a non-interactive
+//!    session …`, never a hang. A `screenshot` taken then reports the routes' own
+//!    failures (`… every route failed: …`): the desk probe stays cached for a minute
+//!    and step 7's capture refreshed it, so the channel is not re-diagnosed.
+
+#![cfg(target_os = "windows")]
+// The Win32 surface this backend speaks (C-style integer geometry, i32/u32 pixel
+// dimensions, RAW handles) makes these pedantic cast lints inherent.
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
+mod capture;
+mod input;
+mod thread;
+mod uia;
+mod window;
+
+use self::thread::Call;
+use super::core::{
+    AppInfo, Backend, Capture, ElementAct, Locator, Observation, RawInput, SurfaceGeometry,
+    TargetSpec, WindowInfo,
+};
+use async_trait::async_trait;
+use std::time::Duration;
+
+// ── Deadlines ───────────────────────────────────────────────────────────
+//
+// One bound per call shape, sized for what that shape actually pays. For the two
+// accessibility shapes that is the common path plus ONE provider transaction: the UIA
+// timeouts set on the apartment thread (3 s connect, 10 s transaction) end a single
+// unresponsive provider call, and [`uia::WALK_DEADLINE`] ends a walk with its own
+// honest timeout before the job deadline fires. A provider that stalls on more than one
+// call inside a job — the `ElementFromHandle` before the walk, one
+// `GetCurrentPatternAs` per pattern tried, the property reads `set_value` does before it
+// types — can still reach the job deadline; that is the timeout case the module header
+// describes, not a hang.
+
+/// The capture-channel probe: whether an interactive desktop is attached
+/// (`window::interactive_desktop_available`), with no provider and no device work.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// App/window enumeration and geometry: plain Win32, no provider involved.
+const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+/// A full accessibility read: the walk plus one transaction.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(25);
+/// An element action — the walk, the pattern it obtains, the action's own call — or a
+/// raw input batch, which pays none of those and stays far below this.
+const ACT_TIMEOUT: Duration = Duration::from_secs(35);
+/// One still, every route included: the screen stitch is cut at `SCREEN_BUDGET` (it
+/// checks the budget before each display and waits no longer than what is left), then
+/// the GDI route runs.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(25);
+
+// ── Backend ─────────────────────────────────────────────────────────────
+
+pub(crate) static WINDOWS_BACKEND: WindowsBackend = WindowsBackend;
+
+pub(crate) struct WindowsBackend;
+
+#[async_trait]
+impl Backend for WindowsBackend {
+    /// No grant, no permission and no signature is involved: UI Automation,
+    /// `SendInput` and the compositor's capture facility are all present on the
+    /// product's Windows floor. What can still fail per call — an elevated
+    /// window, the secure desktop, a single uncooperative provider — is refused
+    /// with its own diagnosis instead.
+    fn is_supported(&self) -> bool {
+        true
+    }
+
+    /// Whether an interactive desktop is attached. Deliberately not about any
+    /// one window and never cached per target: a window that refuses capture
+    /// leaves the channel available for everything else.
+    async fn capture_available(&self) -> bool {
+        thread::submit(Call::ProbeCapture, PROBE_TIMEOUT)
+            .await
+            .unwrap_or(false)
+    }
+
+    fn capture_unavailable_error(&self) -> anyhow::Error {
+        super::core::taxonomy_error(
+            super::core::ERR_DEGRADED,
+            "screen capture is unavailable: no interactive desktop is attached to this \
+             session (the secure desktop or the lock screen owns it, or the service runs \
+             without one) — the accessibility tree may still be readable",
+        )
+    }
+
+    async fn list_apps(&self) -> anyhow::Result<Vec<AppInfo>> {
+        thread::submit(Call::ListApps, LIST_TIMEOUT).await
+    }
+
+    async fn list_windows(&self, app: Option<&AppInfo>) -> anyhow::Result<Vec<WindowInfo>> {
+        let app = app.cloned();
+        thread::submit(Call::ListWindows { app }, LIST_TIMEOUT).await
+    }
+
+    async fn focused_window(&self) -> anyhow::Result<WindowInfo> {
+        thread::submit(Call::FocusedWindow, LIST_TIMEOUT).await
+    }
+
+    async fn surface_geometry(&self, target: &TargetSpec) -> anyhow::Result<SurfaceGeometry> {
+        let target = target.clone();
+        thread::submit(Call::SurfaceGeometry { target }, LIST_TIMEOUT).await
+    }
+
+    async fn observe(&self, target: &TargetSpec) -> anyhow::Result<Observation> {
+        let target = target.clone();
+        thread::submit(Call::Observe { target }, OBSERVE_TIMEOUT).await
+    }
+
+    async fn act_on_element(
+        &self,
+        target: &TargetSpec,
+        locator: &Locator,
+        act: ElementAct,
+    ) -> anyhow::Result<()> {
+        let call = Call::Act {
+            target: target.clone(),
+            locator: locator.clone(),
+            act,
+        };
+        thread::submit(call, ACT_TIMEOUT).await
+    }
+
+    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<()> {
+        let call = Call::RawInput {
+            target: target.clone(),
+            input,
+        };
+        thread::submit(call, ACT_TIMEOUT).await
+    }
+
+    async fn cursor_position(&self) -> anyhow::Result<(f64, f64)> {
+        thread::submit(Call::CursorPosition, LIST_TIMEOUT).await
+    }
+
+    async fn capture(&self, target: &TargetSpec) -> anyhow::Result<Capture> {
+        let target = target.clone();
+        thread::submit(Call::Capture { target }, CAPTURE_TIMEOUT).await
+    }
+}
