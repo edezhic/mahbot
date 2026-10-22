@@ -84,6 +84,14 @@ pub(crate) const ERR_FRAMEWORK_FAILED: &str = "framework-failed";
 )]
 pub(crate) const ERR_AMBIGUOUS_LOCATOR: &str = "ambiguous-locator";
 pub(crate) const ERR_NOT_MATCHED: &str = "not-matched";
+/// The surface a call names is gone: the window closed or was replaced.
+/// Deliberately not `not-matched`, whose guidance — coordinates or a screenshot of
+/// where it used to be — cannot help when the window no longer exists.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    expect(dead_code)
+)]
+pub(crate) const ERR_SURFACE_GONE: &str = "surface-gone";
 /// The target is mahbot's own interface and this platform cannot perform the
 /// operation on itself from inside the process. Deliberately distinct from
 /// `unsupported`, whose prompt guidance ("take another route … or coordinates")
@@ -107,6 +115,55 @@ pub(crate) fn taxonomy_error(kind: &str, msg: impl fmt::Display) -> anyhow::Erro
 )]
 pub(crate) fn framework_failed(what: &str, detail: impl fmt::Display) -> anyhow::Error {
     taxonomy_error(ERR_FRAMEWORK_FAILED, format!("{what} — {detail}"))
+}
+
+/// The `surface-gone` failure for a window of `app_name` (see [`ERR_SURFACE_GONE`]).
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) fn surface_gone(app_name: &str) -> anyhow::Error {
+    taxonomy_error(
+        ERR_SURFACE_GONE,
+        format!(
+            "the window of '{app_name}' this target names can no longer be identified — it \
+             closed or was replaced; enumerate windows again"
+        ),
+    )
+}
+
+/// The `degraded` failure for a minimized window: it has no visible pixels, and
+/// the frame it keeps is the one it had before it was minimized. `title` may be
+/// empty (an untitled window), which [`window_description`] renders as "the window".
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) fn minimized_window(title: &str) -> anyhow::Error {
+    taxonomy_error(
+        ERR_DEGRADED,
+        format!(
+            "{} is minimized — restore it first; a minimized window has no visible pixels",
+            window_description("", title)
+        ),
+    )
+}
+
+/// The `degraded` failure for pinned input whose surface could not be brought to
+/// the front: nothing was sent, so the call cannot claim it landed there. `surface`
+/// is a [`TargetSpec::describe`] or [`window_description`] spelling of it.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    expect(dead_code)
+)]
+pub(crate) fn not_brought_forward(surface: impl fmt::Display) -> anyhow::Error {
+    taxonomy_error(
+        ERR_DEGRADED,
+        format!(
+            "{surface} could not be brought to the front — the input would have gone to another \
+             window, so nothing was sent; bring the window forward (click it) and repeat the action"
+        ),
+    )
 }
 
 /// Build the `permission-denied` failure as a TYPED error: its text is the usual
@@ -275,13 +332,30 @@ pub(crate) struct AppInfo {
     pub name: String,
 }
 
+/// Backend-defined identity of one window surface. Opaque to the core: each
+/// backend formats it so that resolving it lands on that very window or fails —
+/// never on another window the same application happens to own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowKey(String);
+
+impl WindowKey {
+    pub(crate) fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A window of an application.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WindowInfo {
     pub app_pid: Option<u32>,
     pub app_name: String,
     pub title: String,
-    pub index: usize,
+    /// Identity of this window (see [`WindowKey`]).
+    pub key: WindowKey,
     pub surface: SurfaceGeometry,
 }
 
@@ -293,16 +367,26 @@ pub(crate) struct Capture {
     pub rgba: Vec<u8>,
 }
 
-/// The surface an action targets. `Focused` is the default; an app id targets
-/// the app's focused window (empty title, index 0 in the registry).
-#[derive(Debug, Clone, PartialEq)]
+/// The surface a call addresses.
+///
+/// `Focused` is where global input goes and what a call with nothing observed
+/// yet falls back to; `App` is an `a`-id — the application's own focused window,
+/// re-resolved per call by design; `Window` is one exact window, identified by
+/// the backend's own [`WindowKey`] so it can never land on another window.
+#[derive(Debug, Clone)]
 pub(crate) enum TargetSpec {
     Focused,
+    App {
+        app_pid: Option<u32>,
+        app_name: String,
+    },
     Window {
         app_pid: Option<u32>,
         app_name: String,
-        title: String,
-        index: usize,
+        key: WindowKey,
+        /// The window's title when it was enumerated — model-facing text only,
+        /// never identity: a renamed window keeps its key and keeps resolving.
+        label: String,
     },
     Screen,
 }
@@ -316,8 +400,83 @@ impl TargetSpec {
         TargetSpec::Window {
             app_pid: win.app_pid,
             app_name: win.app_name.clone(),
-            title: win.title.clone(),
-            index: win.index,
+            key: win.key.clone(),
+            label: win.title.clone(),
+        }
+    }
+
+    /// The application this target belongs to: the backend resolves it before
+    /// the window (`None` for a target that names no application).
+    #[must_use]
+    pub(crate) fn app(&self) -> Option<(Option<u32>, &str)> {
+        match self {
+            TargetSpec::App {
+                app_pid, app_name, ..
+            }
+            | TargetSpec::Window {
+                app_pid, app_name, ..
+            } => Some((*app_pid, app_name)),
+            TargetSpec::Focused | TargetSpec::Screen => None,
+        }
+    }
+
+    /// Model-facing description of the surface, for results and for errors about
+    /// a target that does not match a ref.
+    #[must_use]
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            TargetSpec::Focused => "the focused window of the frontmost app".to_string(),
+            TargetSpec::App { app_name, .. } => {
+                format!("the focused window of {app_name}")
+            }
+            TargetSpec::Window {
+                app_name, label, ..
+            } => window_description(app_name, label),
+            TargetSpec::Screen => "the screen".to_string(),
+        }
+    }
+}
+
+/// How a window surface is named in results and errors — the one spelling, so a
+/// backend that holds a resolved window names it exactly as its target would. An
+/// empty title is an untitled window, never an empty pair of quotes.
+#[must_use]
+pub(crate) fn window_description(app_name: &str, title: &str) -> String {
+    match (app_name.is_empty(), title.is_empty()) {
+        (false, false) => format!("window \"{title}\" of {app_name}"),
+        (false, true) => format!("a window of {app_name}"),
+        (true, false) => format!("window \"{title}\""),
+        (true, true) => "the window".to_string(),
+    }
+}
+
+/// The definition of surface identity: two specs are equal when they name the same
+/// surface, and the registry hands the same id to equal specs.
+///
+/// An `App` is its application; a `Window` is its backend key alone, because that
+/// key already carries the application and is the only thing every backend
+/// resolves through. The pid, app name and label are snapshots for messages, so a
+/// renamed window (or one whose process-reported name changes) keeps its identity
+/// instead of being handed a second id for the same surface.
+impl PartialEq for TargetSpec {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TargetSpec::Focused, TargetSpec::Focused)
+            | (TargetSpec::Screen, TargetSpec::Screen) => true,
+            (
+                TargetSpec::App {
+                    app_pid: a,
+                    app_name: a_name,
+                },
+                TargetSpec::App {
+                    app_pid: b,
+                    app_name: b_name,
+                },
+            ) => a == b && a_name == b_name,
+            (TargetSpec::Window { key: a_key, .. }, TargetSpec::Window { key: b_key, .. }) => {
+                a_key == b_key
+            }
+            _ => false,
         }
     }
 }
@@ -383,6 +542,37 @@ pub(crate) enum RawInput {
         to: (f64, f64),
     },
 }
+
+/// Whether `input` on `target` has to reach a named window: typed text, a drag
+/// gesture and a wheel aimed at a point, and only when the call names a window (a
+/// `w` id or an `a` id) rather than the focused window or the screen.
+///
+/// Everything else is global input — a key chord, a wheel with no point and a
+/// click at a point go where the system sends them — and no result may report it
+/// as having acted on the observed surface. The one definition of that rule, so
+/// the three backends cannot drift apart.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) fn pinned_input(target: &TargetSpec, input: &RawInput) -> bool {
+    matches!(target, TargetSpec::Window { .. } | TargetSpec::App { .. })
+        && matches!(
+            input,
+            RawInput::TypeText { .. }
+                | RawInput::Drag { .. }
+                | RawInput::Scroll { point: Some(_), .. }
+        )
+}
+
+/// Steps a raise is given to settle before the window is declared unable to come
+/// forward: a window manager completes a raise asynchronously.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), expect(dead_code))]
+pub(crate) const RAISE_SETTLE_STEPS: usize = 4;
+
+/// Pause between two raise checks.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), expect(dead_code))]
+pub(crate) const RAISE_SETTLE_MS: u64 = 25;
 
 // ── Key chord parsing ───────────────────────────────────────────────────
 
@@ -487,21 +677,15 @@ pub(crate) fn contains_point(geo: &SurfaceGeometry, ax: f64, ay: f64) -> bool {
 }
 
 /// Map a normalized region to an integer pixel rect `(x, y, w, h)` of the
-/// captured image (corners ordered, clamped to the image bounds).
+/// captured image (corners ordered, clamped to the image bounds). The image's own
+/// size is the space the region is mapped into, so a crop can never be taken
+/// against a surface other than the one captured.
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn region_to_pixels(
     region: &Region,
-    geo: &SurfaceGeometry,
     px_w: u32,
     px_h: u32,
 ) -> anyhow::Result<(u32, u32, u32, u32)> {
-    if geo.width <= 0.0 || geo.height <= 0.0 {
-        anyhow::bail!(
-            "region_to_pixels: surface geometry has non-positive extent ({}, {})",
-            geo.width,
-            geo.height
-        );
-    }
     for v in [region.x0, region.y0, region.x1, region.y1] {
         if !v.is_finite() || !(0.0..=NORMALIZED_MAX).contains(&v) {
             anyhow::bail!("region_to_pixels: normalized coordinate {v} out of 0-1000 range");
@@ -579,6 +763,44 @@ pub(crate) fn blit_rgba(
         let dst_start = (dy + r) * dest_w * 4 + dx * 4;
         dest[dst_start..dst_start + row_copy * 4]
             .copy_from_slice(&src.rgba[src_start..src_start + row_copy * 4]);
+    }
+}
+
+/// Scale between an accessibility coordinate space and captured pixels.
+///
+/// `a11y_screen` is the whole screen as the accessibility stack reports it and
+/// `pixels` is a full-screen capture's size. `None` when the two cannot be
+/// reconciled — non-positive extents, axes that disagree, or a space larger
+/// than the capture (a scale this tool cannot trust) — so a caller can refuse
+/// instead of cropping the wrong part of the screen. Only extents are compared:
+/// an origin offset between the two spaces is not detectable without a second
+/// anchor, and both ordinary arrangements share the screen's own origin.
+#[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))]
+pub(crate) fn a11y_scale(a11y_screen: &SurfaceGeometry, pixels: (u32, u32)) -> Option<f64> {
+    let (px, py) = (f64::from(pixels.0), f64::from(pixels.1));
+    if a11y_screen.width <= 0.0 || a11y_screen.height <= 0.0 || px <= 0.0 || py <= 0.0 {
+        return None;
+    }
+    let (sx, sy) = (px / a11y_screen.width, py / a11y_screen.height);
+    if !sx.is_finite() || !sy.is_finite() || sx < 0.99 {
+        return None;
+    }
+    // Rounding of odd extents makes the two axes differ by a pixel; a real
+    // disagreement is a space this cannot map.
+    if (sx - sy).abs() > 0.02 * sx {
+        return None;
+    }
+    Some(f64::midpoint(sx, sy))
+}
+
+/// Map a geometry from an accessibility coordinate space into captured pixels.
+#[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))]
+pub(crate) fn scale_geometry(geo: SurfaceGeometry, scale: f64) -> SurfaceGeometry {
+    SurfaceGeometry {
+        x: geo.x * scale,
+        y: geo.y * scale,
+        width: geo.width * scale,
+        height: geo.height * scale,
     }
 }
 
@@ -687,8 +909,8 @@ pub(crate) fn window_capture_rect(
 ) -> Result<(u32, u32, u32, u32), anyhow::Error> {
     if win.width <= 0.0 || win.height <= 0.0 {
         return Err(taxonomy_error(
-            ERR_NOT_MATCHED,
-            "window minimized or no visible area — re-enumerate windows",
+            ERR_DEGRADED,
+            "the window has no visible area — it is minimized or off-screen; restore it and retry",
         ));
     }
     let x0 = (win.x - screen.x).max(0.0);
@@ -697,8 +919,9 @@ pub(crate) fn window_capture_rect(
     let y1 = (win.y + win.height - screen.y).min(screen.height);
     if x1 <= x0 || y1 <= y0 {
         return Err(taxonomy_error(
-            ERR_NOT_MATCHED,
-            "window is off-screen — re-enumerate windows",
+            ERR_DEGRADED,
+            "the window lies entirely outside the captured screen — it is on another display or \
+             minimized; screenshot with target: \"screen\" shows the desktop instead",
         ));
     }
     Ok((
@@ -718,6 +941,10 @@ struct ObservationCache {
 }
 
 static LAST_OBSERVATION: LazyLock<Mutex<HashMap<String, ObservationCache>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The surface each agent last observed or captured (see [`last_surface`]).
+static LAST_SURFACE: LazyLock<Mutex<HashMap<String, TargetSpec>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The per-agent registry key, derived from the tool-context agent id. Task-
@@ -788,38 +1015,122 @@ pub(crate) fn resolve_ref(reference: &str) -> anyhow::Result<(Locator, TargetSpe
     Ok((locator.clone(), cache.target.clone()))
 }
 
-/// The target pinned by the calling agent's most recent observation, if any.
-/// Coordinate actions without an explicit target use it so a focus shift between
-/// observe and the action never retargets a different surface than the refs
-/// came from. `None` means no observation has been cached yet.
+/// The target pinned by the calling agent's most recent observation or capture.
+/// A call with no explicit target addresses it, so a focus shift between
+/// observe and the action never retargets a different surface. `None` means
+/// nothing has been pinned yet.
 #[must_use]
-pub(crate) fn last_observation_target() -> Option<TargetSpec> {
+pub(crate) fn last_surface() -> Option<TargetSpec> {
     let key = agent_key();
-    let guard = LAST_OBSERVATION.lock().unwrap_poison();
-    guard.get(&key).map(|c| c.target.clone())
+    let guard = LAST_SURFACE.lock().unwrap_poison();
+    guard.get(&key).cloned()
+}
+
+/// Pin the surface the calling agent last observed or captured. Only a call that
+/// succeeded pins: a failed observation leaves the previous surface in place.
+pub(crate) fn set_last_surface(target: TargetSpec) {
+    let key = agent_key();
+    let mut guard = LAST_SURFACE.lock().unwrap_poison();
+    guard.insert(key, target);
 }
 
 // ── Target registry ─────────────────────────────────────────────────────
 
-static TARGETS: LazyLock<Mutex<HashMap<String, HashMap<String, TargetSpec>>>> =
+/// The two id classes an enumeration hands out: `a` ids address applications,
+/// `w` ids windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdClass {
+    App,
+    Window,
+}
+
+impl IdClass {
+    fn prefix(self) -> char {
+        match self {
+            Self::App => 'a',
+            Self::Window => 'w',
+        }
+    }
+}
+
+/// Most ids kept per agent, and — through the macOS backend — most window handles
+/// kept per agent, so an id in the registry always has a handle to resolve
+/// through. A long run that enumerates a churning desktop drops its oldest
+/// entries; a dropped id then reads as unknown, which is a safe error.
+pub(crate) const MAX_STORED_TARGETS: usize = 512;
+
+/// One agent's ids: the surfaces they name, and the counters that mint them.
+#[derive(Default)]
+struct TargetRegistry {
+    /// `(id, surface)` in the order minted.
+    entries: Vec<(String, TargetSpec)>,
+    /// Counters are never rewound, so an id is never handed to another surface.
+    next_app: usize,
+    next_window: usize,
+}
+
+impl TargetRegistry {
+    fn mint(&mut self, class: IdClass) -> String {
+        let counter = match class {
+            IdClass::App => &mut self.next_app,
+            IdClass::Window => &mut self.next_window,
+        };
+        *counter += 1;
+        format!("{}{counter}", class.prefix())
+    }
+
+    fn position_of(&self, surface: &TargetSpec) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|(_, stored)| stored == surface)
+    }
+
+    fn insert(&mut self, id: String, surface: TargetSpec) {
+        self.entries.push((id, surface));
+        if self.entries.len() > MAX_STORED_TARGETS {
+            self.entries.remove(0);
+        }
+    }
+}
+
+static TARGETS: LazyLock<Mutex<HashMap<String, TargetRegistry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Update the calling agent's target map. Incoming ids replace existing ids of
-/// the SAME id class (leading `a` for apps, `w` for windows) while ids of the
-/// OTHER class survive — an apps enumeration no longer invalidates window ids
-/// and vice versa, so both enumerations coexist. An empty enumeration is a
-/// no-op (the class is inferred from the first id, so there is nothing to
-/// otherwise clear).
-pub(crate) fn store_targets(targets: Vec<(String, TargetSpec)>) {
+/// Store one enumeration's applications and return their `a` ids, in the same
+/// order.
+pub(crate) fn store_app_targets(apps: &[TargetSpec]) -> Vec<String> {
+    store_targets(IdClass::App, apps)
+}
+
+/// Store one enumeration's windows and return their `w` ids, in the same order.
+pub(crate) fn store_window_targets(windows: &[TargetSpec]) -> Vec<String> {
+    store_targets(IdClass::Window, windows)
+}
+
+/// Store one enumeration's surfaces and return their ids, in the same order. A
+/// surface already enumerated keeps the id it was given — re-enumerating refreshes
+/// its message-only snapshot but not its identity — while a new surface gets a
+/// fresh id; an id of a surface this enumeration did not include is kept, so it
+/// still names that surface (and the backend reports it gone) rather than silently
+/// naming whatever took its place.
+fn store_targets(class: IdClass, surfaces: &[TargetSpec]) -> Vec<String> {
     let key = agent_key();
     let mut guard = TARGETS.lock().unwrap_poison();
-    let map = guard.entry(key).or_default();
-    if let Some(class) = targets.first().map(|(id, _)| id.chars().next()) {
-        map.retain(|id, _| id.chars().next() != class);
+    let registry = guard.entry(key).or_default();
+    let mut ids = Vec::with_capacity(surfaces.len());
+    for surface in surfaces {
+        if let Some(position) = registry.position_of(surface) {
+            // Same surface: keep its id, refresh what messages read from it.
+            let (id, stored) = &mut registry.entries[position];
+            ids.push(id.clone());
+            *stored = surface.clone();
+            continue;
+        }
+        let id = registry.mint(class);
+        registry.insert(id.clone(), surface.clone());
+        ids.push(id);
     }
-    for (id, spec) in targets {
-        map.insert(id, spec);
-    }
+    ids
 }
 
 /// Look up a stored target id without erroring (used when an argument may or
@@ -827,7 +1138,12 @@ pub(crate) fn store_targets(targets: Vec<(String, TargetSpec)>) {
 pub(crate) fn get_target(id: &str) -> Option<TargetSpec> {
     let key = agent_key();
     let guard = TARGETS.lock().unwrap_poison();
-    guard.get(&key)?.get(id).cloned()
+    let registry = guard.get(&key)?;
+    registry
+        .entries
+        .iter()
+        .find(|(stored, _)| stored == id)
+        .map(|(_, surface)| surface.clone())
 }
 
 /// Resolve a target id or the `"screen"` literal. `None` → [`TargetSpec::Focused`].
@@ -838,23 +1154,24 @@ pub(crate) fn resolve_target(target: Option<&str>) -> anyhow::Result<TargetSpec>
     if target == "screen" {
         return Ok(TargetSpec::Screen);
     }
-    let key = agent_key();
-    let guard = TARGETS.lock().unwrap_poison();
-    let spec = guard.get(&key).and_then(|m| m.get(target)).ok_or_else(|| {
+    get_target(target).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown target '{target}' — it is not a stored app/window id; enumerate targets \
              with 'apps' (a1-style) or 'windows' (w1-style) first"
         )
-    })?;
-    Ok(spec.clone())
+    })
 }
 
-/// Remove an agent's cached observation and target entries. Called at agent-run
-/// end so a stale per-agent registry never leaks across runs (see
-/// [`crate::tools::computer::cleanup_agent_state`]). No-op for unknown keys.
+/// Remove an agent's cached observation, pinned surface and target entries.
+/// Called at agent-run end so a stale per-agent registry never leaks across runs
+/// (see [`crate::tools::computer::cleanup_agent_state`]). No-op for unknown keys.
 pub(crate) fn clear_agent_state(key: &str) {
     {
         let mut guard = LAST_OBSERVATION.lock().unwrap_poison();
+        guard.remove(key);
+    }
+    {
+        let mut guard = LAST_SURFACE.lock().unwrap_poison();
         guard.remove(key);
     }
     let mut guard = TARGETS.lock().unwrap_poison();
@@ -1247,7 +1564,6 @@ mod tests {
 
     #[test]
     fn region_to_pixels_maps_orders_and_clamps() {
-        let geo = surface(0.0, 0.0, 1000.0, 1000.0);
         // Normalized 200..=800 on a 1000px image → 200..=800 px.
         let region = Region {
             x0: 200.0,
@@ -1256,7 +1572,7 @@ mod tests {
             y1: 500.0,
         };
         assert_eq!(
-            region_to_pixels(&region, &geo, 1000, 1000).unwrap(),
+            region_to_pixels(&region, 1000, 1000).unwrap(),
             (200, 100, 600, 400)
         );
         // Reversed corners are normalized in order → same rect.
@@ -1267,7 +1583,7 @@ mod tests {
             y1: 100.0,
         };
         assert_eq!(
-            region_to_pixels(&rev, &geo, 1000, 1000).unwrap(),
+            region_to_pixels(&rev, 1000, 1000).unwrap(),
             (200, 100, 600, 400)
         );
         // Out-of-range normalized coords are rejected.
@@ -1277,7 +1593,7 @@ mod tests {
             x1: 200.0,
             y1: 100.0,
         };
-        assert!(region_to_pixels(&bad, &geo, 1000, 1000).is_err());
+        assert!(region_to_pixels(&bad, 1000, 1000).is_err());
         // A region beyond the image is clamped to the image bounds (>=1px).
         let big = Region {
             x0: 500.0,
@@ -1285,7 +1601,7 @@ mod tests {
             x1: 1000.0,
             y1: 1000.0,
         };
-        let (x, y, w, h) = region_to_pixels(&big, &geo, 200, 200).unwrap();
+        let (x, y, w, h) = region_to_pixels(&big, 200, 200).unwrap();
         assert!(x + w <= 200 && y + h <= 200);
         assert!(w >= 1 && h >= 1);
     }
@@ -1374,7 +1690,10 @@ mod tests {
         // Fully off-screen errors instead of cropping a misleading 1x1.
         let off = surface(5000.0, 0.0, 100.0, 100.0);
         let err = window_capture_rect(&off, &screen).unwrap_err();
-        assert!(err.to_string().contains("off-screen"), "{err:?}");
+        assert!(
+            err.to_string().contains("outside the captured screen"),
+            "{err:?}"
+        );
         assert!(window_capture_rect(&surface(0.0, 0.0, 0.0, 0.0), &screen).is_err());
     }
 
@@ -1481,72 +1800,80 @@ mod tests {
         assert!(format!("{err}").contains("stale-element"));
     }
 
-    // The two target-registry tests share the process-global map, so one seeding it
-    // under the other's assertions would flake; serialize them.
+    // The registry tests share the process-global map, so one seeding it under
+    // the other's assertions would flake; serialize them.
     #[serial_test::serial(targets)]
     #[test]
     fn resolve_target_resolves_focused_screen_stored_and_unknown() {
         assert_eq!(resolve_target(None).unwrap(), TargetSpec::Focused);
         assert_eq!(resolve_target(Some("screen")).unwrap(), TargetSpec::Screen);
 
-        store_targets(vec![(
-            "a1".to_string(),
-            TargetSpec::Window {
-                app_pid: Some(42),
-                app_name: "Safari".to_string(),
-                title: String::new(),
-                index: 0,
-            },
-        )]);
-        assert_eq!(
-            resolve_target(Some("a1")).unwrap(),
-            TargetSpec::Window {
-                app_pid: Some(42),
-                app_name: "Safari".to_string(),
-                title: String::new(),
-                index: 0,
-            }
-        );
-        let err = resolve_target(Some("w9")).unwrap_err();
+        let app = TargetSpec::App {
+            app_pid: Some(42),
+            app_name: "Safari".to_string(),
+        };
+        let ids = store_app_targets(std::slice::from_ref(&app));
+        assert_eq!(ids.len(), 1);
+        assert_eq!(resolve_target(Some(&ids[0])).unwrap(), app);
+        let err = resolve_target(Some("w9999")).unwrap_err();
         assert!(format!("{err}").contains("unknown target"));
     }
 
     #[serial_test::serial(targets)]
     #[test]
-    fn store_targets_merges_only_same_id_class() {
-        let window = |app_pid: u32, name: &str, title: &str, index: usize| TargetSpec::Window {
-            app_pid: Some(app_pid),
+    fn store_targets_keeps_ids_for_seen_surfaces_and_never_reuses_them() {
+        let window = |name: &str, key: &str| TargetSpec::Window {
+            app_pid: Some(7),
             app_name: name.to_string(),
-            title: title.to_string(),
-            index,
+            key: WindowKey::new(key),
+            label: format!("{key} title"),
         };
-        // Seed one app id and one window id.
-        store_targets(vec![
-            ("a5".to_string(), window(1, "Alpha", "", 0)),
-            ("w5".to_string(), window(2, "Beta", "doc", 0)),
-        ]);
-        assert!(resolve_target(Some("a5")).is_ok());
-        assert!(resolve_target(Some("w5")).is_ok());
+        let first = store_window_targets(&[window("Beta", "k1"), window("Beta", "k2")]);
+        // The same two windows, re-enumerated in the other order: the ids follow
+        // the surfaces, not their position in the listing.
+        let again = store_window_targets(&[window("Beta", "k2"), window("Beta", "k1")]);
+        assert_eq!(again, vec![first[1].clone(), first[0].clone()]);
 
-        // Re-enumerating apps replaces a-ids but keeps the OTHER class (w5).
-        store_targets(vec![("a5".to_string(), window(3, "Gamma", "", 0))]);
-        assert!(resolve_target(Some("a5")).is_ok());
-        assert!(
-            resolve_target(Some("w5")).is_ok(),
-            "window id survived an apps enumeration"
+        // A vanished window keeps its id pointing at itself, and the id of the
+        // window that took its place is a new one.
+        let after = store_window_targets(&[window("Beta", "k1"), window("Beta", "k3")]);
+        assert_eq!(after[0], first[0]);
+        assert_ne!(after[1], first[1]);
+        assert_eq!(
+            resolve_target(Some(&first[1])).unwrap(),
+            window("Beta", "k2"),
+            "the id of a vanished window must not name its replacement"
         );
 
-        // Re-enumerating windows keeps a-ids and clears only stale w-ids.
-        store_targets(vec![("w6".to_string(), window(2, "Beta", "doc2", 1))]);
-        assert!(
-            resolve_target(Some("a5")).is_ok(),
-            "app id survived a windows enumeration"
+        // A rename keeps the key, so the id still names the same window — and the
+        // message-only label follows the rename. Identity is the key alone: the app
+        // name a backend reports can change with the title (a frame-hosted window on
+        // Windows is named by it) and must not mint a second id for that window.
+        let renamed = TargetSpec::Window {
+            app_pid: Some(7),
+            app_name: "Beta (renamed)".to_string(),
+            key: WindowKey::new("k1"),
+            label: "a new title".to_string(),
+        };
+        assert_eq!(store_window_targets(&[renamed])[0], first[0]);
+        assert_eq!(
+            resolve_target(Some(&first[0])).unwrap().describe(),
+            "window \"a new title\" of Beta (renamed)"
         );
-        assert!(
-            resolve_target(Some("w5")).is_err(),
-            "stale window id cleared"
-        );
-        assert!(resolve_target(Some("w6")).is_ok());
+    }
+
+    #[test]
+    fn a11y_scale_maps_only_reconcilable_spaces() {
+        let screen = surface(0.0, 0.0, 1440.0, 900.0);
+        assert_eq!(a11y_scale(&screen, (1440, 900)), Some(1.0));
+        assert_eq!(a11y_scale(&screen, (2880, 1800)), Some(2.0));
+        // A space larger than the capture, per-axis disagreement, and empty
+        // extents are all refusals rather than guesses.
+        assert_eq!(a11y_scale(&screen, (720, 450)), None);
+        assert_eq!(a11y_scale(&screen, (2880, 900)), None);
+        assert_eq!(a11y_scale(&surface(0.0, 0.0, 0.0, 0.0), (10, 10)), None);
+        let scaled = scale_geometry(surface(10.0, 20.0, 100.0, 50.0), 2.0);
+        assert_eq!(scaled, surface(20.0, 40.0, 200.0, 100.0));
     }
 
     #[test]

@@ -7,13 +7,15 @@
 //! resolved to an `HWND` here, used, and dropped — nothing stores a platform
 //! handle across jobs.
 //!
-//! A `TargetSpec::Window` with an empty title and index 0 is the app-level form
-//! `apps`/`windows` produce. It resolves to the app's foreground window when that
-//! belongs to the app, else to its frontmost (top of the z-order) window; a
-//! non-empty title matches that title first, then the enumeration index — the same
-//! contract the Linux and macOS backends implement.
+//! A window's identity is its own OS handle plus the pid that owned it when it was
+//! enumerated ([`window_key`]): the handle stays valid across moves, renames and
+//! re-enumeration, so a `TargetSpec::Window` either lands on that very window or
+//! fails with [`core::ERR_SURFACE_GONE`] — never on another window of the
+//! application, by title or by position in a listing. `TargetSpec::App` names an
+//! application rather than a window and is resolved per call: its own active
+//! window, else its frontmost one.
 
-use super::super::core::{self, AppInfo, SurfaceGeometry, TargetSpec, WindowInfo};
+use super::super::core::{self, AppInfo, SurfaceGeometry, TargetSpec, WindowInfo, WindowKey};
 use std::sync::{Once, OnceLock};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
@@ -32,10 +34,10 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor, GetCursorPos, GetForegroundWindow,
-    GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetForegroundWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
+    EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor, GetForegroundWindow, GetSystemMetrics,
+    GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SetForegroundWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -75,7 +77,9 @@ pub(super) fn interactive_desktop_available() -> bool {
 // ── Target resolution ───────────────────────────────────────────────────
 
 /// Resolve a target to its window. `Focused` follows the foreground window;
-/// `Screen` is a capture surface, not a window.
+/// `App` re-resolves the application's own window per call; `Window` lands on the
+/// exact window its key names or fails; `Screen` is a capture surface, not a
+/// window.
 pub(super) fn resolve(target: &TargetSpec) -> anyhow::Result<TargetWindow> {
     match target {
         TargetSpec::Screen => Err(core::screen_act_error()),
@@ -92,43 +96,52 @@ pub(super) fn resolve(target: &TargetSpec) -> anyhow::Result<TargetWindow> {
             }
             describe(hwnd)
         }
-        TargetSpec::Window {
-            app_pid,
-            app_name,
-            title,
-            index,
-        } => {
+        TargetSpec::App { app_pid, app_name } => {
             let windows = app_windows(*app_pid, app_name);
-            if windows.is_empty() {
-                return Err(core::taxonomy_error(
-                    core::ERR_NOT_MATCHED,
-                    "no windows found for this app — re-enumerate windows",
-                ));
-            }
-            if !title.is_empty()
-                && let Some(named) = windows.iter().find(|w| &w.title == title)
-            {
-                return describe(named.hwnd);
-            }
-            if title.is_empty()
-                && *index == 0
-                && let Some(active) = windows.iter().find(|w| w.active)
-            {
-                return describe(active.hwnd);
-            }
-            windows.get(*index).map_or_else(
-                || {
-                    Err(core::taxonomy_error(
-                        core::ERR_NOT_MATCHED,
-                        format!(
-                            "window '{title}' (index {index}) not found — re-enumerate windows"
-                        ),
-                    ))
-                },
-                |w| describe(w.hwnd),
-            )
+            let window = windows
+                .iter()
+                .find(|w| w.active)
+                .or_else(|| windows.first())
+                .ok_or_else(|| core::surface_gone(app_name))?;
+            describe(window.hwnd)
         }
+        TargetSpec::Window { app_name, key, .. } => resolve_key(app_name, key),
     }
+}
+
+/// Resolve a stored window key to exactly the window it names, or refuse.
+///
+/// The key carries the window's own handle and the pid that owned it, so a moved,
+/// resized or renamed window keeps resolving while a closed or replaced one does
+/// not. There is no fallback: a title match or another window of the application
+/// would be a different surface than the caller named.
+fn resolve_key(app_name: &str, key: &WindowKey) -> anyhow::Result<TargetWindow> {
+    let Some((pid, hwnd)) = parse_key(key) else {
+        return Err(core::surface_gone(app_name));
+    };
+    let alive =
+        // SAFETY: `hwnd` is a plain handle value from the key; the call only tests it.
+        unsafe { IsWindow(Some(hwnd)) }.as_bool() && pid_of(hwnd) == pid;
+    if !alive {
+        return Err(core::surface_gone(app_name));
+    }
+    describe(hwnd)
+}
+
+/// The identity a [`WindowKey`] carries (`hwnd:<pid>:<handle>`), and the one place
+/// it is spelled. The handle alone is normally unique, but Windows may recycle one
+/// after its window closes: the pid is the guard, and a recycled handle re-creating
+/// the same pid+handle pair while a stale key is held is not addressable here.
+fn window_key(hwnd: HWND, pid: u32) -> WindowKey {
+    WindowKey::new(format!("hwnd:{pid}:{}", hwnd.0 as usize))
+}
+
+/// Split a [`WindowKey`] back into its owning pid and handle. `None` when the text
+/// is not one this backend produced.
+fn parse_key(key: &WindowKey) -> Option<(u32, HWND)> {
+    let (pid, hwnd) = key.as_str().strip_prefix("hwnd:")?.split_once(':')?;
+    let hwnd = hwnd.parse::<usize>().ok()?;
+    Some((pid.parse().ok()?, HWND(hwnd as *mut std::ffi::c_void)))
 }
 
 /// Window geometry for a target: the window's own frame, or the virtual-desktop
@@ -181,15 +194,6 @@ pub(super) fn top_level_at(x: i32, y: i32) -> Option<HWND> {
     Some(if root.0.is_null() { hwnd } else { root })
 }
 
-/// The window under the pointer, for input that lands wherever the cursor is.
-pub(super) fn pointer_window() -> Option<HWND> {
-    let mut point = POINT::default();
-    // SAFETY: `point` is a live local of exactly the type the call fills; a failure
-    // (no attached desktop) becomes `None` through `.ok()?`.
-    unsafe { GetCursorPos(&raw mut point) }.ok()?;
-    top_level_at(point.x, point.y)
-}
-
 /// The window that has focus: where a key chord and synthetic typing go.
 pub(super) fn foreground() -> Option<HWND> {
     // SAFETY: no arguments and no out-pointer; a null handle is filtered out below.
@@ -197,25 +201,25 @@ pub(super) fn foreground() -> Option<HWND> {
     (!hwnd.0.is_null()).then_some(hwnd)
 }
 
-/// Refuse input aimed at a window that is not in front: typing or a fallback
-/// click would land in whatever is. Windows may refuse the foreground change this
+/// Refuse input aimed at a window that is not in front: typing, a drag or a wheel at
+/// a point would land in whatever is. Windows may refuse the foreground change this
 /// follows (a background process), and then the honest answer is to click first.
 pub(super) fn ensure_foreground(hwnd: HWND) -> anyhow::Result<()> {
     // SAFETY: no arguments; the handle is only compared, never dereferenced.
     if unsafe { GetForegroundWindow() } == hwnd {
         return Ok(());
     }
-    Err(core::taxonomy_error(
-        core::ERR_DEGRADED,
-        "could not bring the window to the foreground (Windows refuses a foreground change from a \
-         background process) — click the window first, then repeat the action",
-    ))
+    let title = title_of(hwnd);
+    Err(core::not_brought_forward(core::window_description(
+        &app_name(pid_of(hwnd), &title),
+        &title,
+    )))
 }
 
 /// Bring a window to the foreground before input aimed at it. Best-effort: Windows
-/// may refuse foreground changes for a background process. Callers that then send
-/// input to the focused window or to an element's own point verify with
-/// [`ensure_foreground`]; a pointer action on an explicit coordinate does not need to.
+/// may refuse foreground changes for a background process. Every pinned action —
+/// typing, a drag, a wheel at a point — then verifies with [`ensure_foreground`] and
+/// fails honestly; a coordinate click is deliberately unpinned and only raises.
 pub(super) fn activate(hwnd: HWND) {
     // SAFETY: no arguments; the handle is only compared, never dereferenced.
     if unsafe { GetForegroundWindow() } == hwnd {
@@ -258,10 +262,10 @@ pub(super) fn ensure_actuation_allowed(hwnd: Option<HWND>) -> anyhow::Result<()>
     let title = title_of(hwnd);
     let app = process_name(pid).unwrap_or_else(|| format!("pid {pid}"));
     Err(core::permission_denied(format!(
-        "window \"{title}\" belongs to {app} (pid {pid}), which runs elevated — this non-elevated \
-         process cannot send it input or drive its accessibility elements (Windows blocks both); \
-         a capture of the window may still work — ask the owner to run that application without \
-         elevation"
+        "{} belongs to {app} (pid {pid}), which runs elevated — this non-elevated process cannot \
+         send it input or drive its accessibility elements (Windows blocks both); a capture of \
+         the window may still work — ask the owner to run that application without elevation",
+        core::window_description("", &title)
     )))
 }
 
@@ -282,11 +286,12 @@ pub(super) fn ensure_not_own_window(hwnd: HWND) -> anyhow::Result<()> {
     Err(core::taxonomy_error(
         core::ERR_SELF_TARGET,
         format!(
-            "window \"{title}\" belongs to mahbot itself: this process cannot drive its own \
-             accessibility elements safely, because a same-process element action is answered \
-             in-process and there is no way onto the interface thread — it could freeze the \
-             dashboard or kill the service, so it is refused instead. Our windows stay listed, \
-             readable and capturable, and coordinate input still reaches them"
+            "{} belongs to mahbot itself: this process cannot drive its own accessibility elements \
+             safely, because a same-process element action is answered in-process and there is no \
+             way onto the interface thread — it could freeze the dashboard or kill the service, so \
+             it is refused instead. Our windows stay listed, readable and capturable, and \
+             coordinate input still reaches them",
+            core::window_description("", &title)
         ),
     ))
 }
@@ -385,7 +390,6 @@ struct Enumerated {
     pid: u32,
     app_name: String,
     title: String,
-    index: usize,
     active: bool,
     surface: Option<SurfaceGeometry>,
 }
@@ -425,7 +429,7 @@ pub(super) fn list_windows(app: Option<&AppInfo>) -> Vec<WindowInfo> {
                 app_pid: Some(win.pid),
                 app_name: win.app_name,
                 title: win.title,
-                index: win.index,
+                key: window_key(win.hwnd, win.pid),
                 surface: win.surface?,
             })
         })
@@ -445,33 +449,20 @@ pub(super) fn focused_window() -> anyhow::Result<WindowInfo> {
         ));
     }
     let resolved = describe(hwnd)?;
-    // The index is the one the listing assigned to this window. It is normally there —
-    // an untitled foreground window is put back into the listing when the filter would
-    // hide it — but an invisible or cloaked one is excluded on purpose, and falling
-    // back to 0 would name a DIFFERENT window of the same application.
-    let index = app_windows(Some(resolved.pid), &resolved.app_name)
-        .iter()
-        .find(|w| w.hwnd == hwnd)
-        .map(|w| w.index)
-        .ok_or_else(|| {
-            core::taxonomy_error(
-                core::ERR_NOT_MATCHED,
-                "the foreground window is not in the window listing (it is hidden or cloaked) — \
-                 enumerate apps/windows and pick a surface",
-            )
-        })?;
+    // The key is the handle itself, so a foreground window outside the filtered
+    // listing (a tool palette, an untitled surface) needs no position in it to be
+    // addressable later.
     Ok(WindowInfo {
         app_pid: Some(resolved.pid),
         app_name: resolved.app_name,
         title: resolved.title,
-        index,
+        key: window_key(hwnd, resolved.pid),
         surface: resolved.surface,
     })
 }
 
 /// One application's top-level windows (by pid when known, else by name), in
-/// front-to-back order. The order and the index are the ones [`top_level_windows`]
-/// assigned, so a stored `wN` resolves to the window the `windows` listing showed.
+/// front-to-back order.
 fn app_windows(pid: Option<u32>, app_name: &str) -> Vec<Enumerated> {
     top_level_windows()
         .into_iter()
@@ -512,29 +503,16 @@ fn top_level_windows() -> Vec<Enumerated> {
         .collect();
     // The foreground window joins the list even when the filter above hides it (a tool
     // palette, an untitled surface): `observe` pins the focused surface, and the
-    // `windows` listing and `resolve` must share ONE index space — this pass is the
-    // only place that space is assigned.
+    // listing should name the surface the agent is looking at.
     if foreground_joins_listing(&windows, foreground) {
         windows.insert(0, enumerate(foreground, foreground));
-    }
-    // Indexes are per application — (pid, name), because one frame-host process
-    // serves several apps — even in the unfiltered listing, so a stored target keeps
-    // meaning the same window when a title later changes.
-    let mut next_index: std::collections::HashMap<(u32, String), usize> =
-        std::collections::HashMap::new();
-    for window in &mut windows {
-        let next = next_index
-            .entry((window.pid, window.app_name.clone()))
-            .or_default();
-        window.index = *next;
-        *next += 1;
     }
     windows
 }
 
 /// Whether the foreground window is a surface the filter above hid but the listing
-/// must still carry: it is what `observe` pins and what `resolve` has to find again.
-/// Invisible and cloaked windows stay out — they can have no pixels.
+/// must still carry: it is what `observe` pins. Invisible and cloaked windows stay
+/// out — they can have no pixels.
 fn foreground_joins_listing(windows: &[Enumerated], foreground: HWND) -> bool {
     if foreground.0.is_null() || windows.iter().any(|win| win.hwnd == foreground) {
         return false;
@@ -552,7 +530,6 @@ fn enumerate(hwnd: HWND, foreground: HWND) -> Enumerated {
         pid,
         app_name: app_name(pid, &title),
         title,
-        index: 0,
         active: hwnd == foreground,
         surface: surface_of(hwnd).ok(),
     }
@@ -561,9 +538,9 @@ fn enumerate(hwnd: HWND, foreground: HWND) -> Enumerated {
 /// An application's display name. UWP and WinUI apps are hosted by
 /// `ApplicationFrameHost.exe`, one process for several apps, so the window's own
 /// title is the app there — the exe stem would merge them into one. Consequence: a
-/// frame-hosted app whose title changes after enumeration makes its stored `a`/`w`
-/// target stale, and re-enumerating is the fix (ordinary apps are named by their
-/// executable and are unaffected).
+/// frame-hosted app whose title changes after enumeration makes its stored `a`
+/// target stale (a `w` target keeps the window's own handle and is unaffected), and
+/// re-enumerating is the fix — ordinary apps are named by their executable.
 fn app_name(pid: u32, title: &str) -> String {
     match process_name(pid) {
         Some(stem) if stem.eq_ignore_ascii_case("ApplicationFrameHost") && !title.is_empty() => {
@@ -665,20 +642,14 @@ fn geometry(rect: RECT) -> SurfaceGeometry {
 /// frame sits off-screen and its capture is black, so every action on it would be
 /// a lie.
 fn describe(hwnd: HWND) -> anyhow::Result<TargetWindow> {
-    // SAFETY: one handle argument and no out-pointer; a handle that vanished since
-    // resolution answers FALSE, which reads as "not minimized".
-    if unsafe { IsIconic(hwnd) }.as_bool() {
-        return Err(core::taxonomy_error(
-            core::ERR_DEGRADED,
-            format!(
-                "window \"{}\" is minimized — restore it first; a minimized window has no visible \
-                 frame to act on or capture",
-                title_of(hwnd)
-            ),
-        ));
-    }
     let pid = pid_of(hwnd);
     let title = title_of(hwnd);
+    // A handle that vanished since resolution answers FALSE, which reads as "not
+    // minimized".
+    // SAFETY: one handle argument and no out-pointer.
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return Err(core::minimized_window(&title));
+    }
     Ok(TargetWindow {
         hwnd,
         pid,

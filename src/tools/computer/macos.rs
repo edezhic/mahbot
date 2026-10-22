@@ -29,6 +29,28 @@
 //! type it is read as ([`typed_members`]) instead of being cast wholesale, and a
 //! capture size is validated before it reaches the capture framework.
 //!
+//! # Surfaces and identity
+//!
+//! A window target carries the identity this backend gave it when it was
+//! enumerated — a retained AX window element ([`HELD_WINDOWS`]) — so a stored id
+//! resolves to that very window, live: a moved, resized or renamed window keeps
+//! working, and a closed or replaced one fails as `surface-gone` instead of
+//! becoming another window of the same application. An app target names no
+//! window: it is the application's own focused window, re-resolved per call.
+//!
+//! Stills of a window are matched to ScreenCaptureKit's list by owning process and
+//! frame (`find_sc_window`), never by title alone or by position, and a minimized
+//! window is refused wherever its frame would be reported or used — capture,
+//! observe and coordinate mapping. The `screen` target is composited at the densest
+//! attached display's scale, so a mixed-density arrangement yields one faithful
+//! image.
+//!
+//! Input pinned to a window — typed text, a drag, a wheel at a point — is raised
+//! and then verified to be the window the server would deliver to
+//! ([`ensure_window_receives`]); when it could not be brought forward the call
+//! fails with nothing sent. Keyboard chords, a wheel with no point and a coordinate
+//! click are global input and are described as such.
+//!
 //! # Availability
 //!
 //! macOS 14 is the product's floor, and the ScreenCaptureKit still API
@@ -84,7 +106,7 @@
 
 use super::core::{
     self, AppInfo, Backend, Capture, ElementAct, Locator, Modifier, MouseButton, Observation,
-    RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, UiNode, WindowInfo,
+    RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, UiNode, WindowInfo, WindowKey,
 };
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::anyhow;
@@ -114,8 +136,9 @@ use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
     SCStreamErrorCode, SCWindow,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 pub(crate) static MACOS_BACKEND: MacOsBackend = MacOsBackend;
@@ -192,6 +215,7 @@ const AX_FOCUSED: &str = "AXFocused";
 const AX_PRESS: &str = "AXPress";
 const AX_OPEN: &str = "AXOpen";
 const AX_RAISE: &str = "AXRaise";
+const AX_MINIMIZED: &str = "AXMinimized";
 
 #[inline]
 fn axc(s: &'static str) -> CFRetained<CFString> {
@@ -785,11 +809,15 @@ fn build_tree(root: &AXUIElement, origin: (f64, f64)) -> (UiNode, Vec<CFRetained
 
 fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
     let (window, app) = resolve_window(target)?;
+    // The header reports the window's frame, and a minimized window's is the one it
+    // had before it was minimized: refuse rather than describe a surface that is not
+    // on screen.
+    refuse_minimized(&window)?;
     let origin = window_origin(&window)?;
     let surface = window_frame(&window)?;
-    let app_name = match target {
-        TargetSpec::Window { app_name, .. } => app_name.clone(),
-        _ => attribute_string(&app, &axc(AX_TITLE)).unwrap_or_default(),
+    let app_name = match target.app() {
+        Some((_, name)) => name.to_string(),
+        None => app_display_name(app_pid(&app)?, &app),
     };
     let (root, _handles) = build_tree(&window, origin);
     Ok(Observation {
@@ -798,6 +826,125 @@ fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
         surface,
         root,
     })
+}
+
+// ── Window identity ─────────────────────────────────────────────────────
+
+/// A retained AX window element, addressed by the token that names it in the
+/// target registry. The element itself is the identity: it answers with the
+/// window's live title, frame and process, so nothing here has to re-find a
+/// window by title or by its place in an enumeration. The owner is the agent
+/// that enumerated it, so the cap can drop one agent's handles only.
+struct HeldWindow {
+    element: CFRetained<AXUIElement>,
+    owner: String,
+}
+
+// SAFETY: an AX exchange is not thread-safe, so an element is only ever used on
+// the thread that owns it — the tool serializes every call through one action
+// lock, and exchanges aimed at our own windows run on the main queue under a
+// bounded wait. The wrapper makes the map a static; it does not make concurrent
+// AX calls safe, and none are performed.
+unsafe impl Send for HeldWindow {}
+
+/// Held windows by token. Ordered by token, so the first entry is the oldest.
+static HELD_WINDOWS: LazyLock<Mutex<BTreeMap<u64, HeldWindow>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+static NEXT_WINDOW_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Cap on windows retained per owning agent — the same number the target registry
+/// keeps ([`core::MAX_STORED_TARGETS`]) — so a live id always has a handle to
+/// resolve through. Beyond it that agent's oldest are dropped; an id whose token
+/// went with them reads as a window that can no longer be identified, which is an
+/// honest error rather than a wrong window.
+const MAX_HELD_WINDOWS: usize = core::MAX_STORED_TARGETS;
+
+/// The identity of `window`: the token it already holds, else a fresh one.
+/// `CFEqual` compares accessibility elements by the object they address, so the
+/// same window is recognised across enumerations even though every enumeration
+/// hands back a new element reference. Tokens are per agent, so one agent's cleanup
+/// can never drop a handle another agent's id resolves through. An element id an
+/// application recycles after its window closed is the one case this cannot tell
+/// apart; catching it would need a liveness probe per held window on every listing.
+///
+/// `owner` is read by the caller — never inside an exchange routed to the main
+/// queue, where this thread's task-locals are absent.
+fn window_key(window: &AXUIElement, owner: &str) -> WindowKey {
+    let mut held = HELD_WINDOWS.lock().unwrap_poison();
+    let known = held
+        .iter()
+        .find(|(_, existing)| existing.owner == owner && &*existing.element == window)
+        .map(|(token, _)| *token);
+    let token = if let Some(token) = known {
+        token
+    } else {
+        let token = NEXT_WINDOW_TOKEN.fetch_add(1, Ordering::Relaxed);
+        held.insert(
+            token,
+            HeldWindow {
+                element: window.retain(),
+                owner: owner.to_string(),
+            },
+        );
+        // Tokens increase monotonically, so the owner's first tokens are its
+        // oldest. Collected first: removing while iterating would hold a borrow.
+        let mine: Vec<u64> = held
+            .iter()
+            .filter(|(_, entry)| entry.owner == owner)
+            .map(|(token, _)| *token)
+            .collect();
+        for token in mine
+            .iter()
+            .take(mine.len().saturating_sub(MAX_HELD_WINDOWS))
+        {
+            held.remove(token);
+        }
+        token
+    };
+    WindowKey::new(format!("ax:{token}"))
+}
+
+/// The window a stored key names, refusing rather than substituting another one.
+/// A token that no longer resolves, or an element whose window is gone, is
+/// `surface-gone`: the call is about a window this process can no longer
+/// identify.
+fn window_by_key(
+    key: &WindowKey,
+    app_name: &str,
+) -> Result<CFRetained<AXUIElement>, anyhow::Error> {
+    let token = key
+        .as_str()
+        .strip_prefix("ax:")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .ok_or_else(|| core::surface_gone(app_name))?;
+    let window = {
+        let held = HELD_WINDOWS.lock().unwrap_poison();
+        held.get(&token)
+            .map(|held| held.element.retain())
+            .ok_or_else(|| core::surface_gone(app_name))?
+    };
+    // A retained element outlives its window: reading it is what tells the two
+    // apart, and a closed window answers with an error.
+    attribute_string(&window, &axc(AX_ROLE)).ok_or_else(|| core::surface_gone(app_name))?;
+    Ok(window)
+}
+
+/// Drop every window `agent` holds: its ids are gone with its registry entries.
+pub(crate) fn forget_agent_windows(agent: &str) {
+    let mut held = HELD_WINDOWS.lock().unwrap_poison();
+    held.retain(|_, entry| entry.owner != agent);
+}
+
+/// Refuse a minimized window: it has no visible pixels, and its frame is the one
+/// it had before it was minimized.
+fn refuse_minimized(window: &AXUIElement) -> Result<(), anyhow::Error> {
+    if !attribute_bool(window, &axc(AX_MINIMIZED)).unwrap_or(false) {
+        return Ok(());
+    }
+    Err(core::minimized_window(
+        &window_title(window).unwrap_or_default(),
+    ))
 }
 
 // ── Window resolution ────────────────────────────────────────────────────
@@ -860,9 +1007,7 @@ fn app_display_name(pid: u32, app: &AXUIElement) -> String {
 fn app_element(pid: Option<u32>, name: &str) -> Result<CFRetained<AXUIElement>, anyhow::Error> {
     let pid = match pid {
         Some(p) => p,
-        None => running_app_pid(name).ok_or_else(|| {
-            anyhow!("could not resolve running application '{name}' to a process id")
-        })?,
+        None => running_app_pid(name).ok_or_else(|| core::surface_gone(name))?,
     };
     // SAFETY: `pid` is a running app (or stale); AXUIElementCreateApplication
     // always returns a non-null element — attribute reads surface InvalidUIElement.
@@ -878,18 +1023,20 @@ fn read_windows(app: &AXUIElement) -> Result<Vec<CFRetained<AXUIElement>>, anyho
     Ok(typed_members::<AXUIElement>(&array))
 }
 
-/// One application's listed windows: the AX window array plus each window's frame
-/// and title. A window with neither is not a surface and is dropped.
+/// One application's listed windows: the AX window array plus each window's frame,
+/// title and identity. A window with neither a title nor a frame is not a surface
+/// and is dropped.
 ///
 /// The listing is the one path that knows the target process without resolving a
-/// `TargetSpec`, so it calls [`on_ax_thread`] itself with the app's pid.
-fn windows_of_app(pid: u32, app_name: &str) -> Result<Vec<WindowInfo>, anyhow::Error> {
+/// `TargetSpec`, so it calls [`on_ax_thread`] itself with the app's pid. `owner` is
+/// the enumerating agent's key, read before the exchange for the same reason.
+fn windows_of_app(pid: u32, app_name: &str, owner: &str) -> Result<Vec<WindowInfo>, anyhow::Error> {
     // SAFETY: `pid` is a running app (or stale); AXUIElementCreateApplication
     // always returns a non-null element — attribute reads surface InvalidUIElement.
     let app = unsafe { AXUIElement::new_application(pid as libc::pid_t) };
     let windows = read_windows(&app)?;
     let mut out = Vec::new();
-    for (index, window) in windows.iter().enumerate() {
+    for window in &windows {
         let Ok(frame) = window_frame(window) else {
             continue;
         };
@@ -901,52 +1048,11 @@ fn windows_of_app(pid: u32, app_name: &str) -> Result<Vec<WindowInfo>, anyhow::E
             app_pid: Some(pid),
             app_name: app_name.to_string(),
             title,
-            index,
+            key: window_key(window, owner),
             surface: frame,
         });
     }
     Ok(out)
-}
-
-fn resolve_window_in_app(
-    app: &AXUIElement,
-    title: &str,
-    index: usize,
-) -> Result<CFRetained<AXUIElement>, anyhow::Error> {
-    // App-level target (empty title, index 0) resolves the app's focused window
-    // at ACT time via kAXFocusedWindowAttribute first; only if that is
-    // unavailable does it fall back to the first window in the AXWindows array.
-    // This is deliberately re-resolved per action, so a ref observed against an
-    // app-level target follows the currently focused window. A locator mismatch
-    // inside the so-resolved window then degrades to not-matched (a safe error),
-    // never to a wrong-window action.
-    if title.is_empty()
-        && index == 0
-        && let Some(w) = focused_window_of_app(app)
-    {
-        return Ok(w);
-    }
-    let windows = read_windows(app)?;
-    if windows.is_empty() {
-        return Err(core::taxonomy_error(
-            core::ERR_NOT_MATCHED,
-            "no windows found for this app — re-enumerate windows",
-        ));
-    }
-    if !title.is_empty()
-        && let Some(w) = windows
-            .iter()
-            .find(|w| attribute_string(w, &axc(AX_TITLE)).as_deref() == Some(title))
-    {
-        return Ok(w.retain());
-    }
-    if index < windows.len() {
-        return Ok(windows[index].retain());
-    }
-    Err(core::taxonomy_error(
-        core::ERR_NOT_MATCHED,
-        format!("window '{title}' (index {index}) not found — re-enumerate windows"),
-    ))
 }
 
 /// Resolve a target to its AX window and application element.
@@ -975,15 +1081,31 @@ fn resolve_window(
             })?;
             Ok((window, app))
         }
+        TargetSpec::App {
+            app_pid: pinned,
+            app_name,
+        } => {
+            // An a-id names the application's own focused window and is
+            // deliberately re-resolved per call, so it follows that window.
+            let app = app_element(*pinned, app_name)?;
+            let pid = app_pid(&app)?;
+            ensure_ax_thread(pid)?;
+            let window = focused_window_of_app(&app)
+                .or_else(|| read_windows(&app).ok()?.into_iter().next())
+                .ok_or_else(|| core::surface_gone(app_name))?;
+            Ok((window, app))
+        }
         TargetSpec::Window {
             app_pid: pinned,
             app_name,
-            title,
-            index,
+            key,
+            ..
         } => {
+            // A w-id names one window: the key resolves that window or fails,
+            // never another one of the same application.
             let app = app_element(*pinned, app_name)?;
             ensure_ax_thread(app_pid(&app)?)?;
-            Ok((resolve_window_in_app(&app, title, *index)?, app))
+            Ok((window_by_key(key, app_name)?, app))
         }
         TargetSpec::Screen => Err(core::taxonomy_error(
             core::ERR_UNSUPPORTED,
@@ -1387,7 +1509,11 @@ fn surface_geometry_blocking(target: &TargetSpec) -> Result<SurfaceGeometry, any
     if matches!(target, TargetSpec::Screen) {
         return screen_surface();
     }
-    window_frame(&resolve_window(target)?.0)
+    // Coordinate input maps normalized points through this frame, so a
+    // pre-minimization frame must be refused here too.
+    let (window, _app) = resolve_window(target)?;
+    refuse_minimized(&window)?;
+    window_frame(&window)
 }
 
 /// [`surface_geometry_blocking`] with the grant gate hoisted and the read routed
@@ -1399,22 +1525,10 @@ fn surface_geometry_routed(target: &TargetSpec) -> Result<SurfaceGeometry, anyho
     with_target(target, surface_geometry_blocking)
 }
 
-/// Raise a window target so raw input aimed at it lands there. Best-effort: no
-/// focused window (e.g. desktop frontmost) is fine for key chords/typing — the
-/// geometry is only required by the point-based actions. Returns whether a raise
-/// was actually performed, so the caller can let it settle off the main thread.
-fn activate_window(target: &TargetSpec) -> Result<bool, anyhow::Error> {
-    let (TargetSpec::Focused | TargetSpec::Window { .. }) = target else {
-        return Ok(false);
-    };
-    let (window, _app) = match resolve_window(target) {
-        Ok(resolved) => resolved,
-        // Nothing to raise, but the main-thread marker must reach [`with_target`].
-        Err(e) if !is_ax_thread(&e) => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    // Best-effort by design: an unusable answer only skips the raise.
-    let Some(names) = raw_action_names(&window).ok().flatten() else {
+/// Raise a window so input aimed at it lands there; `false` when it exposes no
+/// usable raise action.
+fn raise_window(window: &AXUIElement) -> Result<bool, anyhow::Error> {
+    let Some(names) = raw_action_names(window).ok().flatten() else {
         return Ok(false);
     };
     if !names.iter().any(|a| a == AX_RAISE) {
@@ -1426,6 +1540,55 @@ fn activate_window(target: &TargetSpec) -> Result<bool, anyhow::Error> {
         return Err(ax_error(err, "raise window"));
     }
     Ok(true)
+}
+
+/// Best-effort raise for input that is not pinned to a window (a coordinate
+/// click, a wheel at a point on `screen`): a refusal is not a failure there,
+/// because the input is allowed to land wherever its point is. Returns whether a
+/// raise was performed, so the caller settles only when there is something to
+/// settle. Pinned input uses [`raise_window`] plus [`ensure_window_receives`]
+/// instead.
+fn activate_window(target: &TargetSpec) -> Result<bool, anyhow::Error> {
+    let (TargetSpec::Focused | TargetSpec::App { .. } | TargetSpec::Window { .. }) = target else {
+        return Ok(false);
+    };
+    let (window, _app) = match resolve_window(target) {
+        Ok(resolved) => resolved,
+        // Nothing to raise, but the main-thread marker must reach [`with_target`].
+        Err(e) if !is_ax_thread(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    raise_window(&window)
+}
+
+/// Whether `window` is where the window server delivers input right now: its
+/// application is frontmost and the window is that application's focused one.
+fn window_receives_input(window: &AXUIElement) -> bool {
+    let Ok(app) = frontmost_app() else {
+        return false;
+    };
+    focused_window_of_app(&app).is_some_and(|focused| &*focused == window)
+}
+
+/// The verification half of pinned input: the window input was aimed at must be
+/// the one the window server would deliver to. A raise completes asynchronously,
+/// so the check is retried over the shared settle budget — the pauses run here, on
+/// the calling thread, and only each accessibility read is routed to the thread
+/// that answers it.
+fn ensure_window_receives(target: &TargetSpec) -> Result<(), anyhow::Error> {
+    for attempt in 0..=core::RAISE_SETTLE_STEPS {
+        if attempt > 0 {
+            sleep_millis(core::RAISE_SETTLE_MS);
+        }
+        let receives = with_target(target, |target| {
+            let (window, _app) = resolve_window(target)?;
+            Ok(window_receives_input(&window))
+        })?;
+        if receives {
+            return Ok(());
+        }
+    }
+    Err(core::not_brought_forward(target.describe()))
 }
 
 /// Reject an argument mistake before any grant is requested: a call that can
@@ -1446,10 +1609,19 @@ fn check_input_arguments(input: &RawInput) -> Result<(), anyhow::Error> {
 }
 
 fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyhow::Error> {
-    // The 80 ms settle after a raise runs here, on the worker: only the raise
-    // itself needs the target's own thread.
-    if with_target(target, activate_window)? {
-        sleep_millis(80);
+    let pinned = core::pinned_input(target, input);
+    // A chord goes to whatever already has focus, so nothing is raised for it.
+    let raises = !matches!(input, RawInput::KeyChord { .. });
+    if pinned {
+        with_target(target, |target| {
+            let (window, _app) = resolve_window(target)?;
+            raise_window(&window).map(|_| ())
+        })?;
+        with_target(target, ensure_window_receives)?;
+    } else if raises && with_target(target, activate_window)? {
+        // Unpinned input has no delivery to verify, so a best-effort raise gets the
+        // same settle budget before the event is posted.
+        sleep_millis((core::RAISE_SETTLE_STEPS as u64) * core::RAISE_SETTLE_MS);
     }
     match input {
         RawInput::Click {
@@ -1584,8 +1756,12 @@ fn get_shareable_content() -> Result<Retained<SCShareableContent>, anyhow::Error
     // SAFETY: `block` is a live stack block; the framework copies it for the
     // asynchronous call, and the wait below keeps the original alive until the
     // handler has run.
+    //
+    // Off-screen windows are included on purpose: a window on another Space, behind
+    // another app or minimized is still the surface a call may name, and excluding
+    // it made the capture path report a missing window as "re-enumerate".
     unsafe {
-        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(false, true, &block);
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(false, false, &block);
     }
     sc_wait::<SendShareable>(&slot, &semaphore, "shareable content").map(|SendShareable(c)| c)
 }
@@ -1708,42 +1884,94 @@ fn capture_image_to_rgba(image: &CGImage) -> Result<Capture, anyhow::Error> {
     })
 }
 
+/// The ScreenCaptureKit window a target's AX window is matched to, or a refusal:
+/// the two are tied together by owning process and frame, never by the order of a
+/// list or a title alone.
 fn find_sc_window(
     content: &SCShareableContent,
     pid: u32,
     title: Option<&str>,
     frame: SurfaceGeometry,
-) -> Option<Retained<SCWindow>> {
-    // SAFETY: SCK getter methods are ObjC messages against live objects.
-    unsafe { content.windows() }.iter().find(|window| {
-        // SAFETY: ObjC message against a live SCWindow/SCRunningApplication.
-        let owner = unsafe { window.owningApplication() };
-        let owner_pid = owner.as_ref().map(|a| unsafe { a.processID() } as u32);
-        if owner_pid != Some(pid) {
-            return false;
-        }
-        if let Some(t) = title {
-            // SAFETY: ObjC message against a live SCWindow.
-            if unsafe { window.title() }.map(|s| s.to_string()).as_deref() == Some(t) {
-                return true;
-            }
-        }
-        // Fall back to frame proximity when the title didn't match.
+) -> Result<Retained<SCWindow>, anyhow::Error> {
+    let near = |window: &SCWindow| {
         // SAFETY: ObjC message against a live SCWindow.
         let f = unsafe { window.frame() };
         (f.origin.x - frame.x).abs() < 2.0
             && (f.origin.y - frame.y).abs() < 2.0
             && (f.size.width - frame.width).abs() < 2.0
             && (f.size.height - frame.height).abs() < 2.0
-    })
+    };
+    let titled = |windows: &[Retained<SCWindow>], title: &str| {
+        windows
+            .iter()
+            .filter(|window| {
+                // SAFETY: ObjC message against a live SCWindow.
+                unsafe { window.title() }.map(|s| s.to_string()).as_deref() == Some(title)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // SAFETY: each call below is an ObjC message against a live object.
+    let of_app = unsafe { content.windows() }
+        .iter()
+        .filter(|window| {
+            let owner = unsafe { window.owningApplication() };
+            owner.as_ref().map(|a| unsafe { a.processID() } as u32) == Some(pid)
+        })
+        .collect::<Vec<_>>();
+    let of_frame = of_app
+        .iter()
+        .filter(|window| near(window))
+        .cloned()
+        .collect::<Vec<_>>();
+    // The frame is the window's own truth; a title only breaks a tie, and a tie
+    // that survives it means the two cannot be told apart — refusing beats
+    // capturing the wrong one. With no frame match the frameworks merely disagree
+    // about geometry, so a unique exact title in the same process still names the
+    // window honestly.
+    let matching = match title.filter(|t| !t.is_empty()) {
+        Some(title) if !of_frame.is_empty() => {
+            let by_title = titled(&of_frame, title);
+            if by_title.is_empty() {
+                of_frame
+            } else {
+                by_title
+            }
+        }
+        Some(title) => titled(&of_app, title),
+        None => of_frame,
+    };
+    match matching.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => Err(core::taxonomy_error(
+            core::ERR_SURFACE_GONE,
+            format!(
+                "{} this target names is not in the capture list — it closed, or the capture \
+                 facility does not expose it; enumerate windows again to pick a surface",
+                core::window_description("", title.unwrap_or_default())
+            ),
+        )),
+        many => Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "{} windows of the same application match this target's title or frame, so the \
+                 capture cannot tell which one to shoot — move or resize one of them, or \
+                 screenshot the screen instead",
+                many.len()
+            ),
+        )),
+    }
 }
 
 /// The AX half of a window still: which process owns the window, its title and
-/// its frame — the facts ScreenCaptureKit is then matched against.
+/// its frame — the facts ScreenCaptureKit is then matched against. A minimized
+/// window is refused here: it has no visible pixels, and its frame is the one it
+/// had before it was minimized.
 fn window_capture_facts(
     target: &TargetSpec,
 ) -> Result<(u32, Option<String>, SurfaceGeometry), anyhow::Error> {
     let (window, app) = resolve_window(target)?;
+    refuse_minimized(&window)?;
     Ok((
         app_pid(&app)?,
         window_title(&window),
@@ -1756,12 +1984,7 @@ fn capture_window_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error
     // for pixels; only that half belongs on the AX thread, never the capture.
     let (pid, title, frame) = with_target(target, window_capture_facts)?;
     let content = get_shareable_content()?;
-    let sc_window = find_sc_window(&content, pid, title.as_deref(), frame).ok_or_else(|| {
-        core::taxonomy_error(
-            core::ERR_NOT_MATCHED,
-            "window not found in shareable content — re-enumerate windows",
-        )
-    })?;
+    let sc_window = find_sc_window(&content, pid, title.as_deref(), frame)?;
     // SAFETY: `alloc()` is the fresh allocation consumed by the init.
     let filter = unsafe {
         SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &sc_window)
@@ -1773,12 +1996,13 @@ fn capture_window_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error
 }
 
 /// Composite each active display into one RGBA buffer at the virtual-desktop
-/// bounding rect, each display drawn at its global-frame offset. Each display is
-/// captured and placed at ITS OWN pixel scale, so a mixed-density setup renders
-/// each screen at its native density; when densities differ the composite is
-/// sized at the first display's reference scale and a lower-density display
-/// occupies a proportionally smaller region of the buffer (an accepted residual
-/// limitation of a single-buffer composite).
+/// bounding rect, each display drawn at its global-frame offset.
+///
+/// One scale governs the whole buffer: the densest display's. Every display is
+/// captured AT that size — ScreenCaptureKit renders a filter's content at the size
+/// it is asked for — so a 1x display beside a 2x one lands at its logical offset ×
+/// that scale instead of covering half the buffer, and a mixed-density arrangement
+/// produces one faithful composite rather than a distorted one.
 fn capture_screen_blocking() -> Result<Capture, anyhow::Error> {
     let content = get_shareable_content()?;
     // SAFETY: SCK getter is an ObjC message against a live object.
@@ -1787,20 +2011,9 @@ fn capture_screen_blocking() -> Result<Capture, anyhow::Error> {
         anyhow::bail!("no shareable displays found");
     }
     let empty: Retained<NSArray<SCWindow>> = NSArray::new();
-    let first = displays.iter().next().expect("displays non-empty");
-    // SAFETY: `alloc()` is the fresh allocation consumed by the init.
-    let first_filter = unsafe {
-        SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &first, &empty)
-    };
-    let ref_scale = unsafe { first_filter.pointPixelScale() } as f64;
-    let bbox = screen_surface()?;
-    let out_w = (bbox.width * ref_scale).round() as usize;
-    let out_h = (bbox.height * ref_scale).round() as usize;
-    if out_w == 0 || out_h == 0 {
-        anyhow::bail!("virtual desktop has zero size");
-    }
-    let mut composite = vec![0u8; out_w * out_h * 4];
-    for display in displays {
+    let mut filters = Vec::with_capacity(displays.len());
+    let mut ref_scale: f64 = 0.0;
+    for display in &displays {
         // SAFETY: `alloc()` is the fresh allocation consumed by the init.
         let filter = unsafe {
             SCContentFilter::initWithDisplay_excludingWindows(
@@ -1811,12 +2024,47 @@ fn capture_screen_blocking() -> Result<Capture, anyhow::Error> {
         };
         // SAFETY: ObjC message against a live SCDisplay.
         let f = unsafe { display.frame() };
-        let scale = unsafe { filter.pointPixelScale() } as f64;
-        let px_w = (f.size.width * scale).round() as usize;
-        let px_h = (f.size.height * scale).round() as usize;
+        ref_scale = ref_scale.max(unsafe { filter.pointPixelScale() } as f64);
+        filters.push((
+            filter,
+            SurfaceGeometry {
+                x: f.origin.x,
+                y: f.origin.y,
+                width: f.size.width,
+                height: f.size.height,
+            },
+        ));
+    }
+    if ref_scale <= 0.0 {
+        anyhow::bail!("no display reported a usable pixel scale");
+    }
+    let bbox = screen_surface()?;
+    let out_w = (bbox.width * ref_scale).round() as usize;
+    let out_h = (bbox.height * ref_scale).round() as usize;
+    if out_w == 0 || out_h == 0 {
+        anyhow::bail!("virtual desktop has zero size");
+    }
+    let mut composite = vec![0u8; out_w * out_h * 4];
+    for (filter, frame) in filters {
+        let px_w = (frame.width * ref_scale).round() as usize;
+        let px_h = (frame.height * ref_scale).round() as usize;
         let cap = capture_filter_to_rgba(&filter, px_w, px_h, false)?;
-        let dx = ((f.origin.x - bbox.x) * scale).round();
-        let dy = ((f.origin.y - bbox.y) * scale).round();
+        // A display that comes back at another size cannot be placed at this
+        // scale, and blitting it would leave part of the buffer black without a
+        // word — refuse instead of composing a wrong image.
+        if (cap.width as usize, cap.height as usize) != (px_w, px_h) {
+            return Err(core::taxonomy_error(
+                core::ERR_DEGRADED,
+                format!(
+                    "a display asked for {px_w}x{px_h} pixels came back at {}x{}, so this \
+                     mixed-density arrangement cannot be composited faithfully — screenshot a \
+                     window instead, or capture with the display arrangement made uniform",
+                    cap.width, cap.height
+                ),
+            ));
+        }
+        let dx = ((frame.x - bbox.x) * ref_scale).round();
+        let dy = ((frame.y - bbox.y) * ref_scale).round();
         if dx >= 0.0 && dy >= 0.0 {
             core::blit_rgba(&mut composite, out_w, out_h, &cap, dx as usize, dy as usize);
         }
@@ -2019,14 +2267,16 @@ impl Backend for MacOsBackend {
                 v
             };
             let mut out = Vec::new();
+            let owner = core::agent_key();
             for ai in app_infos {
                 let Some(pid) = ai.pid else { continue };
                 let name = ai.name;
+                let owner = owner.clone();
                 // An app whose accessibility is unavailable is skipped, as
                 // before; the AX thread only makes our OWN window's reads
                 // possible at all. A listing of ONE app is the caller's whole
                 // request, so its failure is reported instead.
-                match on_ax_thread(pid, move || windows_of_app(pid, &name)) {
+                match on_ax_thread(pid, move || windows_of_app(pid, &name, &owner)) {
                     Ok(rows) => out.extend(rows),
                     // A single-app listing of our OWN window says why it is
                     // missing; every other failure keeps the old "answer what
@@ -2043,14 +2293,15 @@ impl Backend for MacOsBackend {
     async fn focused_window(&self) -> Result<WindowInfo, anyhow::Error> {
         with_platform("read the focused window", || {
             ensure(Grant::Accessibility)?;
-            with_target(&TargetSpec::Focused, |target| {
+            let owner = core::agent_key();
+            with_target(&TargetSpec::Focused, move |target| {
                 let (window, app) = resolve_window(target)?;
                 let pid = app_pid(&app)?;
                 Ok(WindowInfo {
                     app_pid: Some(pid),
                     app_name: app_display_name(pid, &app),
                     title: window_title(&window).unwrap_or_default(),
-                    index: 0,
+                    key: window_key(&window, &owner),
                     surface: window_frame(&window)?,
                 })
             })

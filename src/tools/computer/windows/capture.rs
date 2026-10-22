@@ -111,7 +111,7 @@ impl CaptureContext {
             return Ok(frame);
         }
         Err(no_frame_error(
-            &format!("window \"{}\"", resolved.title),
+            &core::window_description(&resolved.app_name, &resolved.title),
             &causes,
         ))
     }

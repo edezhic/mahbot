@@ -2,9 +2,12 @@
 //!
 //! `SendInput` is session-global: it delivers to whatever window has focus, so a
 //! window target is first brought to the foreground (best-effort — Windows may
-//! refuse a foreground change to a background process, and then a coordinate click
-//! is the honest way in). Coordinates are physical pixels throughout, matching the
-//! UIA tree and the capture.
+//! refuse a foreground change to a background process). Input that is pinned to a
+//! named window — typing, a drag, a wheel at a point — then verifies the window is
+//! actually in front and refuses rather than reporting a success that landed
+//! elsewhere; a coordinate click, a point-less wheel and a key chord are
+//! deliberately unpinned and go where the system sends them. Coordinates are
+//! physical pixels throughout, matching the UIA tree and the capture.
 //!
 //! Every batch is refused before it is sent when the secure desktop is up or the
 //! window belongs to an elevated process (see [`super::window`]), and a batch that
@@ -51,6 +54,7 @@ const KNOWN_KEYS: &str = "return/enter, tab, space, delete/backspace, forwarddel
 // ── Raw input ───────────────────────────────────────────────────────────
 
 pub(super) fn raw_input(target: &TargetSpec, input: RawInput) -> anyhow::Result<()> {
+    let pinned = core::pinned_input(target, &input);
     match input {
         RawInput::Click {
             point,
@@ -61,11 +65,8 @@ pub(super) fn raw_input(target: &TargetSpec, input: RawInput) -> anyhow::Result<
         RawInput::TypeText { text } => {
             let resolved = resolve_window(target)?;
             // Typing goes to whatever holds focus, so that is the window the refusal
-            // is about; a window target must actually be the focused one.
-            activate_target(&Aim::of(resolved.as_ref(), window::foreground))?;
-            if let Some(resolved) = &resolved {
-                window::ensure_foreground(resolved.hwnd)?;
-            }
+            // is about.
+            activate_target(&Aim::of(resolved.as_ref(), window::foreground), pinned)?;
             send(&type_events(&text))
         }
         RawInput::KeyChord { chord } => {
@@ -81,8 +82,8 @@ pub(super) fn raw_input(target: &TargetSpec, input: RawInput) -> anyhow::Result<
             point,
             direction,
             amount,
-        } => scroll(target, point, direction, amount),
-        RawInput::Drag { from, to } => drag(target, from, to),
+        } => scroll(target, point, direction, amount, pinned),
+        RawInput::Drag { from, to } => drag(target, from, to, pinned),
     }
 }
 
@@ -147,12 +148,20 @@ impl<'a> Aim<'a> {
     }
 }
 
-/// Check the two refusals before input, and raise a window target.
-fn activate_target(aim: &Aim<'_>) -> anyhow::Result<()> {
+/// Check the two refusals before input, and raise a window target. Pinned input —
+/// typed text, a drag, a wheel at a point on a named window — is meant for that very
+/// window, so a foreground change Windows refused fails the call here instead of
+/// reporting a success that would land in whatever is in front; unpinned input (a
+/// coordinate click, a point-less wheel) only raises, because it goes where the
+/// system sends it.
+fn activate_target(aim: &Aim<'_>, pinned: bool) -> anyhow::Result<()> {
     match aim {
         Aim::Window(resolved) => {
             window::ensure_actuation_allowed(Some(resolved.hwnd))?;
             window::activate(resolved.hwnd);
+            if pinned {
+                window::ensure_foreground(resolved.hwnd)?;
+            }
             Ok(())
         }
         Aim::Screen(landing) => window::ensure_actuation_allowed(*landing),
@@ -188,7 +197,12 @@ fn click(
     let geometry = surface_of(resolved.as_ref())?;
     let (x, y) = core::normalized_to_surface(point.0, point.1, &geometry)?;
     let (x, y) = (round_i32(x), round_i32(y));
-    activate_target(&Aim::of(resolved.as_ref(), || window::top_level_at(x, y)))?;
+    // A coordinate click is pointer input, never pinned: raise, but the click lands
+    // on whatever is under the point.
+    activate_target(
+        &Aim::of(resolved.as_ref(), || window::top_level_at(x, y)),
+        false,
+    )?;
     set_cursor(x, y)?;
     let (down, up) = match button {
         MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -210,6 +224,7 @@ fn scroll(
     point: Option<(f64, f64)>,
     direction: ScrollDirection,
     amount: u32,
+    pinned: bool,
 ) -> anyhow::Result<()> {
     let resolved = resolve_window(target)?;
     let at = match point {
@@ -220,12 +235,16 @@ fn scroll(
         }
         None => None,
     };
-    // A wheel notch goes to the window under the point, or under the pointer when the
-    // caller names no point. Both are the landing the refusal is about.
-    activate_target(&Aim::of(resolved.as_ref(), || match at {
-        Some((x, y)) => window::top_level_at(x, y),
-        None => window::pointer_window(),
-    }))?;
+    // The elevation refusal is about the window the wheel lands on: the one under the
+    // point. Only a `screen`-targeted wheel reaches this probe (a point-less wheel is
+    // dispatched to the focused surface, whose window the window arm checks), and that
+    // shape always carries a point.
+    activate_target(
+        &Aim::of(resolved.as_ref(), || {
+            at.and_then(|(x, y)| window::top_level_at(x, y))
+        }),
+        pinned,
+    )?;
     if let Some((x, y)) = at {
         set_cursor(x, y)?;
     }
@@ -245,16 +264,19 @@ fn scroll(
     send(&[mouse_event(0, 0, data, flags)])
 }
 
-fn drag(target: &TargetSpec, from: (f64, f64), to: (f64, f64)) -> anyhow::Result<()> {
+fn drag(target: &TargetSpec, from: (f64, f64), to: (f64, f64), pinned: bool) -> anyhow::Result<()> {
     let resolved = resolve_window(target)?;
     let geometry = surface_of(resolved.as_ref())?;
     let (fx, fy) = core::normalized_to_surface(from.0, from.1, &geometry)?;
     let (tx, ty) = core::normalized_to_surface(to.0, to.1, &geometry)?;
     // The gesture starts at `from`, so that is the landing a screen-target drag is
     // checked against — the same rule a click uses.
-    activate_target(&Aim::of(resolved.as_ref(), || {
-        window::top_level_at(round_i32(fx), round_i32(fy))
-    }))?;
+    activate_target(
+        &Aim::of(resolved.as_ref(), || {
+            window::top_level_at(round_i32(fx), round_i32(fy))
+        }),
+        pinned,
+    )?;
     set_cursor(round_i32(fx), round_i32(fy))?;
     send(&[mouse_event(0, 0, 0, MOUSEEVENTF_LEFTDOWN)])?;
     for step in 1..=DRAG_STEPS {

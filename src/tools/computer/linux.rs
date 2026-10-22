@@ -7,6 +7,18 @@
 //! mixed-DPI makes physical↔logical translation unreliable — this is precisely
 //! why the tool is accessibility-first here.
 //!
+//! A window's identity is its AT-SPI object reference (`unique bus name|object
+//! path`): a stored key resolves to that very window or fails, never to another
+//! window of the same application.
+//!
+//! A window still must show the window's current visible pixels, occluders
+//! included, which reading the window's own drawable would not — so a window
+//! still is a crop of the screen capture. AT-SPI extents live in the accessibility
+//! coordinate space, which need not be the capture's pixels: the crop is taken
+//! only after the two are reconciled by `core::a11y_scale`; on X11, whose extents
+//! are the root's own pixels, an unreconcilable pair falls back to 1:1, and on
+//! Wayland the still is refused instead.
+//!
 //! Mahbot's own window publishes no AT-SPI surface, so it never appears in an
 //! enumeration, has no element tree and no window still; screen-target input, key
 //! chords and typing still reach it. Nothing here needs to know which process owns
@@ -27,14 +39,16 @@
 
 use super::core::{
     self, AppInfo, Backend, Capture, ElementAct, Locator, Modifier, MouseButton, Observation,
-    RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, UiNode, WindowInfo,
+    RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, UiNode, WindowInfo, WindowKey,
 };
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::anyhow;
 use async_recursion::async_recursion;
 use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::proxy_ext::{Proxies, ProxyExt};
-use atspi::{AccessibilityConnection, CoordType, ObjectRefOwned, Role, State as AtspiState};
+use atspi::{
+    AccessibilityConnection, CoordType, ObjectRef, ObjectRefOwned, Role, State as AtspiState,
+};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use futures_util::StreamExt as _;
 use std::collections::HashMap;
@@ -101,7 +115,8 @@ impl LinuxBackend {
     }
 
     /// Screen-channel still: X11 full capture or the single portal attempt,
-    /// caching dims for zoom. Window captures crop out of this in `capture`.
+    /// caching dims for zoom. Window stills crop out of this in `capture`, through
+    /// [`window_still`] (which reconciles the accessibility and pixel spaces).
     async fn capture_screen_channel(&self) -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
         if wayland_env() {
             let cap = portal_screenshot().await?;
@@ -217,22 +232,32 @@ fn dbus_err(err: impl std::fmt::Display, ctx: &str) -> anyhow::Error {
     }
 }
 
+/// Identity of a window: its AT-SPI object reference, stable for as long as that
+/// window lives and never positional (`core::WindowKey`).
+fn window_key(object_ref: &ObjectRefOwned) -> WindowKey {
+    WindowKey::new(format!(
+        "{}|{}",
+        object_ref.name_as_str().unwrap_or_default(),
+        object_ref.path_as_str()
+    ))
+}
+
 // ── Registry / tree enumeration ──────────────────────────────────────────
 
 struct WindowHandle {
     object_ref: ObjectRefOwned,
+    key: WindowKey,
     surface: SurfaceGeometry,
     title: String,
     active: bool,
     focused: bool,
-    index: usize,
 }
 
 struct ResolvedWindow {
     object_ref: ObjectRefOwned,
+    key: WindowKey,
     app_info: AppInfo,
     title: String,
-    index: usize,
     surface: SurfaceGeometry,
 }
 
@@ -289,16 +314,14 @@ async fn resolve_app_object(
     let by_pid = apps
         .iter()
         .find(|(_, info)| app_pid.is_some() && info.pid == app_pid);
-    by_name.or(by_pid).map(|(r, _)| r.clone()).ok_or_else(|| {
-        core::taxonomy_error(
-            core::ERR_NOT_MATCHED,
-            format!("application '{app_name}' not found — enumerate apps first"),
-        )
-    })
+    by_name
+        .or(by_pid)
+        .map(|(r, _)| r.clone())
+        .ok_or_else(|| core::surface_gone(app_name))
 }
 
-/// The app's window-role children (Window/Frame/Dialog): global screen extents,
-/// title, active/focused state and filtered position index.
+/// The app's window-role children (Window/Frame/Dialog): identity key, global
+/// screen extents, title and active/focused state.
 async fn app_window_handles(
     app_ref: &ObjectRefOwned,
     conn: &AccessibilityConnection,
@@ -323,14 +346,13 @@ async fn app_window_handles(
         let Some(surface) = window_screen_extents(&ca).await else {
             continue;
         };
-        let index = out.len();
         out.push(WindowHandle {
+            key: window_key(&child),
             object_ref: child,
             surface,
             title,
             active: state.contains(AtspiState::Active),
             focused: state.contains(AtspiState::Focused),
-            index,
         });
     }
     out
@@ -348,38 +370,71 @@ async fn window_screen_extents(accessible: &AccessibleProxy<'_>) -> Option<Surfa
     })
 }
 
-async fn resolve_window_in_app(
-    conn: &AccessibilityConnection,
-    app_ref: &ObjectRefOwned,
-    title: &str,
-    index: usize,
-) -> Result<ObjectRefOwned, anyhow::Error> {
-    let wins = app_window_handles(app_ref, conn).await;
-    if wins.is_empty() {
-        return Err(core::taxonomy_error(
-            core::ERR_NOT_MATCHED,
-            "no windows found for this app — re-enumerate windows",
+/// Refuse a minimized (Iconified) window before its frame is used: it keeps the
+/// extents it had before it was minimized, so a crop of them, or a point mapped
+/// through them, is about a different part of the screen.
+async fn refuse_minimized(proxy: &AccessibleProxy<'_>) -> Result<(), anyhow::Error> {
+    if proxy
+        .get_state()
+        .await
+        .is_ok_and(|state| state.contains(AtspiState::Iconified))
+    {
+        return Err(core::minimized_window(
+            &proxy.name().await.unwrap_or_default(),
         ));
     }
-    if !title.is_empty()
-        && let Some(w) = wins.iter().find(|w| w.title == title)
-    {
+    Ok(())
+}
+
+/// Resolve a stored window key to exactly the window it names.
+///
+/// The key is the AT-SPI object reference (`unique name|object path`), so this
+/// either lands on that window or fails with [`core::ERR_SURFACE_GONE`]: it never
+/// falls back to another window of the app, and never to coordinates.
+async fn resolve_window_by_key(
+    conn: &AccessibilityConnection,
+    app_name: &str,
+    key: &WindowKey,
+) -> Result<ObjectRefOwned, anyhow::Error> {
+    let object_ref = object_ref_from_key(key).ok_or_else(|| core::surface_gone(app_name))?;
+    let accessible = object_ref
+        .as_accessible_proxy(conn.connection())
+        .await
+        .map_err(|_| core::surface_gone(app_name))?;
+    let role = accessible
+        .get_role()
+        .await
+        .map_err(|_| core::surface_gone(app_name))?;
+    if !is_window_role(role) {
+        return Err(core::surface_gone(app_name));
+    }
+    Ok(object_ref)
+}
+
+/// Parse a [`WindowKey`] back into an owned object reference. `None` when the
+/// text is not one this backend produced.
+fn object_ref_from_key(key: &WindowKey) -> Option<ObjectRefOwned> {
+    let (name, path) = key.as_str().split_once('|')?;
+    let name = zbus::names::UniqueName::try_from(name).ok()?;
+    let path = zbus::zvariant::ObjectPath::try_from(path).ok()?;
+    Some(ObjectRef::new_owned(name.to_owned(), path.to_owned()))
+}
+
+/// The app's own window: the one reporting active/focused state, else its first.
+/// Per-call by design — a `TargetSpec::App` names an application, not a window.
+async fn app_current_window(
+    conn: &AccessibilityConnection,
+    app_ref: &ObjectRefOwned,
+    app_name: &str,
+) -> Result<ObjectRefOwned, anyhow::Error> {
+    let wins = app_window_handles(app_ref, conn).await;
+    if let Some(w) = wins.iter().find(|w| w.active || w.focused) {
         return Ok(w.object_ref.clone());
     }
-    // App-level target (empty title, index 0): the app's active window, else first.
-    if title.is_empty()
-        && index == 0
-        && let Some(w) = wins.iter().find(|w| w.active)
-    {
-        return Ok(w.object_ref.clone());
-    }
-    if index < wins.len() {
-        return Ok(wins[index].object_ref.clone());
-    }
-    Err(core::taxonomy_error(
-        core::ERR_NOT_MATCHED,
-        format!("window '{title}' (index {index}) not found — re-enumerate windows"),
-    ))
+    wins.into_iter()
+        .next()
+        .map(|w| w.object_ref)
+        .ok_or_else(|| core::surface_gone(app_name))
 }
 
 async fn resolve_focused_window(
@@ -392,9 +447,9 @@ async fn resolve_focused_window(
             if w.active || w.focused {
                 matches.push(ResolvedWindow {
                     object_ref: w.object_ref,
+                    key: w.key,
                     app_info: app_info.clone(),
                     title: w.title,
-                    index: w.index,
                     surface: w.surface,
                 });
             }
@@ -429,18 +484,148 @@ async fn resolve_window(
             let w = resolve_focused_window(conn).await?;
             Ok((w.object_ref, w.app_info))
         }
-        TargetSpec::Window {
-            app_pid,
-            app_name,
-            title,
-            index,
-        } => {
+        TargetSpec::App { app_pid, app_name } => {
             let app_ref = resolve_app_object(conn, app_name, *app_pid).await?;
-            let win_ref = resolve_window_in_app(conn, &app_ref, title, *index).await?;
+            let win_ref = app_current_window(conn, &app_ref, app_name).await?;
             let app_info = app_info_of(conn, &app_ref).await?;
             Ok((win_ref, app_info))
         }
+        TargetSpec::Window {
+            app_pid,
+            app_name,
+            key,
+            ..
+        } => {
+            let win_ref = resolve_window_by_key(conn, app_name, key).await?;
+            Ok((
+                win_ref,
+                AppInfo {
+                    pid: *app_pid,
+                    name: app_name.clone(),
+                },
+            ))
+        }
     }
+}
+
+// ── Window stills ────────────────────────────────────────────────────────
+//
+// A window still must show the window's current visible pixels, occluders
+// included, which reading the window's own drawable would not — so a window still
+// is a crop of the screen capture. AT-SPI extents and captured pixels are
+// different coordinate spaces whenever the desktop scale is not 1, so the crop is
+// taken only after the whole screen is read from the accessibility stack and
+// reconciled with the capture (`core::a11y_scale`) — an unreconcilable pair
+// refuses instead of cropping a guess.
+
+/// The whole screen in the accessibility coordinate space (the registry root's
+/// own `Component` extents). Every failure is "not available".
+async fn a11y_screen_extents(conn: &AccessibilityConnection) -> Option<SurfaceGeometry> {
+    let root = conn.root_accessible_on_registry().await.ok()?;
+    let proxies = root.proxies().await.ok()?;
+    let component = proxies.component().await.ok()?;
+    let (x, y, w, h) = component.get_extents(CoordType::Screen).await.ok()?;
+    Some(SurfaceGeometry {
+        x: f64::from(x),
+        y: f64::from(y),
+        width: f64::from(w),
+        height: f64::from(h),
+    })
+}
+
+/// The pixel space stills and coordinate mapping use: the X11 virtual desktop, or
+/// the last portal capture's size on Wayland. `None` when it cannot be established.
+fn pixel_space() -> Option<(u32, u32)> {
+    if wayland_env() {
+        // Copied out of the cache, so no lock is held past this call.
+        *SCREEN_DIMS.lock().unwrap_poison()
+    } else {
+        with_block_in_place(x11_screen_geometry)
+            .ok()
+            .map(|geo| (geo.width.round() as u32, geo.height.round() as u32))
+    }
+}
+
+/// What to do instead when an accessibility space cannot be mapped into pixels: the
+/// one tail every refusal in [`a11y_pixel_scale`] ends with.
+const A11Y_UNMAPPED_GUIDANCE: &str = "capture target: \"screen\" first — its still and zoom \
+     always work — and prefer ref actions, which need no pixels";
+
+/// The scale between accessibility extents and the pixel space `pixels` describes —
+/// the one owner of that reconciliation, so a crop and a coordinate map can never
+/// disagree about whether their spaces match.
+///
+/// One message per cause: an unknown pixel space is not a mismatch, an
+/// accessibility screen that cannot be read was never compared at all, and only a
+/// pair that was compared and disagreed is a reconciliation failure. On X11 the
+/// accessibility screen extents are the X11 root's own pixels, and a root covering
+/// one output of a larger desktop is a sub-rect rather than a scale — refusing
+/// there would lose a 1:1 crop that is right, so X11 falls back to it. Wayland's
+/// per-output scaling leaves no such guarantee, so an unreconcilable space there
+/// is refused instead of guessed.
+async fn a11y_pixel_scale(
+    conn: &AccessibilityConnection,
+    pixels: Option<(u32, u32)>,
+) -> Result<f64, anyhow::Error> {
+    let Some((width, height)) = pixels else {
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "the screen's pixel size is not known, so accessibility extents cannot be mapped \
+                 into it — {A11Y_UNMAPPED_GUIDANCE}"
+            ),
+        ));
+    };
+    let Some(extents) = a11y_screen_extents(conn).await else {
+        // Nothing was compared, so this is not a mismatch: the accessibility stack
+        // did not report the screen at all. X11 still answers in the root's own
+        // pixels, so 1:1 remains the right mapping there.
+        if !wayland_env() {
+            return Ok(1.0);
+        }
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "the accessibility stack did not report the screen's geometry, so its coordinates \
+                 cannot be mapped into the captured pixels — {A11Y_UNMAPPED_GUIDANCE}"
+            ),
+        ));
+    };
+    match core::a11y_scale(&extents, (width, height)) {
+        Some(scale) => Ok(scale),
+        None if !wayland_env() => Ok(1.0),
+        None => Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "the accessibility extents could not be reconciled with the {width}x{height} \
+                 screen pixels, so nothing was mapped — {A11Y_UNMAPPED_GUIDANCE}"
+            ),
+        )),
+    }
+}
+
+/// One window still: the window's AT-SPI extents mapped into the captured pixels
+/// by the scale both spaces share, then cropped. `cap_geo` is the geometry the
+/// backend maps coordinates with (the X11 virtual desktop, the portal image on
+/// Wayland), so `cap` and `cap_geo` always describe the same pixels.
+///
+/// The extents are taken to be screen-relative, which is what `CoordType::Screen`
+/// asks for; a toolkit that answers with window-relative extents cannot be told
+/// apart from the accessibility data, so its crop is the wrong part of the screen.
+async fn window_still(
+    conn: &AccessibilityConnection,
+    win: &SurfaceGeometry,
+    cap: &Capture,
+    cap_geo: &SurfaceGeometry,
+) -> Result<Capture, anyhow::Error> {
+    let scale = a11y_pixel_scale(conn, Some((cap.width, cap.height))).await?;
+    // The crop is clamped to the captured screen, so a window that hangs off it
+    // yields its visible part — the same result as before the reconciliation
+    // existed. A window entirely outside it is an honest failure.
+    core::crop_rgba(
+        cap,
+        core::window_capture_rect(&core::scale_geometry(*win, scale), cap_geo)?,
+    )
 }
 
 // ── Accessibility tree walk ──────────────────────────────────────────────
@@ -645,6 +830,40 @@ async fn set_element_value(
 
 // ── Raw input (enigo / XTEST) ────────────────────────────────────────────
 
+/// Bring a window to the front and prove it got there.
+///
+/// XTEST input goes to whatever holds the focus, so input aimed at a window that
+/// did not come forward must fail BEFORE anything is synthesized: reporting
+/// success while the keystrokes went to another window is the failure this
+/// prevents. `grab_focus` is a request to the window manager, so its reply is not
+/// the authority — the window's own active/focused state is, re-read briefly.
+async fn raise_window(
+    conn: &AccessibilityConnection,
+    window_ref: &ObjectRefOwned,
+    target: &TargetSpec,
+) -> Result<(), anyhow::Error> {
+    let proxy = window_ref
+        .as_accessible_proxy(conn.connection())
+        .await
+        .map_err(|e| dbus_err(e, "open window"))?;
+    if let Ok(proxies) = proxy.proxies().await
+        && let Ok(component) = proxies.component().await
+    {
+        let _ = component.grab_focus().await;
+    }
+    for _ in 0..core::RAISE_SETTLE_STEPS {
+        let state = proxy
+            .get_state()
+            .await
+            .map_err(|e| dbus_err(e, "read window state"))?;
+        if state.contains(AtspiState::Active) || state.contains(AtspiState::Focused) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(core::RAISE_SETTLE_MS)).await;
+    }
+    Err(core::not_brought_forward(target.describe()))
+}
+
 fn enigo_mod_key(m: Modifier) -> Key {
     match m {
         Modifier::Cmd => Key::Meta,
@@ -824,6 +1043,11 @@ fn raw_input_blocking(input: RawInput, geo: Option<&SurfaceGeometry>) -> Result<
         RawInput::Drag { from, to } => {
             let (fx, fy) = pixel_point(from, geo)?;
             let (tx, ty) = pixel_point(to, geo)?;
+            // The button goes down where the gesture starts: pressing at the
+            // pointer's previous position would grab whatever window that was.
+            enigo
+                .move_mouse(fx, fy, Coordinate::Abs)
+                .map_err(input_err)?;
             enigo
                 .button(Button::Left, Direction::Press)
                 .map_err(input_err)?;
@@ -1001,7 +1225,8 @@ fn x11_capture_screen() -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
 // degrades to accessibility-only — no retries, no prompt spam.
 
 /// Last known screen pixels, stored on every successful `Screen` capture so
-/// zoom can size itself without triggering a second portal dialog.
+/// zoom can size itself without triggering a second portal dialog, and so AT-SPI
+/// extents can be reconciled with pixels ([`pixel_space`]).
 static SCREEN_DIMS: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 static PORTAL_TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1249,7 +1474,7 @@ impl Backend for LinuxBackend {
                     app_pid: app_info.pid,
                     app_name: app_info.name.clone(),
                     title: w.title,
-                    index: w.index,
+                    key: w.key,
                     surface: w.surface,
                 });
             }
@@ -1264,7 +1489,7 @@ impl Backend for LinuxBackend {
             app_pid: w.app_info.pid,
             app_name: w.app_info.name,
             title: w.title,
-            index: w.index,
+            key: w.key,
             surface: w.surface,
         })
     }
@@ -1302,9 +1527,12 @@ impl Backend for LinuxBackend {
                     .as_accessible_proxy(conn.connection())
                     .await
                     .map_err(|e| dbus_err(e, "open window"))?;
-                window_screen_extents(&proxy)
+                refuse_minimized(&proxy).await?;
+                let win = window_screen_extents(&proxy)
                     .await
-                    .ok_or_else(|| anyhow!("window geometry unavailable"))
+                    .ok_or_else(|| anyhow!("window geometry unavailable"))?;
+                let scale = a11y_pixel_scale(&conn, pixel_space()).await?;
+                Ok(core::scale_geometry(win, scale))
             }
         }
     }
@@ -1324,15 +1552,18 @@ impl Backend for LinuxBackend {
             .as_accessible_proxy(conn.connection())
             .await
             .map_err(|e| dbus_err(e, "open window"))?;
+        // The header reports the window's frame, and a minimized window's is the one
+        // it had before it was minimized: refuse rather than describe a surface that
+        // is not on screen.
+        refuse_minimized(&proxy).await?;
         let surface = window_screen_extents(&proxy)
             .await
             .ok_or_else(|| anyhow!("window geometry unavailable"))?;
         let title = proxy.name().await.ok();
         let (root, _handles) = build_tree(&window_ref, &conn).await;
-        let app_name = match target {
-            TargetSpec::Window { app_name, .. } => app_name.clone(),
-            _ => app_info.name,
-        };
+        let app_name = target
+            .app()
+            .map_or_else(|| app_info.name.clone(), |(_, name)| name.to_string());
         Ok(Observation {
             app_name,
             window_title: title,
@@ -1384,6 +1615,14 @@ impl Backend for LinuxBackend {
                  accessibility actions where the app exposes them",
             ));
         }
+        // Input that lands where the focus is: aimed at one window, it must reach
+        // that window or not go at all. A coordinate click and a point-less wheel
+        // are deliberately unpinned global input.
+        if core::pinned_input(target, &input) {
+            let conn = self.conn().await?;
+            let (window_ref, _app) = resolve_window(&conn, target).await?;
+            raise_window(&conn, &window_ref, target).await?;
+        }
         let geo = match &input {
             RawInput::Click { .. }
             | RawInput::Scroll { point: Some(_), .. }
@@ -1409,7 +1648,9 @@ impl Backend for LinuxBackend {
     }
 
     /// Window stills show current visible pixels (occluders visible; use
-    /// observe for the exact tree).
+    /// observe for the exact tree). Both capture routes crop the same way:
+    /// through [`window_still`], which reconciles the accessibility and pixel
+    /// spaces before cropping.
     async fn capture(&self, target: &TargetSpec) -> Result<Capture, anyhow::Error> {
         match target {
             TargetSpec::Screen => Ok(self.capture_screen_channel().await?.0),
@@ -1420,11 +1661,12 @@ impl Backend for LinuxBackend {
                     .as_accessible_proxy(conn.connection())
                     .await
                     .map_err(|e| dbus_err(e, "open window"))?;
+                refuse_minimized(&proxy).await?;
                 let win = window_screen_extents(&proxy)
                     .await
                     .ok_or_else(|| anyhow!("window geometry unavailable"))?;
                 let (screen_cap, screen_geo) = self.capture_screen_channel().await?;
-                core::crop_rgba(&screen_cap, core::window_capture_rect(&win, &screen_geo)?)
+                window_still(&conn, &win, &screen_cap, &screen_geo).await
             }
         }
     }

@@ -4,7 +4,9 @@
 * X11 = full: screen/window/multi stills + zoom/observe via X11 protocol, AT-SPI2 observe/act, XTEST raw input.
 * Wayland/XWayland (both DISPLAY+WAYLAND_DISPLAY set counts as Wayland) = accessibility + one best-effort Screenshot-portal attempt; a system consent dialog may appear — never click it yourself; deny/timeout/missing → `degraded`, continue accessibility-only.
 * Raw input + cursor `degraded` on Wayland — prefer `ref` actions.
-* Window stills show visible pixels (occluders visible, minimized fails — `observe` for the exact tree).
+* `type`, `drag` and `scroll` with a point on a named window focus that window first and verify it: if it could not be focused, nothing is sent and the call fails with `degraded`. A coordinate `click` raises nothing here — the pointer lands under the point.
+* A window `screenshot` is a crop of the full-screen capture, so its accessibility extents have to be reconciled with the captured pixels. On X11, whose accessibility coordinates are the screen's own pixels, an unreconcilable pair falls back to 1:1 and the crop is taken; on Wayland the still is refused with `degraded` instead of returning the wrong part of the screen — `screenshot { target: "screen" }` and `zoom` on it always work — and normalized coordinates are refused the same way. AT-SPI extents are taken to be screen-relative, as `CoordType.Screen` asks; a toolkit that reports window-relative extents cannot be detected.
+* Window stills show visible pixels (occluders visible). A minimized window is refused with `degraded` for a still, for coordinate mapping and for `observe` — its frame is the one it had before it was minimized; restore it first.
 * No streaming in v1.
 * Offered only when a GUI session with a reachable session D-Bus exists; an accessibility stack that starts later is picked up by newly constructed sessions.
 * `permission-denied` means a D-Bus call was not authorized.

@@ -149,6 +149,13 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"observe\":{\"target\":\"a1\"}}, 
     {\"scroll\":{\"direction\":\"down\",\"amount\":3}}, \
     {\"drag\":{\"from\":[x,y],\"to\":[x,y]}}, {\"cursor\":{}}, {\"wait\":{\"seconds\":2}}";
 
+/// Schema text for the `target` field, shared by every action that takes one so
+/// the schema and the tool description cannot drift apart.
+const TARGET_FIELD: &str = "Target id (a1/w1) or \"screen\". Default: the surface this agent \
+     last observed or captured, initially the focused window of the frontmost app. A w-id names \
+     that one window or fails as surface-gone; an a-id means the application's own focused \
+     window.";
+
 /// Corrective error for an unrecoverable action shape, echoing the exact
 /// expected form so the model can self-correct in one round-trip.
 fn corrective_action_error(received: &Value) -> String {
@@ -297,6 +304,8 @@ static CAPTURE_PATHS: LazyLock<std::sync::Mutex<HashMap<String, String>>> =
 pub(crate) fn cleanup_agent_state(agent_key: &str) {
     CAPTURE_PATHS.lock().unwrap_poison().remove(agent_key);
     core::clear_agent_state(agent_key);
+    #[cfg(target_os = "macos")]
+    macos::forget_agent_windows(agent_key);
 }
 
 // ── Description ────────────────────────────────────────────────────────
@@ -357,22 +366,22 @@ impl Tool for ComputerTool {
             "properties": {
                 "action": {
                     "oneOf": [
-                        super::action_entry_schema("observe", "Get the accessibility tree of a target surface with element refs (e1, e2, ...). Refs expire on re-observe.", &[], &json!({
-                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\". Default: focused window of the frontmost app."}
+                        super::action_entry_schema("observe", "Get the accessibility tree of a target surface with element refs (e1, e2, ...). Refs expire on re-observe. The result names the surface it is about.", &[], &json!({
+                            "target": {"type": "string", "description": TARGET_FIELD}
                         })),
-                        super::action_entry_schema("screenshot", "Capture the target surface as a PNG and inject it as a native image; requires a vision-capable model.", &[], &json!({
-                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\". Default: focused window of the frontmost app."}
+                        super::action_entry_schema("screenshot", "Capture the target surface as a PNG and inject it as a native image; requires a vision-capable model. The result names the surface captured.", &[], &json!({
+                            "target": {"type": "string", "description": TARGET_FIELD}
                         })),
                         super::action_entry_schema("zoom", "Capture and crop a normalized region of the target surface as a PNG.", &["region"], &json!({
-                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\". Default: focused window of the frontmost app."},
+                            "target": {"type": "string", "description": TARGET_FIELD},
                             "region": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}, "description": "Normalized [x0, y0, x1, y1] region (0-1000), relative to the target surface."}
                         })),
                         super::action_entry_schema("apps", "List running GUI applications as a1-style targets.", &[], &json!({})),
-                        super::action_entry_schema("windows", "List windows, optionally filtered to an app, as w1-style targets.", &[], &json!({
+                        super::action_entry_schema("windows", "List windows, optionally filtered to an app, as w1-style targets. A w-id names that one window until it is gone.", &[], &json!({
                             "app": {"type": "string", "description": "App name, pid, or a stored a-id to filter windows."}
                         })),
-                        super::action_entry_schema("click", "Click by element ref (preferred) or normalized coordinates.", &[], &json!({
-                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\". Default: focused window of the frontmost app."},
+                        super::action_entry_schema("click", "Click by element ref (preferred) or normalized coordinates. A coordinate click is pointer input: it lands on whatever is under that point.", &[], &json!({
+                            "target": {"type": "string", "description": TARGET_FIELD},
                             "ref": {"type": "string", "description": "Element ref from the most recent observe; preferred over coordinates."},
                             "x": {"type": "number", "description": "Normalized 0-1000 X, relative to the target surface."},
                             "y": {"type": "number", "description": "Normalized 0-1000 Y, relative to the target surface."},
@@ -380,25 +389,25 @@ impl Tool for ComputerTool {
                             "double": {"type": "boolean", "description": "Double-click; coordinate clicks only. Default: false."},
                             "modifiers": {"type": "array", "items": {"enum": ["cmd", "ctrl", "alt", "shift"]}, "description": "Keyboard modifiers; apply only to coordinate clicks."}
                         })),
-                        super::action_entry_schema("type", "Set an element's value (with ref) or type into the focused element (without).", &["text"], &json!({
+                        super::action_entry_schema("type", "Set an element's value (with ref) or type into the focused element (without). Without a ref the named window is raised first and the call fails instead of typing elsewhere.", &["text"], &json!({
                             "text": {"type": "string", "description": "Text to set/type."},
-                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\". Default: focused window of the frontmost app."},
+                            "target": {"type": "string", "description": TARGET_FIELD},
                             "ref": {"type": "string", "description": "Element ref from the most recent observe; sets its value."}
                         })),
-                        super::action_entry_schema("press", "Press a keyboard chord, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\".", &["keys"], &json!({
+                        super::action_entry_schema("press", "Press a keyboard chord, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\". The chord goes to the focused application.", &["keys"], &json!({
                             "keys": {"type": "string", "description": "Chord to press, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\"."}
                         })),
-                        super::action_entry_schema("scroll", "Scroll the target surface.", &["direction"], &json!({
+                        super::action_entry_schema("scroll", "Scroll the target surface. Without x/y the wheel goes to whatever is under the pointer.", &["direction"], &json!({
                             "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
                             "amount": {"type": "integer", "description": "Scroll ticks. Default: 3."},
-                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\". Default: focused window of the frontmost app."},
+                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\", used with x/y; without x/y the wheel goes to whatever is under the pointer and a target is an error."},
                             "x": {"type": "number", "description": "Normalized 0-1000 X anchor; provide both x and y together, or omit both."},
                             "y": {"type": "number", "description": "Normalized 0-1000 Y anchor; provide both x and y together, or omit both."}
                         })),
                         super::action_entry_schema("drag", "Drag from one normalized point to another on the target surface.", &["from", "to"], &json!({
                             "from": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}, "description": "[x, y] normalized 0-1000."},
                             "to": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}, "description": "[x, y] normalized 0-1000."},
-                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\". Default: focused window of the frontmost app."}
+                            "target": {"type": "string", "description": TARGET_FIELD}
                         })),
                         super::action_entry_schema("cursor", "Report the pointer position as normalized and absolute points.", &[], &json!({})),
                         super::action_entry_schema("wait", "Pause before the next action (greater than 0, at most 10 seconds).", &["seconds"], &json!({
@@ -513,15 +522,17 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
             reference,
         } => type_text(text, target.as_deref(), reference.as_deref()).await?,
         ComputerAction::Press { keys } => {
+            // A chord is global input: it goes to the focused application, so no
+            // surface is resolved and none is raised on its behalf.
             backend()
                 .raw_input(
-                    &resolve_action_target(None)?,
+                    &TargetSpec::Focused,
                     core::RawInput::KeyChord {
                         chord: keys.clone(),
                     },
                 )
                 .await?;
-            format!("pressed chord: {keys}")
+            format!("pressed chord: {keys} — a chord goes to the focused application")
         }
         ComputerAction::Scroll {
             direction,
@@ -532,16 +543,16 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
         } => scroll(*direction, *amount, target.as_deref(), *x, *y).await?,
         ComputerAction::Drag { from, to, target } => {
             let target = resolve_action_target(target.as_deref())?;
-            backend()
-                .raw_input(
-                    &target,
-                    core::RawInput::Drag {
-                        from: *from,
-                        to: *to,
-                    },
-                )
-                .await?;
-            format!("dragged from {from:?} to {to:?}")
+            let gesture = core::RawInput::Drag {
+                from: *from,
+                to: *to,
+            };
+            backend().raw_input(&target, gesture.clone()).await?;
+            format!(
+                "dragged from {from:?} to {to:?}{}{}",
+                on_surface(&target),
+                unpinned_clause(&target, &gesture)
+            )
         }
         ComputerAction::Cursor {} => cursor().await?,
         ComputerAction::Wait { seconds } => {
@@ -555,39 +566,67 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
     Ok(crate::util::scrub_credentials(&output))
 }
 
-/// Narrow a raw target argument to the surface to act on. `Some(t)` resolves
-/// through the target registry as usual; `None` first reuses the target pinned by
-/// the calling agent's most recent observation (so a focus shift between observe
-/// and the action never lands coordinate actions on a different surface than the
-/// refs came from), and only when there is no such pinned target does it fall
-/// back to [`core::TargetSpec::Focused`].
+/// The surface clause of an action result: `""` when the call named no surface
+/// (the focused window), else `" on <surface>"`. Every action states the surface it
+/// addressed this one way, so a result never varies by action.
+fn on_surface(target: &TargetSpec) -> String {
+    match target {
+        TargetSpec::Focused => String::new(),
+        other => format!(" on {}", other.describe()),
+    }
+}
+
+/// The clause a pointer gesture appends when it is not pinned to the surface: its
+/// coordinates were mapped there, but the input lands wherever the pointer is.
+/// Pinned input omits it, having been delivered to the surface it named.
+fn unpinned_clause(target: &TargetSpec, input: &core::RawInput) -> &'static str {
+    if core::pinned_input(target, input) {
+        ""
+    } else {
+        " — the input goes to whatever is under its coordinates"
+    }
+}
+
+/// The surface an action addresses: the explicit target, else the surface this
+/// agent last observed or captured, else — with nothing pinned yet — whatever the
+/// system has focused. Coordinate actions use it so a focus shift between observe
+/// and the action never lands them on a different surface than the refs came from.
 fn resolve_action_target(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     if let Some(t) = target {
         return core::resolve_target(Some(t));
     }
-    Ok(core::last_observation_target().unwrap_or(TargetSpec::Focused))
+    Ok(core::last_surface().unwrap_or(TargetSpec::Focused))
+}
+
+/// [`resolve_action_target`] with the last resort made concrete: a call that ends
+/// up on the focused window names that window, so its result — and the surface it
+/// pins — is about the one surface it actually used.
+async fn resolve_surface(target: Option<&str>) -> anyhow::Result<TargetSpec> {
+    match resolve_action_target(target)? {
+        TargetSpec::Focused => {
+            let win = backend().focused_window().await?;
+            Ok(TargetSpec::from_window(&win))
+        }
+        other => Ok(other),
+    }
 }
 
 async fn apps() -> anyhow::Result<String> {
     let apps = backend().list_apps().await?;
-    let mut targets = Vec::with_capacity(apps.len());
+    // An a-id targets the app's own focused window, re-resolved at act time.
+    let surfaces = apps
+        .iter()
+        .map(|app| TargetSpec::App {
+            app_pid: app.pid,
+            app_name: app.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let ids = core::store_app_targets(&surfaces);
     let mut lines = Vec::with_capacity(apps.len());
-    for (i, app) in apps.iter().enumerate() {
-        let id = format!("a{}", i + 1);
-        // An app id targets the app's focused window (empty title + index 0).
-        targets.push((
-            id.clone(),
-            TargetSpec::Window {
-                app_pid: app.pid,
-                app_name: app.name.clone(),
-                title: String::new(),
-                index: 0,
-            },
-        ));
+    for (app, id) in apps.iter().zip(&ids) {
         let pid = app.pid.map_or_else(|| "?".to_string(), |p| p.to_string());
         lines.push(format!("[{id}] {} (pid {pid})", app.name));
     }
-    core::store_targets(targets);
     if lines.is_empty() {
         Ok("no apps found".to_string())
     } else {
@@ -601,19 +640,10 @@ async fn windows(app: Option<&str>) -> anyhow::Result<String> {
         None => None,
     };
     let wins = backend().list_windows(app_info.as_ref()).await?;
-    let mut targets = Vec::with_capacity(wins.len());
+    let surfaces = wins.iter().map(TargetSpec::from_window).collect::<Vec<_>>();
+    let ids = core::store_window_targets(&surfaces);
     let mut lines = Vec::with_capacity(wins.len());
-    for (i, win) in wins.iter().enumerate() {
-        let id = format!("w{}", i + 1);
-        targets.push((
-            id.clone(),
-            TargetSpec::Window {
-                app_pid: win.app_pid,
-                app_name: win.app_name.clone(),
-                title: win.title.clone(),
-                index: win.index,
-            },
-        ));
+    for (win, id) in wins.iter().zip(&ids) {
         lines.push(format!(
             "[{id}] {} — \"{}\" {}x{} @ ({}, {})",
             win.app_name,
@@ -624,7 +654,6 @@ async fn windows(app: Option<&str>) -> anyhow::Result<String> {
             win.surface.y
         ));
     }
-    core::store_targets(targets);
     if lines.is_empty() {
         Ok("no windows found".to_string())
     } else {
@@ -632,22 +661,19 @@ async fn windows(app: Option<&str>) -> anyhow::Result<String> {
     }
 }
 
-/// Resolve a `windows` app argument: a stored a-id, a numeric pid, or a raw app
-/// name. Always returns a fully-resolved [`AppInfo`] (with a pid) or a clear
-/// error, so the macOS backend never silently skips a pid-less app.
+/// Resolve a `windows` app argument: a stored a-id (or w-id, whose app is what is
+/// being asked about), a numeric pid, or a raw app name. Always returns a
+/// fully-resolved [`AppInfo`] (with a pid) or a clear error, so the macOS backend
+/// never silently skips a pid-less app.
 async fn resolve_app(arg: &str) -> anyhow::Result<AppInfo> {
     let trimmed = arg.trim();
     if trimmed == "screen" {
         anyhow::bail!("'screen' is a surface, not an app — use the 'apps' action to list apps");
     }
-    if let Some(TargetSpec::Window {
-        app_pid, app_name, ..
-    }) = core::get_target(trimmed)
+    if let Some((pid, name)) = core::get_target(trimmed)
+        .and_then(|target| target.app().map(|(pid, name)| (pid, name.to_string())))
     {
-        return Ok(AppInfo {
-            pid: app_pid,
-            name: app_name,
-        });
+        return Ok(AppInfo { pid, name });
     }
     let apps = backend().list_apps().await?;
     if let Ok(pid) = trimmed.parse::<u32>() {
@@ -682,20 +708,6 @@ fn no_app_error(name: &str, apps: &[AppInfo]) -> anyhow::Error {
     }
 }
 
-/// A short human label for a target, used in argument-mismatch errors.
-fn describe_target(spec: &TargetSpec) -> String {
-    match spec {
-        TargetSpec::Focused => "the focused window".to_string(),
-        TargetSpec::Window {
-            app_name, title, ..
-        } if !title.is_empty() => {
-            format!("window '{title}' of {app_name}")
-        }
-        TargetSpec::Window { app_name, .. } => format!("an app-level window of {app_name}"),
-        TargetSpec::Screen => "the screen".to_string(),
-    }
-}
-
 /// A ref-based action pins the observed surface; an explicit target that
 /// resolves to a DIFFERENT surface is almost always a mistake (the model kept
 /// both arguments). An equal target is fine.
@@ -712,22 +724,21 @@ fn ensure_ref_target_match(
         anyhow::bail!(
             "ref {reference} belongs to the surface observed for {} — drop the target argument \
              or re-observe the target you want",
-            describe_target(cache_target)
+            cache_target.describe()
         );
     }
     Ok(())
 }
 
 async fn observe(target: Option<&str>) -> anyhow::Result<String> {
-    let raw_target = core::resolve_target(target)?;
-    // Pin a `Focused` observation to the concrete window at observe time so a
-    // later ref-resolved action re-resolves THIS window (and fails stale if it
-    // closed) instead of whatever happens to be focused then.
-    let target = match raw_target {
-        TargetSpec::Focused => TargetSpec::from_window(&backend().focused_window().await?),
-        other => other,
-    };
+    // A concrete surface, never `Focused`: the observation pins THIS window, so a
+    // later action re-resolves it (and fails honestly if it is gone) instead of
+    // whatever happens to be focused then.
+    let target = resolve_surface(target).await?;
     let obs = backend().observe(&target).await?;
+    // Only a successful observation moves the pin; a failed one leaves the
+    // surface this agent last observed in place.
+    core::set_last_surface(target.clone());
     core::store_observation(target, &obs);
 
     // render_tree emits the "[Surface: ...]" header (with node/interactive
@@ -788,25 +799,27 @@ async fn click(
         backend()
             .act_on_element(&cache_target, &locator, ElementAct::Press)
             .await?;
-        return Ok(format!("clicked element {reference}"));
+        return Ok(format!(
+            "clicked element {reference}{}",
+            on_surface(&cache_target)
+        ));
     }
     let (Some(x), Some(y)) = (x, y) else {
         anyhow::bail!("click requires an element ref (preferred) or normalized x/y coordinates");
     };
     let target = resolve_action_target(target)?;
-    let point = (x, y);
-    backend()
-        .raw_input(
-            &target,
-            core::RawInput::Click {
-                point,
-                button: button.unwrap_or(MouseButton::Left),
-                double: double.unwrap_or(false),
-                modifiers: modifiers.unwrap_or_default().to_vec(),
-            },
-        )
-        .await?;
-    Ok(format!("clicked at ({x}, {y})"))
+    let input = core::RawInput::Click {
+        point: (x, y),
+        button: button.unwrap_or(MouseButton::Left),
+        double: double.unwrap_or(false),
+        modifiers: modifiers.unwrap_or_default().to_vec(),
+    };
+    backend().raw_input(&target, input.clone()).await?;
+    Ok(format!(
+        "clicked at ({x}, {y}){}{}",
+        on_surface(&target),
+        unpinned_clause(&target, &input)
+    ))
 }
 
 async fn type_text(
@@ -826,18 +839,28 @@ async fn type_text(
                 },
             )
             .await?;
-        return Ok(format!("set value on element {reference}"));
+        return Ok(format!(
+            "set value on element {reference} in {}",
+            cache_target.describe()
+        ));
     }
     let target = resolve_action_target(target)?;
-    backend()
-        .raw_input(
-            &target,
-            core::RawInput::TypeText {
-                text: text.to_string(),
-            },
-        )
-        .await?;
-    Ok(format!("typed text ({} chars)", text.chars().count()))
+    let input = core::RawInput::TypeText {
+        text: text.to_string(),
+    };
+    backend().raw_input(&target, input.clone()).await?;
+    // Typing is pinned only on a named window; with `screen` or nothing observed
+    // yet it goes to the focused element, so the result must not claim a surface
+    // it never reached.
+    Ok(format!(
+        "typed text ({} chars){}",
+        text.chars().count(),
+        if core::pinned_input(&target, &input) {
+            on_surface(&target)
+        } else {
+            " — the text goes to the focused element".to_string()
+        }
+    ))
 }
 
 async fn scroll(
@@ -847,7 +870,6 @@ async fn scroll(
     x: Option<f64>,
     y: Option<f64>,
 ) -> anyhow::Result<String> {
-    let target = resolve_action_target(target)?;
     let amount = amount.unwrap_or(3);
     if amount == 0 {
         anyhow::bail!("scroll amount must be > 0");
@@ -859,30 +881,63 @@ async fn scroll(
         }
         (None, None) => None,
     };
-    backend()
-        .raw_input(
-            &target,
-            core::RawInput::Scroll {
-                point,
-                direction,
-                amount,
-            },
-        )
-        .await?;
-    Ok(format!("scrolled {amount} ticks {direction:?}"))
+    let Some(point) = point else {
+        if target.is_some() {
+            anyhow::bail!(
+                "scroll without x/y does not address a surface — the wheel goes to whatever is \
+                 under the pointer; pass x and y to scroll the surface you name"
+            );
+        }
+        // A point-less wheel is global input: no surface is resolved or raised.
+        backend()
+            .raw_input(
+                &TargetSpec::Focused,
+                core::RawInput::Scroll {
+                    point: None,
+                    direction,
+                    amount,
+                },
+            )
+            .await?;
+        return Ok(format!(
+            "scrolled {amount} ticks {direction:?} — a point-less wheel goes to whatever is under \
+             the pointer"
+        ));
+    };
+    let target = resolve_action_target(target)?;
+    let input = core::RawInput::Scroll {
+        point: Some(point),
+        direction,
+        amount,
+    };
+    backend().raw_input(&target, input.clone()).await?;
+    Ok(format!(
+        "scrolled {amount} ticks {direction:?} at ({}, {}){}{}",
+        point.0,
+        point.1,
+        on_surface(&target),
+        unpinned_clause(&target, &input)
+    ))
+}
+
+/// The surface a `cursor` reading is relative to, with its geometry: a concrete
+/// one, so the numbers say what they are relative to.
+async fn cursor_surface() -> anyhow::Result<(TargetSpec, core::SurfaceGeometry)> {
+    let target = resolve_surface(None).await?;
+    let geo = backend().surface_geometry(&target).await?;
+    Ok((target, geo))
 }
 
 async fn cursor() -> anyhow::Result<String> {
-    let target = resolve_action_target(None)?;
     let (ax, ay) = backend().cursor_position().await?;
-    // A surface without usable geometry degrades to the absolute pointer, as it
-    // always has (no focused window, an unreachable AT-SPI bus, a Wayland portal
-    // failure, a self-target read the main thread did not answer), and the reason
-    // is passed on rather than guessed. The one exception is a grant denial, which
-    // is a typed failure: it is actionable (its text names the terminal and the
-    // pane), and "no surface" would misname it.
-    let geo = match backend().surface_geometry(&target).await {
-        Ok(geo) => geo,
+    // A surface that cannot be read degrades to the absolute pointer, as it always
+    // has (no focused window, an unreachable AT-SPI bus, a Wayland portal failure, a
+    // self-target read the main thread did not answer), and the reason is passed on
+    // rather than guessed. The one exception is a grant denial, which is a typed
+    // failure: it is actionable (its text names the terminal and the pane), and "no
+    // surface" would misname it.
+    let (target, geo) = match cursor_surface().await {
+        Ok(resolved) => resolved,
         Err(e) if !core::is_permission_denied(&e) => {
             return Ok(format!(
                 "cursor at absolute ({ax:.1}, {ay:.1}) — no surface to normalize against: {e}"
@@ -893,28 +948,34 @@ async fn cursor() -> anyhow::Result<String> {
     if core::contains_point(&geo, ax, ay) {
         let (nx, ny) = core::surface_to_normalized(ax, ay, &geo)?;
         Ok(format!(
-            "cursor at normalized ({nx:.1}, {ny:.1}) — absolute ({ax:.1}, {ay:.1})"
+            "cursor at normalized ({nx:.1}, {ny:.1}){} — absolute ({ax:.1}, {ay:.1})",
+            on_surface(&target)
         ))
     } else {
         Ok(format!(
-            "cursor outside the target surface ({ax:.1}, {ay:.1}) — surface bounds x:[{:.1}, {:.1}] y:[{:.1}, {:.1}]",
+            "cursor outside {surface} ({ax:.1}, {ay:.1}) — surface bounds x:[{:.1}, {:.1}] \
+             y:[{:.1}, {:.1}]",
             geo.x,
             geo.x + geo.width,
             geo.y,
-            geo.y + geo.height
+            geo.y + geo.height,
+            surface = target.describe()
         ))
     }
 }
 
 /// Capture the target surface (optionally cropping a normalized region) to a PNG
-/// under the managed temp dir, record its path, and return a summary. The capture
-/// probe is cached: a successful capture always refreshes the cache; a failed
-/// capture on a cold cache probes once and caches the grant state, so a
-/// genuinely-grantless setup maps failures to the actionable
-/// [`Backend::capture_unavailable_error`] while a real success upgrades the
-/// cache immediately — a stale cached negative never locks out a working channel.
+/// under the managed temp dir, record its path, and return a summary naming the
+/// surface actually captured. The capture probe is cached: a successful capture
+/// always refreshes the cache; a failed capture on a cold cache probes once and
+/// caches the grant state, so a genuinely-grantless setup maps failures to the
+/// actionable [`Backend::capture_unavailable_error`] while a real success
+/// upgrades the cache immediately — a stale cached negative never locks out a
+/// working channel.
 async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Result<String> {
-    let target = core::resolve_target(target)?;
+    // One resolution for the whole call: the surface captured, the geometry the
+    // region is mapped against and the surface pinned afterwards are the same.
+    let target = resolve_surface(target).await?;
 
     let capture_result = backend().capture(&target).await;
     let cap = match capture_result {
@@ -942,10 +1003,11 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
         }
     };
 
+    // The region is mapped into the capture's own pixels, so it cannot be taken
+    // against a different surface than the one this call captured.
     let (cropped, rect_opt) = match region {
         Some(region) => {
-            let geo = backend().surface_geometry(&target).await?;
-            let rect = core::region_to_pixels(region, &geo, cap.width, cap.height)?;
+            let rect = core::region_to_pixels(region, cap.width, cap.height)?;
             (core::crop_rgba(&cap, rect)?, Some(rect))
         }
         None => (cap, None),
@@ -953,6 +1015,9 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
 
     let (cw, ch) = (cropped.width, cropped.height);
     let path = encode_png(cropped)?;
+    // A capture that produced pixels is an observation of that surface: later
+    // calls with no target address it.
+    core::set_last_surface(target.clone());
     // Record the path under the owning agent id (owner-deletes-at-end via the
     // existing spill machinery) and stash it in the per-agent capture map.
     crate::tools::shell::record_spill_owner(path.clone());
@@ -968,7 +1033,11 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
     let rect_note = rect_opt.map_or_else(String::new, |(x, y, w, h)| {
         format!(" (cropped rect {x},{y},{w},{h})")
     });
-    let summary = format!("{kind} capture: {cw}x{ch} — {}{rect_note}", path.display());
+    let summary = format!(
+        "{kind} of {}: {cw}x{ch} — {}{rect_note}",
+        target.describe(),
+        path.display()
+    );
     Ok(summary)
 }
 

@@ -50,6 +50,16 @@
 //! read — a `cargo`-launched CLI run has no event loop, and a lazily-set awareness
 //! would mix physical UIA bounds with virtualized window metrics.
 //!
+//! # Window identity
+//!
+//! A window target carries the window's own OS handle plus the pid that owned it
+//! ([`window::resolve`] builds and parses that key), so it either lands on that
+//! window or fails as `surface-gone`: a moved, resized or renamed window keeps
+//! resolving, while a closed or replaced one never silently becomes another window
+//! of the same application. An app target names no window — it is the
+//! application's own focused window, re-resolved per call. [`input`] owns which
+//! input is pinned to a named window and which shapes are global.
+//!
 //! # Actuation limits, stated rather than worked around
 //!
 //! [`window::ensure_actuation_allowed`] owns these two refusals and names which one fired:
