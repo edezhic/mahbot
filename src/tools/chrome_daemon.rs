@@ -1593,9 +1593,10 @@ struct SweepTab {
 // sweep converges to Clean with no log. That case is undetectable by design —
 // no CLI path can enumerate a tab the extension no longer announces. An
 // `agent-tab-*` orphan of that shape is still reached by the run-end release,
-// which enumerates the live tab groups by title instead: it closes what the
-// extension owns there and reports what it does not. A link-enricher orphan
-// stays in Chrome until closed by hand.
+// which enumerates the live tab groups by title instead (where a live title
+// still carries the session name — `tools::chrome_tabs`' honest limits): it
+// closes what the extension owns there and reports what it does not. A
+// link-enricher orphan stays in Chrome until closed by hand.
 /// Close every tab in a mahbot-owned session's tab group except the sweep's own
 /// scratch, verifying closure by round-over-round re-enumeration. Shared by the
 /// startup sweep and the link-enricher per-fetch close, which keep to mahbot-owned

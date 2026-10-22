@@ -60,6 +60,14 @@
 //!   that host-level gap, not any one run, is what the caller reports once
 //!   ([`ownership_door_missing`]). A relay that is merely unreachable (Chrome closed, extension
 //!   restarting) is NOT that gap: the door is there, and those names stay retries.
+//! - Where a tab is grouped is chrome-use's rule, not this product's. Since chrome-use 1.5.243
+//!   agent tabs live in one group per project root, titled after the project (`✦ <project>`) and
+//!   shared by every session of it — not the per-session groups whose exact titles this route
+//!   matches. On such a browser no live title carries a session name, so every recorded name
+//!   settles as already gone here, and an ended run's leftover tabs are left to chrome-use's own
+//!   idle cleanup. The agent tail names that shared group
+//!   ([`crate::tools::chrome_groups`]) but leaves a group titled after its session alone, so it
+//!   never takes a title these routes can still match.
 //! - A group renamed in Chrome is invisible to this route — the match is exact on the
 //!   recorded name. A rename that KEEPS `crate::tools::chrome::AGENT_TAB_PREFIX` is still
 //!   reclaimed by the release module's sweep (it enumerates live titles, not recorded names);

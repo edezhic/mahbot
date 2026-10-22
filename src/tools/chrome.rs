@@ -187,6 +187,11 @@ pub(crate) const AGENT_TAB_PREFIX: &str = "agent-tab-";
 /// Logical name of the per-run default session.
 const DEFAULT_TAB: &str = "default";
 
+/// The Issues row an agent step's un-settled tab group is filed under — a named message, because the
+/// Issues view dedupes on `(message, reason)` and a reworded sentence would file the same fact
+/// twice. The reason is the failing leg's own ([`super::chrome_groups::settle`] answers a note).
+const SETTLE_ISSUE_MESSAGE: &str = "the agent's browser tab group was not left named and collapsed";
+
 /// The failure texts this module itself mints for a call that never left mahbot: no CLI
 /// ([`ChromeTool::ensure_available`] and the dispatch's own context), a CLI that could not be
 /// spawned, and the call cut off at mahbot's own bound. Consts so the failure classifiers
@@ -221,9 +226,11 @@ const NO_WORKSPACE: &str = "";
 /// The price of deriving the name rather than minting it: a session opened under a
 /// scheme no agent id derives from is addressable by no run's release — the cost paid
 /// by the runs in flight when per-boot random names were replaced. Its tabs are still
-/// reclaimable, because the release sweep enumerates the live `agent-tab-*` titles and
-/// derives the namespace from the name ([`session_namespace`]); what is lost for such a
-/// name is only the run it came from.
+/// reclaimable where a live group title carries the name: the release sweep enumerates the
+/// live `agent-tab-*` titles and derives the namespace from the name
+/// ([`session_namespace`]), and what is lost for such a name is only the run it came from.
+/// (Which title a group carries is chrome-use's grouping rule to decide — see
+/// [`crate::tools::chrome_tabs`]' honest limits.)
 pub(crate) fn run_session_namespace(agent_id: &str) -> String {
     let hex = crate::util::hex_string(&Sha256::digest(agent_id.as_bytes()));
     format!("{AGENT_TAB_PREFIX}{}-", &hex[..12])
@@ -674,7 +681,7 @@ impl ChromeTool {
     /// Whether a failed dispatch never reached the owner's browser: no CLI (or one that could not
     /// be spawned), a daemon or relay that never took the call ([`never_dispatched_error`]), or
     /// work that went to a browser chrome-use launched itself. Shared by the tab record's
-    /// classifier ([`Self::left_no_page`]) and the step's collapse tail, which skips a step that
+    /// classifier ([`Self::left_no_page`]) and the step's group tail, which skips a step that
     /// provably never used a tab.
     fn never_reached_the_owner_browser(message: &str) -> bool {
         never_dispatched_error(message)
@@ -692,7 +699,7 @@ impl ChromeTool {
         let message = error.to_string();
         // The browser's structural no-page classes, the texts this module mints, and the two
         // page-level classes only this record counts as no page: a call cut off at mahbot's own
-        // bound, and a tab the session cannot drive. The collapse tail skips only the narrower
+        // bound, and a tab the session cannot drive. The group tail skips only the narrower
         // [`Self::never_reached_the_owner_browser`] class — a cut-off step may still have opened
         // its tab first.
         unreached_browser_error(&message)
@@ -1374,7 +1381,7 @@ impl Tool for ChromeTool {
             .await;
         // The cosmetic tail rides the step, inside the same per-tab lock: the
         // step's own result is already decided and is never changed by it.
-        self.collapse_step_group(&tab, outcome.as_ref().err()).await;
+        self.settle_step_group(&tab, outcome.as_ref().err()).await;
         outcome
     }
 
@@ -1416,7 +1423,7 @@ impl Tool for ChromeTool {
 impl ChromeTool {
     /// One browser step with the per-tab lock already held: the action's own
     /// dispatch and its output formatting. The step's cosmetic tail is the
-    /// caller's ([`Self::collapse_step_group`]), so it runs on a failure too.
+    /// caller's ([`Self::settle_step_group`]), so it runs on a failure too.
     async fn run_step(
         &self,
         tab: &str,
@@ -1495,13 +1502,15 @@ impl ChromeTool {
         Ok(body)
     }
 
-    /// Leave the tab groups this step's session used collapsed — see [`super::chrome_groups`].
-    /// Cosmetic and best-effort: the tail answers its trouble for this tool's logs, and it can
-    /// never turn the step into a failed one. Skipped when the step provably never reached the
-    /// owner's browser ([`Self::never_reached_the_owner_browser`]), for the shared non-agent
-    /// instance (link enrichment's sessions are out of scope), and when the CLI binary cannot be
-    /// resolved at all.
-    async fn collapse_step_group(&self, tab: &str, step: Option<&anyhow::Error>) {
+    /// Leave this step's tab group as the agent's own — named `✦ agents` and collapsed — see
+    /// [`super::chrome_groups`].
+    /// Cosmetic and best-effort: a tail that did not work is filed once as the product's own issue
+    /// (the Issues view dedupes it, so a host that cannot have the group does not report on every
+    /// step), and it can never turn the step into a failed one. Skipped when the step provably never
+    /// reached the owner's browser ([`Self::never_reached_the_owner_browser`]), for the shared
+    /// non-agent instance (link enrichment's sessions are out of scope), and when the CLI binary
+    /// cannot be resolved at all.
+    async fn settle_step_group(&self, tab: &str, step: Option<&anyhow::Error>) {
         if self.session_prefix.is_empty()
             || step.is_some_and(|error| Self::never_reached_the_owner_browser(&error.to_string()))
         {
@@ -1510,10 +1519,15 @@ impl ChromeTool {
         let Some(cli) = super::chrome_daemon::cli_path() else {
             return;
         };
-        if let Some(trouble) =
-            super::chrome_groups::collapse(&cli, &self.resolve_session(tab)).await
-        {
-            debug!(trouble, "the step's tab group was not left collapsed");
+        let session = self.resolve_session(tab);
+        if let Some(note) = super::chrome_groups::settle(&cli, &session).await {
+            crate::logs::record_issue_once(
+                SETTLE_ISSUE_MESSAGE,
+                note.reason,
+                super::chrome_release::ISSUE_TARGET,
+                json!({ "detail": note.detail, "session": session }),
+            )
+            .await;
         }
     }
 
@@ -3992,11 +4006,11 @@ mod tests {
         }
     }
 
-    /// The collapse tail runs after a failed step unless the failure proves the owner's browser
+    /// The group tail runs after a failed step unless the failure proves the owner's browser
     /// was never reached: a step cut off at a clock may have opened its tab first, so its group
-    /// must still be put back.
+    /// must still be settled.
     #[test]
-    fn a_cut_off_step_still_owes_its_group_a_collapse() {
+    fn a_cut_off_step_still_owes_its_group_a_settle() {
         for message in [
             "chrome-use did not answer within 45s for `open`",
             "command timed out after 30000ms",

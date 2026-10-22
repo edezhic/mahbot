@@ -408,9 +408,9 @@ pub(crate) enum IssueWrite {
     /// The store already held the very fact: nothing was written now, and a caller that tells
     /// the owner about every row it writes has already had its turn.
     AlreadyRecorded,
-    /// No row carries the fact: there is no logs store to write to (the `mahbot chrome` CLI
-    /// dispatches before [`init_tracing`] ever runs, so [`LOG_STORE`] is unset there), or the
-    /// write was attempted and failed ([`record_issue_once`] says what each caller does then).
+    /// No row carries the fact: this process has no logs store (a caller that dispatched before
+    /// [`init_tracing`] ran, so [`LOG_STORE`] is unset), or the write was attempted and failed
+    /// ([`record_issue_once`] says what each caller does then).
     NotRecorded,
 }
 
@@ -441,9 +441,11 @@ async fn write_warn_row(store: &LogStore, entry: LogEntry) -> Result<(), String>
 /// through the tracing writer, which batches and can drop lines) at `WARN`, which
 /// the Issues view shows and the retention pass never reaps — so a repeat is a
 /// duplicate, not news. A store read that fails records anyway, and says so at `WARN`:
-/// the dedupe was skipped, so the row is written without it. Fail-open: no
-/// store (the `mahbot chrome` CLI dispatches before [`init_tracing`]) writes
-/// nothing.
+/// the dedupe was skipped, so the row is written without it. Fail-open: a
+/// process with no store set ([`LOG_STORE`], e.g. the `mahbot chrome` CLI, which
+/// dispatches before [`init_tracing`]) gets [`IssueWrite::NotRecorded`]; that caller's
+/// notes reach the Issues view through the running instance instead
+/// ([`crate::db::ipc::ipc_file_issue`]).
 ///
 /// `fields` is the row's `fields` JSON object; `reason` is written into it here, so
 /// the dedupe key and the stored row can never disagree. The row has no tool
@@ -467,6 +469,18 @@ pub(crate) async fn record_issue_once(
     let Some(store) = LOG_STORE.get() else {
         return IssueWrite::NotRecorded;
     };
+    record_issue_once_in(store, message, reason, target, fields).await
+}
+
+/// [`record_issue_once`] on a store the caller already holds: the IPC listener is handed its logs
+/// store ([`crate::db::ipc::run_ipc_listener`]) and files a storeless client's note with that one.
+pub(crate) async fn record_issue_once_in(
+    store: &LogStore,
+    message: &str,
+    reason: &str,
+    target: &str,
+    fields: serde_json::Value,
+) -> IssueWrite {
     match store.has_reason(message, reason).await {
         // This reason is already in the Issues view: one fact, told once.
         Ok(true) => return IssueWrite::AlreadyRecorded,

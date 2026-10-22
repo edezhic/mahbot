@@ -15,10 +15,16 @@
 //! clocks the [chrome policy](crate::chrome) defines — chrome-use's clock,
 //! declared to it, and the product's own kill above that — as [`StepClocks`]
 //! derives them for this surface. The wait action never exposes `--load`; its one
-//! raw-argv use is `open`'s internal best-effort post-navigation settle. A step in
-//! a NAMED session leaves the tab groups it used collapsed after the envelope is
-//! out ([`crate::tools::chrome_groups`]), reporting any trouble on stderr; an
-//! ephemeral session is closed right after its command and has nothing to leave.
+//! raw-argv use is `open`'s internal best-effort post-navigation settle. A tab an `open` or `click`
+//! step creates in a NAMED session is left as an ordinary tab, outside chrome-use's group, before
+//! the envelope is out; the whole rule, including which verbs report their tab, is
+//! [`crate::tools::chrome_groups`]'. That move needs the session's own tabs, and when the browser
+//! will not answer for them the tab stays inside chrome-use's group: the step still succeeds and
+//! only its note records the miss. The note is filed as the product's once-only issue on the
+//! instance side, so no command repeats it (with no instance to take it, the one line goes to
+//! stderr instead); a browser side with no `extension call` door is not filed at all: that host
+//! fact is the release sweep's. An ephemeral session is closed right after its command and its tab
+//! closes with it.
 //!
 //! ## Session lifetime
 //!
@@ -65,6 +71,7 @@ use crate::tools::chrome_daemon::{
     CliStatus, SessionRecovery, cli_path, cli_probe, cli_version, ensure_ready_for_actions,
     readiness, recover_unresponsive_session, run_cli_bounded_at,
 };
+use crate::tools::chrome_groups::{self, Note, Opened};
 use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, truncate_sandwich};
 use serde_json::{Value, json};
 
@@ -660,10 +667,12 @@ pub async fn run_cli(args: &[String]) -> i32 {
         }
     };
     outcome.envelope.emit();
-    // The action is answered and its envelope is out: the tail is best-effort cleanup, and
-    // its closes are raced against a second interruption, which must end the process at
-    // once instead of waiting one out. A record left by an aborted close is durable and the
-    // lifetime sweep closes it.
+    // The action is answered and its envelope is out: what is left is best-effort cleanup, and
+    // its closes are raced against a second interruption, which must end the process at once
+    // instead of waiting one out. A record left by an aborted close is durable and the lifetime
+    // sweep closes it. A step whose tab tail ran collapsed its groups before the envelope, where
+    // the caller can see its result ([`run_action`]); any other step collapses its groups here,
+    // after the answer — including an `open` whose baseline the browser would not answer.
     //
     // A record this call created that no session-scoped chrome-use spawn was ever
     // attempted for describes nothing: drop it rather than let it linger — especially a
@@ -695,19 +704,17 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 let display = cli_sessions::display_name(&s.name);
                 eprintln!("mahbot chrome: {}", chrome_leftover_pipe_note(display));
             }
-        } else if outcome.envelope.kind != OutKind::Environment
-            && let Some(cli) = cli_path()
+        } else if !outcome.tail_ran
+            && let Some(cli) = tail_cli(&outcome.envelope, s)
         {
-            // A named session outlives the command, so the groups this step used are
-            // still there to leave collapsed — unless the step failed on its
-            // environment, where the tail cannot reach the browser either. An
-            // ephemeral session is closed just above and has nothing to leave, and a
-            // step that never spawned chrome-use attempted nothing in the browser.
-            // Cosmetic and best-effort: trouble is printed here, like the command's
-            // other post-step diagnostics — see `crate::tools::chrome_groups`.
-            if let Some(trouble) = crate::tools::chrome_groups::collapse(&cli, &s.name).await {
-                eprintln!("mahbot chrome: the step's tab group was not left collapsed: {trouble}");
-            }
+            // A named session outlives the command, so the groups this step used are still there
+            // to leave collapsed — unless the step failed on its environment, where the tail cannot
+            // reach the browser either ([`tail_cli`]). A step whose tab tail ran did this before
+            // the envelope ([`run_action`], [`chrome_groups`]); the rest do it here, including an
+            // `open` whose baseline the browser would not answer. Cosmetic and best-effort: its
+            // trouble is filed as the product's once-only issue, not printed per command.
+            let note = chrome_groups::collapse_own_groups(&cli, &s.name);
+            file_tail_trouble(note.await).await;
         }
     }
     // The call is over: its in-flight mark goes, so the session is idle from here — and a
@@ -732,12 +739,14 @@ fn call_session(invocation: &Invocation, keep: bool) -> CliSession {
     }
 }
 
-/// What `dispatch` produced: the envelope, the session the action ran in (for the
-/// close/collapse tail) and whether this call set the keep mark.
+/// What `dispatch` produced: the envelope, the session the action ran in (for the close/collapse
+/// tails), whether this call set the keep mark, and whether the tab tail ran before the envelope
+/// with a client resolved for it — its collapse is then done, and the post-envelope one is skipped.
 struct DispatchOutcome {
     envelope: OutEnvelope,
     session: Option<CliSession>,
     marked: bool,
+    tail_ran: bool,
 }
 
 impl DispatchOutcome {
@@ -747,6 +756,7 @@ impl DispatchOutcome {
             envelope,
             session: None,
             marked: false,
+            tail_ran: false,
         }
     }
 }
@@ -1628,16 +1638,20 @@ async fn dispatch(invocation: &Invocation, session: &CliSession) -> DispatchOutc
     if invocation.action.runs_in_session() {
         run_action(&invocation.action, session).await
     } else {
-        // These calls run no step, but they are still clocked for their envelope.
+        // These calls run no step, but they are still clocked for their envelope. None of them
+        // opens a page, so the tab report the browser actions keep has no reader here.
         let started = Instant::now();
-        let mut env = execute(&invocation.action, &session.name).await;
+        let (mut env, _) = execute(&invocation.action, &session.name).await;
         stamp_elapsed(&mut env, started);
         DispatchOutcome::plain(env)
     }
 }
 
 /// One action that drives the browser in its session: the pre-flight, the record of this
-/// call's use, the step itself, and the envelope's post-step facts.
+/// call's use, the step itself, and the envelope's post-step facts. The action's clock starts
+/// before the pre-flight and is stamped onto the envelope right after the step, so `elapsed_ms`
+/// covers the pre-flight, `open`'s baseline read and the step; the wedge recovery and the group
+/// tail that follow are outside it (the tail is still inside the caller's wall time).
 async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     // The action's own clock: every envelope it returns — refusals included — is stamped
     // with it (see [`stamp_elapsed`]).
@@ -1650,7 +1664,16 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     // backstop, or the cleanup switched off for a kept one.
     set_group_cleanup_backstop(cli_sessions::backstop_ms(use_outcome.kept));
     CLI_STEP_KILLED_BY_CLOCK.store(false, Ordering::Relaxed);
-    let mut env = execute(action, &session.name).await;
+    // `open` names no tab in its reply, so the tabs the session already had are read before the
+    // step to tell the one it creates apart later; every other verb's own tab comes from its
+    // reply ([`chrome_groups`]). An unreadable answer only costs the moving — the tab then stays in
+    // chrome-use's group — and the note is filed as the product's once-only issue. The pre-flight
+    // has already refused a step its own arguments reject, so no listing is spent on one.
+    let tabs_before = match action {
+        Action::Open { .. } if !session.ephemeral => tabs_before_open(&session.name).await,
+        _ => None,
+    };
+    let (mut env, opened_tab) = execute(action, &session.name).await;
     // Read the kill attribution before ANY recovery call — hygiene only: the wedge
     // probe's own steps are probes ([`CliRecovery::Suppressed`]), so they cannot
     // re-attribute this action's ending.
@@ -1669,19 +1692,97 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     // A session that stopped answering is RECOVERED here — the one place the resolved
     // session name is in scope — and the envelope's error text says what was done
     // ([`recover_session_wedge`]). Whether the session is named is the resolution's own
-    // answer ([`CliSession::ephemeral`]), not re-derived from the name.
+    // answer ([`CliSession::ephemeral`]), not re-derived from the name. It runs before the group
+    // tail below: a wedged session answers no listing, so the tail would spend its bound on a
+    // daemon the recovery is about to replace.
     recover_session_wedge(&mut env, &session.name, !session.ephemeral, killed_by_clock).await;
+    // The tab this step created is taken out of chrome-use's group here, before the caller sees
+    // the result, and the groups this session's tabs sit in are collapsed — see [`chrome_groups`]
+    // for the whole rule. Best-effort: its trouble is filed as the product's once-only issue and
+    // never becomes the step's own failure. A step whose tab the tail has no way to establish — no
+    // tab created, or an `open` baseline the browser would not answer — leaves the collapse to the
+    // post-envelope tail ([`run_cli`]), so its answer is not held back by browser work it does not
+    // depend on.
+    let opened = match (tabs_before.as_ref(), opened_tab.as_deref()) {
+        (Some(before), _) => Some(Opened::Baseline(before)),
+        (None, Some(tab)) => Some(Opened::Tab(tab)),
+        (None, None) => None,
+    };
+    let mut tail_ran = false;
+    if let (Some(opened), Some(cli)) = (opened, tail_cli(&env, session).as_deref()) {
+        tail_ran = true;
+        let note = chrome_groups::leave_command_line_tabs(cli, &session.name, opened);
+        file_tail_trouble(note.await).await;
+    }
     DispatchOutcome {
         envelope: env,
         session: Some(session.clone()),
         marked: use_outcome.marked,
+        tail_ran,
     }
 }
 
+/// The tabs the session has created before an `open` step — the baseline its reply cannot give.
+/// `None` when there is nothing to compare against: the browser would not answer (its note is
+/// filed, and the step's tab then stays in chrome-use's group) or the helper cannot be resolved at
+/// all.
+async fn tabs_before_open(session: &str) -> Option<std::collections::BTreeSet<i64>> {
+    let cli = cli_path()?;
+    match chrome_groups::created_tabs(&cli, session).await {
+        Ok(tabs) => Some(tabs),
+        Err(note) => {
+            file_tail_trouble(note).await;
+            None
+        }
+    }
+}
+
+/// File a tail's note as the product's once-only issue. The command line dispatches before any store
+/// exists, so the fact travels to the running instance ([`crate::db::ipc::ipc_file_issue`]) on one
+/// short-bounded attempt. The Issues view dedupes on the note's own reason, so one cause is one row
+/// however many commands meet it; with no instance to take it there is no view to dedupe in, and the
+/// line goes to stderr — the one place a standalone caller can see it.
+async fn file_tail_trouble(note: Option<Note>) {
+    let Some(note) = note else { return };
+    let filed = match crate::config::default_config_dir() {
+        Ok(root) => {
+            crate::db::ipc::ipc_file_issue(
+                &root,
+                chrome_groups::STEP_ISSUE_MESSAGE,
+                note.reason,
+                crate::tools::chrome_release::ISSUE_TARGET,
+                json!({ "detail": note.detail }),
+            )
+            .await
+        }
+        Err(_) => false,
+    };
+    if !filed {
+        eprintln!("mahbot chrome: {}", note.detail);
+    }
+}
+
+/// The chrome-use binary a step's group tail drives, when the step's session can be reached at all:
+/// a named session whose step ran — not one refused on its environment — after the helper actually
+/// spawned. The one place that condition is spelled out; the pre-envelope tab tail and the
+/// post-envelope collapse both read it here.
+fn tail_cli(env: &OutEnvelope, session: &CliSession) -> Option<std::path::PathBuf> {
+    if env.kind == OutKind::Environment
+        || !CHROME_USE_SPAWNED.load(Ordering::Relaxed)
+        || session.ephemeral
+    {
+        return None;
+    }
+    cli_path()
+}
+
 /// Every action's own work, in one place: the report/repair verbs [`dispatch`] answers
-/// session-unscoped, and the browser actions it wraps in the pre-flight and the tail.
-async fn execute(action: &Action, name: &str) -> OutEnvelope {
-    match action {
+/// session-unscoped, and the browser actions it wraps in the pre-flight and the tail. `opened` is
+/// the tab a verb's reply named as one its page opened — a `click` sets it, every other verb leaves
+/// it alone; it is the caller's own local, never process state.
+async fn execute(action: &Action, name: &str) -> (OutEnvelope, Option<String>) {
+    let mut opened = None;
+    let env = match action {
         Action::Status => status().await,
         Action::SessionStop { name, force } => session_stop(name, *force).await,
         Action::SessionStatus { name } => session_status(name).await,
@@ -1705,7 +1806,11 @@ async fn execute(action: &Action, name: &str) -> OutEnvelope {
             selector,
             if_present,
             bound,
-        } => click(selector, *if_present, *bound, name).await,
+        } => {
+            let (env, tab) = click(selector, *if_present, *bound, name).await;
+            opened = tab;
+            env
+        }
         Action::Fill {
             selector,
             source,
@@ -1723,7 +1828,8 @@ async fn execute(action: &Action, name: &str) -> OutEnvelope {
             hold,
             bound,
         } => press(key, selector.as_deref(), *hold, *bound, name).await,
-    }
+    };
+    (env, opened)
 }
 
 /// The action's pre-flight: the pure argument checks, the keep contract, the helper's
@@ -2876,10 +2982,10 @@ async fn click(
     if_present: bool,
     bound: Option<Duration>,
     session: &str,
-) -> OutEnvelope {
+) -> (OutEnvelope, Option<String>) {
     let path = match require_cli("click", request([("selector", json!(selector))])) {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => return (e, None),
     };
     let mut args = vec!["click".to_string(), selector.to_string()];
     if if_present {
@@ -2888,8 +2994,25 @@ async fn click(
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
     match spawn_step(&path, &refs, Some(session), clocks, None).await {
-        Ok(_) => out_env("click", true, OutKind::Ok, json!({ "selector": selector })),
-        Err(f) => f.envelope("click", json!({ "selector": selector }), clocks),
+        Ok(resp) => {
+            // A page the click opens is reported by chrome-use (its reply names the tab); the
+            // step's tail takes it out of chrome-use's group ([`chrome_groups`]), which is why the
+            // id rides back with the envelope rather than into its result.
+            let opened = resp
+                .data
+                .as_ref()
+                .and_then(|data| data.pointer("/openedTab/tabId"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            (
+                out_env("click", true, OutKind::Ok, json!({ "selector": selector })),
+                opened,
+            )
+        }
+        Err(f) => (
+            f.envelope("click", json!({ "selector": selector }), clocks),
+            None,
+        ),
     }
 }
 

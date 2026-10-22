@@ -66,12 +66,14 @@
 //! and the residue of earlier runs and versions — are reclaimed unprompted by a sweep of the
 //! browser's live tab groups whose title starts with `crate::tools::chrome::AGENT_TAB_PREFIX`
 //! ([`crate::tools::chrome_tabs::agent_group_names`]), so the product does not depend on a
-//! run-end hook having fired. It asks at the start of the process only when the durable record
-//! file handed it something, and after that only while something is unfinished or an event arms
-//! one ([`schedule_reclaim_now`] — a run end or a queue-cap eviction — a parked verdict's
-//! revisit ([`schedule_reclaim_revisit`]), a record concluding with leftovers no route closed,
-//! [`reclaim_unfinished`]) — never on a timer, so an idle product asks the browser nothing and a
-//! start with nothing pending opens no page. Its reads borrow the sessions the records name
+//! run-end hook having fired. The sweep matches a live title exactly; which titles carry a
+//! session name is chrome-use's grouping rule, not this sweep's
+//! ([`crate::tools::chrome_tabs`]' honest limits). It asks at the start of the process only when
+//! the durable record file handed it something, and after that only while something is unfinished
+//! or an event arms one ([`schedule_reclaim_now`] — a run end or a queue-cap eviction — a parked
+//! verdict's revisit ([`schedule_reclaim_revisit`]), a record concluding with leftovers no route
+//! closed, [`reclaim_unfinished`]) — never on a timer, so an idle product asks the browser nothing
+//! and a start with nothing pending opens no page. Its reads borrow the sessions the records name
 //! ([`read_session`]), so the product's own scratch group appears only for a leftover no record
 //! names any more. [`ProtectedNamespaces`] is the set it leaves alone, and it does not
 //! re-interrogate what it has already concluded. The product's other scratch families are NOT
@@ -2142,8 +2144,9 @@ fn names_a_namespace(prefix: &str, name: &str) -> bool {
     !prefix.is_empty() && name.starts_with(prefix)
 }
 
-/// The `target` every row this module files with the Issues view carries.
-const ISSUE_TARGET: &str = "chrome-tabs";
+/// The `target` every row of the chrome-tabs issue family carries: this module's leftover and
+/// reclaim reports, and the agent tool's own un-settled group report.
+pub(crate) const ISSUE_TARGET: &str = "chrome-tabs";
 /// The one durable message every leftover report carries — stable, because the Issues
 /// view dedupes on the `(message, reason)` pair.
 const LEFTOVER_MESSAGE: &str = "agent-run browser tabs could not be closed automatically";
