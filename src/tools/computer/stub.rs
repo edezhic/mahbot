@@ -3,8 +3,8 @@
 //! advertised here, because the capability itself is absent.
 
 use super::core::{
-    self, AppInfo, Backend, Capture, ElementAct, Impact, Locator, Observation, RawInput,
-    SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
+    self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation,
+    RawInput, SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
 };
 
 pub(crate) static STUB_BACKEND: StubBackend = StubBackend;
@@ -65,7 +65,11 @@ impl Backend for StubBackend {
         Err(Self::unsupported("cursor_position"))
     }
 
-    async fn capture(&self, _target: &TargetSpec) -> anyhow::Result<Capture> {
+    async fn capture(
+        &self,
+        _target: &TargetSpec,
+        _budget: &CaptureBudget,
+    ) -> anyhow::Result<Capture> {
         Err(Self::unsupported("capture"))
     }
 }

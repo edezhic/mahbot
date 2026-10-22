@@ -23,6 +23,37 @@
 //! The agent-facing description is the shared `src/prompt/tool/computer.md` plus
 //! only the running platform's own file ([`PLATFORM_DESCRIPTION`]): one
 //! installation is one platform, so no agent is handed another's caveats.
+//!
+//! # Bounded by the product, not by the machine
+//!
+//! This process aborts on a failed allocation, so no figure the machine reports may
+//! decide how much is allocated: one [`core::CaptureBudget`] per capture call bounds
+//! every pixel buffer the call holds at once, and every string a read keeps is capped
+//! at [`core::MAX_VALUE_CHARS`] (values) or [`core::MAX_NAME_CHARS`] (names and
+//! labels) where it is read. A refusal is `degraded` and names the ceiling, the
+//! geometry and what the call already holds; a cut is stated in the observation
+//! header, or marked by the ellipsis where the string is a label. The accounting and
+//! its reasoning live in [`core`].
+//!
+//! # Manual check (run once on a machine of each platform)
+//!
+//! Computer use is offered only to the admin's Assistant, so what can be checked
+//! automatically is the accounting, not the pixels:
+//!
+//! 1. `screenshot { target: "screen" }` on an ordinary display: the image is the
+//!    same as before, the summary names its size and the PNG is attached.
+//! 2. `zoom` over a quarter of that screen: the same crop as before, no refusal.
+//! 3. `observe` a document or a browser page: the tree reads as before. A field
+//!    holding more than 2000 characters shows its first 120 and the header states
+//!    both cuts on macOS and Windows (`1 value cut at 2000 chars`, `1 value cut at
+//!    120 chars`); Linux reads a value only one character past the dump, so it
+//!    states the display cut alone.
+//! 4. A refusal needs a call whose live buffers together exceed 128 Mi pixels — a
+//!    whole-desktop `zoom` on a wall of four or more 6K displays, or a framework
+//!    reporting an absurd geometry — so it is not reachable from an ordinary desktop:
+//!    the accounting is verified by the unit tests on [`core::CaptureBudget`] and
+//!    [`core::Capture::alloc`], and the other platforms by the cross-compile lanes in
+//!    `scripts/`.
 
 mod core;
 mod linux;
@@ -1083,8 +1114,12 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
     // One resolution for the whole call: the surface captured, the geometry the
     // region is mapped against and the surface pinned afterwards are the same.
     let target = resolve_surface(target).await?;
+    // One allowance for everything this call holds at once — the frame, the composite
+    // and the crop — so no reported geometry can drive an allocation the process
+    // cannot survive.
+    let budget = core::CaptureBudget::default();
 
-    let capture_result = backend().capture(&target).await;
+    let capture_result = backend().capture(&target, &budget).await;
     let cap = match capture_result {
         Ok(cap) => {
             // A successful capture proves the channel works — always refresh the
@@ -1115,7 +1150,10 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
     let (cropped, rect_opt) = match region {
         Some(region) => {
             let rect = core::region_to_pixels(region, cap.width, cap.height)?;
-            (core::crop_rgba(&cap, rect)?, Some(rect))
+            (
+                core::crop_rgba(&cap, rect, &budget, "the zoom crop")?,
+                Some(rect),
+            )
         }
         None => (cap, None),
     };
@@ -1155,13 +1193,13 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
 
 /// Encode a capture to PNG on disk (CPU + fs work offloaded with
 /// [`crate::util::with_block_in_place`]), returning the random-nonce path under
-/// the managed agent temp `computer/` dir.
+/// the managed agent temp `computer/` dir. The encode holds no second pixel copy
+/// ([`image::RgbaImage::from_raw`] takes the buffer over) and its compressed output
+/// is bounded by the pixels it encodes, which the call's budget already capped.
 fn encode_png(cap: Capture) -> anyhow::Result<PathBuf> {
-    let Capture {
-        width,
-        height,
-        rgba,
-    } = cap;
+    // The claim rides with the pixels: the call keeps paying for them until the encode
+    // is done with them.
+    let (width, height, rgba, _claim) = cap.into_parts();
     crate::util::with_block_in_place(move || {
         let img = image::RgbaImage::from_raw(width, height, rgba)
             .ok_or_else(|| anyhow::anyhow!("capture dimensions mismatch"))?;

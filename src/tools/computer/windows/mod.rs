@@ -184,8 +184,8 @@ mod window;
 
 use self::thread::Call;
 use super::core::{
-    AppInfo, Backend, Capture, ElementAct, Impact, Locator, Observation, RawInput, SurfaceGeometry,
-    TargetSpec, WindowInfo, WindowListing,
+    AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation, RawInput,
+    SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
 };
 use async_trait::async_trait;
 use std::time::Duration;
@@ -302,8 +302,15 @@ impl Backend for WindowsBackend {
         thread::submit(Call::CursorPosition, LIST_TIMEOUT).await
     }
 
-    async fn capture(&self, target: &TargetSpec) -> anyhow::Result<Capture> {
-        let target = target.clone();
-        thread::submit(Call::Capture { target }, CAPTURE_TIMEOUT).await
+    async fn capture(
+        &self,
+        target: &TargetSpec,
+        budget: &CaptureBudget,
+    ) -> anyhow::Result<Capture> {
+        let call = Call::Capture {
+            target: target.clone(),
+            budget: budget.clone(),
+        };
+        thread::submit(call, CAPTURE_TIMEOUT).await
     }
 }

@@ -14,11 +14,14 @@
 //!
 //! Reading is capped lower than on the other platforms (2000 nodes) because UIA
 //! charges one cross-process call per property. A node or depth cap stops the walk
-//! and is recorded in the observation's truncation, which the header names; a
-//! provider that runs out of TIME is different and abandons the whole read with an
-//! honest `degraded` timeout rather than returning half of a tree. A provider that
-//! refuses a single child or property only ends that subtree or leaves one field
-//! absent, the way a broken accessibility attribute does on the other platforms.
+//! and is recorded in the observation's truncation, which the header names; a name or
+//! a value is kept to `core::MAX_NAME_CHARS` / `core::MAX_VALUE_CHARS` where the tree
+//! takes it, the cut stated in that same header, because a document-shaped field
+//! reports a whole file as its value. A provider that runs out of TIME is different
+//! and abandons the whole read with an honest `degraded` timeout rather than returning
+//! half of a tree. A provider that refuses a single child or property only ends that
+//! subtree or leaves one field absent, the way a broken accessibility attribute does
+//! on the other platforms.
 
 use super::super::core::{
     self, ElementAct, Impact, Locator, Observation, SurfaceGeometry, TargetSpec, Truncation, UiNode,
@@ -62,11 +65,6 @@ pub(super) const WALK_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_NODES: usize = 2000;
 /// Depth per walk — a guard against provider cycles, like the other backends'.
 const MAX_DEPTH: usize = 25;
-/// Cap on a value pulled into a node, mirroring the Linux backend's.
-const MAX_VALUE_CHARS: usize = 2000;
-/// Cap on an element name; a name is a label, not a document. A name cut here is
-/// counted in the observation's truncation.
-const MAX_NAME_CHARS: usize = 200;
 
 /// Roles whose value is worth a second cross-process read.
 const VALUE_ROLES: &[&str] = &[
@@ -90,12 +88,16 @@ pub(super) fn observe(uia: &IUIAutomation, target: &TargetSpec) -> anyhow::Resul
     let resolved = window::resolve(target)?;
     let element = window_element(uia, &resolved)?;
     let tree = build_tree(uia, &element, resolved.surface)?;
+    let mut truncation = tree.truncation;
+    // The header keeps the whole title to the same cap as a name and, unlike a
+    // listing's label, states the cut.
+    let window_title = Some(truncation.keep_name(&window::title_text(resolved.hwnd)));
     Ok(Observation {
         app_name: resolved.app_name,
-        window_title: Some(resolved.title),
+        window_title,
         surface: resolved.surface,
         root: tree.root,
-        truncation: tree.truncation,
+        truncation,
     })
 }
 
@@ -237,12 +239,7 @@ fn read_node(
         .ok()
         .map(|name| name.to_string())
         .filter(|name| !name.is_empty())
-        .map(|name| {
-            if name.chars().count() > MAX_NAME_CHARS {
-                truncation.cut_name(MAX_NAME_CHARS);
-            }
-            crate::util::truncate(&name, MAX_NAME_CHARS)
-        });
+        .map(|name| truncation.keep_name(&name));
     // SAFETY: `element` is live; the rectangle is returned by value.
     let frame = unsafe { element.CurrentBoundingRectangle() }
         .ok()
@@ -251,7 +248,7 @@ fn read_node(
         // SAFETY: `element` is live and the focus flag comes back by value.
         unsafe { element.CurrentHasKeyboardFocus() }.is_ok_and(windows::core::BOOL::as_bool);
     let value = if VALUE_ROLES.contains(&role) {
-        read_value(element)
+        read_value(element).map(|value| truncation.keep_value(&value))
     } else {
         None
     };
@@ -266,6 +263,9 @@ fn read_node(
     }
 }
 
+/// One element's value, whole, as the marshaller handed it over — the caller keeps it
+/// through [`Truncation::keep_value`], where the read's cap applies and the cut is
+/// stated in the observation's header.
 fn read_value(element: &IUIAutomationElement) -> Option<String> {
     // SAFETY: `element` is live; the password flag is returned by value.
     if unsafe { element.CurrentIsPassword() }.is_ok_and(windows::core::BOOL::as_bool) {
@@ -279,11 +279,7 @@ fn read_value(element: &IUIAutomationElement) -> Option<String> {
     // SAFETY: `pattern` is that owned `IUIAutomationValuePattern`; the value is an
     // owned `BSTR`.
     let value = unsafe { pattern.CurrentValue() }.ok()?.to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(crate::util::truncate(&value, MAX_VALUE_CHARS))
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 /// A global physical rect as the surface-local `(x, y, w, h)` a [`UiNode`] carries.

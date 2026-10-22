@@ -31,6 +31,10 @@
 //! limit of the AT-SPI walk. Input synthesis is fire-and-forget, so a gesture that
 //! was partly delivered reports what may still be held or half-applied rather than
 //! failing as if nothing happened.
+//!
+//! Nor is anything sized by what the machine reports: a name or a value is cut at
+//! the product's cap as it is read, and every still buffer is charged to the call's
+//! allowance. The accounting and its reasoning live in [`core`].
 
 #![cfg(target_os = "linux")]
 // A handful of pedantic cast lints are inherent to the C ABI-style integer
@@ -46,9 +50,9 @@
 )]
 
 use super::core::{
-    self, AppInfo, Backend, Capture, ElementAct, Impact, Locator, Modifier, MouseButton,
-    Observation, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, Truncation, UiNode,
-    UnreadWindows, WindowInfo, WindowKey, WindowListing,
+    self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Modifier,
+    MouseButton, Observation, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, Truncation,
+    UiNode, UnreadWindows, WindowInfo, WindowKey, WindowListing,
 };
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::anyhow;
@@ -64,6 +68,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncReadExt as _;
 use tracing::debug;
 use x11rb::connection::{Connection as _, RequestConnection as _};
 use x11rb::protocol::{randr, xproto};
@@ -82,10 +87,10 @@ pub(crate) struct LinuxBackend {
 
 const MAX_DEPTH: usize = 25;
 /// Cap on text read into a node's `value`: one character past what the renderer
-/// shows, so it can tell a value was cut and state it in the observation header.
-/// The tree dump is a map of the surface, not a copy of its text, so there is no
-/// reason to carry more across D-Bus than the model could ever see.
-const MAX_VALUE_CHARS: i32 = core::RENDER_VALUE_CHARS as i32 + 1;
+/// shows. The tree dump is a map of the surface, not a copy of its text, so one
+/// character more than the renderer displays is enough to know the value was cut —
+/// and the renderer's own count states that cut in the header.
+const VALUE_READ_CHARS: i32 = core::RENDER_VALUE_CHARS as i32 + 1;
 const INTERP_STEPS: usize = 12;
 
 const CONN_DEGRADED_MSG: &str =
@@ -128,9 +133,13 @@ impl LinuxBackend {
     /// Screen-channel still: X11 full capture or the single portal attempt,
     /// caching dims for zoom. Window stills crop out of this in `capture`, through
     /// [`window_still`] (which reconciles the accessibility and pixel spaces).
-    async fn capture_screen_channel(&self) -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
+    /// Every buffer either route holds is charged to the call's `budget`.
+    async fn capture_screen_channel(
+        &self,
+        budget: &CaptureBudget,
+    ) -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
         if wayland_env() {
-            let cap = portal_screenshot().await?;
+            let cap = portal_screenshot(budget).await?;
             let geo = SurfaceGeometry {
                 x: 0.0,
                 y: 0.0,
@@ -141,7 +150,7 @@ impl LinuxBackend {
             *SCREEN_DIMS.lock().unwrap_poison() = Some((cap.width, cap.height));
             Ok((cap, geo))
         } else {
-            with_block_in_place(x11_capture_screen)
+            with_block_in_place(|| x11_capture_screen(budget))
         }
     }
 }
@@ -345,7 +354,7 @@ async fn enumerate_apps(
         let Some(accessible) = app_ref.as_accessible_proxy(conn.connection()).await.ok() else {
             continue;
         };
-        let name = accessible.name().await.unwrap_or_default();
+        let name = core::cap_label(&accessible.name().await.unwrap_or_default());
         if name.is_empty() {
             continue;
         }
@@ -363,7 +372,7 @@ async fn app_info_of(
         .as_accessible_proxy(conn.connection())
         .await
         .map_err(|e| dbus_err(e, "open application"))?;
-    let name = accessible.name().await.unwrap_or_default();
+    let name = core::cap_label(&accessible.name().await.unwrap_or_default());
     Ok(AppInfo { pid: None, name })
 }
 
@@ -415,7 +424,7 @@ async fn app_window_handles(
         if !is_window_role(role) {
             continue;
         }
-        let title = ca.name().await.unwrap_or_default();
+        let title = core::cap_label(&ca.name().await.unwrap_or_default());
         let state = ca.get_state().await.unwrap_or_default();
         let Some(surface) = window_screen_extents(&ca).await else {
             continue;
@@ -453,9 +462,9 @@ async fn refuse_minimized(proxy: &AccessibleProxy<'_>) -> Result<(), anyhow::Err
         .await
         .is_ok_and(|state| state.contains(AtspiState::Iconified))
     {
-        return Err(core::minimized_window(
+        return Err(core::minimized_window(&core::cap_label(
             &proxy.name().await.unwrap_or_default(),
-        ));
+        )));
     }
     Ok(())
 }
@@ -693,11 +702,13 @@ async fn a11y_pixel_scale(
 /// The extents are taken to be screen-relative, which is what `CoordType::Screen`
 /// asks for; a toolkit that answers with window-relative extents cannot be told
 /// apart from the accessibility data, so its crop is the wrong part of the screen.
+/// The crop is a buffer of its own, so it is charged to the call's `budget`.
 async fn window_still(
     conn: &AccessibilityConnection,
     win: &SurfaceGeometry,
     cap: &Capture,
     cap_geo: &SurfaceGeometry,
+    budget: &CaptureBudget,
 ) -> Result<Capture, anyhow::Error> {
     let scale = a11y_pixel_scale(conn, Some((cap.width, cap.height))).await?;
     // The crop is clamped to the captured screen, so a window that hangs off it
@@ -706,6 +717,8 @@ async fn window_still(
     core::crop_rgba(
         cap,
         core::window_capture_rect(&core::scale_geometry(*win, scale), cap_geo)?,
+        budget,
+        "the window still",
     )
 }
 
@@ -732,9 +745,18 @@ async fn walk_node(
     handles.push(object_ref.clone());
 
     let role = role_name(accessible.get_role().await.unwrap_or(Role::Unknown));
-    let name = accessible.name().await.ok();
+    // A name is what a ref falls back to matching on and a title can be a document,
+    // so it is capped at the read's own limit and a cut is stated in the header.
+    let name = accessible
+        .name()
+        .await
+        .ok()
+        .map(|name| truncation.keep_name(&name));
     let proxies = accessible.proxies().await.ok();
 
+    // Read one character past what the renderer shows ([`VALUE_READ_CHARS`]), so the
+    // value never needs the shared read cap and the renderer's own count states the
+    // display cut in the header.
     let value = tree_value(proxies.as_ref(), &role).await;
     let frame = tree_frame(proxies.as_ref()).await;
     let actions = tree_actions(proxies.as_ref()).await;
@@ -810,9 +832,9 @@ async fn tree_value(proxies: Option<&Proxies<'_>>, role: &str) -> Option<String>
     if count <= 0 {
         return None;
     }
-    // A text longer than the cap is read up to it and shortened, never dropped:
-    // an absent value would read as "this field is empty".
-    text.get_text(0, count.min(MAX_VALUE_CHARS)).await.ok()
+    // A text longer than the cap is read up to it and shown cut, never dropped: an
+    // absent value would read as "this field is empty".
+    text.get_text(0, count.min(VALUE_READ_CHARS)).await.ok()
 }
 
 async fn tree_frame(proxies: Option<&Proxies<'_>>) -> Option<(f64, f64, f64, f64)> {
@@ -1475,7 +1497,10 @@ fn x11_screen_geometry() -> Result<SurfaceGeometry, anyhow::Error> {
 /// drawable origin == union min (a pixmap has no negative indices), so
 /// screen→drawable mapping is always `coord - union_min`: one global
 /// coordinate system, no mixed spaces.
-fn x11_capture_screen() -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
+///
+/// The composite and every tile are charged to the call's `budget`, so a display
+/// arrangement the server reports as enormous is refused before it is allocated.
+fn x11_capture_screen(budget: &CaptureBudget) -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
     let (conn, screen) = x11rb::connect(None)
         .map_err(|e| core::taxonomy_error(core::ERR_DEGRADED, format!("no X11 display: {e}")))?;
     let root = conn.setup().roots[screen].root;
@@ -1501,7 +1526,7 @@ fn x11_capture_screen() -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
     }
     let (ox, oy) = (geo.x.round() as i32, geo.y.round() as i32);
     let (out_w, out_h) = (w as usize, h as usize);
-    let mut rgba = vec![0u8; out_w * out_h * 4];
+    let mut composite = Capture::alloc(budget, "the virtual desktop", w, h)?;
     for &(rx, ry, rw, rh) in &rects {
         if rw <= 0 || rh <= 0 {
             continue;
@@ -1532,32 +1557,26 @@ fn x11_capture_screen() -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
                     "X11 capture failed",
                 ));
             };
-            let tile =
-                core::x11_pixels_to_rgba(&reply.data, tile_w, tile_h, reply.depth, lsb_first)?;
-            let tile_cap = Capture {
-                width: tile_w,
-                height: tile_h,
-                rgba: tile,
-            };
+            let tile = core::x11_pixels_to_rgba(
+                &reply.data,
+                tile_w,
+                tile_h,
+                reply.depth,
+                lsb_first,
+                budget,
+            )?;
             core::blit_rgba(
-                &mut rgba,
+                &mut composite.rgba,
                 out_w,
                 out_h,
-                &tile_cap,
+                &tile,
                 (rx - ox) as usize,
                 (ry - oy + y) as usize,
             );
             y += tile_h as i32;
         }
     }
-    Ok((
-        Capture {
-            width: w,
-            height: h,
-            rgba,
-        },
-        geo,
-    ))
+    Ok((composite, geo))
 }
 
 // ── Wayland stills (Screenshot portal over zbus) ──────────────────────────
@@ -1574,6 +1593,13 @@ static PORTAL_TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
 const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const PORTAL_IFACE: &str = "org.freedesktop.portal.Screenshot";
+
+/// Ceiling on the encoded file the Screenshot portal hands over. The portal chooses
+/// the image, so this is a FILE limit, separate from what the decode will honour
+/// (the shared raster envelope, itself capped by what the call has left): a PNG of
+/// any surface this tool can hold is far below it, and a larger file is refused
+/// unread.
+const PORTAL_FILE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The session bus has a portal owner. Never pops a dialog — safe as a probe.
 /// Uses an untyped proxy: the generated `DBus` proxy trait is crate-private in
@@ -1600,7 +1626,7 @@ async fn portal_available() -> bool {
 
 /// Single Screenshot-portal attempt: subscribe for the `Response` signal first
 /// (a fast compositor can't beat the subscription), then call, then wait.
-async fn portal_screenshot() -> Result<Capture, anyhow::Error> {
+async fn portal_screenshot(budget: &CaptureBudget) -> Result<Capture, anyhow::Error> {
     let conn = zbus::Connection::session().await.map_err(|e| {
         core::taxonomy_error(
             core::ERR_DEGRADED,
@@ -1679,7 +1705,7 @@ async fn portal_screenshot() -> Result<Capture, anyhow::Error> {
                         format!("portal response decode failed: {e}"),
                     )
                 })?;
-            return portal_response(code, results).await;
+            return portal_response(code, results, budget).await;
         }
         Err(core::taxonomy_error(
             core::ERR_DEGRADED,
@@ -1696,11 +1722,45 @@ async fn portal_screenshot() -> Result<Capture, anyhow::Error> {
         })?
 }
 
+/// The portal's image file, read through a bounded reader: at most
+/// [`PORTAL_FILE_MAX_BYTES`] are taken, so a file that grew past it after it was
+/// opened is refused instead of loaded whole.
+async fn read_portal_file(path: &std::path::Path) -> Result<Vec<u8>, anyhow::Error> {
+    let unreadable = |e: std::io::Error| {
+        core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!("portal screenshot unreadable: {e}"),
+        )
+    };
+    let file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    let mut bytes = Vec::new();
+    file.take(PORTAL_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > PORTAL_FILE_MAX_BYTES {
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "portal screenshot is larger than the {} MiB this tool reads — not read; \
+                 accessibility observe/act remain available",
+                PORTAL_FILE_MAX_BYTES / (1024 * 1024),
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// `Response` signal body → pixels. Response 1 is an in-dialog deny/dismiss:
-/// opt-in consent, no auto-retry.
+/// opt-in consent, no auto-retry. Nothing here is sized by the compositor: the file
+/// is read under this product's own ceiling, the decode is bounded by what is left of
+/// the call's allowance, and the RGBA this path keeps is a claimed buffer — so
+/// neither a compositor nor a crafted PNG can drive an allocation this call cannot
+/// survive.
 async fn portal_response(
     code: u32,
     results: HashMap<String, zbus::zvariant::OwnedValue>,
+    budget: &CaptureBudget,
 ) -> Result<Capture, anyhow::Error> {
     match code {
         0 => {
@@ -1714,27 +1774,41 @@ async fn portal_response(
                 core::taxonomy_error(core::ERR_DEGRADED, format!("portal uri not a string: {e}"))
             })?;
             let path = core::portal_uri_to_path(&uri)?;
-            let read = tokio::fs::read(&path).await;
+            let read = read_portal_file(&path).await;
             tokio::fs::remove_file(&path).await.ok();
-            let bytes = read.map_err(|e| {
+            let bytes = read?;
+            // Two ceilings on the decode: the shared raster envelope, and what is left of
+            // this call's allowance (`remaining` counts RGBA pixels, four bytes each).
+            // The refusal states the one that was applied.
+            let mut limits = crate::util::media_target::raster_decode_limits();
+            let decode_cap = crate::util::media_target::RASTER_DECODE_MAX_ALLOC_BYTES
+                .min(budget.remaining().saturating_mul(4));
+            limits.max_alloc = Some(decode_cap);
+            let img = with_block_in_place(move || {
+                crate::util::media_target::decode_raster_image(&bytes, limits)
+            })
+            .map_err(|e| {
                 core::taxonomy_error(
                     core::ERR_DEGRADED,
-                    format!("portal screenshot unreadable: {e}"),
+                    format!(
+                        "portal screenshot undecodable: {e} (this tool decodes a portal image \
+                             at most {} px on a side within {} MiB)",
+                        crate::util::media_target::RASTER_DECODE_MAX_DIMENSION_PX,
+                        decode_cap / (1024 * 1024),
+                    ),
                 )
             })?;
-            let img =
-                with_block_in_place(move || image::load_from_memory(&bytes)).map_err(|e| {
-                    core::taxonomy_error(
-                        core::ERR_DEGRADED,
-                        format!("portal screenshot undecodable: {e}"),
-                    )
-                })?;
-            let rgba = img.to_rgba8();
-            Ok(Capture {
-                width: rgba.width(),
-                height: rgba.height(),
-                rgba: rgba.into_raw(),
-            })
+            let (w, h) = core::capture_size(
+                "the portal screenshot",
+                img.width() as usize,
+                img.height() as usize,
+            )?;
+            // The RGBA this path keeps is a claimed buffer: charging it BEFORE the
+            // conversion is made refuses an image this call cannot hold instead of
+            // converting it. The decode above is transient and bounded by the same
+            // allowance, so this path peaks at that decode plus the claimed RGBA.
+            let claim = budget.charge("the portal screenshot", w, h)?;
+            Ok(Capture::adopt(claim, w, h, img.into_rgba8().into_raw()))
         }
         1 => Err(core::taxonomy_error(
             core::ERR_DEGRADED,
@@ -1909,14 +1983,20 @@ impl Backend for LinuxBackend {
         let surface = window_screen_extents(&proxy)
             .await
             .ok_or_else(|| anyhow!("window geometry unavailable"))?;
-        let title = proxy.name().await.ok();
-        let (root, _handles, truncation) = build_tree(&window_ref, &conn).await;
+        let (root, _handles, mut truncation) = build_tree(&window_ref, &conn).await;
+        // The header shows the window's title, so it is capped like a tree name and a
+        // cut is counted in the same ceiling.
+        let window_title = proxy
+            .name()
+            .await
+            .ok()
+            .map(|title| truncation.keep_name(&title));
         let app_name = target
             .app()
             .map_or_else(|| app_info.name.clone(), |(_, name)| name.to_string());
         Ok(Observation {
             app_name,
-            window_title: title,
+            window_title,
             surface,
             root,
             truncation,
@@ -2005,10 +2085,14 @@ impl Backend for LinuxBackend {
     /// Window stills show current visible pixels (occluders visible; use
     /// observe for the exact tree). Both capture routes crop the same way:
     /// through [`window_still`], which reconciles the accessibility and pixel
-    /// spaces before cropping.
-    async fn capture(&self, target: &TargetSpec) -> Result<Capture, anyhow::Error> {
+    /// spaces before cropping. Every buffer is charged to the call's `budget`.
+    async fn capture(
+        &self,
+        target: &TargetSpec,
+        budget: &CaptureBudget,
+    ) -> Result<Capture, anyhow::Error> {
         match target {
-            TargetSpec::Screen => Ok(self.capture_screen_channel().await?.0),
+            TargetSpec::Screen => Ok(self.capture_screen_channel(budget).await?.0),
             other => {
                 let conn = self.conn().await?;
                 let (window_ref, _app) = resolve_window(&conn, other).await?;
@@ -2020,8 +2104,8 @@ impl Backend for LinuxBackend {
                 let win = window_screen_extents(&proxy)
                     .await
                     .ok_or_else(|| anyhow!("window geometry unavailable"))?;
-                let (screen_cap, screen_geo) = self.capture_screen_channel().await?;
-                window_still(&conn, &win, &screen_cap, &screen_geo).await
+                let (screen_cap, screen_geo) = self.capture_screen_channel(budget).await?;
+                window_still(&conn, &win, &screen_cap, &screen_geo, budget).await
             }
         }
     }

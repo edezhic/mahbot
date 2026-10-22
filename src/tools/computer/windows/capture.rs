@@ -14,14 +14,21 @@
 //!
 //! A route that yields nothing usable falls through to the next one; what "usable"
 //! means is [`take_route`]'s rule. When every route comes back unusable the caller
-//! gets an `unsupported` error naming each one and its honest cause.
+//! gets an error naming each one and its honest cause.
+//!
+//! Every pixel buffer this backend keeps for a call — the virtual-desktop composite,
+//! a display's or a window's frame copy, the GDI readback and the crop back to the
+//! window's surface — holds a [`core::Claim`] on that call's [`CaptureBudget`].
+//! [`MAX_CAPTURE_EDGE`] stays what it always was, the API's own per-edge limit, with
+//! the product's budget stacked on top; see [`core::CAPTURE_BUDGET_PIXELS`] for the
+//! reasoning.
 //!
 //! Everything here runs on the apartment thread. The D3D device is created lazily and
 //! dropped when a route fails, so a lost device (a driver reset, a GPU switch) is
 //! rebuilt by the next capture instead of leaving this route dead for the thread's
 //! life.
 
-use super::super::core::{self, Capture, SurfaceGeometry, TargetSpec};
+use super::super::core::{self, Capture, CaptureBudget, SurfaceGeometry, TargetSpec};
 use super::window;
 use anyhow::anyhow;
 use std::time::{Duration, Instant};
@@ -78,36 +85,50 @@ pub(super) struct CaptureContext {
 }
 
 impl CaptureContext {
-    pub(super) fn capture(&mut self, target: &TargetSpec) -> anyhow::Result<Capture> {
+    pub(super) fn capture(
+        &mut self,
+        target: &TargetSpec,
+        budget: &CaptureBudget,
+    ) -> anyhow::Result<Capture> {
         match target {
-            TargetSpec::Screen => self.screen(),
+            TargetSpec::Screen => self.screen(budget),
             other => {
                 let resolved = window::resolve(other)?;
-                self.window_frame(&resolved)
+                self.window_frame(&resolved, budget)
             }
         }
     }
 
-    fn screen(&mut self) -> anyhow::Result<Capture> {
+    fn screen(&mut self, budget: &CaptureBudget) -> anyhow::Result<Capture> {
         let geometry = window::screen_geometry()?;
         let mut causes = Vec::new();
-        let graphics = self.with_device(|gpu| screen_graphics(gpu, &geometry));
+        // A route that fails has already dropped its buffers, so the fallback is not
+        // charged for an attempt whose buffers are gone.
+        let graphics = self.with_device(|gpu| screen_graphics(gpu, &geometry, budget));
         if let Some(frame) = take_route(graphics, "Windows.Graphics.Capture", &mut causes) {
             return Ok(frame);
         }
-        if let Some(frame) = take_route(blit_screen(&geometry), "BitBlt", &mut causes) {
+        if let Some(frame) = take_route(blit_screen(&geometry, budget), "BitBlt", &mut causes) {
             return Ok(frame);
         }
         Err(no_frame_error("the screen", &causes))
     }
 
-    fn window_frame(&mut self, resolved: &window::TargetWindow) -> anyhow::Result<Capture> {
+    fn window_frame(
+        &mut self,
+        resolved: &window::TargetWindow,
+        budget: &CaptureBudget,
+    ) -> anyhow::Result<Capture> {
         let mut causes = Vec::new();
-        let graphics = self.with_device(|gpu| window_graphics(gpu, resolved));
+        let graphics = self.with_device(|gpu| window_graphics(gpu, resolved, budget));
         if let Some(frame) = take_route(graphics, "Windows.Graphics.Capture", &mut causes) {
             return Ok(frame);
         }
-        if let Some(frame) = take_route(blit_window(&resolved.surface), "BitBlt", &mut causes) {
+        if let Some(frame) = take_route(
+            blit_window(&resolved.surface, budget),
+            "BitBlt",
+            &mut causes,
+        ) {
             return Ok(frame);
         }
         Err(no_frame_error(
@@ -146,25 +167,33 @@ impl CaptureContext {
 
 /// One window item's frame, aligned with the surface the model's coordinates refer
 /// to (see [`align_to_surface`]).
-fn window_graphics(gpu: &Gpu, resolved: &window::TargetWindow) -> anyhow::Result<Capture> {
+fn window_graphics(
+    gpu: &Gpu,
+    resolved: &window::TargetWindow,
+    budget: &CaptureBudget,
+) -> anyhow::Result<Capture> {
     let item: GraphicsCaptureItem =
         // SAFETY: the interop factory is a live WinRT object on this apartment thread
         // and `resolved.hwnd` is an OS handle nothing here owns or closes; the item
         // comes back owned by this call.
         unsafe { capture_interop()?.CreateForWindow(resolved.hwnd) }?;
-    let frame = grab(gpu, &item, FRAME_WAIT)?;
-    align_to_surface(frame, resolved.hwnd, &resolved.surface)
+    let frame = grab(gpu, &item, FRAME_WAIT, budget)?;
+    align_to_surface(frame, resolved.hwnd, &resolved.surface, budget)
 }
 
 /// The virtual desktop stitched from one capture item per display, within
 /// [`SCREEN_BUDGET`].
-fn screen_graphics(gpu: &Gpu, geometry: &SurfaceGeometry) -> anyhow::Result<Capture> {
+fn screen_graphics(
+    gpu: &Gpu,
+    geometry: &SurfaceGeometry,
+    budget: &CaptureBudget,
+) -> anyhow::Result<Capture> {
     let displays = monitors()?;
     let width = pixels(geometry.width)?;
     let height = pixels(geometry.height)?;
     // Opaque black: an L-shaped desktop leaves gaps no display covers, and a
     // transparent hole would read as "nothing there" in the PNG.
-    let mut buffer = opaque_canvas(width, height);
+    let mut canvas = opaque_canvas(width, height, budget)?;
     let deadline = Instant::now() + SCREEN_BUDGET;
     for (monitor, rect) in displays {
         let item: GraphicsCaptureItem =
@@ -176,7 +205,9 @@ fn screen_graphics(gpu: &Gpu, geometry: &SurfaceGeometry) -> anyhow::Result<Capt
         if remaining.is_zero() {
             return Err(anyhow!("the displays did not produce frames in time"));
         }
-        let frame = grab(gpu, &item, remaining.min(FRAME_WAIT))?;
+        // One display's frame is alive at a time and its claim is released when it
+        // drops, so the stitch costs its canvas plus the frame in flight.
+        let frame = grab(gpu, &item, remaining.min(FRAME_WAIT), budget)?;
         let extent = SurfaceGeometry {
             x: f64::from(rect.left),
             y: f64::from(rect.top),
@@ -198,7 +229,7 @@ fn screen_graphics(gpu: &Gpu, geometry: &SurfaceGeometry) -> anyhow::Result<Capt
             return Err(anyhow!("a display lies outside the virtual desktop"));
         }
         core::blit_rgba(
-            &mut buffer,
+            &mut canvas.rgba,
             width as usize,
             height as usize,
             &frame,
@@ -206,15 +237,16 @@ fn screen_graphics(gpu: &Gpu, geometry: &SurfaceGeometry) -> anyhow::Result<Capt
             dy as usize,
         );
     }
-    Ok(Capture {
-        width,
-        height,
-        rgba: buffer,
-    })
+    Ok(canvas)
 }
 
 /// A frame from the capture facility, or the reason there was none.
-fn grab(gpu: &Gpu, item: &GraphicsCaptureItem, wait: Duration) -> anyhow::Result<Capture> {
+fn grab(
+    gpu: &Gpu,
+    item: &GraphicsCaptureItem,
+    wait: Duration,
+    budget: &CaptureBudget,
+) -> anyhow::Result<Capture> {
     let size = item.Size()?;
     if size.Width <= 0 || size.Height <= 0 {
         return Err(anyhow!(
@@ -255,7 +287,7 @@ fn grab(gpu: &Gpu, item: &GraphicsCaptureItem, wait: Duration) -> anyhow::Result
     };
     // Split out so the `?` inside the read cannot skip the closes below: the session
     // and the pool are released whichever way it ends.
-    let pixels = read_frame(gpu, &frame);
+    let pixels = read_frame(gpu, &frame, budget);
     let _ = frame.Close();
     let _ = session.Close();
     let _ = pool.Close();
@@ -263,13 +295,17 @@ fn grab(gpu: &Gpu, item: &GraphicsCaptureItem, wait: Duration) -> anyhow::Result
 }
 
 /// The frame's pixels, through the D3D texture its surface exposes.
-fn read_frame(gpu: &Gpu, frame: &Direct3D11CaptureFrame) -> anyhow::Result<Capture> {
+fn read_frame(
+    gpu: &Gpu,
+    frame: &Direct3D11CaptureFrame,
+    budget: &CaptureBudget,
+) -> anyhow::Result<Capture> {
     let surface = frame.Surface()?;
     let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
     // SAFETY: `access` is the DXGI access interface of the frame's live surface; the
     // texture it yields is an owned, refcounted `ID3D11Texture2D`.
     let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
-    read_texture(gpu, &texture)
+    read_texture(gpu, &texture, budget)
 }
 
 fn wait_for_frame(
@@ -291,7 +327,11 @@ fn wait_for_frame(
 /// Copy the captured texture into a CPU-readable staging texture and flatten it to
 /// opaque RGBA. The frame's own alpha is dropped: a still is what the screen shows,
 /// and a transparent pixel in the PNG would read as "nothing there".
-fn read_texture(gpu: &Gpu, texture: &ID3D11Texture2D) -> anyhow::Result<Capture> {
+fn read_texture(
+    gpu: &Gpu,
+    texture: &ID3D11Texture2D,
+    budget: &CaptureBudget,
+) -> anyhow::Result<Capture> {
     let mut source = D3D11_TEXTURE2D_DESC::default();
     // SAFETY: `texture` is a live owned interface and `source` is a live local of
     // exactly the type `GetDesc` writes.
@@ -331,6 +371,11 @@ fn read_texture(gpu: &Gpu, texture: &ID3D11Texture2D) -> anyhow::Result<Capture>
     // staging texture and backs the frame pool the source came from; the staging
     // texture repeats the source's own size and format, which `CopyResource` requires.
     unsafe { gpu.context.CopyResource(&staging_texture, texture) };
+    let width = source.Width;
+    let height = source.Height;
+    // The buffer is charged and fallibly reserved BEFORE the mapping exists, so a geometry the
+    // call cannot afford is refused without a mapping left open behind it.
+    let mut capture = Capture::alloc(budget, "a display frame", width, height)?;
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     // SAFETY: the staging texture was created CPU-readable and is not bound for any
     // other use here; `mapped` is a live local out-slot for the mapped row pitch.
@@ -343,27 +388,19 @@ fn read_texture(gpu: &Gpu, texture: &ID3D11Texture2D) -> anyhow::Result<Capture>
             Some(&raw mut mapped),
         )
     }?;
-    let width = source.Width;
-    let height = source.Height;
-    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-    for row in 0..height {
-        let start = (mapped.pData as usize) + row as usize * mapped.RowPitch as usize;
+    let stride = width as usize * 4;
+    for row in 0..height as usize {
+        let start = (mapped.pData as usize) + row * mapped.RowPitch as usize;
         // SAFETY: `pData` is the mapping made above and stays valid until the `Unmap`
         // below; D3D11 guarantees `RowPitch >= width * 4` for this format, so row
         // `row`'s `width * 4` bytes lie inside the mapped image, `u8`-aligned.
-        let line = unsafe { std::slice::from_raw_parts(start as *const u8, width as usize * 4) };
-        for pixel in line.as_chunks::<4>().0 {
-            push_pixel(&mut rgba, pixel);
-        }
+        let line = unsafe { std::slice::from_raw_parts(start as *const u8, stride) };
+        bgra_to_rgba(&mut capture.rgba[row * stride..(row + 1) * stride], line);
     }
     // SAFETY: it releases exactly the mapping `Map` made above, after the last read
     // of `pData`; no `line` slice is alive past this point.
     unsafe { gpu.context.Unmap(&staging_texture, 0) };
-    Ok(Capture {
-        width,
-        height,
-        rgba,
-    })
+    Ok(capture)
 }
 
 /// The reusable D3D11 device, also exposed as the WinRT device the frame pool takes.
@@ -556,7 +593,9 @@ impl Dib {
         })
     }
 
-    fn read_back(&self) -> anyhow::Result<Capture> {
+    /// Copy the DIB's pixels into `rgba`, which the caller has already charged and
+    /// sized to this DIB's canvas.
+    fn read_into(&self, rgba: &mut [u8]) -> anyhow::Result<()> {
         if self.bits.is_null() {
             return Err(anyhow!("the DIB section has no pixels"));
         }
@@ -569,15 +608,8 @@ impl Dib {
                 self.width as usize * self.height as usize * 4,
             )
         };
-        let mut rgba = Vec::with_capacity(bytes.len());
-        for pixel in bytes.as_chunks::<4>().0 {
-            push_pixel(&mut rgba, pixel);
-        }
-        Ok(Capture {
-            width: self.width,
-            height: self.height,
-            rgba,
-        })
+        bgra_to_rgba(rgba, bytes);
+        Ok(())
     }
 }
 
@@ -598,7 +630,7 @@ impl Drop for Dib {
 /// the desktop origin), while `BitBlt` wants absolute screen coordinates, so both
 /// are converted here. Off-screen parts stay black, keeping the image aligned with
 /// the window's own surface for the zoom regions.
-fn blit_window(surface: &SurfaceGeometry) -> anyhow::Result<Capture> {
+fn blit_window(surface: &SurfaceGeometry, budget: &CaptureBudget) -> anyhow::Result<Capture> {
     let desktop = window::screen_geometry()?;
     let (buffer_x, buffer_y, width, height) = core::window_capture_rect(surface, &desktop)?;
     let (full_width, full_height) = edge(surface)?;
@@ -614,25 +646,39 @@ fn blit_window(surface: &SurfaceGeometry) -> anyhow::Result<Capture> {
         (full_width, full_height),
         (source_x, source_y),
         (width, height),
+        budget,
+        "the window still",
     )
 }
 
 /// The whole virtual desktop, whose origin can be negative.
-fn blit_screen(geometry: &SurfaceGeometry) -> anyhow::Result<Capture> {
+fn blit_screen(geometry: &SurfaceGeometry, budget: &CaptureBudget) -> anyhow::Result<Capture> {
     let width = pixels(geometry.width)?;
     let height = pixels(geometry.height)?;
     let (x, y) = (geometry.x.round() as i32, geometry.y.round() as i32);
-    blit_rect((0, 0), (width, height), (x, y), (width, height))
+    blit_rect(
+        (0, 0),
+        (width, height),
+        (x, y),
+        (width, height),
+        budget,
+        "the screen still",
+    )
 }
 
 /// Copy a screen rect into a `canvas`-sized DIB at `dest`. The canvas keeps the
-/// image aligned with the surface the model's coordinates refer to.
+/// image aligned with the surface the model's coordinates refer to; `what` names it
+/// in a refusal. The canvas is charged and fallibly reserved before GDI is asked for one that
+/// size, so an over-large surface is refused rather than handed to BitBlt.
 fn blit_rect(
     dest: (i32, i32),
     canvas: (u32, u32),
     source: (i32, i32),
     region: (u32, u32),
+    budget: &CaptureBudget,
+    what: &str,
 ) -> anyhow::Result<Capture> {
+    let mut capture = Capture::alloc(budget, what, canvas.0, canvas.1)?;
     let dib = Dib::create(canvas.0, canvas.1)?;
     // SAFETY: no arguments; a null DC is refused right below and released in here.
     let screen = unsafe { GetDC(None) };
@@ -661,24 +707,35 @@ fn blit_rect(
     // GDI batches; the DIB bits are not guaranteed to hold the drawing until this.
     // SAFETY: no arguments and no state of ours; it only flushes GDI's own batch.
     let _ = unsafe { GdiFlush() };
-    dib.read_back()
+    dib.read_into(&mut capture.rgba)?;
+    Ok(capture)
 }
 
 // ── Frame checks and errors ─────────────────────────────────────────────
 
 /// A black, fully opaque canvas: gaps no display covers stay black rather than
-/// transparent, which would read as "nothing there" in the PNG.
-fn opaque_canvas(width: u32, height: u32) -> Vec<u8> {
-    let mut rgba = vec![0u8; width as usize * height as usize * 4];
-    for pixel in rgba.as_chunks_mut::<4>().0 {
+/// transparent, which would read as "nothing there" in the PNG. Charged to the call
+/// before it exists — the composite is the largest buffer one capture holds.
+fn opaque_canvas(width: u32, height: u32, budget: &CaptureBudget) -> anyhow::Result<Capture> {
+    let mut canvas = Capture::alloc(budget, "the screen composite", width, height)?;
+    for pixel in canvas.rgba.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
-    rgba
+    Ok(canvas)
 }
 
-/// BGRA in, opaque RGBA out — the one place that byte order is stated.
-fn push_pixel(rgba: &mut Vec<u8>, pixel: &[u8]) {
-    rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+/// BGRA in, opaque RGBA out — the one place that byte order is stated. Both readers
+/// above hand it a row (or a whole DIB) whose alpha is dropped: a still is what the
+/// screen shows, and a transparent pixel in the PNG would read as "nothing there".
+fn bgra_to_rgba(out: &mut [u8], src: &[u8]) {
+    for (out, pixel) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
+        out.copy_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
 }
 
 /// Crop a window frame to the surface its coordinates are expressed in. A capture
@@ -689,11 +746,13 @@ fn push_pixel(rgba: &mut Vec<u8>, pixel: &[u8]) {
 ///
 /// [`core::crop_rgba`] clamps to the frame it is given, so a frame within
 /// [`EXTENT_TOLERANCE`] of the surface comes back a pixel or two narrower — the
-/// coordinates still name the surface.
+/// coordinates still name the surface. The crop is charged to the call like every
+/// other buffer this capture holds.
 fn align_to_surface(
     frame: Capture,
     hwnd: HWND,
     surface: &SurfaceGeometry,
+    budget: &CaptureBudget,
 ) -> anyhow::Result<Capture> {
     let (width, height) = edge(surface)?;
     if matches_extent(&frame, width, height) {
@@ -710,6 +769,8 @@ fn align_to_surface(
                 width,
                 height,
             ),
+            budget,
+            "the window still",
         );
     }
     Err(anyhow!(
@@ -740,6 +801,14 @@ fn matches_extent(frame: &Capture, width: u32, height: u32) -> bool {
         && frame.height.abs_diff(height) <= EXTENT_TOLERANCE
 }
 
+/// One failed route as [`no_frame_error`] reports it: the cause, labelled with the
+/// route that produced it, and whether the product's own bound refused it
+/// (`degraded`) rather than a failure occurring.
+struct Cause {
+    text: String,
+    ceiling: bool,
+}
+
 /// One capture route's answer: the frame, or the route's labelled cause appended to
 /// `causes`. This is the one place the route rule is stated — a route that returns an
 /// empty or all-black frame is a FAILURE, labelled with the route that produced it,
@@ -747,12 +816,18 @@ fn matches_extent(frame: &Capture, width: u32, height: u32) -> bool {
 fn take_route(
     route: anyhow::Result<Capture>,
     label: &str,
-    causes: &mut Vec<String>,
+    causes: &mut Vec<Cause>,
 ) -> Option<Capture> {
     match route {
         Ok(frame) if !is_blank(&frame) => return Some(frame),
-        Ok(_) => causes.push(format!("{label}: {BLANK_CAUSE}")),
-        Err(e) => causes.push(format!("{label}: {e:#}")),
+        Ok(_) => causes.push(Cause {
+            text: format!("{label}: {BLANK_CAUSE}"),
+            ceiling: false,
+        }),
+        Err(e) => causes.push(Cause {
+            text: format!("{label}: {e:#}"),
+            ceiling: core::is_ceiling_refusal(&e),
+        }),
     }
     None
 }
@@ -777,13 +852,23 @@ fn is_blank(capture: &Capture) -> bool {
         .any(|pixel| pixel[0] > BLACK_LEVEL || pixel[1] > BLACK_LEVEL || pixel[2] > BLACK_LEVEL)
 }
 
-fn no_frame_error(target: &str, causes: &[String]) -> anyhow::Error {
+/// Every route failed: one error naming each route and its cause. The category is the
+/// binding reason — `degraded` when at least one route was refused at the capture
+/// ceiling ([`core::is_ceiling_refusal`]), `unsupported` when none was — and every
+/// route's cause is listed either way.
+fn no_frame_error(target: &str, causes: &[Cause]) -> anyhow::Error {
+    let kind = if causes.iter().any(|cause| cause.ceiling) {
+        core::ERR_DEGRADED
+    } else {
+        core::ERR_UNSUPPORTED
+    };
+    let listed: Vec<&str> = causes.iter().map(|cause| cause.text.as_str()).collect();
     core::taxonomy_error(
-        core::ERR_UNSUPPORTED,
+        kind,
         format!(
             "capture of {target} produced no usable frame — every route failed: {}; use observe for \
              the structure, or ask the owner to restore/focus the window",
-            causes.join("; ")
+            listed.join("; ")
         ),
     )
 }

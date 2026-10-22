@@ -16,8 +16,8 @@
 //! deadline for the same reason.
 
 use super::super::core::{
-    self, AppInfo, Capture, ElementAct, Impact, Locator, Observation, RawInput, SurfaceGeometry,
-    TargetSpec, WindowInfo, WindowListing,
+    self, AppInfo, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation, RawInput,
+    SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
 };
 use super::capture::CaptureContext;
 use super::{input, seh, uia, window};
@@ -67,6 +67,9 @@ pub(super) enum Call {
     CursorPosition,
     Capture {
         target: TargetSpec,
+        /// The call's one pixel allowance, carried across the thread boundary so the
+        /// buffers the apartment thread builds are charged to the caller's call.
+        budget: CaptureBudget,
     },
 }
 
@@ -426,9 +429,9 @@ impl Ctx {
                 let (x, y) = input::cursor_position()?;
                 Ok(Reply::Point(x, y))
             }
-            Call::Capture { target } => {
-                Ok(Reply::Capture(Box::new(self.capture.capture(&target)?)))
-            }
+            Call::Capture { target, budget } => Ok(Reply::Capture(Box::new(
+                self.capture.capture(&target, &budget)?,
+            ))),
         }
     }
 }

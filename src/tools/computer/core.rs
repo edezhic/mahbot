@@ -24,7 +24,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Maximum normalized coordinate value, inclusive on both axes ([`NORMALIZED_MAX`]).
 pub(crate) const NORMALIZED_MAX: f64 = 1000.0;
@@ -44,6 +45,49 @@ pub(crate) const MAX_TREE_NODES: usize = 4000;
 /// surface, not a copy of its text, so a long value is cut here and counted in
 /// the truncation header.
 pub(crate) const RENDER_VALUE_CHARS: usize = 120;
+
+/// Most characters one node value keeps, on every platform. It is the read's cap,
+/// not the dump's: a document-shaped field reports a whole file as its value, and
+/// keeping it would inflate the tree by that file per node. A longer value keeps
+/// its beginning with an ellipsis and is counted in the header
+/// ([`Truncation::keep_value`]). Linux reads a value only one character past the
+/// dump's own cap, so this one is out of its reach by design.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) const MAX_VALUE_CHARS: usize = 2000;
+
+/// Most characters one accessible name keeps, on every platform — the same
+/// discipline as a value ([`Truncation::keep_name`]), because a title can be a
+/// document too. A ref records the name it saw and matches it against a freshly read
+/// one, cut the same way on both sides; the recorded child-index path is the primary
+/// key, so a capped name only decides the fallback — two nodes whose names differ
+/// solely past the cap resolve as [`LocatorMatch::Ambiguous`] instead of one of them
+/// being picked.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) const MAX_NAME_CHARS: usize = 200;
+
+/// Ceiling on the pixels ONE capture call may hold at once, chosen by the product
+/// rather than taken from what the machine reports. This process aborts on a failed
+/// allocation, so no figure the machine reports may decide how much is allocated:
+/// every buffer the tool keeps for a capture — a display's frame, the composite of the
+/// whole virtual desktop, the zoom crop taken out of it, the pixels a portal
+/// screenshot decoded to — holds a [`Claim`] on this allowance, weighed before the
+/// buffer exists and given back when it is dropped.
+///
+/// 128 Mi pixels is 512 MiB of RGBA. A whole-desktop capture of a two-6K-display wall
+/// costs its 40.7 MP composite and a 40.7 MP zoom crop — 81 MP — and fits; a wall of
+/// four 6K displays needs 163 MP and is refused, naming this ceiling. A display's
+/// frame is alive only while it is blitted, so the number of displays does not
+/// multiply the cost. The PNG encode holds no second pixel copy and is bounded by the
+/// pixels it encodes; what a platform allocates for itself (the capture framework's
+/// texture, a GDI section) fails with a null handle or an `HRESULT` instead of
+/// aborting, and is bounded by the same geometry checks.
+pub(crate) const CAPTURE_BUDGET_PIXELS: u64 = 128 * 1024 * 1024;
 
 /// Accessible role names considered genuinely actionable (AX-prefix already
 /// stripped, matched case-insensitively). Used alongside non-empty `actions`.
@@ -219,6 +263,43 @@ pub(crate) fn not_brought_forward(surface: impl fmt::Display) -> anyhow::Error {
 pub(crate) fn permission_denied(msg: impl fmt::Display) -> anyhow::Error {
     anyhow::Error::new(PermissionDenied(taxonomy_error(ERR_PERMISSION_DENIED, msg)))
 }
+
+/// The `degraded` refusal for a capture that would exceed the call's
+/// [`CAPTURE_BUDGET_PIXELS`] allowance. TYPED, like [`permission_denied`], so the
+/// Windows route classifier can tell a ceiling refusal — whose remedy is a smaller
+/// surface — from every other degraded cause without reading the message.
+fn ceiling_refused(what: &str, width: u32, height: u32, held: u64) -> anyhow::Error {
+    anyhow::Error::new(CeilingRefusal(taxonomy_error(
+        ERR_DEGRADED,
+        format!(
+            "{what} needs {} MiB of RGBA ({width}x{height}) and this call already holds {} MiB \
+             of its {} MiB — name a smaller surface instead; a capture this large cannot be \
+             held whole",
+            mib(u64::from(width) * u64::from(height)),
+            mib(held),
+            mib(CAPTURE_BUDGET_PIXELS),
+        ),
+    )))
+}
+
+/// Whether `err` is the typed [`ceiling_refused`] failure — robust to a `.context()`
+/// layer added above it.
+#[cfg_attr(not(any(target_os = "windows", test)), expect(dead_code))]
+pub(crate) fn is_ceiling_refusal(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CeilingRefusal>().is_some()
+}
+
+/// A capture refused at the ceiling, as a type (see [`ceiling_refused`]).
+#[derive(Debug)]
+struct CeilingRefusal(anyhow::Error);
+
+impl fmt::Display for CeilingRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for CeilingRefusal {}
 
 /// Whether `err` is the typed [`permission_denied`] failure — robust to a
 /// `.context()` layer added above it.
@@ -396,6 +477,55 @@ pub(crate) fn impact_text(done: String, impact: Impact) -> String {
     }
 }
 
+/// Keep at most `max` characters of one accessible string, its beginning preserved
+/// and an ellipsis where it was cut. The flag reports the cut, so a read can state the
+/// ceiling it hit; a string that fits comes back untouched.
+fn cap_text(text: &str, max: usize) -> (String, bool) {
+    let kept = crate::util::truncate(text, max);
+    let cut = kept != text;
+    (kept, cut)
+}
+
+/// A label read from the accessibility layer — an application name, a window title,
+/// a role — kept to [`MAX_NAME_CHARS`], the ellipsis marking the cut. Labels are shown
+/// rather than matched on (a window resolves through its key), so the cut is marked
+/// and not counted.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) fn cap_label(text: &str) -> String {
+    cap_text(text, MAX_NAME_CHARS).0
+}
+
+/// The pixel size of a buffer this tool may hold, from a figure the machine reported
+/// — a window frame, a display frame, a decoded image. An empty area is an honest
+/// failure (the surface is minimized, off-screen or gone) and a dimension a [`Capture`]
+/// cannot express is refused here, so no caller hands a platform a size the buffer
+/// cannot match. [`CaptureBudget::charge`] runs it too, so every claimed buffer has a
+/// non-empty area by construction.
+pub(crate) fn capture_size(what: &str, width: usize, height: usize) -> anyhow::Result<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return Err(taxonomy_error(
+            ERR_DEGRADED,
+            format!(
+                "{what} has no capture area ({width}x{height} px) — it is minimized, off-screen \
+                 or was closed; restore it and re-observe"
+            ),
+        ));
+    }
+    match (u32::try_from(width), u32::try_from(height)) {
+        (Ok(width), Ok(height)) => Ok((width, height)),
+        _ => Err(taxonomy_error(
+            ERR_DEGRADED,
+            format!(
+                "{what} measures {width}x{height} px, which is more than a capture can express — \
+                 name a smaller surface instead"
+            ),
+        )),
+    }
+}
+
 /// Where a tree read hit a ceiling. Every `None` means that ceiling was not hit;
 /// [`render_tree`] states each one that was, in the header — the only part of a
 /// large observation a spill preview guarantees the agent reads.
@@ -405,6 +535,8 @@ pub(crate) struct Truncation {
     pub nodes: Option<usize>,
     /// Children of this many nodes sit at the depth ceiling and were not read.
     pub depth: Option<Cut>,
+    /// This many values were shortened at the read's own character cap.
+    pub values: Option<Cut>,
     /// This many names were shortened at the read's own character cap.
     pub names: Option<Cut>,
 }
@@ -435,14 +567,48 @@ impl Truncation {
         self.depth.get_or_insert(Cut { count: 0, limit }).count += 1;
     }
 
+    /// Keep at most [`MAX_VALUE_CHARS`] of a value read from the accessibility layer,
+    /// recording the read's cut in the header. The beginning is kept and the cut
+    /// marked, so a document-shaped field still shows the text the model came for.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows", test)),
+        expect(dead_code)
+    )]
+    pub(crate) fn keep_value(&mut self, text: &str) -> String {
+        let (kept, cut) = cap_text(text, MAX_VALUE_CHARS);
+        if cut {
+            self.cut_value(MAX_VALUE_CHARS);
+        }
+        kept
+    }
+
+    /// Keep at most [`MAX_NAME_CHARS`] of a node's name, recording the cut in the
+    /// header as a name cut.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
+        expect(dead_code)
+    )]
+    pub(crate) fn keep_name(&mut self, text: &str) -> String {
+        let (kept, cut) = cap_text(text, MAX_NAME_CHARS);
+        if cut {
+            self.cut_name(MAX_NAME_CHARS);
+        }
+        kept
+    }
+
+    /// Record one value shortened at the read's own character cap.
+    fn cut_value(&mut self, limit: usize) {
+        self.values.get_or_insert(Cut { count: 0, limit }).count += 1;
+    }
+
     /// Record one name shortened at the read's own character cap.
-    #[cfg_attr(not(target_os = "windows"), expect(dead_code))]
-    pub(crate) fn cut_name(&mut self, limit: usize) {
+    fn cut_name(&mut self, limit: usize) {
         self.names.get_or_insert(Cut { count: 0, limit }).count += 1;
     }
 
     /// One line per ceiling that was hit, each naming it. `values_cut` comes from
-    /// the renderer, which is where a value is cut for display.
+    /// the renderer, which is where a value is cut for display — a read cap
+    /// (`values`) and a display cap are different ceilings and both are stated.
     fn statements(&self, values_cut: usize) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(ceiling) = self.nodes {
@@ -455,6 +621,14 @@ impl Truncation {
             out.push(format!(
                 "[Tree truncated: {} nodes at the {}-deep ceiling — their children were not read]",
                 cut.count, cut.limit
+            ));
+        }
+        if let Some(cut) = self.values {
+            out.push(format!(
+                "[Tree truncated: {} {} cut at {} chars]",
+                cut.count,
+                if cut.count == 1 { "value" } else { "values" },
+                cut.limit
             ));
         }
         if values_cut > 0 {
@@ -538,11 +712,171 @@ pub(crate) struct WindowInfo {
 }
 
 /// Plain RGBA pixel data (Send-safe, no platform handles).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct Capture {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// The pixels this buffer holds of its call's [`CaptureBudget`], given back when
+    /// it is dropped.
+    claim: Claim,
+}
+
+impl Capture {
+    /// A blank `width`×`height` RGBA buffer. The size is charged before the buffer
+    /// exists — a surface the call cannot hold is refused, never attempted — and the
+    /// memory is reserved FALLIBLY, so a buffer this tool chose to make fails the call
+    /// instead of aborting the process.
+    ///
+    /// The buffer comes back zeroed: a composite leaves the area no display covers
+    /// black, and a platform that draws into the buffer needs an initialised
+    /// `&mut [u8]` — safe Rust has no uninitialised one. A path that fills every byte
+    /// itself ([`crop_rgba`], macOS's frame copy) takes its pixels over with
+    /// [`Capture::adopt`] instead.
+    pub(crate) fn alloc(
+        budget: &CaptureBudget,
+        what: &str,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<Self> {
+        let claim = budget.charge(what, width, height)?;
+        let bytes = rgba_bytes(width, height);
+        let mut rgba = reserved_bytes(bytes, what, (width, height))?;
+        rgba.resize(bytes, 0);
+        Ok(Self {
+            width,
+            height,
+            rgba,
+            claim,
+        })
+    }
+
+    /// Pixels a platform already produced, copied into a buffer charged to `budget`:
+    /// the fallible reserve of [`Capture::alloc`] with the copy standing in for its
+    /// zero-fill, so no byte is written twice.
+    #[cfg_attr(not(any(target_os = "macos", test)), expect(dead_code))]
+    pub(crate) fn from_pixels(
+        budget: &CaptureBudget,
+        what: &str,
+        width: u32,
+        height: u32,
+        src: &[u8],
+    ) -> anyhow::Result<Self> {
+        debug_assert_eq!(src.len(), rgba_bytes(width, height));
+        let claim = budget.charge(what, width, height)?;
+        let mut rgba = reserved_bytes(src.len(), what, (width, height))?;
+        rgba.extend_from_slice(src);
+        Ok(Self::adopt(claim, width, height, rgba))
+    }
+
+    /// Pixels a platform already produced, taken over with the [`Claim`] their
+    /// conversion was reserved with.
+    pub(crate) fn adopt(claim: Claim, width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        debug_assert_eq!(rgba.len(), rgba_bytes(width, height));
+        Self {
+            width,
+            height,
+            rgba,
+            claim,
+        }
+    }
+
+    /// The pixels and the allowance they hold, separately: the claim has to live as
+    /// long as the pixels do.
+    pub(crate) fn into_parts(self) -> (u32, u32, Vec<u8>, Claim) {
+        (self.width, self.height, self.rgba, self.claim)
+    }
+}
+
+/// An empty byte buffer this tool chose to make, with `bytes` reserved FALLIBLY: a
+/// failed allocation fails the call, naming the buffer, instead of aborting the
+/// process.
+fn reserved_bytes(
+    bytes: usize,
+    what: &str,
+    (width, height): (u32, u32),
+) -> anyhow::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(bytes).map_err(|e| {
+        taxonomy_error(
+            ERR_DEGRADED,
+            format!(
+                "{what} could not be allocated ({bytes} bytes, {width}x{height}: {e}) — the \
+                 machine is out of memory; retry, or capture a smaller surface"
+            ),
+        )
+    })?;
+    Ok(buffer)
+}
+
+// reason: a claimed buffer is at most the ceiling, 512 MiB, which every usize holds.
+#[expect(clippy::cast_possible_truncation)]
+fn rgba_bytes(width: u32, height: u32) -> usize {
+    (u64::from(width) * u64::from(height) * 4) as usize
+}
+
+/// One capture call's allowance of pixels, shared by every buffer the call holds at
+/// once — the async caller and any platform thread it hands the capture to draw on
+/// the same allowance. A [`Claim`] is weighed before its buffer exists and refused
+/// without spending anything, and gives its pixels back when the buffer is dropped, so
+/// the counter is what the call holds rather than what it has ever held. The call is
+/// serialized (one action at a time, and a platform route is awaited), so claiming and
+/// releasing need no stronger guarantee than that.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CaptureBudget(Arc<AtomicU64>);
+
+impl CaptureBudget {
+    /// Claim `width`×`height` pixels of RGBA for `what`, or refuse — naming the
+    /// geometry, what the call already holds and [`CAPTURE_BUDGET_PIXELS`] — when the
+    /// geometry is empty or the remaining allowance cannot cover it. Checked before
+    /// the buffer exists, so a refused request costs nothing.
+    pub(crate) fn charge(&self, what: &str, width: u32, height: u32) -> anyhow::Result<Claim> {
+        // Empty geometry is refused by the one geometry gate, so no path can claim a
+        // buffer of no pixels.
+        let (width, height) = capture_size(what, width as usize, height as usize)?;
+        // Two `u32` dimensions multiply into a `u64` without overflow.
+        let pixels = u64::from(width) * u64::from(height);
+        let spent = self.0.fetch_add(pixels, Ordering::Relaxed) + pixels;
+        if spent > CAPTURE_BUDGET_PIXELS {
+            self.0.fetch_sub(pixels, Ordering::Relaxed);
+            return Err(ceiling_refused(what, width, height, spent - pixels));
+        }
+        Ok(Claim {
+            budget: Arc::clone(&self.0),
+            pixels,
+        })
+    }
+
+    /// What is left of this call's allowance, in pixels — what a decode about to
+    /// materialise pixels can spend without breaking the ceiling.
+    #[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))]
+    pub(crate) fn remaining(&self) -> u64 {
+        CAPTURE_BUDGET_PIXELS.saturating_sub(self.0.load(Ordering::Relaxed))
+    }
+
+    /// What the call holds right now, in pixels.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// What one buffer holds of a [`CaptureBudget`] until the buffer is dropped.
+#[derive(Debug)]
+pub(crate) struct Claim {
+    budget: Arc<AtomicU64>,
+    pixels: u64,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.pixels, Ordering::Relaxed);
+    }
+}
+
+/// Pixels as whole MiB, for the refusals — the figure the ceiling is stated in.
+fn mib(pixels: u64) -> u64 {
+    pixels.saturating_mul(4) / (1024 * 1024)
 }
 
 /// The surface a call addresses.
@@ -892,7 +1226,15 @@ pub(crate) fn region_to_pixels(
 }
 
 /// Crop a rect `(x, y, w, h)` out of a capture, clamping to the image bounds.
-pub(crate) fn crop_rgba(cap: &Capture, rect: (u32, u32, u32, u32)) -> anyhow::Result<Capture> {
+/// `what` names the crop in a refusal, and the copy is charged to the call — a
+/// zoom crop is as large as the surface it came from. The rows are copied straight
+/// into the claimed buffer, so the crop costs one copy and no zero-fill.
+pub(crate) fn crop_rgba(
+    cap: &Capture,
+    rect: (u32, u32, u32, u32),
+    budget: &CaptureBudget,
+    what: &str,
+) -> anyhow::Result<Capture> {
     let (x, y, w, h) = rect;
     if cap.width == 0 || cap.height == 0 {
         anyhow::bail!("crop_rgba: source capture is empty");
@@ -902,17 +1244,15 @@ pub(crate) fn crop_rgba(cap: &Capture, rect: (u32, u32, u32, u32)) -> anyhow::Re
     let w = w.min(cap.width - x).max(1);
     let h = h.min(cap.height - y).max(1);
 
+    let claim = budget.charge(what, w, h)?;
     let stride = cap.width as usize * 4;
-    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
-    for row in y..(y + h) {
-        let start = row as usize * stride + x as usize * 4;
-        rgba.extend_from_slice(&cap.rgba[start..start + w as usize * 4]);
+    let row_bytes = w as usize * 4;
+    let mut rgba = reserved_bytes(row_bytes * h as usize, what, (w, h))?;
+    for index in 0..h as usize {
+        let start = (y as usize + index) * stride + x as usize * 4;
+        rgba.extend_from_slice(&cap.rgba[start..start + row_bytes]);
     }
-    Ok(Capture {
-        width: w,
-        height: h,
-        rgba,
-    })
+    Ok(Capture::adopt(claim, w, h, rgba))
 }
 
 /// Place `src` RGBA pixels at `(dx, dy)` inside a `dest_w`×`dest_h` buffer,
@@ -982,7 +1322,8 @@ pub(crate) fn scale_geometry(geo: SurfaceGeometry, scale: f64) -> SurfaceGeometr
     }
 }
 
-/// ZPixmap tile (`depth` 24/32, 4 bytes/pixel) → RGBA.
+/// ZPixmap tile (`depth` 24/32, 4 bytes/pixel) → one RGBA capture, charged to the
+/// call like every other buffer.
 #[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
 pub(crate) fn x11_pixels_to_rgba(
     data: &[u8],
@@ -990,26 +1331,32 @@ pub(crate) fn x11_pixels_to_rgba(
     height: u32,
     depth: u8,
     lsb_first: bool,
-) -> Result<Vec<u8>, anyhow::Error> {
+    budget: &CaptureBudget,
+) -> Result<Capture, anyhow::Error> {
     if depth != 24 && depth != 32 {
         return Err(taxonomy_error(
             ERR_DEGRADED,
             format!("unsupported X11 depth {depth} (need 24/32)"),
         ));
     }
-    let pixels = width as usize * height as usize;
-    if data.len() < pixels * 4 {
-        anyhow::bail!("short X11 image body: {} < {}", data.len(), pixels * 4);
+    let mut cap = Capture::alloc(budget, "a display tile", width, height)?;
+    if data.len() < cap.rgba.len() {
+        anyhow::bail!("short X11 image body: {} < {}", data.len(), cap.rgba.len());
     }
-    let mut rgba = Vec::with_capacity(pixels * 4);
-    for px in data.as_chunks::<4>().0.iter().take(pixels) {
-        if lsb_first {
-            rgba.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
+    for (out, px) in cap
+        .rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(data.as_chunks::<4>().0)
+    {
+        *out = if lsb_first {
+            [px[2], px[1], px[0], 0xff]
         } else {
-            rgba.extend_from_slice(&[px[1], px[2], px[3], 0xff]);
-        }
+            [px[1], px[2], px[3], 0xff]
+        };
     }
-    Ok(rgba)
+    Ok(cap)
 }
 
 /// `file://` portal URI → path, percent-decoding `%XX` (`+` kept verbatim).
@@ -1647,8 +1994,12 @@ pub(crate) trait Backend: Send + Sync {
     /// Pointer position in ABSOLUTE global surface points (logical points on
     /// macOS, physical pixels on Linux and Windows).
     async fn cursor_position(&self) -> anyhow::Result<(f64, f64)>;
-    /// RGBA pixels of a target surface (window capture, or full virtual desktop for Screen).
-    async fn capture(&self, target: &TargetSpec) -> anyhow::Result<Capture>;
+    /// RGBA pixels of a target surface (window capture, or full virtual desktop for
+    /// Screen). Every buffer this produces is charged to `budget` — the call's one
+    /// allowance, so a surface the machine reports as enormous is refused instead
+    /// of allocated.
+    async fn capture(&self, target: &TargetSpec, budget: &CaptureBudget)
+    -> anyhow::Result<Capture>;
 }
 
 #[cfg(test)]
@@ -1737,11 +2088,9 @@ mod tests {
     #[test]
     fn blit_rgba_clips_and_copies() {
         let mut dest = vec![0u8; 4 * 4 * 4];
-        let src = Capture {
-            width: 2,
-            height: 2,
-            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
-        };
+        let mut src = Capture::alloc(&CaptureBudget::default(), "a test frame", 2, 2).unwrap();
+        src.rgba
+            .copy_from_slice(&[1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]);
         blit_rgba(&mut dest, 4, 4, &src, 1, 1);
         assert_eq!(&dest[4 * 4 + 4..4 * 4 + 8], &[1, 2, 3, 255]);
         assert_eq!(&dest[4 * 4 + 8..4 * 4 + 12], &[4, 5, 6, 255]);
@@ -1793,9 +2142,10 @@ mod tests {
 
     #[test]
     fn crop_rgba_extracts_sub_rect() {
+        let budget = CaptureBudget::default();
         // 4x2 image: rows are constant-color for easy verification.
-        let mut rgba = Vec::new();
-        for (r, c) in [
+        let mut cap = Capture::alloc(&budget, "a test frame", 4, 2).unwrap();
+        for (i, (r, c)) in [
             (0, 0),
             (0, 1),
             (0, 2),
@@ -1804,32 +2154,34 @@ mod tests {
             (1, 1),
             (1, 2),
             (1, 3),
-        ] {
-            rgba.extend_from_slice(&[r * 40, c * 10, 0, 255]);
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cap.rgba[i * 4..(i + 1) * 4].copy_from_slice(&[r * 40, c * 10, 0, 255]);
         }
-        let cap = Capture {
-            width: 4,
-            height: 2,
-            rgba,
-        };
-        let crop = crop_rgba(&cap, (1, 0, 2, 2)).unwrap();
+        let crop = crop_rgba(&cap, (1, 0, 2, 2), &budget, "the zoom crop").unwrap();
         assert_eq!(crop.width, 2);
         assert_eq!(crop.height, 2);
         assert_eq!(crop.rgba.len(), 2 * 2 * 4);
+        // The crop is a buffer of its own, claimed like every other.
+        assert_eq!(budget.held(), 4 * 2 + 2 * 2);
         // First cropped pixel = original row0 col1 = [0, 10, 0, 255].
         assert_eq!(&crop.rgba[..4], &[0, 10, 0, 255]);
         // Out-of-bounds rect is clamped, never panics.
-        let clamp = crop_rgba(&cap, (10, 10, 50, 50)).unwrap();
+        let clamp = crop_rgba(&cap, (10, 10, 50, 50), &budget, "the zoom crop").unwrap();
         assert!(clamp.width >= 1 && clamp.height >= 1);
     }
 
     #[test]
     fn x11_pixels_convert_both_byte_orders() {
-        let rgba = x11_pixels_to_rgba(&[10, 20, 30, 0, 40, 50, 60, 0], 2, 1, 24, true).unwrap();
-        assert_eq!(rgba, vec![30, 20, 10, 255, 60, 50, 40, 255]);
-        let rgba = x11_pixels_to_rgba(&[0, 30, 20, 10], 1, 1, 32, false).unwrap();
-        assert_eq!(rgba, vec![30, 20, 10, 255]);
-        let err = x11_pixels_to_rgba(&[0; 4], 1, 1, 16, true).unwrap_err();
+        let budget = CaptureBudget::default();
+        let tile =
+            x11_pixels_to_rgba(&[10, 20, 30, 0, 40, 50, 60, 0], 2, 1, 24, true, &budget).unwrap();
+        assert_eq!(tile.rgba, vec![30, 20, 10, 255, 60, 50, 40, 255]);
+        let tile = x11_pixels_to_rgba(&[0, 30, 20, 10], 1, 1, 32, false, &budget).unwrap();
+        assert_eq!(tile.rgba, vec![30, 20, 10, 255]);
+        let err = x11_pixels_to_rgba(&[0; 4], 1, 1, 16, true, &budget).unwrap_err();
         assert!(err.to_string().contains("16"), "{err:?}");
     }
 
@@ -1937,9 +2289,13 @@ mod tests {
                     count: 2,
                     limit: 25,
                 }),
+                values: Some(Cut {
+                    count: 1,
+                    limit: MAX_VALUE_CHARS,
+                }),
                 names: Some(Cut {
                     count: 3,
-                    limit: 200,
+                    limit: MAX_NAME_CHARS,
                 }),
             },
         };
@@ -1966,7 +2322,149 @@ mod tests {
             header.contains(&format!("1 value cut at {RENDER_VALUE_CHARS} chars")),
             "{header}"
         );
-        assert!(header.contains("3 names cut at 200 chars"), "{header}");
+        // The read's own value cap is a separate ceiling from the display cap.
+        assert!(
+            header.contains(&format!("1 value cut at {MAX_VALUE_CHARS} chars")),
+            "{header}"
+        );
+        assert!(
+            header.contains(&format!("3 names cut at {MAX_NAME_CHARS} chars")),
+            "{header}"
+        );
+    }
+
+    #[test]
+    fn keep_value_records_only_what_it_cut() {
+        let mut truncation = Truncation::default();
+        let fits = "z".repeat(MAX_VALUE_CHARS);
+        assert_eq!(truncation.keep_value(&fits), fits);
+        assert!(truncation.values.is_none(), "nothing was cut");
+
+        let long = "z".repeat(MAX_VALUE_CHARS + 5);
+        let kept = truncation.keep_value(&long);
+        assert_eq!(kept.chars().count(), MAX_VALUE_CHARS);
+        assert!(kept.starts_with(&"z".repeat(MAX_VALUE_CHARS - 1)), "{kept}");
+        assert!(kept.ends_with('…'), "the cut is marked: {kept}");
+        let cut = truncation.values.expect("the cut is recorded");
+        assert_eq!((cut.count, cut.limit), (1, MAX_VALUE_CHARS));
+
+        // A name is cut at its own, lower cap and counted apart from the values.
+        let name = truncation.keep_name(&"n".repeat(MAX_NAME_CHARS + 1));
+        assert_eq!(name.chars().count(), MAX_NAME_CHARS);
+        assert!(
+            truncation
+                .names
+                .is_some_and(|cut| cut.limit == MAX_NAME_CHARS),
+            "the name cut is recorded"
+        );
+        assert_eq!(truncation.values.expect("one value was cut").count, 1);
+
+        // A label is cut at the same cap and only marked: labels are shown, not
+        // matched on, so there is no header to count it in.
+        let label = cap_label(&"l".repeat(MAX_NAME_CHARS + 1));
+        assert_eq!(label.chars().count(), MAX_NAME_CHARS);
+        assert!(label.ends_with('…'), "{label}");
+    }
+
+    #[test]
+    fn capture_size_refuses_what_a_capture_cannot_express() {
+        assert_eq!(
+            capture_size("a window still", 800, 600).unwrap(),
+            (800, 600)
+        );
+        assert!(capture_size("a window still", 0, 600).is_err());
+        let err = capture_size("a display frame", usize::MAX, 1).unwrap_err();
+        assert!(err.to_string().starts_with(ERR_DEGRADED), "{err}");
+    }
+
+    #[test]
+    fn capture_budget_refuses_a_surface_it_cannot_hold() {
+        let budget = CaptureBudget::default();
+        // A wildly misreported display: the area a u32 rect can name is far past the
+        // call's ceiling, so it is refused before anything is allocated.
+        let err = budget
+            .charge("the screen composite", u32::MAX, u32::MAX)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.starts_with(ERR_DEGRADED), "{text}");
+        assert!(text.contains("the screen composite"), "{text}");
+        assert!(
+            text.contains("already holds 0 MiB of its 512 MiB"),
+            "{text}"
+        );
+        // Nothing was charged by the refusal: an ordinary surface still fits.
+        assert!(budget.charge("a display frame", 3840, 2160).is_ok());
+
+        // Empty geometry is refused rather than allocated as nothing — by the one
+        // geometry gate, whose message says what the surface state is.
+        let empty = budget.charge("a window still", 0, 1080).unwrap_err();
+        assert!(empty.to_string().contains("no capture area"), "{empty}");
+
+        // The ceiling refusal is TYPED, so a caller can tell it from every other
+        // degraded failure without reading the message.
+        let ceiling = budget
+            .charge("the screen composite", u32::MAX, u32::MAX)
+            .unwrap_err();
+        assert!(is_ceiling_refusal(&ceiling), "{ceiling}");
+        let other = taxonomy_error(ERR_DEGRADED, "a frame could not be allocated");
+        assert!(!is_ceiling_refusal(&other));
+    }
+
+    #[test]
+    fn capture_alloc_and_from_pixels_take_their_pixels_from_the_budget() {
+        let budget = CaptureBudget::default();
+        let blank = Capture::alloc(&budget, "a test frame", 4, 2).unwrap();
+        assert_eq!(blank.rgba.len(), 4 * 2 * 4);
+        assert!(
+            blank.rgba.iter().all(|byte| *byte == 0),
+            "the buffer is blank"
+        );
+        assert_eq!(budget.held(), 8);
+        let pixels = vec![7u8; 4];
+        let copied = Capture::from_pixels(&budget, "a small frame", 1, 1, &pixels).unwrap();
+        assert_eq!(copied.rgba, pixels, "the pixels are taken over as they are");
+        assert_eq!(
+            budget.held(),
+            8 + 1,
+            "the claim is the pixels, not the bytes"
+        );
+    }
+
+    #[test]
+    fn capture_budget_follows_the_pixels_a_call_holds() {
+        let budget = CaptureBudget::default();
+        // Each of these fits the ceiling alone; together they do not, and that is the
+        // point of a per-call budget over a per-buffer one. Claims carry the accounting
+        // on their own — no buffer is allocated here.
+        let half = u32::try_from(CAPTURE_BUDGET_PIXELS / 2).unwrap();
+        let composite = budget.charge("the composite", half, 1).unwrap();
+        let frame = budget.charge("a display frame", half, 1).unwrap();
+        assert_eq!(budget.held(), CAPTURE_BUDGET_PIXELS);
+        // A full-size crop of the surface cannot join them, and the refusal names what
+        // the call is already holding — the figure the model can act on.
+        let err = budget.charge("the zoom crop", half, 1).unwrap_err();
+        assert!(err.to_string().contains("the zoom crop"), "{err}");
+        assert!(err.to_string().contains("already holds 512 MiB"), "{err}");
+
+        // A refused claim spends nothing, and a dropped claim gives its pixels back: a
+        // call that blits one display at a time is not charged for every display it has
+        // ever held.
+        drop(frame);
+        assert_eq!(budget.held(), u64::from(half));
+        drop(composite);
+        assert_eq!(budget.held(), 0);
+        assert!(budget.charge("the zoom crop", half, 1).is_ok());
+
+        // Pixels a platform produced itself are taken over with the claim their
+        // conversion was reserved with, and what is left of the allowance follows it.
+        let claim = budget
+            .charge("a decoded image", 4, 4)
+            .expect("the allowance is free again");
+        assert_eq!(budget.remaining(), CAPTURE_BUDGET_PIXELS - 16);
+        let adopted = Capture::adopt(claim, 4, 4, vec![0; 4 * 4 * 4]);
+        assert_eq!(adopted.rgba.len(), 4 * 4 * 4);
+        drop(adopted);
+        assert_eq!(budget.remaining(), CAPTURE_BUDGET_PIXELS);
     }
 
     #[test]

@@ -26,8 +26,13 @@
 //! fail into, [`capture_unavailable_error`], guards its own platform contacts.
 //!
 //! Answers are checked before they are used: an AX array is filtered to the member
-//! type it is read as ([`typed_members`]) instead of being cast wholesale, and a
-//! capture size is validated before it reaches the capture framework.
+//! type it is read as ([`typed_members`]) instead of being cast wholesale, an AX
+//! string is cut at the product's cap by its length before a character of it is
+//! copied ([`attribute_text`]), and a capture size is validated before it reaches the
+//! capture framework. This backend charges every frame copy it makes and the
+//! composite it builds to the call's budget; the framework's own texture is bounded
+//! by the same geometry, while the copy this tool keeps is the one budgeted — the
+//! reasoning lives in [`core::CAPTURE_BUDGET_PIXELS`].
 //!
 //! # Surfaces and identity
 //!
@@ -105,9 +110,9 @@
 )]
 
 use super::core::{
-    self, AppInfo, Backend, Capture, ElementAct, Impact, Locator, Modifier, MouseButton,
-    Observation, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, Truncation, UiNode,
-    UnreadWindows, WindowInfo, WindowKey, WindowListing,
+    self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Modifier,
+    MouseButton, Observation, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, Truncation,
+    UiNode, UnreadWindows, WindowInfo, WindowKey, WindowListing,
 };
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::anyhow;
@@ -121,8 +126,8 @@ use objc2_application_services::{
     AXValueType, kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
-    ConcreteType, Type,
+    CFArray, CFBoolean, CFDictionary, CFRange, CFRetained, CFString, CFType, CGPoint, CGRect,
+    CGSize, ConcreteType, Type,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext, CGDirectDisplayID,
@@ -580,9 +585,38 @@ fn attribute_value(el: &AXUIElement, attr: &CFString) -> Result<CFRetained<CFTyp
     }
 }
 
-fn attribute_string(el: &AXUIElement, attr: &CFString) -> Option<String> {
+/// Read an AX string attribute, copying at most `max` characters of it. The
+/// framework has already materialised the whole value before this is called, so the
+/// cap is on what this copies and keeps: the length decides before a single unit is
+/// read out, and at most `max` characters' worth of UTF-16 units are ever copied.
+/// The caller sets its own ceiling on the result — a value or a name through
+/// [`Truncation::keep_value`]/[`Truncation::keep_name`], a label through
+/// [`core::cap_label`].
+fn attribute_text(el: &AXUIElement, attr: &CFString, max: usize) -> Option<String> {
     let val = attribute_value(el, attr).ok()?;
-    Some(val.downcast_ref::<CFString>()?.to_string())
+    let string = val.downcast_ref::<CFString>()?;
+    let length = string.length();
+    if length <= 0 {
+        return Some(String::new());
+    }
+    // Two UTF-16 units per character at worst, plus one character past the cap so a
+    // string that is merely longer still reads as cut.
+    let wanted = length.min(2 * (max as isize + 2));
+    let mut units = vec![0u16; wanted as usize];
+    // SAFETY: `units` holds exactly `wanted` UTF-16 units, the number of units asked
+    // for, and `wanted` is at most the string's own length.
+    unsafe {
+        string.characters(CFRange::new(0, wanted), units.as_mut_ptr());
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// A string this backend uses as a label rather than as content — a role, a
+/// subrole, an application or window name — kept to [`core::MAX_NAME_CHARS`], the
+/// ellipsis marking the cut ([`core::cap_label`]). A label is shown, not matched on,
+/// and a window is matched on its frame, so the cap only costs title-only matches.
+fn attribute_name(el: &AXUIElement, attr: &CFString) -> Option<String> {
+    attribute_text(el, attr, core::MAX_NAME_CHARS).map(|text| core::cap_label(&text))
 }
 
 fn attribute_point(el: &AXUIElement, attr: &CFString) -> Option<CGPoint> {
@@ -766,15 +800,16 @@ fn walk_element(
     *nodes += 1;
     handles.push(element.retain());
 
-    let role = attribute_string(element, &axc(AX_ROLE)).unwrap_or_else(|| "unknown".to_string());
+    let role = attribute_name(element, &axc(AX_ROLE)).unwrap_or_else(|| "unknown".to_string());
     // Never read a value out of a secure element. A password field reports
     // AXRole="AXTextField" with the secure marker in AXSubrole, so check the
     // subrole (or role) for "secure" before pulling the value.
-    let subrole = attribute_string(element, &axc(AX_SUBROLE));
+    let subrole = attribute_name(element, &axc(AX_SUBROLE));
     let value = if is_secure_field(&role, subrole.as_deref()) {
         None
     } else {
-        attribute_string(element, &axc(AX_VALUE))
+        attribute_text(element, &axc(AX_VALUE), core::MAX_VALUE_CHARS)
+            .map(|value| truncation.keep_value(&value))
     };
     let frame = match (
         attribute_point(element, &axc(AX_POSITION)),
@@ -810,7 +845,8 @@ fn walk_element(
     }
     Some(UiNode {
         role,
-        name: attribute_string(element, &axc(AX_TITLE)),
+        name: attribute_text(element, &axc(AX_TITLE), core::MAX_NAME_CHARS)
+            .map(|name| truncation.keep_name(&name)),
         value,
         frame,
         actions,
@@ -854,11 +890,15 @@ fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
         Some((_, name)) => name.to_string(),
         None => app_display_name(app_pid(&app)?, &app),
     };
-    let (root, _handles, truncation) = build_tree(&window, origin);
+    let (root, _handles, mut truncation) = build_tree(&window, origin);
+    // The title is a name like any node's, so a cut one is counted in the same header
+    // ceiling instead of being shortened silently.
+    let title = attribute_text(&window, &axc(AX_TITLE), core::MAX_NAME_CHARS)
+        .map(|title| truncation.keep_name(&title));
     Ok(Observation {
         truncation,
         app_name,
-        window_title: window_title(&window),
+        window_title: title,
         surface,
         root,
     })
@@ -962,7 +1002,7 @@ fn window_by_key(
     };
     // A retained element outlives its window: reading it is what tells the two
     // apart, and a closed window answers with an error.
-    attribute_string(&window, &axc(AX_ROLE)).ok_or_else(|| core::surface_gone(app_name))?;
+    attribute_name(&window, &axc(AX_ROLE)).ok_or_else(|| core::surface_gone(app_name))?;
     Ok(window)
 }
 
@@ -1037,7 +1077,7 @@ fn app_display_name(pid: u32, app: &AXUIElement) -> String {
         .find(|a| a.processIdentifier() == pid as i32)
         .and_then(|a| a.localizedName().map(|n| n.to_string()))
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| attribute_string(app, &axc(AX_TITLE)).unwrap_or_default())
+        .unwrap_or_else(|| attribute_name(app, &axc(AX_TITLE)).unwrap_or_default())
 }
 
 fn app_element(pid: Option<u32>, name: &str) -> Result<CFRetained<AXUIElement>, anyhow::Error> {
@@ -1818,11 +1858,11 @@ fn get_shareable_content() -> Result<Retained<SCShareableContent>, anyhow::Error
 
 /// A single still of `filter`'s content, at the pixel size the caller asked for.
 ///
-/// The pixel size is validated here because it is what reaches the framework: both
-/// capture routes derive it from what the system reported — a window's frame, a
-/// display's frame — and zero is what a minimized, off-screen or vanished surface
-/// reduces to, so it must be an honest failure rather than a request handed to
-/// ScreenCaptureKit.
+/// Both capture routes derive that size from what the system reported — a window's
+/// frame, a display's frame — so it is put through [`core::capture_size`] BEFORE the
+/// request reaches the framework: zero is what a minimized, off-screen or vanished
+/// surface reduces to, and the framework must never be asked for a size the buffer
+/// cannot match.
 ///
 /// Callers guarantee [`sck_available`]: the `SCScreenshotManager` class itself
 /// only exists from macOS 14 on, and messaging a missing class aborts the
@@ -1832,16 +1872,10 @@ fn capture_filter_to_rgba(
     px_w: usize,
     px_h: usize,
     ignore_shadows: bool,
+    budget: &CaptureBudget,
 ) -> Result<Capture, anyhow::Error> {
-    if px_w == 0 || px_h == 0 {
-        return Err(core::taxonomy_error(
-            core::ERR_DEGRADED,
-            format!(
-                "the target has no capture area ({px_w}x{px_h} px) — it is minimized, off-screen \
-                 or was closed; restore it and re-observe"
-            ),
-        ));
-    }
+    let (px_w, px_h) = core::capture_size("the target", px_w, px_h)?;
+    let (px_w, px_h) = (px_w as usize, px_h as usize);
     let config = unsafe { SCStreamConfiguration::new() };
     // SAFETY: the config setters are ObjC messages against a live object.
     // No source rect is set: SCK interprets one filter-locally and would crop
@@ -1886,18 +1920,21 @@ fn capture_filter_to_rgba(
         );
     }
     let SendImage(image) = sc_wait::<SendImage>(&slot, &semaphore, "screenshot")?;
-    capture_image_to_rgba(&image)
+    capture_image_to_rgba(&image, budget)
 }
 
 /// Turn a CGImage into top-down RGBA bytes. CG contexts use a bottom-left
 /// origin, so the image is flipped (translate+scale) before drawing to yield
-/// top-down rows.
-fn capture_image_to_rgba(image: &CGImage) -> Result<Capture, anyhow::Error> {
+/// top-down rows. The buffer is the call's: its geometry goes through
+/// [`core::capture_size`], and it is charged to `budget` with a fallible reserve,
+/// then filled in one copy from the context's own pixels.
+fn capture_image_to_rgba(
+    image: &CGImage,
+    budget: &CaptureBudget,
+) -> Result<Capture, anyhow::Error> {
     let w = CGImage::width(Some(image));
     let h = CGImage::height(Some(image));
-    if w == 0 || h == 0 {
-        anyhow::bail!("captured image has zero size");
-    }
+    let (px_w, px_h) = core::capture_size("a captured frame", w, h)?;
     let space = CGColorSpace::new_device_rgb()
         .ok_or_else(|| anyhow!("failed to create RGB color space"))?;
     let bitmap_info = CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0;
@@ -1925,13 +1962,10 @@ fn capture_image_to_rgba(image: &CGImage) -> Result<Capture, anyhow::Error> {
     if data.is_null() {
         anyhow::bail!("bitmap context returned no data");
     }
-    // SAFETY: `data` points to `w*h*4` bytes owned by the context; copied before drop.
-    let rgba = unsafe { std::slice::from_raw_parts(data as *const u8, w * h * 4) }.to_vec();
-    Ok(Capture {
-        width: w as u32,
-        height: h as u32,
-        rgba,
-    })
+    // SAFETY: `data` points to `w*h*4` bytes owned by the context — the buffer's own
+    // size, as the charge records — and it is copied before the context is dropped.
+    let pixels = unsafe { std::slice::from_raw_parts(data as *const u8, w * h * 4) };
+    Capture::from_pixels(budget, "a captured frame", px_w, px_h, pixels)
 }
 
 /// The ScreenCaptureKit window a target's AX window is matched to, or a refusal:
@@ -1978,7 +2012,9 @@ fn find_sc_window(
     // that survives it means the two cannot be told apart — refusing beats
     // capturing the wrong one. With no frame match the frameworks merely disagree
     // about geometry, so a unique exact title in the same process still names the
-    // window honestly.
+    // window honestly. The title this is handed is the AX one, capped at
+    // [`core::MAX_NAME_CHARS`], so a longer one no longer compares equal here: the
+    // frame is the primary key and the cap only costs title-only matches.
     let matching = match title.filter(|t| !t.is_empty()) {
         Some(title) if !of_frame.is_empty() => {
             let by_title = titled(&of_frame, title);
@@ -2029,7 +2065,10 @@ fn window_capture_facts(
     ))
 }
 
-fn capture_window_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error> {
+fn capture_window_blocking(
+    target: &TargetSpec,
+    budget: &CaptureBudget,
+) -> Result<Capture, anyhow::Error> {
     // The window is resolved through AX (pid, title, frame) before SCK is asked
     // for pixels; only that half belongs on the AX thread, never the capture.
     let (pid, title, frame) = with_target(target, window_capture_facts)?;
@@ -2042,7 +2081,7 @@ fn capture_window_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error
     let scale = unsafe { filter.pointPixelScale() } as f64;
     let px_w = (frame.width * scale).round();
     let px_h = (frame.height * scale).round();
-    capture_filter_to_rgba(&filter, px_w as usize, px_h as usize, true)
+    capture_filter_to_rgba(&filter, px_w as usize, px_h as usize, true, budget)
 }
 
 /// Composite each active display into one RGBA buffer at the virtual-desktop
@@ -2053,7 +2092,10 @@ fn capture_window_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error
 /// it is asked for — so a 1x display beside a 2x one lands at its logical offset ×
 /// that scale instead of covering half the buffer, and a mixed-density arrangement
 /// produces one faithful composite rather than a distorted one.
-fn capture_screen_blocking() -> Result<Capture, anyhow::Error> {
+///
+/// The composite is the call's largest buffer, so it is charged to `budget` before
+/// it exists — as is each display's frame, which the framework renders at that size.
+fn capture_screen_blocking(budget: &CaptureBudget) -> Result<Capture, anyhow::Error> {
     let content = get_shareable_content()?;
     // SAFETY: SCK getter is an ObjC message against a live object.
     let displays = unsafe { content.displays() };
@@ -2091,14 +2133,12 @@ fn capture_screen_blocking() -> Result<Capture, anyhow::Error> {
     let bbox = screen_surface()?;
     let out_w = (bbox.width * ref_scale).round() as usize;
     let out_h = (bbox.height * ref_scale).round() as usize;
-    if out_w == 0 || out_h == 0 {
-        anyhow::bail!("virtual desktop has zero size");
-    }
-    let mut composite = vec![0u8; out_w * out_h * 4];
+    let (out_px_w, out_px_h) = core::capture_size("the virtual desktop", out_w, out_h)?;
+    let mut composite = Capture::alloc(budget, "the screen composite", out_px_w, out_px_h)?;
     for (filter, frame) in filters {
         let px_w = (frame.width * ref_scale).round() as usize;
         let px_h = (frame.height * ref_scale).round() as usize;
-        let cap = capture_filter_to_rgba(&filter, px_w, px_h, false)?;
+        let cap = capture_filter_to_rgba(&filter, px_w, px_h, false, budget)?;
         // A display that comes back at another size cannot be placed at this
         // scale, and blitting it would leave part of the buffer black without a
         // word — refuse instead of composing a wrong image.
@@ -2116,17 +2156,20 @@ fn capture_screen_blocking() -> Result<Capture, anyhow::Error> {
         let dx = ((frame.x - bbox.x) * ref_scale).round();
         let dy = ((frame.y - bbox.y) * ref_scale).round();
         if dx >= 0.0 && dy >= 0.0 {
-            core::blit_rgba(&mut composite, out_w, out_h, &cap, dx as usize, dy as usize);
+            core::blit_rgba(
+                &mut composite.rgba,
+                out_w,
+                out_h,
+                &cap,
+                dx as usize,
+                dy as usize,
+            );
         }
     }
-    Ok(Capture {
-        width: out_w as u32,
-        height: out_h as u32,
-        rgba: composite,
-    })
+    Ok(composite)
 }
 
-fn capture_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error> {
+fn capture_blocking(target: &TargetSpec, budget: &CaptureBudget) -> Result<Capture, anyhow::Error> {
     if !sck_available() {
         return Err(screen_capture_needs_14());
     }
@@ -2136,8 +2179,8 @@ fn capture_blocking(target: &TargetSpec) -> Result<Capture, anyhow::Error> {
         ensure(Grant::Accessibility)?;
     }
     let result = match target {
-        TargetSpec::Screen => capture_screen_blocking(),
-        _ => capture_window_blocking(target),
+        TargetSpec::Screen => capture_screen_blocking(budget),
+        _ => capture_window_blocking(target, budget),
     };
     // A failed still is diagnosed from the grant, never assumed: the attempt
     // itself is the authority (a preflight answer is only a hint), so a
@@ -2189,8 +2232,8 @@ fn press_element(element: &AXUIElement) -> Result<Impact, anyhow::Error> {
 }
 
 fn set_element_value(element: &AXUIElement, text: &str) -> Result<Impact, anyhow::Error> {
-    let role = attribute_string(element, &axc(AX_ROLE)).unwrap_or_default();
-    let subrole = attribute_string(element, &axc(AX_SUBROLE));
+    let role = attribute_name(element, &axc(AX_ROLE)).unwrap_or_default();
+    let subrole = attribute_name(element, &axc(AX_SUBROLE));
     if is_secure_field(&role, subrole.as_deref()) {
         return Err(core::taxonomy_error(
             core::ERR_UNSUPPORTED,
@@ -2448,13 +2491,20 @@ impl Backend for MacOsBackend {
         })
     }
 
-    async fn capture(&self, target: &TargetSpec) -> Result<Capture, anyhow::Error> {
-        with_platform("capture", || capture_blocking(target)).map_err(degraded_read)
+    async fn capture(
+        &self,
+        target: &TargetSpec,
+        budget: &CaptureBudget,
+    ) -> Result<Capture, anyhow::Error> {
+        with_platform("capture", || capture_blocking(target, budget)).map_err(degraded_read)
     }
 }
 
+/// The window's title as a capped label ([`core::cap_label`]): a cut is marked with an
+/// ellipsis and counted only where a tree header is at hand, which is
+/// [`observe_blocking`] reading the title through [`Truncation::keep_name`] itself.
 fn window_title(window: &AXUIElement) -> Option<String> {
-    attribute_string(window, &axc(AX_TITLE))
+    attribute_name(window, &axc(AX_TITLE))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

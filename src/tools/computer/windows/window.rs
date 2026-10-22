@@ -723,15 +723,28 @@ fn is_own_process(pid: u32) -> bool {
     pid != 0 && pid == unsafe { GetCurrentProcessId() }
 }
 
+/// A window's title as a label: kept to the product's cap, the ellipsis marking the
+/// cut. Used wherever a title is shown or named.
 fn title_of(hwnd: HWND) -> String {
+    core::cap_label(&title_text(hwnd))
+}
+
+/// A window's title as read — bounded by a product-sized buffer, never by what the
+/// window reports, so a document-length title is not materialised. `observe` keeps
+/// it through [`core::Truncation::keep_name`], which is what counts a cut title in
+/// the observation header; a label is only marked.
+pub(super) fn title_text(hwnd: HWND) -> String {
     // SAFETY: one handle argument, no out-pointer.
     let length = unsafe { GetWindowTextLengthW(hwnd) };
     if length <= 0 {
         return String::new();
     }
-    let mut buffer = vec![0u16; length as usize + 1];
-    // SAFETY: `buffer` is `length + 1` code units alive here, and the binding passes
-    // its own length as the cap, so the call cannot write past it.
+    // The reported length decides how much is ASKED FOR, never how much is allocated;
+    // two UTF-16 units per character plus room for the ellipsis and the terminator.
+    let wanted = core::MAX_NAME_CHARS * 2 + 2;
+    let mut buffer = vec![0u16; (length as usize).min(wanted) + 1];
+    // SAFETY: `buffer` is alive here and the binding passes its own length as the cap,
+    // so the call cannot write past it.
     let written = unsafe { GetWindowTextW(hwnd, &mut buffer) };
     String::from_utf16_lossy(&buffer[..written.max(0) as usize])
 }

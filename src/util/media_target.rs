@@ -266,18 +266,35 @@ fn decode_base64_payload(s: &str) -> Option<Vec<u8>> {
         .or_else(|| URL_SAFE_NO_PAD.decode(compact.as_ref()).ok())
 }
 
-/// Decode `bytes` as a native raster (PNG/JPEG/WebP) under `limits`, returning
-/// the decoded image. The single shared decode path used by a validity check
-/// (the classifier and the provider's data-URI gate, which only need to know
-/// the bytes decode) and by the GUI viewer, which converts to RGBA8 for an iced
-/// handle. `None` for a non-native format or a decode exceeding `limits`.
-#[must_use]
-fn decode_raster(bytes: &[u8], limits: image::Limits) -> Option<image::DynamicImage> {
-    let format = image::guess_format(bytes).ok()?;
-    crate::util::image_format_native_label(format)?;
+/// Decode `bytes` as a native raster (PNG/JPEG/WebP) under `limits`. The single
+/// shared decode path — the format is gated through [`image_format_native_label`]
+/// and the pixels are read under `limits` — with the failure kept for a caller
+/// that reports it (computer-use's portal capture names the cap that refused).
+pub(crate) fn decode_raster_image(
+    bytes: &[u8],
+    limits: image::Limits,
+) -> anyhow::Result<image::DynamicImage> {
+    let format = image::guess_format(bytes)
+        .map_err(|e| anyhow::anyhow!("not a recognisable image format ({e})"))?;
+    if crate::util::image_format_native_label(format).is_none() {
+        anyhow::bail!(
+            "{} is not one of the formats this tool decodes (PNG, JPEG, WEBP)",
+            format
+                .extensions_str()
+                .first()
+                .copied()
+                .unwrap_or("unknown")
+        );
+    }
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits);
-    reader.decode().ok()
+    Ok(reader.decode()?)
+}
+
+/// [`decode_raster_image`] for a caller that only needs to know the bytes decode
+/// (the classifier and the provider's data-URI gate).
+fn decode_raster(bytes: &[u8], limits: image::Limits) -> Option<image::DynamicImage> {
+    decode_raster_image(bytes, limits).ok()
 }
 
 /// Decode `bytes` as a native raster under `limits`, returning
