@@ -290,19 +290,29 @@ pub(crate) fn cached_capture_available() -> Option<bool> {
 static ACTION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// Last screenshot/zoom path per agent, keyed by [`core::agent_key`]. A
-/// concurrent agent's capture can never be re-attached by another agent's
-/// `image_payload`. Entries are replaced per agent on each capture and left
-/// stale (the last one is what `image_payload` wants).
-static CAPTURE_PATHS: LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+/// The last screenshot/zoom of each agent, keyed by [`core::agent_key`], so a
+/// concurrent agent's capture can never be re-attached by another agent's call. An
+/// entry is replaced per agent on each capture and left stale (the last one is what
+/// the attachment takes).
+static CAPTURES: LazyLock<std::sync::Mutex<HashMap<String, CaptureRecord>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// One capture as it was produced: the file on disk and the pixel size it was
+/// taken at. The attachment is compressed and possibly reduced on its way to the
+/// model, and it needs the capture's own size to say so.
+#[derive(Clone)]
+struct CaptureRecord {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+}
 
 /// Drop an agent's per-agent registry entries (observation/target/capture) at
 /// agent-run end, so state never leaks across runs. Called from the agent's
 /// run-end cleanup guard (`RunEndCleanup`) with the agent's id string (matching
 /// [`core::agent_key`]'s task-local value).
 pub(crate) fn cleanup_agent_state(agent_key: &str) {
-    CAPTURE_PATHS.lock().unwrap_poison().remove(agent_key);
+    CAPTURES.lock().unwrap_poison().remove(agent_key);
     core::clear_agent_state(agent_key);
     #[cfg(target_os = "macos")]
     macos::forget_agent_windows(agent_key);
@@ -449,40 +459,88 @@ impl Tool for ComputerTool {
         Ok(super::with_normalization_notes(output, &notes))
     }
 
-    async fn image_payload(
+    /// The tool's text is a real result (a surface summary, an action's outcome),
+    /// never a claim about an image, so annotations are appended rather than
+    /// replacing it. A capture whose image cannot be attached says so here instead
+    /// of leaving the call looking like a successful observation.
+    async fn execute_with_payloads(
         &self,
-        _ws: &Workspace,
-        args: &serde_json::Value,
-    ) -> Option<crate::tools::ImagePayload> {
-        // Only a successful `screenshot`/`zoom` produces a payload. Re-parse the
-        // action so a stale capture from a prior round is never re-attached to a
-        // non-capture call. The path is looked up per agent so two concurrent
-        // agents never share a screenshot.
-        let action_value = args.get("action")?.clone();
-        let (action_value, _) = normalize_action(action_value, args).ok()?;
-        let action: ComputerAction = serde_json::from_value(action_value).ok()?;
-        if !matches!(
-            action,
-            ComputerAction::Screenshot { .. } | ComputerAction::Zoom { .. }
-        ) {
-            return None;
-        }
-        let path = CAPTURE_PATHS
-            .lock()
-            .unwrap_poison()
-            .get(&core::agent_key())
-            .cloned()?;
-        let p = PathBuf::from(&path);
-        let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&p)
-            .await
-            .ok()?;
-        Some(crate::tools::ImagePayload::from_compressed_meta(
-            &p,
-            meta,
-            None,
-            crate::tools::ImagePayloadSource::Computer,
-        ))
+        ws: &crate::Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::ToolOutput> {
+        let text = self.execute(ws, args.clone()).await?;
+        let (text, image_payloads) = match captured_payload(&args).await {
+            Ok(Some(payload)) => (text, vec![payload]),
+            Ok(None) => (text, Vec::new()),
+            Err(e) => (
+                format!("{text}\nno image could be attached to this result: {e}"),
+                Vec::new(),
+            ),
+        };
+        Ok(crate::tools::ToolOutput {
+            text,
+            image_payloads,
+            text_is_content: true,
+        })
     }
+}
+
+/// The image a `screenshot`/`zoom` call produced, or `None` for every other action.
+///
+/// The action is re-parsed so a stale capture from a prior round is never attached
+/// to a non-capture call, and the record is looked up per agent so two concurrent
+/// agents never share a screenshot. Failing to produce the attachment is an error
+/// the caller must report, never a silent `None`.
+async fn captured_payload(
+    args: &serde_json::Value,
+) -> anyhow::Result<Option<crate::tools::ImagePayload>> {
+    let Some(action_value) = args.get("action").cloned() else {
+        return Ok(None);
+    };
+    let Ok((action_value, _)) = normalize_action(action_value, args) else {
+        return Ok(None);
+    };
+    let Ok(action) = serde_json::from_value::<ComputerAction>(action_value) else {
+        return Ok(None);
+    };
+    if !matches!(
+        action,
+        ComputerAction::Screenshot { .. } | ComputerAction::Zoom { .. }
+    ) {
+        return Ok(None);
+    }
+    let Some(record) = CAPTURES
+        .lock()
+        .unwrap_poison()
+        .get(&core::agent_key())
+        .cloned()
+    else {
+        // Unreachable: a capture records its file before it can return success.
+        return Ok(None);
+    };
+    let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&record.path).await?;
+    let mut payload = crate::tools::ImagePayload::from_compressed_meta(
+        &record.path,
+        meta,
+        None,
+        crate::tools::ImagePayloadSource::Computer,
+    );
+    // A capture larger than the shared attachment cap reaches the model reduced, so
+    // the model is told: an image it measured at its capture size would otherwise
+    // silently describe pixels it was never shown.
+    let longest = record.width.max(record.height);
+    if longest > crate::util::INBOUND_IMAGE_MAX_SIDE {
+        payload.note = Some(format!(
+            "reduced from the captured {}x{} to {}x{} — an attached image is capped at {} px on \
+             its long edge",
+            record.width,
+            record.height,
+            payload.width,
+            payload.height,
+            crate::util::INBOUND_IMAGE_MAX_SIDE
+        ));
+    }
+    Ok(Some(payload))
 }
 
 // ── Action dispatch ─────────────────────────────────────────────────────
@@ -524,7 +582,7 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
         ComputerAction::Press { keys } => {
             // A chord is global input: it goes to the focused application, so no
             // surface is resolved and none is raised on its behalf.
-            backend()
+            let impact = backend()
                 .raw_input(
                     &TargetSpec::Focused,
                     core::RawInput::KeyChord {
@@ -532,7 +590,10 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
                     },
                 )
                 .await?;
-            format!("pressed chord: {keys} — a chord goes to the focused application")
+            core::impact_text(
+                format!("pressed chord: {keys} — a chord goes to the focused application"),
+                impact,
+            )
         }
         ComputerAction::Scroll {
             direction,
@@ -547,11 +608,14 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
                 from: *from,
                 to: *to,
             };
-            backend().raw_input(&target, gesture.clone()).await?;
-            format!(
-                "dragged from {from:?} to {to:?}{}{}",
-                on_surface(&target),
-                unpinned_clause(&target, &gesture)
+            let impact = backend().raw_input(&target, gesture.clone()).await?;
+            core::impact_text(
+                format!(
+                    "dragged from {from:?} to {to:?}{}{}",
+                    on_surface(&target),
+                    unpinned_clause(&target, &gesture)
+                ),
+                impact,
             )
         }
         ComputerAction::Cursor {} => cursor().await?,
@@ -639,26 +703,54 @@ async fn windows(app: Option<&str>) -> anyhow::Result<String> {
         Some(arg) => Some(resolve_app(arg).await?),
         None => None,
     };
-    let wins = backend().list_windows(app_info.as_ref()).await?;
-    let surfaces = wins.iter().map(TargetSpec::from_window).collect::<Vec<_>>();
+    let listing = backend().list_windows(app_info.as_ref()).await?;
+    let surfaces = listing
+        .windows
+        .iter()
+        .map(TargetSpec::from_window)
+        .collect::<Vec<_>>();
     let ids = core::store_window_targets(&surfaces);
-    let mut lines = Vec::with_capacity(wins.len());
-    for (win, id) in wins.iter().zip(&ids) {
-        lines.push(format!(
-            "[{id}] {} — \"{}\" {}x{} @ ({}, {})",
-            win.app_name,
-            win.title,
-            win.surface.width,
-            win.surface.height,
-            win.surface.x,
-            win.surface.y
-        ));
-    }
+    Ok(render_windows(&listing, &ids))
+}
+
+/// The listing as the model reads it: one line per window, then one line per set of
+/// windows that is not listed. A failed read is never presented as an absence, and
+/// the note never claims anything about the windows listed above it — an application
+/// can have both.
+fn render_windows(listing: &core::WindowListing, ids: &[String]) -> String {
+    let mut lines = listing
+        .windows
+        .iter()
+        .zip(ids)
+        .map(|(win, id)| {
+            format!(
+                "[{id}] {} — \"{}\" {}x{} @ ({}, {})",
+                win.app_name,
+                win.title,
+                win.surface.width,
+                win.surface.height,
+                win.surface.x,
+                win.surface.y
+            )
+        })
+        .collect::<Vec<_>>();
     if lines.is_empty() {
-        Ok("no windows found".to_string())
-    } else {
-        Ok(lines.join("\n"))
+        lines.push(
+            if listing.unread.is_empty() {
+                "no windows found"
+            } else {
+                "no windows could be read"
+            }
+            .to_string(),
+        );
     }
+    lines.extend(listing.unread.iter().map(|unread| {
+        format!(
+            "windows not listed for {}: {}",
+            unread.app_name, unread.reason
+        )
+    }));
+    lines.join("\n")
 }
 
 /// Resolve a `windows` app argument: a stored a-id (or w-id, whose app is what is
@@ -796,12 +888,12 @@ async fn click(
         }
         let (locator, cache_target) = core::resolve_ref(reference)?;
         ensure_ref_target_match(reference, target, &cache_target)?;
-        backend()
+        let impact = backend()
             .act_on_element(&cache_target, &locator, ElementAct::Press)
             .await?;
-        return Ok(format!(
-            "clicked element {reference}{}",
-            on_surface(&cache_target)
+        return Ok(core::impact_text(
+            format!("clicked element {reference}{}", on_surface(&cache_target)),
+            impact,
         ));
     }
     let (Some(x), Some(y)) = (x, y) else {
@@ -814,11 +906,14 @@ async fn click(
         double: double.unwrap_or(false),
         modifiers: modifiers.unwrap_or_default().to_vec(),
     };
-    backend().raw_input(&target, input.clone()).await?;
-    Ok(format!(
-        "clicked at ({x}, {y}){}{}",
-        on_surface(&target),
-        unpinned_clause(&target, &input)
+    let impact = backend().raw_input(&target, input.clone()).await?;
+    Ok(core::impact_text(
+        format!(
+            "clicked at ({x}, {y}){}{}",
+            on_surface(&target),
+            unpinned_clause(&target, &input)
+        ),
+        impact,
     ))
 }
 
@@ -830,7 +925,7 @@ async fn type_text(
     if let Some(reference) = reference {
         let (locator, cache_target) = core::resolve_ref(reference)?;
         ensure_ref_target_match(reference, target, &cache_target)?;
-        backend()
+        let impact = backend()
             .act_on_element(
                 &cache_target,
                 &locator,
@@ -839,27 +934,33 @@ async fn type_text(
                 },
             )
             .await?;
-        return Ok(format!(
-            "set value on element {reference} in {}",
-            cache_target.describe()
+        return Ok(core::impact_text(
+            format!(
+                "set value on element {reference} in {}",
+                cache_target.describe()
+            ),
+            impact,
         ));
     }
     let target = resolve_action_target(target)?;
     let input = core::RawInput::TypeText {
         text: text.to_string(),
     };
-    backend().raw_input(&target, input.clone()).await?;
+    let impact = backend().raw_input(&target, input.clone()).await?;
     // Typing is pinned only on a named window; with `screen` or nothing observed
     // yet it goes to the focused element, so the result must not claim a surface
     // it never reached.
-    Ok(format!(
-        "typed text ({} chars){}",
-        text.chars().count(),
-        if core::pinned_input(&target, &input) {
-            on_surface(&target)
-        } else {
-            " — the text goes to the focused element".to_string()
-        }
+    Ok(core::impact_text(
+        format!(
+            "typed text ({} chars){}",
+            text.chars().count(),
+            if core::pinned_input(&target, &input) {
+                on_surface(&target)
+            } else {
+                " — the text goes to the focused element".to_string()
+            }
+        ),
+        impact,
     ))
 }
 
@@ -889,7 +990,7 @@ async fn scroll(
             );
         }
         // A point-less wheel is global input: no surface is resolved or raised.
-        backend()
+        let impact = backend()
             .raw_input(
                 &TargetSpec::Focused,
                 core::RawInput::Scroll {
@@ -899,9 +1000,12 @@ async fn scroll(
                 },
             )
             .await?;
-        return Ok(format!(
-            "scrolled {amount} ticks {direction:?} — a point-less wheel goes to whatever is under \
-             the pointer"
+        return Ok(core::impact_text(
+            format!(
+                "scrolled {amount} ticks {direction:?} — a point-less wheel goes to whatever is \
+                 under the pointer"
+            ),
+            impact,
         ));
     };
     let target = resolve_action_target(target)?;
@@ -910,13 +1014,16 @@ async fn scroll(
         direction,
         amount,
     };
-    backend().raw_input(&target, input.clone()).await?;
-    Ok(format!(
-        "scrolled {amount} ticks {direction:?} at ({}, {}){}{}",
-        point.0,
-        point.1,
-        on_surface(&target),
-        unpinned_clause(&target, &input)
+    let impact = backend().raw_input(&target, input.clone()).await?;
+    Ok(core::impact_text(
+        format!(
+            "scrolled {amount} ticks {direction:?} at ({}, {}){}{}",
+            point.0,
+            point.1,
+            on_surface(&target),
+            unpinned_clause(&target, &input)
+        ),
+        impact,
     ))
 }
 
@@ -965,13 +1072,13 @@ async fn cursor() -> anyhow::Result<String> {
 }
 
 /// Capture the target surface (optionally cropping a normalized region) to a PNG
-/// under the managed temp dir, record its path, and return a summary naming the
-/// surface actually captured. The capture probe is cached: a successful capture
-/// always refreshes the cache; a failed capture on a cold cache probes once and
-/// caches the grant state, so a genuinely-grantless setup maps failures to the
-/// actionable [`Backend::capture_unavailable_error`] while a real success
-/// upgrades the cache immediately — a stale cached negative never locks out a
-/// working channel.
+/// under the managed temp dir, record it for this call's attachment, and return a
+/// summary naming the surface actually captured. The capture probe is cached: a
+/// successful capture always refreshes the cache; a failed capture on a cold cache
+/// probes once and caches the grant state, so a genuinely-grantless setup maps
+/// failures to the actionable [`Backend::capture_unavailable_error`] while a real
+/// success upgrades the cache immediately — a stale cached negative never locks
+/// out a working channel.
 async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Result<String> {
     // One resolution for the whole call: the surface captured, the geometry the
     // region is mapped against and the surface pinned afterwards are the same.
@@ -1018,13 +1125,18 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
     // A capture that produced pixels is an observation of that surface: later
     // calls with no target address it.
     core::set_last_surface(target.clone());
-    // Record the path under the owning agent id (owner-deletes-at-end via the
-    // existing spill machinery) and stash it in the per-agent capture map.
+    // Record the capture under the owning agent id (owner-deletes-at-end via the
+    // existing spill machinery) and stash it in the per-agent capture map, with the
+    // size it was taken at so the attachment can say when it had to reduce it.
     crate::tools::shell::record_spill_owner(path.clone());
-    CAPTURE_PATHS
-        .lock()
-        .unwrap_poison()
-        .insert(core::agent_key(), path.display().to_string());
+    CAPTURES.lock().unwrap_poison().insert(
+        core::agent_key(),
+        CaptureRecord {
+            path: path.clone(),
+            width: cw,
+            height: ch,
+        },
+    );
     let kind = if rect_opt.is_some() {
         "zoom"
     } else {
@@ -1087,6 +1199,48 @@ mod tests {
             "wait" => json!({"seconds": 1}),
             other => panic!("no lockstep payload for {other}"),
         }
+    }
+
+    fn unread_explorer() -> core::UnreadWindows {
+        core::UnreadWindows {
+            app_name: "Explorer".to_string(),
+            reason: "one read timed out".to_string(),
+        }
+    }
+
+    /// The unread note sits on its own line, so it can neither run into the last
+    /// window line nor claim that an application has nothing listed when it does.
+    #[test]
+    fn window_listing_puts_each_unread_note_on_its_own_line() {
+        let listing = core::WindowListing {
+            windows: vec![core::WindowInfo {
+                app_pid: Some(10),
+                app_name: "Chrome".to_string(),
+                title: "Start".to_string(),
+                key: core::WindowKey::new("k"),
+                surface: core::SurfaceGeometry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 800.0,
+                    height: 600.0,
+                },
+            }],
+            unread: vec![unread_explorer()],
+        };
+        assert_eq!(
+            render_windows(&listing, &["w1".to_string()]),
+            "[w1] Chrome — \"Start\" 800x600 @ (0, 0)\n\
+             windows not listed for Explorer: one read timed out"
+        );
+        // A listing where nothing could be read is a failure, not "no windows".
+        let nothing = core::WindowListing {
+            windows: Vec::new(),
+            unread: vec![unread_explorer()],
+        };
+        assert_eq!(
+            render_windows(&nothing, &[]),
+            "no windows could be read\nwindows not listed for Explorer: one read timed out"
+        );
     }
 
     #[test]

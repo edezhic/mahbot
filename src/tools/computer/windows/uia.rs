@@ -14,14 +14,14 @@
 //!
 //! Reading is capped lower than on the other platforms (2000 nodes) because UIA
 //! charges one cross-process call per property. A node or depth cap stops the walk
-//! with the header still reporting the real counts; a provider that runs out of
-//! TIME is different and abandons the whole read with an honest `degraded` timeout
-//! rather than returning half of a tree. A provider that refuses a single child or
-//! property only ends that subtree or leaves one field absent, the way a broken
-//! accessibility attribute does on the other platforms.
+//! and is recorded in the observation's truncation, which the header names; a
+//! provider that runs out of TIME is different and abandons the whole read with an
+//! honest `degraded` timeout rather than returning half of a tree. A provider that
+//! refuses a single child or property only ends that subtree or leaves one field
+//! absent, the way a broken accessibility attribute does on the other platforms.
 
 use super::super::core::{
-    self, ElementAct, Locator, Observation, SurfaceGeometry, TargetSpec, UiNode,
+    self, ElementAct, Impact, Locator, Observation, SurfaceGeometry, TargetSpec, Truncation, UiNode,
 };
 use super::{input, window};
 use std::time::{Duration, Instant};
@@ -35,19 +35,20 @@ use windows::Win32::UI::Accessibility::{
     UIA_AppBarControlTypeId, UIA_ButtonControlTypeId, UIA_CalendarControlTypeId,
     UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_CustomControlTypeId,
     UIA_DataGridControlTypeId, UIA_DataItemControlTypeId, UIA_DocumentControlTypeId,
-    UIA_E_ELEMENTNOTAVAILABLE, UIA_E_ELEMENTNOTENABLED, UIA_E_NOTSUPPORTED, UIA_EditControlTypeId,
-    UIA_ExpandCollapsePatternId, UIA_GroupControlTypeId, UIA_HeaderControlTypeId,
-    UIA_HeaderItemControlTypeId, UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId,
-    UIA_InvokePatternId, UIA_LegacyIAccessiblePatternId, UIA_ListControlTypeId,
-    UIA_ListItemControlTypeId, UIA_MenuBarControlTypeId, UIA_MenuControlTypeId,
-    UIA_MenuItemControlTypeId, UIA_PATTERN_ID, UIA_PaneControlTypeId, UIA_ProgressBarControlTypeId,
-    UIA_RadioButtonControlTypeId, UIA_ScrollBarControlTypeId, UIA_SelectionItemPatternId,
-    UIA_SemanticZoomControlTypeId, UIA_SeparatorControlTypeId, UIA_SliderControlTypeId,
-    UIA_SpinnerControlTypeId, UIA_SplitButtonControlTypeId, UIA_StatusBarControlTypeId,
-    UIA_TabControlTypeId, UIA_TabItemControlTypeId, UIA_TableControlTypeId, UIA_TextControlTypeId,
-    UIA_ThumbControlTypeId, UIA_TitleBarControlTypeId, UIA_TogglePatternId,
-    UIA_ToolBarControlTypeId, UIA_ToolTipControlTypeId, UIA_TreeControlTypeId,
-    UIA_TreeItemControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId,
+    UIA_E_ELEMENTNOTAVAILABLE, UIA_E_ELEMENTNOTENABLED, UIA_E_NOTSUPPORTED, UIA_E_TIMEOUT,
+    UIA_EditControlTypeId, UIA_ExpandCollapsePatternId, UIA_GroupControlTypeId,
+    UIA_HeaderControlTypeId, UIA_HeaderItemControlTypeId, UIA_HyperlinkControlTypeId,
+    UIA_ImageControlTypeId, UIA_InvokePatternId, UIA_LegacyIAccessiblePatternId,
+    UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_MenuBarControlTypeId,
+    UIA_MenuControlTypeId, UIA_MenuItemControlTypeId, UIA_PATTERN_ID, UIA_PaneControlTypeId,
+    UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId, UIA_ScrollBarControlTypeId,
+    UIA_SelectionItemPatternId, UIA_SemanticZoomControlTypeId, UIA_SeparatorControlTypeId,
+    UIA_SliderControlTypeId, UIA_SpinnerControlTypeId, UIA_SplitButtonControlTypeId,
+    UIA_StatusBarControlTypeId, UIA_TabControlTypeId, UIA_TabItemControlTypeId,
+    UIA_TableControlTypeId, UIA_TextControlTypeId, UIA_ThumbControlTypeId,
+    UIA_TitleBarControlTypeId, UIA_TogglePatternId, UIA_ToolBarControlTypeId,
+    UIA_ToolTipControlTypeId, UIA_TreeControlTypeId, UIA_TreeItemControlTypeId, UIA_ValuePatternId,
+    UIA_WindowControlTypeId,
 };
 use windows::core::BSTR;
 
@@ -56,14 +57,15 @@ use windows::core::BSTR;
 pub(super) const WALK_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Nodes per walk. UIA pays one cross-process read per property, so this is lower
-/// than the other backends' render cap; the header the model sees carries the real
-/// counts of what was read.
+/// than the renderer's `core::MAX_TREE_NODES`; reaching it stops the walk and is
+/// recorded as the walk's own ceiling.
 const MAX_NODES: usize = 2000;
 /// Depth per walk — a guard against provider cycles, like the other backends'.
 const MAX_DEPTH: usize = 25;
 /// Cap on a value pulled into a node, mirroring the Linux backend's.
 const MAX_VALUE_CHARS: usize = 2000;
-/// Cap on an element name; a name is a label, not a document.
+/// Cap on an element name; a name is a label, not a document. A name cut here is
+/// counted in the observation's truncation.
 const MAX_NAME_CHARS: usize = 200;
 
 /// Roles whose value is worth a second cross-process read.
@@ -93,6 +95,7 @@ pub(super) fn observe(uia: &IUIAutomation, target: &TargetSpec) -> anyhow::Resul
         window_title: Some(resolved.title),
         surface: resolved.surface,
         root: tree.root,
+        truncation: tree.truncation,
     })
 }
 
@@ -101,7 +104,7 @@ pub(super) fn act_on_element(
     target: &TargetSpec,
     locator: &Locator,
     act: &ElementAct,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Impact> {
     let resolved = window::resolve(target)?;
     window::ensure_actuation_allowed(Some(resolved.hwnd))?;
     window::ensure_not_own_window(resolved.hwnd)?;
@@ -140,6 +143,8 @@ struct Tree {
     /// One element per node, in the same pre-order as `root` — the mapping
     /// [`core::pre_order_index`] lands in.
     handles: Vec<IUIAutomationElement>,
+    /// Where this walk stopped short of the whole tree.
+    truncation: Truncation,
 }
 
 struct Walk {
@@ -148,6 +153,7 @@ struct Walk {
     deadline: Instant,
     nodes: usize,
     handles: Vec<IUIAutomationElement>,
+    truncation: Truncation,
 }
 
 fn build_tree(
@@ -165,11 +171,13 @@ fn build_tree(
         deadline: Instant::now() + WALK_DEADLINE,
         nodes: 0,
         handles: Vec::new(),
+        truncation: Truncation::default(),
     };
     let root = walk.node(root, 0)?;
     Ok(Tree {
         root,
         handles: walk.handles,
+        truncation: walk.truncation,
     })
 }
 
@@ -187,8 +195,15 @@ impl Walk {
         }
         self.nodes += 1;
         self.handles.push(element.clone());
-        let mut node = read_node(element, self.origin);
+        let mut node = read_node(element, self.origin, &mut self.truncation);
         if depth >= MAX_DEPTH {
+            // The node's subtree is not read. Only a node that has one is a cut, so a
+            // leaf at the ceiling is not reported as a truncation.
+            // SAFETY: `element` is a live element of this walk and `self.walker` is the
+            // walker of the same client; the probe discards the child it returns.
+            if unsafe { self.walker.GetFirstChildElement(element) }.is_ok() {
+                self.truncation.cut_depth(MAX_DEPTH);
+            }
             return Ok(node);
         }
         // SAFETY: `element` is a live element of this walk and `self.walker` is the
@@ -197,6 +212,7 @@ impl Walk {
         let mut child = unsafe { self.walker.GetFirstChildElement(element) }.ok();
         while let Some(element) = child {
             if self.nodes >= MAX_NODES {
+                self.truncation.hit_node_ceiling(MAX_NODES);
                 break;
             }
             node.children.push(self.node(&element, depth + 1)?);
@@ -208,7 +224,11 @@ impl Walk {
     }
 }
 
-fn read_node(element: &IUIAutomationElement, origin: (f64, f64)) -> UiNode {
+fn read_node(
+    element: &IUIAutomationElement,
+    origin: (f64, f64),
+    truncation: &mut Truncation,
+) -> UiNode {
     // SAFETY: `element` is a live element handle; the control type is returned by value.
     let control_type = unsafe { element.CurrentControlType() }.map_or(0, |id| id.0);
     let (role, actions) = role_and_actions(control_type);
@@ -217,7 +237,12 @@ fn read_node(element: &IUIAutomationElement, origin: (f64, f64)) -> UiNode {
         .ok()
         .map(|name| name.to_string())
         .filter(|name| !name.is_empty())
-        .map(|name| crate::util::truncate(&name, MAX_NAME_CHARS));
+        .map(|name| {
+            if name.chars().count() > MAX_NAME_CHARS {
+                truncation.cut_name(MAX_NAME_CHARS);
+            }
+            crate::util::truncate(&name, MAX_NAME_CHARS)
+        });
     // SAFETY: `element` is live; the rectangle is returned by value.
     let frame = unsafe { element.CurrentBoundingRectangle() }
         .ok()
@@ -336,7 +361,7 @@ fn role_and_actions(control_type: i32) -> (&'static str, &'static [&'static str]
 /// Press an element the way a user would: the first accessibility action it actually
 /// supports, in the order a screen reader tries them, and — only when it supports
 /// none at all — a click on its own point.
-fn press(element: &IUIAutomationElement, hwnd: HWND) -> anyhow::Result<()> {
+fn press(element: &IUIAutomationElement, hwnd: HWND) -> anyhow::Result<Impact> {
     // SAFETY: every `unsafe` block below is one method on the pattern that `attempt`
     // obtained from this element — each is owned here, alive for its call, and runs on
     // the thread that owns it.
@@ -403,20 +428,20 @@ fn press(element: &IUIAutomationElement, hwnd: HWND) -> anyhow::Result<()> {
 /// `None` means "try the next one": the pattern is absent, or the element reports
 /// the action itself as unsupported. A pattern that *fails* — a disabled control, a
 /// provider that ran out of time — is the element's own answer and comes back as
-/// `Some(Err)`, so it is reported instead of being replaced by a coordinate click
-/// that would claim a click the element never received.
+/// `Some`, so it is reported instead of being replaced by a coordinate click that
+/// would claim a click the element never received.
 fn attempt<T: windows::core::Interface>(
     element: &IUIAutomationElement,
     id: UIA_PATTERN_ID,
     action: impl FnOnce(&T) -> windows::core::Result<()>,
-) -> Option<anyhow::Result<()>> {
+) -> Option<anyhow::Result<Impact>> {
     // SAFETY: `GetCurrentPatternAs` yields an owned interface for this element; the
     // pattern object is released when it goes out of scope here.
     let pattern = unsafe { element.GetCurrentPatternAs::<T>(id) }.ok()?;
     match action(&pattern) {
-        Ok(()) => Some(Ok(())),
+        Ok(()) => Some(Ok(Impact::Done)),
         Err(error) if is_unsupported(&error) => None,
-        Err(error) => Some(Err(map_uia_error("press the element", &error))),
+        Err(error) => Some(map_uia_action_error("press the element", &error)),
     }
 }
 
@@ -465,7 +490,7 @@ fn clickable_point(element: &IUIAutomationElement) -> Option<POINT> {
 /// an EDITABLE control only — focus the element and type over its selected
 /// contents, which is what a user does. Anything else is refused, like the other
 /// backends: typing into an arbitrary control is destructive, not helpful.
-fn set_value(element: &IUIAutomationElement, hwnd: HWND, text: &str) -> anyhow::Result<()> {
+fn set_value(element: &IUIAutomationElement, hwnd: HWND, text: &str) -> anyhow::Result<Impact> {
     // SAFETY: `element` is live; the password flag is returned by value.
     if unsafe { element.CurrentIsPassword() }.is_ok_and(windows::core::BOOL::as_bool) {
         return Err(core::taxonomy_error(
@@ -485,10 +510,10 @@ fn set_value(element: &IUIAutomationElement, hwnd: HWND, text: &str) -> anyhow::
                 .is_ok_and(windows::core::BOOL::as_bool);
             if !read_only {
                 match pattern.SetValue(&BSTR::from(text)) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return Ok(Impact::Done),
                     // The pattern cannot serve a value here: fall through to typing.
                     Err(e) if is_unsupported(&e) => {}
-                    Err(e) => return Err(map_uia_error("set the element's value", &e)),
+                    Err(e) => return map_uia_action_error("set the element's value", &e),
                 }
             }
         }
@@ -506,15 +531,42 @@ fn set_value(element: &IUIAutomationElement, hwnd: HWND, text: &str) -> anyhow::
     // SAFETY: `element` is live, and focusing it takes no pointer of ours; it runs on
     // the thread that owns the element.
     unsafe { element.SetFocus() }.map_err(|e| map_uia_error("focus the element", &e))?;
-    input::select_all()?;
+    // A select-all that only partly landed leaves the field's old text in place and
+    // a selection nobody can vouch for, so the value is unchanged: that is a failure,
+    // not an unconfirmed set, and the text is deliberately not typed over it.
+    if let Impact::Unconfirmed(detail) = input::select_all()? {
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "the element's value was not set and no text was typed — selecting its existing \
+                 text was only partly delivered ({detail}), so the field's selection is now \
+                 unknown"
+            ),
+        ));
+    }
     input::type_text_into_focus(text)
 }
 
 // ── Errors ──────────────────────────────────────────────────────────────
 
+/// Map a UIA failure of an ACTUATING call. Everything [`map_uia_error`] classifies
+/// means the action was not performed, so it stays an error; a provider that ran out
+/// of time is the one case the element may have acted on anyway, and it answers
+/// [`Impact::Unconfirmed`] rather than inviting a second press.
+fn map_uia_action_error(action: &str, error: &windows::core::Error) -> anyhow::Result<Impact> {
+    if error.code().0.cast_unsigned() == UIA_E_TIMEOUT {
+        return Ok(Impact::Unconfirmed(format!(
+            "the element's provider did not answer {action} within its own timeout, so the call \
+             was abandoned while it may still complete — {error}"
+        )));
+    }
+    Err(map_uia_error(action, error))
+}
+
 /// Map a UIA failure onto the shared taxonomy. The provider's own codes carry the
-/// distinction the model needs: an element that is gone, one that is disabled and a
-/// provider that ran out of time each call for a different next step.
+/// distinction the model needs: an element that is gone and one that is disabled
+/// each call for a different next step; anything else — a provider that ran out of
+/// time, an unknown code — is `degraded`.
 fn map_uia_error(action: &str, error: &windows::core::Error) -> anyhow::Error {
     // Access denied is the typed permission failure, so a caller that must branch
     // on it (see `core::is_permission_denied`) does not read the text.

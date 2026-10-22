@@ -105,8 +105,9 @@
 )]
 
 use super::core::{
-    self, AppInfo, Backend, Capture, ElementAct, Locator, Modifier, MouseButton, Observation,
-    RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, UiNode, WindowInfo, WindowKey,
+    self, AppInfo, Backend, Capture, ElementAct, Impact, Locator, Modifier, MouseButton,
+    Observation, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, Truncation, UiNode,
+    UnreadWindows, WindowInfo, WindowKey, WindowListing,
 };
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::anyhow;
@@ -489,10 +490,39 @@ fn ensure_ax_thread(pid: u32) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// The wait for mahbot's own main thread ran out. Typed so an actuating call can
+/// report the possibly-applied request as applied-but-unconfirmed, while a read
+/// reports it as the `degraded` failure it is (nothing was read, nothing changed).
+#[derive(Debug)]
+struct AxBusy(u64);
+
+impl std::fmt::Display for AxBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mahbot's own window did not answer within {}s — its main thread is busy, so the call \
+             gave up instead of hanging",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AxBusy {}
+
+/// A read's rendering of [`AxBusy`]: the taxonomy failure whose guidance is to
+/// retry a read (an element action converts the same marker into the middle
+/// outcome instead — see [`Backend::act_on_element`]).
+fn degraded_read(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<AxBusy>() {
+        Some(busy) => core::taxonomy_error(core::ERR_DEGRADED, format!("{busy}; retry the read")),
+        None => e,
+    }
+}
+
 /// Run one accessibility exchange where the system requires it: on the main
 /// thread when `pid` is mahbot itself, on the calling thread otherwise. A main
-/// thread that stays busy past [`SELF_AX_WAIT`] fails the call honestly instead
-/// of hanging it; the request itself may still be applied afterwards.
+/// thread that stays busy past [`SELF_AX_WAIT`] gives up as [`AxBusy`] instead of
+/// hanging the call; the request itself may still be applied afterwards.
 fn on_ax_thread<T: Send + 'static>(
     pid: u32,
     f: impl FnOnce() -> Result<T, anyhow::Error> + Send + 'static,
@@ -507,15 +537,7 @@ fn on_ax_thread<T: Send + 'static>(
     });
     match rx.recv_timeout(SELF_AX_WAIT) {
         Ok(result) => result,
-        Err(_) => Err(core::taxonomy_error(
-            core::ERR_DEGRADED,
-            format!(
-                "mahbot's own window did not answer within {}s — its main thread is busy, so the \
-                 call gave up instead of hanging; the request may still be applied once that \
-                 thread catches up, so re-observe before repeating a mutation",
-                SELF_AX_WAIT.as_secs()
-            ),
-        )),
+        Err(_) => Err(anyhow::Error::new(AxBusy(SELF_AX_WAIT.as_secs()))),
     }
 }
 
@@ -735,8 +757,10 @@ fn walk_element(
     depth: usize,
     handles: &mut Vec<CFRetained<AXUIElement>>,
     nodes: &mut usize,
+    truncation: &mut Truncation,
 ) -> Option<UiNode> {
-    if *nodes >= core::MAX_RENDER_NODES {
+    if *nodes >= core::MAX_TREE_NODES {
+        truncation.hit_node_ceiling(core::MAX_TREE_NODES);
         return None;
     }
     *nodes += 1;
@@ -773,10 +797,16 @@ fn walk_element(
     let mut children = Vec::new();
     if depth < MAX_DEPTH {
         for child in attribute_children(element) {
-            if let Some(child_node) = walk_element(&child, origin, depth + 1, handles, nodes) {
+            if let Some(child_node) =
+                walk_element(&child, origin, depth + 1, handles, nodes, truncation)
+            {
                 children.push(child_node);
             }
         }
+    } else if !attribute_children(element).is_empty() {
+        // The node's subtree is not read. Only a node that has one is a cut, so a
+        // leaf at the ceiling is not reported as a truncation.
+        truncation.cut_depth(MAX_DEPTH);
     }
     Some(UiNode {
         role,
@@ -789,22 +819,27 @@ fn walk_element(
     })
 }
 
-/// Build the accessibility tree, returning the root node plus a pre-order-aligned
+/// Build the accessibility tree, returning the root node, a pre-order-aligned
 /// `Vec` of platform handles (used by `act_on_element` to map a matched node back
-/// to its element).
-fn build_tree(root: &AXUIElement, origin: (f64, f64)) -> (UiNode, Vec<CFRetained<AXUIElement>>) {
+/// to its element) and the ceilings the walk hit.
+fn build_tree(
+    root: &AXUIElement,
+    origin: (f64, f64),
+) -> (UiNode, Vec<CFRetained<AXUIElement>>, Truncation) {
     let mut handles = Vec::new();
     let mut nodes = 0usize;
-    let node = walk_element(root, origin, 0, &mut handles, &mut nodes).unwrap_or_else(|| UiNode {
-        role: "unknown".to_string(),
-        name: None,
-        value: None,
-        frame: None,
-        actions: Vec::new(),
-        focused: false,
-        children: Vec::new(),
-    });
-    (node, handles)
+    let mut truncation = Truncation::default();
+    let node = walk_element(root, origin, 0, &mut handles, &mut nodes, &mut truncation)
+        .unwrap_or_else(|| UiNode {
+            role: "unknown".to_string(),
+            name: None,
+            value: None,
+            frame: None,
+            actions: Vec::new(),
+            focused: false,
+            children: Vec::new(),
+        });
+    (node, handles, truncation)
 }
 
 fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
@@ -819,8 +854,9 @@ fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
         Some((_, name)) => name.to_string(),
         None => app_display_name(app_pid(&app)?, &app),
     };
-    let (root, _handles) = build_tree(&window, origin);
+    let (root, _handles, truncation) = build_tree(&window, origin);
     Ok(Observation {
+        truncation,
         app_name,
         window_title: window_title(&window),
         surface,
@@ -1205,43 +1241,37 @@ fn keyboard_event(
         .ok_or_else(|| anyhow!("failed to create a keyboard event"))
 }
 
+/// Every event of the gesture is created before any is posted, so an event that
+/// cannot be made leaves nothing half-done: nothing was delivered, and the call is
+/// a plain failure rather than a click whose release never went out.
 fn click(
     point: CGPoint,
     button: MouseButton,
     double: bool,
     modifiers: &[Modifier],
-) -> Result<(), anyhow::Error> {
+) -> Result<Impact, anyhow::Error> {
     let src = source();
     let flags = cg_flags(modifiers);
-    let flap = |down: bool, state: i64| -> Result<CFRetained<CGEvent>, anyhow::Error> {
-        let ev = mouse_event(
-            src.as_deref(),
-            cg_type_for(button, down),
-            point,
-            cg_mouse_button(button),
-        )?;
-        CGEvent::set_flags(Some(&ev), flags);
-        CGEvent::set_integer_value_field(Some(&ev), CGEventField::MouseEventClickState, state);
-        Ok(ev)
-    };
     // Both halves of a double click carry click-state 2.
     let state = if double { 2 } else { 1 };
+    let mut events = Vec::with_capacity(if double { 4 } else { 2 });
     for _ in 0..if double { 2 } else { 1 } {
-        let down = flap(true, state)?;
-        post_event(&down);
-        release(flap(false, state))?;
+        for down in [true, false] {
+            let ev = mouse_event(
+                src.as_deref(),
+                cg_type_for(button, down),
+                point,
+                cg_mouse_button(button),
+            )?;
+            CGEvent::set_flags(Some(&ev), flags);
+            CGEvent::set_integer_value_field(Some(&ev), CGEventField::MouseEventClickState, state);
+            events.push(ev);
+        }
     }
-    Ok(())
-}
-
-/// Post a created mouse-up event, or report why it could not be created. Once the
-/// matching down is posted the attempt is never skipped, so a failed action
-/// cannot leave the button held down and the desktop mid-drag.
-fn release(made: Result<CFRetained<CGEvent>, anyhow::Error>) -> Result<(), anyhow::Error> {
-    if let Ok(ev) = &made {
+    for ev in &events {
         post_event(ev);
     }
-    made.map(drop)
+    Ok(Impact::Done)
 }
 
 fn sleep_millis(ms: u64) {
@@ -1352,59 +1382,79 @@ fn lookup_key(key: &str) -> Result<i64, anyhow::Error> {
     key_code(key).ok_or_else(|| anyhow!("unknown key '{key}' — supported keys: {KNOWN_KEYS}"))
 }
 
+/// One key tap: both events are built before either is posted, so a build failure
+/// delivers nothing.
 fn press_key(key: &str) -> Result<(), anyhow::Error> {
     let code = lookup_key(key)?;
     let src = source();
     let down = keyboard_event(src.as_deref(), code as u16, true)?;
-    post_event(&down);
     let up = keyboard_event(src.as_deref(), code as u16, false)?;
+    post_event(&down);
     post_event(&up);
     Ok(())
 }
 
-fn type_text(text: &str) -> Result<(), anyhow::Error> {
-    let src = source();
-    for ch in text.chars() {
-        if ch == '\n' {
-            press_key("return")?;
-            continue;
-        }
+/// Typing is one character at a time, so a failure part-way through leaves the
+/// earlier characters typed: that is the middle outcome, not a failure. A failure
+/// on the FIRST character typed nothing and stays a failure.
+fn type_text(text: &str) -> Result<Impact, anyhow::Error> {
+    fn type_char(src: Option<&CGEventSource>, ch: char) -> Result<(), anyhow::Error> {
         let mut buf = [0u16; 2];
         let encoded = ch.encode_utf16(&mut buf);
-        let down = keyboard_event(src.as_deref(), 0, true)?;
-        // SAFETY: `encoded` is a valid UTF-16 buffer.
-        unsafe {
-            CGEvent::keyboard_set_unicode_string(
-                Some(&down),
-                encoded.len() as u64,
-                encoded.as_ptr(),
-            )
-        };
+        // Both events are built before either is posted, as in `press_key`: a build
+        // failure must not leave the character half-posted while it is counted untyped.
+        let down = keyboard_event(src, 0, true)?;
+        let up = keyboard_event(src, 0, false)?;
+        for event in [&down, &up] {
+            // SAFETY: `encoded` is a valid UTF-16 buffer.
+            unsafe {
+                CGEvent::keyboard_set_unicode_string(
+                    Some(event),
+                    encoded.len() as u64,
+                    encoded.as_ptr(),
+                )
+            };
+        }
         post_event(&down);
-        let up = keyboard_event(src.as_deref(), 0, false)?;
-        // SAFETY: `encoded` is a valid UTF-16 buffer.
-        unsafe {
-            CGEvent::keyboard_set_unicode_string(Some(&up), encoded.len() as u64, encoded.as_ptr())
-        };
         post_event(&up);
-        sleep_millis(1);
+        Ok(())
     }
-    Ok(())
+
+    let src = source();
+    let total = text.chars().count();
+    for (typed, ch) in text.chars().enumerate() {
+        let made = if ch == '\n' {
+            press_key("return")
+        } else {
+            type_char(src.as_deref(), ch)
+        };
+        match made {
+            Ok(()) => sleep_millis(1),
+            Err(e) if typed == 0 => return Err(e),
+            Err(e) => {
+                return Ok(Impact::Unconfirmed(format!(
+                    "{typed} of {total} characters were typed before the next keyboard event \
+                     could not be created ({e})"
+                )));
+            }
+        }
+    }
+    Ok(Impact::Done)
 }
 
-fn key_chord(chord: &str) -> Result<(), anyhow::Error> {
+fn key_chord(chord: &str) -> Result<Impact, anyhow::Error> {
     let (modifiers, key) = core::parse_key_chord(chord)?;
     let code = lookup_key(&key)?;
     let src = source();
     let flags = cg_flags(&modifiers);
     let down = keyboard_event(src.as_deref(), code as u16, true)?;
-    CGEvent::set_flags(Some(&down), flags);
-    post_event(&down);
     let up = keyboard_event(src.as_deref(), code as u16, false)?;
+    CGEvent::set_flags(Some(&down), flags);
     // Clear flags on key-up so the modifier doesn't stick.
     CGEvent::set_flags(Some(&up), CGEventFlags::empty());
+    post_event(&down);
     post_event(&up);
-    Ok(())
+    Ok(Impact::Done)
 }
 
 /// Scroll: wheel 1 = vertical (down positive), wheel 2 = horizontal (right
@@ -1413,7 +1463,7 @@ fn scroll(
     point: Option<CGPoint>,
     direction: ScrollDirection,
     amount: u32,
-) -> Result<(), anyhow::Error> {
+) -> Result<Impact, anyhow::Error> {
     let src = source();
     let (w1, w2) = match direction {
         ScrollDirection::Down => (amount as i32, 0),
@@ -1428,40 +1478,41 @@ fn scroll(
         CGEvent::set_location(Some(&ev), p);
     }
     post_event(&ev);
-    Ok(())
+    Ok(Impact::Done)
 }
 
-fn drag(from: CGPoint, to: CGPoint) -> Result<(), anyhow::Error> {
+/// The whole gesture — down, interpolation, up — is created before any of it is
+/// posted, so a gesture that cannot be built delivers nothing instead of leaving
+/// the button down mid-drag.
+fn drag(from: CGPoint, to: CGPoint) -> Result<Impact, anyhow::Error> {
     let src = source();
-    let down = mouse_event(
+    let mut events = Vec::with_capacity(14);
+    events.push(mouse_event(
         src.as_deref(),
         CGEventType::LeftMouseDown,
         from,
         CGMouseButton::Left,
-    )?;
-    post_event(&down);
-    let moved = (|| -> Result<(), anyhow::Error> {
-        for i in 1..=12 {
-            let t = i as f64 / 12.0;
-            let step = mouse_event(
-                src.as_deref(),
-                CGEventType::LeftMouseDragged,
-                CGPoint::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t),
-                CGMouseButton::Left,
-            )?;
-            post_event(&step);
-            sleep_millis(2);
-        }
-        Ok(())
-    })();
-    let released = release(mouse_event(
+    )?);
+    for i in 1..=12 {
+        let t = i as f64 / 12.0;
+        events.push(mouse_event(
+            src.as_deref(),
+            CGEventType::LeftMouseDragged,
+            CGPoint::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t),
+            CGMouseButton::Left,
+        )?);
+    }
+    events.push(mouse_event(
         src.as_deref(),
         CGEventType::LeftMouseUp,
         to,
         CGMouseButton::Left,
-    ));
-    moved?;
-    released
+    )?);
+    for event in &events {
+        post_event(event);
+        sleep_millis(2);
+    }
+    Ok(Impact::Done)
 }
 
 // ── Surface geometry ─────────────────────────────────────────────────────
@@ -1608,7 +1659,7 @@ fn check_input_arguments(input: &RawInput) -> Result<(), anyhow::Error> {
     }
 }
 
-fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyhow::Error> {
+fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<Impact, anyhow::Error> {
     let pinned = core::pinned_input(target, input);
     // A chord goes to whatever already has focus, so nothing is raised for it.
     let raises = !matches!(input, RawInput::KeyChord { .. });
@@ -1632,10 +1683,10 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyho
         } => {
             let (x, y) =
                 core::normalized_to_surface(point.0, point.1, &surface_geometry_routed(target)?)?;
-            click(CGPoint::new(x, y), *button, *double, modifiers)?;
+            click(CGPoint::new(x, y), *button, *double, modifiers)
         }
-        RawInput::TypeText { text } => type_text(text)?,
-        RawInput::KeyChord { chord } => key_chord(chord)?,
+        RawInput::TypeText { text } => type_text(text),
+        RawInput::KeyChord { chord } => key_chord(chord),
         RawInput::Scroll {
             point,
             direction,
@@ -1648,16 +1699,15 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<(), anyho
             } else {
                 None
             };
-            scroll(p, *direction, *amount)?;
+            scroll(p, *direction, *amount)
         }
         RawInput::Drag { from, to } => {
             let geometry = surface_geometry_routed(target)?;
             let (fx, fy) = core::normalized_to_surface(from.0, from.1, &geometry)?;
             let (tx, ty) = core::normalized_to_surface(to.0, to.1, &geometry)?;
-            drag(CGPoint::new(fx, fy), CGPoint::new(tx, ty))?;
+            drag(CGPoint::new(fx, fy), CGPoint::new(tx, ty))
         }
     }
-    Ok(())
 }
 
 // ── Capture (ScreenCaptureKit) ───────────────────────────────────────────
@@ -2104,7 +2154,7 @@ fn capture_available_blocking() -> bool {
 
 // ── Element actions ──────────────────────────────────────────────────────
 
-fn press_element(element: &AXUIElement) -> Result<(), anyhow::Error> {
+fn press_element(element: &AXUIElement) -> Result<Impact, anyhow::Error> {
     let names = raw_action_names(element).map_err(|e| ax_error(e, "read element actions"))?;
     let Some(names) = names else {
         return Err(core::taxonomy_error(
@@ -2138,7 +2188,7 @@ fn press_element(element: &AXUIElement) -> Result<(), anyhow::Error> {
     }
 }
 
-fn set_element_value(element: &AXUIElement, text: &str) -> Result<(), anyhow::Error> {
+fn set_element_value(element: &AXUIElement, text: &str) -> Result<Impact, anyhow::Error> {
     let role = attribute_string(element, &axc(AX_ROLE)).unwrap_or_default();
     let subrole = attribute_string(element, &axc(AX_SUBROLE));
     if is_secure_field(&role, subrole.as_deref()) {
@@ -2159,9 +2209,9 @@ fn act_on_element_blocking(
     target: &TargetSpec,
     locator: &Locator,
     act: &ElementAct,
-) -> Result<(), anyhow::Error> {
+) -> Result<Impact, anyhow::Error> {
     let (window, _app) = resolve_window(target)?;
-    let (root, handles) = build_tree(&window, window_origin(&window)?);
+    let (root, handles, _truncation) = build_tree(&window, window_origin(&window)?);
     let matched = core::resolve_locator_checked(&root, locator)?;
     let element = &handles[core::pre_order_index(&root, matched)];
     match act {
@@ -2170,9 +2220,12 @@ fn act_on_element_blocking(
     }
 }
 
-fn map_action_err(err: AXError, ctx: &str) -> Result<(), anyhow::Error> {
+/// Map the result of an AX ACTION onto the outcome the model is owed. The one
+/// action-specific arm is `CannotComplete`: the request reached the target without
+/// confirmation, so it is the middle outcome, [`Impact::Unconfirmed`].
+fn map_action_err(err: AXError, ctx: &str) -> Result<Impact, anyhow::Error> {
     match err {
-        AXError::Success => Ok(()),
+        AXError::Success => Ok(Impact::Done),
         AXError::AttributeUnsupported => Err(core::taxonomy_error(
             core::ERR_UNSUPPORTED,
             format!(
@@ -2184,10 +2237,10 @@ fn map_action_err(err: AXError, ctx: &str) -> Result<(), anyhow::Error> {
             format!("{ctx} — window closed or changed — re-enumerate"),
         )),
         AXError::APIDisabled => Err(permission_error(Grant::Accessibility)),
-        AXError::CannotComplete => Err(core::taxonomy_error(
-            core::ERR_DEGRADED,
-            format!("{ctx} — transient AX failure, retry"),
-        )),
+        AXError::CannotComplete => Ok(Impact::Unconfirmed(format!(
+            "{ctx} — the application did not confirm the accessibility action, which may already \
+             have been performed"
+        ))),
         _ => Err(anyhow!("AX error {err:?} while {ctx}")),
     }
 }
@@ -2245,7 +2298,7 @@ impl Backend for MacOsBackend {
         })
     }
 
-    async fn list_windows(&self, app: Option<&AppInfo>) -> Result<Vec<WindowInfo>, anyhow::Error> {
+    async fn list_windows(&self, app: Option<&AppInfo>) -> Result<WindowListing, anyhow::Error> {
         with_platform("list windows", || {
             ensure(Grant::Accessibility)?;
             let app_infos: Vec<AppInfo> = if let Some(a) = app {
@@ -2266,28 +2319,29 @@ impl Backend for MacOsBackend {
                 }
                 v
             };
-            let mut out = Vec::new();
+            let mut listing = WindowListing::default();
             let owner = core::agent_key();
             for ai in app_infos {
                 let Some(pid) = ai.pid else { continue };
                 let name = ai.name;
                 let owner = owner.clone();
-                // An app whose accessibility is unavailable is skipped, as
-                // before; the AX thread only makes our OWN window's reads
-                // possible at all. A listing of ONE app is the caller's whole
-                // request, so its failure is reported instead.
+                let app_name = name.clone();
+                // An application whose accessibility cannot be read is named in the
+                // listing with what went wrong — never left out as if it had no
+                // windows, and never allowed to fail the whole listing. The AX thread
+                // only makes our OWN window's reads possible at all, so that app's
+                // failure is the app's, listed like any other.
                 match on_ax_thread(pid, move || windows_of_app(pid, &name, &owner)) {
-                    Ok(rows) => out.extend(rows),
-                    // A single-app listing of our OWN window says why it is
-                    // missing; every other failure keeps the old "answer what
-                    // was read" shape, and the unfiltered listing must never
-                    // fail as a whole because of one app.
-                    Err(e) if app.is_some() && pid == std::process::id() => return Err(e),
-                    Err(_) => {}
+                    Ok(rows) => listing.windows.extend(rows),
+                    Err(e) => listing.unread.push(UnreadWindows {
+                        app_name,
+                        reason: format!("{e:#}"),
+                    }),
                 }
             }
-            Ok(out)
+            Ok(listing)
         })
+        .map_err(degraded_read)
     }
 
     async fn focused_window(&self) -> Result<WindowInfo, anyhow::Error> {
@@ -2306,6 +2360,7 @@ impl Backend for MacOsBackend {
                 })
             })
         })
+        .map_err(degraded_read)
     }
 
     async fn surface_geometry(
@@ -2315,6 +2370,7 @@ impl Backend for MacOsBackend {
         with_platform("read the target's geometry", || {
             surface_geometry_routed(target)
         })
+        .map_err(degraded_read)
     }
 
     async fn observe(&self, target: &TargetSpec) -> Result<Observation, anyhow::Error> {
@@ -2322,6 +2378,7 @@ impl Backend for MacOsBackend {
             ensure(Grant::Accessibility)?;
             with_target(target, observe_blocking)
         })
+        .map_err(degraded_read)
     }
 
     async fn act_on_element(
@@ -2329,25 +2386,57 @@ impl Backend for MacOsBackend {
         target: &TargetSpec,
         locator: &Locator,
         act: ElementAct,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Impact, anyhow::Error> {
         with_platform("act on an element", || {
             if matches!(target, TargetSpec::Screen) {
                 return Err(core::screen_act_error());
             }
             ensure(Grant::Accessibility)?;
             let locator = locator.clone();
-            with_target(target, move |target| {
+            match with_target(target, move |target| {
                 act_on_element_blocking(target, &locator, &act)
-            })
+            }) {
+                // The request was handed to mahbot's own main queue and the wait ran
+                // out: it may still be applied when that thread catches up, so this is
+                // the middle outcome rather than a failure.
+                Err(e) if e.downcast_ref::<AxBusy>().is_some() => Ok(Impact::Unconfirmed(format!(
+                    "{e}; the request may still be applied once that thread catches up"
+                ))),
+                // A framework exception is raised from inside the exchange: where it
+                // stopped is unknown, so the element may already have acted.
+                Err(e) if core::is_framework_failed(&e) => Ok(Impact::Unconfirmed(format!(
+                    "the system raised an exception while the element action was running, so it \
+                     may already have been performed — {e}"
+                ))),
+                other => other,
+            }
         })
     }
 
-    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> Result<(), anyhow::Error> {
-        with_platform("synthesize input", || {
+    async fn raw_input(
+        &self,
+        target: &TargetSpec,
+        input: RawInput,
+    ) -> Result<Impact, anyhow::Error> {
+        match with_platform("synthesize input", || {
             check_input_arguments(&input)?;
             ensure(Grant::Input)?;
             raw_input_blocking(target, &input)
-        })
+        }) {
+            // An own-window exchange that timed out before any event was posted:
+            // nothing was actuated, so it is a plain retryable failure.
+            Err(e) if e.downcast_ref::<AxBusy>().is_some() => Err(core::taxonomy_error(
+                core::ERR_DEGRADED,
+                format!("{e} — nothing was sent to the window; retry the call"),
+            )),
+            // An exception raised under the call: the events already posted stay
+            // posted, so this may have landed and is not a failure.
+            Err(e) if core::is_framework_failed(&e) => Ok(Impact::Unconfirmed(format!(
+                "the system raised an exception while the input was being synthesized, so part of \
+                 it may already have been delivered — {e}"
+            ))),
+            other => other,
+        }
     }
 
     async fn cursor_position(&self) -> Result<(f64, f64), anyhow::Error> {
@@ -2360,7 +2449,7 @@ impl Backend for MacOsBackend {
     }
 
     async fn capture(&self, target: &TargetSpec) -> Result<Capture, anyhow::Error> {
-        with_platform("capture", || capture_blocking(target))
+        with_platform("capture", || capture_blocking(target)).map_err(degraded_read)
     }
 }
 

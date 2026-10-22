@@ -809,8 +809,9 @@ pub(crate) async fn local_image_to_data_uri(path: &std::path::Path) -> anyhow::R
 /// re-encode behind [`local_image_to_compressed_data_uri_with_meta`] (used by
 /// every ingestion path — the `read` tool, chrome/computer screenshots,
 /// document page images, inbound channel media) scales the longest side down to
-/// this many pixels, aspect-preserving.
-const INBOUND_IMAGE_MAX_SIDE: u32 = 1024;
+/// this many pixels, aspect-preserving. Callers that must tell the model an
+/// image was reduced read the cap from here.
+pub(crate) const INBOUND_IMAGE_MAX_SIDE: u32 = 1024;
 const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;
 
 /// Input-size ceiling for the inbound-photo decode, aligned with the
@@ -849,7 +850,7 @@ pub(crate) async fn local_image_to_compressed_data_uri_with_meta(
     }
     if meta.len() > INBOUND_IMAGE_MAX_INPUT_BYTES {
         anyhow::bail!(
-            "Inbound image {} is {} bytes — over the {} MiB decode cap; passing the original through",
+            "Inbound image {} is {} bytes — over the {} MiB decode cap, so it is not compressed",
             path.display(),
             meta.len(),
             INBOUND_IMAGE_MAX_INPUT_BYTES / (1024 * 1024),

@@ -15,7 +15,9 @@
 //! application rather than a window and is resolved per call: its own active
 //! window, else its frontmost one.
 
-use super::super::core::{self, AppInfo, SurfaceGeometry, TargetSpec, WindowInfo, WindowKey};
+use super::super::core::{
+    self, AppInfo, SurfaceGeometry, TargetSpec, UnreadWindows, WindowInfo, WindowKey, WindowListing,
+};
 use std::sync::{Once, OnceLock};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
@@ -391,7 +393,9 @@ struct Enumerated {
     app_name: String,
     title: String,
     active: bool,
-    surface: Option<SurfaceGeometry>,
+    /// The frame, or why it could not be read: a window without one is left out of
+    /// a listing but is still reported there (see [`list_windows`]).
+    surface: anyhow::Result<SurfaceGeometry>,
 }
 
 /// Every running application that owns at least one top-level window, in
@@ -414,26 +418,69 @@ pub(super) fn enumerate_apps() -> Vec<AppInfo> {
     apps
 }
 
-/// Top-level windows, optionally narrowed to one application's. A window whose
-/// frame cannot be read has no coordinates to act on, so it is not listed: a zeroed
-/// surface would silently map every normalized point to the origin.
-pub(super) fn list_windows(app: Option<&AppInfo>) -> Vec<WindowInfo> {
+/// Top-level windows, optionally narrowed to one application's. A window whose frame
+/// cannot be read has no coordinates to act on, so it is not listed — a zeroed
+/// surface would silently map every normalized point to the origin — but the
+/// application that lost one is: [`WindowListing::unread`] carries how many of its
+/// windows could not be read and the first error.
+/// One application's windows that a listing could not read, accumulated to be
+/// reported as one note rather than one note per lost window.
+struct LostFrames {
+    app_name: String,
+    count: usize,
+    first_error: String,
+}
+
+pub(super) fn list_windows(app: Option<&AppInfo>) -> WindowListing {
     let windows = match app {
         Some(app) => app_windows(app.pid, &app.name),
         None => top_level_windows(),
     };
-    windows
+    let mut listing = WindowListing::default();
+    let mut lost: Vec<LostFrames> = Vec::new();
+    for win in windows {
+        let surface = match win.surface {
+            Ok(surface) => surface,
+            Err(error) => {
+                match lost
+                    .iter_mut()
+                    .find(|entry| entry.app_name.eq_ignore_ascii_case(&win.app_name))
+                {
+                    Some(entry) => entry.count += 1,
+                    None => lost.push(LostFrames {
+                        app_name: win.app_name.clone(),
+                        count: 1,
+                        first_error: format!("{error:#}"),
+                    }),
+                }
+                continue;
+            }
+        };
+        listing.windows.push(WindowInfo {
+            app_pid: Some(win.pid),
+            app_name: win.app_name,
+            title: win.title,
+            key: window_key(win.hwnd, win.pid),
+            surface,
+        });
+    }
+    listing.unread = lost
         .into_iter()
-        .filter_map(|win| {
-            Some(WindowInfo {
-                app_pid: Some(win.pid),
-                app_name: win.app_name,
-                title: win.title,
-                key: window_key(win.hwnd, win.pid),
-                surface: win.surface?,
-            })
+        .map(|entry| UnreadWindows {
+            app_name: entry.app_name,
+            reason: format!(
+                "{} {} no readable frame (first error: {})",
+                entry.count,
+                if entry.count == 1 {
+                    "window has"
+                } else {
+                    "windows have"
+                },
+                entry.first_error
+            ),
         })
-        .collect()
+        .collect();
+    listing
 }
 
 /// The focused window of the frontmost application.
@@ -531,7 +578,7 @@ fn enumerate(hwnd: HWND, foreground: HWND) -> Enumerated {
         app_name: app_name(pid, &title),
         title,
         active: hwnd == foreground,
-        surface: surface_of(hwnd).ok(),
+        surface: surface_of(hwnd),
     }
 }
 

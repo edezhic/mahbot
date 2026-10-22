@@ -3,8 +3,8 @@
 //! advertised here, because the capability itself is absent.
 
 use super::core::{
-    self, AppInfo, Backend, Capture, ElementAct, Locator, Observation, RawInput, SurfaceGeometry,
-    TargetSpec, WindowInfo,
+    self, AppInfo, Backend, Capture, ElementAct, Impact, Locator, Observation, RawInput,
+    SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
 };
 
 pub(crate) static STUB_BACKEND: StubBackend = StubBackend;
@@ -32,7 +32,7 @@ impl Backend for StubBackend {
         Err(Self::unsupported("list_apps"))
     }
 
-    async fn list_windows(&self, _app: Option<&AppInfo>) -> anyhow::Result<Vec<WindowInfo>> {
+    async fn list_windows(&self, _app: Option<&AppInfo>) -> anyhow::Result<WindowListing> {
         Err(Self::unsupported("list_windows"))
     }
 
@@ -53,11 +53,11 @@ impl Backend for StubBackend {
         _target: &TargetSpec,
         _locator: &Locator,
         _act: ElementAct,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Impact> {
         Err(Self::unsupported("act_on_element"))
     }
 
-    async fn raw_input(&self, _target: &TargetSpec, _input: RawInput) -> anyhow::Result<()> {
+    async fn raw_input(&self, _target: &TargetSpec, _input: RawInput) -> anyhow::Result<Impact> {
         Err(Self::unsupported("raw_input"))
     }
 

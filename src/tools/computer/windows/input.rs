@@ -10,15 +10,17 @@
 //! physical pixels throughout, matching the UIA tree and the capture.
 //!
 //! Every batch is refused before it is sent when the secure desktop is up or the
-//! window belongs to an elevated process (see [`super::window`]), and a batch that
-//! Windows drops — the UIPI case, where `SendInput` inserts zero events and reports
-//! no error — is reported as a refusal rather than as a successful action.
+//! window belongs to an elevated process (see [`super::window`]); a batch Windows
+//! refuses outright is an error, because nothing was delivered. A batch Windows
+//! drops part-way — the UIPI case, where `SendInput` inserts fewer events and reports
+//! no error — comes back applied-but-unconfirmed, naming how much of the call's input
+//! was delivered.
 //!
 //! Chord syntax is the shared one: `cmd` is the Windows key here, `win` is also
 //! accepted as a key name for a plain Windows-key tap.
 
 use super::super::core::{
-    self, Modifier, MouseButton, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec,
+    self, Impact, Modifier, MouseButton, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec,
 };
 use super::window;
 use anyhow::anyhow;
@@ -53,7 +55,7 @@ const KNOWN_KEYS: &str = "return/enter, tab, space, delete/backspace, forwarddel
 
 // ── Raw input ───────────────────────────────────────────────────────────
 
-pub(super) fn raw_input(target: &TargetSpec, input: RawInput) -> anyhow::Result<()> {
+pub(super) fn raw_input(target: &TargetSpec, input: RawInput) -> anyhow::Result<Impact> {
     let pinned = core::pinned_input(target, &input);
     match input {
         RawInput::Click {
@@ -103,7 +105,7 @@ pub(super) fn cursor_position() -> anyhow::Result<(f64, f64)> {
 
 /// A left click at an absolute physical point — the element-action fallback for an
 /// element that supports no accessibility pattern at all.
-pub(super) fn click_absolute(x: i32, y: i32) -> anyhow::Result<()> {
+pub(super) fn click_absolute(x: i32, y: i32) -> anyhow::Result<Impact> {
     window::ensure_actuation_allowed(window::top_level_at(x, y))?;
     set_cursor(x, y)?;
     send(&[
@@ -114,13 +116,13 @@ pub(super) fn click_absolute(x: i32, y: i32) -> anyhow::Result<()> {
 
 /// Type text into whatever has focus (used by the element-action fallback after
 /// the element itself was focused).
-pub(super) fn type_text_into_focus(text: &str) -> anyhow::Result<()> {
+pub(super) fn type_text_into_focus(text: &str) -> anyhow::Result<Impact> {
     send(&type_events(text))
 }
 
 /// Select everything in the focused element — the prelude to typing over a value
 /// the value pattern refused to set.
-pub(super) fn select_all() -> anyhow::Result<()> {
+pub(super) fn select_all() -> anyhow::Result<Impact> {
     send(&chord_events(&[Modifier::Ctrl], VK_A))
 }
 
@@ -192,7 +194,7 @@ fn click(
     button: MouseButton,
     double: bool,
     modifiers: &[Modifier],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Impact> {
     let resolved = resolve_window(target)?;
     let geometry = surface_of(resolved.as_ref())?;
     let (x, y) = core::normalized_to_surface(point.0, point.1, &geometry)?;
@@ -225,7 +227,7 @@ fn scroll(
     direction: ScrollDirection,
     amount: u32,
     pinned: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Impact> {
     let resolved = resolve_window(target)?;
     let at = match point {
         Some((nx, ny)) => {
@@ -264,7 +266,12 @@ fn scroll(
     send(&[mouse_event(0, 0, data, flags)])
 }
 
-fn drag(target: &TargetSpec, from: (f64, f64), to: (f64, f64), pinned: bool) -> anyhow::Result<()> {
+fn drag(
+    target: &TargetSpec,
+    from: (f64, f64),
+    to: (f64, f64),
+    pinned: bool,
+) -> anyhow::Result<Impact> {
     let resolved = resolve_window(target)?;
     let geometry = surface_of(resolved.as_ref())?;
     let (fx, fy) = core::normalized_to_surface(from.0, from.1, &geometry)?;
@@ -278,19 +285,39 @@ fn drag(target: &TargetSpec, from: (f64, f64), to: (f64, f64), pinned: bool) -> 
         pinned,
     )?;
     set_cursor(round_i32(fx), round_i32(fy))?;
+    // A single-event batch is either delivered or refused outright, so a refused
+    // press means nothing of the gesture is in the system yet.
     send(&[mouse_event(0, 0, 0, MOUSEEVENTF_LEFTDOWN)])?;
     for step in 1..=DRAG_STEPS {
         let progress = step as f64 / DRAG_STEPS as f64;
         let x = round_i32(fx + (tx - fx) * progress);
         let y = round_i32(fy + (ty - fy) * progress);
         if let Err(e) = set_cursor(x, y) {
-            // The button is never left pressed: release before reporting.
-            let _ = send(&[mouse_event(0, 0, 0, MOUSEEVENTF_LEFTUP)]);
-            return Err(e);
+            // The gesture is already under way: let the button go, then report what
+            // landed rather than "nothing happened", which would invite a second drag.
+            let released = match send(&[mouse_event(0, 0, 0, MOUSEEVENTF_LEFTUP)]) {
+                Ok(_) => "the button was released again".to_string(),
+                Err(err) => format!("the button may still be held down ({err:#})"),
+            };
+            return Ok(Impact::Unconfirmed(format!(
+                "the drag started (the button went down at ({}, {})) but the pointer could not be \
+                 moved further — {e}; {released}",
+                round_i32(fx),
+                round_i32(fy)
+            )));
         }
         std::thread::sleep(DRAG_STEP_PAUSE);
     }
-    send(&[mouse_event(0, 0, 0, MOUSEEVENTF_LEFTUP)])
+    // The gesture ran to its end, so only the release is in question: a refusal
+    // leaves the button this call pressed down, which the model must know.
+    let released = match send(&[mouse_event(0, 0, 0, MOUSEEVENTF_LEFTUP)]) {
+        Ok(impact) => return Ok(impact),
+        Err(err) => format!("{err:#}"),
+    };
+    Ok(Impact::Unconfirmed(format!(
+        "the drag ran to its end but the button's release was refused ({released}) — the button \
+         may still be held down"
+    )))
 }
 
 fn set_cursor(x: i32, y: i32) -> anyhow::Result<()> {
@@ -482,12 +509,13 @@ fn vk_for(key: &str) -> anyhow::Result<VIRTUAL_KEY> {
 
 // ── Sending ─────────────────────────────────────────────────────────────
 
-/// Send one batch. `SendInput` silently inserts zero events when UIPI blocks the
-/// input, so a short count is a real refusal and is reported as one, after the half
-/// of the gesture that did land has been undone (see [`release_held`]).
-fn send(events: &[INPUT]) -> anyhow::Result<()> {
+/// Send one batch. `SendInput` inserts fewer events than offered when UIPI blocks
+/// the input — it reports no error, only a short count. Delivering nothing is a
+/// refusal; a short batch is [`Impact::Unconfirmed`], naming how much of the whole
+/// call was delivered, after what this batch left held is let go.
+fn send(events: &[INPUT]) -> anyhow::Result<Impact> {
     if events.is_empty() {
-        return Ok(());
+        return Ok(Impact::Done);
     }
     for (index, batch) in events.chunks(INPUT_BATCH).enumerate() {
         // SAFETY: the binding passes `batch`'s own length as the event count and
@@ -496,27 +524,35 @@ fn send(events: &[INPUT]) -> anyhow::Result<()> {
         if sent as usize != batch.len() {
             // Everything this call delivered so far, earlier batches included: a
             // modifier pressed there is still down.
-            release_held(&events[..index * INPUT_BATCH + sent as usize]);
-            return Err(core::taxonomy_error(
-                core::ERR_DEGRADED,
-                format!(
-                    "Windows dropped part of the synthetic input ({} of {} events delivered) — the \
-                     foreground window may belong to an elevated process, or the secure desktop \
-                     is up; check the window's state before retrying",
-                    sent,
-                    batch.len()
-                ),
-            ));
+            let delivered = index * INPUT_BATCH + sent as usize;
+            if delivered == 0 {
+                return Err(core::taxonomy_error(
+                    core::ERR_DEGRADED,
+                    "Windows refused the input before any of it was delivered — the foreground \
+                     window may belong to an elevated process, or the secure desktop is up; \
+                     nothing was applied, so bring the window to the foreground and act again",
+                ));
+            }
+            let mut detail = format!(
+                "{delivered} of {} events were delivered and the rest were dropped",
+                events.len()
+            );
+            if let Some(repair) = release_held(&events[..delivered]) {
+                detail.push_str("; ");
+                detail.push_str(&repair);
+            }
+            return Ok(Impact::Unconfirmed(detail));
         }
     }
-    Ok(())
+    Ok(Impact::Done)
 }
 
 /// Release whatever the landed events left held, buttons before keys and in reverse
-/// order. Without this a partial insertion (a desktop switch mid-batch) leaves a
-/// modifier held, or — for a click truncated between down and up — the mouse button
-/// down, until the owner presses and releases it again.
-fn release_held(landed: &[INPUT]) {
+/// order, and name what a refused repair leaves down. Without this a partial
+/// insertion (a desktop switch mid-batch) leaves a modifier held, or — for a click
+/// truncated between down and up — the mouse button down, until the owner presses
+/// and releases it again.
+fn release_held(landed: &[INPUT]) -> Option<String> {
     let mut keys: Vec<VIRTUAL_KEY> = Vec::new();
     let mut buttons: Vec<MOUSE_EVENT_FLAGS> = Vec::new();
     for input in landed {
@@ -556,12 +592,13 @@ fn release_held(landed: &[INPUT]) {
             .map(|key| key_event(*key, KEYEVENTF_KEYUP)),
     );
     if releases.is_empty() {
-        return;
+        return None;
     }
     // SAFETY: same contract as `send` — the slice's own length and element size, and it
-    // outlives the call. A refusal here is ignored: the caller is about to report the
-    // first one, and there is nothing further to repair.
-    unsafe {
-        let _ = SendInput(&releases, std::mem::size_of::<INPUT>() as i32);
-    }
+    // outlives the call.
+    let sent = unsafe { SendInput(&releases, std::mem::size_of::<INPUT>() as i32) };
+    (sent as usize != releases.len()).then(|| {
+        "the release of what landed was itself refused, so a key or button may still be held down"
+            .to_string()
+    })
 }

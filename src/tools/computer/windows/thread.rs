@@ -9,13 +9,15 @@
 //!
 //! An abandoned job is an accepted limit: the action lock cannot outlive the
 //! deadline that keeps the product responsive, so a job stuck in a provider may
-//! still finish on the leaked thread after its caller was told it timed out. That
-//! is why the timeout message reports that the call produced no result and says to
-//! check the target's state before repeating it, rather than to retry blindly.
+//! still finish on the leaked thread after its caller was told it timed out. A
+//! timed-out actuation is therefore answered as [`Impact::Unconfirmed`], never as a
+//! failure; a timed-out read has nothing in flight, so its deadline stays an error,
+//! and a job whose thread stopped mid-call answers the same unconfirmed way as a
+//! deadline for the same reason.
 
 use super::super::core::{
-    self, AppInfo, Capture, ElementAct, Locator, Observation, RawInput, SurfaceGeometry,
-    TargetSpec, WindowInfo,
+    self, AppInfo, Capture, ElementAct, Impact, Locator, Observation, RawInput, SurfaceGeometry,
+    TargetSpec, WindowInfo, WindowListing,
 };
 use super::capture::CaptureContext;
 use super::{input, seh, uia, window};
@@ -74,11 +76,11 @@ pub(super) enum Call {
 pub(super) enum Reply {
     Flag(bool),
     Apps(Vec<AppInfo>),
-    Windows(Vec<WindowInfo>),
+    Windows(WindowListing),
     Window(Box<WindowInfo>),
     Geometry(SurfaceGeometry),
     Observation(Box<Observation>),
-    Unit,
+    Act(Impact),
     Point(f64, f64),
     Capture(Box<Capture>),
 }
@@ -106,11 +108,11 @@ macro_rules! from_reply {
 from_reply! {
     bool: Reply::Flag(value) => value,
     Vec<AppInfo>: Reply::Apps(value) => value,
-    Vec<WindowInfo>: Reply::Windows(value) => value,
+    WindowListing: Reply::Windows(value) => value,
     WindowInfo: Reply::Window(value) => *value,
     SurfaceGeometry: Reply::Geometry(value) => value,
     Observation: Reply::Observation(value) => *value,
-    (): Reply::Unit => (),
+    Impact: Reply::Act(value) => value,
     (f64, f64): Reply::Point(x, y) => (x, y),
     Capture: Reply::Capture(value) => *value,
 }
@@ -143,11 +145,25 @@ struct Worker {
 
 static WORKER: LazyLock<Mutex<Option<Worker>>> = LazyLock::new(|| Mutex::new(None));
 
-/// Submit one call and await the payload it answers with under `timeout` — the only
-/// entry point from the async side, so no call can reach a platform API from the
-/// caller's thread.
-pub(super) async fn submit<T: FromReply>(call: Call, timeout: Duration) -> anyhow::Result<T> {
-    let (tx, alive) = sender()?;
+/// Why a call's reply never arrived. The two entry points below differ only in
+/// what this means: a read failed, an actuation may or may not have landed.
+enum JobFailure {
+    /// The call itself failed: its own error, with nothing else to say.
+    Call(anyhow::Error),
+    /// The reply channel died: the thread caught a structured exception or exited
+    /// while running the job.
+    Stopped,
+    /// The deadline expired and the job was abandoned on the leaked thread, which
+    /// may still run it.
+    Deadline(Duration),
+}
+
+/// Submit one call and wait for its reply under `timeout` — the only way a call
+/// reaches the apartment thread. The bookkeeping is here, once: an abandoned
+/// thread is marked dead so the next call starts a fresh apartment, and the wedged
+/// one exits on its own once the provider answers.
+async fn job_reply(call: Call, timeout: Duration) -> Result<Reply, JobFailure> {
+    let (tx, alive) = sender().map_err(JobFailure::Call)?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if tx
         .send(Job {
@@ -157,36 +173,71 @@ pub(super) async fn submit<T: FromReply>(call: Call, timeout: Duration) -> anyho
         .is_err()
     {
         alive.store(false, Ordering::SeqCst);
-        return Err(core::taxonomy_error(
+        return Err(JobFailure::Call(core::taxonomy_error(
             core::ERR_DEGRADED,
-            "the computer-use thread stopped before it accepted the call — retry",
-        ));
+            "the computer-use thread stopped before it accepted the call — nothing was delivered; \
+             retry",
+        )));
     }
     match tokio::time::timeout(timeout, reply_rx).await {
-        Ok(Ok(result)) => result.and_then(T::from_reply),
+        Ok(Ok(Ok(reply))) => Ok(reply),
+        Ok(Ok(Err(e))) => Err(JobFailure::Call(e)),
         Ok(Err(_)) => {
             alive.store(false, Ordering::SeqCst);
-            Err(core::taxonomy_error(
-                core::ERR_DEGRADED,
-                "the computer-use thread stopped while running the call — retry",
-            ))
+            Err(JobFailure::Stopped)
         }
         Err(_) => {
-            // Abandon it: the thread may be blocked inside a provider and can be
-            // neither interrupted nor killed. Marking it dead makes the next call
-            // start a fresh apartment immediately; this one exits on its own once
-            // the provider answers.
             alive.store(false, Ordering::SeqCst);
-            Err(core::taxonomy_error(
-                core::ERR_DEGRADED,
-                format!(
-                    "the application did not respond within {}s — the call was abandoned without a \
-                     result; check the target's state (observe or screenshot) before repeating it, \
-                     since an action that did land would apply twice if repeated",
-                    timeout.as_secs()
-                ),
-            ))
+            Err(JobFailure::Deadline(timeout))
         }
+    }
+}
+
+/// Submit one read-shaped call and await the payload it answers with: every
+/// abandoned reply has nothing in flight, so all of them are failures.
+pub(super) async fn submit<T: FromReply>(call: Call, timeout: Duration) -> anyhow::Result<T> {
+    match job_reply(call, timeout).await {
+        Ok(reply) => T::from_reply(reply),
+        Err(JobFailure::Call(e)) => Err(e),
+        Err(JobFailure::Stopped) => Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            "the computer-use thread stopped while running the call — retry",
+        )),
+        Err(JobFailure::Deadline(timeout)) => Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "the application did not respond within {}s — the call was abandoned without a \
+                 result; retry",
+                timeout.as_secs()
+            ),
+        )),
+    }
+}
+
+/// Submit one actuating call. Only a job that never reached the thread, or one the
+/// thread itself refused, is a failure here; a deadline that expires, a thread that
+/// stops mid-job and a framework exception all answer [`Impact::Unconfirmed`].
+pub(super) async fn submit_act(call: Call, timeout: Duration) -> anyhow::Result<Impact> {
+    match job_reply(call, timeout).await {
+        Ok(reply) => Impact::from_reply(reply),
+        // Foreign code faulted while the job ran: where it stopped is unknown.
+        Err(JobFailure::Call(e)) if core::is_framework_failed(&e) => {
+            Ok(Impact::Unconfirmed(format!(
+                "the system raised a structured exception while the call was running, so its input \
+             may be partly applied — {e}"
+            )))
+        }
+        Err(JobFailure::Call(e)) => Err(e),
+        Err(JobFailure::Stopped) => Ok(Impact::Unconfirmed(
+            "the computer-use thread stopped while running the call, so its input may or may not \
+             have been delivered"
+                .to_string(),
+        )),
+        Err(JobFailure::Deadline(timeout)) => Ok(Impact::Unconfirmed(format!(
+            "the application did not answer within {}s, so the call was abandoned while the job \
+             may still complete on the leaked thread — the input may land after this answer",
+            timeout.as_secs()
+        ))),
     }
 }
 
@@ -234,6 +285,14 @@ fn run(rx: &Receiver<Job>, alive: &AtomicBool) {
     };
     while let Ok(job) = rx.recv() {
         if !alive.load(Ordering::SeqCst) {
+            // This job was abandoned before the thread picked it up. It never ran, so
+            // it is answered as the failure it is — dropping it would reach an
+            // actuating caller as a call that may still land. Break rather than return:
+            // the apartment below must still close inside the exception frame.
+            let error = unstarted();
+            let message = error.to_string();
+            let _ = job.reply.send(Err(error));
+            retire(rx, alive, &message);
             break;
         }
         match seh::guard(|| ctx.execute(job.call)) {
@@ -264,6 +323,15 @@ fn run(rx: &Receiver<Job>, alive: &AtomicBool) {
         let error = framework_failed("close the computer-use apartment", code);
         tracing::warn!("computer use: {error:#}");
     }
+}
+
+/// The answer for a job this thread will never run: it delivered nothing.
+fn unstarted() -> anyhow::Error {
+    core::taxonomy_error(
+        core::ERR_DEGRADED,
+        "the computer-use thread was retired before this call started — nothing was delivered; \
+         retry",
+    )
 }
 
 /// Leave this thread dead and fail everything already queued with `message`, so the
@@ -350,14 +418,10 @@ impl Ctx {
                 target,
                 locator,
                 act,
-            } => {
-                uia::act_on_element(&self.uia, &target, &locator, &act)?;
-                Ok(Reply::Unit)
-            }
-            Call::RawInput { target, input } => {
-                input::raw_input(&target, input)?;
-                Ok(Reply::Unit)
-            }
+            } => Ok(Reply::Act(uia::act_on_element(
+                &self.uia, &target, &locator, &act,
+            )?)),
+            Call::RawInput { target, input } => Ok(Reply::Act(input::raw_input(&target, input)?)),
             Call::CursorPosition => {
                 let (x, y) = input::cursor_position()?;
                 Ok(Reply::Point(x, y))

@@ -1615,15 +1615,17 @@ pub(crate) trait Tool: Send + Sync {
     /// on-disk image as a native image part.
     ///
     /// Default `None` — most tools produce no image. Overridden by the read tool
-    /// (a raster read) and by chrome and computer (screenshots), each re-encoding
-    /// an on-disk raster (PNG/JPEG/WebP) into a bounded JPEG data-URI. For the
-    /// read tool this is the only decode of a NATIVE image file: `execute` only
-    /// cheap-sniffs magic bytes, so the decode happens here, once, guarded by a
-    /// robust file-magic check rather than by the annotation wording. A converted
-    /// document's rasters are not this path — they are decoded as it produces
-    /// them. Safety: the path must obey the same workspace-boundary validation as
-    /// [`Tool::execute`] — an arbitrary `[IMAGE:/path]` reference embedded in
-    /// model text is never resolved here.
+    /// (a raster read) and by chrome (screenshots), each re-encoding an on-disk
+    /// raster (PNG/JPEG/WebP) into a bounded JPEG data-URI. For the read tool this
+    /// is the only decode of a NATIVE image file: `execute` only cheap-sniffs magic
+    /// bytes, so the decode happens here, once, guarded by a robust file-magic
+    /// check rather than by the annotation wording. A converted document's rasters
+    /// are not this path — they are decoded as it produces them. The computer tool
+    /// produces its capture through [`Tool::execute_with_payloads`] instead,
+    /// because its attachment can fail and the result must say so. Safety: the path
+    /// must obey the same workspace-boundary validation as [`Tool::execute`] — an
+    /// arbitrary `[IMAGE:/path]` reference embedded in model text is never resolved
+    /// here.
     async fn image_payload(
         &self,
         _ws: &crate::Workspace,

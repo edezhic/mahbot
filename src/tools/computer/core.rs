@@ -5,6 +5,11 @@
 //! platform imports — `macos.rs`/`linux.rs`/`windows`/`stub.rs` implement
 //! [`Backend`].
 //!
+//! Two honesty rules live here because every backend owes them: a read states
+//! every ceiling it hit ([`Truncation`], rendered into the observation header), and
+//! an actuating call states which of the three outcomes it reached ([`Impact`],
+//! rendered by [`impact_text`]).
+//!
 //! Items carrying a platform-scoped `expect(dead_code)` are the ones only a real
 //! backend — or a test — calls: on a platform whose backend is the stub they
 //! have no caller, and they stay, as they are the real backends' contract. Per
@@ -28,8 +33,17 @@ pub(crate) const NORMALIZED_MAX: f64 = 1000.0;
 /// the model is nudged toward screenshots over the accessibility tree.
 pub(crate) const AX_THIN_INTERACTIVE_ELEMENTS: usize = 5;
 
-/// Cap on nodes rendered in a tree dump — prevents unbounded output.
-pub(crate) const MAX_RENDER_NODES: usize = 4000;
+/// Node ceiling of one tree read — prevents unbounded output. A read that
+/// reaches it records that in [`Truncation`], which the header states. Windows
+/// walks under its own, lower ceiling (UI Automation pays one cross-process call
+/// per property), so only the backends that use this one compile it.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) const MAX_TREE_NODES: usize = 4000;
+
+/// Character cap on a node value shown in a tree dump. The dump is a map of the
+/// surface, not a copy of its text, so a long value is cut here and counted in
+/// the truncation header.
+pub(crate) const RENDER_VALUE_CHARS: usize = 120;
 
 /// Accessible role names considered genuinely actionable (AX-prefix already
 /// stripped, matched case-insensitively). Used alongside non-empty `actions`.
@@ -108,14 +122,43 @@ pub(crate) fn taxonomy_error(kind: &str, msg: impl fmt::Display) -> anyhow::Erro
 }
 
 /// The `framework-failed` failure: `what` names the operation, `detail` what the
-/// system raised under it. Both platforms report the tag in this one shape.
+/// system raised under it. Both platforms report the tag in this one shape, and it
+/// is TYPED so an actuating call can tell "foreign code failed while the call was
+/// running" (its input may be partly applied) from every other failure without
+/// reading the text — see [`is_framework_failed`].
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "windows")),
     expect(dead_code)
 )]
 pub(crate) fn framework_failed(what: &str, detail: impl fmt::Display) -> anyhow::Error {
-    taxonomy_error(ERR_FRAMEWORK_FAILED, format!("{what} — {detail}"))
+    anyhow::Error::new(FrameworkFailed(taxonomy_error(
+        ERR_FRAMEWORK_FAILED,
+        format!("{what} — {detail}"),
+    )))
 }
+
+/// Whether `err` is the typed [`framework_failed`] failure — robust to a
+/// `.context()` layer added above it.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    expect(dead_code)
+)]
+pub(crate) fn is_framework_failed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<FrameworkFailed>().is_some()
+}
+
+/// The `framework-failed` category as a type, so a caller that must branch on it
+/// does not depend on the message's shape.
+#[derive(Debug)]
+struct FrameworkFailed(anyhow::Error);
+
+impl fmt::Display for FrameworkFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for FrameworkFailed {}
 
 /// The `surface-gone` failure for a window of `app_name` (see [`ERR_SURFACE_GONE`]).
 #[cfg_attr(
@@ -316,6 +359,122 @@ pub(crate) struct UiNode {
     pub children: Vec<UiNode>,
 }
 
+/// What a platform backend can honestly say about one actuating call.
+///
+/// Input synthesis is fire-and-forget everywhere: [`Impact::Done`] means the call
+/// was delivered to the system without error — never that its effect happened.
+/// [`Impact::DoneWith`] appends the one thing a delivered call still has to
+/// disclose. [`Impact::Unconfirmed`] is the middle state: part or all of it may
+/// have been applied and the platform cannot say which. It is a normal result, not
+/// a failure — a failure reads as "nothing happened, do it again", and a repeated
+/// click is a second actuation.
+#[derive(Debug, Clone)]
+pub(crate) enum Impact {
+    Done,
+    /// Delivered, with one thing the result must still say: a modifier the call
+    /// could not release again, which may still be held down.
+    #[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code))]
+    DoneWith(String),
+    /// Carries what is known: how much went through, and why it stopped.
+    Unconfirmed(String),
+}
+
+/// Render an actuating call's result: a delivered action keeps its terse
+/// confirmation plus any state it left behind, and an unconfirmed one leads with
+/// that state instead of speaking of failure.
+#[must_use]
+pub(crate) fn impact_text(done: String, impact: Impact) -> String {
+    match impact {
+        Impact::Done => done,
+        Impact::DoneWith(note) => format!("{done} — {note}"),
+        Impact::Unconfirmed(detail) => format!(
+            "applied but unconfirmed — {done}: {detail}. The action was delivered to the system \
+             but not confirmed; it may already have taken effect, so check the target's state \
+             before repeating it, and never repeat it blind, because a second attempt would act \
+             twice."
+        ),
+    }
+}
+
+/// Where a tree read hit a ceiling. Every `None` means that ceiling was not hit;
+/// [`render_tree`] states each one that was, in the header — the only part of a
+/// large observation a spill preview guarantees the agent reads.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Truncation {
+    /// Nodes beyond this node ceiling were not read (the walk stopped).
+    pub nodes: Option<usize>,
+    /// Children of this many nodes sit at the depth ceiling and were not read.
+    pub depth: Option<Cut>,
+    /// This many names were shortened at the read's own character cap.
+    pub names: Option<Cut>,
+}
+
+/// How many items a ceiling cut, and the ceiling itself.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Cut {
+    pub count: usize,
+    pub limit: usize,
+}
+
+impl Truncation {
+    /// Record that the walk stopped at its node ceiling.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+        expect(dead_code)
+    )]
+    pub(crate) fn hit_node_ceiling(&mut self, limit: usize) {
+        self.nodes = Some(limit);
+    }
+
+    /// Record one node whose children sit at the depth ceiling.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+        expect(dead_code)
+    )]
+    pub(crate) fn cut_depth(&mut self, limit: usize) {
+        self.depth.get_or_insert(Cut { count: 0, limit }).count += 1;
+    }
+
+    /// Record one name shortened at the read's own character cap.
+    #[cfg_attr(not(target_os = "windows"), expect(dead_code))]
+    pub(crate) fn cut_name(&mut self, limit: usize) {
+        self.names.get_or_insert(Cut { count: 0, limit }).count += 1;
+    }
+
+    /// One line per ceiling that was hit, each naming it. `values_cut` comes from
+    /// the renderer, which is where a value is cut for display.
+    fn statements(&self, values_cut: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(ceiling) = self.nodes {
+            out.push(format!(
+                "[Tree truncated: the {ceiling}-node ceiling was reached — nodes beyond it were \
+                 not read]"
+            ));
+        }
+        if let Some(cut) = self.depth {
+            out.push(format!(
+                "[Tree truncated: {} nodes at the {}-deep ceiling — their children were not read]",
+                cut.count, cut.limit
+            ));
+        }
+        if values_cut > 0 {
+            out.push(format!(
+                "[Tree truncated: {values_cut} {} cut at {RENDER_VALUE_CHARS} chars]",
+                if values_cut == 1 { "value" } else { "values" }
+            ));
+        }
+        if let Some(cut) = self.names {
+            out.push(format!(
+                "[Tree truncated: {} {} cut at {} chars]",
+                cut.count,
+                if cut.count == 1 { "name" } else { "names" },
+                cut.limit
+            ));
+        }
+        out
+    }
+}
+
 /// A snapshot of one observe call against a target surface.
 #[derive(Debug, Clone)]
 pub(crate) struct Observation {
@@ -323,6 +482,25 @@ pub(crate) struct Observation {
     pub window_title: Option<String>,
     pub surface: SurfaceGeometry,
     pub root: UiNode,
+    /// Where the read stopped short, stated in the header.
+    pub truncation: Truncation,
+}
+
+/// What one window listing produced. A listing never turns a failed read into an
+/// absence: whatever is not listed is named beside the windows that were.
+#[derive(Debug, Default)]
+pub(crate) struct WindowListing {
+    pub windows: Vec<WindowInfo>,
+    pub unread: Vec<UnreadWindows>,
+}
+
+/// Part of a listing that is not listed, and why: per application, with the count of
+/// windows a failed read dropped. The renderer words it without claiming anything
+/// about the windows it did list.
+#[derive(Debug)]
+pub(crate) struct UnreadWindows {
+    pub app_name: String,
+    pub reason: String,
 }
 
 /// An application participating in the target registry.
@@ -1224,25 +1402,30 @@ pub(crate) fn is_ax_thin(obs: &Observation) -> bool {
 }
 
 /// Render the observation as an indented element tree with pre-order refs. The
-/// header carries the node/interactive totals (computed in one pre-walk so they
-/// stay accurate even when the render is capped at [`MAX_RENDER_NODES`]).
+/// header carries the node/interactive totals (computed in one pre-walk, so they
+/// describe everything that was read) and states every ceiling the read hit — a
+/// tree that was cut short must never read as complete.
 #[must_use]
 pub(crate) fn render_tree(obs: &Observation) -> String {
+    let (node_count, interactive_count) = count_stats(&obs.root);
+    let mut tree = String::new();
+    let mut counter = 0usize;
+    let mut values_cut = 0usize;
+    render_node(&obs.root, 0, &mut tree, &mut counter, &mut values_cut);
+
     let surf = &obs.surface;
     let title = obs.window_title.as_deref().unwrap_or("");
-    let (node_count, interactive_count) = count_stats(&obs.root);
     let mut out = String::new();
     let _ = writeln!(
         out,
         "[Surface: app=\"{}\" window=\"{}\" {}x{} @ ({}, {}) — {} nodes, {} interactive]",
         obs.app_name, title, surf.width, surf.height, surf.x, surf.y, node_count, interactive_count
     );
-    let mut counter = 0usize;
-    let mut truncated = false;
-    render_node(&obs.root, 0, &mut out, &mut counter, &mut truncated);
-    if truncated {
-        out.push_str("… (truncated)\n");
+    for statement in obs.truncation.statements(values_cut) {
+        out.push_str(&statement);
+        out.push('\n');
     }
+    out.push_str(&tree);
     out
 }
 
@@ -1251,12 +1434,8 @@ fn render_node(
     depth: usize,
     out: &mut String,
     counter: &mut usize,
-    truncated: &mut bool,
+    values_cut: &mut usize,
 ) {
-    if *counter >= MAX_RENDER_NODES {
-        *truncated = true;
-        return;
-    }
     *counter += 1;
     let indent = "  ".repeat(depth);
     let mut line = format!("{indent}[e{counter}] {}", normalized_role(&node.role));
@@ -1270,7 +1449,10 @@ fn render_node(
         let _ = write!(line, " @ ({x}, {y})");
     }
     if let Some(value) = &node.value {
-        let v = crate::util::truncate(value, 120);
+        let v = crate::util::truncate(value, RENDER_VALUE_CHARS);
+        if v != *value {
+            *values_cut += 1;
+        }
         let _ = write!(line, " value=\"{v}\"");
     }
     if node.focused {
@@ -1279,7 +1461,7 @@ fn render_node(
     out.push_str(&line);
     out.push('\n');
     for child in &node.children {
-        render_node(child, depth + 1, out, counter, truncated);
+        render_node(child, depth + 1, out, counter, values_cut);
     }
 }
 
@@ -1446,7 +1628,9 @@ pub(crate) trait Backend: Send + Sync {
     /// or an OS too old for stills).
     fn capture_unavailable_error(&self) -> anyhow::Error;
     async fn list_apps(&self) -> anyhow::Result<Vec<AppInfo>>;
-    async fn list_windows(&self, app: Option<&AppInfo>) -> anyhow::Result<Vec<WindowInfo>>;
+    /// Windows of one application (or of every application). A failed read of one
+    /// application is reported in [`WindowListing::unread`], never as an empty list.
+    async fn list_windows(&self, app: Option<&AppInfo>) -> anyhow::Result<WindowListing>;
     /// Focused window of the frontmost application (the DEFAULT surface).
     async fn focused_window(&self) -> anyhow::Result<WindowInfo>;
     /// Surface geometry for a target (Screen: virtual-desktop bounding rect).
@@ -1458,8 +1642,8 @@ pub(crate) trait Backend: Send + Sync {
         target: &TargetSpec,
         locator: &Locator,
         act: ElementAct,
-    ) -> anyhow::Result<()>;
-    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Impact>;
+    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<Impact>;
     /// Pointer position in ABSOLUTE global surface points (logical points on
     /// macOS, physical pixels on Linux and Windows).
     async fn cursor_position(&self) -> anyhow::Result<(f64, f64)>;
@@ -1525,6 +1709,7 @@ mod tests {
             window_title: Some("Sample".to_string()),
             surface: surface(0.0, 0.0, 800.0, 600.0),
             root,
+            truncation: Truncation::default(),
         }
     }
 
@@ -1735,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn render_tree_truncates_value_and_nodes() {
+    fn render_tree_states_every_ceiling_it_hit() {
         let long = "x".repeat(200);
         let root = UiNode {
             value: Some(long.clone()),
@@ -1746,29 +1931,62 @@ mod tests {
             window_title: None,
             surface: surface(0.0, 0.0, 10.0, 10.0),
             root,
+            truncation: Truncation {
+                nodes: Some(MAX_TREE_NODES),
+                depth: Some(Cut {
+                    count: 2,
+                    limit: 25,
+                }),
+                names: Some(Cut {
+                    count: 3,
+                    limit: 200,
+                }),
+            },
         };
         let text = render_tree(&obs);
         assert!(text.contains("value=\""), "value should render");
         assert!(!text.contains(&long), "long value must be truncated");
+        // Every cut is stated in the header, above the first element line: a tree
+        // near a ceiling reaches the agent as a preview of its head, so a statement
+        // after the tree would never be read.
+        let header_end = text
+            .lines()
+            .position(|line| line.starts_with("[e"))
+            .expect("the tree renders under the header");
+        let header = text.lines().take(header_end).collect::<Vec<_>>().join("\n");
         assert!(
-            text.contains("…"),
-            "truncated value should carry an ellipsis"
+            header.contains(&format!("the {MAX_TREE_NODES}-node ceiling")),
+            "{header}"
         );
+        assert!(
+            header.contains("2 nodes at the 25-deep ceiling"),
+            "{header}"
+        );
+        assert!(
+            header.contains(&format!("1 value cut at {RENDER_VALUE_CHARS} chars")),
+            "{header}"
+        );
+        assert!(header.contains("3 names cut at 200 chars"), "{header}");
+    }
 
-        // Node cap: a wide tree beyond MAX_RENDER_NODES shows the truncated note
-        // (kept shallow so the DFS does not recurse deeply enough to overflow).
-        let mut root = node("AXWindow", Some("w"));
-        for i in 0..(MAX_RENDER_NODES + 10) {
-            root.children.push(node(&format!("AXButton{i}"), None));
-        }
-        let obs = Observation {
-            app_name: "A".to_string(),
-            window_title: None,
-            surface: surface(0.0, 0.0, 10.0, 10.0),
-            root,
-        };
-        let text = render_tree(&obs);
-        assert!(text.contains("… (truncated)"));
+    #[test]
+    fn impact_text_states_the_middle_outcome_without_advice_to_retry() {
+        assert_eq!(impact_text("clicked".to_string(), Impact::Done), "clicked");
+        assert_eq!(
+            impact_text(
+                "clicked".to_string(),
+                Impact::DoneWith("ctrl may still be held down".to_string()),
+            ),
+            "clicked — ctrl may still be held down"
+        );
+        let text = impact_text(
+            "clicked element e3".to_string(),
+            Impact::Unconfirmed("the call was abandoned".to_string()),
+        );
+        assert!(text.starts_with("applied but unconfirmed"), "{text}");
+        assert!(text.contains("may already have taken effect"), "{text}");
+        assert!(text.contains("act twice"), "{text}");
+        assert!(!text.contains("retry"), "{text}");
     }
 
     #[test]
@@ -1790,6 +2008,7 @@ mod tests {
             window_title: None,
             surface: surface(0.0, 0.0, 10.0, 10.0),
             root: node("AXWindow", Some("other")),
+            truncation: Truncation::default(),
         };
         store_observation(target, &obs2);
         let err = resolve_ref("e2").unwrap_err();

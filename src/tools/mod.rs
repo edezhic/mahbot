@@ -1386,9 +1386,11 @@ pub(crate) struct ToolOutput {
     /// decisions the agent loop makes from a result: with content, image
     /// annotations are APPENDED and any `[IMAGE:path]` marker inside it is
     /// literal text; without it, the annotations REPLACE `text` and such a
-    /// marker is a claim that may be turned into an injected image. `true` only
-    /// for the read tool's converted-document answer — extracted text, or the
-    /// note standing in for what a document could not yield.
+    /// marker is a claim that may be turned into an injected image. `true` for
+    /// the read tool's converted-document answer (extracted text, or the note
+    /// standing in for what a document could not yield) and for the computer
+    /// tool, whose result describes the surface and the action rather than the
+    /// image.
     pub text_is_content: bool,
 }
 
@@ -1400,8 +1402,9 @@ pub(crate) struct ToolOutput {
 /// The text is flagged as a claim about the image (not content) whether or not a
 /// payload comes back, which is what every tool routed here has always meant by
 /// its result: a media tool names the file it wrote, the read tool the file it
-/// read. Only the read tool's converted-document answer, text the model must
-/// keep, bypasses this helper.
+/// read. Tools whose text is the result itself — the read tool's
+/// converted-document answer, the computer tool's surface and outcome — bypass
+/// this helper.
 pub(crate) async fn with_image_payload<T: Tool + ?Sized>(
     tool: &T,
     text: String,

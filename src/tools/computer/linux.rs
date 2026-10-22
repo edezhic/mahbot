@@ -23,6 +23,14 @@
 //! enumeration, has no element tree and no window still; screen-target input, key
 //! chords and typing still reach it. Nothing here needs to know which process owns
 //! a window.
+//!
+//! A read never presents a ceiling as completeness: a tree that stopped at one
+//! records it in the observation's header, and an application whose windows cannot
+//! be read is named as unread instead of appearing to have none. A node whose own
+//! accessibility proxy cannot be read is skipped with its subtree — an accepted
+//! limit of the AT-SPI walk. Input synthesis is fire-and-forget, so a gesture that
+//! was partly delivered reports what may still be held or half-applied rather than
+//! failing as if nothing happened.
 
 #![cfg(target_os = "linux")]
 // A handful of pedantic cast lints are inherent to the C ABI-style integer
@@ -38,8 +46,9 @@
 )]
 
 use super::core::{
-    self, AppInfo, Backend, Capture, ElementAct, Locator, Modifier, MouseButton, Observation,
-    RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, UiNode, WindowInfo, WindowKey,
+    self, AppInfo, Backend, Capture, ElementAct, Impact, Locator, Modifier, MouseButton,
+    Observation, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, Truncation, UiNode,
+    UnreadWindows, WindowInfo, WindowKey, WindowListing,
 };
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::anyhow;
@@ -72,9 +81,11 @@ pub(crate) struct LinuxBackend {
 }
 
 const MAX_DEPTH: usize = 25;
-/// Cap on text pulled into a node's `value` so a huge document never floods the
-/// tree dump (the renderer truncates, but we avoid the round-trip too).
-const MAX_VALUE_CHARS: i32 = 2000;
+/// Cap on text read into a node's `value`: one character past what the renderer
+/// shows, so it can tell a value was cut and state it in the observation header.
+/// The tree dump is a map of the surface, not a copy of its text, so there is no
+/// reason to carry more across D-Bus than the model could ever see.
+const MAX_VALUE_CHARS: i32 = core::RENDER_VALUE_CHARS as i32 + 1;
 const INTERP_STEPS: usize = 12;
 
 const CONN_DEGRADED_MSG: &str =
@@ -199,36 +210,91 @@ fn surface_from_rects(rects: &[(i32, i32, i32, i32)]) -> SurfaceGeometry {
     }
 }
 
-/// D-Bus / atspi error mapping: access denied → permission-denied, a gone
-/// app/object/method → stale-element, a dropped reply → degraded, else plain.
-fn dbus_err(err: impl std::fmt::Display, ctx: &str) -> anyhow::Error {
-    let msg = err.to_string();
+/// What a D-Bus / atspi error string names. One classifier for both mappings:
+/// [`dbus_err`] (reads, and actions that certainly did nothing) and
+/// [`action_dbus_outcome`] (the action call itself) must agree on which failures
+/// are transient, or the same bus failure would be a refusal in one and a silent
+/// success in the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusFault {
+    /// Access denied / not authorized.
+    Denied,
+    /// The app or object is gone, or has no such method.
+    Gone,
+    /// The reply never arrived. Nothing says whether the call was performed.
+    Transient,
+    /// Anything else: passed through as a plain error.
+    Other,
+}
+
+/// The single classification of an atspi/zbus error string, so the read mapping
+/// and the action mapping below can never disagree about what is transient. A
+/// timed-out call (`zbus`'s own "Timeout") belongs with the dropped replies: the
+/// answer was never received, which says nothing about whether it was performed.
+fn classify_bus_fault(msg: &str) -> BusFault {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("accessdenied")
         || lower.contains("notauthorized")
         || lower.contains("authfailed")
     {
-        core::taxonomy_error(core::ERR_PERMISSION_DENIED, format!("{ctx}: {msg}"))
+        BusFault::Denied
     } else if lower.contains("serviceunknown")
         || lower.contains("unknownobject")
         || lower.contains("namehasnoowner")
         || lower.contains("unknownmethod")
     {
-        core::taxonomy_error(
-            core::ERR_STALE_ELEMENT,
-            format!("{ctx}: {msg} — app or window closed; re-enumerate"),
-        )
+        BusFault::Gone
     } else if lower.contains("noreply")
+        || lower.contains("timeout")
         || lower.contains("failed to connect")
         || lower.contains("input/output")
         || lower.contains("connection closed")
     {
-        core::taxonomy_error(
+        BusFault::Transient
+    } else {
+        BusFault::Other
+    }
+}
+
+/// Read error mapping: access denied → permission-denied, a gone app/object/method
+/// → stale-element, a dropped reply → degraded, else plain. Reads only — an
+/// action call maps through [`action_dbus_outcome`], because a dropped reply there
+/// may have carried the action through.
+fn dbus_err(err: impl std::fmt::Display, ctx: &str) -> anyhow::Error {
+    let msg = err.to_string();
+    bus_error(classify_bus_fault(&msg), &msg, ctx)
+}
+
+/// Build the failure for one bus fault. Split out so a caller that has already
+/// classified the fault renders the same message without re-stringifying the error.
+fn bus_error(fault: BusFault, msg: &str, ctx: &str) -> anyhow::Error {
+    match fault {
+        BusFault::Denied => {
+            core::taxonomy_error(core::ERR_PERMISSION_DENIED, format!("{ctx}: {msg}"))
+        }
+        BusFault::Gone => core::taxonomy_error(
+            core::ERR_STALE_ELEMENT,
+            format!("{ctx}: {msg} — app or window closed; re-enumerate"),
+        ),
+        BusFault::Transient => core::taxonomy_error(
             core::ERR_DEGRADED,
             format!("{ctx}: {msg} — transient bus failure, retry"),
-        )
-    } else {
-        anyhow::anyhow!("{ctx}: {msg}")
+        ),
+        BusFault::Other => anyhow::anyhow!("{ctx}: {msg}"),
+    }
+}
+
+/// Outcome of the ACTION call itself — never of the reads that precede it, which
+/// stay [`dbus_err`] failures because nothing was performed yet. A transient bus
+/// failure there may have carried the action through, so it is reported as
+/// [`Impact::Unconfirmed`], naming the call that may have landed.
+fn action_dbus_outcome(err: impl std::fmt::Display, ctx: &str) -> anyhow::Result<Impact> {
+    let msg = err.to_string();
+    match classify_bus_fault(&msg) {
+        BusFault::Transient => Ok(Impact::Unconfirmed(format!(
+            "the accessibility call '{ctx}' failed at the bus level: {msg}"
+        ))),
+        fault => Err(bus_error(fault, &msg, ctx)),
     }
 }
 
@@ -322,17 +388,25 @@ async fn resolve_app_object(
 
 /// The app's window-role children (Window/Frame/Dialog): identity key, global
 /// screen extents, title and active/focused state.
+///
+/// A failure to read the application or its children is an `Err`, never an empty
+/// list: "this app has no windows" and "this app's windows could not be read" are
+/// different answers, and a listing must be able to say which one it has. A child
+/// whose own proxy, role or extents cannot be read is skipped — that is one
+/// window's detail, not a failed read of the application.
 async fn app_window_handles(
     app_ref: &ObjectRefOwned,
     conn: &AccessibilityConnection,
-) -> Vec<WindowHandle> {
+) -> Result<Vec<WindowHandle>, anyhow::Error> {
     let mut out = Vec::new();
-    let Ok(accessible) = app_ref.as_accessible_proxy(conn.connection()).await else {
-        return out;
-    };
-    let Ok(children) = accessible.get_children().await else {
-        return out;
-    };
+    let accessible = app_ref
+        .as_accessible_proxy(conn.connection())
+        .await
+        .map_err(|e| dbus_err(e, "read windows"))?;
+    let children = accessible
+        .get_children()
+        .await
+        .map_err(|e| dbus_err(e, "read windows"))?;
     for child in children {
         let Ok(ca) = child.as_accessible_proxy(conn.connection()).await else {
             continue;
@@ -355,7 +429,7 @@ async fn app_window_handles(
             focused: state.contains(AtspiState::Focused),
         });
     }
-    out
+    Ok(out)
 }
 
 async fn window_screen_extents(accessible: &AccessibleProxy<'_>) -> Option<SurfaceGeometry> {
@@ -427,7 +501,7 @@ async fn app_current_window(
     app_ref: &ObjectRefOwned,
     app_name: &str,
 ) -> Result<ObjectRefOwned, anyhow::Error> {
-    let wins = app_window_handles(app_ref, conn).await;
+    let wins = app_window_handles(app_ref, conn).await?;
     if let Some(w) = wins.iter().find(|w| w.active || w.focused) {
         return Ok(w.object_ref.clone());
     }
@@ -437,13 +511,20 @@ async fn app_current_window(
         .ok_or_else(|| core::surface_gone(app_name))
 }
 
+/// The one window reporting active/focused across every application. An application
+/// whose windows cannot be read is skipped, as it always has been: a targetless read
+/// must not be broken by an unrelated application. The `windows` listing is where
+/// such a failure is disclosed.
 async fn resolve_focused_window(
     conn: &AccessibilityConnection,
 ) -> Result<ResolvedWindow, anyhow::Error> {
     let apps = enumerate_apps(conn).await?;
     let mut matches = Vec::new();
     for (app_ref, app_info) in &apps {
-        for w in app_window_handles(app_ref, conn).await {
+        let Ok(handles) = app_window_handles(app_ref, conn).await else {
+            continue;
+        };
+        for w in handles {
             if w.active || w.focused {
                 matches.push(ResolvedWindow {
                     object_ref: w.object_ref,
@@ -637,8 +718,10 @@ async fn walk_node(
     depth: usize,
     handles: &mut Vec<ObjectRefOwned>,
     nodes: &mut usize,
+    truncation: &mut Truncation,
 ) -> Option<UiNode> {
-    if *nodes >= core::MAX_RENDER_NODES {
+    if *nodes >= core::MAX_TREE_NODES {
+        truncation.hit_node_ceiling(core::MAX_TREE_NODES);
         return None;
     }
     let accessible = object_ref
@@ -661,14 +744,25 @@ async fn walk_node(
         .is_ok_and(|s| s.contains(AtspiState::Focused));
 
     let mut children = Vec::new();
-    if depth < MAX_DEPTH
-        && let Ok(child_refs) = accessible.get_children().await
-    {
+    if depth >= MAX_DEPTH {
+        // The node's subtree is not read. Only a node that has one is a cut, so a leaf
+        // at the ceiling is not reported as a truncation.
+        if accessible
+            .get_children()
+            .await
+            .is_ok_and(|children| !children.is_empty())
+        {
+            truncation.cut_depth(MAX_DEPTH);
+        }
+    } else if let Ok(child_refs) = accessible.get_children().await {
         for child in child_refs {
-            if *nodes >= core::MAX_RENDER_NODES {
+            if *nodes >= core::MAX_TREE_NODES {
+                truncation.hit_node_ceiling(core::MAX_TREE_NODES);
                 break;
             }
-            if let Some(child_node) = walk_node(&child, conn, depth + 1, handles, nodes).await {
+            if let Some(child_node) =
+                walk_node(&child, conn, depth + 1, handles, nodes, truncation).await
+            {
                 children.push(child_node);
             }
         }
@@ -688,10 +782,11 @@ async fn walk_node(
 async fn build_tree(
     root_ref: &ObjectRefOwned,
     conn: &AccessibilityConnection,
-) -> (UiNode, Vec<ObjectRefOwned>) {
+) -> (UiNode, Vec<ObjectRefOwned>, Truncation) {
     let mut handles = Vec::new();
     let mut nodes = 0usize;
-    let node = walk_node(root_ref, conn, 0, &mut handles, &mut nodes)
+    let mut truncation = Truncation::default();
+    let node = walk_node(root_ref, conn, 0, &mut handles, &mut nodes, &mut truncation)
         .await
         .unwrap_or_else(|| UiNode {
             role: "window".to_string(),
@@ -702,7 +797,7 @@ async fn build_tree(
             focused: false,
             children: Vec::new(),
         });
-    (node, handles)
+    (node, handles, truncation)
 }
 
 async fn tree_value(proxies: Option<&Proxies<'_>>, role: &str) -> Option<String> {
@@ -712,10 +807,12 @@ async fn tree_value(proxies: Option<&Proxies<'_>>, role: &str) -> Option<String>
     }
     let text = proxies.text().await.ok()?;
     let count = text.character_count().await.ok()?;
-    if count <= 0 || count > MAX_VALUE_CHARS {
+    if count <= 0 {
         return None;
     }
-    text.get_text(0, count).await.ok()
+    // A text longer than the cap is read up to it and shortened, never dropped:
+    // an absent value would read as "this field is empty".
+    text.get_text(0, count.min(MAX_VALUE_CHARS)).await.ok()
 }
 
 async fn tree_frame(proxies: Option<&Proxies<'_>>) -> Option<(f64, f64, f64, f64)> {
@@ -747,7 +844,7 @@ async fn tree_actions(proxies: Option<&Proxies<'_>>) -> Vec<String> {
 
 // ── Element actions ──────────────────────────────────────────────────────
 
-async fn press_element(proxies: &Proxies<'_>) -> Result<(), anyhow::Error> {
+async fn press_element(proxies: &Proxies<'_>) -> Result<Impact, anyhow::Error> {
     let action = proxies
         .action()
         .await
@@ -780,12 +877,13 @@ async fn press_element(proxies: &Proxies<'_>) -> Result<(), anyhow::Error> {
             format!("element has no press/open action; available actions: {available}"),
         ));
     };
-    let ok = action
-        .do_action(idx as i32)
-        .await
-        .map_err(|e| dbus_err(e, "perform action"))?;
+    let ok = match action.do_action(idx as i32).await {
+        Ok(ok) => ok,
+        // The one actuating call: a bus failure here may have performed it.
+        Err(e) => return action_dbus_outcome(e, "perform action"),
+    };
     if ok {
-        Ok(())
+        Ok(Impact::Done)
     } else {
         Err(anyhow!("action '{}' reported failure", actions[idx].name))
     }
@@ -795,7 +893,7 @@ async fn set_element_value(
     proxies: &Proxies<'_>,
     role: &str,
     text: &str,
-) -> Result<(), anyhow::Error> {
+) -> Result<Impact, anyhow::Error> {
     if role.to_lowercase().contains("password") {
         return Err(core::taxonomy_error(
             core::ERR_UNSUPPORTED,
@@ -803,12 +901,13 @@ async fn set_element_value(
         ));
     }
     if let Ok(editable) = proxies.editable_text().await {
-        let ok = editable
-            .set_text_contents(text)
-            .await
-            .map_err(|e| dbus_err(e, "set text contents"))?;
+        let ok = match editable.set_text_contents(text).await {
+            Ok(ok) => ok,
+            // The one actuating call: a bus failure here may have set the text.
+            Err(e) => return action_dbus_outcome(e, "set text contents"),
+        };
         return if ok {
-            Ok(())
+            Ok(Impact::Done)
         } else {
             Err(anyhow!("set-text-contents returned false"))
         };
@@ -816,11 +915,10 @@ async fn set_element_value(
     if let Ok(value) = proxies.value().await
         && let Ok(num) = text.trim().parse::<f64>()
     {
-        value
-            .set_current_value(num)
-            .await
-            .map_err(|e| dbus_err(e, "set current value"))?;
-        return Ok(());
+        if let Err(e) = value.set_current_value(num).await {
+            return action_dbus_outcome(e, "set current value");
+        }
+        return Ok(Impact::Done);
     }
     Err(core::taxonomy_error(
         core::ERR_UNSUPPORTED,
@@ -949,11 +1047,14 @@ fn enigo_key(name: &str) -> Result<Key, String> {
     Ok(key)
 }
 
-fn press_modifiers(enigo: &mut Enigo, mods: &[Modifier]) -> Result<(), anyhow::Error> {
-    for m in mods {
-        enigo
-            .key(enigo_mod_key(*m), Direction::Press)
-            .map_err(input_err)?;
+/// Press `mods` in order. `Err` carries the index of the modifier whose press failed
+/// and that failure: it and every modifier before it may be down, so a caller that
+/// stops here must say so rather than report that nothing was delivered.
+fn press_modifiers(enigo: &mut Enigo, mods: &[Modifier]) -> Result<(), (usize, enigo::InputError)> {
+    for (i, m) in mods.iter().enumerate() {
+        if let Err(e) = enigo.key(enigo_mod_key(*m), Direction::Press) {
+            return Err((i, e));
+        }
     }
     Ok(())
 }
@@ -965,6 +1066,61 @@ fn release_modifiers(enigo: &mut Enigo, mods: &[Modifier]) -> Result<(), anyhow:
             .map_err(input_err)?;
     }
     Ok(())
+}
+
+/// Name every modifier in `mods` for a result that has to say which may still be
+/// held down. Nothing in this tool can release a key it left down, so the note
+/// names what a held modifier costs and who can clear it.
+fn release_note(enigo: &mut Enigo, mods: &[Modifier]) -> Option<String> {
+    if mods.is_empty() || release_modifiers(enigo, mods).is_ok() {
+        return None;
+    }
+    let names = mods
+        .iter()
+        .map(|m| match m {
+            Modifier::Cmd => "cmd",
+            Modifier::Ctrl => "ctrl",
+            Modifier::Alt => "alt",
+            Modifier::Shift => "shift",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "{names} may still be held down, so every later chord and typed character may be modified \
+         — ask the owner to clear it before acting again"
+    ))
+}
+
+/// Append a release state to a detail that already reports what landed.
+fn with_held(detail: String, held: Option<String>) -> String {
+    match held {
+        Some(held) => format!("{detail}; {held}"),
+        None => detail,
+    }
+}
+
+/// The result of an actuation whose own input is delivered: done, unless letting go
+/// of the modifiers failed, which the result then has to say.
+fn done_after_release(enigo: &mut Enigo, mods: &[Modifier]) -> Impact {
+    match release_note(enigo, mods) {
+        None => Impact::Done,
+        Some(note) => Impact::DoneWith(note),
+    }
+}
+
+/// The failure of an actuation that stopped before its own input was delivered. It
+/// says only what is known: the input did not go through, and a modifier a failed
+/// press left down has to be released before trying again.
+fn press_failed(
+    enigo: &mut Enigo,
+    mods: &[Modifier],
+    what: &str,
+    err: &enigo::InputError,
+) -> anyhow::Error {
+    core::taxonomy_error(
+        core::ERR_DEGRADED,
+        with_held(format!("{what} ({err})"), release_note(enigo, mods)),
+    )
 }
 
 fn scroll_params(direction: ScrollDirection, amount: u32) -> (i32, Axis) {
@@ -987,22 +1143,200 @@ fn pixel_point(
     Ok((x.round() as i32, y.round() as i32))
 }
 
-// The error is only ever a `map_err` callback's argument, so it arrives owned and
-// is formatted as it is: borrowing it would push a closure into every call site.
+// Owned because it is handed to `map_err` at most call sites: borrowing would push
+// a closure into each of them.
 #[expect(clippy::needless_pass_by_value)]
 fn input_err(e: enigo::InputError) -> anyhow::Error {
     anyhow!("input synthesis failed: {e}")
 }
 
-fn key_chord(enigo: &mut Enigo, chord: &str) -> Result<(), anyhow::Error> {
+fn key_chord(enigo: &mut Enigo, chord: &str) -> Result<Impact, anyhow::Error> {
     let (mods, key) = core::parse_key_chord(chord)?;
     let key = enigo_key(&key).map_err(anyhow::Error::msg)?;
-    press_modifiers(enigo, &mods)?;
-    enigo.key(key, Direction::Click).map_err(input_err)?;
-    release_modifiers(enigo, &mods)
+    // Nothing of the chord is in the system before the modifiers are down, so a
+    // failed modifier press is only a half-pressed chord: it and the ones before it
+    // may be down, but no key of it has been delivered.
+    if let Err((failed, e)) = press_modifiers(enigo, &mods) {
+        return Err(press_failed(
+            enigo,
+            &mods[..=failed],
+            "the chord did not go through — a modifier press failed",
+            &e,
+        ));
+    }
+    // XTEST writes the key press before the release can fail, so a press that errors
+    // may already have fired the chord: press and release are driven apart, and a
+    // press failure is repaired by releasing the key again.
+    if let Err(e) = enigo.key(key, Direction::Press) {
+        let released = enigo.key(key, Direction::Release).is_ok();
+        let key_state = if released {
+            "the chord may already have fired, and the key was released again"
+        } else {
+            "the key may still be held down"
+        };
+        return Ok(Impact::Unconfirmed(with_held(
+            format!("the chord's key press errored ({e}) — {key_state}"),
+            release_note(enigo, &mods),
+        )));
+    }
+    if let Err(e) = enigo.key(key, Direction::Release) {
+        return Ok(Impact::Unconfirmed(with_held(
+            format!(
+                "the chord's key went down but its release failed ({e}) — the key may still be \
+                 held down"
+            ),
+            release_note(enigo, &mods),
+        )));
+    }
+    Ok(done_after_release(enigo, &mods))
 }
 
-fn raw_input_blocking(input: RawInput, geo: Option<&SurfaceGeometry>) -> Result<(), anyhow::Error> {
+/// What a drag that stopped after the button went down leaves behind. `released`
+/// says whether the button was let go again, so the result never claims a clean
+/// machine when one may still be mid-gesture.
+fn drag_incomplete(fx: i32, fy: i32, released: bool) -> Impact {
+    let at = format!("the button went down at ({fx}, {fy})");
+    Impact::Unconfirmed(if released {
+        format!(
+            "the drag started ({at}) but the gesture did not complete; the button was released \
+             again"
+        )
+    } else {
+        format!(
+            "the drag started ({at}) but the gesture did not complete and the button may still be \
+             held down"
+        )
+    })
+}
+
+/// Let a button go again after a press that errored — the press may have been
+/// written before the call failed — and say how that ended.
+fn release_after_failed_press(enigo: &mut Enigo, button: Button) -> &'static str {
+    if enigo.button(button, Direction::Release).is_ok() {
+        "was released again"
+    } else {
+        "may still be held down"
+    }
+}
+
+/// A coordinate click: the pointer moves first, then the modifiers, then each
+/// press/release pair (twice for a double click). XTEST synthesizes into whatever is
+/// under the pointer — the model clicks first if focus is required (no
+/// activate-then-control) — and every step after the move is answered for: a failure
+/// names what may have landed or may still be held, because a second click is a
+/// second actuation.
+fn click(
+    enigo: &mut Enigo,
+    x: i32,
+    y: i32,
+    button: Button,
+    double: bool,
+    modifiers: &[Modifier],
+) -> Result<Impact, anyhow::Error> {
+    enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)?;
+    if let Err((failed, e)) = press_modifiers(enigo, modifiers) {
+        return Err(press_failed(
+            enigo,
+            &modifiers[..=failed],
+            "the click did not go through — a modifier press failed",
+            &e,
+        ));
+    }
+    for press in 0..(if double { 2 } else { 1 }) {
+        if let Err(e) = enigo.button(button, Direction::Press) {
+            let state = release_after_failed_press(enigo, button);
+            let detail = if press == 0 {
+                format!(
+                    "the button press errored ({e}) — the target may have seen a click at ({x}, \
+                     {y}), and the button {state}"
+                )
+            } else {
+                format!(
+                    "the first of the two clicks was delivered and the second's button press \
+                     errored ({e}) — the button {state}"
+                )
+            };
+            return Ok(Impact::Unconfirmed(with_held(
+                detail,
+                release_note(enigo, modifiers),
+            )));
+        }
+        if let Err(e) = enigo.button(button, Direction::Release) {
+            let detail = format!(
+                "the button was pressed but its release failed ({e}) — it may still be held down"
+            );
+            return Ok(Impact::Unconfirmed(with_held(
+                detail,
+                release_note(enigo, modifiers),
+            )));
+        }
+    }
+    Ok(done_after_release(enigo, modifiers))
+}
+
+/// Type `text` one character at a time. Enigo writes a character's key press before
+/// its release can fail, so each half is driven apart: a press that errors may
+/// already have typed the character, and a release that errors leaves its key down.
+fn type_text(enigo: &mut Enigo, text: &str) -> Impact {
+    let total = text.chars().count();
+    for (typed, ch) in text.chars().enumerate() {
+        let key = Key::Unicode(ch);
+        if let Err(e) = enigo.key(key, Direction::Press) {
+            let state = if enigo.key(key, Direction::Release).is_ok() {
+                "that character may already have been typed, and its key was released again"
+            } else {
+                "that character may already have been typed and its key may still be held down"
+            };
+            return Impact::Unconfirmed(format!(
+                "{typed} of {total} characters were typed before the next one's key press errored \
+                 ({e}) — {state}"
+            ));
+        }
+        if let Err(e) = enigo.key(key, Direction::Release) {
+            return Impact::Unconfirmed(format!(
+                "{} of {total} characters were typed, but the last one's key release failed ({e}) \
+                 — its key may still be held down",
+                typed + 1
+            ));
+        }
+    }
+    Impact::Done
+}
+
+/// One wheel tick is a press/release pair of a scroll button, and the ticks are
+/// driven apart for the same reason: a failure names how many landed and whether a
+/// wheel button is left down.
+fn scroll(enigo: &mut Enigo, length: i32, axis: Axis) -> Impact {
+    let button = match (length.is_positive(), axis) {
+        (true, Axis::Vertical) => Button::ScrollDown,
+        (false, Axis::Vertical) => Button::ScrollUp,
+        (true, Axis::Horizontal) => Button::ScrollRight,
+        (false, Axis::Horizontal) => Button::ScrollLeft,
+    };
+    let ticks = length.abs();
+    for tick in 0..ticks {
+        if let Err(e) = enigo.button(button, Direction::Press) {
+            let state = release_after_failed_press(enigo, button);
+            return Impact::Unconfirmed(format!(
+                "{tick} of {ticks} scroll ticks were sent before the next one's press errored \
+                 ({e}) — its wheel button {state}"
+            ));
+        }
+        if let Err(e) = enigo.button(button, Direction::Release) {
+            return Impact::Unconfirmed(format!(
+                "{} of {ticks} scroll ticks were sent, but the last one's release failed ({e}) — \
+                 its wheel button may still be held down",
+                tick + 1
+            ));
+        }
+    }
+    Impact::Done
+}
+
+fn raw_input_blocking(
+    input: RawInput,
+    geo: Option<&SurfaceGeometry>,
+) -> Result<Impact, anyhow::Error> {
     let mut enigo =
         Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init failed: {e}"))?;
     match input {
@@ -1013,20 +1347,9 @@ fn raw_input_blocking(input: RawInput, geo: Option<&SurfaceGeometry>) -> Result<
             modifiers,
         } => {
             let (x, y) = pixel_point(point, geo)?;
-            enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)?;
-            let button = enigo_button(button);
-            press_modifiers(&mut enigo, &modifiers)?;
-            // XTEST synthesizes into whatever is under the pointer; the model
-            // clicks first if focus is required (no activate-then-control).
-            for _ in 0..(if double { 2 } else { 1 }) {
-                enigo.button(button, Direction::Press).map_err(input_err)?;
-                enigo
-                    .button(button, Direction::Release)
-                    .map_err(input_err)?;
-            }
-            release_modifiers(&mut enigo, &modifiers)
+            click(&mut enigo, x, y, enigo_button(button), double, &modifiers)
         }
-        RawInput::TypeText { text } => enigo.text(&text).map_err(input_err),
+        RawInput::TypeText { text } => Ok(type_text(&mut enigo, &text)),
         RawInput::KeyChord { chord } => key_chord(&mut enigo, &chord),
         RawInput::Scroll {
             point,
@@ -1038,7 +1361,7 @@ fn raw_input_blocking(input: RawInput, geo: Option<&SurfaceGeometry>) -> Result<
                 enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)?;
             }
             let (length, axis) = scroll_params(direction, amount);
-            enigo.scroll(length, axis).map_err(input_err)
+            Ok(scroll(&mut enigo, length, axis))
         }
         RawInput::Drag { from, to } => {
             let (fx, fy) = pixel_point(from, geo)?;
@@ -1048,19 +1371,36 @@ fn raw_input_blocking(input: RawInput, geo: Option<&SurfaceGeometry>) -> Result<
             enigo
                 .move_mouse(fx, fy, Coordinate::Abs)
                 .map_err(input_err)?;
-            enigo
-                .button(Button::Left, Direction::Press)
-                .map_err(input_err)?;
+            // As in a click, the press may have reached the server before the call
+            // failed: the button can be down and the target may have seen a click.
+            if let Err(e) = enigo.button(Button::Left, Direction::Press) {
+                let state = release_after_failed_press(&mut enigo, Button::Left);
+                return Ok(Impact::Unconfirmed(format!(
+                    "the drag's button press errored ({e}) at ({fx}, {fy}) — the button {state}, \
+                     so the target may have taken it as a click"
+                )));
+            }
+            // Past the button-down the drag is under way: a failure must let the
+            // button go again rather than leave the machine mid-gesture.
             for i in 1..=INTERP_STEPS {
                 let t = i as f64 / INTERP_STEPS as f64;
                 let x = (fx as f64 + (tx - fx) as f64 * t).round() as i32;
                 let y = (fy as f64 + (ty - fy) as f64 * t).round() as i32;
-                enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)?;
+                if enigo.move_mouse(x, y, Coordinate::Abs).is_err() {
+                    let released = enigo.button(Button::Left, Direction::Release).is_ok();
+                    return Ok(drag_incomplete(fx, fy, released));
+                }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            enigo
-                .button(Button::Left, Direction::Release)
-                .map_err(input_err)
+            if let Err(e) = enigo.button(Button::Left, Direction::Release) {
+                // Every step ran and the pointer reached `to`: only the release
+                // failed, which is what must not read as an unfinished gesture.
+                return Ok(Impact::Unconfirmed(format!(
+                    "the drag ran to its end but the button's release failed ({e}) — the button \
+                     may still be held down"
+                )));
+            }
+            Ok(Impact::Done)
         }
     }
 }
@@ -1458,9 +1798,9 @@ impl Backend for LinuxBackend {
         Ok(out)
     }
 
-    async fn list_windows(&self, app: Option<&AppInfo>) -> Result<Vec<WindowInfo>, anyhow::Error> {
+    async fn list_windows(&self, app: Option<&AppInfo>) -> Result<WindowListing, anyhow::Error> {
         let conn = self.conn().await?;
-        let mut out = Vec::new();
+        let mut listing = WindowListing::default();
         for (app_ref, app_info) in enumerate_apps(&conn).await? {
             if let Some(filter) = app {
                 let name_ok = filter.name.eq_ignore_ascii_case(&app_info.name);
@@ -1469,17 +1809,27 @@ impl Backend for LinuxBackend {
                     continue;
                 }
             }
-            for w in app_window_handles(&app_ref, &conn).await {
-                out.push(WindowInfo {
-                    app_pid: app_info.pid,
+            // One unreadable application must not hide the others — and must not
+            // be presented as an application without windows.
+            match app_window_handles(&app_ref, &conn).await {
+                Ok(handles) => {
+                    for w in handles {
+                        listing.windows.push(WindowInfo {
+                            app_pid: app_info.pid,
+                            app_name: app_info.name.clone(),
+                            title: w.title,
+                            key: w.key,
+                            surface: w.surface,
+                        });
+                    }
+                }
+                Err(e) => listing.unread.push(UnreadWindows {
                     app_name: app_info.name.clone(),
-                    title: w.title,
-                    key: w.key,
-                    surface: w.surface,
-                });
+                    reason: format!("{e:#}"),
+                }),
             }
         }
-        Ok(out)
+        Ok(listing)
     }
 
     async fn focused_window(&self) -> Result<WindowInfo, anyhow::Error> {
@@ -1560,7 +1910,7 @@ impl Backend for LinuxBackend {
             .await
             .ok_or_else(|| anyhow!("window geometry unavailable"))?;
         let title = proxy.name().await.ok();
-        let (root, _handles) = build_tree(&window_ref, &conn).await;
+        let (root, _handles, truncation) = build_tree(&window_ref, &conn).await;
         let app_name = target
             .app()
             .map_or_else(|| app_info.name.clone(), |(_, name)| name.to_string());
@@ -1569,6 +1919,7 @@ impl Backend for LinuxBackend {
             window_title: title,
             surface,
             root,
+            truncation,
         })
     }
 
@@ -1577,13 +1928,13 @@ impl Backend for LinuxBackend {
         target: &TargetSpec,
         locator: &Locator,
         act: ElementAct,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Impact, anyhow::Error> {
         let conn = self.conn().await?;
         if matches!(target, TargetSpec::Screen) {
             return Err(core::screen_act_error());
         }
         let (window_ref, _app) = resolve_window(&conn, target).await?;
-        let (root, handles) = build_tree(&window_ref, &conn).await;
+        let (root, handles, _truncation) = build_tree(&window_ref, &conn).await;
         let matched = core::resolve_locator_checked(&root, locator)?;
         if handles.is_empty() {
             return Err(core::taxonomy_error(
@@ -1607,7 +1958,11 @@ impl Backend for LinuxBackend {
         }
     }
 
-    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> Result<(), anyhow::Error> {
+    async fn raw_input(
+        &self,
+        target: &TargetSpec,
+        input: RawInput,
+    ) -> Result<Impact, anyhow::Error> {
         if wayland_env() {
             return Err(core::taxonomy_error(
                 core::ERR_DEGRADED,
