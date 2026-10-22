@@ -1,10 +1,11 @@
 //! The dedicated multithreaded-apartment thread every accessibility and capture
 //! call runs on, and the deadline every caller awaits it under.
 //!
-//! The thread is created lazily and rebuilt after a hang. A job carries a
-//! plain-data [`Call`] and a one-shot reply channel; the COM objects the thread
-//! initializes (`IUIAutomation`, the D3D device) never leave it, which is why the
-//! caller side of this module needs no `unsafe` and no `Send` wrappers.
+//! The thread is created lazily and rebuilt after a hang or a caught structured
+//! exception. A job carries a plain-data [`Call`] and a one-shot reply channel; the
+//! COM objects the thread initializes (`IUIAutomation`, the D3D device) never leave
+//! it, which is why the caller side of this module needs no `unsafe` and no `Send`
+//! wrappers.
 //!
 //! An abandoned job is an accepted limit: the action lock cannot outlive the
 //! deadline that keeps the product responsive, so a job stuck in a provider may
@@ -17,7 +18,7 @@ use super::super::core::{
     TargetSpec, WindowInfo,
 };
 use super::capture::CaptureContext;
-use super::{input, uia, window};
+use super::{input, seh, uia, window};
 use crate::util::UnwrapPoison;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -132,8 +133,9 @@ struct Job {
 // ── The thread ──────────────────────────────────────────────────────────
 
 /// The live apartment thread. `alive` is cleared by a caller whose deadline
-/// expired (or whose reply channel died): the next submission then starts a fresh
-/// thread instead of queueing behind a provider that may never return.
+/// expired (or whose reply channel died), and by the thread itself after a caught
+/// structured exception: the next submission then starts a fresh thread instead of
+/// queueing behind a provider that may never return.
 struct Worker {
     tx: Sender<Job>,
     alive: Arc<AtomicBool>,
@@ -218,28 +220,67 @@ fn sender() -> anyhow::Result<(Sender<Job>, Arc<AtomicBool>)> {
 /// The thread body: initialize the apartment once, then serve jobs until the
 /// channel closes or the thread has been abandoned.
 fn run(rx: &Receiver<Job>, alive: &AtomicBool) {
-    let mut ctx = match Ctx::open() {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            // Nothing on this thread can work. Every queued caller learns why, and
-            // the thread is marked dead so the next call starts a fresh apartment
-            // instead of queueing behind this one.
-            alive.store(false, Ordering::SeqCst);
-            let message = format!("{e:#}");
-            for job in rx {
-                let _ = job.reply.send(Err(anyhow::anyhow!(message.clone())));
-            }
-            return;
+    let mut ctx = match seh::guard(Ctx::open) {
+        Ok(Ok(ctx)) => ctx,
+        Ok(Err(e)) => return retire(rx, alive, &format!("{e:#}")),
+        Err(code) => {
+            // The apartment's own setup faulted. Nothing it built is trustworthy,
+            // and the half-initialized COM state is abandoned with the thread.
+            let error = framework_failed("open the computer-use apartment", code);
+            let message = format!("{error:#}");
+            tracing::warn!("computer use: {message}");
+            return retire(rx, alive, &message);
         }
     };
     while let Ok(job) = rx.recv() {
         if !alive.load(Ordering::SeqCst) {
             break;
         }
-        let result = ctx.execute(job.call);
-        // A caller that gave up has dropped its receiver; that is expected.
-        let _ = job.reply.send(result);
+        match seh::guard(|| ctx.execute(job.call)) {
+            Ok(result) => {
+                // A caller that gave up has dropped its receiver; that is expected.
+                let _ = job.reply.send(result);
+            }
+            Err(code) => {
+                let error = framework_failed("run the computer-use call", code);
+                let message = format!("{error:#}");
+                tracing::warn!("computer use: {message}; retiring the thread");
+                let _ = job.reply.send(Err(error));
+                // Released, this device would run `Release` on a state nobody can
+                // vouch for, outside any exception frame — at most one leaked device
+                // per caught fault is the cheaper consequence.
+                std::mem::forget(ctx);
+                // Nothing here can be resumed, so the thread serves no other job: this
+                // caller has the fault, everything already queued gets it too, and the
+                // next call starts a fresh apartment.
+                return retire(rx, alive, &message);
+            }
+        }
     }
+    // Closing the apartment runs `Release` on native objects, which is foreign code
+    // like any other: the drop is guarded too, and a fault there only ends this
+    // thread, which is ending anyway.
+    if let Err(code) = seh::guard(move || drop(ctx)) {
+        let error = framework_failed("close the computer-use apartment", code);
+        tracing::warn!("computer use: {error:#}");
+    }
+}
+
+/// Leave this thread dead and fail everything already queued with `message`, so the
+/// next call starts a fresh apartment instead of queueing behind this one.
+fn retire(rx: &Receiver<Job>, alive: &AtomicBool, message: &str) {
+    alive.store(false, Ordering::SeqCst);
+    for job in rx {
+        let _ = job.reply.send(Err(anyhow::anyhow!(message.to_owned())));
+    }
+}
+
+/// The fault a caught structured exception becomes, named by what was running.
+fn framework_failed(what: &str, code: u32) -> anyhow::Error {
+    core::framework_failed(
+        what,
+        format!("the system raised structured exception 0x{code:08X}"),
+    )
 }
 
 /// Everything the apartment thread owns: the UIA client and the capture device.

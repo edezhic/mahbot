@@ -26,6 +26,21 @@
 //! afterwards, which is what the timeout message tells the model. At most one thread is
 //! leaked per hang, and the action lock, the agent and the daemon all stay responsive.
 //!
+//! # Structured exceptions
+//!
+//! Foreign code can fault rather than fail: a graphics driver, an in-process provider
+//! or the UI Automation client itself can raise a structured exception from inside a
+//! call this backend made, and Rust can neither catch one nor unwind past it. Every
+//! job the apartment thread serves, the apartment's own setup and its teardown
+//! therefore run inside the one C frame this backend owns ([`seh::guard`]).
+//!
+//! A caught exception fails the call with `framework-failed`, naming the platform's
+//! exception code in hex, and retires the thread. The faulting code cannot resume,
+//! so the state it owned is unknown: the context is abandoned rather than released,
+//! and the next call starts a fresh apartment. [`seh`] owns what a per-call frame
+//! cannot cover: a fault raised on a driver's own thread, and the Rust panics,
+//! control-flow codes and stack overflows the frame must let pass.
+//!
 //! # Coordinates and DPI
 //!
 //! Everything here is PHYSICAL pixels: UI Automation rectangles, window frames,
@@ -132,6 +147,12 @@
 //!    session …`, never a hang. A `screenshot` taken then reports the routes' own
 //!    failures (`… every route failed: …`): the desk probe stays cached for a minute
 //!    and step 7's capture refreshed it, so the channel is not re-diagnosed.
+//! 9. Structured-exception containment: `cargo test --lib tools::computer::windows`
+//!    on that machine, where all three `seh` tests must pass with the harness still
+//!    alive — were containment broken, the test process itself would die instead of
+//!    failing. One raises a real null-read fault, one raises a hand-built foreign C++
+//!    throw (a provider that throws across the boundary), and one asserts that a Rust
+//!    panic still reaches Rust's own handler.
 
 #![cfg(target_os = "windows")]
 // The Win32 surface this backend speaks (C-style integer geometry, i32/u32 pixel
@@ -145,6 +166,7 @@
 
 mod capture;
 mod input;
+mod seh;
 mod thread;
 mod uia;
 mod window;

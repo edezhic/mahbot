@@ -10,10 +10,12 @@
 # project is regularly tested on macOS/Linux only, so without this check the
 # `cfg(windows)` branches of our own source are never compiled by anything.
 #
-# Target: x86_64-pc-windows-gnu. The project's platform gating is by operating
-# system (no code consults `target_env`), so the GNU and MSVC ABIs reach the
-# same branches; the GNU one is chosen because zig ships a mingw-w64 toolchain
-# and can therefore serve as the cross C compiler.
+# Target: x86_64-pc-windows-gnu. The project's Rust-side platform gating is by
+# operating system, so the GNU and MSVC ABIs reach the same branches; the GNU one
+# is chosen because zig ships a mingw-w64 toolchain and can therefore serve as the
+# cross C compiler. build.rs still consults `target_env` — the msvc-only `rc.exe`
+# preference and the shim's gnu flags — and this host is not Windows, so neither the
+# msvc branch nor a change to its flag set is exercised by this lane.
 #
 # Requires: zig, cargo-zigbuild (`brew install cargo-zigbuild`) and the target's
 # rust std (`rustup target add x86_64-pc-windows-gnu`).

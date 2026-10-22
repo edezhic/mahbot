@@ -69,6 +69,15 @@ pub(crate) const ERR_PERMISSION_DENIED: &str = "permission-denied";
 pub(crate) const ERR_UNSUPPORTED: &str = "unsupported";
 pub(crate) const ERR_DEGRADED: &str = "degraded";
 pub(crate) const ERR_STALE_ELEMENT: &str = "stale-element";
+/// The system's own framework (or, on Windows, a structured exception raised
+/// inside it) failed while serving the call: the call was abandoned and the
+/// process is intact. Distinct from `degraded` because retrying the same call is
+/// unlikely to help — the fault is in foreign code, not in the target's state.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    expect(dead_code)
+)]
+pub(crate) const ERR_FRAMEWORK_FAILED: &str = "framework-failed";
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
     expect(dead_code)
@@ -88,6 +97,16 @@ pub(crate) const ERR_SELF_TARGET: &str = "self-target";
 #[must_use]
 pub(crate) fn taxonomy_error(kind: &str, msg: impl fmt::Display) -> anyhow::Error {
     anyhow!("{kind}: {msg}")
+}
+
+/// The `framework-failed` failure: `what` names the operation, `detail` what the
+/// system raised under it. Both platforms report the tag in this one shape.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    expect(dead_code)
+)]
+pub(crate) fn framework_failed(what: &str, detail: impl fmt::Display) -> anyhow::Error {
+    taxonomy_error(ERR_FRAMEWORK_FAILED, format!("{what} — {detail}"))
 }
 
 /// Build the `permission-denied` failure as a TYPED error: its text is the usual
@@ -1462,6 +1481,9 @@ mod tests {
         assert!(format!("{err}").contains("stale-element"));
     }
 
+    // The two target-registry tests share the process-global map, so one seeding it
+    // under the other's assertions would flake; serialize them.
+    #[serial_test::serial(targets)]
     #[test]
     fn resolve_target_resolves_focused_screen_stored_and_unknown() {
         assert_eq!(resolve_target(None).unwrap(), TargetSpec::Focused);
@@ -1489,6 +1511,7 @@ mod tests {
         assert!(format!("{err}").contains("unknown target"));
     }
 
+    #[serial_test::serial(targets)]
     #[test]
     fn store_targets_merges_only_same_id_class() {
         let window = |app_pid: u32, name: &str, title: &str, index: usize| TargetSpec::Window {

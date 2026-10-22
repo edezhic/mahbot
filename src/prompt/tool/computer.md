@@ -41,6 +41,7 @@ Backend/runtime failures carry a leading tag (argument mistakes like out-of-rang
 * `unsupported` — this operation/channel isn't available for the target, or the control refuses the action (disabled, or it does not support it). Take another route: the `chrome` tool for web pages, `shell` for scriptable/terminal paths, or — for a refusing control — coordinates or another element.
 * `degraded` — the platform or surface inherently lacks this channel, or a transient failure occurred. Use another channel or retry.
 * `stale-element` — the ref no longer resolves; the tree changed. Re-observe.
+* `framework-failed` — the OS framework serving the call failed; the call was abandoned. Re-observe or screenshot to check the target's state, then take another route (coordinates, or the `chrome` tool) or report it.
 * `ambiguous-locator` — more than one element matched; re-observe and use a more specific ref.
 * `not-matched` — no element matched; re-observe or use coordinates/screenshot.
 

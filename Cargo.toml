@@ -269,6 +269,14 @@ office_oxide = { version = "=0.1.13" }
 # only when that feature is on, and this project sets the few properties it wants
 # from the build script itself. Every other target builds no resource at all.
 winresource = { version = "0.1", default-features = false }
+# The Computer tool's structured-exception shim (`build.rs`): Rust cannot catch a
+# structured exception, so the one `__try`/`__except` frame in the product is
+# `src/tools/computer/windows/seh.c`, compiled into Windows targets only. Kept out of
+# a `[target.'cfg(windows)'...]` table because build scripts are compiled for the
+# host: target-gating it would make the script itself `#[cfg]`-split for a dependency
+# it only reaches under a Windows target, which is why `winresource` above is
+# unconditional too.
+cc = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -341,8 +349,12 @@ minimp3 = "0.5"
 # accessibility (AXUIElement), input synthesis (CGEvent) and capture
 # (ScreenCaptureKit). Version-aligned objc2 family — the same 0.6.x/0.3.x series
 # already resolved transitively via the GUI stack, so the lock gains no additional
-# objc2 base-version forks.
-objc2 = "0.6"
+# objc2 base-version forks. The `exception` feature is Computer Use's per-call
+# Objective-C exception firewall (`objc2::exception::catch`): it adds the helper
+# that turns an exception thrown by framework code into an error value. It is
+# deliberately NOT `catch-all`, which would wrap every message send in the
+# product and turn an exception into a panic.
+objc2 = { version = "0.6", features = ["exception"] }
 # The AppleEvent features are not for Computer Use: the quit interception (src/shutdown.rs) reads
 # the reason the system names on a Quit AppleEvent — NSAppleEventManager/NSAppleEventDescriptor,
 # plus kAEQuitReason and its reason codes from CoreServices. NSProcessInfo, with the NSString its

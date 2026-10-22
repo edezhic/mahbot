@@ -1,10 +1,33 @@
 //! macOS [`Backend`] for the Computer tool: AX accessibility (observe/act),
 //! CGEvent raw input, and ScreenCaptureKit capture. Non-`Send` platform objects
 //! are created and dropped inside the blocking closure of the call that uses them
-//! (`with_block_in_place`) — never in struct state or across an await. The one
+//! ([`with_platform`]) — never in struct state or across an await. The one
 //! path outside such a closure is the grant diagnosis ([`permission_error`]),
 //! which resolves the responsible application's name synchronously, with no await
 //! in between.
+//!
+//! # Foreign failures
+//!
+//! System frameworks fail in their own terms: an Objective-C exception raised
+//! inside a framework call is not a Rust panic, so Rust cannot contain it — an
+//! unwind that is not caught at the call ends the process, and the panic guard
+//! aborts on it outright. Every async [`Backend`] entry therefore runs behind
+//! [`with_platform`] — the blocking body off the async worker, behind
+//! [`catching_foreign`] — which turns such an exception into a `framework-failed`
+//! failure of the call. The AX C functions are not messages, so the bindings offer
+//! no per-site wrapper for them: the boundary of the call is the widest point an
+//! exception can still be caught at.
+//!
+//! What runs outside that boundary is guarded where it runs, and a failure there has
+//! no call left to fail, so it is logged and dropped: the grant prompt thread, the
+//! grant-name lookup of [`permission_error`], the main-queue exchange of
+//! [`on_ax_thread`] and the completion handlers the system invokes ([`contained`] —
+//! the waiter may already have given up). The one synchronous entry without a call to
+//! fail into, [`capture_unavailable_error`], guards its own platform contacts.
+//!
+//! Answers are checked before they are used: an AX array is filtered to the member
+//! type it is read as ([`typed_members`]) instead of being cast wholesale, and a
+//! capture size is validated before it reaches the capture framework.
 //!
 //! # Availability
 //!
@@ -75,7 +98,8 @@ use objc2_application_services::{
     AXValueType, kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
+    CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+    ConcreteType, Type,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext, CGDirectDisplayID,
@@ -85,7 +109,7 @@ use objc2_core_graphics::{
     CGPreflightScreenCaptureAccess, CGRequestPostEventAccess, CGRequestScreenCaptureAccess,
     CGScrollEventUnit,
 };
-use objc2_foundation::{NSArray, NSError, NSInteger, NSString};
+use objc2_foundation::{NSArray, NSError, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
     SCStreamErrorCode, SCWindow,
@@ -97,6 +121,57 @@ use std::time::Duration;
 pub(crate) static MACOS_BACKEND: MacOsBackend = MacOsBackend;
 
 pub(crate) struct MacOsBackend;
+
+// ── Foreign failures ─────────────────────────────────────────────────────
+//
+// The contract lives in the module header; these are the helpers it names.
+
+/// Run a `Result`-returning body behind Objective-C's own exception handler: an
+/// exception the system raises anywhere under it is caught here and returned as a
+/// failed call. A Rust panic passes through untouched (it is not a foreign exception);
+/// where both guards are wanted, [`contained`] owns their order.
+fn catching_foreign<T>(
+    what: &str,
+    f: impl FnOnce() -> Result<T, anyhow::Error>,
+) -> Result<T, anyhow::Error> {
+    objc2::exception::catch(std::panic::AssertUnwindSafe(f))
+        .map_err(|exc| {
+            let detail = exc
+                .as_ref()
+                .map_or_else(|| "an unnamed exception".to_string(), ToString::to_string);
+            core::framework_failed(what, format!("the system raised an exception: {detail}"))
+        })
+        .and_then(std::convert::identity)
+}
+
+/// Both guards in the one order that works — the exception firewall inside the panic
+/// guard, because a foreign exception reaching that guard aborts the process — for a
+/// body that runs in frames we do not own: a dispatch queue, or a callback the system
+/// invokes. Either failure becomes the error this returns.
+fn contained<T>(
+    what: &str,
+    body: impl FnOnce() -> Result<T, anyhow::Error>,
+) -> Result<T, anyhow::Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        catching_foreign(what, body)
+    }))
+    .unwrap_or_else(|payload| {
+        Err(anyhow!(
+            "{what} panicked: {}",
+            crate::util::panic_message(payload.as_ref())
+        ))
+    })
+}
+
+/// One entry into the system from the async side: the blocking body off the async
+/// worker, behind the Objective-C firewall. `what` names the operation for the
+/// failure it reports.
+fn with_platform<T>(
+    what: &str,
+    f: impl FnOnce() -> Result<T, anyhow::Error>,
+) -> Result<T, anyhow::Error> {
+    with_block_in_place(|| catching_foreign(what, f))
+}
 
 // ── kAX* attribute/action string constants ───────────────────────────────
 //
@@ -191,7 +266,16 @@ impl Grant {
     fn request(self) {
         let (done, wait) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            self.prompt();
+            // A fresh thread is outside the caller's firewall and nothing there can
+            // fail the call: the answer is read by the caller's re-probe, so a failure
+            // is logged and dropped, and a failing body returns instead of leaving the
+            // caller to its timeout.
+            if let Err(e) = contained("ask for the grant", || {
+                self.prompt();
+                Ok(())
+            }) {
+                tracing::warn!("computer use: {e:#}");
+            }
             let _ = done.send(());
         });
         let _ = wait.recv_timeout(PROMPT_WAIT);
@@ -303,14 +387,21 @@ fn responsible_app() -> String {
     if let Some(bundle_id) = non_empty("__CFBundleIdentifier") {
         // The running application's localized name is what System Settings shows.
         let id = NSString::from_str(&bundle_id);
-        let name = NSRunningApplication::runningApplicationsWithBundleIdentifier(&id)
-            .iter()
-            .find_map(|app| {
-                app.localizedName()
-                    .map(|name| name.to_string())
-                    .filter(|name| !name.is_empty())
-            });
-        return name.unwrap_or(bundle_id);
+        let resolved = catching_foreign("resolve the responsible application", || {
+            Ok(
+                NSRunningApplication::runningApplicationsWithBundleIdentifier(&id)
+                    .iter()
+                    .find_map(|app| {
+                        app.localizedName()
+                            .map(|name| name.to_string())
+                            .filter(|name| !name.is_empty())
+                    }),
+            )
+        })
+        .inspect_err(|e| tracing::warn!("computer use: {e:#}"))
+        .ok()
+        .flatten();
+        return resolved.unwrap_or(bundle_id);
     }
     non_empty("TERM_PROGRAM").unwrap_or_else(|| "the terminal you started mahbot from".to_string())
 }
@@ -387,17 +478,7 @@ fn on_ax_thread<T: Send + 'static>(
     }
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     dispatch2::DispatchQueue::main().exec_async(move || {
-        // A Rust panic must not unwind across the dispatch FFI boundary — that
-        // aborts the process — so it becomes an honest error. (An Objective-C
-        // exception raised through the AX C API is not catchable at all; routing
-        // the exchange here is what keeps that class from being reached.)
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
-                Err(anyhow!(
-                    "access to mahbot's own window panicked: {}",
-                    crate::util::panic_message(payload.as_ref())
-                ))
-            });
+        let result = contained("access to mahbot's own window", f);
         let _ = tx.send(result);
     });
     match rx.recv_timeout(SELF_AX_WAIT) {
@@ -491,10 +572,29 @@ fn attribute_bool(el: &AXUIElement, attr: &CFString) -> Option<bool> {
     Some(val.downcast_ref::<CFBoolean>()?.value())
 }
 
-/// Raw (AX-prefixed) action names; the AX error is the caller's to report — a
-/// tree walk degrades to no actions, while acting on an element must not turn a
-/// failed read into "element has no press/open action".
-fn raw_action_names(el: &AXUIElement) -> Result<Vec<String>, AXError> {
+/// The members of `array` that really are `T`. An array arrives with whatever its
+/// owner put in it, so each member is checked against the type it is used as; a
+/// member of another type is skipped rather than read as a `T`.
+fn typed_members<T: ConcreteType>(array: &CFArray) -> Vec<CFRetained<T>> {
+    // SAFETY: an array's members are Core Foundation objects, and `CFType` is the
+    // root of them all — the cast makes no claim about a member's own type, which
+    // is what `downcast` below checks.
+    let members: CFRetained<CFArray<CFType>> =
+        unsafe { CFRetained::cast_unchecked(array.retain()) };
+    members
+        .iter()
+        .filter_map(|member| member.downcast::<T>().ok())
+        .collect()
+}
+
+/// Raw (AX-prefixed) action names. The AX error is the caller's to report — a tree
+/// walk degrades to no actions, while acting on an element must not turn a failed
+/// read into "element has no press/open action".
+///
+/// `Ok(None)` is the third answer: the system replied with something that is not a
+/// list of names — a list whose members are none of them strings — so the caller
+/// knows it learned nothing rather than that the element has no actions.
+fn raw_action_names(el: &AXUIElement) -> Result<Option<Vec<String>>, AXError> {
     let mut names: *const CFArray = std::ptr::null();
     // SAFETY: `names` points to valid storage the binding fills on success.
     let err = unsafe {
@@ -503,15 +603,32 @@ fn raw_action_names(el: &AXUIElement) -> Result<Vec<String>, AXError> {
     if err != AXError::Success {
         return Err(err);
     }
-    // SAFETY: AXUIElementCopyActionNames returns a +1 retained CFArray (Create
-    // rule); null indicates an element with no actions.
+    // SAFETY: AXUIElementCopyActionNames returns a +1 retained Core Foundation
+    // object (Create rule); "Core Foundation object" is all this claims — the
+    // `downcast` below checks which kind it really is. Null indicates an element
+    // with no actions.
     let Some(raw) = std::ptr::NonNull::new(names.cast_mut()) else {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     };
-    let array = unsafe { CFRetained::from_raw(raw) };
-    // SAFETY: AX action names are a CFArray of CFString objects.
-    let typed: CFRetained<CFArray<CFString>> = unsafe { CFRetained::cast_unchecked(array) };
-    Ok(typed.iter().map(|s| s.to_string()).collect())
+    // SAFETY: as above — `from_raw` takes over the +1 reference, `cast_unchecked`
+    // only widens it to the root type, and the type check follows.
+    let object: CFRetained<CFType> =
+        unsafe { CFRetained::cast_unchecked(CFRetained::from_raw(raw)) };
+    // An answer that is not an array is not a list of names, so it taught us
+    // nothing — the same conclusion as an array with no usable member.
+    let Ok(array) = object.downcast::<CFArray>() else {
+        return Ok(None);
+    };
+    let names: Vec<String> = typed_members::<CFString>(&array)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    // An empty array really is "no actions"; a non-empty array with nothing usable
+    // in it taught us nothing.
+    if names.is_empty() && !array.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(names))
 }
 
 fn attribute_children(el: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
@@ -521,9 +638,7 @@ fn attribute_children(el: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
     let Ok(array) = val.downcast::<CFArray>() else {
         return Vec::new();
     };
-    // SAFETY: AXChildren is a CFArray of AXUIElement objects.
-    let typed: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::cast_unchecked(array) };
-    typed.iter().collect()
+    typed_members::<AXUIElement>(&array)
 }
 
 fn normalize_action_name(name: &str) -> String {
@@ -620,7 +735,11 @@ fn walk_element(
         (Some(p), Some(s)) => Some((p.x - origin.0, p.y - origin.1, s.width, s.height)),
         _ => None,
     };
+    // A failed or unusable read only leaves the node's actions absent: the walk
+    // degrades, acting on the element is what must not.
     let actions = raw_action_names(element)
+        .ok()
+        .flatten()
         .unwrap_or_default()
         .iter()
         .map(|a| normalize_action_name(a))
@@ -756,9 +875,7 @@ fn read_windows(app: &AXUIElement) -> Result<Vec<CFRetained<AXUIElement>>, anyho
     let array: CFRetained<CFArray> = val
         .downcast::<CFArray>()
         .map_err(|_| anyhow!("AXWindows was not a CFArray"))?;
-    // SAFETY: AXWindows is a CFArray of AXUIElement objects.
-    let typed: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::cast_unchecked(array) };
-    Ok(typed.iter().collect())
+    Ok(typed_members::<AXUIElement>(&array))
 }
 
 /// One application's listed windows: the AX window array plus each window's frame
@@ -1296,7 +1413,8 @@ fn activate_window(target: &TargetSpec) -> Result<bool, anyhow::Error> {
         Err(e) if !is_ax_thread(&e) => return Ok(false),
         Err(e) => return Err(e),
     };
-    let Ok(names) = raw_action_names(&window) else {
+    // Best-effort by design: an unusable answer only skips the raise.
+    let Some(names) = raw_action_names(&window).ok().flatten() else {
         return Ok(false);
     };
     if !names.iter().any(|a| a == AX_RAISE) {
@@ -1380,39 +1498,30 @@ unsafe impl Send for SendShareable {}
 struct SendImage(Retained<CGImage>);
 unsafe impl Send for SendImage {}
 
-struct ScErr {
-    code: NSInteger,
-    message: String,
-}
-
-impl From<ScErr> for anyhow::Error {
-    fn from(err: ScErr) -> anyhow::Error {
-        if err.code == SCStreamErrorCode::UserDeclined.0
-            || err.code == SCStreamErrorCode::MissingEntitlements.0
-        {
-            permission_error(Grant::ScreenRecording)
-        } else if err.code == SCStreamErrorCode::NoWindowList.0 {
-            core::taxonomy_error(
-                core::ERR_NOT_MATCHED,
-                "no window found — re-enumerate windows",
-            )
-        } else {
-            anyhow!("screen capture failed (code {}): {}", err.code, err.message)
-        }
-    }
-}
-
-fn sc_err_from_nserror(err: &NSError) -> ScErr {
-    ScErr {
-        code: err.code(),
-        message: err.localizedDescription().to_string(),
+/// The failure a completion handler's `NSError` stands for, classified by its
+/// `SCStreamError` code.
+fn sc_error(err: &NSError) -> anyhow::Error {
+    let code = err.code();
+    if code == SCStreamErrorCode::UserDeclined.0 || code == SCStreamErrorCode::MissingEntitlements.0
+    {
+        permission_error(Grant::ScreenRecording)
+    } else if code == SCStreamErrorCode::NoWindowList.0 {
+        core::taxonomy_error(
+            core::ERR_NOT_MATCHED,
+            "no window found — re-enumerate windows",
+        )
+    } else {
+        anyhow!(
+            "screen capture failed (code {code}): {}",
+            err.localizedDescription()
+        )
     }
 }
 
 /// Block on an SCK completion handler (5s timeout) and return the handed-off
 /// result. The caller spawns the provider call; this consumes the shared slot.
 fn sc_wait<T: Send>(
-    slot: &Arc<Mutex<Option<Result<T, ScErr>>>>,
+    slot: &Arc<Mutex<Option<Result<T, anyhow::Error>>>>,
     semaphore: &Arc<DispatchRetained<DispatchSemaphore>>,
     what: &str,
 ) -> Result<T, anyhow::Error> {
@@ -1423,7 +1532,30 @@ fn sc_wait<T: Send>(
         .unwrap_poison()
         .take()
         .ok_or_else(|| anyhow!("{what} handler never invoked"))?
-        .map_err(anyhow::Error::from)
+}
+
+/// Hand one completion handler its answer and release the waiter — the only way a
+/// handler body ends.
+///
+/// The system invokes these bodies on its own frames, where nothing may unwind: a
+/// Rust panic cannot cross into them, and a framework exception raised inside the
+/// body cannot reach the caller's firewall either (the body runs on the system's
+/// thread, possibly after the wait gave up). [`contained`] holds both guards, and a
+/// failure becomes the value the waiter reads — the call that is waiting reports it,
+/// so it is logged at debug rather than as an issue row; a body that fails after the
+/// wait returned is the case with no reader.
+fn sc_complete<T>(
+    slot: &Mutex<Option<Result<T, anyhow::Error>>>,
+    semaphore: &DispatchSemaphore,
+    what: &str,
+    body: impl FnOnce() -> Result<T, anyhow::Error>,
+) {
+    let outcome = contained(what, body);
+    if let Err(e) = &outcome {
+        tracing::debug!("computer use: {e:#}");
+    }
+    *slot.lock().unwrap_poison() = Some(outcome);
+    semaphore.signal();
 }
 
 /// Fetch the shareable-content snapshot (availability probe + window/display
@@ -1431,30 +1563,23 @@ fn sc_wait<T: Send>(
 fn get_shareable_content() -> Result<Retained<SCShareableContent>, anyhow::Error> {
     let semaphore = Arc::new(DispatchSemaphore::new(0));
     let sem2 = Arc::clone(&semaphore);
-    let slot: Arc<Mutex<Option<Result<SendShareable, ScErr>>>> = Arc::new(Mutex::new(None));
+    let slot: Arc<Mutex<Option<Result<SendShareable, anyhow::Error>>>> = Arc::new(Mutex::new(None));
     let slot2 = Arc::clone(&slot);
     let block = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
-        let result = if !err.is_null() {
-            // SAFETY: `err` is valid for the handler's duration.
-            Err(sc_err_from_nserror(unsafe { &*err }))
-        } else if content.is_null() {
-            Err(ScErr {
-                code: 0,
-                message: "no shareable content".to_string(),
-            })
-        } else {
+        sc_complete(&slot2, &sem2, "shareable content", || {
+            if !err.is_null() {
+                // SAFETY: `err` is valid for the handler's duration.
+                return Err(sc_error(unsafe { &*err }));
+            }
+            if content.is_null() {
+                return Err(anyhow!("no shareable content"));
+            }
             // SAFETY: a retained object the handler hands us; `retain` takes
             // ownership beyond the callback.
-            match unsafe { Retained::retain(content) } {
-                Some(c) => Ok(SendShareable(c)),
-                None => Err(ScErr {
-                    code: 0,
-                    message: "null shareable content".to_string(),
-                }),
-            }
-        };
-        *slot2.lock().unwrap_poison() = Some(result);
-        sem2.signal();
+            let content = unsafe { Retained::retain(content) }
+                .ok_or_else(|| anyhow!("null shareable content"))?;
+            Ok(SendShareable(content))
+        });
     });
     // SAFETY: `block` is a live stack block; the framework copies it for the
     // asynchronous call, and the wait below keeps the original alive until the
@@ -1467,6 +1592,12 @@ fn get_shareable_content() -> Result<Retained<SCShareableContent>, anyhow::Error
 
 /// A single still of `filter`'s content, at the pixel size the caller asked for.
 ///
+/// The pixel size is validated here because it is what reaches the framework: both
+/// capture routes derive it from what the system reported — a window's frame, a
+/// display's frame — and zero is what a minimized, off-screen or vanished surface
+/// reduces to, so it must be an honest failure rather than a request handed to
+/// ScreenCaptureKit.
+///
 /// Callers guarantee [`sck_available`]: the `SCScreenshotManager` class itself
 /// only exists from macOS 14 on, and messaging a missing class aborts the
 /// process.
@@ -1476,6 +1607,15 @@ fn capture_filter_to_rgba(
     px_h: usize,
     ignore_shadows: bool,
 ) -> Result<Capture, anyhow::Error> {
+    if px_w == 0 || px_h == 0 {
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "the target has no capture area ({px_w}x{px_h} px) — it is minimized, off-screen \
+                 or was closed; restore it and re-observe"
+            ),
+        ));
+    }
     let config = unsafe { SCStreamConfiguration::new() };
     // SAFETY: the config setters are ObjC messages against a live object.
     // No source rect is set: SCK interprets one filter-locally and would crop
@@ -1491,30 +1631,23 @@ fn capture_filter_to_rgba(
 
     let semaphore = Arc::new(DispatchSemaphore::new(0));
     let sem2 = Arc::clone(&semaphore);
-    let slot: Arc<Mutex<Option<Result<SendImage, ScErr>>>> = Arc::new(Mutex::new(None));
+    let slot: Arc<Mutex<Option<Result<SendImage, anyhow::Error>>>> = Arc::new(Mutex::new(None));
     let slot2 = Arc::clone(&slot);
     let block = RcBlock::new(move |image: *mut CGImage, err: *mut NSError| {
-        let result = if !err.is_null() {
-            // SAFETY: `err` is valid for the handler's duration.
-            Err(sc_err_from_nserror(unsafe { &*err }))
-        } else if image.is_null() {
-            Err(ScErr {
-                code: 0,
-                message: "no image in the screenshot".to_string(),
-            })
-        } else {
+        sc_complete(&slot2, &sem2, "screenshot", || {
+            if !err.is_null() {
+                // SAFETY: `err` is valid for the handler's duration.
+                return Err(sc_error(unsafe { &*err }));
+            }
+            if image.is_null() {
+                return Err(anyhow!("no image in the screenshot"));
+            }
             // SAFETY: a +0 object the handler hands us; `retain` takes ownership
             // beyond the callback, which ends when the waiter returns.
-            match unsafe { Retained::retain(image) } {
-                Some(img) => Ok(SendImage(img)),
-                None => Err(ScErr {
-                    code: 0,
-                    message: "null screenshot image".to_string(),
-                }),
-            }
-        };
-        *slot2.lock().unwrap_poison() = Some(result);
-        sem2.signal();
+            let image = unsafe { Retained::retain(image) }
+                .ok_or_else(|| anyhow!("null screenshot image"))?;
+            Ok(SendImage(image))
+        });
     });
     // SAFETY: filter/config/block are valid; the framework copies the block for
     // the asynchronous call, and the wait below keeps the original alive until
@@ -1725,6 +1858,13 @@ fn capture_available_blocking() -> bool {
 
 fn press_element(element: &AXUIElement) -> Result<(), anyhow::Error> {
     let names = raw_action_names(element).map_err(|e| ax_error(e, "read element actions"))?;
+    let Some(names) = names else {
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            "the accessibility API answered without usable action names for this element — act \
+             on it by coordinates instead of by ref",
+        ));
+    };
     if names.iter().any(|a| a == AX_PRESS) {
         // SAFETY: AXPress was verified to exist on the element.
         map_action_err(
@@ -1814,19 +1954,30 @@ impl Backend for MacOsBackend {
     }
 
     async fn capture_available(&self) -> bool {
-        with_block_in_place(capture_available_blocking)
+        // A probe that cannot answer counts as "no": the capture attempt carries the
+        // real diagnosis, and the failure is logged instead of being lost.
+        with_platform("probe capture", || Ok(capture_available_blocking())).unwrap_or_else(|e| {
+            tracing::warn!("computer use: {e:#}");
+            false
+        })
     }
 
+    /// The diagnosis for a capture that is unavailable. It has no call to fail into,
+    /// so a raised exception *becomes* the answer, as does the diagnosis itself; its
+    /// platform contacts are the version check and the grant-name lookup.
     fn capture_unavailable_error(&self) -> anyhow::Error {
-        if sck_available() {
-            permission_error(Grant::ScreenRecording)
-        } else {
-            screen_capture_needs_14()
-        }
+        catching_foreign("diagnose capture", || {
+            Ok(if sck_available() {
+                permission_error(Grant::ScreenRecording)
+            } else {
+                screen_capture_needs_14()
+            })
+        })
+        .unwrap_or_else(std::convert::identity)
     }
 
     async fn list_apps(&self) -> Result<Vec<AppInfo>, anyhow::Error> {
-        with_block_in_place(|| {
+        with_platform("list applications", || {
             let mut out = Vec::new();
             for app in NSWorkspace::sharedWorkspace().runningApplications() {
                 if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
@@ -1847,7 +1998,7 @@ impl Backend for MacOsBackend {
     }
 
     async fn list_windows(&self, app: Option<&AppInfo>) -> Result<Vec<WindowInfo>, anyhow::Error> {
-        with_block_in_place(|| {
+        with_platform("list windows", || {
             ensure(Grant::Accessibility)?;
             let app_infos: Vec<AppInfo> = if let Some(a) = app {
                 vec![a.clone()]
@@ -1890,7 +2041,7 @@ impl Backend for MacOsBackend {
     }
 
     async fn focused_window(&self) -> Result<WindowInfo, anyhow::Error> {
-        with_block_in_place(|| {
+        with_platform("read the focused window", || {
             ensure(Grant::Accessibility)?;
             with_target(&TargetSpec::Focused, |target| {
                 let (window, app) = resolve_window(target)?;
@@ -1910,11 +2061,13 @@ impl Backend for MacOsBackend {
         &self,
         target: &TargetSpec,
     ) -> Result<SurfaceGeometry, anyhow::Error> {
-        with_block_in_place(|| surface_geometry_routed(target))
+        with_platform("read the target's geometry", || {
+            surface_geometry_routed(target)
+        })
     }
 
     async fn observe(&self, target: &TargetSpec) -> Result<Observation, anyhow::Error> {
-        with_block_in_place(|| {
+        with_platform("observe", || {
             ensure(Grant::Accessibility)?;
             with_target(target, observe_blocking)
         })
@@ -1926,7 +2079,7 @@ impl Backend for MacOsBackend {
         locator: &Locator,
         act: ElementAct,
     ) -> Result<(), anyhow::Error> {
-        with_block_in_place(|| {
+        with_platform("act on an element", || {
             if matches!(target, TargetSpec::Screen) {
                 return Err(core::screen_act_error());
             }
@@ -1939,7 +2092,7 @@ impl Backend for MacOsBackend {
     }
 
     async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> Result<(), anyhow::Error> {
-        with_block_in_place(|| {
+        with_platform("synthesize input", || {
             check_input_arguments(&input)?;
             ensure(Grant::Input)?;
             raw_input_blocking(target, &input)
@@ -1947,7 +2100,7 @@ impl Backend for MacOsBackend {
     }
 
     async fn cursor_position(&self) -> Result<(f64, f64), anyhow::Error> {
-        with_block_in_place(|| {
+        with_platform("read the pointer position", || {
             let event =
                 CGEvent::new(None).ok_or_else(|| anyhow!("failed to create dummy cursor event"))?;
             let p = CGEvent::location(Some(&event));
@@ -1956,7 +2109,7 @@ impl Backend for MacOsBackend {
     }
 
     async fn capture(&self, target: &TargetSpec) -> Result<Capture, anyhow::Error> {
-        with_block_in_place(|| capture_blocking(target))
+        with_platform("capture", || capture_blocking(target))
     }
 }
 
@@ -1964,11 +2117,47 @@ fn window_title(window: &AXUIElement) -> Option<String> {
     attribute_string(window, &axc(AX_TITLE))
 }
 
-// ── Tests (pure logic only; no FFI) ──────────────────────────────────────
+// ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The evidence for this backend's exception route: a framework call that
+    /// raises must come back as a failed call, and raising it must not kill the
+    /// process running this test.
+    #[test]
+    fn a_framework_exception_becomes_a_failed_call() {
+        let err = with_platform("probe", || -> Result<(), anyhow::Error> {
+            let array = NSArray::<objc2::runtime::NSObject>::new();
+            // An out-of-range read is the framework's own failure (an
+            // NSRangeException raised by NSArray), not something Rust maps.
+            let _: *mut objc2::runtime::AnyObject =
+                unsafe { objc2::msg_send![&array, objectAtIndex: 0usize] };
+            Ok(())
+        })
+        .expect_err("the exception must not escape the firewall");
+        let text = format!("{err:#}");
+        assert!(
+            text.starts_with(core::ERR_FRAMEWORK_FAILED),
+            "expected a framework-failed call, got: {text}"
+        );
+        assert!(text.contains("exception"), "{text}");
+    }
+
+    /// A wrongly-typed member of a system array must not be read as the type it
+    /// was assumed to be, and must not take the well-typed members with it.
+    #[test]
+    fn typed_members_skip_a_member_of_another_type() {
+        let name = CFString::from_str("AXPress");
+        let number = objc2_core_foundation::CFNumber::new_i64(7);
+        let array = CFArray::<CFType>::from_objects(&[&name, &number]);
+        let names: Vec<String> = typed_members::<CFString>(array.as_ref())
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, vec!["AXPress".to_string()]);
+    }
 
     #[test]
     fn key_table_covers_chord_parser_keys() {
