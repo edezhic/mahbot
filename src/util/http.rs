@@ -276,10 +276,30 @@ pub fn image_gen_http_client() -> &'static reqwest::Client {
 /// behaviour at runtime.
 #[must_use]
 pub fn build_http_client(timeout: Duration) -> reqwest::Client {
+    build_http_client_with(timeout, reqwest::redirect::Policy::default())
+}
+
+/// Build an HTTP client that treats a redirect as the response: the caller
+/// checked the one address it supplied, and a hop the server picks would escape
+/// that check (the `web_search` picture probe is the user).
+///
+/// # Panics
+///
+/// Same as [`build_http_client`].
+#[must_use]
+pub fn build_no_redirect_http_client(timeout: Duration) -> reqwest::Client {
+    build_http_client_with(timeout, reqwest::redirect::Policy::none())
+}
+
+fn build_http_client_with(
+    timeout: Duration,
+    redirect: reqwest::redirect::Policy,
+) -> reqwest::Client {
     install_ring_provider();
     reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))
+        .redirect(redirect)
         .build()
         .expect("Failed to build HTTP client (rustls TLS initialization failure)")
 }

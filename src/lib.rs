@@ -1503,9 +1503,11 @@ pub(crate) trait Tool: Send + Sync {
     ///
     /// There are three distinct policy patterns across the codebase:
     ///
-    /// 1. **Scrub-all** (trait default: `true`) — web_search, chrome, edit,
-    ///    analyze, ticket, media-gen tools, and most others. The raw output may
-    ///    contain credentials, so it is always scrubbed before the LLM sees it.
+    /// 1. **Scrub-all** (trait default: `true`) — chrome, edit, analyze, ticket,
+    ///    media-gen tools, and most others. The raw output may contain
+    ///    credentials, so it is always scrubbed before the LLM sees it.
+    ///    `web_search` is scrub-all too, except on a picture call, which scrubs
+    ///    its own text — see its override.
     ///
     /// 2. **Skip scrubbing entirely** (`false`) — shell and search tools.
     ///    - The shell tool's internal `apply_profile_pipeline` already scrubs
