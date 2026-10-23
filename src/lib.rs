@@ -655,9 +655,13 @@ pub struct SendMessage {
     pub recipient: String,
     /// Optional inline keyboard markup to attach to the message.
     pub reply_markup: Option<serde_json::Value>,
-    /// Workspace roots that authorize outbound `[FILE:...]` markers: the workspace
-    /// of the agent that authored the message plus, for relayed content, the
-    /// workspace it originated in. Empty = no file delivery on this send.
+    /// Workspace roots that anchor outbound media markers: the workspace of the
+    /// agent that authored the message plus, for relayed content, the workspace
+    /// it originated in. A relative `[IMAGE:]`/`[AUDIO:]`/`[VIDEO:]`/`[FILE:]`
+    /// target names a file in the first root that has it; `[FILE:]` delivery is
+    /// additionally confined to these roots. Empty = no workspace: a relative
+    /// marker cannot be delivered ("the message's workspace is unknown.") and no
+    /// file is authorized.
     pub file_roots: Vec<std::path::PathBuf>,
 }
 

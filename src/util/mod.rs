@@ -22,7 +22,6 @@ pub(crate) mod upload_bridge;
 
 use directories::UserDirs;
 use regex::Regex;
-use regex::RegexBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use strum::IntoEnumIterator;
@@ -49,7 +48,7 @@ impl<T> UnwrapPoison for Result<T, std::sync::PoisonError<T>> {
 
 /// The `[KIND:path]` media marker kinds.
 ///
-/// The single source of the kind set: `MEDIA_MARKER_PATTERN` is generated from
+/// The single source of the kind set: [`MEDIA_MARKER_RE`] is generated from
 /// this enum and [`parse_media_marker`] maps the captured token back onto it, so
 /// a capture can only ever name one of these and a new variant is both matchable
 /// and forced onto every dispatcher.
@@ -71,22 +70,24 @@ impl MediaMarkerKind {
             Self::File => "FILE",
         }
     }
+
+    /// The lowercase word for the thing the kind delivers, used to name a
+    /// refusal for a target that carries no file name of its own. Derived from
+    /// [`Self::token`] so the kind set has one table, not two.
+    pub(crate) fn noun(self) -> String {
+        self.token().to_ascii_lowercase()
+    }
 }
 
-/// The regex pattern for the `[KIND:path]` media markers, generated from
-/// [`MediaMarkerKind`] — the enum is the only source of the kind set, so every
-/// pipeline (enrichment, GUI, Telegram delivery, reply snippets) matches
-/// exactly the kinds the rest of the system knows.
-static MEDIA_MARKER_PATTERN: LazyLock<String> = LazyLock::new(|| {
-    let kinds = MediaMarkerKind::iter()
-        .map(MediaMarkerKind::token)
-        .collect::<Vec<_>>()
-        .join("|");
-    format!(r"\[(?P<kind>{kinds}):(?P<path>[^\]\r\n]+)\]")
-});
-
 /// Matches `[IMAGE:path]`, `[AUDIO:path]`, `[VIDEO:path]`, or `[FILE:path]`
-/// markers in message content, using [`MEDIA_MARKER_PATTERN`].
+/// markers in message content, in any casing.
+///
+/// The kind list is generated from [`MediaMarkerKind`] — the enum is the only
+/// source of the kind set, so every pipeline (enrichment, GUI, Telegram
+/// delivery, reply snippets) matches exactly the kinds the rest of the system
+/// knows. Case-insensitive because no prompt tells the model that the casing of
+/// a kind is significant: `[image:…]` is the same marker as `[IMAGE:…]`, and
+/// either it is delivered or it becomes a refusal notice, on every surface.
 ///
 /// **Invariant — marker stripping:** the pattern decides which kinds the
 /// enrichment and GUI passes can see; `enrich_message` strips only the kinds it
@@ -94,22 +95,28 @@ static MEDIA_MARKER_PATTERN: LazyLock<String> = LazyLock::new(|| {
 /// to this list later — through untouched. IMAGE markers are preserved for
 /// native image-part integration via `to_message_content()`, FILE markers
 /// because they carry a workspace file handle the routed role consumes.
-pub(crate) static MEDIA_MARKER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&MEDIA_MARKER_PATTERN).expect("MEDIA_MARKER_RE must compile"));
-
-/// Case-insensitive variant of [`MEDIA_MARKER_RE`], used by the Telegram
-/// delivery parser and the reply-snippet normalizer, which also accept other
-/// casings (`[image:...]`). Same kind set: a marker-shaped word of any other
-/// kind is not a marker and is left as literal text.
-pub(crate) static TELEGRAM_MEDIA_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    RegexBuilder::new(&MEDIA_MARKER_PATTERN)
-        .case_insensitive(true)
-        .build()
-        .expect("TELEGRAM_MEDIA_MARKER_RE must compile")
+pub(crate) static MEDIA_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let kinds = MediaMarkerKind::iter()
+        .map(MediaMarkerKind::token)
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&format!(r"(?i)\[(?P<kind>{kinds}):(?P<path>[^\]\r\n]+)\]"))
+        .expect("MEDIA_MARKER_RE must compile")
 });
 
-/// Extract the kind and `path` named groups from a [`MEDIA_MARKER_RE`] /
-/// [`TELEGRAM_MEDIA_MARKER_RE`] capture.
+/// Whether `text` carries a `[KIND:` marker of `kind` in any casing — the cheap
+/// guard the marker consumers use to skip [`MEDIA_MARKER_RE`] on text that
+/// cannot hold one. A case-sensitive `contains` would disagree with the
+/// case-insensitive pattern and silently skip `[image:…]`.
+#[must_use]
+pub(crate) fn has_media_marker(text: &str, kind: MediaMarkerKind) -> bool {
+    let prefix = format!("[{}:", kind.token());
+    text.as_bytes()
+        .windows(prefix.len())
+        .any(|window| window.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// Extract the kind and `path` named groups from a [`MEDIA_MARKER_RE`] capture.
 ///
 /// Returns the [`MediaMarkerKind`] and the path slice borrowed from the original
 /// haystack.
@@ -117,7 +124,7 @@ pub(crate) static TELEGRAM_MEDIA_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// # Panics
 ///
 /// Panics if the `kind` or `path` group is missing, or the captured token names
-/// no kind — this cannot fire because [`MEDIA_MARKER_PATTERN`] is generated from
+/// no kind — this cannot fire because [`MEDIA_MARKER_RE`] is generated from
 /// [`MediaMarkerKind`], so the pattern and the kind list are one source and
 /// cannot drift.
 #[must_use]

@@ -156,8 +156,9 @@ pub struct AgentJob {
     pub pending_job_id: Option<String>,
     /// For relayed jobs ([`MessageKind::ManagerNotify`]) this names the
     /// workspace the relayed content originated in, so a project-workspace
-    /// `[FILE:...]` marker in that content is not rejected just because the
-    /// relaying Assistant sits in the admin's personal workspace.
+    /// media marker in that content (`[FILE:...]`, `[IMAGE:...]`, `[AUDIO:...]`,
+    /// `[VIDEO:...]`) resolves and delivers from where it was produced, not just
+    /// because the relaying Assistant sits in the admin's personal workspace.
     #[serde(default)]
     pub originating_workspace: Option<String>,
     /// The branch launch this job runs, when it runs one ([`Role::Custom`] or
@@ -831,10 +832,12 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
         };
 
-        // ── Roots authorizing outbound `[FILE:...]` markers ────────────
+        // ── Roots anchoring outbound media markers ─────────────────────
         // The job's own workspace, plus the workspace the relayed content
         // originated in when it differs (a Manager→Assistant relay names it in
-        // `originating_workspace`). A failed lookup only narrows the roots.
+        // `originating_workspace`): a relative `[IMAGE:]`/`[AUDIO:]`/`[VIDEO:]`
+        // target resolves against them, and `[FILE:]` is confined to them. A
+        // failed lookup only narrows the roots.
         let mut file_roots = vec![std::path::PathBuf::from(&ws.path)];
         if let Some(origin) = job.originating_workspace.as_deref()
             && origin != job.workspace_name
@@ -843,12 +846,12 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                 Ok(Some(origin_ws)) => file_roots.push(std::path::PathBuf::from(&origin_ws.path)),
                 Ok(None) => debug!(
                     workspace = %origin,
-                    "Message router: originating workspace not found — file delivery roots narrowed",
+                    "Message router: originating workspace not found — marker roots narrowed",
                 ),
                 Err(e) => debug!(
                     workspace = %origin,
                     error = %e,
-                    "Message router: originating workspace lookup failed — file delivery roots narrowed",
+                    "Message router: originating workspace lookup failed — marker roots narrowed",
                 ),
             }
         }
@@ -1587,8 +1590,9 @@ async fn deliver_single_user_response(
 /// The response is always broadcast + persisted first (so it appears in the
 /// GUI chat history even if the channel transport delivery fails).
 ///
-/// `file_roots` authorizes outbound `[FILE:...]` markers exactly as in
-/// [`deliver_single_user_response`]; an empty slice disables file delivery,
+/// `file_roots` anchors and confines outbound media markers exactly as in
+/// [`deliver_single_user_response`]; an empty slice names no workspace, so a
+/// relative marker cannot be delivered and no `[FILE:...]` is authorized —
 /// which is what the inline-confirmation caller passes.
 pub async fn deliver_unregistered_user_response(
     response: &str,

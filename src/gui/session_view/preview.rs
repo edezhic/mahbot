@@ -187,19 +187,23 @@ pub(crate) fn width_bucket(width: f32) -> u32 {
 ///
 /// `display_text` is the raw message body (the same text that the Sessions
 /// ledger's `parse_entry_bodies` feeds to `markdown::parse`); media-marker
-/// preprocessing and image placeholder reduction happen here. The source is
-/// owned as [`Arc<str>`] so a width-bucket change can re-measure without
-/// copying the (potentially hundreds of KB) display text again.
-/// `font_size` is the body size the text renders at (body or narration),
-/// used for wrap and preview-line-budget shaping and heading scaling.
+/// preprocessing and image placeholder reduction happen here, under the same
+/// [`media_markers::MarkerContext`] the render uses so a notice and an image
+/// measure as what they render. The source is owned as [`Arc<str>`] so a
+/// width-bucket change can re-measure without copying the (potentially hundreds
+/// of KB) display text again. `font_size` is the body size the text renders at
+/// (body or narration), used for wrap and preview-line-budget shaping and
+/// heading scaling.
 pub(crate) fn measure_message(
     display_text: impl Into<Arc<str>>,
+    markers: &media_markers::MarkerContext<'_>,
     width: f32,
     content_len: usize,
     font_size: f32,
 ) -> MessageMeasure {
     let source = display_text.into();
-    let processed: Arc<str> = placeholder_media(&media_markers::preprocess(&source)).into();
+    let processed: Arc<str> =
+        placeholder_media(&media_markers::preprocess(&source, markers).text).into();
     measure_processed(source, processed, width, content_len, font_size)
 }
 
@@ -534,7 +538,11 @@ fn setext_heading_size(current: &str, next: Option<&str>, font_size: f32) -> Opt
 fn placeholder_media(processed: &str) -> String {
     IMAGE_PLACEHOLDER_RE
         .replace_all(processed, |caps: &regex::Captures| {
-            let url = caps.get(1).map_or("", |m| m.as_str());
+            // A quoted destination is captured without its `<>`.
+            let url = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .map_or("", |url| url.as_str());
             let label = if url.starts_with("data:") {
                 // Base64 data-URI images have no filename — generic label.
                 "image"
@@ -547,11 +555,13 @@ fn placeholder_media(processed: &str) -> String {
 }
 
 /// Matches markdown image syntax as produced by `media_markers::preprocess`
-/// (`![Image](path)`) and raw `![alt](url)` in agent text. The url group
-/// stops at the first `)`, which is also where pulldown-cmark closes the
-/// destination.
+/// (`![Image](path)`) and raw `![alt](url)` in agent text. The destination is
+/// either `<>`-quoted — how `media_markers::image_item` writes a path with a
+/// space or a parenthesis — or bare, which closes at the first `)`, where
+/// pulldown-cmark stops reading it too.
 static IMAGE_PLACEHOLDER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"!\[[^\]]*\]\(([^)]*)\)").expect("image placeholder regex must compile")
+    regex::Regex::new(r"!\[[^\]]*\]\((?:<([^>]*)>|([^)]*))\)")
+        .expect("image placeholder regex must compile")
 });
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -586,9 +596,24 @@ mod tests {
     /// per wrapped line at 13px JetBrains Mono (0.6em advance = 7.8px/char).
     const TEST_WIDTH: f32 = 500.0;
 
+    /// The marker context an assistant body measures under: no workspace to
+    /// resolve against, refusals enabled.
+    fn agent_markers() -> media_markers::MarkerContext<'static> {
+        media_markers::MarkerContext {
+            workspace: None,
+            refusals: true,
+        }
+    }
+
     fn measure(text: &str) -> MessageMeasure {
         ensure_fonts_loaded();
-        measure_message(text, TEST_WIDTH, text.len(), MARKDOWN_TEXT_SIZE)
+        measure_message(
+            text,
+            &agent_markers(),
+            TEST_WIDTH,
+            text.len(),
+            MARKDOWN_TEXT_SIZE,
+        )
     }
 
     fn assert_preview_lines(preview: &str, expected: usize) {
@@ -820,7 +845,7 @@ mod tests {
     fn base64_data_uri_reduced_to_placeholder() {
         // A valid native data-URI image marker is reduced to a short
         // `🖼️ image` placeholder rather than its base64 payload being counted
-        // as token text. (Non-raster markers stay as literal text.)
+        // as token text.
         let png = {
             let img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
             let mut buf = Vec::new();
@@ -835,7 +860,7 @@ mod tests {
         assert!(m.wrapped_lines <= 3, "{} lines", m.wrapped_lines);
         assert!(m.preview.is_none());
         // The placeholder must not contain the raw base64 blob.
-        let measured = placeholder_media(&media_markers::preprocess(&text));
+        let measured = placeholder_media(&media_markers::preprocess(&text, &agent_markers()).text);
         assert!(!measured.contains("base64"));
         assert!(measured.contains("🖼️ image"));
     }
@@ -854,8 +879,36 @@ mod tests {
         let m = measure(&text);
         assert_eq!(m.wrapped_lines, 1);
         assert!(m.preview.is_none());
-        let measured = placeholder_media(&media_markers::preprocess(&text));
+        let measured = placeholder_media(&media_markers::preprocess(&text, &agent_markers()).text);
         assert!(measured.contains("🖼️ cap.png"), "got: {measured:?}");
+    }
+
+    #[test]
+    fn spaced_image_marker_placeholder_names_the_file() {
+        // A resolved picture in a path with a space or a parenthesis renders as
+        // a `<>`-quoted destination; the measurement must name it like any other.
+        let dir = tempfile::tempdir().unwrap();
+        let png = {
+            let img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+            let mut buf = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .expect("test PNG must encode");
+            buf
+        };
+        for name in ["my file.png", "my (1).png"] {
+            std::fs::write(dir.path().join(name), &png).unwrap();
+            let markers = media_markers::MarkerContext {
+                workspace: Some(dir.path()),
+                refusals: true,
+            };
+            let measured = placeholder_media(
+                &media_markers::preprocess(&format!("[IMAGE:{name}]"), &markers).text,
+            );
+            assert!(
+                measured.contains(&format!("🖼️ {name}")),
+                "got: {measured:?}"
+            );
+        }
     }
 
     #[test]

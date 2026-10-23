@@ -1226,7 +1226,7 @@ impl Dashboard {
                     .map(Message::Logs),
                 Page::Sessions => self
                     .sessions_state
-                    .update(sessions::SessionsMessage::Escape)
+                    .update(sessions::SessionsMessage::Escape, &self.workspaces)
                     .map(Message::Sessions),
                 Page::Editor => self
                     .editor_state
@@ -1505,7 +1505,7 @@ impl Dashboard {
                 // cannot go stale.
                 if self.page == Page::Sessions {
                     self.sessions_state
-                        .update(sessions::SessionsMessage::RuntimeChanged)
+                        .update(sessions::SessionsMessage::RuntimeChanged, &self.workspaces)
                         .map(Message::Sessions)
                 } else {
                     Task::none()
@@ -1529,7 +1529,10 @@ impl Dashboard {
                 }
                 self.board_state.update(msg).map(Message::Board)
             }
-            Message::Sessions(msg) => self.sessions_state.update(msg).map(Message::Sessions),
+            Message::Sessions(msg) => self
+                .sessions_state
+                .update(msg, &self.workspaces)
+                .map(Message::Sessions),
             Message::Alarms(msg) => self.alarms_state.update(msg).map(Message::Alarms),
             Message::RunningAgents(msg) => self.process_running_message(msg),
             // Intercept CloseModal from successful manual commit — auto-close

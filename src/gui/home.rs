@@ -81,6 +81,11 @@ struct DisplayMessage {
 /// parses markdown; divider directions skip markdown (rendered as rules).
 /// `id` is `Some` for history-loaded entries, `None` for live/optimistic
 /// messages.
+///
+/// Markers resolve against the conversation's own workspace — Home shows the
+/// admin's personal conversation, so that is the root — and only an agent's
+/// message turns an undeliverable marker into a notice; what the owner typed
+/// stays their words.
 #[expect(clippy::too_many_arguments)]
 fn display_message(
     id: Option<i64>,
@@ -96,12 +101,16 @@ fn display_message(
     let (md_items, file_markers) = if direction == ChatDirection::Divider {
         (Vec::new(), Vec::new())
     } else {
-        let processed = super::media_markers::preprocess(&content);
-        let processed = super::markdown_breaks::hard_breaks(&processed);
-        (
-            markdown::parse(&processed).collect(),
-            super::media_markers::file_markers(&content),
-        )
+        let workspace = HomeState::conversation_workspace_path();
+        let rendered = super::media_markers::preprocess(
+            &content,
+            &super::media_markers::MarkerContext {
+                workspace: Some(&workspace),
+                refusals: direction == ChatDirection::Agent,
+            },
+        );
+        let processed = super::markdown_breaks::hard_breaks(&rendered.text);
+        (markdown::parse(&processed).collect(), rendered.files)
     };
     DisplayMessage {
         id,
@@ -580,6 +589,12 @@ impl HomeState {
     /// — is tagged with it, and nothing else is.
     fn conversation_workspace() -> String {
         crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME)
+    }
+
+    /// The conversation's filesystem root: a relative marker target in this chat
+    /// names a file in the admin's personal workspace, and nothing else.
+    fn conversation_workspace_path() -> std::path::PathBuf {
+        crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME)
     }
 
     /// Open the app's own conversation: bring the persisted composer draft back
@@ -1563,8 +1578,7 @@ impl HomeState {
             HomeMessage::LinkClicked(url) => {
                 if let Some(target) = super::media_markers::file_link_target(&url) {
                     let target = target.to_string();
-                    let workspace =
-                        crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME);
+                    let workspace = HomeState::conversation_workspace_path();
                     // The reveal stats and spawns a launcher: keep it out of the
                     // update handler.
                     Task::perform(
@@ -2050,6 +2064,64 @@ mod tests {
         crate::channels::chat_draft::DraftStore::at(Some(
             DIR.path().join(format!("draft-{n}.json")),
         ))
+    }
+
+    #[test]
+    fn only_an_agent_message_turns_an_undeliverable_marker_into_a_notice() {
+        // The desktop resolves a relative target against the conversation's own
+        // workspace — Home shows the admin's personal one — and reports the
+        // reason in the product's own reply...
+        let agent = display_message(
+            None,
+            "m1".to_string(),
+            "see [IMAGE:generated/poster.png]".to_string(),
+            ChatDirection::Agent,
+            None,
+            None,
+            None,
+            false,
+        );
+        let text = rendered_text(&agent.md_items);
+        assert!(
+            text.contains("Could not send \"poster.png\": file not found."),
+            "got: {text:?}"
+        );
+        assert!(!text.contains("[IMAGE:"), "got: {text:?}");
+
+        // ...while what the owner typed stays their own words.
+        let owner = display_message(
+            None,
+            "m2".to_string(),
+            "see [IMAGE:generated/poster.png]".to_string(),
+            ChatDirection::User,
+            None,
+            None,
+            None,
+            false,
+        );
+        let text = rendered_text(&owner.md_items);
+        assert!(
+            text.contains("[IMAGE:generated/poster.png]"),
+            "got: {text:?}"
+        );
+    }
+
+    /// All paragraph text a rendered body carries, flattened, for asserting on
+    /// what the user reads.
+    fn rendered_text(items: &[iced::widget::markdown::Item]) -> String {
+        let style = crate::gui::theme::markdown_settings().style;
+        items
+            .iter()
+            .filter_map(|item| match item {
+                iced::widget::markdown::Item::Paragraph(text) => Some(
+                    text.spans(style)
+                        .iter()
+                        .map(|span| span.text.to_string())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

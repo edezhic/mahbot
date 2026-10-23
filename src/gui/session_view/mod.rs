@@ -187,30 +187,52 @@ pub(crate) fn build_ledger_with_sources(
     (entries, sources)
 }
 
-/// A transcript body parsed for display: its markdown items and the
-/// `[FILE:…]` markers it contains, in body order (the viewer turns each
-/// marker's rendered label into a click).
+/// A transcript body parsed for display: its markdown items, the `[FILE:…]`
+/// markers it contains, in body order (the viewer turns each marker's rendered
+/// label into a click), and whether an undeliverable marker became a refusal —
+/// carried so the collapse measurement of the same body resolves under the
+/// context it was parsed with.
 pub(crate) struct ParsedBody {
     pub items: Vec<markdown::Item>,
     pub files: Vec<media_markers::FileMarker>,
+    pub refusals: bool,
 }
 
 /// Per-entry markdown parse for bubble bodies: Message → its content,
 /// ToolRound → its narration. None = nothing to render.
-pub(crate) fn parse_entry_bodies(entries: &[SessionEntry]) -> Vec<Option<ParsedBody>> {
+///
+/// `workspace` is the root the session's relative marker targets resolve
+/// against. Only an assistant body (a message from the model, or a round's
+/// narration) turns an undeliverable marker into a notice — a user or tool
+/// message keeps the structural display, because the product never rewrites
+/// what a person typed into a refusal.
+pub(crate) fn parse_entry_bodies(
+    entries: &[SessionEntry],
+    workspace: Option<&std::path::Path>,
+) -> Vec<Option<ParsedBody>> {
     entries
         .iter()
         .map(|entry| {
-            let display = match entry {
-                SessionEntry::Message { content, .. } => content.as_deref()?,
-                SessionEntry::ToolRound { narration, .. } => narration.as_deref()?,
+            let (display, refusals) = match entry {
+                SessionEntry::Message { role, content, .. } => (
+                    content.as_deref()?,
+                    matches!(role, crate::ChatRole::Assistant),
+                ),
+                SessionEntry::ToolRound { narration, .. } => (narration.as_deref()?, true),
             };
-            let processed = media_markers::preprocess(display);
-            let escaped = escape_html_blocks(&processed);
+            let rendered = media_markers::preprocess(
+                display,
+                &media_markers::MarkerContext {
+                    workspace,
+                    refusals,
+                },
+            );
+            let escaped = escape_html_blocks(&rendered.text);
             let with_breaks = markdown_breaks::hard_breaks(&escaped);
             Some(ParsedBody {
                 items: markdown::parse(&with_breaks).collect(),
-                files: media_markers::file_markers(display),
+                files: rendered.files,
+                refusals,
             })
         })
         .collect()

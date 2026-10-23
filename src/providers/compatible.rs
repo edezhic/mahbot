@@ -424,8 +424,7 @@ fn to_message_content(role: ChatRole, content: &str) -> MessageContent {
     }
 
     // Fast path: avoid regex work when there are no IMAGE markers at all.
-    // All valid markers begin with "[IMAGE:" so a simple substring check is safe.
-    if !content.contains("[IMAGE:") {
+    if !crate::util::has_media_marker(content, crate::util::MediaMarkerKind::Image) {
         return MessageContent::Text(content.to_string());
     }
 
@@ -1900,16 +1899,19 @@ mod tests {
     #[test]
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let uri = tiny_png_data_uri();
-        let content = format!("Describe this\n\n[IMAGE:{uri}]");
-        let value = serde_json::to_value(to_message_content(ChatRole::User, &content)).unwrap();
-        let parts = value
-            .as_array()
-            .expect("multimodal content should be an array");
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[0]["text"], "Describe this");
-        assert_eq!(parts[1]["type"], "image_url");
-        assert_eq!(parts[1]["image_url"]["url"], uri);
+        // Any casing is the same marker, including in the fast-path guard.
+        for token in ["IMAGE", "image"] {
+            let content = format!("Describe this\n\n[{token}:{uri}]");
+            let value = serde_json::to_value(to_message_content(ChatRole::User, &content)).unwrap();
+            let parts = value
+                .as_array()
+                .expect("multimodal content should be an array");
+            assert_eq!(parts.len(), 2);
+            assert_eq!(parts[0]["type"], "text");
+            assert_eq!(parts[0]["text"], "Describe this");
+            assert_eq!(parts[1]["type"], "image_url");
+            assert_eq!(parts[1]["image_url"]["url"], uri);
+        }
     }
 
     #[test]

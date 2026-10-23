@@ -352,7 +352,7 @@ fn session_image_marker_count(history: &[ChatMessage]) -> usize {
 /// which is what actually bounds the emitted payload.
 async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> {
     // Cheap guard: skip the regex scan for outputs carrying no image marker.
-    if !output.contains("[IMAGE:") {
+    if !crate::util::has_media_marker(output, MediaMarkerKind::Image) {
         return None;
     }
     for caps in MEDIA_MARKER_RE.captures_iter(output) {

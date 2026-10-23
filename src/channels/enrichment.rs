@@ -320,7 +320,7 @@ async fn handle_image(
     if !is_inbound_attachment(path_obj, staging_dirs).await {
         tracing::warn!(%path, "Image path outside this message's inbound attachments — annotating without copy");
         return ImageAction::Replace {
-            replacement: format!("[Image: {} attached]", file_name_or_path(path)),
+            replacement: format!("[Image attached: {}]", file_name_or_path(path)),
             upload_annotation: None,
             delete_temp: false,
         };
@@ -473,7 +473,7 @@ async fn handle_video(
     processing_bound: Option<u64>,
 ) -> VideoAction {
     if is_http_url(path) {
-        return VideoAction::annotation(format!("[Video: {path}]"));
+        return VideoAction::annotation(format!("[Video link: {path}]"));
     }
     if !path_obj.exists() || !path_obj.is_file() {
         tracing::warn!(%path, "Video file not found for enrichment");
@@ -481,7 +481,7 @@ async fn handle_video(
     }
     if !is_inbound_attachment(path_obj, staging_dirs).await {
         tracing::warn!(%path, "Video path outside this message's inbound attachments — annotating without copy");
-        return VideoAction::annotation(format!("[Video: {} attached]", file_name_or_path(path)));
+        return VideoAction::annotation(format!("[Video attached: {}]", file_name_or_path(path)));
     }
     if let Some(saved) = save_media_to_workspace(path_obj, uploads_dir, "video", "mp4").await {
         // Transcribe the persistent workspace copy — never the temp file
@@ -512,7 +512,7 @@ async fn handle_video(
     // pure intermediate artifact and is cleaned up. `is_inbound_attachment` was
     // verified above, so the delete stays inside the containment boundary.
     VideoAction {
-        replacement: format!("[Video: {} attached]", file_name_or_path(path)),
+        replacement: format!("[Video attached: {}]", file_name_or_path(path)),
         delete_temp: true,
         transcription: None,
     }
@@ -1568,7 +1568,7 @@ mod tests {
         enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         assert!(
-            msg.content.contains("[Image: secret.png attached]"),
+            msg.content.contains("[Image attached: secret.png]"),
             "Out-of-scope path must degrade to a plain-text annotation, got: {}",
             msg.content
         );
@@ -1602,11 +1602,16 @@ mod tests {
         // HTTP URL video reference is preserved as plain text (no marker strip)
         assert!(
             msg.content
-                .contains("[Video: https://example.com/clip.mp4]"),
+                .contains("[Video link: https://example.com/clip.mp4]"),
             "HTTP video URL must be kept as plain-text reference, got: {}",
             msg.content
         );
         assert!(!msg.content.contains("[VIDEO:"));
+        assert!(
+            !crate::util::MEDIA_MARKER_RE.is_match(&msg.content),
+            "the product's own note must not read as a media marker: {}",
+            msg.content
+        );
     }
 
     #[tokio::test]
@@ -1622,7 +1627,7 @@ mod tests {
 
         assert!(
             msg.content.contains(&format!(
-                "[Video: {} attached]",
+                "[Video attached: {}]",
                 tmp_video.file_name().unwrap().to_string_lossy()
             )),
             "Plain video annotation must be present, got: {}",
@@ -1656,7 +1661,7 @@ mod tests {
         enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
         assert!(
-            msg.content.contains("[Video: secret.mp4 attached]"),
+            msg.content.contains("[Video attached: secret.mp4]"),
             "Out-of-scope path must degrade to a plain-text annotation, got: {}",
             msg.content
         );

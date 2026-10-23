@@ -332,8 +332,8 @@ fn test_inline_formatting() {
             input: "**bold `[docs](https://example.com)` tail**",
             expected: "<b>bold `[docs](https://example.com)` tail</b>",
         },
-        // An unattachable media marker is kept verbatim in the outgoing text:
-        // followed by a parenthesised URL it is scaffolding, not a link label.
+        // A media marker is delivery scaffolding, not prose: an anchor labelled
+        // with the marker's own text would fabricate a link out of it.
         Case {
             name: "marker label is not a link",
             input: "[IMAGE:data:image/png;base64,AAAA](https://example.com)",
@@ -394,25 +394,19 @@ fn parse_attachment_markers_tests() {
     std::fs::write(&vid, b"fake-mp4").unwrap();
     let roots = vec![dir.path().to_path_buf()];
 
-    // Placeholder/inexistent targets stay as literal text.
-    let (cleaned, att, _) = parse_attachment_markers(
+    // A bare word naming no file is prose explaining the syntax: the one case
+    // kept exactly as written.
+    let (cleaned, att, refusals) = parse_attachment_markers(
         "use `[IMAGE:path]` or `[VIDEO:...]`",
         &roots,
         TransferLimits::CLOUD,
     );
     assert_eq!(cleaned, "use `[IMAGE:path]` or `[VIDEO:...]`");
     assert!(att.is_empty());
-    // Directory targets are not regular files → prose.
-    let (cleaned, att, _) = parse_attachment_markers(
-        &format!("[IMAGE:{}]", dir.path().display()),
-        &roots,
-        TransferLimits::CLOUD,
-    );
-    assert_eq!(cleaned, format!("[IMAGE:{}]", dir.path().display()));
-    assert!(att.is_empty());
+    assert!(refusals.is_empty());
 
-    // Existing files become attachments.
-    let (cleaned, att, _) = parse_attachment_markers(
+    // Existing files become attachments, carrying the path as written.
+    let (cleaned, att, refusals) = parse_attachment_markers(
         &format!(
             "Here are files [IMAGE:{}] and [AUDIO:{}]",
             png.display(),
@@ -422,38 +416,50 @@ fn parse_attachment_markers_tests() {
         TransferLimits::CLOUD,
     );
     assert_eq!(cleaned, "Here are files  and");
+    assert!(refusals.is_empty());
     assert_eq!(att.len(), 2);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
+    assert_eq!(att[0].target, png.to_string_lossy());
     assert_eq!(att[1].kind, TelegramAttachmentKind::Audio);
+    assert_eq!(att[1].target, ogg.to_string_lossy());
 
-    // http(s) URLs become attachments.
-    let (cleaned, att, _) = parse_attachment_markers(
-        "See [VIDEO:https://example.com/vid.mp4]",
+    // http(s) URLs become attachments: an image by address, a video fetched.
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        "See [VIDEO:https://example.com/vid.mp4] and [IMAGE:https://example.com/a.png]",
         &roots,
         TransferLimits::CLOUD,
     );
-    assert_eq!(cleaned, "See");
-    assert_eq!(att.len(), 1);
+    assert_eq!(cleaned, "See  and");
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 2);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Video);
     assert_eq!(att[0].target, "https://example.com/vid.mp4");
+    assert_eq!(att[1].kind, TelegramAttachmentKind::Image);
+    assert_eq!(att[1].target, "https://example.com/a.png");
 
-    // A bad marker doesn't abort valid ones in the same message.
-    let (cleaned, att, _) = parse_attachment_markers(
-        &format!("[IMAGE:missing.png] ok [VIDEO:{}]", vid.display()),
+    // An image address that is not well-formed to fetch is refused, not sent
+    // and not left as markup.
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        "[IMAGE:https://example.com:bad/x.png]",
         &roots,
         TransferLimits::CLOUD,
     );
-    assert_eq!(cleaned, "[IMAGE:missing.png] ok");
-    assert_eq!(att.len(), 1);
-    assert_eq!(att[0].kind, TelegramAttachmentKind::Video);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"x.png\": it is not a valid address."]
+    );
 
     // Unknown markers kept as text: a marker-shaped word of a kind outside the
     // vocabulary is not a marker at all, so the parser leaves the user's text
     // alone.
-    let (cleaned, att, _) =
+    let (cleaned, att, refusals) =
         parse_attachment_markers("Report [UNKNOWN:/tmp/a.bin]", &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
     assert!(att.is_empty());
+    assert!(refusals.is_empty());
+
     // Case-insensitive matching with a real file.
     let (cleaned, att, _) = parse_attachment_markers(
         &format!("[image:{}]", png.display()),
@@ -465,20 +471,146 @@ fn parse_attachment_markers_tests() {
     assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
 
     // Regression (case-insensitive gate): a lowercase `[image:...]` targeting an
-    // existing NON-raster file must NOT bypass the classifier into the loose
-    // is_file() path — it stays as inert literal text.
+    // existing NON-raster file must not bypass the classifier — it is refused
+    // rather than shown to the user as marker text.
     let nonimg = dir.path().join("note.txt");
     std::fs::write(&nonimg, b"not an image").unwrap();
-    let (cleaned, att, _) = parse_attachment_markers(
+    let (cleaned, att, refusals) = parse_attachment_markers(
         &format!("[image:{}]", nonimg.display()),
         &roots,
         TransferLimits::CLOUD,
     );
-    assert_eq!(cleaned, format!("[image:{}]", nonimg.display()));
-    assert!(
-        att.is_empty(),
-        "non-raster lowercase image marker must stay literal"
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty(), "a non-raster image marker must not attach");
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"note.txt\": it is not an image."]
     );
+}
+
+/// A relative media target names a file in the workspace the message belongs
+/// to, exactly as `[FILE:...]` does: it is attached from the resolved ABSOLUTE
+/// path, resolved against the first root that has it.
+#[test]
+fn a_relative_media_marker_resolves_against_the_messages_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let generated = dir.path().join("generated");
+    std::fs::create_dir(&generated).unwrap();
+    let png = generated.join("a.png");
+    let ogg = dir.path().join("voice.ogg");
+    let vid = dir.path().join("clip.mp4");
+    write_test_png(&png);
+    std::fs::write(&ogg, b"fake-ogg").unwrap();
+    std::fs::write(&vid, b"fake-mp4").unwrap();
+    let roots = vec![dir.path().to_path_buf()];
+
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        "[IMAGE:generated/a.png] [AUDIO:voice.ogg] [VIDEO:clip.mp4]",
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert_eq!(cleaned, "");
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 3);
+    assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
+    assert_eq!(att[0].target, png.to_string_lossy());
+    assert_eq!(att[1].kind, TelegramAttachmentKind::Audio);
+    assert_eq!(att[1].target, ogg.to_string_lossy());
+    assert_eq!(att[2].kind, TelegramAttachmentKind::Video);
+    assert_eq!(att[2].target, vid.to_string_lossy());
+
+    // Relayed content names a file in the originating workspace: the root that
+    // has it wins, as `[FILE:...]` already resolves.
+    let relayed = other.path().join("relayed.png");
+    write_test_png(&relayed);
+    let (_, att, refusals) = parse_attachment_markers(
+        "[IMAGE:relayed.png]",
+        &[dir.path().to_path_buf(), other.path().to_path_buf()],
+        TransferLimits::CLOUD,
+    );
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1);
+    assert_eq!(att[0].target, relayed.to_string_lossy());
+}
+
+/// A target that cannot be delivered never reaches the user as raw marker text:
+/// it leaves a short refusal naming what could not be sent.
+#[test]
+fn an_undeliverable_marker_becomes_a_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let roots = vec![dir.path().to_path_buf()];
+    let pictures = dir.path().join("pictures");
+    std::fs::create_dir(&pictures).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), b"not an image").unwrap();
+
+    // A relative image no root holds: refused by name, with the marker gone.
+    let (cleaned, att, refusals) =
+        parse_attachment_markers("[IMAGE:missing/a.png]", &roots, TransferLimits::CLOUD);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(refusals, vec!["Could not send \"a.png\": file not found."]);
+
+    // A directory target is refused as what it is.
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        &format!("[IMAGE:{}]", pictures.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"pictures\": it is a directory."]
+    );
+
+    // An existing file that is not a raster cannot be sent as a picture.
+    let (cleaned, att, refusals) =
+        parse_attachment_markers("[IMAGE:notes.txt]", &roots, TransferLimits::CLOUD);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"notes.txt\": it is not an image."]
+    );
+
+    // An inline payload has no file name worth quoting: the refusal names the
+    // kind and never echoes the payload.
+    let blob = format!("[IMAGE:data:image/png;base64,{}]", "A".repeat(500));
+    let (cleaned, att, refusals) = parse_attachment_markers(&blob, &roots, TransferLimits::CLOUD);
+    assert_eq!(cleaned, "");
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"image\": it carries an inline payload, not a file."]
+    );
+}
+
+/// One refused marker does not stop the others in the same message: every valid
+/// target is attached and only the failing one leaves a notice, in body order.
+#[test]
+fn one_refused_marker_does_not_cost_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let generated = dir.path().join("generated");
+    std::fs::create_dir(&generated).unwrap();
+    let png = generated.join("a.png");
+    let vid = dir.path().join("clip.mp4");
+    write_test_png(&png);
+    std::fs::write(&vid, b"fake-mp4").unwrap();
+
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        &format!(
+            "Two of three [IMAGE:generated/a.png] ok [IMAGE:missing/a.png] [VIDEO:{}]",
+            vid.display()
+        ),
+        &[dir.path().to_path_buf()],
+        TransferLimits::CLOUD,
+    );
+    assert_eq!(cleaned, "Two of three  ok");
+    assert_eq!(att.len(), 2);
+    assert_eq!(att[0].target, png.to_string_lossy());
+    assert_eq!(att[1].kind, TelegramAttachmentKind::Video);
+    assert_eq!(refusals, vec!["Could not send \"a.png\": file not found."]);
 }
 
 /// `[FILE:...]` is the one local-only kind: it resolves against the
@@ -578,10 +710,11 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     assert!(att.is_empty());
     assert_eq!(
         refusals,
-        vec!["Could not send \"y.pdf\": FILE targets are local files, not URLs."]
+        vec!["Could not send \"y.pdf\": an address is not a local file."]
     );
 
-    // No roots → no file delivery at all (the plain-text/mirror sends).
+    // No roots → no workspace to authorize a local file (the plain-text/mirror
+    // sends).
     let (cleaned, att, refusals) = parse_attachment_markers(
         &format!("[FILE:{}]", pdf.display()),
         &[],
@@ -591,21 +724,18 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     assert!(att.is_empty());
     assert_eq!(
         refusals,
-        vec!["Could not send \"specs.pdf\": no workspace is available for file delivery."]
+        vec!["Could not send \"specs.pdf\": the message's workspace is unknown."]
     );
 
-    // A malformed marker's notice names a bounded prefix of the target rather
-    // than echoing a whole inline payload back at the user.
+    // An inline payload is not a file to hand over, and the notice never echoes
+    // it back at the user.
     let blob = format!("[FILE:data:application/pdf;base64,{}]", "A".repeat(500));
     let (cleaned, att, refusals) = parse_attachment_markers(&blob, &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
-    assert_eq!(refusals.len(), 1);
-    assert!(refusals[0].ends_with("file not found."), "{refusals:?}");
-    assert!(
-        refusals[0].len() < 200,
-        "the notice must not echo the whole payload: {} bytes",
-        refusals[0].len()
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"file\": it carries an inline payload, not a file."]
     );
 }
 
@@ -906,10 +1036,10 @@ async fn a_declared_length_over_the_ceiling_is_refused_before_writing() {
     assert_eq!(tokio::fs::read(&exact).await.unwrap(), b"twelve bytes");
 }
 
-/// A video address whose bytes cannot be had leaves the reply with the address
-/// as a link rather than losing it.
+/// A video address whose bytes cannot be had is reported, never pasted into the
+/// reply as a bare link: the user reads why, and nothing is uploaded.
 #[tokio::test]
-async fn an_unfetchable_video_address_still_reaches_the_user_as_a_link() {
+async fn an_unfetchable_video_address_is_reported_not_pasted_as_a_link() {
     crate::users::test_util::init_test_store().await;
     let fake = FakeTelegram::start(&[("token-a", 700)]);
     let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
@@ -924,10 +1054,14 @@ async fn an_unfetchable_video_address_still_reaches_the_user_as_a_link() {
             file_roots: Vec::new(),
         })
         .await
-        .expect("the address is delivered as a link");
+        .expect_err("a failed delivery is reported to the caller");
 
     assert_eq!(fake.count("sendDocument"), 0);
-    assert_eq!(fake.sent_texts(), vec![format!("Video: {address}")]);
+    // The body is rendered as Telegram HTML, so the quotes arrive escaped.
+    assert_eq!(
+        fake.sent_texts(),
+        vec!["Could not send &quot;clip.mp4&quot;: it could not be fetched or sent."]
+    );
 }
 
 #[test]
@@ -1120,8 +1254,17 @@ fn attachment_rejection_content_shapes() {
     );
     assert_eq!(
         attachment_rejection_content(None, NOT_RECEIVED, &reason, None),
-        format!("[File: not received — {reason}]")
+        format!("[File not received — {reason}]")
     );
+    for note in [
+        attachment_rejection_content(Some("report.pdf"), NOT_RECEIVED, &reason, None),
+        attachment_rejection_content(None, NOT_RECEIVED, &reason, None),
+    ] {
+        assert!(
+            !crate::util::MEDIA_MARKER_RE.is_match(&note),
+            "a rejection note must not read as a media marker: {note}"
+        );
+    }
 }
 
 #[tokio::test]

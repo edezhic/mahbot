@@ -258,6 +258,9 @@ pub(crate) struct SessionsState {
     /// Per-entry parsed bodies, parallel to `entries` (parsed from the
     /// ledger via `session_view::parse_entry_bodies`).
     entry_md: Vec<Option<ParsedBody>>,
+    /// The root this transcript's relative marker targets resolve against: the
+    /// selected session's workspace, resolved when its messages load.
+    workspace_root: Option<PathBuf>,
     /// For each entry, the index of the stored `sessions` row it was built from
     /// (see `session_view::build_ledger_with_sources`). `None` while the ledger
     /// has no stored-row identity: before the first stored load, and after any
@@ -312,6 +315,7 @@ impl SessionsState {
             selected_session: None,
             entries: Vec::new(),
             entry_md: Vec::new(),
+            workspace_root: None,
             entry_rows: None,
             selected_loading: false,
             selected_error: None,
@@ -346,12 +350,25 @@ impl SessionsState {
         clippy::too_many_lines,
         reason = "one arm per transcript interaction; the per-session selection bookkeeping is only readable inline"
     )]
-    pub(crate) fn update(&mut self, msg: SessionsMessage) -> Task<SessionsMessage> {
+    pub(crate) fn update(
+        &mut self,
+        msg: SessionsMessage,
+        workspaces: &HashMap<String, Workspace>,
+    ) -> Task<SessionsMessage> {
         match msg {
             SessionsMessage::Refreshed(sessions) => {
                 self.sessions = sessions;
                 // A fresh full read supersedes any in-flight membership probe.
                 self.membership_load_in_flight = false;
+                // The selected session's workspace may only be named now: adopt
+                // it so its relative marker targets resolve, and re-parse the
+                // bodies already loaded.
+                if self.adopt_workspace_root(workspaces) {
+                    self.entry_md = session_view::parse_entry_bodies(
+                        &self.entries,
+                        self.workspace_root.as_deref(),
+                    );
+                }
                 self.rebuild_session_cache();
                 self.load_state.clear_error();
                 self.load_state.finish_loading();
@@ -394,7 +411,11 @@ impl SessionsState {
                     let (entries, rows) = session_view::build_ledger_with_sources(&messages);
                     self.entries = entries;
                     self.entry_rows = Some(rows);
-                    self.entry_md = session_view::parse_entry_bodies(&self.entries);
+                    self.adopt_workspace_root(workspaces);
+                    self.entry_md = session_view::parse_entry_bodies(
+                        &self.entries,
+                        self.workspace_root.as_deref(),
+                    );
                     // Fresh session load: reset the measurement cache (the
                     // previous session's keys are index-stale) and any pending
                     // collapse from the old ledger.
@@ -533,7 +554,7 @@ impl SessionsState {
                 }
                 Task::none()
             }
-            SessionsMessage::RuntimeChanged => self.on_runtime_changed(),
+            SessionsMessage::RuntimeChanged => self.on_runtime_changed(workspaces),
             SessionsMessage::LiveSessionsRead(result) => {
                 self.membership_load_in_flight = false;
                 match result {
@@ -588,6 +609,7 @@ impl SessionsState {
         self.entries.clear();
         self.entry_md.clear();
         self.entry_rows = None;
+        self.workspace_root = None;
         self.selected_loading = false;
         self.selected_error = None;
         self.expanded.clear();
@@ -637,10 +659,13 @@ impl SessionsState {
     /// Coalesced runtime-change tick: refresh the cached relative-time labels,
     /// add sessions whose agent started working since the page was opened, and
     /// merge the selected session's live transcript into the view.
-    fn on_runtime_changed(&mut self) -> Task<SessionsMessage> {
+    fn on_runtime_changed(
+        &mut self,
+        workspaces: &HashMap<String, Workspace>,
+    ) -> Task<SessionsMessage> {
         self.rebuild_session_cache();
         Task::batch([
-            self.merge_selected_transcript(),
+            self.merge_selected_transcript(workspaces),
             self.refresh_live_membership(),
         ])
     }
@@ -696,6 +721,30 @@ impl SessionsState {
         self.rebuild_session_cache();
     }
 
+    /// The root the selected session's relative marker targets resolve against:
+    /// its workspace, by stored name. `None` while no session is selected or
+    /// when its workspace row is gone and the name is not a path of its own.
+    fn selected_workspace_root(&self, workspaces: &HashMap<String, Workspace>) -> Option<PathBuf> {
+        self.selected_session
+            .as_deref()
+            .and_then(|key| self.sessions.iter().find(|session| session.agent_id == key))
+            .and_then(|session| session.workspace_name.as_deref())
+            .and_then(|name| workspace_root_for(name, workspaces))
+    }
+
+    /// Adopt the selected session's workspace root: `true` when it changed, in
+    /// which case the bodies and measurements made under the old root must be
+    /// rebuilt by the caller.
+    fn adopt_workspace_root(&mut self, workspaces: &HashMap<String, Workspace>) -> bool {
+        let root = self.selected_workspace_root(workspaces);
+        if root == self.workspace_root {
+            return false;
+        }
+        self.workspace_root = root;
+        self.measure_cache.borrow_mut().clear();
+        true
+    }
+
     /// Merge the selected session's live transcript into the view while its
     /// agent is running.
     ///
@@ -709,7 +758,10 @@ impl SessionsState {
     /// running check — `None` when the agent is not running; a recycled agent
     /// id surfaces the new run's fresh (empty) holder, replacing the displayed
     /// transcript wholesale.
-    fn merge_selected_transcript(&mut self) -> Task<SessionsMessage> {
+    fn merge_selected_transcript(
+        &mut self,
+        workspaces: &HashMap<String, Workspace>,
+    ) -> Task<SessionsMessage> {
         let Some(ref key) = self.selected_session else {
             return Task::none();
         };
@@ -720,7 +772,14 @@ impl SessionsState {
             return Task::none();
         };
         let live = session_view::build_ledger(&snapshot.history);
-        let common = common_entry_prefix(&self.entries, &live);
+        // A workspace resolved after the first load re-parses the whole ledger
+        // and re-measures every bubble under it.
+        let root_changed = self.adopt_workspace_root(workspaces);
+        let common = if root_changed {
+            0
+        } else {
+            common_entry_prefix(&self.entries, &live)
+        };
         if common == self.entries.len() && common == live.len() {
             return Task::none();
         }
@@ -732,8 +791,10 @@ impl SessionsState {
         // stored-row identity (see `entry_rows`).
         self.entry_rows = None;
         self.entry_md.truncate(common);
-        self.entry_md
-            .extend(session_view::parse_entry_bodies(&self.entries[common..]));
+        self.entry_md.extend(session_view::parse_entry_bodies(
+            &self.entries[common..],
+            self.workspace_root.as_deref(),
+        ));
 
         // Live updates only auto-scroll when the user was already following
         // the bottom (same rule as the fresh-load path).
@@ -880,12 +941,7 @@ impl SessionsState {
             // Transcript on the right side. Wrapped in `responsive` so the
             // collapse measurement uses the real bubble body width, correct on
             // first render and after every window resize.
-            let workspace_root = self
-                .selected_session
-                .as_deref()
-                .and_then(|key| self.sessions.iter().find(|session| session.agent_id == key))
-                .and_then(|session| session.workspace_name.as_deref())
-                .and_then(|name| workspace_root_for(name, workspaces));
+            let workspace_root = self.workspace_root.clone();
             let transcript: iced::Element<'_, SessionsMessage> = if self.selected_loading {
                 iced::widget::container(widgets::loading_text())
                     .width(Length::Fill)
@@ -1056,6 +1112,7 @@ fn element_measurement(
     need_preview: bool,
     content: &str,
     font_size: f32,
+    markers: &media_markers::MarkerContext<'_>,
 ) -> (u32, Option<String>) {
     let bucket = width_bucket(text_width);
     let content_len = content.len();
@@ -1076,7 +1133,7 @@ fn element_measurement(
             {
                 re_measure(m, text_width)
             }
-            _ => measure_message(content, text_width, content_len, font_size),
+            _ => measure_message(content, markers, text_width, content_len, font_size),
         };
         cache.insert(key, m);
     }
@@ -1140,6 +1197,18 @@ fn click_toggle(
     }
 }
 
+/// The marker context a transcript body resolves under: its session workspace,
+/// and whether an undeliverable marker becomes a refusal.
+fn marker_context<'a>(
+    ctx: &'a TranscriptCtx<'_>,
+    refusals: bool,
+) -> media_markers::MarkerContext<'a> {
+    media_markers::MarkerContext {
+        workspace: ctx.workspace_root.as_deref(),
+        refusals,
+    }
+}
+
 /// Shared collapse-state preamble for the transcript's collapsible elements:
 /// returns `(is_expanded, collapses, preview)` — whether the user expanded the
 /// element, whether it renders more than [`MAX_PREVIEW_LINES`] wrapped lines
@@ -1150,6 +1219,7 @@ fn collapse_state(
     key: (usize, usize),
     content: &str,
     font_size: f32,
+    refusals: bool,
 ) -> (bool, bool, Option<String>) {
     let is_expanded = ctx.expanded.contains(&key);
     let (wrapped_lines, preview) = element_measurement(
@@ -1159,6 +1229,7 @@ fn collapse_state(
         !is_expanded,
         content,
         font_size,
+        &marker_context(ctx, refusals),
     );
     (is_expanded, wrapped_lines > MAX_PREVIEW_LINES, preview)
 }
@@ -1177,7 +1248,7 @@ fn plain_collapsible<'a>(
     color: iced::Color,
 ) -> Element<'a, SessionsMessage> {
     let (is_expanded, collapses, preview) =
-        collapse_state(ctx, key, content, theme::MARKDOWN_TEXT_SIZE);
+        collapse_state(ctx, key, content, theme::MARKDOWN_TEXT_SIZE, false);
     let el = collapsible_text_block(
         collapses,
         is_expanded,
@@ -1200,7 +1271,7 @@ fn thinking_block<'a>(
     content: &'a str,
 ) -> Element<'a, SessionsMessage> {
     let (is_expanded, collapses, preview) =
-        collapse_state(ctx, key, content, theme::MARKDOWN_TEXT_SIZE);
+        collapse_state(ctx, key, content, theme::MARKDOWN_TEXT_SIZE, false);
     let header = row![
         lucide::brain::<iced::Theme, iced::Renderer>()
             .size(theme::TEXT_11)
@@ -1230,8 +1301,8 @@ fn thinking_block<'a>(
 /// element shows a plain clickable preview; an expanded (or short) element
 /// shows the markdown body parsed from `md`. `content` is the plain text used
 /// for the collapse measurement (at the bubble body width); `md` is the parsed
-/// body (markdown items and file markers) for the expanded view. Narration
-/// bodies render italic at
+/// body (markdown items, file markers and whether its markers became refusals)
+/// for the expanded view. Narration bodies render italic at
 /// [`theme::NARRATION_TEXT_SIZE`]; user/assistant bodies stay at
 /// [`theme::MARKDOWN_TEXT_SIZE`] regular.
 fn body_block<'a>(
@@ -1246,7 +1317,10 @@ fn body_block<'a>(
     } else {
         theme::MARKDOWN_TEXT_SIZE
     };
-    let (is_expanded, collapses, preview) = collapse_state(ctx, key, content, size);
+    // The refusal rule is a property of the parsed body, so the measurement of
+    // a body always resolves under the context it was parsed with.
+    let refusals = md.is_some_and(|parsed| parsed.refusals);
+    let (is_expanded, collapses, preview) = collapse_state(ctx, key, content, size, refusals);
     let font = if is_narration {
         theme::FONT_ITALIC
     } else {
@@ -1340,6 +1414,7 @@ fn render_tool_round<'a>(
                 false,
                 result,
                 theme::MARKDOWN_TEXT_SIZE,
+                &marker_context(ctx, false),
             );
             wrapped_lines > MAX_PREVIEW_LINES
         });
@@ -1558,6 +1633,63 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_named_after_the_load_reparses_the_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let photo = tmp.path().join("generated/poster.png");
+        std::fs::create_dir_all(photo.parent().unwrap()).unwrap();
+        std::fs::write(&photo, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
+
+        // Loaded before the workspace could be named: with no root the relative
+        // picture is refused rather than drawn.
+        let mut state = SessionsState::new();
+        state.selected_session = Some("s1".to_string());
+        state.entries = vec![msg(
+            ChatRole::Assistant,
+            Some("[IMAGE:generated/poster.png]"),
+        )];
+        state.entry_md = session_view::parse_entry_bodies(&state.entries, None);
+        assert_eq!(state.workspace_root, None);
+        assert!(
+            state.entry_md[0]
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .all(|item| !matches!(item, iced::widget::markdown::Item::Image { .. }))
+        );
+
+        // The workspace list arrives later: the already-loaded ledger is
+        // re-parsed under the root, so the picture now renders.
+        let workspaces = HashMap::from([(
+            "ws".to_string(),
+            Workspace {
+                name: "ws".to_string(),
+                path: tmp.path().to_string_lossy().into_owned(),
+                ..Workspace::default()
+            },
+        )]);
+        state.sessions = vec![metadata("s1")];
+        let sessions = state.sessions.clone();
+        let _ = state.update(SessionsMessage::Refreshed(sessions), &workspaces);
+
+        assert_eq!(state.workspace_root.as_deref(), Some(tmp.path()));
+        let parsed = state.entry_md[0].as_ref().unwrap();
+        assert!(
+            parsed.refusals,
+            "an assistant body is the product's own reply"
+        );
+        let expected = photo.to_string_lossy().into_owned();
+        assert!(
+            parsed.items.iter().any(|item| matches!(
+                item,
+                iced::widget::markdown::Item::Image { url, .. } if url.as_str() == expected
+            )),
+            "the reassembled body must draw the picture: {:?}",
+            parsed.items
+        );
+    }
+
+    #[test]
     fn common_entry_prefix_empty_vs_empty() {
         assert_eq!(common_entry_prefix(&[], &[]), 0);
     }
@@ -1607,10 +1739,13 @@ mod tests {
         state.selected_session = Some("s1".to_string());
         state.selected_loading = true;
 
-        let _ = state.update(SessionsMessage::SessionError {
-            key: "s1".to_string(),
-            error: "read failed".to_string(),
-        });
+        let _ = state.update(
+            SessionsMessage::SessionError {
+                key: "s1".to_string(),
+                error: "read failed".to_string(),
+            },
+            &HashMap::new(),
+        );
 
         assert_eq!(state.selected_error.as_deref(), Some("read failed"));
         assert!(!state.selected_loading);
@@ -1622,10 +1757,13 @@ mod tests {
         // An error for a session the user has since left is ignored.
         state.selected_error = None;
         state.selected_loading = true;
-        let _ = state.update(SessionsMessage::SessionError {
-            key: "s2".to_string(),
-            error: "stale failure".to_string(),
-        });
+        let _ = state.update(
+            SessionsMessage::SessionError {
+                key: "s2".to_string(),
+                error: "stale failure".to_string(),
+            },
+            &HashMap::new(),
+        );
         assert!(state.selected_error.is_none());
         assert!(state.selected_loading);
     }
@@ -1637,7 +1775,10 @@ mod tests {
         state.selected_error = Some("old failure".to_string());
         state.selected_loading = true;
 
-        let _ = state.update(SessionsMessage::SessionMessages("s1".to_string(), vec![]));
+        let _ = state.update(
+            SessionsMessage::SessionMessages("s1".to_string(), vec![]),
+            &HashMap::new(),
+        );
 
         assert!(state.selected_error.is_none());
         assert!(!state.selected_loading);

@@ -4,7 +4,7 @@
 
 use crate::Role;
 use crate::util::html::decode_html_entities;
-use crate::util::{MediaMarkerKind, TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
+use crate::util::{MEDIA_MARKER_RE, MediaMarkerKind, parse_media_marker};
 use regex::Captures;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +29,7 @@ pub struct ReplyReference {
 /// 3. Remove all `<` / `>` characters.
 /// 4. Collapse `\r\n` and `\n` to single spaces (other whitespace untouched).
 /// 5. Map media markers inline (IMAGE→`[Photo]`, AUDIO→`[Voice message]`,
-///    VIDEO→`[Video]`, FILE→`[File]`) via [`TELEGRAM_MEDIA_MARKER_RE`].
+///    VIDEO→`[Video]`, FILE→`[File]`) via [`MEDIA_MARKER_RE`].
 /// 6. Cap at [`REPLY_SNIPPET_MAX_CHARS`] — the ellipsis counts inside the cap,
 ///    and whitespace at the cut is trimmed (a shared-helper consequence: a cut
 ///    landing in a run of spaces drops that run).
@@ -63,7 +63,7 @@ pub fn normalize_reply_text(raw: &str) -> String {
     text = text.replace("\r\n", " ").replace('\n', " ");
 
     // 5. Map media markers inline, preserving surrounding text.
-    text = TELEGRAM_MEDIA_MARKER_RE
+    text = MEDIA_MARKER_RE
         .replace_all(&text, |caps: &Captures| match parse_media_marker(caps).0 {
             MediaMarkerKind::Image => "[Photo]",
             MediaMarkerKind::Audio => "[Voice message]",

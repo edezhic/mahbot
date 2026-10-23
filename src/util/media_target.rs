@@ -1,23 +1,34 @@
-//! Shared classifier for `[IMAGE:...]` media-marker targets.
+//! Shared semantics for `[KIND:…]` media-marker targets.
+//!
+//! [`resolve_marker_target`] is the single authority on what a target names,
+//! used by both delivery surfaces: an http(s) address, an inline payload, a
+//! bare word of prose, or a local path — a relative one resolved against the
+//! workspace the message belongs to, exactly as `[FILE:…]` targets are. It
+//! performs no containment: only `[FILE:…]` is workspace-confined, and the
+//! other kinds deliberately accept any location on disk. What a placed target
+//! becomes is also decided here — [`local_refusal`], [`remote_marker`] and
+//! [`inline_marker_refusal`] are the gates both surfaces ask — and a target that
+//! cannot be delivered is reported with [`marker_refusal`], whose wording and
+//! reasons are shared so a refused picture reads the same in the desktop chat
+//! and in Telegram.
 //!
 //! Consumers that must decide whether a target is a "real image" use
 //! [`classify_media_image_target`] (Telegram and enrichment, which offload the
-//! blocking local-file decode off the async path); an invalid target stays inert
-//! literal text. Two consumers deliberately do NOT route through it: the GUI
-//! render path (a classifier decode would run on the render thread —
-//! `replace_media_markers` uses a cheap O(1) structural gate and the viewer
-//! decodes boundedly / downscales itself) and the provider's agent-context
-//! scanner (`compatible.rs`, which must never read a local file during request
-//! serialization and calls [`is_native_data_uri`] directly). No
-//! workspace-boundary containment — a valid raster anywhere on disk is valid.
-//! Local files are validated by a real raster decode (memoized per canonical
-//! path + mtime); remote URLs by well-formedness. A `data:...` URI is NOT
-//! classified here — it is an inline payload validated by its own
-//! [`is_native_data_uri`] gate, which only the provider uses directly; other
-//! consumers route through the classifier, which rejects a `data:` target
-//! cheaply before any decode.
+//! blocking local-file decode off the async path). Two consumers deliberately
+//! do NOT route a decode through it: the GUI render path (a full decode would
+//! run on the render thread — the preprocessor asks [`local_refusal`], which for
+//! an image is metadata and a head read, and the viewer does the bounded decode
+//! itself) and the provider's agent-context scanner (`compatible.rs`, which must
+//! never read a local file during request serialization and calls
+//! [`is_native_data_uri`] directly). No workspace-boundary containment — a valid
+//! raster anywhere on disk is valid. Local files are validated by a real raster
+//! decode (memoized per canonical path + mtime); remote URLs by
+//! well-formedness. A `data:...` URI is NOT classified here — it is an inline
+//! payload validated by its own [`is_native_data_uri`] gate, which only the
+//! provider uses directly; other consumers route through the classifier, which
+//! rejects a `data:` target cheaply before any decode.
 
-use crate::util::UnwrapPoison;
+use crate::util::{MediaMarkerKind, UnwrapPoison};
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
@@ -40,8 +51,9 @@ pub(crate) enum MediaTarget {
     LocalImage,
     /// Well-formed http(s) URL for an image reference.
     RemoteUrl,
-    /// Anything else — the marker stays as inert literal text. (A `data:...`
-    /// URI is NOT classified here: it is an inline payload validated by
+    /// Anything else — not deliverable as an image reference, so a consumer that
+    /// shows the marker to the user refuses it instead. (A `data:...` URI is NOT
+    /// classified here: it is an inline payload validated by
     /// [`is_native_data_uri`], which the provider uses directly.)
     Invalid,
 }
@@ -95,12 +107,234 @@ pub(crate) fn classify_media_image_target(target: &str) -> MediaTarget {
     }
 }
 
+/// Where a `[KIND:…]` marker target points after workspace-relative resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MarkerTarget {
+    /// A bare word naming no file — `[IMAGE:path]`, the form prose uses to
+    /// explain the syntax. Kept as the author wrote it.
+    NotAReference,
+    /// An inline `data:` payload, or the placeholder left where one was
+    /// stripped: a value, not a location.
+    Inline,
+    /// An http(s) address.
+    Remote,
+    /// A local path: an absolute target as written, a relative one joined to
+    /// the workspace root that has it (the first root when none does).
+    Local(PathBuf),
+}
+
+/// Resolve a marker target against the workspace roots of the message it
+/// belongs to: `https://…` is an address, `data:…` an inline payload, a bare
+/// word of prose is not a reference, and any other target is a local path.
+///
+/// A relative path names a file in the workspace the message belongs to — the
+/// first root that actually has it (relayed content names a file in the
+/// originating workspace, which is the second root), exactly as a `[FILE:…]`
+/// target resolves. Existence decides whether a bare word is a reference, so
+/// `[FILE:Makefile]` delivers the workspace's file; only a target that names
+/// nothing anywhere stays prose. Without a root the path stays relative, which
+/// [`local_target_refusal`] reports as an unknown workspace.
+#[must_use]
+pub(crate) fn resolve_marker_target(target: &str, roots: &[PathBuf]) -> MarkerTarget {
+    let target = target.trim();
+    // The stripped-payload placeholder is a data URI's stand-in: still a value,
+    // never a path or an address.
+    if target.starts_with("data:") || target.starts_with(crate::util::DATA_URI_OMITTED_PREFIX) {
+        return MarkerTarget::Inline;
+    }
+    if crate::util::is_http_url(target) {
+        return MarkerTarget::Remote;
+    }
+    let raw = Path::new(target);
+    if raw.is_absolute() {
+        return MarkerTarget::Local(raw.to_path_buf());
+    }
+    if let Some(joined) = roots
+        .iter()
+        .map(|root| root.join(raw))
+        .find(|candidate| candidate.exists())
+    {
+        return MarkerTarget::Local(joined);
+    }
+    if !names_a_reference(target) {
+        return MarkerTarget::NotAReference;
+    }
+    MarkerTarget::Local(
+        roots
+            .first()
+            .map_or_else(|| raw.to_path_buf(), |root| root.join(raw)),
+    )
+}
+
+/// True when a target names something rather than being a bare word: it has a
+/// path separator, or its last segment carries an extension (`photo.png`). Only
+/// `[IMAGE:path]`-shaped prose — a bare word, no separator, no extension, and no
+/// workspace file of that name (see [`resolve_marker_target`]) — does not.
+fn names_a_reference(target: &str) -> bool {
+    target.contains('/')
+        || target.contains('\\')
+        || target
+            .rsplit_once('.')
+            .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+}
+
+/// What an http(s) address becomes for a marker of `kind`.
+pub(crate) enum RemoteMarker {
+    /// The address is the whole target; the surface renders its own form of it.
+    Deliverable,
+    /// The address is not a supported target for this kind: the notice a user
+    /// reads instead.
+    Refused(String),
+}
+
+/// Judge an http(s) address for `kind`: a `[FILE:…]` address is never a local
+/// file, and an `[IMAGE:…]` address must be well-formed. This one mapping
+/// governs both surfaces, so neither states the rule itself.
+#[must_use]
+pub(crate) fn remote_marker(kind: MediaMarkerKind, target: &str) -> RemoteMarker {
+    let reason = match kind {
+        MediaMarkerKind::File => FILE_URL_REASON,
+        MediaMarkerKind::Image if !is_valid_remote_url(target) => INVALID_ADDRESS_REASON,
+        MediaMarkerKind::Image | MediaMarkerKind::Audio | MediaMarkerKind::Video => {
+            return RemoteMarker::Deliverable;
+        }
+    };
+    RemoteMarker::Refused(marker_refusal_for(target, reason))
+}
+
+/// The notice for a marker whose target is a value rather than a location: an
+/// inline payload cannot be attached as the kind it claims.
+#[must_use]
+pub(crate) fn inline_marker_refusal(kind: MediaMarkerKind) -> String {
+    marker_refusal(&kind.noun(), INLINE_PAYLOAD_REASON)
+}
+
+/// Why a resolved local target cannot be delivered as `kind`, or `None` when it
+/// can: an image must carry a native raster signature, any other kind only needs
+/// to name an existing regular file. Telegram runs its authoritative image
+/// decode after this; the desktop cannot, because a decode on the render thread
+/// is not worth a frame.
+#[must_use]
+pub(crate) fn local_refusal(kind: MediaMarkerKind, path: &Path) -> Option<&'static str> {
+    if kind == MediaMarkerKind::Image {
+        image_target_refusal(path)
+    } else {
+        local_target_refusal(path)
+    }
+}
+
+/// Why a resolved local target cannot be handed over, or `None` when it is an
+/// existing regular file. A path still relative names a file in a workspace the
+/// message has none of; an unreadable one is reported as unreadable, not missing.
+#[must_use]
+fn local_target_refusal(path: &Path) -> Option<&'static str> {
+    if path.is_relative() {
+        return Some(NO_WORKSPACE_REASON);
+    }
+    match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(FILE_NOT_FOUND_REASON),
+        Err(_) => Some(UNREADABLE_REASON),
+        Ok(metadata) if metadata.is_dir() => Some(DIRECTORY_REASON),
+        Ok(metadata) if !metadata.is_file() => Some(NOT_A_FILE_REASON),
+        Ok(_) => None,
+    }
+}
+
+/// Why a local image target cannot be delivered, or `None` when it is a regular
+/// file within the shared input cap whose head carries a native raster
+/// signature. Metadata plus a bounded head read — no decode — so the desktop can
+/// ask this on the render thread. Telegram runs the authoritative decode
+/// ([`classify_media_image_target`]) after it, so a corrupt raster that passes
+/// the signature is refused there as `it is not an image.`, while the desktop
+/// shows the viewer's placeholder; that divergence is deliberate and must not be
+/// "fixed" with a decode on the render thread.
+#[must_use]
+fn image_target_refusal(path: &Path) -> Option<&'static str> {
+    use std::io::Read as _;
+    if let Some(reason) = local_target_refusal(path) {
+        return Some(reason);
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Some(UNREADABLE_REASON);
+    };
+    let Ok(metadata) = file.metadata() else {
+        return Some(UNREADABLE_REASON);
+    };
+    if metadata.len() > crate::util::INBOUND_IMAGE_MAX_INPUT_BYTES {
+        return Some(TOO_LARGE_REASON);
+    }
+    let mut head = [0_u8; 16];
+    let Ok(read) = file.read(&mut head) else {
+        return Some(UNREADABLE_REASON);
+    };
+    if matches!(
+        image::guess_format(&head[..read]),
+        Ok(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP)
+    ) {
+        None
+    } else {
+        Some(NOT_AN_IMAGE_REASON)
+    }
+}
+
+/// Why a marker could not be delivered. Every surface quotes the same reasons,
+/// so a refusal reads identically in the desktop chat and in Telegram.
+pub(crate) const FILE_NOT_FOUND_REASON: &str = "file not found.";
+pub(crate) const DIRECTORY_REASON: &str = "it is a directory.";
+pub(crate) const NO_WORKSPACE_REASON: &str = "the message's workspace is unknown.";
+pub(crate) const UNREADABLE_REASON: &str = "it could not be read.";
+pub(crate) const INLINE_PAYLOAD_REASON: &str = "it carries an inline payload, not a file.";
+pub(crate) const NOT_AN_IMAGE_REASON: &str = "it is not an image.";
+pub(crate) const NOT_A_FILE_REASON: &str = "it is not a regular file.";
+pub(crate) const TOO_LARGE_REASON: &str = "it is too large to send.";
+pub(crate) const INVALID_ADDRESS_REASON: &str = "it is not a valid address.";
+pub(crate) const FILE_URL_REASON: &str = "an address is not a local file.";
+
+/// The name a refusal quotes: the target's last path component, bounded so a
+/// malformed marker cannot dump an arbitrary blob into the chat.
+#[must_use]
+pub(crate) fn marker_name(target: &str) -> String {
+    crate::util::truncate(
+        crate::util::file_name_or_path(without_credentials(target).as_ref()),
+        60,
+    )
+}
+
+/// `target` without what can carry credentials but names nothing: an address's
+/// query, fragment and authority userinfo. Only an address has any of them — a
+/// local path keeps its own `#` and `?`, which its name may legitimately carry.
+fn without_credentials(target: &str) -> Cow<'_, str> {
+    let Some((scheme, rest)) = target.split_once("://") else {
+        return Cow::Borrowed(target);
+    };
+    let without_value = rest.split(['?', '#']).next().unwrap_or(rest);
+    let (authority, path) = without_value.split_once('/').unwrap_or((without_value, ""));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    Cow::Owned(format!("{scheme}://{host}/{path}"))
+}
+
+/// The notice a user reads where an undeliverable marker was: a marker is never
+/// shown to the user as markup — either the thing arrives, or this says why it
+/// did not.
+#[must_use]
+pub(crate) fn marker_refusal(name: &str, reason: &str) -> String {
+    format!("Could not send \"{name}\": {reason}")
+}
+
+/// [`marker_refusal`] for a raw marker target, named by [`marker_name`].
+#[must_use]
+pub(crate) fn marker_refusal_for(target: &str, reason: &str) -> String {
+    marker_refusal(&marker_name(target), reason)
+}
+
 /// True when `target` is a well-formed http(s) URL for an image reference.
 /// Rejects whitespace anywhere, an empty or malformed authority, userinfo
 /// (`@`), a bad or empty port, and malformed brackets. Deliberately STRICTER
 /// than the config endpoint check (which defers embedded-space hosts to
 /// warmup) — a space, a bad/duplicate port, or userinfo is malformed for an
-/// image reference and must stay inert text.
+/// image reference and cannot be delivered as one.
 #[must_use]
 pub(crate) fn is_valid_remote_url(target: &str) -> bool {
     let Some(rest) = target
@@ -129,7 +363,7 @@ pub(crate) fn is_valid_remote_url(target: &str) -> bool {
     // A bracketed host is `[...]` with a non-empty inner and exactly one pair of
     // brackets; a non-bracketed host is non-empty with no `:` (a second `:`
     // would have been an extra port separator) and no `[` (a stray unmatched
-    // bracket — e.g. `host[` — is malformed and stays inert text).
+    // bracket — e.g. `host[` — is malformed).
     if host.starts_with('[') {
         host.ends_with(']')
             && host.len() > 2
@@ -490,9 +724,9 @@ mod tests {
             classify_media_image_target("https://example.com/foo bar.png"),
             MediaTarget::Invalid
         );
-        // A stray unmatched `[` in a non-bracketed host is malformed and stays
-        // inert text (the bracket-balance guard must not regress: `host[` and
-        // `host[foo:80` are not valid remote URL hosts).
+        // A stray unmatched `[` in a non-bracketed host is malformed (the
+        // bracket-balance guard must not regress: `host[` and `host[foo:80` are
+        // not valid remote URL hosts).
         assert_eq!(
             classify_media_image_target("http://host[/x.png"),
             MediaTarget::Invalid
@@ -607,6 +841,55 @@ mod tests {
         assert_eq!(
             classify_media_image_target("/tmp/definitely_missing_mahbot.png"),
             MediaTarget::Invalid
+        );
+    }
+
+    #[test]
+    fn refusal_names_hide_credentials() {
+        // A refusal quotes a bounded name, never the target's payload: an
+        // address's query, fragment and userinfo can all carry a secret.
+        assert_eq!(
+            marker_name("https://cdn.example.com/a/poster.png?token=s3cret"),
+            "poster.png"
+        );
+        assert_eq!(
+            marker_name("https://user:pass@cdn.example.com/poster.png"),
+            "poster.png"
+        );
+        assert_eq!(
+            marker_name("https://user:pass@cdn.example.com#s3cret"),
+            "cdn.example.com"
+        );
+        assert_eq!(marker_name("generated/some-poster.png"), "some-poster.png");
+        // A local name keeps its own `#` and `?`: only an address has a payload.
+        assert_eq!(marker_name("generated/poster#2.png"), "poster#2.png");
+    }
+
+    #[test]
+    fn workspace_files_decide_bare_word_references() {
+        // Existence decides whether a bare word is a reference: `[FILE:Makefile]`
+        // names the workspace's file, so it must not fall back to raw prose just
+        // because its name has no extension (or an unusual one).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), b"all:").unwrap();
+        std::fs::write(dir.path().join("poster.thumbnail"), b"x").unwrap();
+        let roots = [dir.path().to_path_buf()];
+        for name in ["Makefile", "poster.thumbnail"] {
+            assert_eq!(
+                resolve_marker_target(name, &roots),
+                MarkerTarget::Local(dir.path().join(name)),
+                "{name} is a file the workspace has"
+            );
+        }
+        // Nothing by that name anywhere: a bare word stays prose, while a
+        // target shaped like a path still names a (missing) file.
+        assert_eq!(
+            resolve_marker_target("path", &roots),
+            MarkerTarget::NotAReference
+        );
+        assert_eq!(
+            resolve_marker_target("plot.png", &roots),
+            MarkerTarget::Local(dir.path().join("plot.png"))
         );
     }
 

@@ -11,10 +11,9 @@ use crate::channels::reply::normalize_reply_text;
 use crate::channels::telegram_intake::{Intake, TelegramIntakeStore, listener_claim};
 use crate::pipeline::board::{Ticket, TicketPhase};
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
-use crate::util::media_target::{self, MediaTarget};
+use crate::util::media_target::{self, MarkerTarget, MediaTarget};
 use crate::util::{
-    FILE_MAX_BYTES, MediaMarkerKind, TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, file_name_or_path,
-    is_http_url, parse_media_marker,
+    FILE_MAX_BYTES, MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, is_http_url, parse_media_marker,
 };
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
@@ -422,8 +421,8 @@ struct AttachmentMeta {
 }
 
 impl TelegramAttachmentKind {
-    /// How the kind is named where the product reports it: in a chat fallback
-    /// ("Video: <address>") and in the delivery record's `kind` field.
+    /// How the kind is named where the product reports it: in the delivery
+    /// record's `kind` field.
     const fn label(self) -> &'static str {
         match self {
             Self::Image => "Image",
@@ -803,8 +802,9 @@ fn local_attachment_name(
 /// first, then the `[File <name>: <outcome> — <reason>]` note. `display_name`
 /// is `None` for an attachment with no usable name to show (a recorded voice
 /// message has none, and [`local_attachment_name`] would invent one with the
-/// wrong extension), which renders the name-less `[File: <outcome> — <reason>]`
-/// instead.
+/// wrong extension), which renders the name-less `[File <outcome> — <reason>]`
+/// instead. Neither shape is a media marker: the kind word is never followed by
+/// a colon, so `MEDIA_MARKER_RE` cannot read a product note as one.
 #[must_use]
 fn attachment_rejection_content(
     display_name: Option<&str>,
@@ -814,34 +814,11 @@ fn attachment_rejection_content(
 ) -> String {
     let note = match display_name {
         Some(name) => format!("[File {name}: {outcome} — {reason}]"),
-        None => format!("[File: {outcome} — {reason}]"),
+        None => format!("[File {outcome} — {reason}]"),
     };
     match caption.filter(|c| !c.is_empty()) {
         Some(caption) => format!("{caption}\n\n{note}"),
         None => note,
-    }
-}
-
-/// Attachment-target acceptance gate used by `parse_attachment_markers`:
-/// image markers may only attach a real raster or an http(s) URL (via
-/// `media_target::classify_media_image_target`); video and audio accept an
-/// http(s) URL or any existing regular file.
-///
-/// Deliberately looser than `[FILE:...]`, which [`resolve_file_target`] resolves
-/// against the authoring workspace roots: only that kind is workspace-confined.
-fn is_attachable_target(kind: TelegramAttachmentKind, target: &str) -> bool {
-    match kind {
-        TelegramAttachmentKind::Image => matches!(
-            media_target::classify_media_image_target(target),
-            MediaTarget::LocalImage | MediaTarget::RemoteUrl
-        ),
-        TelegramAttachmentKind::Video | TelegramAttachmentKind::Audio => {
-            is_http_url(target) || Path::new(target).is_file()
-        }
-        // Unreachable: only `[FILE:...]` yields a document, and it returns above.
-        // Refused rather than accepted so a new marker route cannot attach one
-        // without the containment this gate does not do.
-        TelegramAttachmentKind::Document => false,
     }
 }
 
@@ -901,38 +878,36 @@ fn video_upload_name(url: &str, content_type: Option<&str>) -> String {
     )
 }
 
-/// Build the user-facing notice for a refused outbound file delivery.
-fn file_refusal(name: &str, reason: &str) -> String {
-    format!("Could not send \"{name}\": {reason}")
-}
+/// The one refusal only a `[FILE:...]` marker can produce: the other kinds
+/// deliberately accept any location on disk, so this reason is not part of the
+/// shared vocabulary.
+const OUTSIDE_WORKSPACE_REASON: &str = "it is outside your workspace.";
 
-/// Resolve an outbound `[FILE:...]` target against the roots that authorize it.
-/// A URL is rejected: the marker is local-only.
+/// Resolve an outbound `[FILE:...]` target within the roots that authorize it.
+///
+/// `path` is where [`media_target::resolve_marker_target`] placed the target: an
+/// absolute path as written, or a relative one joined to the first workspace root
+/// that has it. A URL or an inline payload never reaches here — `[FILE:...]` is
+/// local-only, and [`marker_outcome`] refuses those before containment.
 ///
 /// The target is canonicalized (a symlink cannot smuggle out a file from
 /// outside a root) and must be inside one of the roots BEFORE the existence,
 /// directory and size checks, so a refusal does not disclose which of those the
-/// target is. The notice names a bounded prefix of the target, which a
-/// malformed marker can make an arbitrary blob. `Err` is that notice.
+/// target is. The notice names a bounded last path component, which a malformed
+/// marker can make an arbitrary blob. `Err` is that notice.
 fn resolve_file_target(
-    target: &str,
+    path: &Path,
     file_roots: &[PathBuf],
     upload_max: u64,
 ) -> Result<PathBuf, String> {
-    let name = crate::util::truncate(file_name_or_path(target), 60);
+    let name = media_target::marker_name(&path.to_string_lossy());
+    let refuse = |reason: &str| Err(media_target::marker_refusal(&name, reason));
 
-    // `[FILE:...]` is a local-only mechanism; a URL belongs to the other kinds.
-    if is_http_url(target) {
-        return Err(file_refusal(
-            &name,
-            "FILE targets are local files, not URLs.",
-        ));
-    }
+    // Nothing authorizes a local file when the message names no workspace: a
+    // still-relative target never found a root, and an absolute one has no root
+    // to be inside.
     if file_roots.is_empty() {
-        return Err(file_refusal(
-            &name,
-            "no workspace is available for file delivery.",
-        ));
+        return refuse(media_target::NO_WORKSPACE_REASON);
     }
 
     // Containment compares like with like, so the roots are canonicalized too:
@@ -944,46 +919,30 @@ fn resolve_file_target(
         .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
         .collect();
 
-    let raw = Path::new(target);
-    let joined = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        // A relative target belongs to whichever root actually has it: relayed
-        // content names a file in the originating workspace, which is the
-        // second root. When no root has it, the first one backs the
-        // "file not found." refusal.
-        roots
-            .iter()
-            .map(|root| root.join(raw))
-            .find(|candidate| candidate.exists())
-            .unwrap_or_else(|| roots[0].join(raw))
-    };
-
     // Containment comes before the directory and size checks: a path outside
     // the workspace must not have those disclosed to the end user. (Whether it
     // exists at all is still visible in the refusal text.)
-    let Ok(canonical) = std::fs::canonicalize(&joined) else {
-        return Err(file_refusal(&name, "file not found."));
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return refuse(media_target::FILE_NOT_FOUND_REASON);
     };
     if !crate::tools::path::is_path_under_roots(&canonical, &roots) {
-        return Err(file_refusal(&name, "it is outside your workspace."));
+        return refuse(OUTSIDE_WORKSPACE_REASON);
     }
 
     let Ok(meta) = std::fs::metadata(&canonical) else {
-        return Err(file_refusal(&name, "file not found."));
+        return refuse(media_target::FILE_NOT_FOUND_REASON);
     };
     if meta.is_dir() {
-        return Err(file_refusal(&name, "it is a directory."));
+        return refuse(media_target::DIRECTORY_REASON);
     }
     if meta.len() > upload_max {
-        return Err(file_refusal(
-            &name,
+        return refuse(
             &UploadTooLarge {
                 size: meta.len(),
                 max: upload_max,
             }
             .to_string(),
-        ));
+        );
     }
 
     // The plain spelling, not the platform's verbatim form: this value becomes
@@ -991,20 +950,88 @@ fn resolve_file_target(
     Ok(crate::util::strip_verbatim_prefix(&canonical))
 }
 
+/// What one parsed `[KIND:...]` marker became.
+enum MarkerOutcome {
+    /// A bare word naming no file — prose explaining the syntax. Kept as written.
+    Literal,
+    /// Delivered from this target: an address, or a resolved absolute path.
+    Attach(String),
+    /// Undeliverable: the user reads this notice where the marker was.
+    Refuse(String),
+}
+
+/// The refusal for a target that cannot be delivered, named by its bounded last
+/// path component so a malformed marker cannot dump a blob into the chat.
+fn refused(target: &str, reason: &str) -> MarkerOutcome {
+    MarkerOutcome::Refuse(media_target::marker_refusal_for(target, reason))
+}
+
+/// Decide what one marker becomes: the target is placed first
+/// ([`media_target::resolve_marker_target`]), then the kind's own gate decides
+/// whether it can be delivered as what the marker claims.
+///
+/// A recognized marker never stays markup: it is an attachment or a refusal.
+/// The one exception is a bare word naming nothing (`[IMAGE:path]` in prose),
+/// which is not a reference at all.
+fn marker_outcome(
+    marker_kind: MediaMarkerKind,
+    target: &str,
+    file_roots: &[PathBuf],
+    limits: TransferLimits,
+) -> MarkerOutcome {
+    let path = match media_target::resolve_marker_target(target, file_roots) {
+        MarkerTarget::NotAReference => return MarkerOutcome::Literal,
+        MarkerTarget::Inline => {
+            // A data URI has no name worth quoting: name the kind instead.
+            return MarkerOutcome::Refuse(media_target::inline_marker_refusal(marker_kind));
+        }
+        MarkerTarget::Remote => {
+            return match media_target::remote_marker(marker_kind, target) {
+                media_target::RemoteMarker::Refused(notice) => MarkerOutcome::Refuse(notice),
+                media_target::RemoteMarker::Deliverable => {
+                    MarkerOutcome::Attach(target.to_string())
+                }
+            };
+        }
+        MarkerTarget::Local(path) => path,
+    };
+
+    if marker_kind == MediaMarkerKind::File {
+        return match resolve_file_target(&path, file_roots, limits.upload) {
+            Ok(canonical) => MarkerOutcome::Attach(canonical.to_string_lossy().into_owned()),
+            Err(notice) => MarkerOutcome::Refuse(notice),
+        };
+    }
+
+    // Images, audio and video deliberately accept any location on disk — only
+    // `[FILE:...]` is workspace-confined. The kind's own gate still applies: an
+    // image marker must name a real raster, not a directory, a text file or an
+    // over-cap file.
+    if let Some(reason) = media_target::local_refusal(marker_kind, &path) {
+        return refused(target, reason);
+    }
+    let resolved = path.to_string_lossy();
+    if marker_kind == MediaMarkerKind::Image
+        && media_target::classify_media_image_target(&resolved) != MediaTarget::LocalImage
+    {
+        return refused(target, media_target::NOT_AN_IMAGE_REASON);
+    }
+    MarkerOutcome::Attach(resolved.into_owned())
+}
+
 /// Parse `[KIND:path]` media markers from a message, returning cleaned text
 /// (with markers removed), extracted attachments, and user-facing refusal
-/// notices for `[FILE:...]` markers.
+/// notices.
 ///
-/// A matched marker is only consumed when the delivery layer can act on it: a
-/// kind whose target is not attachable stays literal, so prose quoting the
-/// syntax never aborts delivery and never silently disappears. The gate is
-/// structural, so marker-shaped prose naming a real existing file still
-/// delivers as an attachment.
+/// A recognized marker is never delivered as raw markup: its target is placed by
+/// [`media_target::resolve_marker_target`] — a relative path against `file_roots`,
+/// the workspace the message belongs to — and the marker then either arrives or
+/// leaves a [`media_target::marker_refusal`] notice in the returned notices.
+/// Several markers are independent, so one refusal costs the user neither the
+/// others nor the surrounding text.
 ///
-/// `[FILE:...]` markers are the exception: they are resolved against
-/// `file_roots` (see [`resolve_file_target`]) and stripped either way — a
-/// delivered file leaves nothing behind, a refused one is reported in the
-/// notices instead of echoing raw marker syntax at the user.
+/// The one target kept as written is a bare word naming no file (`[IMAGE:path]`
+/// used to explain the syntax), which is prose rather than a reference.
 fn parse_attachment_markers(
     message: &str,
     file_roots: &[PathBuf],
@@ -1013,36 +1040,23 @@ fn parse_attachment_markers(
     let mut attachments: Vec<TelegramAttachment> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
 
-    let cleaned = TELEGRAM_MEDIA_MARKER_RE
+    let cleaned = MEDIA_MARKER_RE
         .replace_all(message, |caps: &regex::Captures| {
             let (marker_kind, path) = parse_media_marker(caps);
-            let path = path.trim();
-
-            if marker_kind == MediaMarkerKind::File {
-                match resolve_file_target(path, file_roots, limits.upload) {
-                    Ok(canonical) => attachments.push(TelegramAttachment {
-                        kind: TelegramAttachmentKind::Document,
-                        target: canonical.to_string_lossy().into_owned(),
-                    }),
-                    Err(notice) => refusals.push(notice),
+            match marker_outcome(marker_kind, path.trim(), file_roots, limits) {
+                MarkerOutcome::Literal => caps.get_match().as_str().to_string(),
+                MarkerOutcome::Attach(target) => {
+                    attachments.push(TelegramAttachment {
+                        kind: TelegramAttachmentKind::from(marker_kind),
+                        target,
+                    });
+                    String::new()
                 }
-                return String::new();
+                MarkerOutcome::Refuse(notice) => {
+                    refusals.push(notice);
+                    String::new()
+                }
             }
-
-            // Only a valid image target is attached as a photo; everything
-            // else — including a data-URI, which the classifier rejects
-            // cheaply (no decode, and Telegram cannot send inline data URIs)
-            // — stays as literal text.
-            let kind = TelegramAttachmentKind::from(marker_kind);
-            if !is_attachable_target(kind, path) {
-                return caps.get_match().as_str().to_string();
-            }
-
-            attachments.push(TelegramAttachment {
-                kind,
-                target: path.to_string(),
-            });
-            String::new()
         })
         .to_string();
 
@@ -1293,7 +1307,13 @@ impl std::error::Error for UploadTooLarge {}
 /// Deliberately static: the transport error text embeds the request URL, which
 /// carries the bot token, so it is logged and returned as an `Err` but never
 /// rendered into the user's chat.
-const ATTACHMENT_UPLOAD_FAILED_REASON: &str = "the upload failed";
+const ATTACHMENT_UPLOAD_FAILED_REASON: &str = "the upload failed.";
+
+/// User-facing reason when an addressed attachment never arrived: Telegram's
+/// own fetch failed, or ours did before the upload. Static for the same reason
+/// as [`ATTACHMENT_UPLOAD_FAILED_REASON`] — the error itself may carry the URL
+/// and its credentials.
+const ATTACHMENT_FETCH_FAILED_REASON: &str = "it could not be fetched or sent.";
 
 /// User-facing reason when a recorded voice message arrives off macOS, where
 /// no local audio subsystem exists to transcribe it: it is refused rather than
@@ -1591,10 +1611,10 @@ fn parse_markdown_link(text: &str, i: usize) -> Option<(&str, &str, usize)> {
 /// True when a bracketed label names a media marker rather than prose: a known
 /// [`MediaMarkerKind`], in any casing (`[FILE:…]`, `[image:…]`).
 ///
-/// [`parse_attachment_markers`] keeps an unattachable marker verbatim in the
-/// outgoing text, and such a marker immediately followed by a parenthesised URL
-/// is delivery scaffolding: an anchor labelled with the marker's text would
-/// fabricate a link out of it.
+/// A marker [`parse_attachment_markers`] leaves as written is prose explaining
+/// the syntax (`[IMAGE:path]`), and such a marker immediately followed by a
+/// parenthesised URL is delivery scaffolding: an anchor labelled with the
+/// marker's text would fabricate a link out of it.
 fn is_marker_label(label: &str) -> bool {
     let Some((kind, _)) = label.split_once(':') else {
         return false;
@@ -3011,42 +3031,21 @@ impl TelegramChannel {
         let target = attachment.target.trim();
         let route = attachment_route(kind, target);
 
-        // Every arm either yields what to record or has already kept the target
-        // reachable as a link; the record is written once, below.
+        // A failure is returned, not papered over with a bare link: the caller
+        // reports every failed attachment to the user with a reason. The record
+        // is written once, below, on success only.
         let (file, bytes, source_url) = match route {
             AttachmentRoute::ByAddress => {
-                match self
-                    .send_media_by_url(chat_id, thread_id, kind, target)
-                    .await
-                {
-                    Ok(()) => (address_file_name(target, "file"), None, Some(target)),
-                    Err(e) => {
-                        self.fall_back_to_link(chat_id, thread_id, kind, target, &e)
-                            .await?;
-                        return Ok(());
-                    }
-                }
+                self.send_media_by_url(chat_id, thread_id, kind, target)
+                    .await?;
+                (address_file_name(target, "file"), None, Some(target))
             }
             AttachmentRoute::FetchThenUpload => {
-                let delivered = async {
-                    let fetched = self.fetch_remote_upload(target).await?;
-                    let size = self
-                        .send_media_file(chat_id, thread_id, kind, &fetched.path)
-                        .await?;
-                    Ok::<_, anyhow::Error>((fetched, size))
-                }
-                .await;
-                match delivered {
-                    Ok((fetched, size)) => (fetched.name, Some(size), Some(target)),
-                    // Oversize is a fact about the file, not a failed fetch: the
-                    // user gets the honest size notice instead of a link.
-                    Err(e) if upload_too_large(&e).is_some() => return Err(e),
-                    Err(e) => {
-                        self.fall_back_to_link(chat_id, thread_id, kind, target, &e)
-                            .await?;
-                        return Ok(());
-                    }
-                }
+                let fetched = self.fetch_remote_upload(target).await?;
+                let size = self
+                    .send_media_file(chat_id, thread_id, kind, &fetched.path)
+                    .await?;
+                (fetched.name, Some(size), Some(target))
             }
             AttachmentRoute::LocalFile => {
                 let path = Path::new(target);
@@ -3062,25 +3061,6 @@ impl TelegramChannel {
 
         record_attachment_delivery(chat_id, kind, route, &file, bytes, source_url);
         Ok(())
-    }
-
-    /// Keep an address reachable when it cannot be delivered as media: log the
-    /// cause and put the address in the reply as a plain link instead of losing it.
-    async fn fall_back_to_link(
-        &self,
-        chat_id: &str,
-        thread_id: Option<&str>,
-        kind: TelegramAttachmentKind,
-        target: &str,
-        error: &anyhow::Error,
-    ) -> anyhow::Result<()> {
-        tracing::warn!(
-            url = %crate::util::http::redact_address(target),
-            error = %error,
-            "Telegram: an attachment could not be delivered; falling back to text link"
-        );
-        let text = format!("{}: {target}", kind.label());
-        self.send_text_chunks(&text, chat_id, thread_id, None).await
     }
 
     /// Post a pre-built media request and check its status. Success is recorded
@@ -4228,8 +4208,9 @@ impl Channel for TelegramChannel {
         // Look for inline attachment markers like [IMAGE:path/to/file.png].
         // Marker parsing now runs the shared classifier, whose local-file branch
         // is a blocking raster decode — offload it so a Tokio worker is not
-        // parked while a local image is decoded for attachment. `[FILE:...]`
-        // markers are resolved (and possibly refused) here too.
+        // parked while a local image is decoded for attachment. A relative target
+        // resolves against `message.file_roots`; every marker either arrives or
+        // leaves a refusal notice, never raw markup.
         let (text_without_markers, attachments, refusals) =
             crate::util::with_block_in_place(|| {
                 parse_attachment_markers(content, &message.file_roots, self.limits())
@@ -4272,16 +4253,16 @@ impl Channel for TelegramChannel {
                     file = %crate::util::http::redact_address(&attachment.target),
                     "Telegram: attachment delivery failed"
                 );
-                // An address's name drops its query and fragment: a signed URL's
-                // credentials must never be quoted back into the chat.
-                let name = if is_http_url(&attachment.target) {
-                    address_file_name(&attachment.target, "file")
-                } else {
-                    file_name_or_path(&attachment.target).to_string()
-                };
+                // The notice names a bounded last path component, and an
+                // address's query, fragment and userinfo are dropped: a signed
+                // URL's credentials must never be quoted back into the chat.
+                let name = media_target::marker_name(&attachment.target);
                 let notice = match upload_too_large(&e) {
-                    Some(too_large) => file_refusal(&name, &too_large.to_string()),
-                    None => file_refusal(&name, ATTACHMENT_UPLOAD_FAILED_REASON),
+                    Some(too_large) => media_target::marker_refusal(&name, &too_large.to_string()),
+                    None if is_http_url(&attachment.target) => {
+                        media_target::marker_refusal(&name, ATTACHMENT_FETCH_FAILED_REASON)
+                    }
+                    None => media_target::marker_refusal(&name, ATTACHMENT_UPLOAD_FAILED_REASON),
                 };
                 if let Err(notice_err) = self
                     .send_text_chunks(&notice, chat_id, thread_id, None)
@@ -4846,9 +4827,7 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
     // deleted. A reply reference is preserved as a `↩` header line inside the
     // blockquote; when a reference is present the media-only guard below is
     // relaxed so a reply to a media message still mirrors the `↩` line.
-    let content = TELEGRAM_MEDIA_MARKER_RE
-        .replace_all(trimmed, "")
-        .to_string();
+    let content = MEDIA_MARKER_RE.replace_all(trimmed, "").to_string();
     let content = content.trim().to_string();
 
     let quoted = if let Some(reply) = &msg.reply_reference {
