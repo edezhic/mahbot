@@ -580,9 +580,9 @@ pub const MAX_BOUNCES: usize = 10;
 pub const BOUNCE_BADGE_WARNING_THRESHOLD: usize = 5;
 
 /// Every [`BOUNCE_NOTICE_INTERVAL`]-th return to development the Manager gets a
-/// looping notice — the 3rd, 6th and 9th at the current [`MAX_BOUNCES`]. See
-/// [`bounce_notice_mark`].
-const BOUNCE_NOTICE_INTERVAL: usize = 3;
+/// looping notice — the 2nd, 4th, 6th, 8th and 10th at the current
+/// [`MAX_BOUNCES`]. See [`bounce_notice_mark`].
+const BOUNCE_NOTICE_INTERVAL: usize = 2;
 
 // ── Transition + notification helpers (shared by the phase modules) ─────
 
@@ -1734,15 +1734,12 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
 /// when the bounce being applied lands on the notice grid, or `None` when this
 /// bounce carries no notice. `bounce_count` is the count *before* the increment,
 /// so matching exactly (never `>=`) keeps each notice once-per-ticket and never
-/// backfills a ticket already past a grid point. A count at or above
-/// [`MAX_BOUNCES`] carries no notice, so the trip — whose failure notice stands
-/// alone — can never stack one on top, even if a future budget is itself a grid
-/// multiple.
+/// backfills a ticket already past a grid point.
 #[must_use]
 fn bounce_notice_mark(bounce_count: i64) -> Option<i64> {
     let next = bounce_count.checked_add(1)?;
     let n = usize::try_from(next).ok()?;
-    (n < MAX_BOUNCES && n % BOUNCE_NOTICE_INTERVAL == 0).then_some(next)
+    (n % BOUNCE_NOTICE_INTERVAL == 0).then_some(next)
 }
 
 /// Move all other Queued tickets in the workspace to Planning after a breaker

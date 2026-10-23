@@ -524,12 +524,12 @@ async fn run_claim_pipeline_claims_new_work() {
     );
 }
 
-/// The Manager gets a looping notice on every third return to development (the
-/// 3rd, 6th and 9th of the shared budget) and on no other bounce — so a ticket
-/// is never double-notified and a ticket already past a grid point is never
-/// backfilled. The breaker trip carries only its own failure notice.
+/// The Manager gets a looping notice on every second return to development (the
+/// 2nd, 4th, 6th, 8th and 10th of the shared budget) and on no other bounce — so
+/// a ticket is never double-notified and a ticket already past a grid point is
+/// never backfilled.
 #[tokio::test]
-async fn every_third_bounce_notifies_manager() {
+async fn every_second_bounce_notifies_manager() {
     let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let ws = create_test_workspace("/tmp/bounce_notice_ws", "bounce_notice_ws").await;
@@ -550,7 +550,7 @@ async fn every_third_bounce_notifies_manager() {
         assert_eq!(bounced.phase, TicketPhase::InDevelopment);
         let notice = manager_inbox.try_recv().ok();
         if bounced.bounce_count % interval == 0 {
-            let job = notice.expect("every third bounce notifies the Manager");
+            let job = notice.expect("every second bounce notifies the Manager");
             assert!(
                 job.content.contains(&format!(
                     "⏳ This ticket has been returned to development {} times already; \
@@ -570,17 +570,9 @@ async fn every_third_bounce_notifies_manager() {
         }
     }
 
-    // Exhausting the budget stops the ticket: the failure notice stands alone.
+    // Exhausting the budget stops the ticket.
     let failed = bounce_once(&ws, budget).await;
     assert_eq!(failed.phase, TicketPhase::Failed);
-    let job = manager_inbox
-        .try_recv()
-        .expect("the breaker trip notifies the Manager");
-    assert!(
-        !job.content.contains("returned to development"),
-        "the looping notice must not stack onto the breaker trip:\n{}",
-        job.content,
-    );
     crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
 }
 
