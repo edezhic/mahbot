@@ -123,7 +123,8 @@ tempfile = "3"
 unicode-normalization = "0.1"
 unicase = "2.10"
 
-# URL parsing + IP netmask matching for chrome URL validation (SSRF guard).
+# URL parsing + IP netmask matching for the shared URL validation (the SSRF
+# guard in src/util/http.rs).
 # `percent-encoding` is `url`'s own path-segment codec (already in the graph);
 # the rasterize page server decodes a request path with it directly.
 url = "2"

@@ -1,4 +1,6 @@
-//! Shared `reqwest::Client` construction with configurable timeouts.
+//! Shared `reqwest::Client` construction, the SSRF screen shared by daemon-side
+//! fetches of a caller-supplied address ([`validate_url`], [`DENIED_IP_NETS`]),
+//! and a redirect-screened GET ([`get_guarded`]).
 //!
 //! All call sites that need an HTTP client should use this helper instead of
 //! building one from scratch.  `reqwest::Client` is designed to be created once
@@ -281,7 +283,7 @@ pub fn build_http_client(timeout: Duration) -> reqwest::Client {
 
 /// Build an HTTP client that treats a redirect as the response: the caller
 /// checked the one address it supplied, and a hop the server picks would escape
-/// that check (the `web_search` picture probe is the user).
+/// that check (the `web_search` picture probe and [`get_guarded`] are the users).
 ///
 /// # Panics
 ///
@@ -302,6 +304,142 @@ fn build_http_client_with(
         .redirect(redirect)
         .build()
         .expect("Failed to build HTTP client (rustls TLS initialization failure)")
+}
+
+/// IP networks [`validate_url`] refuses — the unambiguous metadata/link-local
+/// targets only: link-local (incl. the 169.254.169.254 cloud-metadata endpoint),
+/// the 0.0.0.0/8 source-address space, the IPv6 loopback, and all IPv4-mapped
+/// IPv6. Loopback (127.0.0.1) and RFC1918 are deliberately NOT blocked: this is a
+/// local-first product whose agents already drive the owner's own browser and
+/// render pages from their own machine and LAN, so a file hosted there is a
+/// legitimate target — including for the delivery paths that fetch one.
+static DENIED_IP_NETS: std::sync::LazyLock<[ipnet::IpNet; 4]> = std::sync::LazyLock::new(|| {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    [
+        ipnet::IpNet::new(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16)
+            .expect("169.254.0.0/16 is a valid IPv4 net"),
+        ipnet::IpNet::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8)
+            .expect("0.0.0.0/8 is a valid IPv4 net"),
+        ipnet::IpNet::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 128)
+            .expect("::1/128 is a valid IPv6 net"),
+        ipnet::IpNet::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)), 96)
+            .expect("::ffff:0:0/96 is a valid IPv6 net"),
+    ]
+});
+
+/// Validate an address is structurally safe for the daemon to fetch — the screen
+/// shared by the daemon-side fetches that use it, navigation and file delivery
+/// alike.
+///
+/// The SSRF screen is deliberately narrow: it blocks only the unambiguous
+/// metadata/link-local targets (see [`DENIED_IP_NETS`]), leaving loopback and
+/// RFC1918 reachable by policy. It screens the address as written — a redirect
+/// hop is a second address and must be screened again, which [`get_guarded`]
+/// does.
+pub(crate) fn validate_url(url: &str) -> anyhow::Result<()> {
+    use url::Host;
+
+    let url = url.trim();
+    if url.is_empty() {
+        anyhow::bail!("URL cannot be empty");
+    }
+    // Block file:// case-insensitively — it bypasses SSRF controls.
+    if url.to_ascii_lowercase().starts_with("file://") {
+        anyhow::bail!("file:// URLs are not allowed");
+    }
+    // url::Url lowercases scheme+host, so "HTTP://EXAMPLE.COM" passes and
+    // scheme-less strings ("example.com") stay rejected. Parse error or a
+    // non-http(s) scheme is the same structural rejection.
+    let parsed = url::Url::parse(url)
+        .map_err(|_| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("Only http:// and https:// URLs are allowed");
+    }
+
+    let Some(host) = parsed.host() else {
+        return Ok(());
+    };
+    let denied = |host: url::Host<&str>| {
+        anyhow::anyhow!("host {host} is a denied link-local/metadata address (SSRF guard)")
+    };
+    let ip = match host {
+        Host::Domain(domain) => {
+            if domain.eq_ignore_ascii_case("metadata.google.internal") {
+                return Err(denied(host));
+            }
+            None
+        }
+        Host::Ipv4(addr) => Some(std::net::IpAddr::V4(addr)),
+        Host::Ipv6(addr) => Some(std::net::IpAddr::V6(addr)),
+    };
+    if ip.is_some_and(|ip| DENIED_IP_NETS.iter().any(|net| net.contains(&ip))) {
+        return Err(denied(host));
+    }
+    Ok(())
+}
+
+/// An address as a log, a chat notice or a durable record may carry it: scheme,
+/// host and path with the query and fragment dropped, so a signed URL's
+/// credentials are neither quoted back to the user nor persisted. Anything that
+/// is not an http(s) address is returned as written.
+pub(crate) fn redact_address(value: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(value) else {
+        return value.to_string();
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return value.to_string();
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
+/// The most hops a [`get_guarded`] fetch follows: a CDN chain is short, and a
+/// bound keeps a loop from holding the caller.
+const MAX_GUARDED_REDIRECTS: usize = 5;
+
+/// GET `url`, screening every hop of the redirect chain with [`validate_url`].
+///
+/// The caller supplies the first address and screens it here; a hop the server
+/// picks is a second address the caller never saw, so it is screened on arrival
+/// instead of being trusted. `client` must not follow redirects of its own
+/// ([`build_no_redirect_http_client`]) — otherwise this never sees them.
+///
+/// No timeout here: the caller bounds the transfer as a whole, because the bound
+/// has to cover the body this returns too, not just the hops.
+pub(crate) async fn get_guarded(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<reqwest::Response> {
+    use anyhow::Context as _;
+
+    let mut next = url.trim().to_string();
+    for _ in 0..=MAX_GUARDED_REDIRECTS {
+        validate_url(&next)
+            .with_context(|| format!("refusing to fetch {}", redact_address(&next)))?;
+        let response = client
+            .get(&next)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .context("a redirect answered with no location")?;
+        next = url::Url::parse(&next)
+            .ok()
+            .and_then(|base| base.join(location).ok())
+            .map(|target| target.to_string())
+            .context("a redirect named an address that cannot be resolved")?;
+    }
+    anyhow::bail!(
+        "{} redirected more than {MAX_GUARDED_REDIRECTS} times",
+        redact_address(url)
+    )
 }
 
 /// Build an HTTP client for large model downloads: `total_timeout` per
@@ -570,6 +708,73 @@ pub(crate) async fn download_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_validation_accepts_real_and_local_targets() {
+        for url in [
+            "https://example.com",
+            "HTTP://EXAMPLE.COM",
+            "https://EXAMPLE.com/path",
+            "http://localhost:3000",
+            "http://127.0.0.1",
+            "http://192.168.1.1",
+            "http://10.0.0.5",
+            // Canonicalizes to 127.0.0.1 — loopback is not blocked.
+            "http://0x7f000001/",
+        ] {
+            assert!(validate_url(url).is_ok(), "expected {url:?} to be accepted");
+        }
+    }
+
+    #[test]
+    fn url_validation_rejects_unsafe_targets() {
+        let err = validate_url("").unwrap_err();
+        assert!(err.to_string().contains("URL cannot be empty"));
+
+        for url in ["ftp://example.com", "example.com"] {
+            let err = validate_url(url).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Only http:// and https:// URLs are allowed"),
+                "unexpected error for {url:?}: {err}"
+            );
+        }
+
+        for url in ["FILE:///etc/passwd", "file:///etc/passwd"] {
+            let err = validate_url(url).unwrap_err();
+            assert!(
+                err.to_string().contains("not allowed"),
+                "unexpected error for {url:?}: {err}"
+            );
+        }
+
+        for url in [
+            "http://169.254.169.254/",
+            "http://0.0.0.0/",
+            "http://0.1.2.3/",
+            "http://[::1]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            let err = validate_url(url).unwrap_err();
+            assert!(
+                err.to_string().contains("SSRF guard"),
+                "unexpected error for {url:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_loses_its_credentials() {
+        assert_eq!(
+            redact_address("https://cdn.example.com/clip.mp4?sig=secret&exp=1#t=3"),
+            "https://cdn.example.com/clip.mp4"
+        );
+        assert_eq!(
+            redact_address("/tmp/workspace/clip.mp4"),
+            "/tmp/workspace/clip.mp4"
+        );
+    }
 
     #[tokio::test]
     async fn check_response_returns_http_error_on_non_2xx() {

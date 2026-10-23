@@ -635,6 +635,301 @@ fn parse_file_markers_refuse_symlink_out_of_workspace() {
     );
 }
 
+/// Only the delivery route collapses for a video: where one may come from does
+/// not. A remote video is fetched and uploaded — never handed to Telegram by
+/// address, whose by-address document form would only accept a couple of types —
+/// while images and audio keep the by-address methods, and any existing file is
+/// uploaded from disk.
+#[test]
+fn a_video_route_depends_only_on_its_target() {
+    use AttachmentRoute::{ByAddress, FetchThenUpload, LocalFile};
+
+    assert_eq!(
+        attachment_route(
+            TelegramAttachmentKind::Video,
+            "https://example.com/clip.mov"
+        ),
+        FetchThenUpload
+    );
+    assert_eq!(
+        attachment_route(TelegramAttachmentKind::Video, "/nowhere/clip.mov"),
+        LocalFile
+    );
+    assert_eq!(
+        attachment_route(TelegramAttachmentKind::Audio, "https://example.com/a.ogg"),
+        ByAddress
+    );
+    assert_eq!(
+        attachment_route(TelegramAttachmentKind::Image, "https://example.com/a.png"),
+        ByAddress
+    );
+}
+
+/// A fetched video is named so a client can pick a player: the address's own
+/// last segment when it is a video name, otherwise that stem with the extension
+/// the declared type gives — the rule the receive direction already applies.
+#[test]
+fn a_fetched_video_is_named_for_a_player() {
+    let name = |url: &str, content_type: Option<&str>| video_upload_name(url, content_type);
+    assert_eq!(
+        name("https://example.com/dir/clip.mov?sig=abc#t", None),
+        "clip.mov"
+    );
+    assert_eq!(
+        name("https://example.com/clip.mov", Some("video/mp4")),
+        "clip.mov"
+    );
+    assert_eq!(
+        name(
+            "https://example.com/download?id=7",
+            Some("video/quicktime; q=1")
+        ),
+        "download.mov"
+    );
+    assert_eq!(
+        name("https://example.com/clip.php", Some("video/webm")),
+        "clip.webm"
+    );
+    assert_eq!(name("https://example.com/", Some("video/mp4")), "video.mp4");
+    assert_eq!(name("https://example.com", None), "video.mp4");
+    assert_eq!(name("https://example.com/a/..", None), "video.mp4");
+}
+
+/// The document-upload wire shape: one upload, no video message, detection off, no
+/// geometry claimed, and `bytes` carried verbatim under `name`.
+fn assert_document_upload(fake: &FakeTelegram, name: &str, bytes: &str) {
+    assert_eq!(fake.count("sendDocument"), 1);
+    assert_eq!(fake.count("sendVideo"), 0);
+    let body = String::from_utf8_lossy(&fake.bodies("sendDocument")[0]).into_owned();
+    assert!(body.contains("name=\"document\""), "{body}");
+    assert!(body.contains("disable_content_type_detection"), "{body}");
+    assert!(body.contains(name), "the file keeps its name: {body}");
+    assert!(
+        body.contains(bytes),
+        "the file's bytes go out as they are: {body}"
+    );
+    for geometry in [
+        "width",
+        "height",
+        "duration",
+        "thumbnail",
+        "supports_streaming",
+    ] {
+        assert!(
+            !body.contains(geometry),
+            "no {geometry} may be claimed: {body}"
+        );
+    }
+}
+
+/// What the product actually puts on the wire for a video: a document upload
+/// carrying the file's own bytes, with content-type detection disabled and no
+/// geometry claim — the recipient's own player, not the message, describes the
+/// clip.
+#[tokio::test]
+async fn a_video_is_uploaded_as_a_document_with_no_geometry() {
+    crate::users::test_util::init_test_store().await;
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("clip.mov");
+    std::fs::write(&clip, b"fake-mov-bytes").unwrap();
+
+    telegram
+        .send(&SendMessage {
+            content: format!("[VIDEO:{}]", clip.display()),
+            recipient: "42".to_string(),
+            reply_markup: None,
+            file_roots: Vec::new(),
+        })
+        .await
+        .expect("the video is delivered");
+
+    assert_document_upload(&fake, "clip.mov", "fake-mov-bytes");
+}
+
+/// The composition the change turns on: a video addressed by a URL reaches the
+/// chat as one document upload carrying the fetched bytes — never a video message,
+/// never a handover by address.
+#[tokio::test]
+async fn a_remote_video_is_fetched_and_uploaded_as_a_document() {
+    crate::users::test_util::init_test_store().await;
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_file("clip", b"remote-video-bytes", Duration::ZERO);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    let url = format!("{}/file/bottoken-a/{}", fake.base, file_path_of("clip"));
+
+    telegram
+        .send(&SendMessage {
+            content: format!("[VIDEO:{url}]"),
+            recipient: "42".to_string(),
+            reply_markup: None,
+            file_roots: Vec::new(),
+        })
+        .await
+        .expect("the remote video is delivered");
+
+    assert_document_upload(&fake, "clip.mp4", "remote-video-bytes");
+}
+
+/// An image addressed by a URL keeps its by-address method: Telegram fetches and
+/// serves it as a photo, not as an upload of ours.
+#[tokio::test]
+async fn an_image_by_address_keeps_the_photo_method() {
+    crate::users::test_util::init_test_store().await;
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    let url = "https://example.com/pictures/sunset.png".to_string();
+
+    telegram
+        .send(&SendMessage {
+            content: format!("[IMAGE:{url}]"),
+            recipient: "42".to_string(),
+            reply_markup: None,
+            file_roots: Vec::new(),
+        })
+        .await
+        .expect("the image is delivered");
+
+    assert_eq!(fake.count("sendPhoto"), 1);
+    assert_eq!(fake.count("sendDocument"), 0);
+    let body: serde_json::Value =
+        serde_json::from_slice(&fake.bodies("sendPhoto")[0]).expect("the by-address body is JSON");
+    assert_eq!(body["photo"], url);
+}
+
+/// `[FILE:]` keeps its route: a local file goes out as a document upload of its
+/// own bytes.
+#[tokio::test]
+async fn a_file_is_uploaded_as_a_document() {
+    crate::users::test_util::init_test_store().await;
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report.pdf");
+    std::fs::write(&report, b"%PDF-1.4 fake").unwrap();
+
+    telegram
+        .send(&SendMessage {
+            content: format!("[FILE:{}]", report.display()),
+            recipient: "42".to_string(),
+            reply_markup: None,
+            file_roots: vec![dir.path().to_path_buf()],
+        })
+        .await
+        .expect("the file is delivered");
+
+    assert_document_upload(&fake, "report.pdf", "%PDF-1.4 fake");
+}
+
+/// A fetched copy lives in a temp directory of its own and goes away with the
+/// value that carries it, whatever the upload that follows did.
+#[tokio::test]
+async fn a_fetched_copy_is_removed_with_its_delivery() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_file("clip", b"remote-video-bytes", Duration::ZERO);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+
+    let url = format!("{}/file/bottoken-a/{}", fake.base, file_path_of("clip"));
+    let fetched = telegram.fetch_remote_upload(&url).await.expect("fetch");
+    let path = fetched.path.clone();
+    drop(fetched);
+    assert!(
+        !path.exists(),
+        "the fetched copy must not outlive the delivery"
+    );
+}
+
+/// An address the model supplied passes the shared screen on every hop: the first
+/// one it wrote and each one a redirect names. A metadata target is refused
+/// whether addressed directly or reached through a hop, and a hop to the file
+/// itself is followed.
+#[tokio::test]
+async fn an_address_is_screened_on_every_hop() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_file("clip.mov", b"remote-video-bytes", Duration::ZERO);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    let file = format!("{}/file/bottoken-a/{}", fake.base, file_path_of("clip.mov"));
+
+    let direct = telegram
+        .fetch_remote_upload("http://169.254.169.254/latest/meta-data")
+        .await
+        .err()
+        .expect("a metadata address is refused on the first hop");
+    assert!(format!("{direct:#}").contains("SSRF"), "{direct:#}");
+
+    let followed = telegram
+        .fetch_remote_upload(&format!("{}/redirect?to={file}", fake.base))
+        .await
+        .expect("a redirect to the file itself is followed");
+    assert_eq!(
+        tokio::fs::read(&followed.path).await.unwrap(),
+        b"remote-video-bytes"
+    );
+
+    let hopped = telegram
+        .fetch_remote_upload(&format!(
+            "{}/redirect?to=http://169.254.169.254/latest/meta-data",
+            fake.base
+        ))
+        .await
+        .err()
+        .expect("a metadata hop is refused");
+    assert!(format!("{hopped:#}").contains("SSRF"), "{hopped:#}");
+}
+
+/// The shared body stream refuses a declared length over its ceiling before the
+/// file is created, and stores a body at the ceiling byte for byte — the bound
+/// both the inbound download and the outbound fetch rely on.
+#[tokio::test]
+async fn a_declared_length_over_the_ceiling_is_refused_before_writing() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_file("clip", b"twelve bytes", Duration::ZERO);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    let url = format!("{}/file/bottoken-a/{}", fake.base, file_path_of("clip"));
+    let dir = tempfile::tempdir().unwrap();
+    let over_limit = |size: u64, max: u64| anyhow::anyhow!("{size} over {max}");
+
+    let over = dir.path().join("over.bin");
+    let response = telegram.transfer_client().get(&url).send().await.unwrap();
+    let refused = stream_capped(response, &over, Some(4), over_limit)
+        .await
+        .expect_err("the declared length is over the ceiling");
+    assert_eq!(refused.to_string(), "12 over 4");
+    assert!(!over.exists(), "a refused body must not be created");
+
+    let exact = dir.path().join("exact.bin");
+    let response = telegram.transfer_client().get(&url).send().await.unwrap();
+    stream_capped(response, &exact, Some(12), over_limit)
+        .await
+        .expect("a body at the ceiling is delivered");
+    assert_eq!(tokio::fs::read(&exact).await.unwrap(), b"twelve bytes");
+}
+
+/// A video address whose bytes cannot be had leaves the reply with the address
+/// as a link rather than losing it.
+#[tokio::test]
+async fn an_unfetchable_video_address_still_reaches_the_user_as_a_link() {
+    crate::users::test_util::init_test_store().await;
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    // Nothing listens on port 1: the fetch fails before any upload.
+    let address = "http://127.0.0.1:1/clip.mp4".to_string();
+
+    telegram
+        .send(&SendMessage {
+            content: format!("[VIDEO:{address}]"),
+            recipient: "42".to_string(),
+            reply_markup: None,
+            file_roots: Vec::new(),
+        })
+        .await
+        .expect("the address is delivered as a link");
+
+    assert_eq!(fake.count("sendDocument"), 0);
+    assert_eq!(fake.sent_texts(), vec![format!("Video: {address}")]);
+}
+
 #[test]
 fn bare_path_without_marker_is_plain_text() {
     let dir = tempfile::tempdir().unwrap();
@@ -3541,16 +3836,25 @@ struct FakeState {
     accounts: HashMap<String, i64>,
     /// The `getUpdates` batches queued for each token, oldest first.
     batches: Mutex<HashMap<String, VecDeque<Vec<serde_json::Value>>>>,
-    /// Every request a listener made, in arrival order: the method, the
-    /// `getUpdates` offset it asked for (`None` for other methods), and when it
-    /// arrived.
-    requests: Mutex<Vec<(String, Option<i64>, std::time::Instant)>>,
+    /// Every request a listener made, in arrival order: what it was and what it
+    /// carried.
+    requests: Mutex<Vec<ServedRequest>>,
     /// The `text` of every `sendMessage`, in arrival order.
     sent_texts: Mutex<Vec<String>>,
     /// The files a listener may fetch, keyed by the `file_path` the fake's own
     /// `getFile` hands back: the bytes the transfer serves and how long it takes
     /// to answer them.
     files: Mutex<HashMap<String, FakeFile>>,
+}
+
+/// One request a listener made: the method, the `getUpdates` offset it asked for
+/// (`None` for other methods), when it arrived, and the raw body — what an upload
+/// actually put on the wire.
+struct ServedRequest {
+    method: String,
+    offset: Option<i64>,
+    at: std::time::Instant,
+    body: Vec<u8>,
 }
 
 /// A file the fake serves over a transfer of its own: the bytes, and how long
@@ -3665,8 +3969,8 @@ impl FakeTelegram {
             .lock()
             .expect("fake request log")
             .iter()
-            .filter(|(method, _, _)| method == "getUpdates")
-            .filter_map(|(_, offset, _)| *offset)
+            .filter(|request| request.method == "getUpdates")
+            .filter_map(|request| request.offset)
             .collect()
     }
 
@@ -3677,8 +3981,20 @@ impl FakeTelegram {
             .lock()
             .expect("fake request log")
             .iter()
-            .filter(|(called, _, _)| called == method)
+            .filter(|request| request.method == method)
             .count()
+    }
+
+    /// The raw bodies of every `method` call, in order.
+    fn bodies(&self, method: &str) -> Vec<Vec<u8>> {
+        self.state
+            .requests
+            .lock()
+            .expect("fake request log")
+            .iter()
+            .filter(|request| request.method == method)
+            .map(|request| request.body.clone())
+            .collect()
     }
 
     /// The texts of the `sendMessage` calls, in order.
@@ -3741,11 +4057,28 @@ fn serve(mut stream: TcpStream, state: &FakeState) {
     };
     // Recorded as the request arrives — before its answer, so the log is the
     // durable evidence of what a listener called.
-    state.requests.lock().expect("fake request log").push((
-        method.clone(),
-        offset,
-        std::time::Instant::now(),
-    ));
+    state
+        .requests
+        .lock()
+        .expect("fake request log")
+        .push(ServedRequest {
+            method: method.clone(),
+            offset,
+            at: std::time::Instant::now(),
+            body: request.body.clone(),
+        });
+
+    // `/redirect?to=<address>` answers 302 to that address: a check scripts the
+    // hop it wants the fetch to take.
+    if target == "/redirect"
+        && let Some(to) = request.path.split("?to=").nth(1)
+    {
+        let head = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(head.as_bytes());
+        return;
+    }
 
     // A file transfer is not a Bot API method: its URL is
     // `{base}/file/bot<token>/<path>` and its body is the bytes themselves.
@@ -3774,6 +4107,13 @@ fn serve(mut stream: TcpStream, state: &FakeState) {
         ),
         "getUpdates" => serve_get_updates(&mut stream, state, token, &request),
         "sendMessage" => serve_send_message(&mut stream, state, &request),
+        "sendDocument" | "sendPhoto" | "sendAudio" => respond(
+            &mut stream,
+            &serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1, "chat": { "id": 5 }, "date": 0 },
+            }),
+        ),
         "getFile" => serve_get_file(&mut stream, state, &request),
         "setMessageReaction" | "answerCallbackQuery" | "setMyCommands" | "sendChatAction" => {
             respond(
@@ -5357,8 +5697,10 @@ async fn an_event_the_record_cannot_be_written_for_is_neither_acknowledged_nor_c
         let requests = fake.state.requests.lock().expect("fake request log");
         requests
             .iter()
-            .filter(|(method, offset, _)| method == "getUpdates" && offset.is_some_and(|o| o > 0))
-            .map(|(_, _, at)| *at)
+            .filter(|request| {
+                request.method == "getUpdates" && request.offset.is_some_and(|offset| offset > 0)
+            })
+            .map(|request| request.at)
             .collect()
     };
     let gap = loop_polls[1] - loop_polls[0];

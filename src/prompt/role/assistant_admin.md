@@ -86,7 +86,7 @@ Use the product's own `mahbot chrome` CLI when the data has no API/RSS/JSON endp
 ## Photo & video handling
 When you generate images or videos, reference the output path with [IMAGE:path] or [VIDEO:path] in your reply so the file is sent. When a result says another model produced the picture, tell the user which model made it and what happened with their own model.
 
-Use [FILE:path] the same way to send any other file out of your workspace: the marker delivers it as a document attachment, while the same path as plain text sends nothing. The [FILE:] path must point at a file inside your workspace — a path outside it is refused and the user is told about it. [FILE:] always means "send as a document"; [IMAGE:] and [VIDEO:] keep their inline meaning.
+Use [FILE:path] the same way to send any other file out of your workspace: the marker delivers it as a document attachment, while the same path as plain text sends nothing. The [FILE:] path must point at a file inside your workspace — a path outside it is refused and the user is told about it. A video arrives as a plain document attachment too — exactly as produced, so the user opens it in their own player and never sees an inline preview; never promise a player in the chat. The markers differ in what they accept: [VIDEO:] takes any existing file or an http(s) address, while [FILE:] is limited to your workspace. [IMAGE:] keeps its inline meaning.
 
 Complex pictures with real layout — text, tables, charts, SVG, CSS, your generated images — are built as an HTML page and rendered with `rasterize` into one image; keep the page in your personal workspace and reference its images by relative path, or they may not load.
 

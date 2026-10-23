@@ -66,7 +66,7 @@ use crate::chrome::spawn::{
 use crate::chrome::{
     CHROME_USE_DECLARED_BUDGET, CHROME_USE_OWN_BUDGET, CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX,
     ChromeCallClocks, CliRecovery, DEFAULT_OPEN_TIMEOUT, DEFAULT_STEP_TIMEOUT, KILL_SLACK,
-    SESSION_STOP_TIMEOUT, clocks, is_blank_page_url, kill_bound, probe_clocks, validate_url,
+    SESSION_STOP_TIMEOUT, clocks, is_blank_page_url, kill_bound, probe_clocks,
 };
 use crate::tools::chrome_daemon::{
     CliStatus, SessionRecovery, cli_path, cli_probe, cli_version, ensure_ready_for_actions,
@@ -2577,7 +2577,7 @@ fn settle_budget(remaining: Duration) -> Option<Duration> {
 /// before navigating, never after. The resolved wait target is the check's own
 /// by-product.
 fn open_args(url: &str, expect: Option<&str>) -> Result<Option<WaitTarget>, OutEnvelope> {
-    if let Err(e) = validate_url(url) {
+    if let Err(e) = crate::util::http::validate_url(url) {
         return Err(out_env(
             "open",
             false,

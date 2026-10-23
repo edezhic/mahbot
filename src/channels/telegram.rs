@@ -385,6 +385,9 @@ enum TelegramAttachmentKind {
     /// The `[FILE:...]` outbound kind — sent via `sendDocument`. Local image
     /// files also route through `sendDocument`; see [`Self::file_meta`].
     Document,
+    /// The `[VIDEO:...]` outbound kind. Delivered exactly like [`Self::Document`]
+    /// (see [`Self::meta`]); kept apart only because it accepts a wider set of
+    /// targets — any existing file or address — and is named in the chat.
     Video,
     Audio,
 }
@@ -411,63 +414,50 @@ struct TelegramAttachment {
 struct AttachmentMeta {
     api_method: &'static str,
     form_field: &'static str,
-    default_filename: &'static str,
-    label: &'static str,
     /// Send `disable_content_type_detection=true` with the multipart form so
     /// Telegram does not re-classify the upload server-side: an image sent as a
     /// general file would be re-encoded as a photo despite the sendDocument
-    /// path, and a file the assistant promised to send as a document would come
-    /// back as media.
+    /// path, and a video must not come back as a video message.
     disable_content_type_detection: bool,
 }
 
 impl TelegramAttachmentKind {
+    /// How the kind is named where the product reports it: in a chat fallback
+    /// ("Video: <address>") and in the delivery record's `kind` field.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Image => "Image",
+            Self::Document => "Document",
+            Self::Video => "Video",
+            Self::Audio => "Audio",
+        }
+    }
+
     const fn meta(self) -> AttachmentMeta {
         match self {
             Self::Image => AttachmentMeta {
                 api_method: "sendPhoto",
                 form_field: "photo",
-                default_filename: "photo.jpg",
-                label: "Image",
                 disable_content_type_detection: false,
             },
-            Self::Document => AttachmentMeta {
+            Self::Document | Self::Video => AttachmentMeta {
                 api_method: "sendDocument",
                 form_field: "document",
-                default_filename: "file",
-                label: "Document",
                 disable_content_type_detection: true,
-            },
-            Self::Video => AttachmentMeta {
-                api_method: "sendVideo",
-                form_field: "video",
-                default_filename: "video.mp4",
-                label: "Video",
-                disable_content_type_detection: false,
             },
             Self::Audio => AttachmentMeta {
                 api_method: "sendAudio",
                 form_field: "audio",
-                default_filename: "audio.mp3",
-                label: "Audio",
                 disable_content_type_detection: false,
             },
         }
     }
 
-    /// Metadata for local-file sends. Image files use the general-file path
-    /// (sendDocument) so recipients get the original bytes — sendPhoto always
-    /// re-encodes server-side. URL sends keep `meta()` (sendDocument-by-URL
-    /// only accepts .PDF/.ZIP), so this routing must not touch that path.
+    /// Metadata for local-file sends: a local image goes out as a document
+    /// (sendDocument) because sendPhoto always re-encodes server-side.
     const fn file_meta(self) -> AttachmentMeta {
         match self {
-            Self::Image => AttachmentMeta {
-                api_method: "sendDocument",
-                form_field: "document",
-                default_filename: "image",
-                label: "Image",
-                disable_content_type_detection: true,
-            },
+            Self::Image => Self::Document.meta(),
             _ => self.meta(),
         }
     }
@@ -697,14 +687,14 @@ fn normalize_video_filename(
         else {
             return filename.to_string();
         };
-        // Derive the extension from the declared MIME when available so a
-        // video/webm document isn't mislabeled as mp4.
-        let ext = match mime_type {
+        // From the declared type, so a `video/webm` or `video/quicktime` file is
+        // not mislabeled `mp4`.
+        let extension = match mime_type {
             Some("video/webm") => "webm",
             Some("video/quicktime") => "mov",
             _ => "mp4",
         };
-        format!("{stem}.{ext}")
+        format!("{stem}.{extension}")
     } else {
         filename.to_string()
     }
@@ -853,6 +843,62 @@ fn is_attachable_target(kind: TelegramAttachmentKind, target: &str) -> bool {
         // without the containment this gate does not do.
         TelegramAttachmentKind::Document => false,
     }
+}
+
+/// How an outbound attachment reaches Telegram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentRoute {
+    /// An existing local file, uploaded from disk.
+    LocalFile,
+    /// Telegram fetches the address itself: the image and audio methods. A
+    /// `[FILE:]` target is local-only, so no document arrives this way.
+    ByAddress,
+    /// The product fetches the bytes and uploads them unchanged: a video
+    /// addressed by a URL. Telegram's by-address document form accepts only a
+    /// couple of specific types, and a video message is not the delivery this
+    /// path makes.
+    FetchThenUpload,
+}
+
+/// Which route a target takes.
+fn attachment_route(kind: TelegramAttachmentKind, target: &str) -> AttachmentRoute {
+    if !is_http_url(target) {
+        return AttachmentRoute::LocalFile;
+    }
+    if kind == TelegramAttachmentKind::Video {
+        return AttachmentRoute::FetchThenUpload;
+    }
+    AttachmentRoute::ByAddress
+}
+
+/// The last path segment of an address, sanitized as a path component: the name
+/// a file fetched from it is uploaded under, and what a refusal names. `fallback`
+/// when the address names no file.
+fn address_file_name(url: &str, fallback: &str) -> String {
+    let parsed = url::Url::parse(url).ok();
+    parsed
+        .as_ref()
+        .and_then(url::Url::path_segments)
+        .and_then(|mut segments| segments.next_back())
+        .filter(|name| !name.is_empty())
+        .map_or_else(
+            || fallback.to_string(),
+            |name| sanitize_attachment_filename(name, fallback),
+        )
+}
+
+/// The name a fetched video is uploaded under: the address's own last segment,
+/// normalized to a video extension by the rule the receive direction uses, so the
+/// recipient's client can pick a player for it.
+fn video_upload_name(url: &str, content_type: Option<&str>) -> String {
+    let content_type = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    normalize_video_filename(
+        IncomingAttachmentKind::Video,
+        &address_file_name(url, "video"),
+        content_type,
+    )
 }
 
 /// Build the user-facing notice for a refused outbound file delivery.
@@ -1057,12 +1103,28 @@ impl TransferLimits {
         upload: TELEGRAM_LOCAL_MAX_UPLOAD_BYTES,
         request: None,
     };
+
+    /// The bound on one transfer as a duration: the transport's own when it sets
+    /// one, otherwise the day-long client bound that ends a hung socket.
+    fn request_bound(self) -> Duration {
+        self.request.unwrap_or(LOCAL_TRANSFER_BOUND)
+    }
 }
 
 /// The client the local server's transfers run on, built once.
 fn local_transfer_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| crate::util::http::build_http_client(LOCAL_TRANSFER_BOUND))
+}
+
+/// The client a fetched address runs on, built once: it follows no redirect of
+/// its own — [`crate::util::http::get_guarded`] screens each hop — and carries
+/// the day-long bound that ends a hung socket. The transfer bound in force bounds
+/// the whole transfer, body included (see
+/// [`TelegramChannel::fetch_remote_upload`]).
+fn fetch_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| crate::util::http::build_no_redirect_http_client(LOCAL_TRANSFER_BOUND))
 }
 
 /// Bot-API URL for `method` on the bot identified by `token`, at `api_base`.
@@ -1204,6 +1266,12 @@ const ATTACHMENT_SAVE_REFUSED_REASON: &str = "the file could not be saved locall
 struct UploadTooLarge {
     size: u64,
     max: u64,
+}
+
+/// The size refusal in an error's chain, if one of its causes is [`UploadTooLarge`].
+fn upload_too_large(err: &anyhow::Error) -> Option<&UploadTooLarge> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<UploadTooLarge>())
 }
 
 impl std::fmt::Display for UploadTooLarge {
@@ -2317,9 +2385,6 @@ impl TelegramChannel {
         dest: &Path,
         expected: Option<u64>,
     ) -> anyhow::Result<()> {
-        use futures_util::StreamExt as _;
-        use tokio::io::AsyncWriteExt as _;
-
         if self.local {
             // A local server has no `/file/…` route at all: it hands over a path
             // on this machine, and nothing else. Anything else here is a server
@@ -2387,28 +2452,10 @@ impl TelegramChannel {
 
         // The cloud reports no size for a large file, so the bound is enforced on the
         // stream as well as on the declared length.
-        let download_max = self.limits().download;
-        if let Some(max) = download_max {
-            anyhow::ensure!(
-                resp.content_length().is_none_or(|len| len <= max),
-                "{}",
-                telegram_download_limit_reason(max)
-            );
-        }
-
-        let mut file = tokio::fs::File::create(dest).await?;
-        let mut stream = resp.bytes_stream();
-        let mut written: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Telegram file download was cut off")?;
-            written += chunk.len() as u64;
-            if let Some(max) = download_max {
-                anyhow::ensure!(written <= max, "{}", telegram_download_limit_reason(max));
-            }
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        Ok(())
+        stream_capped(resp, dest, self.limits().download, |_, max| {
+            anyhow::anyhow!("{}", telegram_download_limit_reason(max))
+        })
+        .await
     }
 
     /// Extract attachment metadata from an incoming Telegram message.
@@ -2960,60 +3007,100 @@ impl TelegramChannel {
         thread_id: Option<&str>,
         attachment: &TelegramAttachment,
     ) -> anyhow::Result<()> {
+        let kind = attachment.kind;
         let target = attachment.target.trim();
+        let route = attachment_route(kind, target);
 
-        if is_http_url(target) {
-            let result = self
-                .send_media_by_url(chat_id, thread_id, attachment.kind, target)
-                .await;
-
-            // If sending media by URL failed (e.g. Telegram can't fetch the URL,
-            // wrong content type, etc.), fall back to sending the URL as a text link
-            // instead of losing the reply entirely.
-            if let Err(e) = result {
-                tracing::warn!(
-                    url = target,
-                    error = %e,
-                    "Telegram send media by URL failed; falling back to text link"
-                );
-                let fallback_text = format!("{}: {target}", attachment.kind.meta().label);
-                self.send_text_chunks(&fallback_text, chat_id, thread_id, None)
-                    .await?;
+        // Every arm either yields what to record or has already kept the target
+        // reachable as a link; the record is written once, below.
+        let (file, bytes, source_url) = match route {
+            AttachmentRoute::ByAddress => {
+                match self
+                    .send_media_by_url(chat_id, thread_id, kind, target)
+                    .await
+                {
+                    Ok(()) => (address_file_name(target, "file"), None, Some(target)),
+                    Err(e) => {
+                        self.fall_back_to_link(chat_id, thread_id, kind, target, &e)
+                            .await?;
+                        return Ok(());
+                    }
+                }
             }
+            AttachmentRoute::FetchThenUpload => {
+                let delivered = async {
+                    let fetched = self.fetch_remote_upload(target).await?;
+                    let size = self
+                        .send_media_file(chat_id, thread_id, kind, &fetched.path)
+                        .await?;
+                    Ok::<_, anyhow::Error>((fetched, size))
+                }
+                .await;
+                match delivered {
+                    Ok((fetched, size)) => (fetched.name, Some(size), Some(target)),
+                    // Oversize is a fact about the file, not a failed fetch: the
+                    // user gets the honest size notice instead of a link.
+                    Err(e) if upload_too_large(&e).is_some() => return Err(e),
+                    Err(e) => {
+                        self.fall_back_to_link(chat_id, thread_id, kind, target, &e)
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            AttachmentRoute::LocalFile => {
+                let path = Path::new(target);
+                if !path.is_file() {
+                    anyhow::bail!(
+                        "Telegram attachment target is not an existing regular file: {target}"
+                    );
+                }
+                let size = self.send_media_file(chat_id, thread_id, kind, path).await?;
+                (target.to_string(), Some(size), None)
+            }
+        };
 
-            return Ok(());
-        }
-
-        let path = Path::new(&target);
-        if !path.is_file() {
-            anyhow::bail!("Telegram attachment target is not an existing regular file: {target}");
-        }
-
-        self.send_media_file(chat_id, thread_id, attachment.kind, path)
-            .await
+        record_attachment_delivery(chat_id, kind, route, &file, bytes, source_url);
+        Ok(())
     }
 
-    /// Post a pre-built media request, check status, and log success.
-    async fn send_media(
+    /// Keep an address reachable when it cannot be delivered as media: log the
+    /// cause and put the address in the reply as a plain link instead of losing it.
+    async fn fall_back_to_link(
         &self,
         chat_id: &str,
+        thread_id: Option<&str>,
+        kind: TelegramAttachmentKind,
+        target: &str,
+        error: &anyhow::Error,
+    ) -> anyhow::Result<()> {
+        tracing::warn!(
+            url = %crate::util::http::redact_address(target),
+            error = %error,
+            "Telegram: an attachment could not be delivered; falling back to text link"
+        );
+        let text = format!("{}: {target}", kind.label());
+        self.send_text_chunks(&text, chat_id, thread_id, None).await
+    }
+
+    /// Post a pre-built media request and check its status. Success is recorded
+    /// by the caller, which knows what was delivered and how.
+    async fn send_media(
+        &self,
         api_method: &'static str,
         request: reqwest::RequestBuilder,
-        label: &str,
     ) -> anyhow::Result<()> {
         let resp = request.send().await?;
-        if !resp.status().is_success() {
-            let err = resp.text().await?;
-            anyhow::bail!("Telegram {api_method} failed: {err}");
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("Telegram {api_method} failed: {text}");
         }
-        // Debug: one record per successfully delivered attachment — routine traffic
-        // on a path whose failures are reported separately, at warn.
-        tracing::debug!("Telegram {api_method} sent to {chat_id}: {label}");
         Ok(())
     }
 
     /// Send a media file (image-as-file/document/video/audio) to a Telegram
-    /// chat.
+    /// chat, returning how many bytes were uploaded.
     ///
     /// The body streams from disk with its own length, so a large file is never
     /// read into memory; the mode's own upload limit is quoted when it is too
@@ -3024,13 +3111,8 @@ impl TelegramChannel {
         thread_id: Option<&str>,
         kind: TelegramAttachmentKind,
         file_path: &Path,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         let meta = kind.file_meta();
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(meta.default_filename);
-
         let limits = self.limits();
         let size = tokio::fs::metadata(file_path).await?.len();
         if size > limits.upload {
@@ -3060,11 +3142,11 @@ impl TelegramChannel {
                 .multipart(form),
         );
 
-        self.send_media(chat_id, meta.api_method, request, file_name)
-            .await
+        self.send_media(meta.api_method, request).await?;
+        Ok(size)
     }
 
-    /// Send a file by URL (Telegram will download it).
+    /// Send a file by address (Telegram will download it).
     async fn send_media_by_url(
         &self,
         chat_id: &str,
@@ -3084,9 +3166,148 @@ impl TelegramChannel {
                 .json(&body),
         );
 
-        self.send_media(chat_id, meta.api_method, request, url)
-            .await
+        self.send_media(meta.api_method, request).await
     }
+
+    /// Fetch a remote attachment's bytes into the daemon's private temp root so
+    /// they can be uploaded as a file.
+    ///
+    /// The address is model-supplied, so every hop is screened by the shared SSRF
+    /// guard. The bytes stream to disk — never held in memory — under the mode's
+    /// upload ceiling, so an oversized address is refused with the same honest
+    /// message a local file gets. The whole transfer — hops, headers and body —
+    /// lives under the bound this mode applies to any other transfer.
+    async fn fetch_remote_upload(&self, url: &str) -> anyhow::Result<FetchedUpload> {
+        let bound = self.limits().request_bound();
+        tokio::time::timeout(bound, async {
+            let max = self.limits().upload;
+            let response = crate::util::http::get_guarded(fetch_client(), url).await?;
+            if !response.status().is_success() {
+                anyhow::bail!("the address answered {}", response.status());
+            }
+            // The address last fetched: a redirect chain may end elsewhere, and
+            // that address is the one that names the file.
+            let fetched_url = response.url().as_str().to_string();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+
+            let dir = tempfile::Builder::new()
+                .prefix("telegram-upload-")
+                .tempdir()
+                .context("the temp directory for the fetched file could not be created")?;
+            let name = video_upload_name(&fetched_url, content_type.as_deref());
+            let path = dir.path().join(&name);
+            stream_capped(response, &path, Some(max), |size, max| {
+                UploadTooLarge { size, max }.into()
+            })
+            .await?;
+
+            Ok::<_, anyhow::Error>(FetchedUpload {
+                path,
+                name,
+                _dir: dir,
+            })
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "fetching {} did not finish within {bound:?}",
+                crate::util::http::redact_address(url)
+            )
+        })?
+    }
+}
+
+/// A remote attachment's bytes fetched into the daemon's temp root, removed
+/// with this value whatever the upload did; a process that dies mid-transfer
+/// leaves a directory the temp cleaner reclaims.
+struct FetchedUpload {
+    path: PathBuf,
+    /// The name the bytes are uploaded and recorded under.
+    name: String,
+    _dir: tempfile::TempDir,
+}
+
+/// Stream a response body into `dest`, refusing a body over `ceiling` on the
+/// declared length and again on the stream; `too_large` renders the refusal for
+/// the caller's own transport.
+async fn stream_capped(
+    response: reqwest::Response,
+    dest: &Path,
+    ceiling: Option<u64>,
+    too_large: impl Fn(u64, u64) -> anyhow::Error,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    if let (Some(max), Some(declared)) = (ceiling, response.content_length())
+        && declared > max
+    {
+        return Err(too_large(declared, max));
+    }
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut stream = response.bytes_stream();
+    let mut written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        // The transport's own error quotes the address it fetched, query and all;
+        // strip it here so no caller can log a caller-supplied address whole.
+        let chunk = chunk
+            .map_err(reqwest::Error::without_url)
+            .context("the transfer was cut off")?;
+        written += chunk.len() as u64;
+        if let Some(max) = ceiling
+            && written > max
+        {
+            return Err(too_large(written, max));
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+/// One record per delivered attachment: what went out, on which route, and from
+/// where. WARN is the level the log store keeps — INFO is swept after hours —
+/// and a delivery has no other durable trace.
+///
+/// `file` is the name the delivery carries: the path of a local file, the name the
+/// product gave a fetched upload, or the name an address's last segment suggests
+/// for a send Telegram fetches itself. `source_url` is that address for both
+/// remote routes, so every remote delivery answers one query. Both are recorded
+/// by [`crate::util::http::redact_address`]: no query, no fragment — a signed
+/// URL's credentials must not outlive the delivery, exactly as they are kept out
+/// of the chat and out of the errors logged on the same path. `bytes` is how many
+/// bytes the product uploaded; a by-address send has `None` — Telegram fetched and
+/// possibly re-encoded that file, so the product never learns its size.
+fn record_attachment_delivery(
+    chat_id: &str,
+    kind: TelegramAttachmentKind,
+    route: AttachmentRoute,
+    file: &str,
+    bytes: Option<u64>,
+    source_url: Option<&str>,
+) {
+    let (method, delivery) = match route {
+        AttachmentRoute::ByAddress => (kind.meta().api_method, "by address"),
+        AttachmentRoute::LocalFile | AttachmentRoute::FetchThenUpload => {
+            (kind.file_meta().api_method, "uploaded attachment")
+        }
+    };
+    let file = crate::util::http::redact_address(file);
+    let source_url = source_url.map(crate::util::http::redact_address);
+    tracing::warn!(
+        chat_id,
+        kind = kind.label(),
+        file,
+        method,
+        delivery,
+        bytes = ?bytes,
+        source_url = ?source_url,
+        "Telegram: attachment delivered"
+    );
 }
 
 /// Outcome of a single `getUpdates` poll.
@@ -4048,16 +4269,19 @@ impl Channel for TelegramChannel {
             if let Err(e) = self.send_attachment(chat_id, thread_id, attachment).await {
                 tracing::warn!(
                     error = %e,
-                    file = %attachment.target,
+                    file = %crate::util::http::redact_address(&attachment.target),
                     "Telegram: attachment delivery failed"
                 );
-                let name = file_name_or_path(&attachment.target);
-                let notice = match e
-                    .chain()
-                    .find_map(|cause| cause.downcast_ref::<UploadTooLarge>())
-                {
-                    Some(too_large) => file_refusal(name, &too_large.to_string()),
-                    None => file_refusal(name, ATTACHMENT_UPLOAD_FAILED_REASON),
+                // An address's name drops its query and fragment: a signed URL's
+                // credentials must never be quoted back into the chat.
+                let name = if is_http_url(&attachment.target) {
+                    address_file_name(&attachment.target, "file")
+                } else {
+                    file_name_or_path(&attachment.target).to_string()
+                };
+                let notice = match upload_too_large(&e) {
+                    Some(too_large) => file_refusal(&name, &too_large.to_string()),
+                    None => file_refusal(&name, ATTACHMENT_UPLOAD_FAILED_REASON),
                 };
                 if let Err(notice_err) = self
                     .send_text_chunks(&notice, chat_id, thread_id, None)

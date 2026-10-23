@@ -77,12 +77,7 @@
 //! kill follows. A probe takes NO margin: [`probe_clocks`] makes its bound its
 //! kill.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::LazyLock;
 use std::time::Duration;
-
-use ipnet::IpNet;
-use url::Host;
 
 pub(crate) mod actions;
 pub(crate) mod cli;
@@ -281,76 +276,6 @@ pub(crate) const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
 /// (cookie persistence is a feature).
 pub(crate) const CLI_EPHEMERAL_PREFIX: &str = "mahbot-chrome-ephemeral-";
 
-/// IP networks [`validate_url`] refuses to navigate to — the unambiguous
-/// metadata/link-local targets only: link-local (incl. the 169.254.169.254
-/// cloud-metadata endpoint), the 0.0.0.0/8 source-address space, the IPv6
-/// loopback, and all IPv4-mapped IPv6. Loopback (127.0.0.1) and RFC1918 are
-/// deliberately NOT blocked — driving the user's real browser for local dev is
-/// a legitimate scenario, and deny-lists are inherently bypass-prone.
-static DENIED_IP_NETS: LazyLock<[IpNet; 4]> = LazyLock::new(|| {
-    [
-        IpNet::new(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16)
-            .expect("169.254.0.0/16 is a valid IPv4 net"),
-        IpNet::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8).expect("0.0.0.0/8 is a valid IPv4 net"),
-        IpNet::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 128).expect("::1/128 is a valid IPv6 net"),
-        IpNet::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)), 96)
-            .expect("::ffff:0:0/96 is a valid IPv6 net"),
-    ]
-});
-
-/// Validate a URL is structurally safe to navigate to.
-///
-/// The SSRF guard is deliberately narrow: it blocks only the unambiguous
-/// metadata/link-local targets (see [`DENIED_IP_NETS`]), leaving loopback and
-/// RFC1918 reachable. A TLS-intercepting captive portal presenting a fake
-/// certificate still passes this structural check — that is caught at runtime
-/// by the chrome-error page detection, not here.
-pub(crate) fn validate_url(url: &str) -> anyhow::Result<()> {
-    let url = url.trim();
-
-    if url.is_empty() {
-        anyhow::bail!("URL cannot be empty");
-    }
-
-    // Block file:// case-insensitively — it bypasses SSRF controls.
-    if url.to_ascii_lowercase().starts_with("file://") {
-        anyhow::bail!("file:// URLs are not allowed in chrome automation");
-    }
-
-    // url::Url lowercases scheme+host, so "HTTP://EXAMPLE.COM" passes and
-    // scheme-less strings ("example.com") stay rejected. Parse error or a
-    // non-http(s) scheme is the same structural rejection.
-    let parsed = url::Url::parse(url)
-        .map_err(|_| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        anyhow::bail!("Only http:// and https:// URLs are allowed");
-    }
-
-    let Some(host) = parsed.host() else {
-        return Ok(());
-    };
-
-    let ip = match host {
-        Host::Domain(domain) => {
-            if domain.eq_ignore_ascii_case("metadata.google.internal") {
-                anyhow::bail!(
-                    "Refused to navigate to {url}: host {host} is a denied link-local/metadata address (SSRF guard)"
-                );
-            }
-            None
-        }
-        Host::Ipv4(addr) => Some(IpAddr::V4(addr)),
-        Host::Ipv6(addr) => Some(IpAddr::V6(addr)),
-    };
-    if ip.is_some_and(|ip| DENIED_IP_NETS.iter().any(|net| net.contains(&ip))) {
-        anyhow::bail!(
-            "Refused to navigate to {url}: host {host} is a denied link-local/metadata address (SSRF guard)"
-        );
-    }
-
-    Ok(())
-}
-
 /// A navigation that ends here never committed — the tab stayed on the scratch
 /// `about:blank` page (relay broken, navigation blocked, etc.). Keyed on the
 /// final URL only, so legitimately content-free pages (image URLs, PDFs, canvas
@@ -413,23 +338,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_validation_accepts_real_and_local_targets() {
-        for url in [
-            "https://example.com",
-            "HTTP://EXAMPLE.COM",
-            "https://EXAMPLE.com/path",
-            "http://localhost:3000",
-            "http://127.0.0.1",
-            "http://192.168.1.1",
-            "http://10.0.0.5",
-            // Canonicalizes to 127.0.0.1 — loopback is not blocked.
-            "http://0x7f000001/",
-        ] {
-            assert!(validate_url(url).is_ok(), "expected {url:?} to be accepted");
-        }
-    }
-
-    #[test]
     fn clocks_declare_the_verb_clock_and_ride_the_kill_above_it() {
         // No declared deadline: the product declares one kill margin under
         // chrome-use's own client tolerance (so the tool always gives up with its
@@ -481,44 +389,6 @@ mod tests {
                 kill: Duration::from_secs(60),
             }
         );
-    }
-
-    #[test]
-    fn url_validation_rejects_unsafe_targets() {
-        let err = validate_url("").unwrap_err();
-        assert!(err.to_string().contains("URL cannot be empty"));
-
-        for url in ["ftp://example.com", "example.com"] {
-            let err = validate_url(url).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("Only http:// and https:// URLs are allowed"),
-                "unexpected error for {url:?}: {err}"
-            );
-        }
-
-        for url in ["FILE:///etc/passwd", "file:///etc/passwd"] {
-            let err = validate_url(url).unwrap_err();
-            assert!(
-                err.to_string().contains("not allowed"),
-                "unexpected error for {url:?}: {err}"
-            );
-        }
-
-        for url in [
-            "http://169.254.169.254/",
-            "http://0.0.0.0/",
-            "http://0.1.2.3/",
-            "http://[::1]/",
-            "http://[::ffff:169.254.169.254]/",
-            "http://metadata.google.internal/computeMetadata/v1/",
-        ] {
-            let err = validate_url(url).unwrap_err();
-            assert!(
-                err.to_string().contains("SSRF guard"),
-                "unexpected error for {url:?}: {err}"
-            );
-        }
     }
 
     #[test]

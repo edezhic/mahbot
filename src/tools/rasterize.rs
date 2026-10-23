@@ -169,7 +169,7 @@ impl RasterizeTool {
             if page.is_some() {
                 return Err(page_is_for_pdf(requested));
             }
-            crate::chrome::validate_url(url)
+            crate::util::http::validate_url(url)
                 .map_err(|error| anyhow::anyhow!("cannot render {requested}: {error:#}"))?;
             let workspace = ws.as_path().to_string_lossy();
             let _permit = capture_permit().await;

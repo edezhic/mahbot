@@ -455,7 +455,7 @@ impl ChromeTool {
     /// per-tab lock is held for the full duration (navigate + extract) so
     /// concurrent callers targeting the same tab are serialized consistently.
     pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
-        crate::chrome::validate_url(url)?;
+        crate::util::http::validate_url(url)?;
 
         Self::ensure_available().await?;
 
@@ -1116,7 +1116,7 @@ impl ChromeTool {
     fn build_args(action: &ChromeAction) -> anyhow::Result<Vec<String>> {
         match action {
             ChromeAction::Open { url } => {
-                crate::chrome::validate_url(url)?;
+                crate::util::http::validate_url(url)?;
                 Ok(vec!["open".into(), url.clone()])
             }
             ChromeAction::Snapshot {
