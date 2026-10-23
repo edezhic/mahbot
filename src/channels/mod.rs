@@ -15,6 +15,7 @@ pub(crate) mod reply;
 pub mod telegram;
 mod telegram_group;
 pub(crate) mod telegram_intake;
+pub(crate) mod telegram_local;
 pub use chat_history::run_cap_loop;
 #[cfg(target_os = "macos")]
 pub(crate) use enrichment::marked_transcript;
@@ -36,6 +37,19 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
+
+/// Keep the optional self-hosted Telegram Bot API server alive, updated and
+/// clean, and finish any switch a crash interrupted. A no-op in the cloud mode
+/// beyond one cheap check a minute.
+pub async fn run_telegram_server_supervisor() {
+    telegram_local::run_supervisor().await;
+}
+
+/// Stop the self-hosted Telegram Bot API server, if this process runs one. Called
+/// from the exits that skip destructors as well as the ordinary shutdown.
+pub async fn stop_telegram_server() {
+    telegram_local::stop_for_exit().await;
+}
 
 /// Broadcast an agent response to CHAT_BROADCAST for live GUI display and
 /// persist it to chat_history. This is the canonical entry point for all

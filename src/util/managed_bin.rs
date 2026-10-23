@@ -149,6 +149,22 @@ pub(crate) fn parse_version_token(s: &str) -> Option<semver::Version> {
     semver::Version::parse(s.strip_prefix('v').unwrap_or(s)).ok()
 }
 
+/// A version whose publisher numbers it with fewer than three parts (`10.3`,
+/// `10.3.1`), padded to semver: the Bot API reports itself as `Bot API 10.3`,
+/// and its release tags carry the same two-part number.
+#[must_use]
+pub(crate) fn parse_short_version(text: &str) -> Option<semver::Version> {
+    let text = text.trim();
+    let mut parts = text.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(semver::Version::new(major, minor, patch))
+}
+
 /// The release version a tag carries. The helper's tags look like `v1.5.140`
 /// and bun's like `bun-v1.2.21`; a tag that is a bare version keeps its
 /// prerelease suffix (`v1.5.140-rc1`), so the whole tag is tried before its
@@ -478,10 +494,12 @@ fn zip_reason(error: &zip::result::ZipError) -> String {
     }
 }
 
-/// Make a freshly extracted/installed binary executable by resetting its full
-/// mode to 0o755. The failure message names the io kind only — never the path.
+/// Make a binary executable by resetting its full mode to 0o755: an archive may
+/// carry no mode at all, and both the place-then-install step and the probe that
+/// runs an extracted copy before placing it need one. The failure message names
+/// the io kind only — never the path.
 #[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), String> {
+pub(crate) fn set_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|e| {
         format!(
@@ -494,7 +512,7 @@ fn set_executable(path: &Path) -> Result<(), String> {
 // Callers use `?` uniformly, so the signature mirrors the Unix implementation.
 #[cfg(not(unix))]
 #[expect(clippy::unnecessary_wraps)]
-fn set_executable(_path: &Path) -> Result<(), String> {
+pub(crate) fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -720,6 +738,20 @@ mod tests {
         );
         assert_eq!(parse_version_token("latest"), None);
         assert_eq!(parse_version_token(""), None);
+    }
+
+    #[test]
+    fn a_two_part_version_pads_to_semver() {
+        assert_eq!(
+            parse_short_version("10.3"),
+            Some(semver::Version::new(10, 3, 0))
+        );
+        assert_eq!(
+            parse_short_version("10.3.1"),
+            Some(semver::Version::new(10, 3, 1))
+        );
+        assert_eq!(parse_short_version("Telegram Bot API"), None);
+        assert_eq!(parse_short_version("10.3.1.2"), None);
     }
 
     #[test]

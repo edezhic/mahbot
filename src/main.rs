@@ -282,6 +282,13 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::log_retention::run_retention_loop(log_store.clone()),
     );
 
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "telegram-bot-api",
+        mahbot::channels::run_telegram_server_supervisor(),
+    );
+
     // The chat window's conversation cap, and the repair of what a store
     // already holds past it (`mahbot::channels::chat_history`).
     spawn_cancellable(
@@ -594,29 +601,16 @@ fn init_message_pipeline(
     // Initialize the channel registry (empty — channels register below).
     let _ = mahbot::CHANNEL_REGISTRY.set(mahbot::ChannelRegistry::default());
 
-    // Only create and start the Telegram channel if a bot token is configured.
-    if let Some(token) = CONFIG.telegram_bot_token() {
-        use mahbot::channels::telegram::TelegramChannel;
-        let channel: std::sync::Arc<TelegramChannel> =
-            std::sync::Arc::new(TelegramChannel::new(token));
-        // Register bot commands with Telegram API (fire-and-forget, non-blocking).
-        tokio::spawn({
-            let tc = std::sync::Arc::clone(&channel);
-            async move {
-                tc.set_my_commands().await;
-            }
-        });
-        let channel: Arc<dyn Channel> = channel;
-        mahbot::channel_registry().register(Arc::clone(&channel));
-        spawn_cancellable(tasks, cancel, "telegram-listener", {
-            let channel = Arc::clone(&channel);
-            async move {
-                let _ = channel.listen(tx).await;
-            }
-        });
-    } else {
-        info!("No Telegram bot token configured — running in dashboard-only mode");
-    }
+    // The Telegram channel starts as a task of its own: which Bot API it talks to
+    // (the cloud, or the product's own local server) is decided by the mode the
+    // owner chose, and a switch that the last shutdown interrupted is finished
+    // before any listener runs.
+    spawn_cancellable(
+        tasks,
+        cancel,
+        "telegram-channel",
+        mahbot::channels::telegram::run_configured_channel(tx.clone()),
+    );
 
     // Always register the GUI channel — even in dashboard-only mode it provides
     // the bridge between the Iced UI and the message pipeline.
@@ -702,6 +696,11 @@ async fn shutdown_after_dashboard() {
     // writer is live. Relocated here from save_and_exit (which ran it while
     // background writers were still active — contradicting single-writer).
     mahbot::db::checkpoint::checkpoint_all_databases().await;
+
+    // The bot's local Bot API server is a child of this process: it goes away
+    // with it, so the next start finds nothing to adopt and cannot end up with
+    // two pollers on one bot token.
+    mahbot::channels::stop_telegram_server().await;
 }
 
 /// A short-lived current-thread runtime for a command-line entry point: each of

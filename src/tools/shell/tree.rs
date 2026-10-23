@@ -116,7 +116,10 @@
 //! `tools::shell::build_shell_command` through the shared start above — the shell
 //! tool, the diagnostics runner, the `custom` tool's script, a user's alarm program,
 //! and every step of a rewritten line's plan, [`super::plan`] included) with the grep
-//! engine's own probe (`tools::shell::grep_engine::probe_engine`); and the file
+//! engine's own probe (`tools::shell::grep_engine::probe_engine`); the
+//! self-hosted Telegram Bot API server (`channels::telegram_local::server::spawn`
+//! for the process it supervises, and `channels::telegram_local::server::reported_version_at`
+//! for the artifact's own `--version`); and the file
 //! manager (`gui::reveal_in_file_manager`).
 //!
 //! Not covered, on purpose: the terminal the owner opens inside the app
@@ -624,7 +627,7 @@ mod tests {
     /// The number of spawn sites the sweep must see — the module docs' inventory,
     /// counted. A site that constant and that inventory do not account for fails
     /// the sweep, and a scan that stopped reading the tree finds far fewer.
-    const SPAWN_SITES: usize = 16;
+    const SPAWN_SITES: usize = 18;
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()

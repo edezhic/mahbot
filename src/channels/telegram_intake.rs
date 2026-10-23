@@ -89,6 +89,23 @@ pub(crate) struct BurstRecord {
 }
 
 impl TelegramIntakeStore {
+    /// Drop every recorded event and burst.
+    ///
+    /// A switch of Bot API server invalidates the whole record at once: the two
+    /// servers number updates independently, so nothing recorded against one may
+    /// stand in for an event of the other's, and a row left behind would make a
+    /// fresh local event look handled. Called only after the listener has drained,
+    /// so no held event is lost by it.
+    pub(crate) async fn purge_all(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM telegram_intake", db::params![])
+            .await?;
+        self.conn
+            .execute("DELETE FROM telegram_bursts", db::params![])
+            .await?;
+        Ok(())
+    }
+
     /// Drop rows older than the retention bound. Whichever timestamp a row has
     /// decides its age: a resolved row ages from its decision, a row still held
     /// from its arrival. A row no run ever settled is dropped rather than kept
@@ -144,6 +161,12 @@ impl TelegramIntakeStore {
             .await?;
         Ok(())
     }
+}
+
+/// Delete the whole record: nothing a previous Bot API server gave the intake can
+/// stand in for the next one's events.
+pub(crate) async fn purge_all() -> Result<()> {
+    store().purge_all().await
 }
 
 /// The intake's durable record as one listener sees it: where the record lives,

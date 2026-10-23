@@ -1,0 +1,389 @@
+# The Bot API server's own release pipeline.
+#
+# This publishes this repository's builds of `tdlib/telegram-bot-api` — upstream
+# publishes source only, with no releases, no binaries and no container — for the
+# five platforms the product installs the server on. Its tag prefix is `tgapi-v`,
+# a stream of its own, apart from the product's releases (`v<version>`, which
+# `release.yml` owns), and nothing here runs on a `v*` tag.
+#
+# Every release in this stream is a prerelease, and that is what keeps the
+# product's own update channel untouched: `releases/latest` — read by
+# `src/self_update.rs`, `install.sh` and `install.ps1` — never names one, while a
+# release asset stays downloadable by a plain HTTP client, which is how the
+# product's installer (`src/channels/telegram_local/install.rs`) fetches the
+# server.
+#
+# One release carries all five of these, built natively, or none of them:
+#
+#   telegram-bot-api-<version>-linux-x86_64.tar.gz
+#   telegram-bot-api-<version>-linux-aarch64.tar.gz
+#   telegram-bot-api-<version>-macos-aarch64.tar.gz
+#   telegram-bot-api-<version>-macos-x86_64.tar.gz
+#   telegram-bot-api-<version>-windows-x86_64.zip
+#   SHA256SUMS                    one `<sha256>  <file>` line per archive
+#
+# Each archive holds one regular file named `telegram-bot-api`
+# (`telegram-bot-api.exe` on Windows); the installer finds it by name at any
+# depth and swaps it into place.
+#
+# `<version>` is the Bot API version the build implements, and it is never
+# written down in this file: it is read back out of the built binary's own
+# `--version` (`Bot API <major>.<minor>`), so a tag, an archive name and the
+# binary inside it cannot disagree. Bumping `TDLIB_COMMIT` to a newer upstream
+# revision — and dispatching this workflow — is therefore the only way a new
+# server version is published.
+#
+# No code signing and no notarization: each leg builds on the platform's own
+# machine, and the product downloads the artifact itself, so no quarantine
+# attribute is ever applied to it. Windows is built against the static C runtime
+# with static OpenSSL and zlib, so the owner needs neither a C++ redistributable
+# nor a DLL beside the exe.
+
+name: Telegram Bot API server
+
+# Dispatch only, on purpose: a `v*` tag is the product's own release mark, and a
+# server release is started by hand from a revision chosen by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'tdlib/telegram-bot-api commit to build instead of the pinned one'
+        required: false
+        type: string
+
+env:
+  # The pinned upstream revision every artifact is built from. It must stay at or
+  # after d7aff88 (2026-08-23), the revision that added `--files-dir`: the product
+  # spawns the server with that flag and an older binary refuses to start. Nothing
+  # else here names a version — the number comes out of the binary itself.
+  TDLIB_COMMIT: ${{ inputs.commit || 'e3e9dd8e5b3d7ab8537cd5a10dc31d5ffa8f82d1' }}
+
+permissions:
+  contents: write
+
+# One dispatch at a time: two runs publishing the same version would race for the
+# same tag, and the one that arrives second is meant to find the first one's
+# release and stop.
+concurrency:
+  group: tgapi-release
+  cancel-in-progress: false
+
+jobs:
+  # ── The five archives ─────────────────────────────────────────────────────
+
+  build:
+    name: Build ${{ matrix.target_os }}-${{ matrix.target_arch }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Spelled once: every archive name below is built from these two.
+      ASSET_OS: ${{ matrix.target_os }}
+      ASSET_ARCH: ${{ matrix.target_arch }}
+    strategy:
+      # Every leg runs to its own end even when one fails: a release needs all
+      # five, and the failing leg's own log is what the fix starts from.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target_os: linux
+            target_arch: x86_64
+          - runner: ubuntu-22.04-arm
+            target_os: linux
+            target_arch: aarch64
+          - runner: macos-14
+            target_os: macos
+            target_arch: aarch64
+          # Intel macOS. `macos-13` has been retired, so the image `release.yml`
+          # already builds its own x86_64 file on is the one used here.
+          - runner: macos-15-intel
+            target_os: macos
+            target_arch: x86_64
+          - runner: windows-latest
+            target_os: windows
+            target_arch: x86_64
+    steps:
+      # A commit, never a branch: repeating the same dispatch must build the same
+      # server. The TDLib sources are a submodule, so they come along.
+      - uses: actions/checkout@v4
+        with:
+          repository: tdlib/telegram-bot-api
+          ref: ${{ env.TDLIB_COMMIT }}
+          submodules: recursive
+
+      # OpenSSL, zlib and gperf are what the upstream tree needs, and CMake is
+      # what builds it. `libssl-dev` and `zlib1g-dev` carry the static archives
+      # the configure step insists on, so the artifact links nothing that must be
+      # present on the owner's machine.
+      - name: Install the build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake gperf libssl-dev zlib1g-dev
+
+      # macOS ships zlib as a dynamic library only, and Homebrew's `zlib` is what
+      # carries the static one; `openssl@3` is keg-only, so its prefix is handed
+      # to CMake below instead of being linked through the default paths.
+      - name: Install the build prerequisites (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake gperf openssl@3 zlib
+
+      # The static triplets are the point: `x64-windows-static` OpenSSL and zlib
+      # are the archives linked below, so the exe needs no DLL beside it. gperf
+      # is a build tool, taken from the dynamic triplet the upstream instructions
+      # name and handed to CMake by its full path, because vcpkg does not put
+      # tool ports on PATH.
+      - name: Install the build prerequisites (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install gperf:x64-windows `
+            openssl:x64-windows-static zlib:x64-windows-static
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DZLIB_USE_STATIC_LIBS=TRUE
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DZLIB_ROOT="$(brew --prefix zlib)" \
+            -DZLIB_USE_STATIC_LIBS=TRUE
+
+      # The static runtime, three ways: the target property, the release flags
+      # themselves, and the libraries above, which are `/MT` builds. The property
+      # needs CMP0091 on, because upstream declares `cmake_minimum_required(3.10)`
+      # and would otherwise leave it unused — hence the policy default and the
+      # flag, so whichever of the two takes effect the exe is the same.
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $static = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-static'
+          $gperf = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\tools\gperf\gperf.exe'
+          if (-not (Test-Path $gperf)) { throw "vcpkg installed no gperf at $gperf" }
+
+          cmake -S . -B build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_INSTALL_PREFIX=$env:RUNNER_TEMP\install" `
+            "-DOPENSSL_ROOT_DIR=$static" `
+            -DOPENSSL_USE_STATIC_LIBS=TRUE `
+            "-DZLIB_ROOT=$static" `
+            -DZLIB_USE_STATIC_LIBS=TRUE `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
+            "-DCMAKE_CXX_FLAGS_RELEASE=/MT /O2" `
+            "-DGPERF_EXECUTABLE=$gperf"
+
+      # `--config Release` is what picks the configuration on the Windows
+      # generator, which takes it here rather than from `CMAKE_BUILD_TYPE`; the
+      # single-configuration generators ignore it.
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Install into the staging directory
+        run: cmake --install build --config Release
+
+      # The version every name in this release carries, read from the binary that
+      # will be published rather than declared anywhere: a build of a different
+      # upstream revision tags and names itself accordingly.
+      - name: Read the Bot API version (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/install/bin/telegram-bot-api"
+          banner="$("$binary" --version 2>&1 | tr -d '\r')"
+          version="$(printf '%s\n' "$banner" \
+            | sed -nE 's/^Bot API ([0-9]+\.[0-9]+)$/\1/p' | tail -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::$binary --version printed no 'Bot API <major>.<minor>' line:"
+            printf '%s\n' "$banner"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "The artifact implements Bot API $version"
+
+      - name: Read the Bot API version (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:RUNNER_TEMP 'install\bin\telegram-bot-api.exe'
+          $banner = ((& $binary --version 2>&1 | Out-String) -replace "`r", '')
+          if ($banner -notmatch '(?m)^Bot API ([0-9]+)\.([0-9]+)$') {
+            Write-Host $banner
+            throw "$binary --version printed no 'Bot API <major>.<minor>' line"
+          }
+          $version = "$($Matches[1]).$($Matches[2])"
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          Write-Host "The artifact implements Bot API $version"
+
+      # The archive holds one regular file, under a folder named after the
+      # archive; the installer looks it up by name at any depth.
+      - name: Package the archive (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          name="telegram-bot-api-$VERSION-$ASSET_OS-$ASSET_ARCH"
+          mkdir -p "$RUNNER_TEMP/stage/$name" "$RUNNER_TEMP/dist"
+          cp "$RUNNER_TEMP/install/bin/telegram-bot-api" "$RUNNER_TEMP/stage/$name/telegram-bot-api"
+          chmod 0755 "$RUNNER_TEMP/stage/$name/telegram-bot-api"
+          # `COPYFILE_DISABLE` keeps macOS `tar` from adding `._` extended
+          # attribute entries beside the file.
+          COPYFILE_DISABLE=1 tar -czf "$RUNNER_TEMP/dist/$name.tar.gz" \
+            -C "$RUNNER_TEMP/stage" "$name"
+          cd "$RUNNER_TEMP/dist"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          cat "$name.tar.gz.sha256"
+
+      # One file at the archive's root, so no path separator has to be read back
+      # out of a zip entry name.
+      - name: Package the archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "telegram-bot-api-$env:VERSION-$env:ASSET_OS-$env:ASSET_ARCH"
+          $dist = Join-Path $env:RUNNER_TEMP 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $exe = Join-Path $env:RUNNER_TEMP 'install\bin\telegram-bot-api.exe'
+          $zip = Join-Path $dist "$name.zip"
+          Compress-Archive -Path $exe -DestinationPath $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          # Two spaces between digest and name: `sha256sum`'s own shape.
+          "$hash  $name.zip" | Out-File -FilePath "$zip.sha256" -Encoding ascii
+          Get-Content "$zip.sha256"
+
+      # Workflow artifacts are the hand-off to the job below only; what announces
+      # the server to the product is the release the next job publishes.
+      - name: Hand the archive to the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgapi-${{ matrix.target_os }}-${{ matrix.target_arch }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  # ── The release ───────────────────────────────────────────────────────────
+
+  # All five archives in one prerelease, plus the single checksum list that covers
+  # them. Nothing becomes visible before every file is here, and the tag is
+  # derived from what arrived, so it cannot name a version no artifact implements.
+  publish:
+    name: Publish the server prerelease
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download the five archives
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+
+      # One version, five platforms, one line per archive — and every digest
+      # checked against the file beside it, so a truncated upload ships nothing.
+      - name: Assemble SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dist"
+
+          shopt -s nullglob
+          archives=(telegram-bot-api-*.tar.gz telegram-bot-api-*.zip)
+          if [ "${#archives[@]}" -ne 5 ]; then
+            echo "::error::five archives were expected, ${#archives[@]} arrived"
+            exit 1
+          fi
+
+          pattern='^telegram-bot-api-([0-9]+\.[0-9]+)'
+          pattern+='-(linux|macos|windows)-(x86_64|aarch64)\.(tar\.gz|zip)$'
+
+          version=""
+          : > SHA256SUMS
+          for archive in "${archives[@]}"; do
+            if [[ ! "$archive" =~ $pattern ]]; then
+              echo "::error::$archive is not telegram-bot-api-<version>-<os>-<arch>.<ext>"
+              exit 1
+            fi
+            if [ -z "$version" ]; then
+              version="${BASH_REMATCH[1]}"
+            elif [ "$version" != "${BASH_REMATCH[1]}" ]; then
+              echo "::error::$archive implements Bot API ${BASH_REMATCH[1]}, not $version"
+              exit 1
+            fi
+
+            sidecar="$archive.sha256"
+            if [ ! -f "$sidecar" ]; then
+              echo "::error::$archive arrived without its checksum line"
+              exit 1
+            fi
+            line="$(tr -d '\r' < "$sidecar" | sed '/^$/d')"
+            digest="^[0-9a-f]{64}  ${archive//./\\.}\$"
+            if [[ ! "$line" =~ $digest ]]; then
+              echo "::error::$sidecar does not hold one '<sha256>  $archive' line: $line"
+              exit 1
+            fi
+            printf '%s\n' "$line" >> SHA256SUMS
+          done
+
+          missing=0
+          for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 windows-x86_64; do
+            case "$platform" in
+              windows-*) extension=zip ;;
+              *) extension=tar.gz ;;
+            esac
+            name="telegram-bot-api-$version-$platform.$extension"
+            if [ ! -f "$name" ]; then
+              echo "::error::$name did not arrive"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+          if ! sha256sum -c SHA256SUMS; then
+            echo "::error::an archive does not match the checksum line beside it"
+            exit 1
+          fi
+
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "Bot API $version: five archives, one checksum list"
+
+      - name: Publish the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dist"
+          tag="tgapi-v$VERSION"
+          notes="Bot API $VERSION server built from tdlib/telegram-bot-api@$TDLIB_COMMIT"
+
+          # An existing release is left alone: the product's installer compares
+          # versions, and assets changing under one tag would hand the owner a
+          # different build at the same version. A new server version means a
+          # newer upstream revision, and so a newer Bot API version.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$tag already exists — bump TDLIB_COMMIT to a newer upstream revision to publish a new server version, or delete that release by hand if it should never have existed"
+            exit 1
+          fi
+
+          # A prerelease, so `releases/latest` keeps naming the product's own
+          # release; the tag points at the commit this run started from.
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Bot API $VERSION server" \
+            --notes "$notes" \
+            telegram-bot-api-*.tar.gz \
+            telegram-bot-api-*.zip \
+            SHA256SUMS

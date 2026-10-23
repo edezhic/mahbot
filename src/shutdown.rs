@@ -11,9 +11,9 @@
 //!
 //! The product's closing path is the library's `gui::Dashboard::save_and_exit` (draft flush,
 //! window state, the token fired before the iced runtime drops) and the binary's
-//! `shutdown_after_dashboard` (browser release, background-task join, store checkpoint). The exits
-//! below run none of it, and are listed here once so that the rest of the tree points at this list
-//! instead of restating it:
+//! `shutdown_after_dashboard` (browser release, background-task join, store checkpoint, the stop of
+//! the supervised Telegram Bot API server child). The exits below run none of it, and are listed
+//! here once so that the rest of the tree points at this list instead of restating it:
 //!
 //! - a platform-forced termination (Force Quit, a `SIGKILL`): nothing can intercept it; a plain
 //!   `kill` is SIGTERM, which the product handles once its signal task is installed;
@@ -34,6 +34,11 @@
 //!   process the same way;
 //! - the exit bound `macos_quit` arms for a taken-over quit: a hard `_exit` with no closing steps
 //!   after the closing path has failed to finish within it, the same class as a force quit.
+//!
+//! The closing path stops the supervised Telegram Bot API server child. The exits listed above run
+//! none of that path, so they leave the child running; the next start adopts or reaps it — by
+//! verifying the process it recorded, never by signalling a pid it cannot verify — so nothing is
+//! left serving beside a new one.
 //!
 //! A Windows session end is not on that list: the listener stops the daemon like any other stop
 //! request, so the closing path runs, bounded by the deadline the platform gave it — except for a

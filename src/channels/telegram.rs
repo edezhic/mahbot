@@ -868,7 +868,11 @@ fn file_refusal(name: &str, reason: &str) -> String {
 /// directory and size checks, so a refusal does not disclose which of those the
 /// target is. The notice names a bounded prefix of the target, which a
 /// malformed marker can make an arbitrary blob. `Err` is that notice.
-fn resolve_file_target(target: &str, file_roots: &[PathBuf]) -> Result<PathBuf, String> {
+fn resolve_file_target(
+    target: &str,
+    file_roots: &[PathBuf],
+    upload_max: u64,
+) -> Result<PathBuf, String> {
     let name = crate::util::truncate(file_name_or_path(target), 60);
 
     // `[FILE:...]` is a local-only mechanism; a URL belongs to the other kinds.
@@ -925,14 +929,14 @@ fn resolve_file_target(target: &str, file_roots: &[PathBuf]) -> Result<PathBuf, 
     if meta.is_dir() {
         return Err(file_refusal(&name, "it is a directory."));
     }
-    if meta.len() > FILE_MAX_BYTES {
+    if meta.len() > upload_max {
         return Err(file_refusal(
             &name,
-            &format!(
-                "it is {} MB, larger than the {} MB limit.",
-                meta.len().div_ceil(1024 * 1024),
-                mb(FILE_MAX_BYTES)
-            ),
+            &UploadTooLarge {
+                size: meta.len(),
+                max: upload_max,
+            }
+            .to_string(),
         ));
     }
 
@@ -958,6 +962,7 @@ fn resolve_file_target(target: &str, file_roots: &[PathBuf]) -> Result<PathBuf, 
 fn parse_attachment_markers(
     message: &str,
     file_roots: &[PathBuf],
+    limits: TransferLimits,
 ) -> (String, Vec<TelegramAttachment>, Vec<String>) {
     let mut attachments: Vec<TelegramAttachment> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
@@ -968,7 +973,7 @@ fn parse_attachment_markers(
             let path = path.trim();
 
             if marker_kind == MediaMarkerKind::File {
-                match resolve_file_target(path, file_roots) {
+                match resolve_file_target(path, file_roots, limits.upload) {
                     Ok(canonical) => attachments.push(TelegramAttachment {
                         kind: TelegramAttachmentKind::Document,
                         target: canonical.to_string_lossy().into_owned(),
@@ -998,13 +1003,77 @@ fn parse_attachment_markers(
     (cleaned.trim().to_string(), attachments, refusals)
 }
 
-/// Base URL for the Telegram Bot API.
-const API_BASE: &str = "https://api.telegram.org";
+/// Base URL for Telegram's cloud Bot API.
+pub(crate) const CLOUD_API_BASE: &str = "https://api.telegram.org";
+
+/// The base the transport must use right now: the cloud, or the local server's
+/// own endpoint. `None` means the configured mode is the local server and it has
+/// no endpoint yet — no listener may run, because the only other endpoint would
+/// be the cloud the bot has just left.
+fn active_base() -> Option<String> {
+    match crate::channels::telegram_local::serving_mode() {
+        crate::channels::telegram_local::Mode::Cloud => Some(CLOUD_API_BASE.to_string()),
+        crate::channels::telegram_local::Mode::Local => {
+            crate::channels::telegram_local::local_endpoint()
+        }
+    }
+}
+
+/// What one transfer may be in the mode in force.
+///
+/// The cloud caps a bot at 20 MB per download and 50 MB per upload; the local
+/// server removes the download cap and accepts 2000 MB per upload. The numbers
+/// are the transport's own statement of the limit in force, so every refusal
+/// quotes the limit that actually applies.
+#[derive(Clone, Copy, Debug)]
+struct TransferLimits {
+    /// The largest file the bot may take in — `None` when the transport imposes
+    /// no cap of its own.
+    download: Option<u64>,
+    /// The largest file the bot may send.
+    upload: u64,
+    /// The bound on one transfer request — `None` when the transport imposes no
+    /// bound of its own. The local client's own day-long bound still applies, so
+    /// no real file fails on it and a hung socket still ends.
+    request: Option<Duration>,
+}
+
+/// The total bound on one transfer to the local server: a day is long enough that
+/// no real file fails on it, short enough that a hung socket still ends.
+const LOCAL_TRANSFER_BOUND: Duration = Duration::from_hours(24);
+
+impl TransferLimits {
+    /// The cloud's limits.
+    const CLOUD: Self = Self {
+        download: Some(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES),
+        upload: FILE_MAX_BYTES,
+        request: Some(MEDIA_TRANSFER_TIMEOUT),
+    };
+
+    /// The local server's limits: no download cap, 2000 MB per upload, no total
+    /// request bound.
+    const LOCAL: Self = Self {
+        download: None,
+        upload: TELEGRAM_LOCAL_MAX_UPLOAD_BYTES,
+        request: None,
+    };
+}
+
+/// The client the local server's transfers run on, built once.
+fn local_transfer_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| crate::util::http::build_http_client(LOCAL_TRANSFER_BOUND))
+}
 
 /// Bot-API URL for `method` on the bot identified by `token`, at `api_base`.
 fn bot_api_url(api_base: &str, token: &str, method: &str) -> String {
     format!("{api_base}/bot{token}/{method}")
 }
+
+/// What a refused `getMe` starts with when the platform rejected the token, as
+/// opposed to failing to answer. One spelling, so whoever reads the error can tell
+/// a rejected pair from an unreachable endpoint without parsing the sentence.
+pub(crate) const REJECTED_TOKEN_PREFIX: &str = "Telegram rejected the bot token — ";
 
 /// The `getMe` answer for `token` at `api_base`, once the platform has confirmed
 /// the token is one of its own.
@@ -1030,13 +1099,17 @@ async fn get_me(
     };
     if !status.is_success() || data["ok"].as_bool() != Some(true) {
         let desc = data["description"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("Invalid Telegram bot token: {desc}");
+        anyhow::bail!("{REJECTED_TOKEN_PREFIX}{desc}");
     }
     Ok(data)
 }
 
-/// Telegram Bot API maximum file download size.
-const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+/// Telegram Bot API maximum file download size on the cloud. The enrichment
+/// gate reuses it as the automatic-processing bound.
+pub(crate) const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+
+/// The largest file a local Bot API server accepts per upload.
+const TELEGRAM_LOCAL_MAX_UPLOAD_BYTES: u64 = 2000 * 1024 * 1024;
 
 /// A byte cap as the whole-MB figure the user-facing notices quote, derived from
 /// the cap itself so the text cannot drift from the number enforced.
@@ -1044,18 +1117,20 @@ fn mb(bytes: u64) -> u64 {
     bytes / (1024 * 1024)
 }
 
-/// User-facing reason when a declared attachment size exceeds the
-/// product-level [`FILE_MAX_BYTES`] cap.
-fn file_too_large_reason() -> String {
-    format!("the file exceeds the {} MB limit", mb(FILE_MAX_BYTES))
+/// User-facing reason when a declared attachment size exceeds the inbound limit
+/// of the mode in force, or `None` when it fits.
+#[must_use]
+fn declared_size_refusal(limits: TransferLimits, size: u64) -> Option<String> {
+    let download = limits.download?;
+    (size > download).then(|| telegram_download_limit_reason(download))
 }
 
 /// User-facing reason when a declared attachment size exceeds Telegram's own
-/// bot-download limit (which is stricter than [`FILE_MAX_BYTES`]).
-fn telegram_download_limit_reason() -> String {
+/// bot-download limit — which only exists on the cloud.
+fn telegram_download_limit_reason(download: u64) -> String {
     format!(
         "Telegram only lets the bot download files up to {} MB",
-        mb(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES)
+        mb(download)
     )
 }
 
@@ -1075,6 +1150,27 @@ const ATTACHMENT_DOWNLOAD_TIMEOUT_REASON: &str = "the download took too long and
 /// the connection failed before a response. Like the timeout, that is this
 /// side's failure and not a refusal by the transport.
 const ATTACHMENT_DOWNLOAD_FAILED_REASON: &str = "the connection to Telegram failed";
+
+/// Reported when the local server did not hand over a file it said it had. The
+/// local server serves no download route, so the file must already be on disk.
+const LOCAL_FILE_MISSING_REASON: &str =
+    "the local Bot API server did not hand the file over — it is not on this machine";
+
+/// Reported when the local server names a file outside the directory it was
+/// given: the product only ever takes back what it handed over.
+const LOCAL_FILE_OUTSIDE_REASON: &str =
+    "the local Bot API server handed over a file that is not its own";
+
+/// How long a hand-over may take in total before it is treated as one that will
+/// not finish. A bound on the whole wait, not on a pause: a write stall is
+/// ordinary at the sizes this feature exists for, and only a hand-over that never
+/// reaches the declared size is refused.
+const LOCAL_HANDOVER_WAIT: Duration = Duration::from_mins(30);
+
+/// How long the file may take to appear at all. A hand-over naming a path that
+/// never comes into being is a broken answer, not a slow transfer, and waiting the
+/// whole [`LOCAL_HANDOVER_WAIT`] for it would hold the batch for half an hour.
+const LOCAL_HANDOVER_APPEAR: Duration = Duration::from_mins(1);
 
 /// Reported when Telegram did not return a download path for an attachment the
 /// bot is otherwise allowed to fetch — an API or network failure, not a size
@@ -1100,6 +1196,29 @@ const ATTACHMENT_DIR_REFUSED_REASON: &str =
 /// transport's own refusals.
 const ATTACHMENT_SAVE_REFUSED_REASON: &str = "the file could not be saved locally";
 
+/// An outbound file larger than the upload limit of the mode in force.
+///
+/// Its text names the limit and nothing else — no path, no URL — so it is safe to
+/// render into the chat, unlike the transport's own errors.
+#[derive(Debug)]
+struct UploadTooLarge {
+    size: u64,
+    max: u64,
+}
+
+impl std::fmt::Display for UploadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "it is {} MB, larger than the {} MB limit.",
+            self.size.div_ceil(1024 * 1024),
+            mb(self.max)
+        )
+    }
+}
+
+impl std::error::Error for UploadTooLarge {}
+
 /// User-facing reason when the transport failed to deliver a local file that
 /// passed the product-level size check.
 ///
@@ -1114,34 +1233,140 @@ const ATTACHMENT_UPLOAD_FAILED_REASON: &str = "the upload failed";
 #[cfg(not(target_os = "macos"))]
 const VOICE_UNSUPPORTED_REASON: &str = "voice messages are not supported on this platform";
 
-/// The refusal reason for an attachment whose *declared* size exceeds a limit,
-/// or `None` when it is within both. The product cap is checked first, so a
-/// size over both reports that one.
-#[must_use]
-fn declared_size_refusal(size: u64) -> Option<String> {
-    if size > FILE_MAX_BYTES {
-        Some(file_too_large_reason())
-    } else if size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
-        Some(telegram_download_limit_reason())
-    } else {
-        None
+/// The local server's hand-over produced no usable file.
+///
+/// A type of its own, with one variant per fault, so the refusal reaches the owner
+/// as the hand-over failure it is — "it is not on this machine", "it is not its
+/// own", "it stopped short" — instead of one sentence standing for all of them.
+#[derive(Debug)]
+enum LocalHandOver {
+    /// It named no path on this machine, or one that is not there. A hand-over
+    /// root that cannot be resolved lands here too: nothing can be taken from a
+    /// directory that does not exist.
+    Missing,
+    /// It named a file outside the directory the product gave it.
+    Outside,
+    /// It handed over fewer bytes than the attachment declared.
+    Incomplete { got: u64, expected: u64 },
+}
+
+impl LocalHandOver {
+    /// The user-facing reason, in the terms of the variant.
+    fn reason(&self) -> String {
+        match self {
+            Self::Missing => LOCAL_FILE_MISSING_REASON.to_string(),
+            Self::Outside => LOCAL_FILE_OUTSIDE_REASON.to_string(),
+            Self::Incomplete { got, expected } => local_file_incomplete_reason(*got, *expected),
+        }
     }
 }
 
-/// The user-facing reason for a failed inbound download. Only what Telegram
-/// itself answered — an error status, or a body over the product cap — is a
-/// refusal; a transfer that got no answer at all (a `reqwest` error in the
-/// chain, whether it timed out or the connection failed) is reported as the
-/// failure on this side that it is.
-fn download_failure_reason(error: &anyhow::Error) -> &'static str {
-    match error
+impl std::fmt::Display for LocalHandOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason())
+    }
+}
+
+impl std::error::Error for LocalHandOver {}
+
+/// User-facing reason when the local server handed over fewer bytes than the
+/// attachment declared: what is on disk is a truncated copy, so it is refused
+/// rather than delivered short. Both counts are in the sentence, which is why the
+/// text is built rather than held as a constant.
+fn local_file_incomplete_reason(got: u64, expected: u64) -> String {
+    format!(
+        "the local Bot API server handed over {got} of {expected} bytes — the transfer did not finish"
+    )
+}
+
+/// Wait for a handed-over path to become the file Telegram declared.
+///
+/// `getFile` normally answers after the server has written the file, but an
+/// answer that races the write is cheap to absorb: the path is waited for until
+/// its size reaches `expected`.
+///
+/// Completeness is decided against the declared size, never by a pause: a size
+/// that stops changing *short* of `expected` is a write stall — a page-cache
+/// flush, a busy disk — and the wait goes on, however long the stall lasts, until
+/// the size is reached or [`LOCAL_HANDOVER_WAIT`] runs out. With no declared size
+/// there is nothing to compare against, and a size that no longer changes is all
+/// the evidence there is. A file that never appears at all is a hand-over that
+/// names nothing, and is given up on after [`LOCAL_HANDOVER_APPEAR`].
+async fn wait_for_hand_over(path: &Path, expected: Option<u64>) -> anyhow::Result<()> {
+    let started = tokio::time::Instant::now();
+    let mut previous: Option<u64> = None;
+    loop {
+        let size = tokio::fs::metadata(path)
+            .await
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|meta| meta.len());
+        match (size, expected) {
+            // A declared size is what Telegram says the file is: reaching it is
+            // complete, and a file at least that large is whole too.
+            (Some(size), Some(expected)) if size >= expected => return Ok(()),
+            // Nothing to compare against: a size that no longer changes is all the
+            // evidence there is.
+            (Some(size), None) if previous == Some(size) => return Ok(()),
+            _ => {}
+        }
+        let bound = if size.is_some() {
+            LOCAL_HANDOVER_WAIT
+        } else {
+            LOCAL_HANDOVER_APPEAR
+        };
+        if started.elapsed() >= bound {
+            return Err(match (size, expected) {
+                // A file that is there but short is a transfer that did not finish;
+                // one that never appeared is a hand-over that named nothing.
+                (Some(size), Some(expected)) => LocalHandOver::Incomplete {
+                    got: size,
+                    expected,
+                },
+                _ => LocalHandOver::Missing,
+            }
+            .into());
+        }
+        previous = size;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The user-facing reason for a failed inbound download. A write that failed on
+/// this side is storage, not the transport; only what Telegram itself answered —
+/// an error status, or a body over the limit in force — is a refusal; a transfer
+/// that got no answer at all (a `reqwest` error in the chain, whether it timed out
+/// or the connection failed) is reported as the failure on this side that it is.
+///
+/// The local hand-over's own failures come after those, in its own words
+/// ([`LocalHandOver`]). Anything unrecognised is still the transport's refusal.
+fn download_failure_reason(error: &anyhow::Error) -> String {
+    // The transport first: a `reqwest` error wraps the socket's own io error, so
+    // testing io first would report a broken connection as a local write failure.
+    if let Some(e) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
     {
-        Some(e) if e.is_timeout() => ATTACHMENT_DOWNLOAD_TIMEOUT_REASON,
-        Some(_) => ATTACHMENT_DOWNLOAD_FAILED_REASON,
-        None => TELEGRAM_TRANSFER_REFUSED_REASON,
+        let reason = if e.is_timeout() {
+            ATTACHMENT_DOWNLOAD_TIMEOUT_REASON
+        } else {
+            ATTACHMENT_DOWNLOAD_FAILED_REASON
+        };
+        return reason.to_string();
     }
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+    {
+        return ATTACHMENT_SAVE_REFUSED_REASON.to_string();
+    }
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<LocalHandOver>())
+        .map_or_else(
+            || TELEGRAM_TRANSFER_REFUSED_REASON.to_string(),
+            LocalHandOver::reason,
+        )
 }
 
 /// Change-detection state for a chat's per-user command menu refresh.
@@ -1162,9 +1387,14 @@ pub struct TelegramChannel {
     /// channel's listener, not the entire application.
     cancel: std::sync::Arc<tokio_util::sync::CancellationToken>,
 
-    /// The Bot API base this listener calls — [`API_BASE`] in production, and an
-    /// endpoint of its own when a check drives the intake.
+    /// The Bot API base this listener calls — the cloud, or the product's own
+    /// local server's endpoint.
     api_base: String,
+    /// Whether that base is the local server's: its transfer limits, its
+    /// file-on-disk hand-over and its unbounded transfers differ from the cloud's.
+    /// A field of its own, not `api_base != CLOUD_API_BASE`, so a channel pointed
+    /// at an endpoint of its own in a check is still a cloud channel.
+    local: bool,
     /// The intake's durable store, resolved the first time a listener runs (the
     /// stores open after the channel is built).
     intake_store: std::sync::OnceLock<TelegramIntakeStore>,
@@ -1570,11 +1800,20 @@ const LEGACY_FORWARD_FIELDS: [(&str, ForwardLabel); 3] = [
 
 impl TelegramChannel {
     /// Internal constructor every other constructor builds on.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reqwest::Client::build()` fails — with reqwest 0.13's
+    /// `rustls-no-provider` TLS stack this happens when no rustls crypto
+    /// provider is installed. `util::http::install_ring_provider` installs
+    /// the ring provider before the client is built (the TLS stack is
+    /// rustls/ring — OpenSSL is not involved).
     #[must_use]
-    fn new_with(bot_token: String, api_base: String) -> Self {
+    fn new_with(bot_token: String, api_base: String, local: bool) -> Self {
         Self {
             bot_token,
             api_base,
+            local,
             http_client: crate::util::http::build_http_client(Duration::from_mins(1)),
             cancel: std::sync::Arc::new(tokio_util::sync::CancellationToken::new()),
             intake_store: std::sync::OnceLock::new(),
@@ -1586,18 +1825,6 @@ impl TelegramChannel {
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
         }
-    }
-
-    /// # Panics
-    ///
-    /// Panics if `reqwest::Client::build()` fails — with reqwest 0.13's
-    /// `rustls-no-provider` TLS stack this happens when no rustls crypto
-    /// provider is installed. `util::http::install_ring_provider` installs
-    /// the ring provider before the client is built (the TLS stack is
-    /// rustls/ring — OpenSSL is not involved).
-    #[must_use]
-    pub fn new(bot_token: String) -> Self {
-        Self::new_with(bot_token, API_BASE.to_string())
     }
 
     /// The intake's store for this process.
@@ -1616,7 +1843,46 @@ impl TelegramChannel {
     fn for_test(bot_token: String, api_base: String, store: TelegramIntakeStore) -> Self {
         Self {
             intake_store: std::sync::OnceLock::from(store),
-            ..Self::new_with(bot_token, api_base)
+            ..Self::new_with(bot_token, api_base, false)
+        }
+    }
+
+    /// The channel the configured mode serves, or `None` when that mode is the
+    /// local server and it has no endpoint yet — in which case no listener may
+    /// run at all.
+    #[must_use]
+    fn from_config(bot_token: String) -> Option<Self> {
+        let local = crate::channels::telegram_local::serving_mode()
+            == crate::channels::telegram_local::Mode::Local;
+        Some(Self::new_with(bot_token, active_base()?, local))
+    }
+
+    /// The client one transfer runs on: the shared one in the cloud mode, and one
+    /// whose total bound is not sized for a small file in the local mode.
+    fn transfer_client(&self) -> &reqwest::Client {
+        if self.local {
+            local_transfer_client()
+        } else {
+            &self.http_client
+        }
+    }
+
+    /// `request` under the bound the transport imposes on one transfer: the cloud's
+    /// own, or none at all in the local mode — where the client's day-long bound is
+    /// what ends a hung socket.
+    fn with_transfer_bound(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.limits().request {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
+    }
+
+    /// The transfer limits of the server this channel talks to.
+    fn limits(&self) -> TransferLimits {
+        if self.local {
+            TransferLimits::LOCAL
+        } else {
+            TransferLimits::CLOUD
         }
     }
 
@@ -1922,15 +2188,66 @@ impl TelegramChannel {
         });
     }
 
-    /// Validate a Telegram bot token by calling the `getMe` endpoint.
-    /// Returns `Ok(())` if the token is valid, `Err` with a descriptive
-    /// message otherwise.
+    /// Validate a Telegram bot token by asking the Bot API the current mode serves
+    /// for it. Returns `Ok(())` if that base accepts the token, `Err` with the cause
+    /// otherwise.
+    ///
+    /// There is no fallback to the cloud: once the bot has left it, a token-bearing
+    /// cloud request logs the bot back in there and splits its updates. In local
+    /// mode with no published endpoint there is nothing to ask, so nothing is
+    /// checked — the token is saved and the switch reports what the server says when
+    /// it can. A save must stay possible in that state: the token field may be what
+    /// fixes the bot.
     pub async fn validate_token(token: &str) -> anyhow::Result<()> {
         if token.trim().is_empty() {
             anyhow::bail!("Telegram bot token is empty");
         }
+        let Some(base) = active_base() else {
+            tracing::info!(
+                "Telegram: the local server has no endpoint yet, so the token is kept unchecked"
+            );
+            return Ok(());
+        };
         let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
-        get_me(&client, API_BASE, token).await.map(|_| ())
+        get_me(&client, &base, token).await.map(|_| ())
+    }
+
+    /// The bot's own account id at `api_base` — the same call as validation,
+    /// asked for what it says rather than whether it worked.
+    pub(crate) async fn probe_bot(api_base: &str, token: &str) -> anyhow::Result<i64> {
+        let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
+        let data = get_me(&client, api_base, token).await?;
+        data["result"]["id"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("the Bot API named no bot account"))
+    }
+
+    /// Take the bot out of a Bot API server (`logOut`), the step that lets it be
+    /// served by another one.
+    ///
+    /// A server that already considers the bot logged out (`401`, `Logged out`)
+    /// is the state this asks for, not a failure: the switch is resumable and
+    /// must not be stuck on a step that has nothing left to do.
+    pub(crate) async fn log_out(api_base: &str, token: &str) -> anyhow::Result<()> {
+        let client = crate::util::http::build_http_client(std::time::Duration::from_secs(30));
+        let response = client
+            .post(bot_api_url(api_base, token, "logOut"))
+            .send()
+            .await
+            .context("the Bot API could not be reached")?;
+        let data: serde_json::Value = response.json().await.unwrap_or_default();
+        if data["ok"].as_bool() == Some(true) {
+            return Ok(());
+        }
+        let description = data["description"].as_str().unwrap_or("no reason given");
+        // Only "already out" is the state this asks for. A bare `401 Unauthorized`
+        // is a token the server does not know, which must not be mistaken for a
+        // completed logOut — the switch would then record having left a server the
+        // bot is still logged into.
+        if description.to_ascii_lowercase().contains("logged out") {
+            return Ok(());
+        }
+        anyhow::bail!("{description}")
     }
 
     fn handle_non_parseable_message(update: &serde_json::Value) {
@@ -1945,38 +2262,121 @@ impl TelegramChannel {
         tracing::debug!("Telegram: message not parseable (unsupported type), skipping: {text}");
     }
 
-    /// Get the file path for a Telegram file ID via the Bot API.
-    async fn get_file_path(&self, file_id: &str) -> anyhow::Result<String> {
+    /// Get the file path for a Telegram file ID via the Bot API, with the size the
+    /// server reports for it when it reports one.
+    async fn get_file_path(&self, file_id: &str) -> anyhow::Result<(String, Option<u64>)> {
         let url = self.api_url("getFile");
-        let resp = self
-            .http_client()
-            .get(&url)
-            .query(&[("file_id", file_id)])
+        // A local server answers only once it has the file, so this request carries
+        // the mode's own bound: a 1-minute client would cut a large fetch off before
+        // the transfer itself was ever asked for.
+        let request = self.with_transfer_bound(
+            self.transfer_client()
+                .get(&url)
+                .query(&[("file_id", file_id)]),
+        );
+        let resp = request
             .send()
             .await
             .context("Failed to call Telegram getFile")?;
 
         let data: serde_json::Value = resp.json().await?;
-        data.get("result")
-            .and_then(|r| r.get("file_path"))
+        let result = data
+            .get("result")
+            .context("Telegram getFile: missing result in response")?;
+        let path = result
+            .get("file_path")
             .and_then(serde_json::Value::as_str)
             .map(String::from)
-            .context("Telegram getFile: missing file_path in response")
+            .context("Telegram getFile: missing file_path in response")?;
+        // The size is the one fact that makes a hand-over with no declared size
+        // checkable: the message sometimes carries none, the server always does.
+        let size = result.get("file_size").and_then(serde_json::Value::as_u64);
+        Ok((path, size))
     }
 
-    /// Download a file from the Telegram CDN.
+    /// Fetch one file into `dest`, streaming it there.
     ///
-    /// Bounded by [`FILE_MAX_BYTES`] on both sides: a declared `Content-Length`
-    /// over the cap is refused before the body is buffered, and the received
-    /// body is checked again because the transport does not always declare one.
-    /// The request carries [`MEDIA_TRANSFER_TIMEOUT`]: the cap itself takes
-    /// longer than the client's one-minute default to pull over a slow link.
-    async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
+    /// A local server hands over an absolute path in `file_path` instead of
+    /// serving the bytes over HTTP: the file is already on this machine, so it is
+    /// copied across and left in place. The hand-over is confined to the directory
+    /// the product handed the server *before* anything else is done with it, so a
+    /// malformed or misbehaving answer can neither copy nor delete anything else —
+    /// and a file outside that tree is refused as such at once, rather than being
+    /// waited for and then called truncated. Both paths stream — a multi-gigabyte
+    /// file is never held in memory.
+    ///
+    /// `expected` is the size Telegram declared — the message's own, or the
+    /// server's answer when the message carried none. The local hand-over checks
+    /// against it twice — while it waits for the file to be complete, and again on
+    /// what the copy actually stored — so a server write that stops short is
+    /// refused instead of being taken as the whole file; the cloud transfer has
+    /// the response's own length for that.
+    async fn download_file(
+        &self,
+        file_path: &str,
+        dest: &Path,
+        expected: Option<u64>,
+    ) -> anyhow::Result<()> {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        if self.local {
+            // A local server has no `/file/…` route at all: it hands over a path
+            // on this machine, and nothing else. Anything else here is a server
+            // failure and must be reported as that, not as a size refusal.
+            let Some(root) = crate::channels::telegram_local::incoming_files_dir() else {
+                return Err(LocalHandOver::Missing.into());
+            };
+            let source = Path::new(file_path);
+            if !source.is_absolute() {
+                return Err(LocalHandOver::Missing.into());
+            }
+            // Containment first, on the path as it was named: a file outside the
+            // server's own tree is refused as such at once, instead of being waited
+            // for and then called truncated. Both the configured root and its
+            // canonical form count, because the server's directory may sit under a
+            // symlinked path (macOS `/var`) — and the path may not exist yet, which
+            // is why the check is lexical here.
+            let mut roots = vec![root.clone()];
+            if let Ok(canonical) = tokio::fs::canonicalize(&root).await {
+                roots.push(canonical);
+            }
+            if !crate::tools::path::is_path_under_roots(source, &roots) {
+                return Err(LocalHandOver::Outside.into());
+            }
+            wait_for_hand_over(source, expected).await?;
+            // And again on the file that actually appeared: a link inside the tree
+            // could still point anywhere.
+            let source = tokio::fs::canonicalize(source)
+                .await
+                .map_err(|_| anyhow::Error::from(LocalHandOver::Missing))?;
+            if !crate::tools::path::is_path_under_roots(&source, &roots) {
+                return Err(LocalHandOver::Outside.into());
+            }
+            let copied = tokio::fs::copy(&source, dest).await?;
+            // What was stored is what has to be whole: a copy that stopped short
+            // would leave the agent a truncated file and nothing that could ever
+            // complete it.
+            if let Some(expected) = expected
+                && copied < expected
+            {
+                let _ = tokio::fs::remove_file(dest).await;
+                return Err(LocalHandOver::Incomplete {
+                    got: copied,
+                    expected,
+                }
+                .into());
+            }
+            // The server's copy is left where it is: its own record still names it
+            // as downloaded, so dropping it would make a second `getFile` for the
+            // same file wait for a file that will never appear. The age sweep is
+            // what bounds the disk it uses.
+            return Ok(());
+        }
+
         let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
-        let resp = self
-            .http_client()
-            .get(&url)
-            .timeout(MEDIA_TRANSFER_TIMEOUT)
+        let request = self.with_transfer_bound(self.transfer_client().get(&url));
+        let resp = request
             .send()
             .await
             .context("Failed to download Telegram file")?;
@@ -1985,19 +2385,30 @@ impl TelegramChannel {
             anyhow::bail!("Telegram file download failed: {}", resp.status());
         }
 
-        anyhow::ensure!(
-            resp.content_length()
-                .is_none_or(|len| len <= FILE_MAX_BYTES),
-            "Telegram file is larger than the {} MB product cap",
-            mb(FILE_MAX_BYTES)
-        );
-        let bytes = resp.bytes().await?;
-        anyhow::ensure!(
-            bytes.len() as u64 <= FILE_MAX_BYTES,
-            "Telegram file is larger than the {} MB product cap",
-            mb(FILE_MAX_BYTES)
-        );
-        Ok(bytes.to_vec())
+        // The cloud reports no size for a large file, so the bound is enforced on the
+        // stream as well as on the declared length.
+        let download_max = self.limits().download;
+        if let Some(max) = download_max {
+            anyhow::ensure!(
+                resp.content_length().is_none_or(|len| len <= max),
+                "{}",
+                telegram_download_limit_reason(max)
+            );
+        }
+
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut stream = resp.bytes_stream();
+        let mut written: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Telegram file download was cut off")?;
+            written += chunk.len() as u64;
+            if let Some(max) = download_max {
+                anyhow::ensure!(written <= max, "{}", telegram_download_limit_reason(max));
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok(())
     }
 
     /// Extract attachment metadata from an incoming Telegram message.
@@ -2090,7 +2501,6 @@ impl TelegramChannel {
     /// `[Forwarded from …]` attribution (and the `forwarded` flag) is applied by
     /// [`MessageContext::into_channel_message`], so it survives every refusal
     /// path below as well as the success one.
-    #[expect(clippy::too_many_lines)] // one linear fetch-and-refuse run, each gate a distinct outcome
     async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
@@ -2125,11 +2535,11 @@ impl TelegramChannel {
             ));
         }
 
-        // Declared-size gate. Telegram reports the size on most attachments,
-        // so reject locally before spending a download; the two limits differ
-        // and the user must be told which one was hit.
+        // Declared-size gate. Telegram reports the size on most attachments, so
+        // a file the mode in force cannot carry is refused before a transfer is
+        // spent on it; the wording names the limit that applies on this server.
         if let Some(size) = attachment.file_size
-            && let Some(reason) = declared_size_refusal(size)
+            && let Some(reason) = declared_size_refusal(self.limits(), size)
         {
             tracing::info!("Rejecting attachment: declared size {size} bytes ({reason})");
             return Ok(Some(
@@ -2139,12 +2549,14 @@ impl TelegramChannel {
         }
 
         // Download file from Telegram. The transport does not always report a
-        // size, so a transfer failure is the other way the 20 MB limit shows
-        // up — surface it instead of dropping the update. A failure on this side
-        // (a timeout, or a connection that broke) is reported as that, not as a
-        // refusal by the transport.
-        let tg_file_path = match self.get_file_path(&attachment.file_id).await {
-            Ok(p) => p,
+        // size on the message, and the server's own answer reports one — that is
+        // what the hand-over is checked against when the message carried none. A
+        // transfer failure is the other way a limit shows up — surface it instead
+        // of dropping the update. A failure on this side (a timeout, or a
+        // connection that broke) is reported as that, not as a refusal by the
+        // transport.
+        let (tg_file_path, server_size) = match self.get_file_path(&attachment.file_id).await {
+            Ok(answer) => answer,
             Err(e) => {
                 tracing::warn!("Failed to get attachment file path: {e}");
                 return Ok(Some(
@@ -2159,29 +2571,13 @@ impl TelegramChannel {
                 ));
             }
         };
+        let expected = attachment.file_size.or(server_size);
         let remote_ext = Path::new(&tg_file_path)
             .extension()
             .and_then(|e| e.to_str());
 
-        let file_data = match self.download_file(&tg_file_path).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("Failed to download attachment: {e}");
-                return Ok(Some(
-                    self.reject_attachment(
-                        ctx,
-                        &attachment,
-                        remote_ext,
-                        NOT_RECEIVED,
-                        download_failure_reason(&e),
-                    )
-                    .await,
-                ));
-            }
-        };
-
-        // The directory is created only once the bytes are here so a refused
-        // transfer leaves nothing behind.
+        // The directory is created up front because the transfer streams straight
+        // into it; a refused or cut-off transfer takes the directory with it.
         let staging_dir = crate::util::telegram_staging_dir_name(&ctx.chat_id, ctx.message_id);
         let save_dir = crate::util::telegram_files_root().join(&staging_dir);
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
@@ -2201,20 +2597,21 @@ impl TelegramChannel {
         let local_filename =
             local_attachment_name(&attachment, &ctx.chat_id, ctx.message_id, remote_ext);
         let local_path = save_dir.join(&local_filename);
-        if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
-            tracing::warn!("Failed to save attachment to {}: {e}", local_path.display());
-            // A partial write must not linger: nothing downstream will ever
-            // reference this per-message directory.
+        if let Err(e) = self
+            .download_file(&tg_file_path, &local_path, expected)
+            .await
+        {
+            tracing::warn!("Failed to download attachment: {e}");
             let _ = tokio::fs::remove_dir_all(&save_dir).await;
+            let reason = download_failure_reason(&e);
+            let outcome = if reason == ATTACHMENT_SAVE_REFUSED_REASON {
+                NOT_STORED
+            } else {
+                NOT_RECEIVED
+            };
             return Ok(Some(
-                self.reject_attachment(
-                    ctx,
-                    &attachment,
-                    remote_ext,
-                    NOT_STORED,
-                    ATTACHMENT_SAVE_REFUSED_REASON,
-                )
-                .await,
+                self.reject_attachment(ctx, &attachment, remote_ext, outcome, &reason)
+                    .await,
             ));
         }
 
@@ -2617,6 +3014,10 @@ impl TelegramChannel {
 
     /// Send a media file (image-as-file/document/video/audio) to a Telegram
     /// chat.
+    ///
+    /// The body streams from disk with its own length, so a large file is never
+    /// read into memory; the mode's own upload limit is quoted when it is too
+    /// large, and the local mode imposes no total request bound.
     async fn send_media_file(
         &self,
         chat_id: &str,
@@ -2630,8 +3031,16 @@ impl TelegramChannel {
             .and_then(|n| n.to_str())
             .unwrap_or(meta.default_filename);
 
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let part = Part::bytes(file_bytes).file_name(file_name.to_string());
+        let limits = self.limits();
+        let size = tokio::fs::metadata(file_path).await?.len();
+        if size > limits.upload {
+            return Err(anyhow::Error::new(UploadTooLarge {
+                size,
+                max: limits.upload,
+            }));
+        }
+
+        let part = Part::file(file_path).await?;
 
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
@@ -2645,11 +3054,11 @@ impl TelegramChannel {
             form = form.text("message_thread_id", tid.to_string());
         }
 
-        let request = self
-            .http_client()
-            .post(self.api_url(meta.api_method))
-            .multipart(form)
-            .timeout(MEDIA_TRANSFER_TIMEOUT);
+        let request = self.with_transfer_bound(
+            self.transfer_client()
+                .post(self.api_url(meta.api_method))
+                .multipart(form),
+        );
 
         self.send_media(chat_id, meta.api_method, request, file_name)
             .await
@@ -2669,10 +3078,11 @@ impl TelegramChannel {
 
         set_thread_id_on_json(&mut body, thread_id);
 
-        let request = self
-            .http_client()
-            .post(self.api_url(meta.api_method))
-            .json(&body);
+        let request = self.with_transfer_bound(
+            self.transfer_client()
+                .post(self.api_url(meta.api_method))
+                .json(&body),
+        );
 
         self.send_media(chat_id, meta.api_method, request, url)
             .await
@@ -2842,9 +3252,17 @@ impl TelegramChannel {
         Ok(Some(msg))
     }
 
-    /// Take one polled batch on: record every event, then hand on only the events
-    /// this call was the first to record. `None` when the pipeline is gone (the
-    /// listener stops).
+    /// Take one polled batch on: record every event, then hand the batch to the
+    /// processor with only the events this call was the first to record.
+    ///
+    /// The record is written here, on the poll loop, because writing it is what
+    /// lets the offset advance; the parse — which may download a large attachment
+    /// for minutes — is not. Polling therefore continues only while the processor
+    /// has room: at [`BATCH_QUEUE`] recorded-but-unparsed batches the poll loop
+    /// stops issuing `getUpdates` until one is taken, so that depth, not the
+    /// parse, is the real responsiveness boundary during a large transfer. Nothing
+    /// is lost at that bound — a batch left unconfirmed is offered again by the
+    /// platform, and the re-offer is deduped against the intake record.
     ///
     /// The batch is recorded unit by unit — an album's members as one unit, every
     /// other update on its own (see [`poll_plan`]) — and a unit the record could not
@@ -2852,22 +3270,30 @@ impl TelegramChannel {
     /// request started from, when the platform never identified it), so the platform
     /// offers the unit again rather than the intake handing on the parts of it that
     /// could be recorded.
-    async fn take_up(
+    async fn hold_up(
         &self,
-        parts_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         intake: &Intake,
         offset: i64,
         updates: Vec<serde_json::Value>,
         origin: BatchOrigin,
-    ) -> Option<Polled> {
+    ) -> (Polled, Option<HeldBatch>) {
         // A long poll that timed out with nothing to offer leaves the position
         // where it is: there is nothing behind it the platform has not given up
         // on already.
         if updates.is_empty() {
-            return Some(Polled {
-                position: offset,
-                reoffered: false,
-            });
+            return (
+                Polled {
+                    position: offset,
+                    reoffered: false,
+                },
+                None,
+            );
+        }
+        // An update the poll loop received is proof that the local server reaches
+        // Telegram — nothing else produces one — and that is the only such proof
+        // available in local mode, where `getMe` is answered from the server's cache.
+        if self.local {
+            crate::channels::telegram_local::note_telegram_contact();
         }
         let plan = poll_plan(&updates);
         let mut fresh = HashSet::new();
@@ -2923,21 +3349,25 @@ impl TelegramChannel {
                 .map_or(offset, |newest| newest + 1)
         });
 
-        if !self
-            .process_updates(parts_tx, intake, &mut fresh, origin, updates, &plan)
-            .await
-        {
-            return None;
-        }
-        // The platform offers the batch again immediately, so a record that could
-        // not be written for would otherwise spin.
+        // The batch is handed to the processor rather than parsed here: parsing may
+        // spend minutes downloading an attachment, and the poll loop must keep
+        // acknowledging updates while that happens (see [`HeldBatch`]).
         if unrecorded.is_some() {
             self.intake_pause(RECORD_FAILURE_BACKOFF).await;
         }
-        Some(Polled {
+        let polled = Polled {
             position,
             reoffered: unrecorded.is_some(),
-        })
+        };
+        (
+            polled,
+            Some(HeldBatch {
+                updates,
+                plan,
+                origin,
+                fresh,
+            }),
+        )
     }
 
     /// Parse a recorded batch and hand it to the collector.
@@ -3217,13 +3647,19 @@ impl TelegramChannel {
     }
 
     /// The intake proper, once the handshake has resolved the account and fetched the
-    /// opening batch: the sweep, what the record holds, and the long-poll loop.
+    /// opening batch: the sweep, the long-poll loop, and the queue of held batches
+    /// the processor takes its work from.
+    ///
+    /// This half never parses or downloads anything: a batch is recorded and
+    /// queued, the offset advances, and the next poll is issued — so a
+    /// multi-gigabyte attachment cannot stop the platform being polled (see
+    /// [`Self::process_updates`] for the other half).
     ///
     /// Returns when the listener stops, however it stops; the frame stays the collector's
     /// until the burst it still held has been handed on ([`ListenerFrame`]).
     async fn intake_loop(
         &self,
-        parts_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        batch_tx: &tokio::sync::mpsc::Sender<HeldBatch>,
         intake: &Intake,
         handshake: Vec<serde_json::Value>,
     ) {
@@ -3233,11 +3669,6 @@ impl TelegramChannel {
         self.age_out_record().await;
         let mut aged_at = Instant::now();
 
-        if !self.recover(intake, parts_tx).await {
-            tracing::warn!("Telegram listener stopping: the message pipeline is closed");
-            return;
-        }
-
         // The batch the handshake fetched was fetched at offset 0, before any
         // position existed, so it is input of unknown age — as is every batch behind
         // it: a fetch that fills the platform's own page may not have come to the end
@@ -3245,15 +3676,14 @@ impl TelegramChannel {
         // the platform has nothing more from before this run. Control input that
         // arrived in any of those batches must not be executed out of context.
         let page_full = handshake.len() >= UPDATES_PAGE;
-        let Some(taken) = self
-            .take_up(parts_tx, intake, 0, handshake, BatchOrigin::Stale)
-            .await
-        else {
-            tracing::warn!("Telegram listener stopping: the message pipeline is closed");
-            return;
-        };
+        let (taken, batch) = self.hold_up(intake, 0, handshake, BatchOrigin::Stale).await;
         let mut offset = taken.position;
         let mut backlog_open = page_full || taken.reoffered;
+        if let Some(batch) = batch
+            && batch_tx.send(batch).await.is_err()
+        {
+            return;
+        }
 
         let shutdown_token = crate::shutdown::shutdown_token();
         let per_channel_cancel = self.cancel.clone();
@@ -3306,22 +3736,43 @@ impl TelegramChannel {
                     };
 
                     let page_full = updates.len() >= UPDATES_PAGE;
-                    let Some(taken) = self
-                        .take_up(parts_tx, intake, offset, updates, batch_origin(backlog_open))
-                        .await
-                    else {
-                        tracing::warn!(
-                            "Telegram listener stopping: the message pipeline is closed"
-                        );
-                        return;
-                    };
+                    let (taken, batch) = self
+                        .hold_up(intake, offset, updates, batch_origin(backlog_open))
+                        .await;
                     offset = taken.position;
                     backlog_open = (backlog_open && page_full) || taken.reoffered;
+                    if let Some(batch) = batch
+                        && batch_tx.send(batch).await.is_err()
+                    {
+                        tracing::info!("Telegram listener stopping: the batch processor is gone");
+                        return;
+                    }
                 }
             }
         }
     }
 }
+
+/// One polled batch the poll loop recorded and the processor has yet to parse.
+///
+/// It exists so the two are separate tasks in one `listen` future: the record is
+/// written (and the offset advanced) on the poll loop, while the parse — which
+/// may spend minutes downloading an attachment — happens here. Every event in a
+/// queued batch is already held durably, so a stop between the two leaves nothing
+/// lost: the next listener takes the batch over from the record.
+struct HeldBatch {
+    updates: Vec<serde_json::Value>,
+    /// The album grouping the record wrote the batch by, and the parse walks it by.
+    plan: Vec<PollPlacement>,
+    origin: BatchOrigin,
+    /// The events this run was the first to record.
+    fresh: HashSet<i64>,
+}
+
+/// How many recorded batches may wait for the processor. Deep enough that one long
+/// download leaves the platform's polling running, bounded so a processor that
+/// never returns cannot grow it without limit.
+const BATCH_QUEUE: usize = 32;
 
 /// What the opening handshake resolves to.
 struct IntakeSlot {
@@ -3560,7 +4011,7 @@ impl Channel for TelegramChannel {
         // markers are resolved (and possibly refused) here too.
         let (text_without_markers, attachments, refusals) =
             crate::util::with_block_in_place(|| {
-                parse_attachment_markers(content, &message.file_roots)
+                parse_attachment_markers(content, &message.file_roots, self.limits())
             });
 
         if attachments.is_empty() && refusals.is_empty() {
@@ -3600,10 +4051,14 @@ impl Channel for TelegramChannel {
                     file = %attachment.target,
                     "Telegram: attachment delivery failed"
                 );
-                let notice = file_refusal(
-                    file_name_or_path(&attachment.target),
-                    ATTACHMENT_UPLOAD_FAILED_REASON,
-                );
+                let name = file_name_or_path(&attachment.target);
+                let notice = match e
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<UploadTooLarge>())
+                {
+                    Some(too_large) => file_refusal(name, &too_large.to_string()),
+                    None => file_refusal(name, ATTACHMENT_UPLOAD_FAILED_REASON),
+                };
                 if let Err(notice_err) = self
                     .send_text_chunks(&notice, chat_id, thread_id, None)
                     .await
@@ -3664,13 +4119,80 @@ impl Channel for TelegramChannel {
             frame,
         );
 
-        self.intake_loop(&parts_tx, &intake, slot.updates).await;
+        // Two halves, one future. The poll loop records a batch and queues it; the
+        // processor parses it and hands the parts to the collector. They run
+        // concurrently, so a large attachment being downloaded keeps the platform
+        // polled while the processor has queue room — and the offset still advances
+        // only on what was recorded, so nothing is lost or acknowledged early.
+        let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<HeldBatch>(BATCH_QUEUE);
+        // Each half owns what it needs, so the queue's sender dies with the poll
+        // loop and the receiver's end tells the processor there is nothing more.
+        let fetch_intake = intake.clone();
+        let fetch = async move {
+            self.intake_loop(&batch_tx, &fetch_intake, slot.updates)
+                .await;
+        };
+        let process_intake = intake.clone();
+        let process = async move {
+            // What a previous run held is taken over first: it is older than
+            // anything the platform is about to offer.
+            if self.recover(&process_intake, &parts_tx).await {
+                while let Some(HeldBatch {
+                    updates,
+                    plan,
+                    origin,
+                    mut fresh,
+                }) = batch_rx.recv().await
+                {
+                    // A stop refuses new work, exactly as the poll loop does: the
+                    // batch stays recorded, so the listener that takes over finds
+                    // it instead of it being half-handled here.
+                    if crate::shutdown::aborting() {
+                        tracing::info!(
+                            "Telegram listener stopping: recorded batches left for the next run"
+                        );
+                        break;
+                    }
+                    if !self
+                        .process_updates(
+                            &parts_tx,
+                            &process_intake,
+                            &mut fresh,
+                            origin,
+                            updates,
+                            &plan,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Telegram listener stopping: the message pipeline is closed"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                tracing::warn!("Telegram listener stopping: the message pipeline is closed");
+            }
+            // Dropping the last sender releases an open burst: the collector hands
+            // it to the pipeline and settles it, so the frame of this listener ends
+            // only once that collector has finished ([`ListenerFrame`]).
+            drop(parts_tx);
+        };
+        tokio::pin!(fetch, process);
+        tokio::select! {
+            // A stop the poll loop sees closes the queue when it returns, and the
+            // processor then drains what it already holds before the frame ends.
+            () = &mut fetch => { process.await; }
+            // The pipeline is gone: nothing this listener fetches could be handed
+            // on, so its poll loop is cancelled rather than left polling a bot no
+            // one is reading — two pollers on one token is what that would become
+            // the moment a replacement starts.
+            () = &mut process => {
+                self.cancel.cancel();
+                fetch.await;
+            }
+        }
 
-        // Every way the intake returns passes through this drain: dropping the sender
-        // releases an open burst, which the collector hands to the pipeline and settles,
-        // so the frame of this listener ends only once that collector has finished
-        // ([`ListenerFrame`]).
-        drop(parts_tx);
         if let Err(err) = collector.await {
             tracing::error!(
                 %err,
@@ -3692,6 +4214,115 @@ impl Channel for TelegramChannel {
         set_thread_id_on_json(&mut body, thread_id);
         self.http_client().post(&url).json(&body).send().await?;
         Ok(())
+    }
+}
+
+/// The Bot API base the registered listener was built for, when one is
+/// registered: the supervisor compares it with the endpoint that is serving, so a
+/// server restarted on a fresh port is followed by a listener to match.
+pub(crate) fn listener_base() -> Option<String> {
+    let channel = crate::channel_registry().get("telegram")?;
+    channel
+        .as_any()
+        .downcast_ref::<TelegramChannel>()
+        .map(|channel| channel.api_base.clone())
+}
+
+/// Start the listener the current mode serves, with the configured token.
+///
+/// This is the step that makes a switch real when the mode is the local server:
+/// the token is validated there first, and a token-bearing request is what logs
+/// the bot into that server. `Err` therefore means the bot is not being served
+/// at all — the caller reports the cause it names.
+pub(crate) async fn start_telegram_listener() -> anyhow::Result<()> {
+    let token = crate::config::CONFIG
+        .telegram_bot_token()
+        .ok_or_else(|| anyhow::anyhow!("Telegram has no bot token configured"))?;
+    // Checked here, once: this is the switch's own first token-bearing request
+    // against the base it just moved the bot to, and it is what logs the bot in
+    // there. A rejected token is therefore reported as the cause it is, before any
+    // listener is built.
+    TelegramChannel::validate_token(&token).await?;
+    restart_telegram_listener(Some(&token))
+}
+
+/// Stop the listener and wait until the frame that holds its events has ended.
+///
+/// A frame that has ended means everything it held is either handed on or left
+/// held in the record, which is the state a switch needs before it takes the bot
+/// out of one server: nothing is still being downloaded from the side being left.
+/// The retirement itself is [`retire_channel`]'s.
+pub(crate) async fn stop_telegram_listener() -> anyhow::Result<()> {
+    let registry = crate::channel_registry();
+    let frames = registry.replaced("telegram");
+    match registry.get("telegram") {
+        Some(current) => {
+            retire_channel(registry, std::sync::Arc::clone(&current)).await;
+        }
+        // Nothing is registered, but a frame an earlier attempt left running is still
+        // recorded — and still polling the side the switch is leaving.
+        None => stop_listeners(&frames, None).await,
+    }
+    // The wait is bounded, so a listener still finishing what it held is a state
+    // the caller has to know about: a switch that logged the bot out of the cloud
+    // while this frame kept polling it would leave two pollers on one token.
+    let still_running = frames
+        .snapshot()
+        .iter()
+        .filter_map(|frame| frame.as_any().downcast_ref::<TelegramChannel>())
+        .any(TelegramChannel::running);
+    if still_running {
+        return Err(anyhow::anyhow!(
+            "the Telegram listener is still finishing the batch it held"
+        ));
+    }
+    Ok(())
+}
+
+/// Run the Telegram channel the configured mode serves, for the life of the
+/// process: the cloud listener by default, the local server's once it is up.
+///
+/// The boot-time preparation happens here rather than before the pipeline is
+/// built, because the base URL is only known once the server is running and a
+/// switch interrupted by the last shutdown has to finish first.
+pub async fn run_configured_channel(tx: tokio::sync::mpsc::Sender<ChannelMessage>) {
+    use crate::channels::telegram_local::Boot;
+
+    let Some(token) = crate::config::CONFIG.telegram_bot_token() else {
+        tracing::info!("No Telegram bot token configured — running in dashboard-only mode");
+        return;
+    };
+
+    match crate::channels::telegram_local::prepare_for_boot().await {
+        Boot::Start => {}
+        Boot::Running => {
+            tracing::info!("Telegram channel already started by the resumed switch");
+            return;
+        }
+        Boot::Waiting => {
+            tracing::warn!(
+                "Telegram: the local Bot API server is not ready — the bot connects once it is"
+            );
+            return;
+        }
+    }
+
+    let Some(channel) = TelegramChannel::from_config(token) else {
+        tracing::warn!("Telegram: the configured mode has no Bot API endpoint yet");
+        return;
+    };
+    let channel = std::sync::Arc::new(channel);
+    // Register commands with the Bot API (fire-and-forget, non-blocking).
+    tokio::spawn({
+        let tc = std::sync::Arc::clone(&channel);
+        async move {
+            tc.set_my_commands().await;
+        }
+    });
+    let channel: std::sync::Arc<dyn Channel> = channel;
+    crate::channel_registry().register(std::sync::Arc::clone(&channel));
+    if let Err(e) = channel.listen(tx).await {
+        tracing::error!(error = %e, "Telegram listener error");
     }
 }
 
@@ -3742,18 +4373,20 @@ async fn stop_listeners(
 /// channel nothing listens on while the listener it replaced is already stopped.
 ///
 /// - **New token provided** (`Some(token)`): the pipeline is resolved (the listener
-///   cannot run without it), the token is validated and the new channel takes the old
-///   one's place in the registry, which records what it moved past; the hand-over task
-///   then cancels and waits out every such listener — one whose collector has drained
-///   means everything it held is settled or left held, so what is left for the take-over
-///   is exactly what it could not hand on — and listens, never stopping the channel it
-///   starts itself ([`hand_over_listener`]).
+///   cannot run without it) and the token is used as given — the paths that must
+///   prove a listener starts validate it first ([`start_telegram_listener`], the
+///   token save path), while a rebuild reuses a token that already served. The new
+///   channel takes the old one's place in the registry, which records what it moved
+///   past; the hand-over task then cancels and waits out every such listener — one
+///   whose collector has drained means everything it held is settled or left held,
+///   so what is left for the take-over is exactly what it could not hand on — and
+///   listens, never stopping the channel it starts itself ([`hand_over_listener`]).
 /// - **Token cleared** (`None`): the old listener is cancelled and the channel
 ///   unregistered once it has ended its frame — unless a token saved in the meantime
 ///   has already put another channel in its place, which must stay registered. The
 ///   channel keeps serving outbound sends while it winds down, so a reply that is
 ///   already on its way still leaves through the token being removed.
-pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Result<()> {
+pub fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Result<()> {
     let registry = crate::channel_registry();
 
     if let Some(token) = new_token.filter(|t| !t.trim().is_empty()) {
@@ -3767,14 +4400,18 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
             );
         };
 
-        // Validate the new token before touching anything.
-        TelegramChannel::validate_token(token).await?;
-
-        // The record's rows are keyed by the account and claimed by the listener
-        // that holds them, so the replacement records and recovers on its own: what
-        // this process already has in flight is left to finish, and what the
-        // listener it replaced left held is taken over by the new one.
-        let telegram_arc = std::sync::Arc::new(TelegramChannel::new(token.to_string()));
+        // Validating here would be a second token-bearing request for the same save:
+        // the check belongs to the paths that have to prove a listener starts
+        // ([`start_telegram_listener`], the save path before it writes), while a
+        // rebuild after a failure ([`restore_cloud_listener`], the supervisor) reuses
+        // a token that has already served.
+        let telegram_arc = std::sync::Arc::new(
+            TelegramChannel::from_config(token.to_string()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the local Telegram Bot API server has no endpoint yet — the listener cannot start"
+                )
+            })?,
+        );
 
         // Register commands with Telegram API (fire-and-forget, non-blocking).
         tokio::spawn({
@@ -3796,32 +4433,44 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
     } else {
         // Token cleared — stop the old listener and unregister it once it has ended,
         // unless a token saved while it wound down has already taken its place.
-        let frames = registry.replaced("telegram");
         let old_channel = registry.get("telegram");
-        tokio::spawn(async move { retire_listener(registry, frames, old_channel).await });
+        tokio::spawn(async move { retire_listener(registry, old_channel).await });
     }
 
     Ok(())
+}
+
+/// Stop the listener `channel` runs and take it out of the registry once its frame
+/// has ended, reporting whether the registry still held it then.
+///
+/// The channel is recorded among the frames a hand-over waits out: a replace records
+/// what it displaces, but nothing displaces a channel being retired here (a cleared
+/// token, a switch taking the listener away), so the retirement is what moves past it
+/// — and a save landing meanwhile has to wait it out before it starts its own listener.
+async fn retire_channel(
+    registry: &crate::ChannelRegistry,
+    channel: std::sync::Arc<dyn Channel>,
+) -> bool {
+    let frames = registry.replaced("telegram");
+    frames.record(std::sync::Arc::clone(&channel));
+    stop_listeners(&frames, None).await;
+    registry.unregister_if(&channel)
 }
 
 /// Stop the listener `old` runs and, once its frame has ended, take it out of the
 /// registry — unless the registry holds a channel registered since (a token saved
 /// while the teardown waited), which is the one that is live by then.
 ///
-/// The cleared channel is recorded among the frames a hand-over waits out: nothing
-/// displaced it, so the teardown is what moves past it, and a save landing meanwhile
-/// has to wait it out before it starts its own listener.
+/// The two log lines are what the teardown reports; stopping and unregistering are
+/// [`retire_channel`]'s, the same retirement every other stop goes through.
 async fn retire_listener(
     registry: &crate::ChannelRegistry,
-    frames: std::sync::Arc<crate::ReplacedChannels>,
     old: Option<std::sync::Arc<dyn Channel>>,
 ) {
     let Some(old) = old else {
         return;
     };
-    frames.record(std::sync::Arc::clone(&old));
-    stop_listeners(&frames, None).await;
-    if registry.unregister_if(&old) {
+    if retire_channel(registry, old).await {
         tracing::info!("Telegram bot token cleared — listener stopped");
     } else {
         tracing::info!("Telegram bot token cleared — a channel registered since is live");
@@ -3852,22 +4501,32 @@ async fn hand_over_listener(
 }
 
 /// Send a message directly through the registered Telegram channel, bypassing
-/// the router (no broadcast/persist). Errors if the channel is missing from
-/// the registry or the transport send fails.
+/// the router (no broadcast/persist). Errors if the transport send fails.
+///
+/// When no channel is registered — a switch has just taken the listener away,
+/// which is exactly when the owner has to be told — the message goes out through
+/// a one-off channel on the base the current mode serves. That is the only base
+/// the bot can be reached on: the cloud while it has not left it, the local
+/// server once it has. No endpoint at all means it cannot be said at all.
 pub async fn send_direct(
     recipient: &str,
     content: String,
     reply_markup: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let Some(channel) = crate::channel_registry().get("telegram") else {
-        anyhow::bail!("Telegram channel not found in registry");
-    };
     let reply = SendMessage {
         content,
         recipient: recipient.to_string(),
         reply_markup,
         file_roots: Vec::new(),
     };
+    if let Some(channel) = crate::channel_registry().get("telegram") {
+        return channel.send(&reply).await;
+    }
+    let token = crate::config::CONFIG
+        .telegram_bot_token()
+        .ok_or_else(|| anyhow::anyhow!("Telegram channel not found in registry"))?;
+    let channel = TelegramChannel::from_config(token)
+        .ok_or_else(|| anyhow::anyhow!("the Bot API this mode serves has no endpoint"))?;
     channel.send(&reply).await
 }
 

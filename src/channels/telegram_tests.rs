@@ -54,7 +54,7 @@ fn test_update(overrides: &[(&str, serde_json::Value)]) -> serde_json::Value {
 /// Uses token `"token"` and calls `init_test_store` before returning.
 async fn test_channel() -> TelegramChannel {
     crate::users::test_util::init_test_store().await;
-    TelegramChannel::new("token".into())
+    TelegramChannel::new_with("token".into(), CLOUD_API_BASE.to_string(), false)
 }
 
 #[test]
@@ -395,12 +395,19 @@ fn parse_attachment_markers_tests() {
     let roots = vec![dir.path().to_path_buf()];
 
     // Placeholder/inexistent targets stay as literal text.
-    let (cleaned, att, _) = parse_attachment_markers("use `[IMAGE:path]` or `[VIDEO:...]`", &roots);
+    let (cleaned, att, _) = parse_attachment_markers(
+        "use `[IMAGE:path]` or `[VIDEO:...]`",
+        &roots,
+        TransferLimits::CLOUD,
+    );
     assert_eq!(cleaned, "use `[IMAGE:path]` or `[VIDEO:...]`");
     assert!(att.is_empty());
     // Directory targets are not regular files → prose.
-    let (cleaned, att, _) =
-        parse_attachment_markers(&format!("[IMAGE:{}]", dir.path().display()), &roots);
+    let (cleaned, att, _) = parse_attachment_markers(
+        &format!("[IMAGE:{}]", dir.path().display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
     assert_eq!(cleaned, format!("[IMAGE:{}]", dir.path().display()));
     assert!(att.is_empty());
 
@@ -412,6 +419,7 @@ fn parse_attachment_markers_tests() {
             ogg.display()
         ),
         &roots,
+        TransferLimits::CLOUD,
     );
     assert_eq!(cleaned, "Here are files  and");
     assert_eq!(att.len(), 2);
@@ -419,8 +427,11 @@ fn parse_attachment_markers_tests() {
     assert_eq!(att[1].kind, TelegramAttachmentKind::Audio);
 
     // http(s) URLs become attachments.
-    let (cleaned, att, _) =
-        parse_attachment_markers("See [VIDEO:https://example.com/vid.mp4]", &roots);
+    let (cleaned, att, _) = parse_attachment_markers(
+        "See [VIDEO:https://example.com/vid.mp4]",
+        &roots,
+        TransferLimits::CLOUD,
+    );
     assert_eq!(cleaned, "See");
     assert_eq!(att.len(), 1);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Video);
@@ -430,6 +441,7 @@ fn parse_attachment_markers_tests() {
     let (cleaned, att, _) = parse_attachment_markers(
         &format!("[IMAGE:missing.png] ok [VIDEO:{}]", vid.display()),
         &roots,
+        TransferLimits::CLOUD,
     );
     assert_eq!(cleaned, "[IMAGE:missing.png] ok");
     assert_eq!(att.len(), 1);
@@ -438,11 +450,16 @@ fn parse_attachment_markers_tests() {
     // Unknown markers kept as text: a marker-shaped word of a kind outside the
     // vocabulary is not a marker at all, so the parser leaves the user's text
     // alone.
-    let (cleaned, att, _) = parse_attachment_markers("Report [UNKNOWN:/tmp/a.bin]", &roots);
+    let (cleaned, att, _) =
+        parse_attachment_markers("Report [UNKNOWN:/tmp/a.bin]", &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
     assert!(att.is_empty());
     // Case-insensitive matching with a real file.
-    let (cleaned, att, _) = parse_attachment_markers(&format!("[image:{}]", png.display()), &roots);
+    let (cleaned, att, _) = parse_attachment_markers(
+        &format!("[image:{}]", png.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
     assert_eq!(cleaned, "");
     assert_eq!(att.len(), 1);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
@@ -452,8 +469,11 @@ fn parse_attachment_markers_tests() {
     // is_file() path — it stays as inert literal text.
     let nonimg = dir.path().join("note.txt");
     std::fs::write(&nonimg, b"not an image").unwrap();
-    let (cleaned, att, _) =
-        parse_attachment_markers(&format!("[image:{}]", nonimg.display()), &roots);
+    let (cleaned, att, _) = parse_attachment_markers(
+        &format!("[image:{}]", nonimg.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
     assert_eq!(cleaned, format!("[image:{}]", nonimg.display()));
     assert!(
         att.is_empty(),
@@ -476,8 +496,11 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     let pdf = dir.path().join("specs.pdf");
     std::fs::write(&pdf, b"fake-pdf").unwrap();
     let canonical = canonical_without_verbatim_prefix(&pdf);
-    let (cleaned, att, refusals) =
-        parse_attachment_markers(&format!("Here: [FILE:{}]", pdf.display()), &roots);
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        &format!("Here: [FILE:{}]", pdf.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
     assert_eq!(cleaned, "Here:");
     assert!(refusals.is_empty());
     assert_eq!(att.len(), 1);
@@ -485,7 +508,8 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     assert_eq!(att[0].target, canonical.to_string_lossy());
 
     // A relative target resolves against the first (authoring) root.
-    let (cleaned, att, refusals) = parse_attachment_markers("[FILE:specs.pdf]", &roots);
+    let (cleaned, att, refusals) =
+        parse_attachment_markers("[FILE:specs.pdf]", &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "");
     assert!(refusals.is_empty());
     assert_eq!(att.len(), 1);
@@ -500,6 +524,7 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     let (cleaned, att, refusals) = parse_attachment_markers(
         "[FILE:relayed.pdf]",
         &[dir.path().to_path_buf(), other.path().to_path_buf()],
+        TransferLimits::CLOUD,
     );
     assert_eq!(cleaned, "");
     assert!(refusals.is_empty());
@@ -510,8 +535,11 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     );
 
     // An existing file outside the roots is refused by name.
-    let (cleaned, att, refusals) =
-        parse_attachment_markers(&format!("[FILE:{}]", escape.display()), &roots);
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        &format!("[FILE:{}]", escape.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
@@ -520,7 +548,8 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     );
 
     // A missing target is refused (no attachment, no literal marker left).
-    let (cleaned, att, refusals) = parse_attachment_markers("[FILE:missing.pdf]", &roots);
+    let (cleaned, att, refusals) =
+        parse_attachment_markers("[FILE:missing.pdf]", &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
@@ -531,7 +560,11 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     // A directory target is refused.
     let sub = dir.path().join("reports");
     std::fs::create_dir(&sub).unwrap();
-    let (_, att, refusals) = parse_attachment_markers(&format!("[FILE:{}]", sub.display()), &roots);
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[FILE:{}]", sub.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
     assert!(att.is_empty());
     assert_eq!(
         refusals,
@@ -539,7 +572,8 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     );
 
     // `[FILE:...]` is local-only — a URL target is not part of the mechanism.
-    let (cleaned, att, refusals) = parse_attachment_markers("[FILE:http://x/y.pdf]", &roots);
+    let (cleaned, att, refusals) =
+        parse_attachment_markers("[FILE:http://x/y.pdf]", &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
@@ -548,8 +582,11 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     );
 
     // No roots → no file delivery at all (the plain-text/mirror sends).
-    let (cleaned, att, refusals) =
-        parse_attachment_markers(&format!("[FILE:{}]", pdf.display()), &[]);
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        &format!("[FILE:{}]", pdf.display()),
+        &[],
+        TransferLimits::CLOUD,
+    );
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
@@ -560,7 +597,7 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     // A malformed marker's notice names a bounded prefix of the target rather
     // than echoing a whole inline payload back at the user.
     let blob = format!("[FILE:data:application/pdf;base64,{}]", "A".repeat(500));
-    let (cleaned, att, refusals) = parse_attachment_markers(&blob, &roots);
+    let (cleaned, att, refusals) = parse_attachment_markers(&blob, &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(refusals.len(), 1);
@@ -588,6 +625,7 @@ fn parse_file_markers_refuse_symlink_out_of_workspace() {
     let (cleaned, att, refusals) = parse_attachment_markers(
         &format!("[FILE:{}]", link.display()),
         &[dir.path().to_path_buf()],
+        TransferLimits::CLOUD,
     );
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
@@ -606,26 +644,169 @@ fn bare_path_without_marker_is_plain_text() {
     // A reply that is exactly an existing file path — but carries no marker —
     // must be delivered as plain text with no attachment.
     let path = png.to_string_lossy().to_string();
-    let (cleaned, att, _) = parse_attachment_markers(&path, &[dir.path().to_path_buf()]);
+    let (cleaned, att, _) =
+        parse_attachment_markers(&path, &[dir.path().to_path_buf()], TransferLimits::CLOUD);
     assert_eq!(cleaned, path);
     assert!(att.is_empty());
 }
 
-/// Boundaries of the declared-size gate: exactly at a limit passes, one byte
-/// over trips it, and the between-the-limits band reports Telegram's own limit.
+/// The local server hands a file over as a path on this machine instead of
+/// serving it: the file is copied from there — left in place, because the server's
+/// own record still names it — and no HTTP request is involved (the base points at
+/// a port nothing listens on).
+#[tokio::test]
+async fn a_local_server_hands_a_file_over_as_a_path() {
+    let root = tempfile::tempdir().unwrap();
+    let _files = crate::util::test::set_env_var(
+        "MAHBOT_TGAPI_FILES_DIR",
+        Some(root.path().to_str().unwrap()),
+    );
+    let source = root.path().join("clip.bin");
+    std::fs::write(&source, vec![7u8; 4096]).unwrap();
+    let dest = root.path().join("staged.bin");
+    let channel = TelegramChannel::new_with("token".into(), "http://127.0.0.1:9".into(), true);
+
+    channel
+        .download_file(&source.to_string_lossy(), &dest, Some(4096))
+        .await
+        .expect("the file on disk is taken without a transfer");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), vec![7u8; 4096]);
+    assert!(
+        source.exists(),
+        "the server's copy stays where its own record names it"
+    );
+}
+
+/// A hand-over naming a file outside the directory the product gave the server is
+/// refused: nothing is copied, and the named file is not deleted.
+#[tokio::test]
+async fn a_local_hand_over_outside_the_servers_directory_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let _files = crate::util::test::set_env_var(
+        "MAHBOT_TGAPI_FILES_DIR",
+        Some(root.path().to_str().unwrap()),
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    let source = elsewhere.path().join("owner.txt");
+    std::fs::write(&source, b"owner data").unwrap();
+    let dest = root.path().join("staged.txt");
+    let channel = TelegramChannel::new_with("token".into(), "http://127.0.0.1:9".into(), true);
+
+    let started = std::time::Instant::now();
+    let err = channel
+        .download_file(&source.to_string_lossy(), &dest, Some(10))
+        .await
+        .expect_err("a hand-over outside the server's directory must be refused");
+    assert!(
+        err.to_string().contains(LOCAL_FILE_OUTSIDE_REASON),
+        "the refusal must name the hand-over: {err}"
+    );
+    // Refused as what it is, before the wait: not probed for a minute and then
+    // reported as a transfer that never finished.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "an outside path is not waited for"
+    );
+    assert!(source.exists(), "the named file must be left untouched");
+    assert!(!dest.exists(), "nothing may be copied out of the refusal");
+}
+
+/// A size that stops changing short of the declared one is a stall, not the end of
+/// the transfer: the wait keeps waiting and completes when the write reaches the
+/// size Telegram declared.
+#[tokio::test]
+async fn a_hand_over_survives_a_stall_and_completes_at_the_declared_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("clip.bin");
+    std::fs::write(&source, vec![7u8; 3]).unwrap();
+
+    let (waited, ()) = tokio::join!(wait_for_hand_over(&source, Some(9)), async {
+        // Long enough for the size to look settled for several samples.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(&source, vec![7u8; 9]).unwrap();
+    });
+    waited.expect("a stalled write is not the end of the transfer");
+}
+
+/// A hand-over that is exactly the declared size is the whole file as soon as it is
+/// measured; with no declared size there is nothing to compare against, so a size
+/// that no longer changes is what completes it.
+#[tokio::test]
+async fn a_hand_over_at_the_declared_size_is_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("clip.bin");
+    std::fs::write(&source, vec![7u8; 9]).unwrap();
+
+    wait_for_hand_over(&source, Some(9))
+        .await
+        .expect("a file of the size the attachment declared is the whole file");
+    wait_for_hand_over(&source, None)
+        .await
+        .expect("an undeclared size is complete once it stops changing");
+}
+
+/// Each way a local hand-over fails reaches the owner as what it is: a file handed
+/// over from outside the directory the server was given, one that never arrived, and
+/// one that stopped short are three different faults, and only a failure nothing
+/// recognises is still the transport's own refusal.
+#[test]
+fn every_local_hand_over_failure_reaches_the_owner_as_itself() {
+    let outside: anyhow::Error = LocalHandOver::Outside.into();
+    assert_eq!(download_failure_reason(&outside), LOCAL_FILE_OUTSIDE_REASON);
+
+    let missing: anyhow::Error = LocalHandOver::Missing.into();
+    assert_eq!(download_failure_reason(&missing), LOCAL_FILE_MISSING_REASON);
+
+    let incomplete: anyhow::Error = LocalHandOver::Incomplete {
+        got: 3,
+        expected: 9,
+    }
+    .into();
+    assert_eq!(
+        download_failure_reason(&incomplete),
+        local_file_incomplete_reason(3, 9)
+    );
+
+    let unknown = anyhow::anyhow!("the staging disk went away");
+    assert_eq!(
+        download_failure_reason(&unknown),
+        TELEGRAM_TRANSFER_REFUSED_REASON
+    );
+}
+
+/// The limit a refusal names is the one in force: the cloud caps a download at
+/// 20 MB, the local server has no cap at all.
+#[test]
+fn the_refusal_limit_is_the_one_the_mode_has() {
+    assert!(declared_size_refusal(TransferLimits::CLOUD, 20 * 1024 * 1024 + 1).is_some());
+    assert!(declared_size_refusal(TransferLimits::LOCAL, 20 * 1024 * 1024 + 1).is_none());
+    assert_eq!(TransferLimits::LOCAL.upload, 2000 * 1024 * 1024);
+    assert_eq!(TransferLimits::CLOUD.upload, FILE_MAX_BYTES);
+}
+
+/// Boundaries of the declared-size gate: exactly at the cloud's limit passes,
+/// one byte over trips it, and the local mode — which has no download cap — never
+/// refuses on size at all.
 #[test]
 fn declared_size_refusal_boundaries() {
     const MIB: u64 = 1024 * 1024;
+    let cloud = TransferLimits::CLOUD;
+    let limit = telegram_download_limit_reason(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES);
     let cases: &[(u64, Option<String>)] = &[
         (0, None),
         (20 * MIB, None),
-        (20 * MIB + 1, Some(telegram_download_limit_reason())),
-        (50 * MIB, Some(telegram_download_limit_reason())),
-        (50 * MIB + 1, Some(file_too_large_reason())),
+        (20 * MIB + 1, Some(limit.clone())),
+        (2000 * MIB, Some(limit)),
     ];
     for (size, expected) in cases {
-        assert_eq!(declared_size_refusal(*size), *expected, "size {size} bytes");
+        assert_eq!(
+            declared_size_refusal(cloud, *size),
+            *expected,
+            "size {size} bytes"
+        );
     }
+    assert_eq!(declared_size_refusal(TransferLimits::LOCAL, u64::MAX), None);
 }
 
 /// The rejection note is caption-then-note, with an empty caption treated as
@@ -633,7 +814,7 @@ fn declared_size_refusal_boundaries() {
 /// recorded-voice refusal) leaves the name out instead of inventing one.
 #[test]
 fn attachment_rejection_content_shapes() {
-    let reason = telegram_download_limit_reason();
+    let reason = telegram_download_limit_reason(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES);
     assert_eq!(
         attachment_rejection_content(Some("report.pdf"), NOT_RECEIVED, &reason, Some("my report")),
         format!("my report\n\n[File report.pdf: not received — {reason}]")
@@ -3338,7 +3519,7 @@ const BACKOFF_OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the injected fetch of a forwarded attachment takes: past the group's
 /// own ceiling, so a pair that reaches the assistant as one turn can only have
 /// been held across the fetch — no window of the collector's own reaches that far.
-const FETCH_DELAY: Duration = Duration::from_secs(6);
+const FETCH_DELAY: Duration = Duration::from_secs(2);
 
 /// How long a check waits for a burst that has to fetch a file first: the fetch,
 /// the group's own extended window, and room for a loaded machine.
@@ -4294,13 +4475,10 @@ async fn a_clear_then_set_releases_both_waiters_and_keeps_its_channel() {
     .await;
 
     // The clear: its teardown records the cleared channel among the frames a hand-over
-    // waits out and waits for the frame the check is holding open.
+    // waits out and waits for the frame the check is holding open. `frames` is that same
+    // list under the name, which the hand-over below waits out too.
     let frames = registry.replaced("telegram");
-    let teardown = retire_listener(
-        &registry,
-        std::sync::Arc::clone(&frames),
-        Some(std::sync::Arc::clone(&old)),
-    );
+    let teardown = retire_listener(&registry, Some(std::sync::Arc::clone(&old)));
     tokio::pin!(teardown);
     assert!(
         tokio::time::timeout(Duration::from_millis(200), &mut teardown)
@@ -4409,7 +4587,7 @@ async fn a_cleared_token_takes_its_channel_out_of_the_registry() {
     let old: std::sync::Arc<dyn Channel> = std::sync::Arc::new(channel("token-a", &fake, &store));
     registry.register(std::sync::Arc::clone(&old));
 
-    retire_listener(&registry, registry.replaced("telegram"), Some(old)).await;
+    retire_listener(&registry, Some(old)).await;
     assert!(
         registry.get("telegram").is_none(),
         "a cleared token must leave no channel behind"
@@ -5365,6 +5543,42 @@ async fn a_slow_forwarded_attachment_and_its_comment_reach_the_assistant_as_one_
     let rows = burst_rows(&store).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].parts, 2);
+    listener.abort();
+}
+
+/// The poll loop keeps polling while a batch is being parsed: the fetch of a
+/// forwarded photo runs on the processor, so the next `getUpdates` must arrive
+/// while that fetch is still in flight — the point of splitting the intake in two.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(drain)] // serializes the process-global drain flag
+async fn the_poll_loop_keeps_polling_while_a_batch_is_parsed() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    // The handshake's zero-timeout probe takes the empty batch; the photo's batch
+    // is the first the processor parses, and the third poll is what the loop must
+    // reach while that fetch is still running.
+    fake.push_batch("token-a", Vec::new());
+    fake.push_batch(
+        "token-a",
+        vec![forwarded_photo_update(1, 33, "photo-1", 1024)],
+    );
+    fake.push_batch("token-a", vec![test_text_update(2, "still here")]);
+    fake.push_file("photo-1", b"jpeg-bytes", FETCH_DELAY);
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    // A third poll within a window shorter than the fetch: the loop issued it
+    // while the photo was still being fetched, not after the parse returned.
+    until_within(
+        Duration::from_millis(1500),
+        "a third getUpdates arrives while the photo is still being fetched",
+        || async { fake.poll_offsets().len() >= 3 },
+    )
+    .await;
     listener.abort();
 }
 

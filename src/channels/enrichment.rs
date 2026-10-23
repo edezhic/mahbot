@@ -133,6 +133,19 @@ async fn transcribe_audio_marker(path: &str) -> String {
     AUDIO_ICON.to_string()
 }
 
+/// Whether `path` is above the size automatic processing stops at.
+///
+/// `bound` is the transport's own limit, and only the Telegram receive path has
+/// one: a file above it could only have arrived through the local Bot API server,
+/// and receiving such a file means saving it — a phone video is hundreds of
+/// megabytes, and uploading or decoding one is not part of receiving it. Every
+/// other producer (the desktop composer) has its own file cap and no such bound.
+async fn too_large_to_process(path: &std::path::Path, bound: u64) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.len() > bound)
+}
+
 /// A media file copied into the workspace `uploads/` directory: the
 /// `[Saved {label}: path]` annotation for the message and the destination
 /// path for agent tool references.
@@ -457,6 +470,7 @@ async fn handle_video(
     uploads_dir: Option<&std::path::Path>,
     workspace: &str,
     staging_dirs: &[String],
+    processing_bound: Option<u64>,
 ) -> VideoAction {
     if is_http_url(path) {
         return VideoAction::annotation(format!("[Video: {path}]"));
@@ -473,9 +487,20 @@ async fn handle_video(
         // Transcribe the persistent workspace copy — never the temp file
         // (deleted after a successful copy). The annotation keeps the original
         // Telegram filename; fail-open: any failure degrades to the plain
-        // [Saved video: ...] annotation.
-        let transcription =
-            transcribe_saved_video(&saved.dest, file_name_or_path(path), workspace).await;
+        // [Saved video: ...] annotation. A file only the local server could have
+        // delivered is saved and left alone: uploading or decoding it is not part
+        // of receiving it.
+        let transcription = if let Some(bound) = processing_bound
+            && too_large_to_process(&saved.dest, bound).await
+        {
+            tracing::info!(
+                path = %saved.dest.display(),
+                "Video saved without transcription: larger than the automatic-processing bound"
+            );
+            None
+        } else {
+            transcribe_saved_video(&saved.dest, file_name_or_path(path), workspace).await
+        };
         return VideoAction {
             replacement: saved.annotation,
             delete_temp: true,
@@ -490,6 +515,54 @@ async fn handle_video(
         replacement: format!("[Video: {} attached]", file_name_or_path(path)),
         delete_temp: true,
         transcription: None,
+    }
+}
+
+/// Handle an AUDIO marker, answering the annotation to add and whether the
+/// source temp file may be deleted.
+///
+/// macOS transcribes only this message's own inbound attachment. A recording
+/// above the automatic-processing bound is saved to the workspace instead: only
+/// the local Bot API server could have delivered it, and receiving it means
+/// keeping it. Elsewhere an audio marker can only come from outside the
+/// attachment path, so it gets an honest note rather than the bare icon.
+#[cfg_attr(not(target_os = "macos"), expect(clippy::unused_async))]
+async fn handle_audio(
+    path: &str,
+    path_obj: &std::path::Path,
+    uploads_dir: Option<&std::path::Path>,
+    staging_dirs: &[String],
+    processing_bound: Option<u64>,
+) -> (String, bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if path_obj.is_file() && is_inbound_attachment(path_obj, staging_dirs).await {
+            if let Some(bound) = processing_bound
+                && too_large_to_process(path_obj, bound).await
+            {
+                let annotation =
+                    match save_media_to_workspace(path_obj, uploads_dir, "audio", "mp3").await {
+                        Some(saved) => saved.annotation,
+                        None => AUDIO_ICON.to_string(),
+                    };
+                return (annotation, true);
+            }
+            return (transcribe_audio_marker(path).await, true);
+        }
+        tracing::warn!(
+            %path,
+            "Audio marker is not an inbound attachment file — annotating without transcription"
+        );
+        (AUDIO_ICON.to_string(), false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path_obj, uploads_dir, staging_dirs, processing_bound);
+        tracing::debug!(
+            %path,
+            "Audio marker on a platform with no local audio — annotating without transcription"
+        );
+        (AUDIO_UNAVAILABLE.to_string(), false)
     }
 }
 
@@ -519,12 +592,14 @@ async fn transcribe_saved_video(
 /// accumulating the workspace copy, the extracted text and the converter's
 /// notes into `batch`; a missing attachment, an unrouted message and a failed
 /// copy each degrade to a plain annotation rather than dropping the user's
-/// message.
+/// message. A file above the automatic-processing bound is saved and left
+/// alone: receiving it means keeping it, not reading it.
 async fn handle_file(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
     staging_dirs: &[String],
+    processing_bound: Option<u64>,
     batch: &mut EnrichmentBatch,
 ) -> Option<String> {
     // Containment: only this message's own inbound attachment may be read,
@@ -568,6 +643,26 @@ async fn handle_file(
         Some(dest) => format!("[FILE:{}]", dest.display()),
         None => format!("[File {name}: received, not saved to the workspace]"),
     };
+
+    // A file above the automatic-processing bound could only have arrived through
+    // the local Bot API server, and receiving it means keeping it: converting it
+    // would read the whole file into memory. The agent still gets the marker and can
+    // open it with its own tools, whose refusals name their own limits.
+    if let Some(bound) = processing_bound
+        && too_large_to_process(path_obj, bound).await
+    {
+        let saved = if copied_to_workspace {
+            " — open the saved file directly"
+        } else {
+            ""
+        };
+        batch.annotations.push(format!(
+            "[File {name}: received but not converted (larger than the {} MB the bot reads \
+             automatically){saved}]",
+            bound.div_ceil(1024 * 1024)
+        ));
+        return Some(replacement);
+    }
 
     // Extracted images go into the attachment's own per-message directory, so
     // they stay inside the directory the inbound IMAGE containment accepts.
@@ -877,6 +972,12 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
     // Telegram receive path, or the desktop composer (`gui::attachment`). Empty
     // when it has no attachment.
     let staging_dirs = msg.attachment_dirs.clone();
+    // Automatic processing stops at the bound of the transport that carried the
+    // file, and only the Telegram side has one: a file above the cloud's download
+    // limit can only have come through the local Bot API server, and receiving it
+    // means keeping it. A composer attachment has its own cap and no such bound.
+    let processing_bound = (msg.channel == "telegram")
+        .then_some(crate::channels::telegram::TELEGRAM_MAX_FILE_DOWNLOAD_BYTES);
 
     for caps in MEDIA_MARKER_RE.captures_iter(&msg.content) {
         let whole = caps.get_match();
@@ -893,6 +994,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                     path_obj,
                     uploads_dir.as_deref(),
                     &staging_dirs,
+                    processing_bound,
                     &mut batch,
                 )
                 .await
@@ -932,26 +1034,19 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
             }
             MediaMarkerKind::Audio => {
                 // macOS: containment applies — only this message's own inbound
-                // attachment is transcribed or deleted; out-of-scope markers
-                // and a marker naming a directory degrade to the icon only.
-                #[cfg(target_os = "macos")]
-                {
-                    if path_obj.is_file() && is_inbound_attachment(path_obj, &staging_dirs).await {
-                        batch.annotations.push(transcribe_audio_marker(path).await);
-                        batch.files_to_delete.push(path_obj.to_path_buf());
-                    } else {
-                        tracing::warn!(%path, "Audio marker is not an inbound attachment file — annotating without transcription");
-                        batch.annotations.push(AUDIO_ICON.to_string());
-                    }
-                }
-                // No local audio anywhere else: an audio marker can only come
-                // from outside the attachment path (typed by hand, or from a
-                // source that produced one), so it gets an honest note instead
-                // of the bare icon or a path nothing here can use.
-                #[cfg(not(target_os = "macos"))]
-                {
-                    tracing::debug!(%path, "Audio marker on a platform with no local audio — annotating without transcription");
-                    batch.annotations.push(AUDIO_UNAVAILABLE.to_string());
+                // attachment is transcribed or deleted; an out-of-scope marker
+                // degrades to the icon only.
+                let (annotation, delete_temp) = handle_audio(
+                    path,
+                    path_obj,
+                    uploads_dir.as_deref(),
+                    &staging_dirs,
+                    processing_bound,
+                )
+                .await;
+                batch.annotations.push(annotation);
+                if delete_temp {
+                    batch.files_to_delete.push(path_obj.to_path_buf());
                 }
             }
             MediaMarkerKind::Video => {
@@ -965,6 +1060,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                     uploads_dir.as_deref(),
                     &msg.workspace,
                     &staging_dirs,
+                    processing_bound,
                 )
                 .await;
                 result = result.replacen(whole.as_str(), &replacement, 1);

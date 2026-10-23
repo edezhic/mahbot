@@ -372,7 +372,7 @@ async fn reacquire_instance_lock() -> Result<()> {
 /// Where the product's own releases live: this crate's repository, one release
 /// per version. The release workflow publishes to it and the install scripts
 /// download from it, so this is the single source of truth for all three.
-const RELEASE_REPO: &str = env!("CARGO_PKG_REPOSITORY");
+pub(crate) const RELEASE_REPO: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Test-only: the release base a driven update downloads from, in place of
 /// [`RELEASE_REPO`].
@@ -1758,10 +1758,15 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
         }
     }
 
-    // 4. Release the instance lock so the child can acquire it on startup.
+    // 4. The local Bot API server is a child of this process and this exit runs
+    //    no destructors: it is stopped BEFORE the lock is released, so the
+    //    replacement start cannot adopt a server this process is about to kill.
+    crate::channels::stop_telegram_server().await;
+
+    // 5. Release the instance lock so the child can acquire it on startup.
     release_instance_lock().await;
 
-    // 5. Spawn the new instance from the determined spawn path, marked as the
+    // 6. Spawn the new instance from the determined spawn path, marked as the
     //    update hand-off.
     if let Err(e) = spawn_new_instance_from(spawn_path) {
         // Spawn failed — the process stays alive (unless a window close or a
@@ -1776,7 +1781,7 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
         return Err(e);
     }
 
-    // 6. Exit — spawn succeeded.
+    // 7. Exit — spawn succeeded.
     crate::channels::chat_draft::flush_global();
     std::process::exit(0);
 }
@@ -1913,15 +1918,16 @@ pub async fn resolve_admin_telegram_target() -> Option<String> {
 }
 
 /// Send a notification to the admin via Telegram.
+///
+/// Delivery does not depend on a registered listener: the transport send falls
+/// back to a one-off channel on the base the current mode serves when none is
+/// registered, which is exactly the case of a switch having taken the listener
+/// away. A target is therefore the only thing that can be missing; a send that
+/// fails is logged and otherwise left alone.
 pub async fn notify_admin(message: &str, target: Option<&str>) {
     let Some(recipient) = target else {
         return;
     };
-
-    if crate::channel_registry().get("telegram").is_none() {
-        warn!("Telegram channel not found in registry — cannot send update notification");
-        return;
-    }
 
     if let Err(e) =
         crate::channels::telegram::send_direct(recipient, message.to_string(), None).await

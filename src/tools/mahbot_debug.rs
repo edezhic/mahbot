@@ -96,12 +96,7 @@ fn format_readonly_rows(rows: &crate::db::ReadonlyRows) -> String {
         &rows.columns,
         rows.rows
             .iter()
-            .map(|row| {
-                row.iter()
-                    .map(crate::db::format_cell)
-                    .collect::<Vec<_>>()
-                    .join("|")
-            })
+            .map(|row| row.iter().map(crate::db::format_cell).collect::<Vec<_>>())
             .collect(),
         rows.truncated,
     )

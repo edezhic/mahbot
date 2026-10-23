@@ -700,12 +700,7 @@ async fn query_over_ipc(read: Read<'_>, root: &Path, physical: &str, sql: &str) 
         let rows = resp
             .rows
             .iter()
-            .map(|row| {
-                row.iter()
-                    .map(ipc::WireValue::format)
-                    .collect::<Vec<_>>()
-                    .join("|")
-            })
+            .map(|row| row.iter().map(ipc::WireValue::format).collect::<Vec<_>>())
             .collect();
         render_pipe_table(&resp.columns, rows, resp.truncated)
     };
@@ -951,7 +946,64 @@ fn execute_query_readonly(
         format_core_row(row, col_count)
     })?;
 
-    Ok(render_pipe_table(&column_names, rows, has_more))
+    let table = render_pipe_table(&column_names, rows, has_more);
+    // This process never loads the config, so the renderer's value pass has nothing
+    // to look for: the secrets are read from the store being queried instead, which
+    // is what masks a projection that drops the key. A read that fails fails the
+    // command: printing the table unmasked is the leak this exists to prevent.
+    let values = store_secret_values(read, io, conn, db_path)?;
+    Ok(crate::config::scrub_secret_values(&table, &values).into_owned())
+}
+
+/// The secret config values as stored, for [`execute_query_readonly`]: the same
+/// store that answers the query holds them.
+///
+/// A store with no `config_kv` table — the logs store, a forensic snapshot — has no
+/// secrets and answers empty. Any other failure is returned instead of read as
+/// "nothing to mask": this list is all that stands between a value-only projection
+/// and the secret in clear, so it fails closed.
+fn store_secret_values(
+    read: Read<'_>,
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    conn: &std::sync::Arc<turso::core::Connection>,
+    db_path: &Path,
+) -> Result<Vec<String>> {
+    if !has_config_table(read, io, conn, db_path)? {
+        return Ok(Vec::new());
+    }
+    let keys = crate::config::SECRET_CONFIG_KEYS
+        .iter()
+        .map(|key| format!("'{}'", key.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT value FROM config_kv WHERE key IN ({keys})");
+    let rows = collect_rows(
+        read,
+        io,
+        conn,
+        &sql,
+        db_path,
+        |row| match crate::db::Value::from(row.get_value(0).clone()) {
+            crate::db::Value::Text(text) => Some(text),
+            _ => None,
+        },
+    )?;
+    Ok(rows.into_iter().flatten().collect())
+}
+
+/// Whether the store has the config table at all: the only reason a store has no
+/// secrets to mask.
+fn has_config_table(
+    read: Read<'_>,
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    conn: &std::sync::Arc<turso::core::Connection>,
+    db_path: &Path,
+) -> Result<bool> {
+    let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'config_kv'";
+    let counts = collect_rows(read, io, conn, sql, db_path, |row| {
+        format_core_value(row.get_value(0))
+    })?;
+    Ok(counts.first().is_some_and(|count| count != "0"))
 }
 
 /// SQL selecting a store's user tables: `type='table'`, with real DDL, and not
@@ -1339,12 +1391,11 @@ fn scan_sql(sql: &str) -> Result<Vec<SqlToken>, String> {
     Ok(tokens)
 }
 
-/// Format a single `turso::core` result row as pipe-delimited values.
-fn format_core_row(row: &turso::core::Row, column_count: usize) -> String {
-    let parts: Vec<String> = (0..column_count)
+/// Format a single `turso::core` result row as its pipe-table cells.
+fn format_core_row(row: &turso::core::Row, column_count: usize) -> Vec<String> {
+    (0..column_count)
         .map(|idx| format_core_value(row.get_value(idx)))
-        .collect();
-    parts.join("|")
+        .collect()
 }
 
 /// Convert a `turso::core` column value to its display representation through
@@ -1360,7 +1411,11 @@ fn format_core_value(val: &turso::core::Value) -> String {
 /// row limit was hit. Callers spell their own cells through
 /// [`crate::db::format_cell`] (the value types differ per path) and delegate
 /// the assembly here. An empty column list renders as empty output.
-pub(crate) fn render_pipe_table(columns: &[String], rows: Vec<String>, truncated: bool) -> String {
+pub(crate) fn render_pipe_table(
+    columns: &[String],
+    rows: Vec<Vec<String>>,
+    truncated: bool,
+) -> String {
     if columns.is_empty() {
         return String::new();
     }
@@ -1368,14 +1423,19 @@ pub(crate) fn render_pipe_table(columns: &[String], rows: Vec<String>, truncated
     out.push_str(&columns.join("|"));
     out.push('\n');
     for row in rows {
-        out.push_str(&row);
+        out.push_str(&row.join("|"));
         out.push('\n');
     }
     if truncated {
         out.push_str(&format_truncation_row(columns.len()));
         out.push('\n');
     }
-    out
+    // Masking by key and, where this process holds the config, by value. The value
+    // pass is what covers a projection that drops the key; the paths that render
+    // without a loaded config (the command line over IPC, the direct read) mask
+    // those before the rows reach here — see `response_from_rows` and
+    // [`execute_query_readonly`].
+    crate::config::scrub_secret_config_values(&out).into_owned()
 }
 
 /// Format a truncation sentinel row that matches the column count.
@@ -1511,6 +1571,55 @@ mod tests {
         ] {
             assert!(validate_read_only(sql).is_err(), "should reject: {sql}");
         }
+    }
+
+    /// A projection that drops the key is masked from the store's own secret
+    /// values — the direct path has no loaded config to mask against.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn a_value_only_projection_is_masked_from_the_stores_own_secrets() {
+        let (store, dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        let hash = "0123456789abcdef0123456789abcdef";
+        store
+            .set_kv(crate::config::CONFIG_KEY_TELEGRAM_API_HASH, hash)
+            .await
+            .expect("store the secret");
+
+        let db_path = crate::db::store_db_path(dir.path(), crate::db::CONSOLIDATED_DB_NAME);
+        let budget = Budget::start();
+        let read = Read::direct("config", &budget);
+        let out = open_and_run_readonly(read, &db_path, |read, io, db, path| {
+            connect_execute(
+                read,
+                io,
+                db,
+                format!(
+                    "SELECT value AS v FROM config_kv WHERE key='{}'",
+                    crate::config::CONFIG_KEY_TELEGRAM_API_HASH
+                )
+                .as_str(),
+                path,
+            )
+        })
+        .expect("the query must run on a real store");
+        assert!(!out.contains(hash), "the secret must not print: {out}");
+        assert!(out.contains("[redacted]"), "{out}");
+    }
+
+    /// A key beside the value still prints a non-secret row: the mask matches the
+    /// secret keys, not the shape of a config table.
+    #[test]
+    fn only_the_secret_keys_are_masked() {
+        let out = render_pipe_table(
+            &["key".to_string(), "value".to_string()],
+            vec![vec![
+                "provider_endpoint".to_string(),
+                "https://example.test".to_string(),
+            ]],
+            true,
+        );
+        assert!(out.contains("provider_endpoint|https://example.test"));
+        assert!(out.contains("truncated"));
     }
 
     #[test]

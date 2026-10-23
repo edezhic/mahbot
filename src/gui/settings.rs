@@ -12,11 +12,12 @@
 
 use crate::Role;
 use crate::Workspace;
+use crate::channels::telegram_local::{self, Health, Mode};
 use crate::config::{
     CONFIG, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_MANAGER_MODEL,
     CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY, CONFIG_KEY_PROVIDER_KEY,
-    CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL,
-    ConfigData, ModelRouting,
+    CONFIG_KEY_TELEGRAM_API_HASH, CONFIG_KEY_TELEGRAM_API_ID, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
+    CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL, ConfigData, ModelRouting,
 };
 #[cfg(target_os = "macos")]
 use crate::config::{
@@ -28,12 +29,13 @@ use crate::tools::media_catalog::image::validate_image_model;
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
+#[cfg(target_os = "macos")]
+use iced::widget::Text;
+use iced::widget::text::IntoFragment;
 use iced::widget::{
     Column, Id, Row, Space, button, checkbox, column, container, image, pick_list, responsive, row,
     stack, text, toggler, tooltip,
 };
-#[cfg(target_os = "macos")]
-use iced::widget::{Text, text::IntoFragment};
 use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
@@ -182,6 +184,28 @@ fn model_picker_list<'a>(
     col.into()
 }
 
+// ── Telegram Bot API mode helpers ────────────────────────────────
+
+/// The mode the owner asked for, in the words the Settings page shows it.
+fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Cloud => "Cloud Bot API",
+        Mode::Local => "Local Bot API server",
+    }
+}
+
+/// What the feature is doing right now, in words — never a claim beyond what
+/// the supervisor last observed.
+fn health_label(health: Health) -> &'static str {
+    match health {
+        Health::Cloud => "using Telegram's cloud API",
+        Health::Starting => "installing or starting…",
+        Health::Running => "running",
+        Health::Unconfirmed => "server running; Telegram not confirmed",
+        Health::Down => "not running",
+    }
+}
+
 // ── Messages ─────────────────────────────────────────────────────
 
 /// Which model picker is being operated on.
@@ -236,6 +260,8 @@ pub enum PasswordTarget {
     FirecrawlKey,
     ExaKey,
     TelegramToken,
+    TelegramApiId,
+    TelegramApiHash,
     EndpointKey,
 }
 
@@ -310,6 +336,34 @@ pub enum SettingsMessage {
     },
     /// Toggle password visibility for a specific field.
     TogglePasswordVisibility(PasswordTarget),
+    // ── Telegram Bot API mode messages ──────────────────────────
+    /// Open the api_id/api_hash dialog, re-seeded from CONFIG.
+    OpenTelegramCredentials,
+    /// Close the api_id/api_hash dialog without switching.
+    CloseTelegramCredentials,
+    /// A shared-editor action on the dialog's api_id field.
+    TelegramApiIdInput(EditorAction),
+    /// A shared-editor action on the dialog's api_hash field.
+    TelegramApiHashInput(EditorAction),
+    /// Save the pair, then ask for the switch to the local server. Refused
+    /// while a save or switch started here is still in flight.
+    SubmitTelegramCredentials,
+    /// Open the confirmation that gives up the local server and its data.
+    RequestSwitchToCloud,
+    /// Close that confirmation without switching.
+    DismissSwitchToCloud,
+    /// The confirmation was accepted: ask for the switch back to the cloud.
+    ConfirmSwitchToCloud,
+    /// Re-attempt the switch that is pending. The direction is read from the
+    /// journal at the moment of the click, so a retry can only repeat the switch
+    /// the owner already asked for — never start the opposite one.
+    RetrySwitch,
+    /// Result of a save-and-switch this page started. `target` names which
+    /// switch it was, so a failure is reported where it happened.
+    TelegramSwitchResult {
+        target: Mode,
+        result: Result<(), String>,
+    },
     // ── Workspace management (sub-messages) ─────────────────────
     /// Wrapped workspace message.
     WorkspaceMsg(workspaces::WorkspacesMessage),
@@ -539,6 +593,27 @@ pub struct SettingsState {
     /// OpenRouter), so the toggle never shows ON while nothing is configured.
     custom_revealed: bool,
 
+    // ── Telegram Bot API mode state ─────────────────────────────
+    /// Whether the api_id/api_hash dialog is open.
+    telegram_credentials_open: bool,
+    /// api_id field of the credentials dialog. Seeded from CONFIG when the
+    /// dialog opens; its own buffer so an abandoned edit is not staged into the
+    /// config snapshot before submit.
+    telegram_api_id_input: SingleLineEditorState,
+    /// api_hash field of the credentials dialog — rendered masked, like every
+    /// other secret on this page (masking is render-only).
+    telegram_api_hash_input: SingleLineEditorState,
+    /// Inline error inside the credentials dialog: a rejected save, or the
+    /// switch request refusing to start. Never carries the values themselves.
+    telegram_credentials_error: Option<String>,
+    /// Whether the switch-back-to-the-cloud confirmation is open.
+    confirm_switch_to_cloud: bool,
+    /// A save-and-switch this page started is in flight. Kept apart from the
+    /// feature's own `migrating` flag because it exists from the click until
+    /// the request returns — before anything is journaled and after a request
+    /// that refused to start — so a double submit cannot start two switches.
+    telegram_switch_busy: bool,
+
     // ── Workspace management state ──────────────────────────────
     pub(crate) workspaces_state: workspaces::WorkspacesState,
     /// Whether the add-workspace modal is visible.
@@ -653,6 +728,12 @@ impl SettingsState {
             error: None,
             password_visible: HashSet::new(),
             custom_revealed: false,
+            telegram_credentials_open: false,
+            telegram_api_id_input: SingleLineEditorState::new(""),
+            telegram_api_hash_input: SingleLineEditorState::new(""),
+            telegram_credentials_error: None,
+            confirm_switch_to_cloud: false,
+            telegram_switch_busy: false,
             workspaces_state: workspaces::WorkspacesState::new(),
             users_state: users::UsersState::new(),
             show_add_workspace_modal: false,
@@ -1283,6 +1364,127 @@ impl SettingsState {
                 Task::none()
             }
 
+            // ── Telegram Bot API mode ──────────────────────────
+            SettingsMessage::OpenTelegramCredentials => {
+                // Seed from what is on file, so a correction starts from the
+                // pair already saved — this dialog is the only place it is ever
+                // shown, and always masked. An empty pair simply seeds empty.
+                self.telegram_api_id_input
+                    .set_text(CONFIG.telegram_api_id().as_deref().unwrap_or_default());
+                self.telegram_api_hash_input
+                    .set_text(CONFIG.telegram_api_hash().as_deref().unwrap_or_default());
+                self.telegram_credentials_error = None;
+                self.telegram_credentials_open = true;
+                Task::none()
+            }
+            SettingsMessage::CloseTelegramCredentials => {
+                self.telegram_credentials_open = false;
+                Task::none()
+            }
+            SettingsMessage::TelegramApiIdInput(action) => {
+                apply_simple_editor_action(&mut self.telegram_api_id_input, action)
+            }
+            SettingsMessage::TelegramApiHashInput(action) => {
+                apply_simple_editor_action(&mut self.telegram_api_hash_input, action)
+            }
+            SettingsMessage::SubmitTelegramCredentials => {
+                // One switch at a time: the request behind this button journals
+                // a migration, and a second one would interleave the two.
+                if self.telegram_switch_busy {
+                    return Task::none();
+                }
+                let api_id = self.telegram_api_id_input.text();
+                let api_hash = self.telegram_api_hash_input.text();
+                let (id_error, hash_error) =
+                    telegram_local::credential_problems(&api_id, &api_hash);
+                if id_error.is_some() || hash_error.is_some() {
+                    // Both messages are already inline under their fields; the
+                    // dialog stays open and nothing is saved or started.
+                    return Task::none();
+                }
+                self.telegram_switch_busy = true;
+                self.telegram_credentials_error = None;
+                Task::perform(
+                    save_credentials_and_switch_local(api_id, api_hash),
+                    |result| SettingsMessage::TelegramSwitchResult {
+                        target: Mode::Local,
+                        result,
+                    },
+                )
+            }
+            SettingsMessage::RequestSwitchToCloud => {
+                if !self.telegram_switch_busy {
+                    self.confirm_switch_to_cloud = true;
+                }
+                Task::none()
+            }
+            SettingsMessage::DismissSwitchToCloud => {
+                self.confirm_switch_to_cloud = false;
+                Task::none()
+            }
+            SettingsMessage::ConfirmSwitchToCloud => {
+                self.confirm_switch_to_cloud = false;
+                if self.telegram_switch_busy {
+                    return Task::none();
+                }
+                self.telegram_switch_busy = true;
+                Task::perform(
+                    async {
+                        telegram_local::request_switch(Mode::Cloud)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    |result| SettingsMessage::TelegramSwitchResult {
+                        target: Mode::Cloud,
+                        result,
+                    },
+                )
+            }
+            SettingsMessage::RetrySwitch => {
+                if self.telegram_switch_busy {
+                    return Task::none();
+                }
+                // The pending direction comes from the journal, so the retry
+                // repeats what was asked for — a blocked revert stays a revert.
+                let target = telegram_local::status().target;
+                self.telegram_switch_busy = true;
+                Task::perform(
+                    async move {
+                        telegram_local::request_switch(target)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    move |result| SettingsMessage::TelegramSwitchResult { target, result },
+                )
+            }
+            SettingsMessage::TelegramSwitchResult { target, result } => {
+                self.telegram_switch_busy = false;
+                match (target, result) {
+                    // The local switch is journaled and runs in the background
+                    // from here; the dialog's job is done.
+                    (Mode::Local, Ok(())) => {
+                        self.telegram_credentials_open = false;
+                        self.telegram_credentials_error = None;
+                        self.telegram_api_id_input.clear();
+                        self.telegram_api_hash_input.clear();
+                    }
+                    // The pair is saved but the switch did not start: reopen the
+                    // dialog if the owner dismissed it while the request ran,
+                    // so the reason is never hidden behind a closed window.
+                    (Mode::Local, Err(e)) => {
+                        self.telegram_credentials_open = true;
+                        self.telegram_credentials_error = Some(e);
+                    }
+                    // The back-to-cloud switch reports on the page banner: its
+                    // confirmation is gone by the time the answer lands.
+                    (Mode::Cloud, Ok(())) => {}
+                    (Mode::Cloud, Err(e)) => {
+                        self.error = Some(format!("The bot could not return to the cloud: {e}"));
+                    }
+                }
+                Task::none()
+            }
+
             // ── Transcription ───────────────────────────────────
             #[cfg(target_os = "macos")]
             SettingsMessage::TranscriptionToggle(enabled) => {
@@ -1677,6 +1879,10 @@ impl SettingsState {
                     self.close_add_workspace_modal();
                 } else if self.show_add_user_modal {
                     self.close_add_user_modal();
+                } else if self.telegram_credentials_open {
+                    self.telegram_credentials_open = false;
+                } else if self.confirm_switch_to_cloud {
+                    self.confirm_switch_to_cloud = false;
                 } else {
                     // The last tier, matching render_modal_overlay: the
                     // custom-tools details window, the custom-roles editor and
@@ -2643,7 +2849,9 @@ impl SettingsState {
             fields,
             Some(middle.into()),
             if is_new { "Add" } else { "Save" },
-            editor.in_flight,
+            editor
+                .in_flight
+                .then_some(if is_new { BUSY_ADDING } else { BUSY_SAVING }),
             !editor.name.text().is_empty() && !editor.prompt.text().is_empty() && !editor.in_flight,
             SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::CloseEditor),
             SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::SubmitEditor),
@@ -2871,6 +3079,12 @@ impl SettingsState {
             )
         } else if let Some(roles_modal) = self.custom_roles_modal() {
             roles_modal
+        } else if self.telegram_credentials_open {
+            let dialog = self.telegram_credentials_dialog();
+            widgets::modal_backdrop(dialog, SettingsMessage::CloseTelegramCredentials, 0.5)
+        } else if self.confirm_switch_to_cloud {
+            let dialog = Self::switch_to_cloud_dialog();
+            widgets::modal_backdrop(dialog, SettingsMessage::DismissSwitchToCloud, 0.5)
         } else {
             // Keep Stack widget type stable
             iced::widget::stack([widgets::empty_stack_placeholder()]).into()
@@ -2928,7 +3142,7 @@ impl SettingsState {
             ],
             None,
             "Add",
-            self.add_workspace_adding,
+            self.add_workspace_adding.then_some(BUSY_ADDING),
             !self.add_workspace_name.text().is_empty()
                 && !self.add_workspace_path.text().is_empty(),
             SettingsMessage::ToggleAddWorkspaceModal,
@@ -2975,7 +3189,7 @@ impl SettingsState {
             }],
             Some(middle.spacing(theme::SPACE_4).into()),
             "Add",
-            self.add_user_adding,
+            self.add_user_adding.then_some(BUSY_ADDING),
             !name.is_empty() && problem.is_none(),
             SettingsMessage::ToggleAddUserModal,
             SettingsMessage::SubmitAddUser,
@@ -3649,8 +3863,269 @@ impl SettingsState {
                     None,
                     false,
                 ),
+                self.telegram_local_area(),
             ],
         )
+    }
+
+    /// The Telegram Bot API mode area of the Integrations section: the current
+    /// facts in words and the switch this state allows.
+    ///
+    /// The state is read at render time: every change of the feature publishes
+    /// [`crate::runtime_events::RuntimeEvent::TelegramLocal`], which the
+    /// dashboard turns into a repaint, so there is no poll loop here.
+    fn telegram_local_area(&self) -> Element<'_, SettingsMessage> {
+        let status = telegram_local::status();
+        // A switch actually in flight, or a request this page just started:
+        // every control is unavailable meanwhile. A switch waiting for the owner
+        // (blocked with a cause) is not busy by this definition.
+        let busy = self.telegram_switch_busy || (status.migrating && status.blocked.is_none());
+
+        let mut facts = Column::new()
+            .spacing(theme::SPACE_4)
+            .push(field_row(
+                "Bot API Mode",
+                text(mode_label(status.serving)).size(theme::TEXT_13).into(),
+                None,
+            ))
+            .push(field_row(
+                "Bot API Status",
+                text(health_label(status.health))
+                    .size(theme::TEXT_13)
+                    .into(),
+                None,
+            ));
+        if status.target != status.serving {
+            // The switch has not reached its irreversible point: the mode above
+            // is what serves now, and this says where the owner is taking it.
+            facts = facts.push(
+                text(format!("switching to {}…", mode_label(status.target)))
+                    .size(theme::TEXT_11)
+                    .color(theme::TEXT_SECONDARY),
+            );
+        }
+        if let Some(version) = status.version.as_deref() {
+            facts = facts.push(field_row(
+                "Server Version",
+                text(version.to_owned()).size(theme::TEXT_13).into(),
+                None,
+            ));
+        }
+        if let Some(reason) = status.last_error.as_deref() {
+            // The reason lives in the status snapshot, not in the page state.
+            // When the switch is blocked this is the journal's cause, which
+            // survives restarts; it is printed here only.
+            let line: Element<'_, SettingsMessage> =
+                inline_error(reason.to_owned(), FIELD_ROW_INLINE_PAD);
+            facts = facts.push(line);
+        }
+
+        let mut area = column![Space::new().height(theme::SPACE_2), facts].spacing(theme::SPACE_4);
+
+        if busy {
+            // The switch itself reports progress through the same status block;
+            // this only says the click was taken and no second one will be.
+            area = area.push(
+                row![
+                    super::spinner(theme::TEXT_14),
+                    text("working…")
+                        .size(theme::TEXT_12)
+                        .color(theme::TEXT_SECONDARY)
+                ]
+                .spacing(theme::SPACE_6)
+                .align_y(Alignment::Center),
+            );
+        }
+        area.push(Self::telegram_mode_controls(&status, busy))
+            .into()
+    }
+
+    /// The controls this switch state allows. A switch that cannot finish must
+    /// leave the owner a way forward and a way out; which one that is follows the
+    /// switch that is pending, not the mode it is heading for — a blocked revert is
+    /// a switch to finish just as much as a blocked forward switch.
+    fn telegram_mode_controls(
+        status: &telegram_local::Status,
+        busy: bool,
+    ) -> Element<'static, SettingsMessage> {
+        // Telegram refused the pasted pair — the switch blocks on the same test, and
+        // only that outcome is fixed by entering the pair again.
+        let rejected = status
+            .last_error
+            .as_deref()
+            .is_some_and(telegram_local::credentials_rejected);
+        let credentials_button = || {
+            button(text("Enter api_id/api_hash again").size(theme::TEXT_12))
+                .style(theme::button_secondary)
+                .on_press(SettingsMessage::OpenTelegramCredentials)
+        };
+        let switch_back_button = || {
+            button(text("Switch back to the cloud").size(theme::TEXT_12))
+                .style(theme::button_secondary)
+                .on_press(SettingsMessage::RequestSwitchToCloud)
+        };
+
+        let mut controls = Column::new().spacing(theme::SPACE_4);
+        if status.migrating {
+            if !busy {
+                controls = controls.push(if rejected {
+                    // The pair was refused, so entering it again is the way on:
+                    // the same dialog, whose submit resumes the switch.
+                    credentials_button()
+                } else {
+                    // The switch waits for something outside this page. Asking for
+                    // the same direction again re-runs it cleared of the cause that
+                    // blocked it.
+                    let retry = match status.target {
+                        Mode::Local => "Try switching again",
+                        Mode::Cloud => "Try switching back again",
+                    };
+                    button(text(retry).size(theme::TEXT_12))
+                        .style(theme::button_secondary)
+                        .on_press(SettingsMessage::RetrySwitch)
+                });
+            }
+            if status.target == Mode::Local {
+                // The way out of the local mode is offered even while a switch is
+                // pending: it is the owner's escape from a server that will not
+                // recover, whatever step the switch stopped at.
+                controls = controls.push(switch_back_button());
+            }
+        } else if status.target == Mode::Cloud {
+            if !busy {
+                // The switch needs a working bot: without a token the local server
+                // has nothing to serve, so the control says so instead of starting
+                // a switch that would refuse immediately.
+                let configured = CONFIG.telegram_bot_token().is_some();
+                controls = controls.push(
+                    button(text("Use a local Bot API server").size(theme::TEXT_12))
+                        .style(theme::button_secondary)
+                        .on_press_maybe(
+                            configured.then_some(SettingsMessage::OpenTelegramCredentials),
+                        ),
+                );
+                if !configured {
+                    controls = controls.push(inline_label(
+                        "Add a Telegram bot token above first — the switch needs a working bot.",
+                        FIELD_ROW_INLINE_PAD,
+                        theme::TEXT_SECONDARY,
+                    ));
+                }
+            }
+        } else {
+            // Settled on the local server: the pair was rejected (or was never
+            // usable), so the way forward is entering it again — the same dialog,
+            // whose submit is what resumes a blocked switch.
+            if !busy && (rejected || !status.credentials_set) {
+                controls = controls.push(credentials_button());
+            }
+            controls = controls.push(switch_back_button());
+        }
+        controls.into()
+    }
+
+    /// Build the api_id/api_hash dialog.
+    ///
+    /// The body is passed as [`modal_dialog`]'s `middle` because each field
+    /// carries a hint and its validator's message, which the shared field rows
+    /// do not — [`credentials_dialog_field`] builds them.
+    fn telegram_credentials_dialog(&self) -> Element<'_, SettingsMessage> {
+        let api_id = self.telegram_api_id_input.text();
+        let api_hash = self.telegram_api_hash_input.text();
+        let (id_error, hash_error) = telegram_local::credential_problems(&api_id, &api_hash);
+        let busy = self.telegram_switch_busy;
+        // The shape check only gates the button: nothing is downloaded or
+        // started until the owner submits.
+        let ready = !busy && id_error.is_none() && hash_error.is_none();
+
+        // Both halves of the pair are secrets and are rendered masked: this
+        // dialog is the only place either is ever shown, and never unmasked
+        // without the eye toggle.
+        let id_input = widgets::password_field_editor(
+            &self.telegram_api_id_input.buffer,
+            "1234567",
+            self.password_visible
+                .contains(&PasswordTarget::TelegramApiId),
+            Length::Fixed(375.0),
+            false,
+            Some(Id::new("telegram_api_id")),
+            SettingsMessage::TelegramApiIdInput,
+            SettingsMessage::TogglePasswordVisibility(PasswordTarget::TelegramApiId),
+        );
+        let hash_input = widgets::password_field_editor(
+            &self.telegram_api_hash_input.buffer,
+            "0123456789abcdef0123456789abcdef",
+            self.password_visible
+                .contains(&PasswordTarget::TelegramApiHash),
+            Length::Fixed(375.0),
+            false,
+            Some(Id::new("telegram_api_hash")),
+            SettingsMessage::TelegramApiHashInput,
+            SettingsMessage::TogglePasswordVisibility(PasswordTarget::TelegramApiHash),
+        );
+
+        let mut body = Column::new()
+            .push(dialog::dialog_body([
+                "MahBot can serve the bot from its own Bot API server instead of Telegram's \
+                 cloud API: up to 2000 MB can be sent, and incoming files are no longer \
+                 refused at 20 MB.",
+                "Paste the api_id and api_hash of a Telegram application from \
+                 my.telegram.org. They are stored with the product's settings and are only \
+                 ever shown masked.",
+            ]))
+            .push(Space::new().height(16))
+            .push(credentials_dialog_field(
+                "api_id",
+                id_input,
+                "the number shown on my.telegram.org",
+                id_error,
+            ))
+            .push(Space::new().height(theme::SPACE_8))
+            .push(credentials_dialog_field(
+                "api_hash",
+                hash_input,
+                "the 32-character value next to it",
+                hash_error,
+            ));
+
+        if let Some(error) = self.telegram_credentials_error.as_deref() {
+            body = body
+                .push(Space::new().height(theme::SPACE_8))
+                .push(inline_error(error, 0.0));
+        }
+
+        modal_dialog(
+            "Local Telegram Bot API server".to_string(),
+            &[],
+            Some(body.into()),
+            "Switch to the local server",
+            busy.then_some(BUSY_SWITCHING),
+            ready,
+            SettingsMessage::CloseTelegramCredentials,
+            SettingsMessage::SubmitTelegramCredentials,
+        )
+    }
+
+    /// The confirmation for giving up the local server — the one action here
+    /// that deletes something.
+    fn switch_to_cloud_dialog() -> Element<'static, SettingsMessage> {
+        dialog::confirm_dialog(
+            dialog::dialog_title("Switch back to the cloud Bot API?"),
+            dialog::dialog_body([
+                "The bot returns to Telegram's cloud API, and the local Bot API server is \
+                 removed together with everything it holds: the installed server, its state \
+                 directory and the bot's login there. Files are limited by the cloud again — \
+                 20 MB to the bot, 50 MB from it.",
+            ]),
+            [
+                dialog::DialogAction::secondary(
+                    "Keep the local server",
+                    SettingsMessage::DismissSwitchToCloud,
+                ),
+                dialog::DialogAction::danger("Switch back", SettingsMessage::ConfirmSwitchToCloud),
+            ],
+        )
+        .into()
     }
 
     /// About block — version and how this copy of it was obtained, on one line.
@@ -3798,8 +4273,12 @@ fn field_row<'a>(
 
 /// Small inline status label in the given color, indented `left_pad` px to
 /// align with the input column — shared body of [`inline_error`],
-/// [`inline_warning`], and the model-slot role-list hint above the input.
-fn inline_label(msg: &str, left_pad: f32, color: iced::Color) -> Element<'_, SettingsMessage> {
+/// [`inline_warning`] and the model-slot role-list hint above the input.
+fn inline_label<'a>(
+    msg: impl IntoFragment<'a>,
+    left_pad: f32,
+    color: iced::Color,
+) -> Element<'a, SettingsMessage> {
     container(text(msg).size(theme::TEXT_10).color(color))
         .padding(iced::Padding::default().left(left_pad))
         .into()
@@ -3812,8 +4291,10 @@ fn status_label<'a>(msg: impl IntoFragment<'a>) -> Element<'a, SettingsMessage> 
     Text::new(msg).size(theme::TEXT_13).into()
 }
 
-/// The inline error label rendered under a control, in the error color.
-fn inline_error(err: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
+/// The inline error label rendered under a control, in the error color. Takes a
+/// borrowed or an owned message: a field's shape problem is computed at render
+/// time and cannot be borrowed from the page state.
+fn inline_error<'a>(err: impl IntoFragment<'a>, left_pad: f32) -> Element<'a, SettingsMessage> {
     inline_label(err, left_pad, theme::STATUS_ERROR)
 }
 
@@ -3938,6 +4419,26 @@ fn field_row_with_error<'a>(
     }
 }
 
+/// One field of the api_id/api_hash dialog: the shared label/input row, the
+/// hint under it, and the validator's message about this field below that.
+fn credentials_dialog_field<'a>(
+    label: &'static str,
+    input: Element<'a, SettingsMessage>,
+    hint: &'static str,
+    error: Option<String>,
+) -> Element<'a, SettingsMessage> {
+    let mut col = column![
+        field_row(label, input, None),
+        inline_label(hint, FIELD_ROW_INLINE_PAD, theme::TEXT_SECONDARY),
+    ]
+    .spacing(theme::SPACE_2);
+    if let Some(err) = error {
+        let line: Element<'a, SettingsMessage> = inline_error(err, FIELD_ROW_INLINE_PAD);
+        col = col.push(line);
+    }
+    col.into()
+}
+
 /// Delete confirmation prompt — the inline "Delete? Yes / No" row shown
 /// below a workspace card when the row is the delete target.
 fn delete_confirm_button<'a>(
@@ -3984,6 +4485,45 @@ async fn persist_settled_field(
     anyhow::bail!("unknown settings field: {field}");
 }
 
+/// Save the pair the owner pasted, then ask for the switch to the local server.
+///
+/// api_id is written first and a failed save stops before the request, so a
+/// switch never starts against a half-saved pair; [`telegram_local`] itself
+/// re-checks the shape of both before it journals anything. The error names the
+/// field that failed and never carries a value.
+async fn save_credentials_and_switch_local(api_id: String, api_hash: String) -> Result<(), String> {
+    // Saved as typed (trimmed): telegram_local::credentials is the one place that
+    // normalises what launches, so the pair has a single spelling there.
+    let api_id = api_id.trim();
+    let api_hash = api_hash.trim();
+    let previous_id = crate::config::CONFIG.telegram_api_id();
+    crate::config::persist_settled_string_field(CONFIG_KEY_TELEGRAM_API_ID, api_id)
+        .await
+        .map_err(|e| format!("api_id could not be saved: {e}"))?;
+    if let Err(e) =
+        crate::config::persist_settled_string_field(CONFIG_KEY_TELEGRAM_API_HASH, api_hash).await
+    {
+        // Half a pair is worse than none: the new id beside the old hash would be
+        // fingerprinted and launched as if it were the pair that was checked, so the
+        // id is put back before the error reaches the dialog.
+        let _ = crate::config::persist_settled_string_field(
+            CONFIG_KEY_TELEGRAM_API_ID,
+            previous_id.as_deref().unwrap_or_default(),
+        )
+        .await;
+        return Err(format!("api_hash could not be saved: {e}"));
+    }
+    telegram_local::request_switch(Mode::Local)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The progress labels a dialog's submit button shows while its work is in flight:
+/// one spelling per family, so the button cannot drift from what is happening.
+const BUSY_ADDING: &str = "Adding…";
+const BUSY_SAVING: &str = "Saving…";
+const BUSY_SWITCHING: &str = "Switching…";
+
 /// Configuration for a single text field in [`modal_dialog`].
 struct DialogField<'a> {
     label: &'static str,
@@ -4001,8 +4541,9 @@ struct DialogField<'a> {
 }
 
 /// Build a reusable modal dialog: title, optional field rows, optional `middle`
-/// content, and a Cancel / submit footer. The submit button shows `Adding...`
-/// while in flight and is otherwise disabled unless `submit_enabled`.
+/// content, and a Cancel / submit footer. `busy` is the label the submit button
+/// shows while the action is in flight (`None` when it is idle); the button is
+/// disabled while `busy` is set or `submit_enabled` is false.
 ///
 /// Layout: title, spacer(16), field rows (8 px between), spacer(16),
 /// middle (if any), spacer(16), footer.
@@ -4012,7 +4553,7 @@ fn modal_dialog<'a>(
     fields: &[DialogField<'a>],
     middle: Option<Element<'a, SettingsMessage>>,
     submit_label: &'static str,
-    adding: bool,
+    busy: Option<&'static str>,
     submit_enabled: bool,
     on_cancel: SettingsMessage,
     on_submit: SettingsMessage,
@@ -4055,14 +4596,13 @@ fn modal_dialog<'a>(
     let cancel_btn = button(text("Cancel").size(theme::TEXT_13))
         .style(theme::button_secondary)
         .on_press(on_cancel);
-    let submit_btn =
-        button(text(if adding { "Adding..." } else { submit_label }).size(theme::TEXT_13))
-            .style(theme::button_secondary)
-            .on_press_maybe(if adding || !submit_enabled {
-                None
-            } else {
-                Some(on_submit)
-            });
+    let submit_btn = button(text(busy.unwrap_or(submit_label)).size(theme::TEXT_13))
+        .style(theme::button_secondary)
+        .on_press_maybe(if busy.is_some() || !submit_enabled {
+            None
+        } else {
+            Some(on_submit)
+        });
     col = col.push(dialog::dialog_footer_row([
         cancel_btn.into(),
         submit_btn.into(),

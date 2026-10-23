@@ -15,6 +15,9 @@ pub(crate) enum RuntimeEvent {
     /// Agent/non-agent registry lifecycle, activity instrumentation, or live
     /// transcript content changed.
     Registries,
+    /// The self-hosted Telegram Bot API server's state changed: health, mode,
+    /// version or last error.
+    TelegramLocal,
     /// The voice pipeline status value changed.
     #[cfg(target_os = "macos")]
     VoiceStatus,
