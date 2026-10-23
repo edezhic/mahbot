@@ -93,6 +93,14 @@ pub(crate) fn chrome_use_warning(resp: &ChromeResponse) -> Option<Value> {
         .find_map(|map| map.get("warning").cloned())
 }
 
+/// A warning's text as it is shown to a caller: a plain string unquoted, any other
+/// value as its JSON. The raw [`Value`] stays with whoever puts it in an envelope.
+pub(crate) fn warning_text(warning: &Value) -> String {
+    warning
+        .as_str()
+        .map_or_else(|| warning.to_string(), str::to_string)
+}
+
 /// Stable fragments of chrome-use's browser-replacement note — the warning it
 /// attaches to a command it ran in a browser it launched ITSELF after the
 /// session's previous browser went away ("This session's previous browser is

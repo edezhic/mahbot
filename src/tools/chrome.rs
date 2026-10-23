@@ -11,6 +11,9 @@ use crate::chrome::contract::{
     with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
+use crate::chrome::files::{
+    OneFileTarget, judge_one_file_target, one_file_probe, single_file_input, upload_argv,
+};
 use crate::chrome::forms::{
     ExpectCond, ExtractGate, count_eval_js, expect_args, extract_gate, parse_count_op,
     parse_predicate, parse_state, validate_extract_getters, wait_args, wait_target,
@@ -166,11 +169,38 @@ enum ChromeAction {
     /// the model can visually inspect the rendered page. The output path is
     /// chosen by the tool (under the safe temp root), never by the model.
     Screenshot {},
+    /// Attach local files to the page's file input — the input itself, the label
+    /// that pairs with it, or a container holding it. Relative paths resolve against
+    /// the workspace, and the result names the absolute file each one was read from.
+    Upload {
+        selector: String,
+        /// A list of local paths; a single path string is taken as the one-element
+        /// list models keep reaching for.
+        #[serde(deserialize_with = "one_or_many_paths")]
+        files: Vec<String>,
+    },
 }
 
 /// Helper for `#[serde(default = "true_val")]` on boolean fields.
 const fn true_val() -> bool {
     true
+}
+
+/// Deserialize a list of paths that a model may have written as one string.
+fn one_or_many_paths<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(path) => vec![path],
+        OneOrMany::Many(paths) => paths,
+    })
 }
 
 /// Root session namespace of the interactive chrome tool. Every agent-run session
@@ -1173,6 +1203,9 @@ impl ChromeTool {
             ChromeAction::Screenshot { .. } => {
                 anyhow::bail!("Screenshot is handled in execute(), not build_args")
             }
+            ChromeAction::Upload { .. } => {
+                anyhow::bail!("Upload is handled in execute(), not build_args")
+            }
             ChromeAction::Wait {
                 selector,
                 url,
@@ -1465,6 +1498,15 @@ impl ChromeTool {
                 output: super::with_normalization_notes(output, normalized_notes),
                 leftover_pipes,
             }
+        } else if let ChromeAction::Upload { selector, files } = &action {
+            let ActionOutput {
+                output,
+                leftover_pipes,
+            } = self.upload(selector, files, tab, workspace).await?;
+            ActionOutput {
+                output: super::with_normalization_notes(output, normalized_notes),
+                leftover_pipes,
+            }
         } else if let ChromeAction::Extract { schema, limit } = &action {
             let (schema, schema_note) = Self::normalize_extract_schema(schema)?;
             let ActionOutput {
@@ -1569,13 +1611,26 @@ impl ChromeTool {
         }
         // A corrupt/truncated PNG would otherwise emit a phantom `[IMAGE:…]`
         // marker that the payload path fails open on — gate the emission here.
-        let (width, height) = validate_png(&path)?;
+        let (width, height) = crate::chrome::files::validate_png(&path)?;
         *self.last_screenshot.lock().unwrap_poison() = Some(path_str.clone());
+        let mut output = format!(
+            "[Tab: {tab}] Captured a chrome screenshot: {path_str} ({width}x{height}). \
+             [IMAGE:{path_str}]"
+        );
+        // chrome-use warns when the pixels did not come from the page the caller
+        // thinks it captured; the file is still a picture, so the capture stands
+        // and the warning is repeated rather than swallowed (as the CLI's does).
+        if let Some(warning) = chrome_use_warning(&call.output) {
+            use std::fmt::Write as _;
+            let _ = write!(
+                output,
+                "\n\n⚠ chrome-use warning: {} — the picture was still written; check it \
+                 shows the page you meant",
+                crate::chrome::contract::warning_text(&warning)
+            );
+        }
         Ok(ActionOutput {
-            output: format!(
-                "[Tab: {tab}] Captured a chrome screenshot: {path_str} ({width}x{height}). \
-                 [IMAGE:{path_str}]"
-            ),
+            output,
             leftover_pipes: call.leftover_pipes,
         })
     }
@@ -1595,6 +1650,175 @@ impl ChromeTool {
         let slug = sanitize_filename_component(tab);
         let nonce = rand::random::<u64>();
         Ok(dir.join(format!("{slug}_{nonce:016x}.png")))
+    }
+
+    /// Attach local files to the page's file input — the input itself, a hidden one
+    /// behind a styled control, the label that pairs with it, or a container holding
+    /// it. Every path resolves against the workspace and is handed to
+    /// chrome-use as the absolute file the result then names.
+    ///
+    /// Delivery is reported in chrome-use's own terms: its `uploaded`/`attached`
+    /// counts, and its `warning` verbatim when it could not confirm the input still
+    /// holds the files (a React-style control consumed or replaced them). That
+    /// warning is a degraded SUCCESS here — unlike the text-input warnings, the
+    /// files did reach the page — and nothing here can claim the page's own
+    /// validation accepted them.
+    async fn upload(
+        &self,
+        selector: &str,
+        files: &[String],
+        tab: &str,
+        workspace: &str,
+    ) -> anyhow::Result<ActionOutput<String>> {
+        if files.is_empty() {
+            anyhow::bail!("Not delivered — no local files were named for the attach");
+        }
+        let mut resolved = Vec::with_capacity(files.len());
+        for raw in files {
+            resolved.push(
+                crate::chrome::files::resolve_local_file(raw, Path::new(workspace))
+                    .map_err(|reason| anyhow::anyhow!("Not delivered — {reason}"))?,
+            );
+        }
+        let mut leftover_pipes = false;
+        // Several files at a one-file input is a FileList no real selection can
+        // produce; the files module owns the question and its verdict, this only asks
+        // the page. A probe that cannot answer never refuses the attach — the answer
+        // says the check was skipped instead.
+        let mut unchecked = false;
+        if let Some(probe) = one_file_probe(selector, resolved.len()) {
+            match self.run_command(&["eval", &probe], tab, workspace).await {
+                Ok(call) => {
+                    leftover_pipes |= call.leftover_pipes;
+                    match judge_one_file_target(selector, single_file_input(&call.output)) {
+                        OneFileTarget::Refused(reason) => {
+                            anyhow::bail!("Not delivered — {reason}");
+                        }
+                        OneFileTarget::Unjudged => unchecked = true,
+                        OneFileTarget::Proceed => {}
+                    }
+                }
+                Err(error) => {
+                    debug!("upload one-file probe did not run: {error}");
+                    unchecked = true;
+                }
+            }
+        }
+        let argv = upload_argv(selector, &resolved);
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let call = match self.run_command(&refs, tab, workspace).await {
+            Ok(call) => call,
+            // A step the product's own clock ended — including the daemon-health
+            // verdict that probe runs after such a kill — never learned what reached
+            // the page, so its verdict is the unconfirmed delivery it is, and a plain
+            // retry is not the next thing to do: a queued or half-streamed attach may
+            // still land.
+            Err(error) if Self::upload_delivery_unknown(&error) => {
+                return Err(anyhow::anyhow!(
+                    "Delivery is not confirmed — treat the files as not attached, and check the \
+                     page before attaching them again: {error}"
+                ));
+            }
+            // Any other failure may have streamed part of a file before giving up,
+            // so it never claims the files are on the input either.
+            Err(error) => return Err(anyhow::anyhow!("Attach did not complete — {error}")),
+        };
+        leftover_pipes |= call.leftover_pipes;
+        // A browser answer of zero uploaded files is not delivery, so the call fails
+        // as the CLI's does — the message keeps the counts, the files and the
+        // browser's own words.
+        if crate::chrome::files::upload_counts(&call.output).0 == Some(0) {
+            return Err(anyhow::anyhow!(
+                "Not delivered — {}",
+                Self::upload_output(tab, selector, &resolved, &call.output, unchecked)
+            ));
+        }
+        Ok(ActionOutput {
+            output: Self::upload_output(tab, selector, &resolved, &call.output, unchecked),
+            leftover_pipes,
+        })
+    }
+
+    /// Whether a failed attach's cause leaves delivery unknown: the product's own
+    /// clock ended the step ([`CLI_BOUND_EXCEEDED`]), or the daemon-health probe
+    /// that rides above such a kill reported the helper unreachable.
+    fn upload_delivery_unknown(error: &anyhow::Error) -> bool {
+        let text = error.to_string();
+        text.contains(CLI_BOUND_EXCEEDED) || is_daemon_unavailable_error(&text)
+    }
+
+    /// The `upload` answer: chrome-use's own counts, the absolute file each path was
+    /// read from, and its warning. A warning marks a delivered attach the page may
+    /// have consumed; it never claims the page's own validation accepted the files.
+    /// A zero upload reads as nothing reaching the page and fails the call.
+    fn upload_output(
+        tab: &str,
+        selector: &str,
+        resolved: &[PathBuf],
+        response: &ChromeResponse,
+        unchecked: bool,
+    ) -> String {
+        use std::fmt::Write as _;
+        let (uploaded, attached) = crate::chrome::files::upload_counts(response);
+        let paths = resolved
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Never invent a count chrome-use did not state: an honest "the N it was
+        // given" beats a delivered claim the browser never made. A stated zero is
+        // the opposite of delivery and never reads as one.
+        let mut output = match uploaded {
+            Some(0) => format!(
+                "[Tab: {tab}] Nothing reached the page for \"{selector}\": {paths} — the browser \
+                 side reported 0 of {} file(s) uploaded",
+                resolved.len()
+            ),
+            Some(uploaded) => format!(
+                "[Tab: {tab}] Delivered {uploaded} of {} file(s) to \"{selector}\": {paths}",
+                resolved.len()
+            ),
+            None => format!(
+                "[Tab: {tab}] Delivered the {} file(s) it was given for \"{selector}\": {paths}",
+                resolved.len()
+            ),
+        };
+        if let Some(warning) = chrome_use_warning(response) {
+            let text = crate::chrome::contract::warning_text(&warning);
+            // A warning rides a delivered attach; with nothing uploaded it is just
+            // the browser side's own words, never a delivery claim.
+            if uploaded == Some(0) {
+                let _ = write!(output, "\n\n⚠ chrome-use warning: {text}");
+            } else {
+                let _ = write!(
+                    output,
+                    "\n\n⚠ chrome-use warning: {text} — the files did reach the page, so this is \
+                     not a failed attach; it is not a claim that the page's own validation \
+                     accepted them"
+                );
+            }
+        } else if let (Some(uploaded), Some(attached)) = (uploaded, attached) {
+            // Only a real delivery can be a kept claim.
+            if uploaded > 0 {
+                if attached == uploaded {
+                    output.push_str(" — the file input still holds them");
+                } else {
+                    // The input itself disagrees with what was sent (a transport
+                    // that kept one file, or a page that added or dropped one):
+                    // report what it holds instead of passing the sent count off as
+                    // delivered.
+                    let _ = write!(output, " — the file input holds {attached} of them");
+                }
+            }
+        }
+        if unchecked {
+            let _ = write!(
+                output,
+                "\n\nNote: {}",
+                crate::chrome::files::unchecked_several_files_note()
+            );
+        }
+        output
     }
 
     /// Normalize the raw tool arguments into the parsed action plus the tab
@@ -1782,10 +2006,10 @@ impl ChromeTool {
         notes: &[String],
     ) -> String {
         use std::fmt::Write as _;
-        // chrome-use's degraded-success `warning` only applies to the
-        // text-input actions (`type` read-back mismatch, `press` with no key
-        // listeners / provably nowhere) — don't scan the shared path for them.
-        // The browser-replacement note is never one of these: [`Self::run_command`]
+        // This shared path renders the text-input warnings only (`type` read-back
+        // mismatch, `press` with no key listeners / provably nowhere); `upload` and
+        // `screenshot` carry their own warnings in their own branches. The
+        // browser-replacement note is never one of these: [`Self::run_command`]
         // already failed the call for it before any response reaches here.
         let warning = if matches!(
             action,
@@ -1854,14 +2078,10 @@ impl ChromeTool {
         };
 
         if let Some(warning) = warning {
-            // The warning is normally a plain string — render it unquoted,
-            // not as its JSON serialization.
-            let text = warning
-                .as_str()
-                .map_or_else(|| warning.to_string(), str::to_string);
             let _ = write!(
                 output,
-                "\n\n⚠ chrome-use warning: {text} — treat the action as NOT applied and choose another approach"
+                "\n\n⚠ chrome-use warning: {} — treat the action as NOT applied and choose another approach",
+                crate::chrome::contract::warning_text(&warning)
             );
         }
 
@@ -1997,43 +2217,6 @@ impl ChromeTool {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Validate a screenshot file is a real PNG: magic bytes + IHDR dimensions
-/// (bytes 16..24, big-endian). chrome-use can report success yet write a
-/// corrupt/truncated file, and `image_payload` fails open on undecodable
-/// rasters — so the validation gates the `[IMAGE:…]` marker emission here,
-/// where a corrupt capture becomes an explicit error instead of a phantom
-/// image part.
-fn validate_png(path: &Path) -> anyhow::Result<(u32, u32)> {
-    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    // Only the header is needed — magic bytes + IHDR dimensions (bytes 16..24).
-    let mut header = [0u8; 24];
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to read screenshot {}", path.display()))?;
-    std::io::Read::read_exact(&mut file, &mut header).map_err(|_| {
-        anyhow::anyhow!(
-            "Screenshot at {} is not a valid PNG (truncated or wrong format)",
-            path.display()
-        )
-    })?;
-    if header[..8] != PNG_MAGIC {
-        anyhow::bail!(
-            "Screenshot at {} is not a valid PNG (wrong format)",
-            path.display()
-        );
-    }
-    let width = u32::from_be_bytes(header[16..20].try_into().expect("slice is 4 bytes"));
-    let height = u32::from_be_bytes(header[20..24].try_into().expect("slice is 4 bytes"));
-    if width == 0 || height == 0 {
-        anyhow::bail!(
-            "Screenshot at {} has an empty IHDR ({}x{})",
-            path.display(),
-            width,
-            height
-        );
-    }
-    Ok((width, height))
-}
-
 /// Reduce a name to a single safe filename component (ASCII alphanumerics,
 /// `-`, `_`), so a model-supplied value (e.g. a chrome `tab`) can never
 /// inject path separators or `..` traversal into a tool-chosen output path.
@@ -2162,6 +2345,7 @@ const KNOWN_ACTIONS: &[&str] = &[
     "eval",
     "find",
     "screenshot",
+    "upload",
     "wait",
     "expect",
     "extract",
@@ -2179,7 +2363,8 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
     {\"eval\":{\"js\":\"...\"}}, \
     {\"find\":{\"by\":\"text|role|label|placeholder|alt|title|testid|first|last|nth\",\
     \"value\":\"...\",\"action\":\"click|fill|hover|check|text\"}}, \
-    {\"screenshot\":{}}, {\"wait\":{\"selector\":\"...\"}}, \
+    {\"screenshot\":{}}, {\"upload\":{\"selector\":\"...\",\"files\":[\"...\"]}}, \
+    {\"wait\":{\"selector\":\"...\"}}, \
     {\"expect\":{\"condition\":\"visible|hidden|present|count|text|value|attr|url\",\
     \"selector\":\"...\",\"count\":int,\"op\":\"==\",\"predicate\":\"equals|contains|matches\",\"name\":\"...\",\"expected\":\"...\"}}, \
     {\"extract\":{\"schema\":{...},\"limit\":int}}";
@@ -2880,11 +3065,11 @@ mod tests {
             .as_array()
             .expect("oneOf should be an array");
 
-        // There are exactly 15 chrome actions.
+        // There are exactly 16 chrome actions.
         assert_eq!(
             action_schemas.len(),
-            15,
-            "expected 15 actions, got {}",
+            16,
+            "expected 16 actions, got {}",
             action_schemas.len()
         );
 
@@ -2911,6 +3096,7 @@ mod tests {
             "eval",
             "find",
             "screenshot",
+            "upload",
             "wait",
             "expect",
             "extract",
@@ -3356,6 +3542,7 @@ mod tests {
                 "wait" => json!({"selector": "#x"}),
                 "expect" => json!({"condition": "visible", "selector": "#x"}),
                 "extract" => json!({"schema": {"rows": ".r"}}),
+                "upload" => json!({"selector": "#f", "files": ["/tmp/a.txt"]}),
                 other => panic!("KNOWN_ACTIONS entry {other} has no lockstep payload"),
             }
         };
@@ -3383,6 +3570,7 @@ mod tests {
             "eval",
             "find",
             "screenshot",
+            "upload",
             "wait",
             "expect",
             "extract",
@@ -3395,12 +3583,19 @@ mod tests {
     }
 
     #[test]
-    fn build_args_rejects_screenshot() {
-        let action = ChromeAction::Screenshot {};
-        assert!(
-            ChromeTool::build_args(&action).is_err(),
-            "Screenshot must be handled in execute(), not build_args"
-        );
+    fn build_args_rejects_verbs_handled_in_execute() {
+        for action in [
+            ChromeAction::Screenshot {},
+            ChromeAction::Upload {
+                selector: "#f".to_string(),
+                files: vec!["/tmp/a.txt".to_string()],
+            },
+        ] {
+            assert!(
+                ChromeTool::build_args(&action).is_err(),
+                "{action:?} must be handled in execute(), not build_args"
+            );
+        }
     }
 
     #[expect(clippy::too_many_lines)] // the per-argv wait/expect shapes are one cohesive table
@@ -3776,38 +3971,6 @@ mod tests {
         assert_ne!(p, p2);
     }
 
-    // ── validate_png ─────────────────────────────────────────────────────
-
-    #[test]
-    fn validate_png_accepts_real_png() {
-        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
-        let dir = std::env::temp_dir().join("mahbot-chrome-test-valid");
-        std::fs::create_dir_all(&dir).unwrap();
-        let png_path = dir.join("valid.png");
-        let mut buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-            .unwrap();
-        std::fs::write(&png_path, &buf).unwrap();
-
-        let (width, height) = validate_png(&png_path).unwrap();
-        assert_eq!((width, height), (2, 2));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn validate_png_rejects_corrupt_file() {
-        let dir = std::env::temp_dir().join("mahbot-chrome-test-corrupt");
-        std::fs::create_dir_all(&dir).unwrap();
-        let png_path = dir.join("corrupt.png");
-        std::fs::write(&png_path, b"not a png").unwrap();
-
-        let err = validate_png(&png_path).unwrap_err().to_string();
-        assert!(err.contains("not a valid PNG"), "err: {err}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     // ── format_action_output: eval ───────────────────────────────────────
 
     #[test]
@@ -3844,6 +4007,61 @@ mod tests {
             &[],
         );
         assert!(out.contains('{'), "should fall back to pretty-print: {out}");
+    }
+
+    #[test]
+    fn upload_output_reports_delivery_and_keeps_the_warning_a_success() {
+        let resolved = vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")];
+        let kept = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({ "uploaded": 2, "attached": 2 })),
+            ..ChromeResponse::default()
+        };
+        let out = ChromeTool::upload_output("default", "#f", &resolved, &kept, false);
+        assert!(out.contains("/tmp/a.txt, /tmp/b.txt"), "{out}");
+        assert!(out.contains("still holds them"), "{out}");
+        assert!(!out.contains("⚠"), "{out}");
+
+        // A file input the page emptied after the upload warns on an exit-0
+        // success: the files did reach the page, so the answer repeats the browser's
+        // words and never calls the attach failed.
+        let consumed = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({
+                "uploaded": 2, "attached": 0,
+                "warning": "the file input is now empty",
+            })),
+            ..ChromeResponse::default()
+        };
+        let out = ChromeTool::upload_output("default", "#f", &resolved, &consumed, false);
+        assert!(out.contains("the file input is now empty"), "{out}");
+        assert!(out.contains("not a failed attach"), "{out}");
+        assert!(!out.contains("still holds them"), "{out}");
+
+        // A stated zero never reads as delivery, and never claims the input kept
+        // files the browser says were not uploaded.
+        let nothing = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({
+                "uploaded": 0, "attached": 0,
+                "warning": "the files could not be streamed",
+            })),
+            ..ChromeResponse::default()
+        };
+        let out = ChromeTool::upload_output("default", "#f", &resolved, &nothing, false);
+        assert!(out.contains("Nothing reached the page"), "{out}");
+        assert!(out.contains("the files could not be streamed"), "{out}");
+        assert!(!out.contains("Delivered"), "{out}");
+        assert!(!out.contains("still holds them"), "{out}");
+        assert!(!out.contains("did reach the page"), "{out}");
+    }
+
+    #[test]
+    fn a_single_files_path_is_taken_as_a_list() {
+        let action: ChromeAction =
+            serde_json::from_value(json!({"upload": {"selector": "#f", "files": "a.txt"}}))
+                .expect("a single path is the one-element list");
+        assert!(matches!(action, ChromeAction::Upload { files, .. } if files == ["a.txt"]));
     }
 
     #[test]

@@ -126,12 +126,12 @@ pub(crate) struct ActionDesc {
     pub(crate) cli: Option<CliHelp>,
 }
 
-/// The `--timeout` row for the seven verbs chrome-use takes no per-call deadline
-/// for (click, count, eval, extract, fill, type, press). Their call runs to the
-/// clock mahbot declares to chrome-use and the product kills only above it, so a
-/// bound below that clock cannot be honoured — it is refused (rc 3) rather than
-/// silently discarded — and a larger one widens only mahbot's own kill. The
-/// printed floor is [`CHROME_USE_DECLARED_BUDGET`], the same number
+/// The `--timeout` row for the eight verbs chrome-use takes no per-call deadline
+/// for (click, count, eval, extract, fill, type, press, upload). Their call runs
+/// to the clock mahbot declares to chrome-use and the product kills only above
+/// it, so a bound below that clock cannot be honoured — it is refused (rc 3)
+/// rather than silently discarded — and a larger one widens only mahbot's own
+/// kill. The printed floor is [`CHROME_USE_DECLARED_BUDGET`], the same number
 /// [`parse_bound_timeout`](crate::chrome::cli) enforces.
 fn own_bound_flag() -> String {
     let floor = CHROME_USE_DECLARED_BUDGET.as_secs();
@@ -559,6 +559,35 @@ fn build_actions() -> Vec<ActionDesc> {
             }),
         },
         ActionDesc {
+            name: "upload",
+            purpose: "attach local files to the page's file input",
+            tool: Some(ToolParams {
+                required: &["selector", "files"],
+                properties: json!({
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector or ref (@e1) of the file input, of the label that pairs with it, or of a container holding it. Refs come from the most recent snapshot on this tab — they become stale after navigation or re-snapshot"
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Local files to attach: absolute paths, or paths relative to your workspace. The result names the absolute file each one was read from. Several files need a target that accepts several"
+                    }
+                }),
+            }),
+            cli: Some(CliHelp {
+                syntax: "<selector> <path...> [--timeout <secs>]",
+                declared: vec![value_flag("--timeout <secs>", own_bound_flag())],
+                session_refusal: None,
+                kinds: STEP_KINDS,
+                details: "Hands each path to the page's file input — the input itself, a hidden one behind a styled control, the label that pairs with it, or the container holding it — the way a real selection reaches it. The CLI has no snapshot refs, so the selector is always CSS. Relative paths resolve against the directory this command was run in, and every path is reported as the absolute file that was used; any file you can read may be attached. Several files need a target that accepts several: a one-file input — named directly, through the label that pairs with it, or through the container holding it — refuses more than one. A success means the files reached the page. The browser side's own warning — it could not confirm the input still holds them (a React-style control consumed or replaced them) — is still a success and is repeated verbatim; it never means the page's own validation accepted them, which is invisible here. A failure means the attach did not complete, and its reason says how far it got. Where the target's shape cannot be judged from the page, the files are sent and the result's `note` says the one-file check was skipped; a target that only accepts drops, with no file input behind it, is refused by the browser side and reported as not delivered.",
+                examples: &[
+                    "mahbot chrome upload \"#file\" ./report.pdf",
+                    "mahbot chrome upload \"input[type=file]\" ./page-1.png ./page-2.png",
+                ],
+            }),
+        },
+        ActionDesc {
             name: "session",
             purpose: "manage named CLI sessions (session stop / session status / session list)",
             tool: None,
@@ -680,12 +709,33 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "screenshot",
-            purpose: "Capture a screenshot of the current page as a PNG and inject it into the conversation as a native image, so you can visually inspect the rendered page",
+            purpose: "capture the current page as a PNG picture",
             tool: Some(ToolParams {
                 required: &[],
                 properties: json!({}),
             }),
-            cli: None,
+            cli: Some(CliHelp {
+                syntax: "[--output-dir <dir>]",
+                declared: vec![value_flag(
+                    "--output-dir <dir>",
+                    "directory the picture is written into (default: the directory this command \
+                     was run in) — it must already exist and be your own; the file is named \
+                     screenshot.png, or screenshot_2.png … when that name is taken, so nothing is \
+                     overwritten",
+                )],
+                session_refusal: None,
+                kinds: STEP_KINDS,
+                details: "Captures the visible page exactly as the agent-facing capture does — the \
+                          same viewport capture, framed and sized by chrome-use the same way. \
+                          `path` in the result is the absolute file that was written, in the \
+                          platform's own spelling, so it can be opened as it is; `origin` names the \
+                          page those pixels came from. The session rule in `mahbot chrome --help` \
+                          decides which tab is captured.",
+                examples: &[
+                    "mahbot chrome screenshot",
+                    "mahbot chrome screenshot --output-dir ~/Pictures --session shot",
+                ],
+            }),
         },
     ]
 }
@@ -763,8 +813,20 @@ mod tests {
         assert_action_set(
             names,
             &[
-                "status", "open", "count", "wait", "expect", "eval", "extract", "click", "fill",
-                "type", "press", "session",
+                "status",
+                "open",
+                "count",
+                "wait",
+                "expect",
+                "eval",
+                "extract",
+                "click",
+                "fill",
+                "type",
+                "press",
+                "upload",
+                "screenshot",
+                "session",
             ],
         );
     }

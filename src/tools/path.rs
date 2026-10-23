@@ -825,6 +825,14 @@ fn live_store_refusal(action: &str, path: &str) -> anyhow::Error {
     )
 }
 
+/// The same refusal for a caller outside this module that hands a local file to
+/// something else — the browser's attach — and must not open a live store on the
+/// way. Answered by location alone, like every store rule.
+pub(crate) fn live_store_denial(path: &Path, action: &str) -> Option<anyhow::Error> {
+    matches!(product_store_file(path), Some(StoreFile::Live))
+        .then(|| live_store_refusal(action, &path.to_string_lossy()))
+}
+
 /// Whether `path` names an existing file or directory once resolved the way a
 /// read resolves it — the test that tells a literal path whose own name carries
 /// glob metacharacters from a pattern.

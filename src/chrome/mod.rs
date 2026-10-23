@@ -88,6 +88,7 @@ pub(crate) mod actions;
 pub(crate) mod cli;
 pub(crate) mod cli_sessions;
 pub(crate) mod contract;
+pub(crate) mod files;
 pub(crate) mod forms;
 pub(crate) mod spawn;
 

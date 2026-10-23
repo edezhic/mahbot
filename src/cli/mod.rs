@@ -2549,9 +2549,11 @@ fn misuse(family: &Family, reason: &str) -> i32 {
 
 // ── The destination ───────────────────────────────────────────────
 
-/// Resolve a producing family's destination — the `--output-dir` value, or the
+/// Resolve a producing command's destination — the `--output-dir` value, or the
 /// directory this command was run in when it was left out — into the absolute
 /// directory the produced files go into, or the reason it cannot be used.
+///
+/// Shared with the `mahbot chrome` screenshot, which produces a file the same way.
 ///
 /// The destination is the caller's own operand, so it is spelled as the caller
 /// sees it and RESOLVED where this command runs, in the directory it was run in
@@ -2565,7 +2567,7 @@ fn misuse(family: &Family, reason: &str) -> i32 {
 /// The one place a governed destination can slip through is a daemon whose own
 /// temp environment differs from this process's: it may scan a root this process
 /// cannot name ([`crate::temp::cleanup_scan_roots_unpinned`]).
-fn resolve_output_dir(named: Option<&str>) -> Result<String, String> {
+pub(crate) fn resolve_output_dir(named: Option<&str>) -> Result<String, String> {
     let (raw, what) = match named {
         Some(value) => (
             crate::util::expand_tilde(value),

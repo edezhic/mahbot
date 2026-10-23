@@ -54,6 +54,7 @@ use crate::chrome::contract::{
     self_launched_browser_error, self_launched_browser_note, truncated_output_error,
     unreachable_tab_message, with_condition_timeout_note,
 };
+use crate::chrome::files::OneFileTarget;
 use crate::chrome::forms::{
     ExpectCond, ExtractGate, WaitTarget, count_eval_js, describe, expect_args, extract_gate,
     parse_count_op, parse_predicate, parse_state, text_value_argv, validate_extract_getters,
@@ -276,7 +277,7 @@ fn top_help() -> String {
     let minutes = cli_sessions::LIFETIME_MINUTES;
     let _ = write!(
         out,
-        "  Without --session a call runs in a throwaway session whose tabs are closed right after the call.\n  With --session <name> the session's tabs live {minutes} minutes after its last use and are then closed;\n  any later call with the same name starts those {minutes} minutes again. With --keep the session never\n  expires: it stays until 'mahbot chrome session stop <name>'. 'mahbot chrome session list' shows the\n  sessions this CLI created, whether each is kept, and how long since it was last used.\n  Stopping, restarting or updating mahbot closes no browser tabs.\n\n"
+        "  Without --session a call runs in a throwaway session whose tabs are closed right after the call.\n  With --session <name> the session's tabs live {minutes} minutes after its last use and are then closed;\n  any later call with the same name starts those {minutes} minutes again. With --keep the session never\n  expires: it stays until 'mahbot chrome session stop <name>'. 'mahbot chrome session list' shows the\n  sessions this CLI created, whether each is kept, and how long since it was last used.\n  A second call is not the first one's page: without --session, 'screenshot' or 'upload' after a\n  separate 'open' sees a blank tab — name the same --session in both calls.\n  Stopping, restarting or updating mahbot closes no browser tabs.\n\n"
     );
     out.push_str("Output (stdout, one JSON line):\n");
     out.push_str(
@@ -443,6 +444,14 @@ enum Action {
         hold: Option<u64>,
         bound: Option<Duration>,
     },
+    Upload {
+        selector: String,
+        files: Vec<String>,
+        bound: Option<Duration>,
+    },
+    Screenshot {
+        output_dir: Option<String>,
+    },
     SessionStop {
         name: String,
         force: bool,
@@ -479,6 +488,8 @@ impl Action {
             Action::Fill { .. } => "fill",
             Action::Type { .. } => "type",
             Action::Press { .. } => "press",
+            Action::Upload { .. } => "upload",
+            Action::Screenshot { .. } => "screenshot",
             Action::SessionStop { .. } | Action::SessionStatus { .. } | Action::SessionList => {
                 "session"
             }
@@ -869,6 +880,8 @@ fn parse_invocation(args: &[String]) -> Result<(Invocation, bool), String> {
         "fill" => parse_fill(session.as_deref(), rest, &allowed),
         "type" => parse_type(session.as_deref(), rest, &allowed),
         "press" => parse_press(session.as_deref(), rest, &allowed),
+        "upload" => parse_upload(session.as_deref(), rest, &allowed),
+        "screenshot" => parse_screenshot(session.as_deref(), rest, &allowed),
         "session" => parse_session(rest, &allowed),
         other => Err(format!("unknown action '{other}'")),
     }?;
@@ -1388,6 +1401,53 @@ fn parse_press(
     })
 }
 
+/// `upload <selector> <path...>` — the paths stay as the caller wrote them here;
+/// the action resolves each against this command's working directory at dispatch,
+/// so a bad path is reported with the reason it failed, not as a shape error.
+fn parse_upload(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: &[&CliFlag],
+) -> Result<Invocation, String> {
+    let (positionals, flags) = parse_flags(rest, allowed)?;
+    let usage = "upload <selector> <path...>";
+    let selector = match positionals.first() {
+        Some(s) => s.clone(),
+        None => return Err(format!("missing selector — {usage}")),
+    };
+    let files: Vec<String> = positionals[1..].to_vec();
+    if files.is_empty() {
+        return Err(format!("missing local file path — {usage}"));
+    }
+    Ok(Invocation {
+        action: Action::Upload {
+            selector,
+            files,
+            bound: parse_bound_timeout(&flags)?,
+        },
+        session: session.map(String::from),
+    })
+}
+
+/// `screenshot [--output-dir <dir>]` — the destination is resolved at dispatch
+/// ([`crate::cli::resolve_output_dir`]), the same rule every producing command
+/// line follows: it must already exist, be the caller's own, and the picture is
+/// never written over anything.
+fn parse_screenshot(
+    session: Option<&str>,
+    rest: &[String],
+    allowed: &[&CliFlag],
+) -> Result<Invocation, String> {
+    let (positionals, flags) = parse_flags(rest, allowed)?;
+    reject_extra_positionals(&positionals, 0)?;
+    Ok(Invocation {
+        action: Action::Screenshot {
+            output_dir: flags.value("output-dir").map(String::from),
+        },
+        session: session.map(String::from),
+    })
+}
+
 fn parse_session(rest: &[String], allowed: &[&CliFlag]) -> Result<Invocation, String> {
     let sub = rest.first().map(String::as_str).ok_or_else(|| {
         "usage: session stop <name> | session status <name> | session list".to_string()
@@ -1472,12 +1532,13 @@ fn parse_forwarded_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
 }
 
 /// The value of a bound `--timeout` — every verb chrome-use takes no per-call
-/// deadline for (count, eval, extract, click, fill, type, press). Nothing can make
-/// chrome-use give up earlier on those, so a bound below the clock the product
-/// declares to chrome-use ([`CHROME_USE_DECLARED_BUDGET`]) CANNOT be honoured: it
-/// is refused as a usage error rather than accepted and silently discarded. A
-/// bound at or above that clock is accepted: the call is never cut off below it,
-/// and above the clock it widens the product's own kill ([`StepClocks::tool_clock`]).
+/// deadline for (count, eval, extract, click, fill, type, press, upload). Nothing
+/// can make chrome-use give up earlier on those, so a bound below the clock the
+/// product declares to chrome-use ([`CHROME_USE_DECLARED_BUDGET`]) CANNOT be
+/// honoured: it is refused as a usage error rather than accepted and silently
+/// discarded. A bound at or above that clock is accepted: the call is never cut off
+/// below it, and above the clock it widens the product's own kill
+/// ([`StepClocks::tool_clock`]).
 /// There is no upper limit here: while the call runs, its session is not closed — the call
 /// says so through `cli_sessions`' in-flight mark, honoured for an hour (a call longer than
 /// that falls back to the session's ordinary lifetime).
@@ -1619,16 +1680,50 @@ fn resolve_stop_target(name: &str, force: bool) -> Result<String, String> {
 
 // ── Dispatch ─────────────────────────────────────────────────────
 
-/// The pure argument checks the pre-action arm runs BEFORE the readiness gate:
-/// the usage errors an action can answer without probing anything, so they are
-/// never buried under an environment refusal. Only checks that are pure and
-/// already exist inside the action live here — `open`'s URL and `--expect`
-/// validation, which `open` re-runs for real.
+/// The caller-operand checks the pre-action arm runs BEFORE the readiness gate —
+/// the usage errors an action can answer without probing the environment, so they
+/// are never buried under an environment refusal: `open`'s URL and `--expect`
+/// validation, an attach's local paths, and a capture's destination. Each verb
+/// re-runs its own check for the values it actually uses.
 fn validate_action_args(action: &Action) -> Option<OutEnvelope> {
-    let Action::Open { url, expect, .. } = action else {
-        return None;
-    };
-    open_args(url, expect.as_deref()).err()
+    match action {
+        Action::Open { url, expect, .. } => open_args(url, expect.as_deref()).err(),
+        Action::Upload {
+            selector, files, ..
+        } => resolve_upload_files(files)
+            .err()
+            .map(|(kind, reason)| upload_refusal(selector, files, kind, &reason)),
+        Action::Screenshot { output_dir } => crate::cli::resolve_output_dir(output_dir.as_deref())
+            .err()
+            .map(|error| {
+                out_env(
+                    "screenshot",
+                    false,
+                    OutKind::Usage,
+                    json!({ "error": error }),
+                )
+            }),
+        _ => None,
+    }
+}
+
+/// Resolve an attach's paths against the directory this command was run in — the
+/// caller's own operand check, run by the pre-flight (before any environment probe)
+/// and again by the verb for the files it hands chrome-use.
+fn resolve_upload_files(files: &[String]) -> Result<Vec<std::path::PathBuf>, (OutKind, String)> {
+    let cwd = std::env::current_dir().map_err(|e| {
+        (
+            OutKind::Environment,
+            format!("the directory this command was run in cannot be read: {e}"),
+        )
+    })?;
+    files
+        .iter()
+        .map(|raw| {
+            crate::chrome::files::resolve_local_file(raw, &cwd)
+                .map_err(|reason| (OutKind::Usage, reason))
+        })
+        .collect()
 }
 
 /// One parsed call: the verbs that run in no session (they report and repair) are answered
@@ -1828,6 +1923,12 @@ async fn execute(action: &Action, name: &str) -> (OutEnvelope, Option<String>) {
             hold,
             bound,
         } => press(key, selector.as_deref(), *hold, *bound, name).await,
+        Action::Upload {
+            selector,
+            files,
+            bound,
+        } => upload(selector, files, *bound, name).await,
+        Action::Screenshot { output_dir } => screenshot(output_dir.as_deref(), name).await,
     };
     (env, opened)
 }
@@ -2007,7 +2108,7 @@ impl StepClocks {
     }
 
     /// Every other agent-facing verb (click, count, eval, extract, fill, type,
-    /// press): the step forwards no `--timeout` chrome-use
+    /// press, upload): the step forwards no `--timeout` chrome-use
     /// honours, so [`CHROME_USE_DECLARED_BUDGET`] — one [`KILL_SLACK`] under
     /// chrome-use's own client tolerance — is the clock it is given.
     /// `own_bound` is the caller's `--timeout`, which [`parse_bound_timeout`]
@@ -3177,6 +3278,277 @@ async fn press(
     match spawn_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => text_input_ok_envelope(action, &Value::Object(base.clone()), resp),
         Err(f) => f.envelope(action, Value::Object(base), clocks),
+    }
+}
+
+/// The delivery verdict a failed attach carries: a kill at the step's own clock
+/// never learned what reached the page, and a failure chrome-use did report may
+/// have streamed part of a file before it gave up — so neither ever claims the
+/// files are on the input.
+const ATTACH_INCOMPLETE_NOTE: &str =
+    "the attach did not complete — treat the files as not attached";
+const DELIVERY_UNCONFIRMED_NOTE: &str =
+    "delivery is not confirmed — treat the files as not attached";
+
+/// The payload an attach reports: the target and the paths it was asked to send.
+fn upload_base(selector: &str, files: &[String]) -> serde_json::Map<String, Value> {
+    let mut base = request([("selector", json!(selector))]);
+    base.insert("files".into(), json!(files));
+    base
+}
+
+/// An attach that never reached the browser, reported against the same payload a
+/// successful one carries.
+fn upload_refusal(selector: &str, files: &[String], kind: OutKind, error: &str) -> OutEnvelope {
+    let mut payload = upload_base(selector, files);
+    payload.insert("error".into(), json!(error));
+    out_env("upload", false, kind, Value::Object(payload))
+}
+
+/// An attach's envelope from chrome-use's answer: the success carries its
+/// `uploaded`/`attached` counts, the absolute files that were read, and its
+/// `warning` verbatim when it could not confirm the input still holds them — a
+/// delivered attach only while something was uploaded, and never a claim about the
+/// page's own validation, which nothing here can see. A stated zero upload is the
+/// failure envelope: nothing reached the page.
+fn upload_ok_envelope(
+    selector: &str,
+    files: &[String],
+    resolved: &[std::path::PathBuf],
+    response: &ChromeResponse,
+    unchecked: bool,
+) -> OutEnvelope {
+    let (uploaded, attached) = crate::chrome::files::upload_counts(response);
+    let mut payload = upload_base(selector, files);
+    payload.insert(
+        "absolute_files".into(),
+        json!(
+            resolved
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        ),
+    );
+    if let Some(n) = uploaded {
+        payload.insert("uploaded".into(), json!(n));
+    }
+    if let Some(n) = attached {
+        payload.insert("attached".into(), json!(n));
+    }
+    if let Some(warning) = chrome_use_warning(response) {
+        payload.insert("warning".into(), warning);
+    }
+    // A stated zero is the opposite of delivery: nothing reached the page, so the
+    // attach is a failure whatever the browser's exit said.
+    if uploaded == Some(0) {
+        payload.insert(
+            "error".into(),
+            json!(format!(
+                "the browser side reported 0 of {} file(s) uploaded — nothing reached the page",
+                resolved.len()
+            )),
+        );
+        return out_env("upload", false, OutKind::Error, Value::Object(payload));
+    }
+    if unchecked {
+        payload.insert(
+            "note".into(),
+            json!(crate::chrome::files::unchecked_several_files_note()),
+        );
+    }
+    out_env("upload", true, OutKind::Ok, Value::Object(payload))
+}
+
+/// `upload` — attach local files to the page's file input, the label that pairs
+/// with it, or the container holding it.
+///
+/// Paths resolve against the directory this command was run in and are handed to
+/// chrome-use as absolute files, which is also what the result reports. A success
+/// carries chrome-use's own `uploaded`/`attached` counts and, verbatim, the
+/// warning it raises when it could not confirm the input still holds the files —
+/// that warning is a degraded success, never this action's failure, and it is
+/// never a claim about the page's own validation, which nothing here can see.
+async fn upload(
+    selector: &str,
+    files: &[String],
+    bound: Option<Duration>,
+    session: &str,
+) -> OutEnvelope {
+    let action = "upload";
+    let base = upload_base(selector, files);
+    // The pre-flight has already refused a path the caller cannot read (usage,
+    // whatever the environment); this is the resolved list it hands chrome-use.
+    let resolved = match resolve_upload_files(files) {
+        Ok(resolved) => resolved,
+        Err((kind, reason)) => return upload_refusal(selector, files, kind, &reason),
+    };
+    let path = match require_cli(action, base.clone()) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // Several files at a one-file input is a state a real selection can never
+    // produce: the page would see a FileList no user could have chosen.
+    let mut unchecked = false;
+    match probe_one_file_target(&path, selector, resolved.len(), session).await {
+        OneFileTarget::Refused(reason) => {
+            return upload_refusal(selector, files, OutKind::Usage, &reason);
+        }
+        OneFileTarget::Unjudged => unchecked = true,
+        OneFileTarget::Proceed => {}
+    }
+    let argv = crate::chrome::files::upload_argv(selector, &resolved);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let clocks = StepClocks::tool_clock(bound);
+    match spawn_step(&path, &refs, Some(session), clocks, None).await {
+        Ok(resp) => upload_ok_envelope(selector, files, &resolved, &resp, unchecked),
+        Err(f) => {
+            let note = if f.kind == OutKind::Timeout {
+                DELIVERY_UNCONFIRMED_NOTE
+            } else {
+                ATTACH_INCOMPLETE_NOTE
+            };
+            let mut env = f.envelope(action, Value::Object(base), clocks);
+            append_error_note(&mut env, note);
+            env
+        }
+    }
+}
+
+/// Ask the page the one-file question the files module puts to a several-file
+/// attach, and hand back its verdict. The probe is the product's own bounded
+/// question, so it runs to [`DEFAULT_STEP_TIMEOUT`] rather than a step's clock.
+async fn probe_one_file_target(
+    path: &Path,
+    selector: &str,
+    files: usize,
+    session: &str,
+) -> OneFileTarget {
+    let Some(probe) = crate::chrome::files::one_file_probe(selector, files) else {
+        return OneFileTarget::Proceed;
+    };
+    let Ok(resp) = spawn_step(
+        path,
+        &["eval", &probe],
+        Some(session),
+        StepClocks::probe(DEFAULT_STEP_TIMEOUT),
+        None,
+    )
+    .await
+    else {
+        return OneFileTarget::Unjudged;
+    };
+    crate::chrome::files::judge_one_file_target(
+        selector,
+        crate::chrome::files::single_file_input(&resp),
+    )
+}
+
+/// A screenshot's reserved file: removed on every path that is not a reported
+/// capture — a spawn failure, a corrupt write, and an interrupted call, whose
+/// future is dropped mid-step. [`ReservedPicture::commit`] is what hands the file
+/// to the caller.
+struct ReservedPicture {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+impl ReservedPicture {
+    fn commit(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for ReservedPicture {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// `screenshot` — capture the visible page into a produced PNG.
+///
+/// The destination is the caller's own directory ([`crate::cli::resolve_output_dir`]):
+/// it is resolved here, where the command ran, and the picture is written under a
+/// name nothing occupies yet — a produced file never overwrites one. The result
+/// reports the absolute path that was written, in the platform's own spelling
+/// (never the verbatim form), so the caller can open it as it is.
+async fn screenshot(output_dir: Option<&str>, session: &str) -> OutEnvelope {
+    let action = "screenshot";
+    let dir = match crate::cli::resolve_output_dir(output_dir) {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(error) => {
+            return out_env(action, false, OutKind::Usage, json!({ "error": error }));
+        }
+    };
+    let path = match require_cli(action, serde_json::Map::new()) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // The claim IS the collision check, and chrome-use writes over the reserved
+    // file it is handed, so a name already present can never be taken.
+    let (file, file_path) = match crate::util::create_unique_file(&dir, "screenshot.png").await {
+        Ok(claimed) => claimed,
+        Err(e) => {
+            return out_env(
+                action,
+                false,
+                OutKind::Error,
+                json!({ "error": format!("cannot write into {}: {e}", dir.display()) }),
+            );
+        }
+    };
+    drop(file);
+    // The reservation is removed on every path that does not become a reported
+    // capture — including a call interrupted mid-step, whose future is dropped here.
+    let picture = ReservedPicture {
+        path: file_path.clone(),
+        keep: false,
+    };
+    let written = file_path.to_string_lossy().into_owned();
+    let clocks = StepClocks::tool_clock(None);
+    match spawn_step(
+        &path,
+        &["screenshot", written.as_str()],
+        Some(session),
+        clocks,
+        None,
+    )
+    .await
+    {
+        Ok(resp) => {
+            let (width, height) = match crate::chrome::files::validate_png(&file_path) {
+                Ok(size) => size,
+                Err(e) => {
+                    return out_env(
+                        action,
+                        false,
+                        OutKind::Error,
+                        json!({ "error": e.to_string() }),
+                    );
+                }
+            };
+            let bytes = std::fs::metadata(&file_path).map_or(0, |m| m.len());
+            let mut payload = serde_json::Map::new();
+            payload.insert("path".into(), json!(written));
+            payload.insert("width".into(), json!(width));
+            payload.insert("height".into(), json!(height));
+            payload.insert("bytes".into(), json!(bytes));
+            // The page the pixels came from: an unaddressed throwaway tab captures
+            // `about:blank`, and the caller must see that rather than trust success.
+            if let Some(origin) = resp.data.as_ref().and_then(|d| d.get("origin")) {
+                payload.insert("origin".into(), origin.clone());
+            }
+            // chrome-use warns when the pixels did not come from the page the
+            // caller thinks it captured; the file is still written, so the capture
+            // stands and the warning is repeated rather than swallowed.
+            if let Some(warning) = chrome_use_warning(&resp) {
+                payload.insert("warning".into(), warning);
+            }
+            picture.commit();
+            out_env(action, true, OutKind::Ok, Value::Object(payload))
+        }
+        Err(f) => f.envelope(action, json!({}), clocks),
     }
 }
 
@@ -4517,6 +4889,7 @@ mod tests {
             &["fill".into(), "#a".into(), "t".into()][..],
             &["type".into(), "#a".into(), "t".into()][..],
             &["press".into(), "Enter".into()][..],
+            &["upload".into(), "#f".into(), "a.txt".into()][..],
         ] {
             let mut argv = action.to_vec();
             argv.extend(["--timeout".into(), "5".into()]);
@@ -5198,6 +5571,86 @@ mod tests {
         assert!(!env.ok);
         assert_eq!(env.kind, OutKind::Error);
         assert_eq!(env.payload["warning"], json!("no key listeners"));
+    }
+
+    fn upload_payload() -> (Vec<String>, Vec<std::path::PathBuf>) {
+        (
+            vec!["a.txt".to_string()],
+            vec![std::path::PathBuf::from("/tmp/a.txt")],
+        )
+    }
+
+    #[test]
+    fn upload_envelope_reports_the_counts_and_the_absolute_files() {
+        let (files, resolved) = upload_payload();
+        let kept = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({ "uploaded": 1, "attached": 1, "selector": "#f" })),
+            ..ChromeResponse::default()
+        };
+        let env = upload_ok_envelope("#f", &files, &resolved, &kept, false);
+        assert!(env.ok);
+        assert_eq!(env.kind, OutKind::Ok);
+        assert_eq!(env.payload["uploaded"], json!(1));
+        assert_eq!(env.payload["attached"], json!(1));
+        assert_eq!(env.payload["absolute_files"], json!(["/tmp/a.txt"]));
+        assert!(env.payload.get("warning").is_none());
+        assert!(env.payload.get("note").is_none());
+    }
+
+    #[test]
+    fn upload_envelope_fails_a_zero_delivery() {
+        let (files, resolved) = upload_payload();
+        let nothing = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({ "uploaded": 0, "attached": 0, "selector": "#f" })),
+            ..ChromeResponse::default()
+        };
+        let env = upload_ok_envelope("#f", &files, &resolved, &nothing, false);
+        assert!(!env.ok);
+        assert_eq!(env.kind, OutKind::Error);
+        assert!(
+            env.payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("nothing reached")
+        );
+    }
+
+    #[test]
+    fn upload_envelope_notes_a_skipped_one_file_check() {
+        let (files, resolved) = upload_payload();
+        let kept = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({ "uploaded": 1, "attached": 1, "selector": "#f" })),
+            ..ChromeResponse::default()
+        };
+        let env = upload_ok_envelope("#f", &files, &resolved, &kept, true);
+        assert_eq!(
+            env.payload["note"],
+            json!(crate::chrome::files::unchecked_several_files_note())
+        );
+    }
+
+    #[test]
+    fn upload_envelope_keeps_a_consumed_input_a_success_with_its_warning() {
+        let (files, resolved) = upload_payload();
+        let consumed = ChromeResponse {
+            success: Some(true),
+            data: Some(json!({
+                "uploaded": 1, "attached": 0,
+                "warning": "upload events were delivered, but the file input is now empty",
+            })),
+            ..ChromeResponse::default()
+        };
+        let env = upload_ok_envelope("#f", &files, &resolved, &consumed, false);
+        assert!(env.ok);
+        assert_eq!(env.kind, OutKind::Ok);
+        assert_eq!(env.payload["attached"], json!(0));
+        assert_eq!(
+            env.payload["warning"],
+            json!("upload events were delivered, but the file input is now empty")
+        );
     }
 
     #[test]

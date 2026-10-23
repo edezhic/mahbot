@@ -16,13 +16,15 @@ Opens a page and automatically returns a compact accessibility snapshot. Read th
 ### 2. Understand the page: `snapshot`
 Re-scan the page to get fresh element refs. Pass `compact: false` to include empty structural elements, `interactive_only: true` to see only buttons/links/inputs, or `depth: N` to limit tree depth (useful for deeply nested pages).
 
-### 3. Interact: `find`, `click`, `fill`, `type`, `press`
+### 3. Interact: `find`, `click`, `fill`, `type`, `press`, `upload`
 Use `find` with locators to click, fill, hover, or check elements. Use `click` with a CSS selector or ref (`@e1`) for simple clicks. Always take a fresh `snapshot` after navigation before using refs — they become stale on any DOM change.
 
 Text input — never set `.value` via eval; use the native actions (they route through React/Vue/Angular setters and rich-editor APIs like CodeMirror/Monaco/ProseMirror):
 * `fill { selector: "input#email", text: "user@example.com" }` — clear the field and write the text; the written value is read back and verified, so success means the field really holds it. The default choice, including multiline/large text.
 * `type { selector: "#search", text: "hello", key_events: true }` — type character-by-character WITHOUT clearing (appends to existing content). `key_events: true` sends real per-character keyDown/keyUp for autocomplete/combobox fields. Embedded newlines press Enter (which may submit a form) — use `fill` for multiline text. A ⚠ warning in the output means the page rewrote or filtered the typed text.
 * `press { key: "Enter", selector: "textarea[name=q]" }` — press a key at the focused element; `selector` tries to focus the element first (use it when focus may have moved), but focus moves only if it is focusable (input, textarea, button, ...) — for a non-focusable selector (e.g. `body`) focus does not move and the key lands wherever focus currently is. `data.target` shows where the key actually landed (may differ from `selector`, may be absent). Press Enter after filling to submit forms. A ⚠ warning means the key provably had no effect — no key listeners for a listener-dependent key (Enter on a bare input, Escape, arrows in text fields; keys with browser defaults like Enter on a button are never probed), an Enter that landed where nothing is focused, or the key going to an iframe boundary — click the target instead.
+
+Files: `upload { selector: "#file", files: ["report.pdf"] }` attaches local files to the page's file input (the input itself, a label that pairs with it, or a container holding it), and the output names the absolute file each was read from — relative paths resolve against your workspace, and several files need a target that accepts several. The output says whether the files were delivered; a ⚠ warning there means the browser side could not confirm the input still holds them (something consumed or replaced them), which still stands as delivery and is never a claim that the page's own validation accepted them.
 
 ### 4. Extract content: `get_text`, `get_innertext`, `eval`, or `snapshot`
 * `get_text { selector: "body" }` — uses DOM `textContent`, so returns ALL descendant text including content inside `<script>` and `<style>` elements. For visible text only (no script/style), use `get_innertext` or `eval` with `document.querySelector('body').innerText`.
