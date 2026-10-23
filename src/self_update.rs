@@ -47,9 +47,21 @@
 //!   [`crate::util::managed_bin::host_os_arch`] returns and `tar.gz` on
 //!   macOS/Linux, `zip` on Windows;
 //! * the archive holds exactly one file, `mahbot` (`mahbot.exe` on Windows), at
-//!   its root.
+//!   its root;
+//! * every release whose body lists changes also carries `changelog.txt` — the
+//!   same text — at `{base}/releases/download/v{version}/changelog.txt`, so an
+//!   update takes the list down with itself instead of reading the release page
+//!   after the restart.
 //!
 //! No hosting-service API call is made anywhere — only those download URLs.
+//!
+//! ## Telling the admin's assistant what changed
+//!
+//! A downloaded update takes the release's change list down with itself, before
+//! the restart, and the first start of the new version hands it to the admin's
+//! assistant as one tagged message in its ordinary queue
+//! ([`announce_update_to_assistant`]). A build from source, a first install and
+//! a restart of the same version produce nothing.
 //!
 //! ## Test-only hooks
 //!
@@ -733,17 +745,8 @@ pub(crate) enum UpdateMode {
 fn classify_update_mode(manifest_dir: &Path) -> UpdateMode {
     // 1. The package registry's source cache (registry src or git checkouts), as
     //    adjacent path segments — separator-agnostic (Windows uses backslashes).
-    let mut prev: Option<&std::ffi::OsStr> = None;
-    for component in manifest_dir.components() {
-        if let (Some(a), std::path::Component::Normal(b)) = (prev, component)
-            && ((a == "registry" && b == "src") || (a == "git" && b == "checkouts"))
-        {
-            return UpdateMode::Downloaded;
-        }
-        prev = match component {
-            std::path::Component::Normal(os) => Some(os),
-            _ => None,
-        };
+    if is_registry_source_cache(manifest_dir) {
+        return UpdateMode::Downloaded;
     }
     // 2. Real working tree: git metadata present.
     if manifest_dir.join(".git").exists() {
@@ -755,6 +758,41 @@ fn classify_update_mode(manifest_dir: &Path) -> UpdateMode {
     } else {
         UpdateMode::Downloaded
     }
+}
+
+/// Whether `manifest_dir` is the package registry's own source cache — a build
+/// from source whose update strategy is nonetheless "download".
+fn is_registry_source_cache(manifest_dir: &Path) -> bool {
+    let mut prev: Option<&std::ffi::OsStr> = None;
+    for component in manifest_dir.components() {
+        if let (Some(a), std::path::Component::Normal(b)) = (prev, component)
+            && ((a == "registry" && b == "src") || (a == "git" && b == "checkouts"))
+        {
+            return true;
+        }
+        prev = match component {
+            std::path::Component::Normal(os) => Some(os),
+            _ => None,
+        };
+    }
+    false
+}
+
+/// Whether this binary is one of the product's ready-made published files, as
+/// opposed to a build from source. A checkout, a source-tarball extract and the
+/// package registry's source cache all keep a build source, and none of them was
+/// delivered by the release pipeline — even though the registry cache updates by
+/// downloading (see [`UpdateMode`]).
+fn is_published_copy() -> bool {
+    is_published_copy_at(Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+/// [`is_published_copy`] for a manifest-directory probe: the mode says the file
+/// was downloaded, and the one source build that also downloads — the package
+/// registry's cache — is excluded.
+fn is_published_copy_at(manifest_dir: &Path) -> bool {
+    classify_update_mode(manifest_dir) == UpdateMode::Downloaded
+        && !is_registry_source_cache(manifest_dir)
 }
 
 /// Determine how the running binary was installed — see [`UpdateMode`].
@@ -1109,6 +1147,253 @@ pub(crate) const UPDATE_DOWNLOAD_COMPLETE_MSG: &str = "✅ Update downloaded and
 /// out.
 pub(crate) const UPDATE_RESTART_MSG: &str =
     "🔄 Waiting for work in progress to finish before the restart…";
+
+// ── The update notice the admin assistant receives ────────────────────────
+
+/// `config_kv` keys of the update notice's durable state. Owned by this
+/// subsystem — preserved by the config store's orphan purge.
+pub(crate) const UPDATE_LAST_RUN_VERSION_KV_KEY: &str = "update_last_run_version";
+pub(crate) const UPDATE_PENDING_CHANGELOG_KV_KEY: &str = "update_pending_changelog";
+
+/// The change list captured during an update, waiting for the first start of the
+/// version it belongs to.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PendingChangelog {
+    version: String,
+    /// `None` when the release carried no list, or it could not be read: the
+    /// notice then says the list is unavailable rather than inventing one.
+    changes: Option<String>,
+}
+
+/// What a start must do about the update notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateNotice {
+    /// The same version started again: nothing to do.
+    Unchanged,
+    /// Record this start as the last run, and say whether it also announces.
+    Record { announce: bool },
+}
+
+/// The whole rule of which starts produce an update notice: a restart of the
+/// same version says nothing; a build from source never does, whatever its
+/// version string says; an installation that has not finished setup records the
+/// version because there is no assistant to tell; and a published copy with
+/// finished setup but no record at all is the first start of a version installed
+/// by a build that predates the record, so it announces with the list
+/// unavailable.
+fn update_notice_action(
+    last_run: Option<&str>,
+    current: &str,
+    published: bool,
+    onboarding_finished: bool,
+) -> UpdateNotice {
+    if last_run == Some(current) {
+        UpdateNotice::Unchanged
+    } else {
+        UpdateNotice::Record {
+            announce: published && onboarding_finished,
+        }
+    }
+}
+
+/// Write the version this start runs from, reporting a failed write rather than
+/// hiding it: the caller decides whether its own contract can go on.
+async fn record_notice_state(version: &str) -> bool {
+    match crate::config_db::store()
+        .set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, version)
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(error = %e, "Could not record the update notice state");
+            false
+        }
+    }
+}
+
+/// The change list captured for `version`, when the record belongs to it. Only
+/// one that cannot be parsed is treated as absent.
+fn pending_changelog_from_str(raw: &str, version: &str) -> Option<PendingChangelog> {
+    let pending: PendingChangelog = match serde_json::from_str(raw) {
+        Ok(pending) => pending,
+        Err(e) => {
+            warn!(error = %e, "The captured update change list could not be read");
+            return None;
+        }
+    };
+    (pending.version == version).then_some(pending)
+}
+
+/// The change list captured for `version`, when the record belongs to it. A
+/// record of another version is left in place: it belongs to a release that may
+/// still start. A failed read is an error so the caller can retry at the next
+/// start instead of burning the notice with "unavailable".
+async fn pending_changelog(
+    store: &crate::config_db::ConfigStore,
+    version: &str,
+) -> Result<Option<PendingChangelog>> {
+    let Some(raw) = store.get_kv(UPDATE_PENDING_CHANGELOG_KV_KEY).await? else {
+        return Ok(None);
+    };
+    Ok(pending_changelog_from_str(&raw, version))
+}
+
+/// The notice itself: one self-contained, tagged block carrying the version and
+/// the release's change list (or the plain statement that there is none).
+fn update_notice_text(version: &str, changes: Option<&str>) -> String {
+    match changes {
+        Some(changes) => crate::prompt::substitute(
+            &crate::prompt::load_prompt("update_notice.md"),
+            &[("{{version}}", version), ("{{changes}}", changes)],
+        ),
+        None => crate::prompt::substitute(
+            &crate::prompt::load_prompt("update_notice_unavailable.md"),
+            &[("{{version}}", version)],
+        ),
+    }
+}
+
+/// Tell the admin's assistant once that the product was updated to this version,
+/// carrying the change list captured during the update.
+///
+/// Called once at daemon start, after the message pipeline is up: the notice
+/// enters the assistant's ordinary queue exactly as a message from the owner
+/// does, so it needs no special surface. The once-only record is written before
+/// the notice is handed over — a crash loses the notice rather than repeating
+/// it, and a restart of the same version finds nothing left to say.
+pub async fn announce_update_to_assistant() {
+    let current = VERSION;
+    let store = crate::config_db::store();
+    let last_run = match store.get_kv(UPDATE_LAST_RUN_VERSION_KV_KEY).await {
+        Ok(last_run) => last_run,
+        Err(e) => {
+            warn!(error = %e, "Could not read the update notice state — no notice is produced");
+            return;
+        }
+    };
+    let action = update_notice_action(
+        last_run.as_deref(),
+        current,
+        is_published_copy(),
+        crate::config::CONFIG.onboarding_stage() == crate::config::OnboardingState::Finished,
+    );
+    let announce = action == UpdateNotice::Record { announce: true };
+
+    // A captured list for this version is spent as soon as this start settles —
+    // announced now, or settled without one — so it is cleared below on every
+    // path. A failed read is only worth holding the notice back for when one is
+    // to be sent.
+    let pending = match pending_changelog(store, current).await {
+        Ok(pending) => pending,
+        Err(e) => {
+            if announce {
+                warn!(
+                    error = %e,
+                    "Could not read the captured update change list — no notice is produced"
+                );
+                return;
+            }
+            None
+        }
+    };
+    // On a version this start settles, the once-only record goes down first:
+    // everything after it is hand-over, which a crash may lose but can never
+    // repeat.
+    if action != UpdateNotice::Unchanged && !record_notice_state(current).await {
+        return;
+    }
+    if pending.is_some()
+        && let Err(e) = store.delete_kv(UPDATE_PENDING_CHANGELOG_KV_KEY).await
+    {
+        warn!(error = %e, "Could not clear the captured update change list");
+    }
+    if !announce {
+        return;
+    }
+    let changes = pending.and_then(|pending| pending.changes);
+    let content = update_notice_text(current, changes.as_deref());
+    crate::agent::message_router::post_assistant_notice(
+        &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+        crate::users::ADMIN_USER_NAME,
+        content,
+    );
+    info!(
+        version = current,
+        "Told the admin assistant about the update"
+    );
+}
+
+/// The URL of a release's change list — the release body's own text, published
+/// as an asset so the update can take it down before the restart.
+fn changelog_url(base: &str, version: &semver::Version) -> String {
+    format!("{base}/releases/download/v{version}/changelog.txt")
+}
+
+/// How long the release's change list may take before the update goes on without
+/// it. The fetch runs beside the archive download, so this is the most an
+/// unreachable list can add to the update.
+const CHANGELOG_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read a release's change list, if it carries one. A missing asset (a release
+/// published before the list travelled with the build) and an empty one are both
+/// `None`, which the notice renders as "unavailable".
+async fn fetch_release_changelog(
+    client: &reqwest::Client,
+    version: &semver::Version,
+) -> Option<String> {
+    let url = changelog_url(&release_base_url(), version);
+    let fetch = async {
+        let response = match client.get(&url).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                info!(url = %url, error = %e, "The release's change list could not be fetched");
+                return None;
+            }
+        };
+        if !response.status().is_success() {
+            info!(url = %url, status = %response.status(), "The release carries no change list");
+            return None;
+        }
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                info!(url = %url, error = %e, "The release's change list could not be read");
+                return None;
+            }
+        };
+        let body = body.trim();
+        (!body.is_empty()).then(|| body.to_string())
+    };
+    if let Ok(changes) = tokio::time::timeout(CHANGELOG_TIMEOUT, fetch).await {
+        changes
+    } else {
+        info!(url = %url, "The release's change list took too long to fetch");
+        None
+    }
+}
+
+/// Record the release's change list for the first start of `target`, while the
+/// update is still running: that start may be offline, and must not consume the
+/// notice with "unavailable" while the list exists.
+async fn capture_update_announcement(target: &semver::Version, changes: Option<String>) {
+    let pending = PendingChangelog {
+        version: target.to_string(),
+        changes,
+    };
+    let value = match serde_json::to_string(&pending) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(error = %e, "Could not encode the update change list");
+            return;
+        }
+    };
+    if let Err(e) = crate::config_db::store()
+        .set_kv(UPDATE_PENDING_CHANGELOG_KV_KEY, &value)
+        .await
+    {
+        warn!(error = %e, "Could not record the update change list");
+    }
+}
 
 // ── The durable record of a partly-finished update ────────────────────────
 
@@ -1490,19 +1775,25 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
     let client = crate::util::http::build_download_client(DOWNLOAD_TIMEOUT)
         .context("Failed to build the download client for self-update")?;
     let archive = temp_dir.path().join(&name);
-    crate::util::http::download_verified(
-        &client,
-        &url,
-        &archive,
-        // The product's own file: it is published beside the version that names
-        // it, so there is deliberately no checksum to verify it against.
-        "",
-        Some(DOWNLOAD_TIMEOUT),
-        crate::util::http::DownloadSizeCheck::Exact,
-        |_, _| {},
-    )
-    .await
-    .with_context(|| format!("Failed to download {name}"))?;
+    // The release's change list is taken down alongside the archive, so the start
+    // after the restart — which may be offline — still has it. Both run together;
+    // the list request is capped at [`CHANGELOG_TIMEOUT`], so a slow or missing
+    // asset costs the update at most that but never the update itself.
+    let (downloaded, changes) = tokio::join!(
+        crate::util::http::download_verified(
+            &client,
+            &url,
+            &archive,
+            // The product's own file: it is published beside the version that names
+            // it, so there is deliberately no checksum to verify it against.
+            "",
+            Some(DOWNLOAD_TIMEOUT),
+            crate::util::http::DownloadSizeCheck::Exact,
+            |_, _| {},
+        ),
+        fetch_release_changelog(&client, &target),
+    );
+    downloaded.with_context(|| format!("Failed to download {name}"))?;
     // The archive runs a zip for Windows and a tar.gz everywhere else — the
     // platform split [`asset_name`] owns.
     let extract = if os == "windows" {
@@ -1564,14 +1855,20 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
         record_update_unfinished(admin_target.as_deref(), SECOND_COPY_REMAINS).await;
     }
 
-    // 8. Notify: in place, then wrapping up before the restart (MUST be before
+    // 8. Record the release's change list for the first start of the new version
+    //    — the list was taken down with the archive above, before the restart. A
+    //    release that carries none is recorded as unavailable; neither case can
+    //    fail the update.
+    capture_update_announcement(&target, changes).await;
+
+    // 9. Notify: in place, then wrapping up before the restart (MUST be before
     //    the shutdown in finalize_update_and_restart — the Telegram channel must
     //    still be live).
     notify_admin(UPDATE_DOWNLOAD_COMPLETE_MSG, admin_target.as_deref()).await;
     notify_admin(UPDATE_RESTART_MSG, admin_target.as_deref()).await;
 
-    // 9. Shared finalize tail. The temp dir is never the spawn target (that is
-    //    always the file the update left in place).
+    // 10. Shared finalize tail. The temp dir is never the spawn target (that is
+    //     always the file the update left in place).
     finalize_update_and_restart(&spawn_path, vec![temp_dir.path().to_path_buf()]).await
 }
 
@@ -2399,6 +2696,13 @@ mod tests {
         let bare = dir.path().join("bare");
         std::fs::create_dir_all(&bare).unwrap();
         assert_eq!(classify_update_mode(&bare), UpdateMode::Downloaded);
+
+        // The registry cache downloads but is still a build from source, so only
+        // the copy with no build source was delivered by the release pipeline.
+        for source in [&checkout, &registry, &git_checkout, &custom, &plain] {
+            assert!(!is_published_copy_at(source), "{}", source.display());
+        }
+        assert!(is_published_copy_at(&bare));
     }
 
     /// The unattended trigger's whole rule, one case per clause: only a
@@ -2488,7 +2792,7 @@ mod tests {
         }
 
         // The newest release is found through its own tiny file, an exact version
-        // through its tag.
+        // through its tag; the change list travels with that same release.
         assert_eq!(
             latest_version_url(base),
             "https://example.test/owner/repo/releases/latest/download/version.txt"
@@ -2496,6 +2800,10 @@ mod tests {
         assert_eq!(
             asset_url(base, &version, "windows", "x86_64"),
             "https://example.test/owner/repo/releases/download/v1.2.3/mahbot-1.2.3-windows-x86_64.zip"
+        );
+        assert_eq!(
+            changelog_url(base, &version),
+            "https://example.test/owner/repo/releases/download/v1.2.3/changelog.txt"
         );
 
         // A pre-release version — what a test release carries — uses the same two
@@ -2506,6 +2814,75 @@ mod tests {
             "https://example.test/owner/repo/releases/download/v1.2.3-rc.1/\
              mahbot-1.2.3-rc.1-linux-aarch64.tar.gz"
         );
+    }
+
+    /// The notice's whole rule: a restart of the same version, a source build and
+    /// an unfinished setup say nothing; a published copy on a different version —
+    /// or the first start of one installed by a build that predates the record —
+    /// announces.
+    #[test]
+    fn test_the_update_notice_is_only_for_a_downloaded_version_change() {
+        let current = "1.2.3";
+        let case = |last, published, onboarding| {
+            update_notice_action(last, current, published, onboarding)
+        };
+
+        // The version already ran: nothing to settle.
+        assert_eq!(case(Some(current), true, true), UpdateNotice::Unchanged);
+
+        // A first install, a build from source and an unfinished setup record the
+        // version without telling anyone.
+        assert_eq!(
+            case(None, false, true),
+            UpdateNotice::Record { announce: false }
+        );
+        assert_eq!(
+            case(None, true, false),
+            UpdateNotice::Record { announce: false }
+        );
+        assert_eq!(
+            case(Some("1.2.2"), false, true),
+            UpdateNotice::Record { announce: false }
+        );
+        assert_eq!(
+            case(Some("1.2.2"), true, false),
+            UpdateNotice::Record { announce: false }
+        );
+
+        // A published copy with finished setup on a new version — including the
+        // first start of one installed by a build that predates the record.
+        assert_eq!(
+            case(None, true, true),
+            UpdateNotice::Record { announce: true }
+        );
+        assert_eq!(
+            case(Some("1.2.2"), true, true),
+            UpdateNotice::Record { announce: true }
+        );
+    }
+
+    /// The rendered notice is one tagged, self-explanatory block in both states.
+    #[test]
+    fn test_the_update_notice_carries_the_version_and_the_list() {
+        let with_list = update_notice_text("1.2.3", Some("* a new capability"));
+        assert!(with_list.starts_with("<product-update version=\"1.2.3\">"));
+        assert!(with_list.contains("* a new capability"));
+
+        let without_list = update_notice_text("1.2.3", None);
+        assert!(without_list.starts_with("<product-update version=\"1.2.3\">"));
+    }
+
+    /// The captured list is used only for the version it was taken for: a record
+    /// belonging to another release is left alone, and an unreadable one is
+    /// treated as absent.
+    #[test]
+    fn test_the_captured_changelog_belongs_to_its_version() {
+        let recorded = r#"{"version":"1.2.3","changes":"* a change"}"#;
+        let matched =
+            pending_changelog_from_str(recorded, "1.2.3").expect("the record belongs to 1.2.3");
+        assert_eq!(matched.changes.as_deref(), Some("* a change"));
+        assert!(pending_changelog_from_str(recorded, "1.2.4").is_none());
+        assert!(pending_changelog_from_str("not a record", "1.2.3").is_none());
     }
 
     /// The version file's own rule: an ordinary copy is never offered a test
@@ -2595,6 +2972,10 @@ mod tests {
         // all six are attached, so its own list of them is the release's definition.
         let workflow = read(".github/workflows/release.yml");
         floors_are_spelled_the_same(&sh, &ps1, &workflow);
+        assert!(
+            workflow.contains("assets+=(\"$RUNNER_TEMP/release/changelog.txt\")"),
+            "release.yml must attach the change list the updater takes down"
+        );
 
         // The words the owner is refused with are one fact too: the scripts begin
         // their refusals with this file's own opening, and name the same requirement

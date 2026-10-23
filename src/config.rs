@@ -1335,9 +1335,9 @@ pub async fn reload_from_db() -> Result<()> {
 /// Delete `config_kv` rows whose keys are no longer recognized config fields
 /// (e.g. a setting removed in an upgrade), so stale values cannot resurface if
 /// the key is ever reintroduced. The shared namespaces written by other
-/// subsystems (the nightly-discovery marker and the temp-cleanup cadence
-/// state) are left untouched. Delete failures are logged and tolerated
-/// (transient, retried on the next reload).
+/// subsystems (the nightly-discovery marker, the temp-cleanup cadence state and
+/// the update notice's records) are left untouched. Delete failures are logged
+/// and tolerated (transient, retried on the next reload).
 async fn purge_unknown_kv_orphans(store: &crate::config_db::ConfigStore, kvs: &[(String, String)]) {
     let orphans: Vec<String> = kvs
         .iter()
@@ -1346,6 +1346,8 @@ async fn purge_unknown_kv_orphans(store: &crate::config_db::ConfigStore, kvs: &[
                 && key != crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY
                 && key != crate::temp::TEMP_CLEANUP_LAST_RUN_KV_KEY
                 && key != crate::temp::TEMP_CLEANUP_MODE_KV_KEY
+                && key != crate::self_update::UPDATE_LAST_RUN_VERSION_KV_KEY
+                && key != crate::self_update::UPDATE_PENDING_CHANGELOG_KV_KEY
         })
         .map(|(key, _)| key.clone())
         .collect();
@@ -2574,6 +2576,14 @@ mod tests {
             .set_kv(crate::temp::TEMP_CLEANUP_MODE_KV_KEY, "daily")
             .await
             .unwrap();
+        store
+            .set_kv(crate::self_update::UPDATE_LAST_RUN_VERSION_KV_KEY, "1.2.3")
+            .await
+            .unwrap();
+        store
+            .set_kv(crate::self_update::UPDATE_PENDING_CHANGELOG_KV_KEY, "{}")
+            .await
+            .unwrap();
 
         let kvs = store.get_all_kv().await.unwrap();
         purge_unknown_kv_orphans(&store, &kvs).await;
@@ -2619,6 +2629,15 @@ mod tests {
             Some("daily"),
             "temp-cleanup mode must survive the purge"
         );
+        for key in [
+            crate::self_update::UPDATE_LAST_RUN_VERSION_KV_KEY,
+            crate::self_update::UPDATE_PENDING_CHANGELOG_KV_KEY,
+        ] {
+            assert!(
+                store.get_kv(key).await.unwrap().is_some(),
+                "update-notice state must survive the purge: {key}"
+            );
+        }
     }
 
     /// The migration must be a no-op when a slot already holds the target

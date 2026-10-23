@@ -298,8 +298,8 @@ pub fn route(agent_id: &str, job: AgentJob) {
 /// incoming message builds: a routed incoming message ([`route_user_message`]),
 /// the command line's handover ([`deliver_command_line_message`]), and a notice
 /// the product addresses to the owner's assistant
-/// ([`deliver_assistant_notice`]). The routing fields such a message never
-/// carries are the shape's own defaults.
+/// ([`assistant_notice_job`], shared by both of its delivery paths). The routing
+/// fields such a message never carries are the shape's own defaults.
 fn user_message_job(
     content: String,
     workspace_name: String,
@@ -611,7 +611,18 @@ pub(crate) async fn deliver_assistant_notice(
     user_name: &str,
     content: String,
 ) -> anyhow::Result<()> {
-    let mut job = user_message_job(
+    let mut job = assistant_notice_job(content, user_name);
+    let durable = persist_and_stamp(&mut job).await;
+    route(agent_id, job);
+    durable
+}
+
+/// The envelope a notice addressed to an Assistant carries: the owner's personal
+/// workspace, the Assistant role, and the history tag an owner-side message
+/// carries. Both delivery paths build it here so the fields that must match an
+/// incoming message are spelled once.
+fn assistant_notice_job(content: String, user_name: &str) -> AgentJob {
+    user_message_job(
         content,
         // The user's own personal workspace — the Assistant is pinned there.
         crate::users::personal_workspace_name(user_name),
@@ -621,10 +632,18 @@ pub(crate) async fn deliver_assistant_notice(
         "gui".to_string(),
         Role::Assistant,
         None,
-    );
-    let durable = persist_and_stamp(&mut job).await;
-    route(agent_id, job);
-    durable
+    )
+}
+
+/// Post a notice addressed to an Assistant straight into its ordinary queue,
+/// with no `pending_jobs` row.
+///
+/// This is the at-most-once sibling of [`deliver_assistant_notice`]: a durable
+/// row is replayed at boot, so a producer that owns its own once-only record and
+/// writes it before calling here must never also persist the envelope — losing
+/// the notice in a crash is preferable to repeating it.
+pub(crate) fn post_assistant_notice(agent_id: &str, user_name: &str, content: String) {
+    route(agent_id, assistant_notice_job(content, user_name));
 }
 
 /// Register an agent in the router table without spawning a consumer loop.

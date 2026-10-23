@@ -30,12 +30,19 @@
 #   version.txt: the version and a newline, so the product learns the newest
 #                version from {base}/releases/latest/download/version.txt and never
 #                calls a hosting-service API
+#   changelog.txt: the body's list of changes, when there is one, so the product's
+#                updater can take it down beside the archive and tell the owner's
+#                assistant what the installed version brought; a release with
+#                nothing to list has no such file
 #   licences:    LICENSE-MIT and LICENSE-APACHE, beside every release
 #
 # Every release also carries a body: a `### Changelog` heading over the titles of the
 # commits made since the last ordinary release, oldest first, one bullet per commit,
 # with the machine's own version bumps left out. A release with no title to list has
-# an empty body, heading and all.
+# an empty body, heading and all. That same text is published as `changelog.txt` when
+# it is not empty, and an empty asset is never uploaded: GitHub refuses one, and the
+# product reads an absent file exactly like an empty list. Everything the updater
+# needs is therefore reachable by URL alone.
 #
 # Nothing becomes visible before all six files have arrived, and then all of it
 # does at once: the files go onto a draft first and the draft is flipped visible in
@@ -315,6 +322,21 @@ jobs:
         run: |
           printf '%s\n' "$VERSION" > "$RUNNER_TEMP/release/version.txt"
 
+          # The list travels with the release as a file the updater can take down
+          # by URL. An empty file is left out — GitHub refuses a zero-byte asset,
+          # and the product reads an absent file exactly like an empty list — so
+          # the same text becomes the release body whether or not it has entries.
+          assets=(
+            "$RUNNER_TEMP/release"/mahbot-*.tar.gz
+            "$RUNNER_TEMP/release"/mahbot-*.zip
+            "$RUNNER_TEMP/release/version.txt"
+            LICENSE-MIT LICENSE-APACHE
+          )
+          if [ -s "$RUNNER_TEMP/changelog.txt" ]; then
+            cp "$RUNNER_TEMP/changelog.txt" "$RUNNER_TEMP/release/changelog.txt"
+            assets+=("$RUNNER_TEMP/release/changelog.txt")
+          fi
+
           # A failed earlier attempt leaves an invisible draft of this mark behind,
           # and the next attempt of the same mark replaces it. A visible release is
           # never touched, and neither is the mark itself.
@@ -324,8 +346,7 @@ jobs:
 
           gh release create "$TAG" --draft --title "$TAG" \
             --notes-file "$RUNNER_TEMP/changelog.txt" \
-            "$RUNNER_TEMP/release"/mahbot-*.tar.gz "$RUNNER_TEMP/release"/mahbot-*.zip \
-            "$RUNNER_TEMP/release/version.txt" LICENSE-MIT LICENSE-APACHE
+            "${assets[@]}"
 
       - name: Make it visible
         run: |
