@@ -35,6 +35,17 @@
 //! header, or marked by the ellipsis where the string is a label. The accounting and
 //! its reasoning live in [`core`].
 //!
+//! # No call waits forever
+//!
+//! Every accessibility exchange is bounded by a deadline the product chose, and each
+//! backend bounds a whole call on top of that: Linux and macOS with the aggregate budget
+//! on [`core`]'s deadline constants, checked between exchanges; Windows with a per-shape
+//! job deadline and the walk's own. A bound that runs out always answers — naming the
+//! surface and saying whether anything was applied, since an abandoned actuation may have
+//! landed — so [`ACTION_LOCK`] is released by an answer and the next call proceeds; a
+//! responsive target never reaches one. Each backend's header states its mechanism, and
+//! the numbers the model is told are in the tool's prompt.
+//!
 //! # Manual check (run once on a machine of each platform)
 //!
 //! Computer use is offered only to the admin's Assistant, so what can be checked
@@ -54,6 +65,12 @@
 //!    the accounting is verified by the unit tests on [`core::CaptureBudget`] and
 //!    [`core::Capture::alloc`], and the other platforms by the cross-compile lanes in
 //!    `scripts/`.
+//! 5. A target that stops answering: `kill -STOP` a throwaway application, `observe`
+//!    it, and the call ends inside its budget with `degraded` naming the window
+//!    instead of hanging; `kill -CONT` and the next call works again. Linux only: a
+//!    restarted at-spi (`kill` its bus launcher) is picked up by the next call, and a
+//!    target advertising an absurd child count is read without its children and says
+//!    so in the header.
 
 mod core;
 mod linux;

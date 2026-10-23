@@ -27,7 +27,7 @@ use super::super::core::{
     self, ElementAct, Impact, Locator, Observation, SurfaceGeometry, TargetSpec, Truncation, UiNode,
 };
 use super::{input, window};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use windows::Win32::Foundation::{E_ACCESSDENIED, E_NOTIMPL};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::UI::Accessibility::{
@@ -56,7 +56,10 @@ use windows::Win32::UI::Accessibility::{
 use windows::core::BSTR;
 
 /// How long one walk may spend before it gives up — inside the caller's
-/// [`super::OBSERVE_TIMEOUT`], so a stuck provider still ends as a clean timeout.
+/// [`super::OBSERVE_TIMEOUT`], so a stuck provider still ends as a clean timeout. A UIA
+/// read is a cross-process property call under the apartment thread's transaction
+/// timeout, which is this same figure: one stalled read spends the whole walk, and the
+/// check before the next read is what stops it there instead of paying another.
 pub(super) const WALK_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Nodes per walk. UIA pays one cross-process read per property, so this is lower
@@ -86,12 +89,20 @@ pub(super) fn observe(uia: &IUIAutomation, target: &TargetSpec) -> anyhow::Resul
         ));
     }
     let resolved = window::resolve(target)?;
+    // The title is read before the walk: a walk that spends its budget has to name
+    // the window it abandoned, and this read is one it can no longer afford then.
+    let title = window::title_text(resolved.hwnd);
     let element = window_element(uia, &resolved)?;
-    let tree = build_tree(uia, &element, resolved.surface)?;
+    let budget = core::Budget::new(
+        WALK_DEADLINE,
+        "tree walk",
+        core::window_description(&resolved.app_name, &title),
+    );
+    let tree = build_tree(uia, &element, resolved.surface, &budget)?;
     let mut truncation = tree.truncation;
     // The header keeps the whole title to the same cap as a name and, unlike a
     // listing's label, states the cut.
-    let window_title = Some(truncation.keep_name(&window::title_text(resolved.hwnd)));
+    let window_title = Some(truncation.keep_name(&title));
     Ok(Observation {
         app_name: resolved.app_name,
         window_title,
@@ -111,7 +122,14 @@ pub(super) fn act_on_element(
     window::ensure_actuation_allowed(Some(resolved.hwnd))?;
     window::ensure_not_own_window(resolved.hwnd)?;
     let element = window_element(uia, &resolved)?;
-    let tree = build_tree(uia, &element, resolved.surface)?;
+    // Resolution already read the title, so the walk's own bound is named from it
+    // rather than paying a second cross-process read.
+    let budget = core::Budget::new(
+        WALK_DEADLINE,
+        "tree walk",
+        core::window_description(&resolved.app_name, &resolved.title),
+    );
+    let tree = build_tree(uia, &element, resolved.surface, &budget)?;
     let node = core::resolve_locator_checked(&tree.root, locator)?;
     let index = core::pre_order_index(&tree.root, node);
     let element = tree.handles.get(index).ok_or_else(|| {
@@ -149,10 +167,11 @@ struct Tree {
     truncation: Truncation,
 }
 
-struct Walk {
+struct Walk<'a> {
     walker: IUIAutomationTreeWalker,
     origin: (f64, f64),
-    deadline: Instant,
+    /// The walk's own bound, checked before every provider read it makes.
+    budget: &'a core::Budget,
     nodes: usize,
     handles: Vec<IUIAutomationElement>,
     truncation: Truncation,
@@ -162,6 +181,7 @@ fn build_tree(
     uia: &IUIAutomation,
     root: &IUIAutomationElement,
     surface: SurfaceGeometry,
+    budget: &core::Budget,
 ) -> anyhow::Result<Tree> {
     // SAFETY: `uia` is the live client owned by this thread's `Ctx`; the walker it
     // yields is an owned interface, held by the `Walk` below.
@@ -170,7 +190,7 @@ fn build_tree(
     let mut walk = Walk {
         walker,
         origin: (surface.x, surface.y),
-        deadline: Instant::now() + WALK_DEADLINE,
+        budget,
         nodes: 0,
         handles: Vec::new(),
         truncation: Truncation::default(),
@@ -183,21 +203,15 @@ fn build_tree(
     })
 }
 
-impl Walk {
+impl Walk<'_> {
     fn node(&mut self, element: &IUIAutomationElement, depth: usize) -> anyhow::Result<UiNode> {
-        if Instant::now() > self.deadline {
-            return Err(core::taxonomy_error(
-                core::ERR_DEGRADED,
-                format!(
-                    "the application did not finish exposing its accessibility tree within {}s — \
-                     it may be busy or hung; retry, or use screenshot",
-                    WALK_DEADLINE.as_secs()
-                ),
-            ));
-        }
+        self.budget.check()?;
         self.nodes += 1;
         self.handles.push(element.clone());
-        let mut node = read_node(element, self.origin, &mut self.truncation);
+        let mut node = read_node(element, self.origin, &mut self.truncation, self.budget)?;
+        // The child probe below is another provider call, and so is every sibling read
+        // after it: none may start once the walk has spent its budget.
+        self.budget.check()?;
         if depth >= MAX_DEPTH {
             // The node's subtree is not read. Only a node that has one is a cut, so a
             // leaf at the ceiling is not reported as a truncation.
@@ -217,6 +231,7 @@ impl Walk {
                 self.truncation.hit_node_ceiling(MAX_NODES);
                 break;
             }
+            self.budget.check()?;
             node.children.push(self.node(&element, depth + 1)?);
             // SAFETY: as above — `element` is the child the previous call returned and
             // is still alive here; the sibling comes back owned.
@@ -226,33 +241,41 @@ impl Walk {
     }
 }
 
+/// One node's own fields. Each provider read below is preceded by the budget check,
+/// so a target that stalls mid-node costs at most one transaction past the walk's
+/// bound instead of one per field.
 fn read_node(
     element: &IUIAutomationElement,
     origin: (f64, f64),
     truncation: &mut Truncation,
-) -> UiNode {
+    budget: &core::Budget,
+) -> anyhow::Result<UiNode> {
+    budget.check()?;
     // SAFETY: `element` is a live element handle; the control type is returned by value.
     let control_type = unsafe { element.CurrentControlType() }.map_or(0, |id| id.0);
     let (role, actions) = role_and_actions(control_type);
+    budget.check()?;
     // SAFETY: `element` is live; the name comes back as an owned `BSTR`.
     let name = unsafe { element.CurrentName() }
         .ok()
         .map(|name| name.to_string())
         .filter(|name| !name.is_empty())
         .map(|name| truncation.keep_name(&name));
+    budget.check()?;
     // SAFETY: `element` is live; the rectangle is returned by value.
     let frame = unsafe { element.CurrentBoundingRectangle() }
         .ok()
         .and_then(|rect| surface_frame(rect, origin));
+    budget.check()?;
     let focused =
         // SAFETY: `element` is live and the focus flag comes back by value.
         unsafe { element.CurrentHasKeyboardFocus() }.is_ok_and(windows::core::BOOL::as_bool);
     let value = if VALUE_ROLES.contains(&role) {
-        read_value(element).map(|value| truncation.keep_value(&value))
+        read_value(element, budget)?.map(|value| truncation.keep_value(&value))
     } else {
         None
     };
-    UiNode {
+    Ok(UiNode {
         role: role.to_string(),
         name,
         value,
@@ -260,26 +283,38 @@ fn read_node(
         actions: actions.iter().map(|action| (*action).to_string()).collect(),
         focused,
         children: Vec::new(),
-    }
+    })
 }
 
 /// One element's value, whole, as the marshaller handed it over — the caller keeps it
 /// through [`Truncation::keep_value`], where the read's cap applies and the cut is
-/// stated in the observation's header.
-fn read_value(element: &IUIAutomationElement) -> Option<String> {
+/// stated in the observation's header. `Err` is the walk's budget spent; an absent
+/// pattern or an unreadable value is `Ok(None)`.
+fn read_value(
+    element: &IUIAutomationElement,
+    budget: &core::Budget,
+) -> anyhow::Result<Option<String>> {
+    budget.check()?;
     // SAFETY: `element` is live; the password flag is returned by value.
     if unsafe { element.CurrentIsPassword() }.is_ok_and(windows::core::BOOL::as_bool) {
-        return None;
+        return Ok(None);
     }
-    let pattern =
-        // SAFETY: `element` is live and the pattern id is a constant; the pattern comes
-        // back as an owned `IUIAutomationValuePattern` that outlives the read below.
-        unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
-            .ok()?;
+    budget.check()?;
+    // SAFETY: `element` is live and the pattern id is a constant; the pattern comes
+    // back as an owned `IUIAutomationValuePattern` that outlives the read below.
+    let Ok(pattern) =
+        (unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) })
+    else {
+        return Ok(None);
+    };
+    budget.check()?;
     // SAFETY: `pattern` is that owned `IUIAutomationValuePattern`; the value is an
     // owned `BSTR`.
-    let value = unsafe { pattern.CurrentValue() }.ok()?.to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let Ok(value) = (unsafe { pattern.CurrentValue() }) else {
+        return Ok(None);
+    };
+    let value = value.to_string();
+    Ok(if value.is_empty() { None } else { Some(value) })
 }
 
 /// A global physical rect as the surface-local `(x, y, w, h)` a [`UiNode`] carries.

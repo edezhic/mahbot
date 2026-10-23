@@ -13,7 +13,10 @@
 //! timed-out actuation is therefore answered as [`Impact::Unconfirmed`], never as a
 //! failure; a timed-out read has nothing in flight, so its deadline stays an error,
 //! and a job whose thread stopped mid-call answers the same unconfirmed way as a
-//! deadline for the same reason.
+//! deadline for the same reason. Each thread a hang leaves behind is counted (see
+//! [`LEAKED_THREADS`]) and the count is reported in the deadline's answer — the one
+//! failure that produced it — so a run that keeps hanging shows what it costs instead
+//! of leaking silently.
 
 use super::super::core::{
     self, AppInfo, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation, RawInput,
@@ -22,7 +25,7 @@ use super::super::core::{
 use super::capture::CaptureContext;
 use super::{input, seh, uia, window};
 use crate::util::UnwrapPoison;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -71,6 +74,29 @@ pub(super) enum Call {
         /// buffers the apartment thread builds are charged to the caller's call.
         budget: CaptureBudget,
     },
+}
+
+impl Call {
+    /// What this call is addressed to, in the words an error about it should use.
+    /// Read before the call moves onto the thread: a deadline that names nothing tells
+    /// the model less than the failure it reports.
+    fn label(&self) -> String {
+        match self {
+            Call::ProbeCapture => "the capture channel".to_string(),
+            Call::ListApps => "the running applications".to_string(),
+            Call::ListWindows { app } => match app {
+                Some(app) => format!("the windows of {}", app.name),
+                None => "the open windows".to_string(),
+            },
+            Call::FocusedWindow => "the focused window".to_string(),
+            Call::SurfaceGeometry { target }
+            | Call::Observe { target }
+            | Call::Act { target, .. }
+            | Call::RawInput { target, .. }
+            | Call::Capture { target, .. } => target.describe(),
+            Call::CursorPosition => "the pointer".to_string(),
+        }
+    }
 }
 
 /// The answer to one [`Call`]. `pub(super)` only because [`FromReply`] names it in its
@@ -148,6 +174,14 @@ struct Worker {
 
 static WORKER: LazyLock<Mutex<Option<Worker>>> = LazyLock::new(|| Mutex::new(None));
 
+/// Threads a hang left behind. Windows offers no safe way to interrupt a thread
+/// blocked inside a provider, so every expired deadline leaks one MTA thread with its
+/// apartment and UIA client. The count is reported in that deadline's answer and
+/// logged with it: unbounded in principle, visible in practice. A thread that exited on
+/// its own is not counted — and no other answer carries the count, since nothing is left
+/// running for it.
+static LEAKED_THREADS: AtomicU64 = AtomicU64::new(0);
+
 /// Why a call's reply never arrived. The two entry points below differ only in
 /// what this means: a read failed, an actuation may or may not have landed.
 enum JobFailure {
@@ -158,7 +192,12 @@ enum JobFailure {
     Stopped,
     /// The deadline expired and the job was abandoned on the leaked thread, which
     /// may still run it.
-    Deadline(Duration),
+    Deadline {
+        timeout: Duration,
+        /// What the abandoned call was addressed to, read before the call moved onto
+        /// the thread.
+        label: String,
+    },
 }
 
 /// Submit one call and wait for its reply under `timeout` — the only way a call
@@ -166,6 +205,9 @@ enum JobFailure {
 /// thread is marked dead so the next call starts a fresh apartment, and the wedged
 /// one exits on its own once the provider answers.
 async fn job_reply(call: Call, timeout: Duration) -> Result<Reply, JobFailure> {
+    // Named before the call is moved onto the thread: the deadline error must say what
+    // it was addressed to, and there is nothing left to ask once it is abandoned.
+    let label = call.label();
     let (tx, alive) = sender().map_err(JobFailure::Call)?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if tx
@@ -186,14 +228,43 @@ async fn job_reply(call: Call, timeout: Duration) -> Result<Reply, JobFailure> {
         Ok(Ok(Ok(reply))) => Ok(reply),
         Ok(Ok(Err(e))) => Err(JobFailure::Call(e)),
         Ok(Err(_)) => {
+            // The thread itself is gone (a caught fault retired it, or it exited):
+            // nothing is still running, so nothing is leaked here.
             alive.store(false, Ordering::SeqCst);
             Err(JobFailure::Stopped)
         }
         Err(_) => {
-            alive.store(false, Ordering::SeqCst);
-            Err(JobFailure::Deadline(timeout))
+            leak(&alive);
+            Err(JobFailure::Deadline { timeout, label })
         }
     }
+}
+
+/// Mark the live thread dead and account for the one it leaves behind: the next call
+/// starts a fresh apartment, while this thread keeps the provider call it is stuck in.
+fn leak(alive: &AtomicBool) {
+    alive.store(false, Ordering::SeqCst);
+    let count = LEAKED_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
+    tracing::warn!(
+        leaked_threads = count,
+        "computer use: abandoned a hung worker thread — {count} left behind since this process \
+         started"
+    );
+}
+
+/// How many threads hangs left behind, in the words appended to the answer one of them
+/// produced. Read after [`leak`], so it always counts that thread.
+fn leaked_note() -> String {
+    let count = LEAKED_THREADS.load(Ordering::SeqCst);
+    let (threads, have) = if count == 1 {
+        ("thread", "has")
+    } else {
+        ("threads", "have")
+    };
+    format!(
+        "; {count} computer-use worker {threads} {have} been left behind by hangs since start — \
+         the next call starts a fresh one"
+    )
 }
 
 /// Submit one read-shaped call and await the payload it answers with: every
@@ -202,16 +273,18 @@ pub(super) async fn submit<T: FromReply>(call: Call, timeout: Duration) -> anyho
     match job_reply(call, timeout).await {
         Ok(reply) => T::from_reply(reply),
         Err(JobFailure::Call(e)) => Err(e),
+        // Nothing was left running here, so this answer never carries the leak count.
         Err(JobFailure::Stopped) => Err(core::taxonomy_error(
             core::ERR_DEGRADED,
             "the computer-use thread stopped while running the call — retry",
         )),
-        Err(JobFailure::Deadline(timeout)) => Err(core::taxonomy_error(
+        Err(JobFailure::Deadline { timeout, label }) => Err(core::taxonomy_error(
             core::ERR_DEGRADED,
             format!(
-                "the application did not respond within {}s — the call was abandoned without a \
-                 result; retry",
-                timeout.as_secs()
+                "{label} did not respond within {}s — the call was abandoned without a result; \
+                 retry{}",
+                timeout.as_secs(),
+                leaked_note()
             ),
         )),
     }
@@ -231,15 +304,15 @@ pub(super) async fn submit_act(call: Call, timeout: Duration) -> anyhow::Result<
             )))
         }
         Err(JobFailure::Call(e)) => Err(e),
-        Err(JobFailure::Stopped) => Ok(Impact::Unconfirmed(
+        Err(JobFailure::Stopped) => Ok(Impact::Unconfirmed(String::from(
             "the computer-use thread stopped while running the call, so its input may or may not \
-             have been delivered"
-                .to_string(),
-        )),
-        Err(JobFailure::Deadline(timeout)) => Ok(Impact::Unconfirmed(format!(
-            "the application did not answer within {}s, so the call was abandoned while the job \
-             may still complete on the leaked thread — the input may land after this answer",
-            timeout.as_secs()
+             have been delivered",
+        ))),
+        Err(JobFailure::Deadline { timeout, label }) => Ok(Impact::Unconfirmed(format!(
+            "{label} did not answer within {}s, so the call was abandoned while the job may still \
+             complete on the leaked thread — the input may land after this answer{}",
+            timeout.as_secs(),
+            leaked_note()
         ))),
     }
 }

@@ -34,6 +34,15 @@
 //! by the same geometry, while the copy this tool keeps is the one budgeted — the
 //! reasoning lives in [`core::CAPTURE_BUDGET_PIXELS`].
 //!
+//! # Deadlines
+//!
+//! One AX exchange is bounded by the process-wide messaging timeout this backend sets
+//! on the system-wide element before its first one ([`install_messaging_timeout`],
+//! [`core::EXCHANGE_DEADLINE`], deliberately not shorter than the default applications
+//! rely on). One [`core::Budget`] per call bounds the whole of it; the walk cannot be
+//! bounded from outside — it runs inside the blocking frame no timer can interrupt — so
+//! it checks the budget between exchanges, and a responsive target never reaches it.
+//!
 //! # Surfaces and identity
 //!
 //! A window target carries the identity this backend gave it when it was
@@ -144,12 +153,45 @@ use objc2_screen_capture_kit::{
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::time::Duration;
 
 pub(crate) static MACOS_BACKEND: MacOsBackend = MacOsBackend;
 
 pub(crate) struct MacOsBackend;
+
+// ── AX exchange deadline ─────────────────────────────────────────────────
+//
+// The contract lives in the module header; this is the one place it is set.
+
+/// Set the AX messaging timeout, once per process, on the system-wide element.
+///
+/// Apple honours a process-wide setting only when it is applied to the system-wide
+/// element — one set on an application or window element bounds that element alone, and
+/// this backend makes its exchanges through fresh per-application elements. Installed
+/// from [`with_platform`], the funnel every AX entry point passes through, rather than
+/// from the grant check: a missing grant must not be what decides whether the setting
+/// was ever applied.
+fn install_messaging_timeout() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        // SAFETY: both calls only configure this process's own accessibility client —
+        // creating the system-wide element allocates it, and the timeout is a positive
+        // number of seconds; no pointer outlives the statement and no other process is
+        // contacted.
+        let err = unsafe {
+            AXUIElement::new_system_wide()
+                .set_messaging_timeout(core::EXCHANGE_DEADLINE.as_secs_f32())
+        };
+        if err != AXError::Success {
+            tracing::warn!(
+                limit_secs = core::EXCHANGE_DEADLINE.as_secs(),
+                "computer use: could not set the AX messaging timeout ({err:?}) — an \
+                 exchange that never answers is then unbounded"
+            );
+        }
+    });
+}
 
 // ── Foreign failures ─────────────────────────────────────────────────────
 //
@@ -199,7 +241,12 @@ fn with_platform<T>(
     what: &str,
     f: impl FnOnce() -> Result<T, anyhow::Error>,
 ) -> Result<T, anyhow::Error> {
-    with_block_in_place(|| catching_foreign(what, f))
+    with_block_in_place(|| {
+        catching_foreign(what, || {
+            install_messaging_timeout();
+            f()
+        })
+    })
 }
 
 // ── kAX* attribute/action string constants ───────────────────────────────
@@ -785,6 +832,10 @@ fn is_secure_field(role: &str, subrole: Option<&str>) -> bool {
         || subrole.is_some_and(|s| s.to_lowercase().contains("secure"))
 }
 
+/// One node and its subtree, read within `budget`. `Ok(None)` is a node not read
+/// because the node ceiling was reached; `Err` is the call's budget spent, which is
+/// the only failure a walk raises — a refused or timed-out attribute stays the tolerant
+/// `None`/empty it has always been, and the walk goes on.
 fn walk_element(
     element: &AXUIElement,
     origin: (f64, f64),
@@ -792,25 +843,33 @@ fn walk_element(
     handles: &mut Vec<CFRetained<AXUIElement>>,
     nodes: &mut usize,
     truncation: &mut Truncation,
-) -> Option<UiNode> {
+    budget: &core::Budget,
+) -> anyhow::Result<Option<UiNode>> {
+    budget.check()?;
     if *nodes >= core::MAX_TREE_NODES {
         truncation.hit_node_ceiling(core::MAX_TREE_NODES);
-        return None;
+        return Ok(None);
     }
     *nodes += 1;
     handles.push(element.retain());
 
+    // Each group below is one or two AX exchanges, and the budget is re-checked
+    // between them: a target that stalls across a node's own reads must not spend the
+    // whole walk's budget inside that node.
+    budget.check()?;
     let role = attribute_name(element, &axc(AX_ROLE)).unwrap_or_else(|| "unknown".to_string());
     // Never read a value out of a secure element. A password field reports
     // AXRole="AXTextField" with the secure marker in AXSubrole, so check the
     // subrole (or role) for "secure" before pulling the value.
     let subrole = attribute_name(element, &axc(AX_SUBROLE));
+    budget.check()?;
     let value = if is_secure_field(&role, subrole.as_deref()) {
         None
     } else {
         attribute_text(element, &axc(AX_VALUE), core::MAX_VALUE_CHARS)
             .map(|value| truncation.keep_value(&value))
     };
+    budget.check()?;
     let frame = match (
         attribute_point(element, &axc(AX_POSITION)),
         attribute_size(element, &axc(AX_SIZE)),
@@ -818,6 +877,7 @@ fn walk_element(
         (Some(p), Some(s)) => Some((p.x - origin.0, p.y - origin.1, s.width, s.height)),
         _ => None,
     };
+    budget.check()?;
     // A failed or unusable read only leaves the node's actions absent: the walk
     // degrades, acting on the element is what must not.
     let actions = raw_action_names(element)
@@ -827,14 +887,22 @@ fn walk_element(
         .iter()
         .map(|a| normalize_action_name(a))
         .collect();
+    budget.check()?;
     let focused = attribute_bool(element, &axc(AX_FOCUSED)).unwrap_or(false);
 
     let mut children = Vec::new();
     if depth < MAX_DEPTH {
+        budget.check()?;
         for child in attribute_children(element) {
-            if let Some(child_node) =
-                walk_element(&child, origin, depth + 1, handles, nodes, truncation)
-            {
+            if let Some(child_node) = walk_element(
+                &child,
+                origin,
+                depth + 1,
+                handles,
+                nodes,
+                truncation,
+                budget,
+            )? {
                 children.push(child_node);
             }
         }
@@ -843,7 +911,7 @@ fn walk_element(
         // leaf at the ceiling is not reported as a truncation.
         truncation.cut_depth(MAX_DEPTH);
     }
-    Some(UiNode {
+    Ok(Some(UiNode {
         role,
         name: attribute_text(element, &axc(AX_TITLE), core::MAX_NAME_CHARS)
             .map(|name| truncation.keep_name(&name)),
@@ -852,7 +920,7 @@ fn walk_element(
         actions,
         focused,
         children,
-    })
+    }))
 }
 
 /// Build the accessibility tree, returning the root node, a pre-order-aligned
@@ -861,40 +929,82 @@ fn walk_element(
 fn build_tree(
     root: &AXUIElement,
     origin: (f64, f64),
-) -> (UiNode, Vec<CFRetained<AXUIElement>>, Truncation) {
+    budget: &core::Budget,
+) -> anyhow::Result<(UiNode, Vec<CFRetained<AXUIElement>>, Truncation)> {
     let mut handles = Vec::new();
     let mut nodes = 0usize;
     let mut truncation = Truncation::default();
-    let node = walk_element(root, origin, 0, &mut handles, &mut nodes, &mut truncation)
-        .unwrap_or_else(|| UiNode {
-            role: "unknown".to_string(),
-            name: None,
-            value: None,
-            frame: None,
-            actions: Vec::new(),
-            focused: false,
-            children: Vec::new(),
-        });
-    (node, handles, truncation)
+    let node = walk_element(
+        root,
+        origin,
+        0,
+        &mut handles,
+        &mut nodes,
+        &mut truncation,
+        budget,
+    )?
+    .ok_or_else(|| {
+        // The root is the first node, so only its own reads can leave it unread — and an
+        // empty tree would present "nothing was read" as a window with no content.
+        core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "{} did not answer for its accessibility root, so nothing was read — retry, \
+                 or use screenshot instead",
+                budget.target()
+            ),
+        )
+    })?;
+    Ok((node, handles, truncation))
+}
+
+/// The application a target points at: the name the target carries, else the resolved
+/// application's own (one exchange when the target names none).
+fn resolved_app_name(target: &TargetSpec, app: &AXUIElement) -> Result<String, anyhow::Error> {
+    match target.app() {
+        Some((_, name)) => Ok(name.to_string()),
+        None => Ok(app_display_name(app_pid(app)?, app)),
+    }
+}
+
+/// The label of the surface a call resolved, for the failures that follow the reads that
+/// name it — the same rule [`core::name_surface`] applies where a budget survives to be
+/// pointed at it. The title is passed in, so a caller that already read it does not read it
+/// again from a target that may be the hung one.
+fn resolved_surface_label(
+    target: &TargetSpec,
+    app: &AXUIElement,
+    title: Option<&str>,
+) -> Result<String, anyhow::Error> {
+    Ok(core::surface_label(&resolved_app_name(target, app)?, title))
 }
 
 fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
-    let (window, app) = resolve_window(target)?;
+    // One clock for the whole call, resolution and the reads that name the surface
+    // included, so the budget the model is told about is the one the call pays.
+    let mut budget = core::Budget::new(core::OBSERVE_BUDGET, "observation", target.describe());
+    let (window, app) = resolve_window(target, &budget)?;
+    budget.check()?;
+    // The identity is read before the reads that can go unanswered: a failure has to
+    // name the window, and a title is an exchange it can no longer afford then.
+    let app_name = resolved_app_name(target, &app)?;
+    // The header title is a name, not a label: read past the cap so a cut is counted.
+    let title = attribute_text(&window, &axc(AX_TITLE), core::MAX_NAME_CHARS);
+    let label = core::name_surface(&mut budget, &app_name, title.as_deref());
     // The header reports the window's frame, and a minimized window's is the one it
     // had before it was minimized: refuse rather than describe a surface that is not
     // on screen.
     refuse_minimized(&window)?;
-    let origin = window_origin(&window)?;
-    let surface = window_frame(&window)?;
-    let app_name = match target.app() {
-        Some((_, name)) => name.to_string(),
-        None => app_display_name(app_pid(&app)?, &app),
-    };
-    let (root, _handles, mut truncation) = build_tree(&window, origin);
+    budget.check()?;
+    let origin =
+        window_origin(&window).map_err(|_| core::unanswered(&label, "for its position"))?;
+    let surface =
+        window_frame(&window, &budget).map_err(|_| core::unanswered(&label, "for its frame"))?;
+    budget.check()?;
+    let (root, _handles, mut truncation) = build_tree(&window, origin, &budget)?;
     // The title is a name like any node's, so a cut one is counted in the same header
     // ceiling instead of being shortened silently.
-    let title = attribute_text(&window, &axc(AX_TITLE), core::MAX_NAME_CHARS)
-        .map(|title| truncation.keep_name(&title));
+    let title = title.map(|title| truncation.keep_name(&title));
     Ok(Observation {
         truncation,
         app_name,
@@ -1000,10 +1110,18 @@ fn window_by_key(
             .map(|held| held.element.retain())
             .ok_or_else(|| core::surface_gone(app_name))?
     };
-    // A retained element outlives its window: reading it is what tells the two
-    // apart, and a closed window answers with an error.
-    attribute_name(&window, &axc(AX_ROLE)).ok_or_else(|| core::surface_gone(app_name))?;
-    Ok(window)
+    // A retained element outlives its window: reading it is what tells the two apart.
+    // Only the framework's own "no longer an element" answer is a gone window — a read
+    // that timed out is a live window that stopped answering, and calling that
+    // `surface-gone` would send the model re-enumerating a window that is still there.
+    match attribute_value(&window, &axc(AX_ROLE)) {
+        Ok(_) => Ok(window),
+        Err(AXError::InvalidUIElement) => Err(core::surface_gone(app_name)),
+        Err(_) => Err(core::unanswered(
+            &core::surface_label(app_name, None),
+            "for its role",
+        )),
+    }
 }
 
 /// Drop every window `agent` holds: its ids are gone with its registry entries.
@@ -1090,9 +1208,20 @@ fn app_element(pid: Option<u32>, name: &str) -> Result<CFRetained<AXUIElement>, 
     Ok(unsafe { AXUIElement::new_application(pid as libc::pid_t) })
 }
 
-fn read_windows(app: &AXUIElement) -> Result<Vec<CFRetained<AXUIElement>>, anyhow::Error> {
-    let val = attribute_value(app, &axc(AX_WINDOWS))
-        .map_err(|e| ax_window_error(e, "enumerate windows"))?;
+/// An application's windows. A target that stopped answering is named as such: the
+/// generic "transient AX failure, retry" would send the model re-enumerating a hung
+/// application instead of reporting it.
+fn read_windows(
+    app: &AXUIElement,
+    app_name: &str,
+) -> Result<Vec<CFRetained<AXUIElement>>, anyhow::Error> {
+    let val = attribute_value(app, &axc(AX_WINDOWS)).map_err(|e| {
+        if e == AXError::CannotComplete {
+            core::unanswered(&core::surface_label(app_name, None), "for its window list")
+        } else {
+            ax_window_error(e, "enumerate windows")
+        }
+    })?;
     let array: CFRetained<CFArray> = val
         .downcast::<CFArray>()
         .map_err(|_| anyhow!("AXWindows was not a CFArray"))?;
@@ -1101,21 +1230,35 @@ fn read_windows(app: &AXUIElement) -> Result<Vec<CFRetained<AXUIElement>>, anyho
 
 /// One application's listed windows: the AX window array plus each window's frame,
 /// title and identity. A window with neither a title nor a frame is not a surface
-/// and is dropped.
+/// and is dropped. The budget is checked before the window list and before every
+/// window, so an application that stalls is caught at the check after its stall.
 ///
 /// The listing is the one path that knows the target process without resolving a
 /// `TargetSpec`, so it calls [`on_ax_thread`] itself with the app's pid. `owner` is
 /// the enumerating agent's key, read before the exchange for the same reason.
-fn windows_of_app(pid: u32, app_name: &str, owner: &str) -> Result<Vec<WindowInfo>, anyhow::Error> {
+fn windows_of_app(
+    pid: u32,
+    app_name: &str,
+    owner: &str,
+    budget: &core::Budget,
+) -> Result<Vec<WindowInfo>, anyhow::Error> {
     // SAFETY: `pid` is a running app (or stale); AXUIElementCreateApplication
     // always returns a non-null element — attribute reads surface InvalidUIElement.
     let app = unsafe { AXUIElement::new_application(pid as libc::pid_t) };
-    let windows = read_windows(&app)?;
+    budget.check()?;
+    let windows = read_windows(&app, app_name)?;
     let mut out = Vec::new();
     for window in &windows {
-        let Ok(frame) = window_frame(window) else {
-            continue;
+        budget.check()?;
+        let frame = match window_frame(window, budget) {
+            Ok(frame) => frame,
+            // A refused frame loses this window; a spent share ends this application's
+            // answer instead, so the window is never dropped as if it had none.
+            Err(e) if budget.expired() => return Err(e),
+            Err(_) => continue,
         };
+        // A window costs its frame and its title: a stall on either is caught here.
+        budget.check()?;
         let title = window_title(window).unwrap_or_default();
         if title.is_empty() && (frame.width <= 0.0 || frame.height <= 0.0) {
             continue;
@@ -1140,7 +1283,9 @@ fn windows_of_app(pid: u32, app_name: &str, owner: &str) -> Result<Vec<WindowInf
 /// local getter, not an exchange.
 fn resolve_window(
     target: &TargetSpec,
+    budget: &core::Budget,
 ) -> Result<(CFRetained<AXUIElement>, CFRetained<AXUIElement>), anyhow::Error> {
+    budget.check()?;
     match target {
         TargetSpec::Focused => {
             let app = frontmost_app()?;
@@ -1148,13 +1293,25 @@ fn resolve_window(
             // Strictly the frontmost app's focused window: a coordinate action on
             // a fallback surface would land on whatever is visible, which may not
             // be that window (another Space, a minimized window).
-            let window = focused_window_of_app(&app).ok_or_else(|| {
-                core::taxonomy_error(
-                    core::ERR_NOT_MATCHED,
-                    "no focused window (desktop frontmost/screensaver) — use 'apps'/'windows' \
-                     to pick a surface",
-                )
-            })?;
+            let Some(window) = focused_window_of_app(&app) else {
+                // Both leave AXFocusedWindow unset, and only a live application's answer
+                // says it has no focused window: one that does not answer at all must be
+                // named as such instead.
+                return Err(match attribute_value(&app, &axc(AX_ROLE)) {
+                    Ok(_) => core::taxonomy_error(
+                        core::ERR_NOT_MATCHED,
+                        "no focused window (desktop frontmost/screensaver) — use \
+                         'apps'/'windows' to pick a surface",
+                    ),
+                    Err(_) => core::unanswered(
+                        &format!(
+                            "the frontmost application ({})",
+                            app_display_name(app_pid(&app)?, &app)
+                        ),
+                        "for its focused window",
+                    ),
+                });
+            };
             Ok((window, app))
         }
         TargetSpec::App {
@@ -1166,9 +1323,16 @@ fn resolve_window(
             let app = app_element(*pinned, app_name)?;
             let pid = app_pid(&app)?;
             ensure_ax_thread(pid)?;
-            let window = focused_window_of_app(&app)
-                .or_else(|| read_windows(&app).ok()?.into_iter().next())
-                .ok_or_else(|| core::surface_gone(app_name))?;
+            budget.check()?;
+            let window = match focused_window_of_app(&app) {
+                Some(window) => window,
+                // A read that failed is the application's answer, not an application
+                // without a window: only a successful read that found none means that.
+                None => read_windows(&app, app_name)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| core::surface_gone(app_name))?,
+            };
             Ok((window, app))
         }
         TargetSpec::Window {
@@ -1196,9 +1360,16 @@ fn window_origin(window: &AXUIElement) -> Result<(f64, f64), anyhow::Error> {
     Ok((p.x, p.y))
 }
 
-fn window_frame(window: &AXUIElement) -> Result<SurfaceGeometry, anyhow::Error> {
+/// A window's frame: position and size, two AX reads, each charged to `budget` so a target
+/// that stalls between them does not outlive the call by a whole extra read.
+fn window_frame(
+    window: &AXUIElement,
+    budget: &core::Budget,
+) -> Result<SurfaceGeometry, anyhow::Error> {
+    budget.check()?;
     let p = attribute_point(window, &axc(AX_POSITION))
         .ok_or_else(|| anyhow!("window position unavailable"))?;
+    budget.check()?;
     let s =
         attribute_size(window, &axc(AX_SIZE)).ok_or_else(|| anyhow!("window size unavailable"))?;
     Ok(SurfaceGeometry {
@@ -1594,26 +1765,40 @@ fn screen_surface() -> Result<SurfaceGeometry, anyhow::Error> {
 }
 
 /// The target's surface. A window frame is an AX read, so the grant gate belongs
-/// to [`surface_geometry_routed`], which keeps it on the calling thread: a missing
+/// to [`surface_geometry_with`], which keeps it on the calling thread: a missing
 /// grant is requested there, never from the main queue.
-fn surface_geometry_blocking(target: &TargetSpec) -> Result<SurfaceGeometry, anyhow::Error> {
+fn surface_geometry_blocking(
+    target: &TargetSpec,
+    budget: &core::Budget,
+) -> Result<SurfaceGeometry, anyhow::Error> {
     if matches!(target, TargetSpec::Screen) {
         return screen_surface();
     }
     // Coordinate input maps normalized points through this frame, so a
     // pre-minimization frame must be refused here too.
-    let (window, _app) = resolve_window(target)?;
+    let (window, app) = resolve_window(target, budget)?;
+    budget.check()?;
+    let label = resolved_surface_label(target, &app, window_title(&window).as_deref())?;
+    budget.check()?;
     refuse_minimized(&window)?;
-    window_frame(&window)
+    // `window_frame` checks the budget itself before each of its two reads.
+    window_frame(&window, budget).map_err(|_| core::unanswered(&label, "for its frame"))
 }
 
 /// [`surface_geometry_blocking`] with the grant gate hoisted and the read routed
-/// to the thread the system answers a self target on.
-fn surface_geometry_routed(target: &TargetSpec) -> Result<SurfaceGeometry, anyhow::Error> {
+/// to the thread the system answers a self target on. The budget is owned so it can
+/// cross to that thread; a caller that already holds one passes a [`core::Budget`]
+/// clone, so the lookup cannot outlive the call it belongs to.
+fn surface_geometry_with(
+    target: &TargetSpec,
+    budget: core::Budget,
+) -> Result<SurfaceGeometry, anyhow::Error> {
     if !matches!(target, TargetSpec::Screen) {
         ensure(Grant::Accessibility)?;
     }
-    with_target(target, surface_geometry_blocking)
+    with_target(target, move |target| {
+        surface_geometry_blocking(target, &budget)
+    })
 }
 
 /// Raise a window so input aimed at it lands there; `false` when it exposes no
@@ -1639,11 +1824,11 @@ fn raise_window(window: &AXUIElement) -> Result<bool, anyhow::Error> {
 /// raise was performed, so the caller settles only when there is something to
 /// settle. Pinned input uses [`raise_window`] plus [`ensure_window_receives`]
 /// instead.
-fn activate_window(target: &TargetSpec) -> Result<bool, anyhow::Error> {
+fn activate_window(target: &TargetSpec, budget: &core::Budget) -> Result<bool, anyhow::Error> {
     let (TargetSpec::Focused | TargetSpec::App { .. } | TargetSpec::Window { .. }) = target else {
         return Ok(false);
     };
-    let (window, _app) = match resolve_window(target) {
+    let (window, _app) = match resolve_window(target, budget) {
         Ok(resolved) => resolved,
         // Nothing to raise, but the main-thread marker must reach [`with_target`].
         Err(e) if !is_ax_thread(&e) => return Ok(false),
@@ -1666,13 +1851,15 @@ fn window_receives_input(window: &AXUIElement) -> bool {
 /// so the check is retried over the shared settle budget — the pauses run here, on
 /// the calling thread, and only each accessibility read is routed to the thread
 /// that answers it.
-fn ensure_window_receives(target: &TargetSpec) -> Result<(), anyhow::Error> {
+fn ensure_window_receives(target: &TargetSpec, budget: &core::Budget) -> Result<(), anyhow::Error> {
     for attempt in 0..=core::RAISE_SETTLE_STEPS {
         if attempt > 0 {
             sleep_millis(core::RAISE_SETTLE_MS);
         }
-        let receives = with_target(target, |target| {
-            let (window, _app) = resolve_window(target)?;
+        budget.check()?;
+        let probe = budget.clone();
+        let receives = with_target(target, move |target| {
+            let (window, _app) = resolve_window(target, &probe)?;
             Ok(window_receives_input(&window))
         })?;
         if receives {
@@ -1703,16 +1890,26 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<Impact, a
     let pinned = core::pinned_input(target, input);
     // A chord goes to whatever already has focus, so nothing is raised for it.
     let raises = !matches!(input, RawInput::KeyChord { .. });
+    // One lookup budget for the whole call: raising a window, proving it receives the
+    // input and reading the frame the input is mapped through all fit in it.
+    let lookup = core::Budget::new(core::LIST_BUDGET, "surface lookup", target.describe());
+    let geometry = lookup.clone();
     if pinned {
-        with_target(target, |target| {
-            let (window, _app) = resolve_window(target)?;
+        let raise = lookup.clone();
+        with_target(target, move |target| {
+            let (window, _app) = resolve_window(target, &raise)?;
             raise_window(&window).map(|_| ())
         })?;
-        with_target(target, ensure_window_receives)?;
-    } else if raises && with_target(target, activate_window)? {
-        // Unpinned input has no delivery to verify, so a best-effort raise gets the
-        // same settle budget before the event is posted.
-        sleep_millis((core::RAISE_SETTLE_STEPS as u64) * core::RAISE_SETTLE_MS);
+        with_target(target, move |target| {
+            ensure_window_receives(target, &lookup)
+        })?;
+    } else if raises {
+        let raise = lookup.clone();
+        if with_target(target, move |target| activate_window(target, &raise))? {
+            // Unpinned input has no delivery to verify, so a best-effort raise gets the
+            // same settle budget before the event is posted.
+            sleep_millis((core::RAISE_SETTLE_STEPS as u64) * core::RAISE_SETTLE_MS);
+        }
     }
     match input {
         RawInput::Click {
@@ -1721,8 +1918,11 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<Impact, a
             double,
             modifiers,
         } => {
-            let (x, y) =
-                core::normalized_to_surface(point.0, point.1, &surface_geometry_routed(target)?)?;
+            let (x, y) = core::normalized_to_surface(
+                point.0,
+                point.1,
+                &surface_geometry_with(target, geometry)?,
+            )?;
             click(CGPoint::new(x, y), *button, *double, modifiers)
         }
         RawInput::TypeText { text } => type_text(text),
@@ -1733,8 +1933,11 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<Impact, a
             amount,
         } => {
             let p = if let Some((nx, ny)) = point {
-                let (x, y) =
-                    core::normalized_to_surface(*nx, *ny, &surface_geometry_routed(target)?)?;
+                let (x, y) = core::normalized_to_surface(
+                    *nx,
+                    *ny,
+                    &surface_geometry_with(target, geometry)?,
+                )?;
                 Some(CGPoint::new(x, y))
             } else {
                 None
@@ -1742,9 +1945,9 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<Impact, a
             scroll(p, *direction, *amount)
         }
         RawInput::Drag { from, to } => {
-            let geometry = surface_geometry_routed(target)?;
-            let (fx, fy) = core::normalized_to_surface(from.0, from.1, &geometry)?;
-            let (tx, ty) = core::normalized_to_surface(to.0, to.1, &geometry)?;
+            let surface = surface_geometry_with(target, geometry)?;
+            let (fx, fy) = core::normalized_to_surface(from.0, from.1, &surface)?;
+            let (tx, ty) = core::normalized_to_surface(to.0, to.1, &surface)?;
             drag(CGPoint::new(fx, fy), CGPoint::new(tx, ty))
         }
     }
@@ -2055,14 +2258,19 @@ fn find_sc_window(
 /// had before it was minimized.
 fn window_capture_facts(
     target: &TargetSpec,
+    budget: &core::Budget,
 ) -> Result<(u32, Option<String>, SurfaceGeometry), anyhow::Error> {
-    let (window, app) = resolve_window(target)?;
+    let (window, app) = resolve_window(target, budget)?;
+    budget.check()?;
+    let pid = app_pid(&app)?;
+    let title = window_title(&window);
+    budget.check()?;
+    let label = resolved_surface_label(target, &app, title.as_deref())?;
     refuse_minimized(&window)?;
-    Ok((
-        app_pid(&app)?,
-        window_title(&window),
-        window_frame(&window)?,
-    ))
+    // `window_frame` checks the budget itself before each of its two reads.
+    let frame =
+        window_frame(&window, budget).map_err(|_| core::unanswered(&label, "for its frame"))?;
+    Ok((pid, title, frame))
 }
 
 fn capture_window_blocking(
@@ -2071,7 +2279,9 @@ fn capture_window_blocking(
 ) -> Result<Capture, anyhow::Error> {
     // The window is resolved through AX (pid, title, frame) before SCK is asked
     // for pixels; only that half belongs on the AX thread, never the capture.
-    let (pid, title, frame) = with_target(target, window_capture_facts)?;
+    let lookup = core::Budget::new(core::LIST_BUDGET, "surface lookup", target.describe());
+    let (pid, title, frame) =
+        with_target(target, move |target| window_capture_facts(target, &lookup))?;
     let content = get_shareable_content()?;
     let sc_window = find_sc_window(&content, pid, title.as_deref(), frame)?;
     // SAFETY: `alloc()` is the fresh allocation consumed by the init.
@@ -2253,8 +2463,18 @@ fn act_on_element_blocking(
     locator: &Locator,
     act: &ElementAct,
 ) -> Result<Impact, anyhow::Error> {
-    let (window, _app) = resolve_window(target)?;
-    let (root, handles, _truncation) = build_tree(&window, window_origin(&window)?);
+    // One clock for the whole call: resolution, the reads that name the surface, the
+    // walk and the action itself.
+    let mut budget = core::Budget::new(core::ACT_BUDGET, "element action", target.describe());
+    let (window, app) = resolve_window(target, &budget)?;
+    budget.check()?;
+    let app_name = resolved_app_name(target, &app)?;
+    // The header title is a name, not a label: read past the cap so a cut is counted.
+    let title = attribute_text(&window, &axc(AX_TITLE), core::MAX_NAME_CHARS);
+    let label = core::name_surface(&mut budget, &app_name, title.as_deref());
+    let origin =
+        window_origin(&window).map_err(|_| core::unanswered(&label, "for its position"))?;
+    let (root, handles, _truncation) = build_tree(&window, origin, &budget)?;
     let matched = core::resolve_locator_checked(&root, locator)?;
     let element = &handles[core::pre_order_index(&root, matched)];
     match act {
@@ -2364,9 +2584,29 @@ impl Backend for MacOsBackend {
             };
             let mut listing = WindowListing::default();
             let owner = core::agent_key();
+            // One clock for the whole enumeration, and one slice of it per application:
+            // a hung application costs its own part rather than the healthy ones read
+            // before and after it.
+            let budget = core::Budget::new(
+                core::LIST_BUDGET,
+                "window listing",
+                app.map_or_else(
+                    || "the running applications".to_string(),
+                    |a| core::windows_label(&a.name),
+                ),
+            );
             for ai in app_infos {
                 let Some(pid) = ai.pid else { continue };
                 let name = ai.name;
+                // A listing that runs out of time keeps what it read and names the
+                // applications it did not reach, instead of discarding healthy windows.
+                if let Err(e) = budget.check() {
+                    listing.unread.push(UnreadWindows {
+                        app_name: name,
+                        reason: format!("{e:#}"),
+                    });
+                    continue;
+                }
                 let owner = owner.clone();
                 let app_name = name.clone();
                 // An application whose accessibility cannot be read is named in the
@@ -2374,11 +2614,16 @@ impl Backend for MacOsBackend {
                 // windows, and never allowed to fail the whole listing. The AX thread
                 // only makes our OWN window's reads possible at all, so that app's
                 // failure is the app's, listed like any other.
-                match on_ax_thread(pid, move || windows_of_app(pid, &name, &owner)) {
+                let app_budget = budget.slice(core::APP_SLICE, core::windows_label(&name));
+                // The copy outlives the closure, so the listing can ask afterwards whether
+                // it was this application's share that ran out.
+                let share = app_budget.clone();
+                match on_ax_thread(pid, move || windows_of_app(pid, &name, &owner, &app_budget)) {
                     Ok(rows) => listing.windows.extend(rows),
+                    // A spent share is one skipped application, said on the line naming it.
                     Err(e) => listing.unread.push(UnreadWindows {
                         app_name,
-                        reason: format!("{e:#}"),
+                        reason: core::unread_reason(&e, &share),
                     }),
                 }
             }
@@ -2391,15 +2636,25 @@ impl Backend for MacOsBackend {
         with_platform("read the focused window", || {
             ensure(Grant::Accessibility)?;
             let owner = core::agent_key();
+            let budget = core::Budget::new(
+                core::LIST_BUDGET,
+                "focused-window search",
+                "the running applications",
+            );
             with_target(&TargetSpec::Focused, move |target| {
-                let (window, app) = resolve_window(target)?;
+                let (window, app) = resolve_window(target, &budget)?;
+                budget.check()?;
                 let pid = app_pid(&app)?;
+                let app_name = resolved_app_name(target, &app)?;
+                let title = window_title(&window);
+                let label = resolved_surface_label(target, &app, title.as_deref())?;
                 Ok(WindowInfo {
                     app_pid: Some(pid),
-                    app_name: app_display_name(pid, &app),
-                    title: window_title(&window).unwrap_or_default(),
+                    app_name,
+                    title: title.unwrap_or_default(),
                     key: window_key(&window, &owner),
-                    surface: window_frame(&window)?,
+                    surface: window_frame(&window, &budget)
+                        .map_err(|_| core::unanswered(&label, "for its frame"))?,
                 })
             })
         })
@@ -2411,7 +2666,8 @@ impl Backend for MacOsBackend {
         target: &TargetSpec,
     ) -> Result<SurfaceGeometry, anyhow::Error> {
         with_platform("read the target's geometry", || {
-            surface_geometry_routed(target)
+            let budget = core::Budget::new(core::LIST_BUDGET, "surface lookup", target.describe());
+            surface_geometry_with(target, budget)
         })
         .map_err(degraded_read)
     }

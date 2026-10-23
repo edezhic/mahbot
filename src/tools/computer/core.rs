@@ -26,6 +26,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// Maximum normalized coordinate value, inclusive on both axes ([`NORMALIZED_MAX`]).
 pub(crate) const NORMALIZED_MAX: f64 = 1000.0;
@@ -40,6 +41,14 @@ pub(crate) const AX_THIN_INTERACTIVE_ELEMENTS: usize = 5;
 /// per property), so only the backends that use this one compile it.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) const MAX_TREE_NODES: usize = 4000;
+
+/// Ceiling on the children ONE node may contribute. A target that advertises an
+/// absurd child list — a spreadsheet's cell list is the classic case, a count near
+/// 2^31 — would otherwise be paid for inside a single exchange, long before the node
+/// ceiling applies, so the advertised count is read first and a node beyond this
+/// ceiling is not walked at all.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const MAX_CHILDREN: usize = 1000;
 
 /// Character cap on a node value shown in a tree dump. The dump is a map of the
 /// surface, not a copy of its text, so a long value is cut here and counted in
@@ -88,6 +97,213 @@ pub(crate) const MAX_NAME_CHARS: usize = 200;
 /// texture, a GDI section) fails with a null handle or an `HRESULT` instead of
 /// aborting, and is bounded by the same geometry checks.
 pub(crate) const CAPTURE_BUDGET_PIXELS: u64 = 128 * 1024 * 1024;
+
+// ── Deadlines ───────────────────────────────────────────────────────────
+//
+// Every exchange is bounded by a deadline the product chose, and every call by a bound on
+// top of that (the aggregate budget below on Linux and macOS, a job deadline on Windows),
+// so a target that does not answer costs a lost detail instead of the action lock. The
+// figures are these constants and each backend's header; what the model is told lives in
+// the tool's prompt.
+
+/// How long ONE accessibility exchange may take before its target counts as not
+/// answering: the D-Bus method timeout on Linux and the AX messaging timeout on macOS,
+/// deliberately not shorter than the OS default applications rely on (1.5 s measured on
+/// a stopped application here). Windows sets its own transaction timeout.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const EXCHANGE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The aggregate budget of one observation, resolution included: well clear of what a
+/// responsive target at the node ceiling pays (~2.5 s of exchanges measured over AX,
+/// tens of seconds at a slow AT-SPI round trip), so only a target that stops answering
+/// reaches it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const OBSERVE_BUDGET: Duration = Duration::from_secs(120);
+
+/// One element action also observes the surface it addresses, so it pays the
+/// observation budget plus one exchange for the action itself.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const ACT_BUDGET: Duration = OBSERVE_BUDGET.saturating_add(EXCHANGE_DEADLINE);
+
+/// One listing, application walk or surface lookup — a handful of exchanges per
+/// application, where a hung one must not hold the call either.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const LIST_BUDGET: Duration = Duration::from_secs(20);
+
+/// What ONE application may spend of a listing's or a search's budget: one stalled
+/// exchange, checked before every read that application makes, so a hung application is
+/// caught at the check after its stall. A share is overshot by the read in flight, never
+/// by more, and the healthy applications keep the rest of the call.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const APP_SLICE: Duration = EXCHANGE_DEADLINE;
+
+/// The reason a listing gives for one item it skipped, where the line already names that
+/// item: it did not answer within its share of the call, so nothing about it was read.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const SKIPPED_NOTE: &str = "did not answer within its share of the call — skipped";
+
+/// The reason a listing gives for one unread item: a spent share is one skipped item, said
+/// in [`SKIPPED_NOTE`] because the line already names it and the call did return; anything
+/// else is that item's own failure, stated in full.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn unread_reason(err: &anyhow::Error, share: &Budget) -> String {
+    if share.expired() {
+        SKIPPED_NOTE.to_string()
+    } else {
+        format!("{err:#}")
+    }
+}
+
+/// One call's aggregate deadline, checked between exchanges, because a platform walk
+/// runs inside a blocking frame no external timer can interrupt. Linux and macOS make
+/// one per call and thread it through resolution and the walk; Windows makes its walk
+/// budget at the walk and bounds the rest with the job deadline it awaits the apartment
+/// thread under. The macOS listing clones one so it can hand a copy to the AX thread and
+/// still ask afterwards which application's share ran out.
+#[derive(Clone)]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) struct Budget {
+    end: Instant,
+    limit: Duration,
+    what: &'static str,
+    target: String,
+    /// This is one item's share of the call rather than the call itself, so running
+    /// out means that item was skipped — not that the call was abandoned.
+    part: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+impl Budget {
+    /// Start the clock for `what` (the operation the model asked for) against
+    /// `target`, named the way results name a surface.
+    pub(crate) fn new(limit: Duration, what: &'static str, target: impl Into<String>) -> Self {
+        Self {
+            end: Instant::now() + limit,
+            limit,
+            what,
+            target: target.into(),
+            part: false,
+        }
+    }
+
+    /// One application's share of this budget: at most `share` from now, and never past the
+    /// call's own end, so the step it bounds cannot outlive the call that owns it. Running
+    /// out of a share skips that application; it does not abandon the call.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn slice(&self, share: Duration, target: impl Into<String>) -> Self {
+        let now = Instant::now();
+        let end = self.end.min(now + share);
+        Self {
+            end,
+            limit: end.saturating_duration_since(now),
+            what: self.what,
+            target: target.into(),
+            part: true,
+        }
+    }
+
+    /// The surface this budget names, once the call has resolved it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Point the budget at the surface the call resolved: every failure from here on
+    /// names the window rather than the target as the model wrote it. [`name_surface`]
+    /// is the only caller, so a label and the budget it bounds are set together.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn retarget(&mut self, target: &str) {
+        target.clone_into(&mut self.target);
+    }
+
+    /// Whether the budget is spent, without building the error or logging it — for the
+    /// callers that record the expiry and describe it later.
+    pub(crate) fn expired(&self) -> bool {
+        Instant::now() >= self.end
+    }
+
+    /// Fail the call if its budget is spent — the one shape a walk checks with, so
+    /// every backend notices it between exchanges and nowhere inside one.
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        if self.expired() {
+            Err(self.error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The sentence for a target that stopped answering: it names the surface, says what
+    /// ran out of time and whether that ended the call or only skipped the item. Untagged,
+    /// so a caller that has more to say about the result can build the answer from it.
+    pub(crate) fn note(&self) -> String {
+        tracing::warn!(
+            target = %self.target,
+            limit_secs = self.limit.as_secs(),
+            part = self.part,
+            "computer use: the {} budget ran out",
+            self.what
+        );
+        if self.part {
+            format!(
+                "{} stopped answering accessibility requests — it was skipped, so the {} went on \
+                 without it",
+                self.target, self.what
+            )
+        } else {
+            format!(
+                "{} stopped answering accessibility requests — the {} was abandoned after {}s; \
+                 retry, or use screenshot instead",
+                self.target,
+                self.what,
+                self.limit.as_secs()
+            )
+        }
+    }
+
+    /// The honest answer for a spent budget, tagged and logged ([`Budget::note`]).
+    fn error(&self) -> anyhow::Error {
+        taxonomy_error(ERR_DEGRADED, self.note())
+    }
+}
+
+/// The label a call uses for the surface it resolved, both parts capped like any name.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn surface_label(app_name: &str, title: Option<&str>) -> String {
+    window_description(&cap_label(app_name), &cap_label(title.unwrap_or_default()))
+}
+
+/// The label a listing or a search uses for one application's windows — the one way such a
+/// call names them, capped like any other name.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn windows_label(app_name: &str) -> String {
+    format!("the windows of {}", cap_label(app_name))
+}
+
+/// The same label, and the call's budget pointed at it: the one place the identity →
+/// label → budget rule lives, so a call cannot report a surface one way and bound it under
+/// another. Returns the label for the errors that name it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn name_surface(budget: &mut Budget, app_name: &str, title: Option<&str>) -> String {
+    let label = surface_label(app_name, title);
+    budget.retarget(&label);
+    label
+}
+
+/// The failure for a surface that did not answer one of the reads a call makes before
+/// it can show, act on or capture anything. Both AT-SPI and AX report an unanswered
+/// request as a missing value, so a target that stopped answering is named — with what
+/// the call asked it for — instead of being reported as an attribute it does not have
+/// or as a surface that went away.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn unanswered(surface: &str, what: &str) -> anyhow::Error {
+    taxonomy_error(
+        ERR_DEGRADED,
+        format!(
+            "{surface} did not answer {what} — it may be busy or hung; retry, or use screenshot \
+             instead"
+        ),
+    )
+}
 
 /// Accessible role names considered genuinely actionable (AX-prefix already
 /// stripped, matched case-insensitively). Used alongside non-empty `actions`.
@@ -535,6 +751,12 @@ pub(crate) struct Truncation {
     pub nodes: Option<usize>,
     /// Children of this many nodes sit at the depth ceiling and were not read.
     pub depth: Option<Cut>,
+    /// This many nodes advertised more children than the child ceiling allows, so
+    /// their children were not read at all.
+    pub children: Option<Cut>,
+    /// This many nodes' child lists were longer than the child ceiling despite what
+    /// they advertised, so they were cut there.
+    pub children_cut: Option<Cut>,
     /// This many values were shortened at the read's own character cap.
     pub values: Option<Cut>,
     /// This many names were shortened at the read's own character cap.
@@ -546,6 +768,12 @@ pub(crate) struct Truncation {
 pub(crate) struct Cut {
     pub count: usize,
     pub limit: usize,
+}
+
+/// The one pluralisation rule of the ceiling statements: `one` for a count of one, `many`
+/// otherwise — nouns, verbs and pronouns alike, so none of them can read "1 nodes".
+fn counted(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
 }
 
 impl Truncation {
@@ -565,6 +793,20 @@ impl Truncation {
     )]
     pub(crate) fn cut_depth(&mut self, limit: usize) {
         self.depth.get_or_insert(Cut { count: 0, limit }).count += 1;
+    }
+
+    /// Record one node whose advertised children exceed the child ceiling.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cut_children(&mut self, limit: usize) {
+        self.children.get_or_insert(Cut { count: 0, limit }).count += 1;
+    }
+
+    /// Record one node whose child list was cut at the child ceiling.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn trim_children(&mut self, limit: usize) {
+        self.children_cut
+            .get_or_insert(Cut { count: 0, limit })
+            .count += 1;
     }
 
     /// Keep at most [`MAX_VALUE_CHARS`] of a value read from the accessibility layer,
@@ -619,29 +861,51 @@ impl Truncation {
         }
         if let Some(cut) = self.depth {
             out.push(format!(
-                "[Tree truncated: {} nodes at the {}-deep ceiling — their children were not read]",
-                cut.count, cut.limit
+                "[Tree truncated: {} {} at the {}-deep ceiling — {} children were not read]",
+                cut.count,
+                counted(cut.count, "node", "nodes"),
+                cut.limit,
+                counted(cut.count, "its", "their")
+            ));
+        }
+        if let Some(cut) = self.children {
+            out.push(format!(
+                "[Tree truncated: {} {} {} more than {} children — {} children were not read]",
+                cut.count,
+                counted(cut.count, "node", "nodes"),
+                counted(cut.count, "claims", "claim"),
+                cut.limit,
+                counted(cut.count, "its", "their")
+            ));
+        }
+        if let Some(cut) = self.children_cut {
+            out.push(format!(
+                "[Tree truncated: {} {} listed more than {} children — only the first {} were read]",
+                cut.count,
+                counted(cut.count, "node", "nodes"),
+                cut.limit,
+                cut.limit
             ));
         }
         if let Some(cut) = self.values {
             out.push(format!(
                 "[Tree truncated: {} {} cut at {} chars]",
                 cut.count,
-                if cut.count == 1 { "value" } else { "values" },
+                counted(cut.count, "value", "values"),
                 cut.limit
             ));
         }
         if values_cut > 0 {
             out.push(format!(
                 "[Tree truncated: {values_cut} {} cut at {RENDER_VALUE_CHARS} chars]",
-                if values_cut == 1 { "value" } else { "values" }
+                counted(values_cut, "value", "values")
             ));
         }
         if let Some(cut) = self.names {
             out.push(format!(
                 "[Tree truncated: {} {} cut at {} chars]",
                 cut.count,
-                if cut.count == 1 { "name" } else { "names" },
+                counted(cut.count, "name", "names"),
                 cut.limit
             ));
         }
@@ -2297,6 +2561,14 @@ mod tests {
                     count: 3,
                     limit: MAX_NAME_CHARS,
                 }),
+                children: Some(Cut {
+                    count: 4,
+                    limit: MAX_CHILDREN,
+                }),
+                children_cut: Some(Cut {
+                    count: 1,
+                    limit: MAX_CHILDREN,
+                }),
             },
         };
         let text = render_tree(&obs);
@@ -2330,6 +2602,27 @@ mod tests {
         assert!(
             header.contains(&format!("3 names cut at {MAX_NAME_CHARS} chars")),
             "{header}"
+        );
+        assert!(
+            header.contains(&format!("4 nodes claim more than {MAX_CHILDREN} children")),
+            "{header}"
+        );
+        assert!(
+            header.contains(&format!(
+                "1 node listed more than {MAX_CHILDREN} children — only the first {MAX_CHILDREN} \
+                 were read"
+            )),
+            "{header}"
+        );
+    }
+
+    #[test]
+    fn a_single_node_at_a_ceiling_reads_as_one_node() {
+        let mut truncation = Truncation::default();
+        truncation.cut_depth(25);
+        assert_eq!(
+            truncation.statements(0),
+            ["[Tree truncated: 1 node at the 25-deep ceiling — its children were not read]"]
         );
     }
 
@@ -2696,5 +2989,72 @@ mod tests {
         // Two key names → error.
         let err = parse_key_chord("a+b").unwrap_err();
         assert!(format!("{err}").contains("too many key names"), "got {err}");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_share_cannot_outlive_its_call_or_lengthen_a_short_one() {
+        let call = Budget::new(
+            Duration::from_secs(10),
+            "window listing",
+            "the running applications",
+        );
+        // A share asking for more than the call has ends with the call.
+        let long = call.slice(Duration::from_secs(60), "the windows of Numbers");
+        assert_eq!(long.end, call.end);
+        assert!(long.limit <= call.limit);
+        // A share asking for less keeps its own, shorter end.
+        let short = call.slice(Duration::ZERO, "the windows of Numbers");
+        assert_eq!(short.limit, Duration::ZERO);
+        assert!(short.expired());
+        assert!(!call.expired());
+    }
+
+    #[test]
+    fn a_spent_call_says_it_was_abandoned_and_names_the_target() {
+        let call = Budget::new(Duration::ZERO, "window listing", "the windows of Numbers");
+        let text = format!("{:#}", call.check().expect_err("the clock is spent"));
+        assert!(text.starts_with("degraded: "), "{text}");
+        assert!(
+            text.contains("the windows of Numbers stopped answering accessibility requests"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the window listing was abandoned after 0s"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_spent_share_says_the_item_was_skipped_not_the_call_abandoned() {
+        let call = Budget::new(
+            Duration::from_secs(20),
+            "window listing",
+            "the running applications",
+        );
+        let share = call.slice(Duration::ZERO, "the windows of Numbers");
+        let note = share.note();
+        assert!(
+            note.contains("the windows of Numbers stopped answering accessibility requests"),
+            "{note}"
+        );
+        assert!(
+            note.contains("it was skipped, so the window listing went on without it"),
+            "{note}"
+        );
+        // A share never speaks for the call: the model must not be told to retry a call
+        // that returned results, nor read the skipped application as the call failing.
+        assert!(!note.contains("abandoned"), "{note}");
+        assert!(!note.contains("retry"), "{note}");
+        // The listing renders an expired share as "skipped" and anything else as itself.
+        assert_eq!(
+            unread_reason(&anyhow!("window refused"), &share),
+            SKIPPED_NOTE
+        );
+        assert_eq!(
+            unread_reason(&anyhow!("window refused"), &call),
+            "window refused"
+        );
     }
 }

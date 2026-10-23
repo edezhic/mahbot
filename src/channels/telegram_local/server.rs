@@ -715,8 +715,15 @@ fn process_identity(pid: u32) -> Option<u64> {
         let mut exit = creation;
         let mut kernel = creation;
         let mut user = creation;
-        let asked =
-            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        let asked = unsafe {
+            GetProcessTimes(
+                handle,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
         unsafe { CloseHandle(handle) };
         let start = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
         (asked != 0).then_some(start)

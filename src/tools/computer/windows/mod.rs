@@ -15,17 +15,21 @@
 //!
 //! # No call may hang
 //!
-//! Two bounds stack. Each provider call is bounded client-side by the UI
-//! Automation timeouts this thread sets (3 s connection, 10 s transaction), and the
-//! whole job is awaited under a per-call deadline sized for what that shape actually
-//! pays (see the deadline constants below). A provider that stalls on several calls
-//! inside one job can still reach a job deadline: the thread is marked dead — the
-//! next call starts a fresh MTA thread and the wedged one is left to the OS (Windows
-//! offers no safe way to interrupt a thread blocked inside a provider). A read then
-//! fails with an honest `degraded` timeout; an actuation answers
-//! applied-but-unconfirmed, because it may still land on that leaked thread. At most
-//! one thread is leaked per hang, and the action lock, the agent and the daemon all
-//! stay responsive.
+//! Three bounds stack. Each provider call is bounded client-side by the UI Automation
+//! timeouts this thread sets; a whole accessibility walk runs under
+//! [`uia::WALK_DEADLINE`], a budget checked before every provider read it makes, so a
+//! stalled target costs one transaction rather than seven; and the whole job is awaited
+//! under a per-call deadline sized for what that shape actually pays (see the deadline
+//! constants below). Every one of those failures names the surface it was addressed to.
+//! A provider that stalls on several calls inside one job can still reach a job
+//! deadline: the thread is marked dead — the next call starts a fresh MTA thread and
+//! the wedged one is left to the OS (Windows offers no safe way to interrupt a thread
+//! blocked inside a provider). A read then fails with an honest `degraded` timeout; an
+//! actuation answers applied-but-unconfirmed, because it may still land on that leaked
+//! thread. One thread is leaked per hang and none is reused: the running count is
+//! reported in that deadline's answer and logged with it, so repeated hangs are visible
+//! instead of silent, and the action lock, the agent and the daemon all stay
+//! responsive.
 //!
 //! # Structured exceptions
 //!
@@ -194,14 +198,16 @@ use std::time::Duration;
 //
 // One bound per call shape, sized for what that shape actually pays. For the two
 // accessibility shapes that is the common path plus ONE provider transaction: the UIA
-// timeouts set on the apartment thread (3 s connect, 10 s transaction) end a single
-// unresponsive provider call, and [`uia::WALK_DEADLINE`] ends a walk with its own
-// honest timeout before the job deadline fires. A provider that stalls on more than one
-// call inside a job — the `ElementFromHandle` before the walk, one
-// `GetCurrentPatternAs` per pattern tried, the property reads `set_value` does before it
-// types — can still reach the job deadline. For an actuating call that deadline
-// answers applied-but-unconfirmed (see [`thread::submit_act`]), because its input may
-// still land; for a read it stays an error, since nothing is left in flight.
+// timeouts set on the apartment thread end a single unresponsive provider call, and
+// [`uia::WALK_DEADLINE`] — a [`super::core::Budget`] checked before every provider
+// read, whose error names the window — ends a walk with its own honest timeout before
+// the job deadline fires. A provider that stalls on more than one call inside a job —
+// the `ElementFromHandle` before the walk, one `GetCurrentPatternAs` per pattern tried,
+// the property reads `set_value` does before it types — can still reach the job
+// deadline, and that error names the same surface (the call's own label, read before it
+// is submitted). For an actuating call the deadline answers applied-but-unconfirmed
+// (see [`thread::submit_act`]), because its input may still land; for a read it stays
+// an error, since nothing is left in flight.
 
 /// The capture-channel probe: whether an interactive desktop is attached
 /// (`window::interactive_desktop_available`), with no provider and no device work.

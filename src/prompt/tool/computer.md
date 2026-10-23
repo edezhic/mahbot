@@ -65,7 +65,7 @@ Backend/runtime failures carry a leading tag (argument mistakes like out-of-rang
 
 * `permission-denied` — the OS refused the call. The error names the condition; report it to the owner and retry only once that condition is gone. Never work around it.
 * `unsupported` — this operation/channel isn't available for the target, or the control refuses the action (disabled, or it does not support it). Take another route: the `chrome` tool for web pages, `shell` for scriptable/terminal paths, or — for a refusing control — coordinates or another element.
-* `degraded` — the platform or surface inherently lacks this channel, or a transient failure occurred. Use another channel or retry.
+* `degraded` — the platform or surface inherently lacks this channel, or a transient failure occurred. A target that stops answering accessibility requests lands here too, with a message naming the surface and the budget that ran out: it is busy or hung, so retry, or take a screenshot of it instead. Otherwise use another channel or retry.
 * `stale-element` — the ref no longer resolves; the tree changed. Re-observe.
 * `surface-gone` — the window the call names no longer exists or can no longer be identified. Nothing was done to another surface. Enumerate apps/windows again and name a current one.
 * `framework-failed` — the OS framework serving the call failed; the call was abandoned. Re-observe or screenshot to check the target's state, then take another route (coordinates, or the `chrome` tool) or report it.

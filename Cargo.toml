@@ -381,7 +381,7 @@ dispatch2 = "0.3"
 # Computer Use tool (GUI observe/act): AT-SPI2 accessibility tree over D-Bus,
 # XTEST input synthesis via enigo, X11 stills via x11rb and Wayland stills via
 # the Screenshot portal over zbus — all Rust-only, no system packages.
-atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "wrappers", "tokio"] }
+atspi = { version = "0.30", default-features = false, features = ["proxies", "wrappers", "tokio"] }
 enigo = { version = "0.6", default-features = false, features = ["x11rb"] }
 x11rb = "0.13"
 zbus = "5"
