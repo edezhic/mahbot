@@ -62,6 +62,15 @@ const CANCELLED_ARCHIVE_HOURS: i64 = 1;
 /// `last_transition_actor` in the same statement — the chronicle materializer
 /// reads whatever value is current in the CDC after-row, so a phase change
 /// that leaves the column stale would misattribute the *previous* actor.
+///
+/// Invariant: a finished (`done`) ticket's phase is immutable. Every phase
+/// statement whose source phase could be `done` must carry `phase <> 'done'`
+/// (writing `done` onto an already-`done` ticket is not a transition and stays
+/// allowed), so no writer — tool, GUI, pipeline stage or future raw UPDATE —
+/// can reopen or re-route a finished ticket. The claim and drain statements are
+/// safe only because their source is pinned to `backlog`/`queued`; keep any new
+/// phase writer inside this rule. Only archiving (`is_archived`) remains
+/// available.
 pub(crate) const PIPELINE_ACTOR: &str = "pipeline";
 
 // Column definitions for ticket SELECT/RETURNING queries.
@@ -309,8 +318,9 @@ pub struct Ticket {
     /// have staged. Together with [`reviewed_head`](Self::reviewed_head) and a
     /// clean porcelain this identifies the exact content reviewers saw.
     pub reviewed_tree: Option<String>,
-    /// Exact completion timestamp: set on transition to Done, cleared when the
-    /// ticket leaves Done. `None` for never-done or not-currently-done tickets.
+    /// Exact completion timestamp: set on transition to Done and never cleared —
+    /// a finished ticket's phase is immutable. `None` for tickets that never
+    /// reached Done.
     pub done_at: Option<String>,
     /// Number of times this ticket bounced back into development from a
     /// non-success in either post-development stage.
@@ -533,6 +543,8 @@ pub enum TicketPhase {
     /// produce one consolidated result. The round also runs the workspace's own
     /// project commands alongside its participants.
     Verification,
+    /// Finished for good: the phase is immutable — only archiving remains, plus
+    /// reading and commenting, which never touch the phase.
     Done,
     Cancelled,
     Failed,
@@ -557,8 +569,9 @@ impl TicketPhase {
     /// finished.
     ///
     /// Delegates to the crate-private terminal-phase set so the terminal set
-    /// is authoritative for both the transition-clearing clause and the
-    /// implementation completion.
+    /// is authoritative for both the manual transition's phase-job completion
+    /// and the terminal session-pin cleanup
+    /// (`jobs::purge_terminal_session_pins`).
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         TERMINAL_PHASES.contains(self)
@@ -631,11 +644,12 @@ impl std::str::FromStr for TicketPhase {
 // Display and AsRefStr are provided by strum derives. FromStr is implemented
 // manually above to produce user-friendly error messages.
 
-/// Bundles a SQL mutation statement with its parameters and ticket id.
-/// Returned by [`BoardStore::build_transition_sql`]; executed via
-/// [`PreparedUpdate::execute_no_cancel`], [`PreparedUpdate::execute_tx`],
-/// [`PreparedUpdate::execute_and_cancel`] or
-/// [`PreparedUpdate::execute_tx_matched`].
+/// Bundles an `UPDATE tickets` statement with its bound parameters and the
+/// ticket id the update targets. Phase transitions execute the SQL directly
+/// (their zero-row outcome needs its own explanation); the other producers go
+/// through [`PreparedUpdate::execute_no_cancel`], [`PreparedUpdate::execute_tx`]
+/// or [`PreparedUpdate::execute_and_cancel`], which use `ticket_id` for the
+/// not-found check.
 struct PreparedUpdate {
     sql: String,
     params: Vec<db::Value>,
@@ -683,17 +697,6 @@ impl PreparedUpdate {
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&self.ticket_id);
         Ok(())
-    }
-
-    /// Execute within an existing transaction, reporting whether the CAS
-    /// guard matched: `Ok(true)` when a row was updated, `Ok(false)` when no
-    /// row matched — the ticket is no longer in the expected phase (moved
-    /// externally) or does not exist. Follows the claim convention
-    /// (guard miss = `Ok(false)`, an expected no-op), unlike the other
-    /// executors which treat a no-row match as an error.
-    async fn execute_tx_matched(self, tx: &db::TxGuard<'_>) -> Result<bool> {
-        let rows = tx.execute(&self.sql, self.params).await?;
-        Ok(rows > 0)
     }
 }
 
@@ -902,6 +905,7 @@ impl BoardStore {
     ///
     /// Returns an error if:
     /// - The superseded ticket does not exist
+    /// - The superseded ticket is finished (`done`) — its phase is immutable
     /// - The superseded ticket is in a different workspace
     /// - A self-reference is detected (supersede ID in the new ticket's prerequisites)
     /// - Any prerequisite is invalid (doesn't exist or cross-workspace)
@@ -920,11 +924,13 @@ impl BoardStore {
             .begin_tx_and_validate_prerequisites(&params.workspace_name, &params.prerequisites)
             .await?;
 
-        // Verify the superseded ticket exists and belongs to the same workspace.
+        // Verify the superseded ticket exists, belongs to the same workspace,
+        // and is not finished — a finished ticket's phase is immutable, and
+        // supersede is a phase write (it cancels the old ticket).
         // This runs INSIDE the transaction — see [`TxGuard::query`].
         let rows = tx
             .query(
-                "SELECT workspace_name FROM tickets WHERE id = ?1",
+                "SELECT workspace_name, phase FROM tickets WHERE id = ?1",
                 db::params![supersede_id],
             )
             .await?;
@@ -933,6 +939,7 @@ impl BoardStore {
             .next()
             .ok_or_else(|| anyhow::anyhow!("Superseded ticket not found: {supersede_id}"))?;
         let old_ws: String = row.get(0)?;
+        let old_phase: String = row.get(1)?;
         anyhow::ensure!(
             old_ws == params.workspace_name,
             "Superseded ticket {supersede_id} belongs to workspace '{old_ws}', \
@@ -940,14 +947,17 @@ impl BoardStore {
              Cross-workspace supersede is not allowed.",
             params.workspace_name,
         );
+        if old_phase == TicketPhase::Done.as_ref() {
+            return Err(Self::finished_ticket_error(supersede_id, "superseded"));
+        }
 
         let now = db::now();
         let cancelled_rows = tx
             .execute(
                 "UPDATE tickets SET phase = ?1, updated_at = ?2, \
-                 superseded_by = ?4, is_archived = 1, done_at = NULL, \
+                 superseded_by = ?4, is_archived = 1, \
                  last_transition_actor = ?5 \
-                 WHERE id = ?3",
+                 WHERE id = ?3 AND phase <> 'done'",
                 db::params![
                     TicketPhase::Cancelled.as_ref(),
                     now,
@@ -1341,14 +1351,19 @@ impl BoardStore {
     ///
     /// Note: this does **not** use [`Self::build_ticket_update_with_updated_at`]
     /// because it has extra SET columns (`last_transition_actor = ?3` and
-    /// `done_at = CASE ...`) and an
-    /// additional WHERE condition (`AND (?5 IS NULL OR phase = ?5)`) that
+    /// `done_at = CASE ...`) and extra WHERE conditions (the optional CAS guard
+    /// `AND (?5 IS NULL OR phase = ?5)` and the finished-ticket guard) that
     /// don't fit the helper's fixed pattern.
     ///
-    /// `done_at` is set to `?2` (now) when the target is `done` — overwriting
-    /// on re-completion — and cleared when the ticket leaves `done`, so the
-    /// column holds a timestamp iff the ticket is currently in the Done phase.
-    /// Later non-transition activity (comments, archive) never touches it.
+    /// `done_at` is set to `?2` (now) when the target is `done` and never
+    /// cleared: a finished ticket's phase is immutable, so no transition ever
+    /// leaves `done`.
+    ///
+    /// `AND (phase <> 'done' OR ?1 = 'done')` is the finished-ticket rule in the
+    /// statement itself: any attempt to move a `done` ticket to another phase
+    /// matches zero rows, so no writer can slip a finished ticket back into
+    /// work. Writing `done` onto an already-`done` ticket is not a transition
+    /// and stays allowed (the existing overwrite of `done_at` is kept).
     fn build_transition_sql(
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
@@ -1359,10 +1374,9 @@ impl BoardStore {
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
         let sql = "UPDATE tickets SET phase = ?1, updated_at = ?2, \
                     last_transition_actor = ?3, \
-                    done_at = CASE WHEN ?1 = 'done' THEN ?2 \
-                                   WHEN phase = 'done' THEN NULL \
-                                   ELSE done_at END \
-                    WHERE id = ?4 AND (?5 IS NULL OR phase = ?5)";
+                    done_at = CASE WHEN ?1 = 'done' THEN ?2 ELSE done_at END \
+                    WHERE id = ?4 AND (?5 IS NULL OR phase = ?5) \
+                    AND (phase <> 'done' OR ?1 = 'done')";
         let params: Vec<db::Value> = vec![
             Value::from(target_phase.as_ref()),
             Value::from(now),
@@ -1386,7 +1400,10 @@ impl BoardStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the UPDATE matched 0 rows or a database error occurs.
+    /// Returns an error when the ticket does not exist, when the CAS guard
+    /// misses (the ticket is in another phase), when a `done` ticket is asked
+    /// to move to any other phase (its phase is immutable), or on a database
+    /// error. A `done → done` write is not a transition and succeeds.
     pub async fn transition_to(
         &self,
         ticket_id: &str,
@@ -1395,7 +1412,22 @@ impl BoardStore {
         actor: &str,
     ) -> Result<()> {
         let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase, actor);
-        prepared.execute_and_cancel(&self.conn).await?;
+        let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
+        if rows == 0 {
+            let current = self.get_ticket_phase(ticket_id).await?;
+            if Self::is_finished_phase_refusal(current, target_phase) {
+                return Err(Self::finished_transition_error(ticket_id, target_phase));
+            }
+            return Err(match current {
+                Some(current) => anyhow::anyhow!(
+                    "Ticket {ticket_id} is in phase '{current}', so the change to '{}' \
+                     did not apply",
+                    target_phase.as_ref(),
+                ),
+                None => anyhow::anyhow!("Ticket {ticket_id} not found"),
+            });
+        }
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
         // A terminal transition (Done/Cancelled/Failed) completes the ticket's
         // phase jobs (idempotent; no-op when the ticket has none) so a manual
         // Done/Cancelled does not leave a lingering 'launched' phase job. The
@@ -1419,13 +1451,19 @@ impl BoardStore {
     ///
     /// # Return value
     ///
-    /// Returns `Ok(true)` when the CAS guard matched and the row was
-    /// updated; `Ok(false)` when no row matched — the ticket is no longer in
-    /// the expected phase (moved externally while the stage finished) or does
-    /// not exist. The guard miss follows the board layer's claim convention
+    /// Returns `Ok(true)` when the guard matched and the row was updated;
+    /// `Ok(false)` when no row matched — the ticket is no longer in the
+    /// expected phase (moved externally while the stage finished) or does not
+    /// exist. The guard miss follows the board layer's claim convention
     /// (expected no-op, not an error), unlike
     /// [`transition_to`](Self::transition_to) whose callers perform
     /// user-initiated actions on a ticket that must exist.
+    ///
+    /// A `done` ticket asked to move to another phase is the exception: it
+    /// returns the finished-ticket refusal as an error, because "the ticket
+    /// moved externally" would be a false reason for a phase that can never
+    /// move. Carrying a stale guard onto `done` itself is not a transition, so
+    /// it keeps the benign `Ok(false)`.
     pub(crate) async fn transition_to_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
@@ -1434,7 +1472,49 @@ impl BoardStore {
         actor: &str,
     ) -> Result<bool> {
         let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase, actor);
-        prepared.execute_tx_matched(tx).await
+        if tx.execute(&prepared.sql, prepared.params).await? > 0 {
+            return Ok(true);
+        }
+        let current = tx
+            .query_map_strict(
+                "SELECT phase FROM tickets WHERE id = ?1",
+                db::params![ticket_id],
+                |row| {
+                    let phase: String = row.get(0)?;
+                    phase.parse()
+                },
+            )
+            .await?
+            .into_iter()
+            .next();
+        if Self::is_finished_phase_refusal(current, target_phase) {
+            return Err(Self::finished_transition_error(ticket_id, target_phase));
+        }
+        Ok(false)
+    }
+
+    /// Whether a zero-row phase write was refused by the finished-ticket rule:
+    /// the ticket is `done` and the target is not (`done → done` is not a
+    /// transition, so it keeps the CAS-miss semantics).
+    fn is_finished_phase_refusal(current: Option<TicketPhase>, target: TicketPhase) -> bool {
+        current == Some(TicketPhase::Done) && target != TicketPhase::Done
+    }
+
+    /// The one refusal for a phase write on a finished ticket: names the ticket,
+    /// the attempted action, and what still works, so no caller mistakes it for
+    /// "not found" or a silent no-op.
+    fn finished_ticket_error(ticket_id: &str, action: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "Ticket {ticket_id} is finished (phase 'done') — a finished ticket's phase is \
+             immutable, so it cannot be {action}. Only archiving remains; the ticket can \
+             still be read and commented on.",
+        )
+    }
+
+    /// The refusal for a phase transition on a finished ticket — the shared
+    /// action wording for both transition paths.
+    fn finished_transition_error(ticket_id: &str, target: TicketPhase) -> anyhow::Error {
+        Self::finished_ticket_error(ticket_id, &format!("moved to '{}'", target.as_ref()))
     }
 
     /// Verify that a mutation query affected at least one row, returning an

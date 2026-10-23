@@ -4,6 +4,8 @@ Transition an existing ticket to a new phase. Requires the ticket `ticket_id`, w
 - **planning** — paused state awaiting further decision whether to proceed with the ticket or cancel it
 - **queued** — send the ticket to the engineer's queue for implementation
 - **cancelled** — abandon the ticket without completing it (beware that if the ticket already had some work done in it then the workspace will be left in a dirty state even after cancellation).
-- **done** — mark the ticket as complete and successful
+- **done** — mark the ticket as complete and successful (irreversible: a finished ticket's phase can never change again)
 
 In general you should not set any other phases unless explicitly requested by the user.
+
+A ticket in `done` is finished for good. Its phase is immutable: any attempt to move it to another phase is refused and it cannot be superseded. Only the phase is frozen — a finished ticket can still be read, commented on and archived. If finished work needs to be revisited, create a new standalone ticket instead of trying to re-open the finished one.

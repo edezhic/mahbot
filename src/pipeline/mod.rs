@@ -764,9 +764,9 @@ where
         Err(e) => {
             warn!(
                 ticket = %ctx.ticket.id,
-                error = %e,
-                "{}: transition to {} failed — ticket stuck in {}",
-                ctx.log_label, ctx.target, ctx.source,
+                error = ?e,
+                "{}: transition to {} failed",
+                ctx.log_label, ctx.target,
             );
             FinalizeOutcome::Failed
         }

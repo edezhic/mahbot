@@ -4,9 +4,9 @@ Parameters:
 - `title`: short ticket title
 - `description`: full ticket description
 - `prerequisites`: optional ticket IDs that must finish before this ticket can be claimed
-- `supersede`: optional ticket ID to replace/refine
+- `supersede`: optional ticket ID to replace/refine (never a finished `done` ticket — it cannot be superseded)
 - `priority` (Manager only): optional priority level (0 = highest urgency, 1 default, 2, 3, ... higher = lower). Maintainer must NOT include this parameter.
 
 Ticket IDs may be given as a bare number (e.g. `123`) or the fully prefixed form (e.g. `workspace-123`); both refer to tickets in the current workspace only. IDs from other workspaces are rejected.
 
-When `supersede` is provided, the old ticket is cancelled, this ticket is created as its replacement, and dependent prerequisites are rewired to the new ticket.
+When `supersede` is provided, the old ticket is cancelled, this ticket is created as its replacement, and dependent prerequisites are rewired to the new ticket. A `done` ticket cannot be superseded — its phase is immutable, so the follow-up work must be filed as a new standalone ticket.

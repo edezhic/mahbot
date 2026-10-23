@@ -177,6 +177,105 @@ async fn claim_queued_unblocked_by_superseding_failed_sibling() {
     );
 }
 
+/// A finished ticket's phase is immutable on every writer: the manual/GUI
+/// transition, the pipeline's transactional finalization and supersede all
+/// refuse it with the finished-ticket reason, `done → done` is not a transition,
+/// and archiving (of a non-archived or already-archived ticket) still works.
+#[tokio::test]
+async fn done_ticket_phase_is_immutable() {
+    let (store, _dir) = crate::open_test_store!(BoardStore, "board");
+    let ws = ws_named("ws-a");
+    let id = make_ticket(&store, &ws, "Finished", TicketPhase::Done).await;
+
+    for target in [
+        TicketPhase::Backlog,
+        TicketPhase::Analysis,
+        TicketPhase::Planning,
+        TicketPhase::Queued,
+        TicketPhase::InDevelopment,
+        TicketPhase::Verification,
+        TicketPhase::InSanitation,
+        TicketPhase::Cancelled,
+        TicketPhase::Failed,
+    ] {
+        let err = store
+            .transition_to(&id, None, target, "manager")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("finished (phase 'done')"),
+            "the refusal must name the reason for {target}: {err}",
+        );
+        assert_eq!(expect_ticket_phase(&store, &id).await, TicketPhase::Done);
+    }
+
+    // A stale CAS guard does not hide the finished reason.
+    let err = store
+        .transition_to(&id, Some(TicketPhase::Backlog), TicketPhase::Queued, "user")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("finished (phase 'done')"), "{err}");
+
+    // The pipeline's transactional finalizer refuses identically (it would
+    // otherwise report a benign external move).
+    let err = crate::db::with_tx_outcome(&store.conn, &id, "transition", async |tx| {
+        BoardStore::transition_to_tx(
+            tx,
+            &id,
+            Some(TicketPhase::Verification),
+            TicketPhase::InSanitation,
+            "pipeline",
+        )
+        .await
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("finished (phase 'done')"),
+        "{err:#}"
+    );
+
+    // Re-writing `done` is not a transition and stays allowed.
+    store
+        .transition_to(&id, Some(TicketPhase::Done), TicketPhase::Done, "user")
+        .await
+        .unwrap();
+
+    // Supersede is a phase write too (it cancels the superseded ticket).
+    let err = store
+        .supersede_and_create(
+            &id,
+            &crate::pipeline::board::TicketParams {
+                title: "Replacement".to_string(),
+                description: "replacement".to_string(),
+                workspace_name: ws.name.clone(),
+                phase: TicketPhase::Queued,
+                prerequisites: Vec::new(),
+                reporter: "manager".to_string(),
+                embedding: None,
+                priority: 1,
+            },
+            "manager",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("finished (phase 'done')"), "{err}");
+    assert_eq!(expect_ticket_phase(&store, &id).await, TicketPhase::Done);
+
+    // Archiving still works, and an archived finished ticket is equally frozen.
+    store.set_archived(&id).await.unwrap();
+    let err = store
+        .transition_to(&id, None, TicketPhase::Backlog, "user")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("finished (phase 'done')"), "{err}");
+    assert_eq!(expect_ticket_phase(&store, &id).await, TicketPhase::Done);
+}
+
 /// Backlog → Analysis claim honors prerequisites: a dependent ticket with an
 /// unmet prereq stays in Backlog; once the prereq reaches an unblocking phase
 /// the dependent is eligible.
