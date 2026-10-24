@@ -1,0 +1,1 @@
+Hand the message to another account's own assistant — it runs as that account, in its personal workspace. One-way: that assistant answers its own user through their own channels, and nothing — no answer, no notice, no failure — comes back here.

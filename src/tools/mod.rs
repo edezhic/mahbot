@@ -613,11 +613,11 @@ impl SyncDurableCore {
     /// The core is resolved from the tool plus its choice argument, never by
     /// matching a name against a stored round kind: `analyze`'s sync form is the
     /// quick round and `send`'s is the single-run worker, so a call that asked for
-    /// another kind (`deep`, `worker_branch`, `manager`, `role`), an unknown
-    /// value, a non-string, or an unknown tool name — a retired tool's included
-    /// — resolves to `None` and is re-executed instead of binding an unrelated
-    /// job. A retired tool name is not resolvable either: history is never
-    /// rewritten, so a cut-mid-flight retired call is simply repeated.
+    /// another kind (`deep`, `worker_branch`, `manager`, `role`, `guest`), an
+    /// unknown value, a non-string, or an unknown tool name — a retired tool's
+    /// included — resolves to `None` and is re-executed instead of binding an
+    /// unrelated job. A retired tool name is not resolvable either: history is
+    /// never rewritten, so a cut-mid-flight retired call is simply repeated.
     #[must_use]
     pub(crate) fn from_call(name: &str, args: &serde_json::Value) -> Option<Self> {
         // A cancel call names an existing round instead of starting one: a

@@ -34,6 +34,10 @@
 //!   ([`route_worker_branch_report`] / [`route_worker_branch_failure`]) — the
 //!   asking custom role's branch when it carried one, else the admin's
 //!   Assistant.
+//! - A guest's Assistant is handed a one-way `<owner-assistant-message>` from the
+//!   owner's Assistant ([`route_guest_message`]); it runs as that guest like any
+//!   other incoming message, so its answer reaches the guest's own channels and
+//!   nothing goes back to the sender.
 //! - Other roles deliver to the triggering user's channel bindings (with an
 //!   unregistered-user fallback).
 
@@ -126,6 +130,18 @@ pub enum MessageKind {
     /// [`MessageKind::ImplementResult`], which carries no extra file-delivery
     /// root.)
     CustomRoleNotify,
+    /// A one-way handover from the owner's Assistant into a guest's own Assistant
+    /// conversation (`<owner-assistant-message>` envelope): the job runs AS that
+    /// guest, in their personal workspace, and the answer it produces reaches the
+    /// guest's own channels. Nothing returns to the sender — hence no reply
+    /// target — and `originating_workspace` stays unset, so the guest's workspace
+    /// is the only root its RELATIVE media markers resolve in (an absolute one is
+    /// not confined by the media layer, the same as any other message). Durable —
+    /// produced through [`hand_over`]. Deliberately distinct from `UserMessage` so
+    /// the failure-emoji gate (`== UserMessage`) structurally excludes it: the
+    /// guest never sees an unexplained failure mark from a message they did not
+    /// send.
+    GuestMessage,
 }
 
 /// A single unit of work for an agent consumer.
@@ -366,7 +382,8 @@ pub async fn route_user_message(
     );
 
     // DURABLE kinds = UserMessage (manager-bound), AgentMessage, ManagerNotify,
-    // CustomRoleNotify, AnalyzeToolResult, ResearchResult, ImplementResult.
+    // CustomRoleNotify, GuestMessage, AnalyzeToolResult, ResearchResult,
+    // ImplementResult.
     if job.role == Role::Manager {
         stamp_and_route(job, &agent_id, "manager message").await;
         return;
@@ -501,6 +518,41 @@ pub(crate) async fn route_agent_message_to_manager(
     let job = agent_message_job(content, workspace_name, &user_name, asker);
     let target = crate::jobs::envelope_target(&job);
     hand_over(job, &target, "agent message", answered_for).await
+}
+
+/// Hand one message from the owner's Assistant to a guest account's own Assistant
+/// (`MessageKind::GuestMessage`, durable) — one-way: nothing is addressed back to
+/// the sender.
+///
+/// The producer (`tools::send`) has already wrapped the text in
+/// `<owner-assistant-message>`. The job runs AS the guest — their account is the
+/// identity and their personal workspace the folder, so the consumer's pinning and
+/// delivery give it the guest's own toolset, conversation and channels, never the
+/// owner's. `answered_for` carries the handover's contract ([`hand_over`]).
+pub(crate) async fn route_guest_message(
+    content: String,
+    guest_name: &str,
+    answered_for: AnsweredFor,
+) -> anyhow::Result<()> {
+    let job = AgentJob {
+        content,
+        workspace_name: crate::users::personal_workspace_name(guest_name),
+        user_name: guest_name.to_string(),
+        // History-attribution tag only: the answer is broadcast to all of the
+        // guest's channel bindings, so no single transport is claimed here.
+        channel: "gui".to_string(),
+        kind: MessageKind::GuestMessage,
+        role: Role::Assistant,
+        reply_target: None,
+        pending_job_id: None,
+        // No root of the sender's rides along: relative markers in the guest's
+        // answer resolve in the guest's own workspace.
+        originating_workspace: None,
+        custom_role: None,
+        reply_to_custom: None,
+    };
+    let target = crate::jobs::envelope_target(&job);
+    hand_over(job, &target, "guest message", answered_for).await
 }
 
 /// Hand one message from the COMMAND LINE to the owner's own assistant.
@@ -990,8 +1042,8 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
             // Send emoji error only for UserMessage jobs where the agent truly
             // failed (not cancelled or shutdown). Internal job kinds
-            // (TicketNotify, AnalyzeToolResult, ResearchResult, ManagerNotify)
-            // get no feedback.
+            // (TicketNotify, AnalyzeToolResult, ResearchResult, ManagerNotify,
+            // CustomRoleNotify, GuestMessage) get no feedback.
             //
             // We check both the agent-specific token AND the
             // global shutdown token because during SIGTERM/SIGINT the global

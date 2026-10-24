@@ -1,10 +1,12 @@
 //! SendTool — hand one message to exactly one addressee.
 //!
 //! The addressees are the worker (a single worker run), a worker branch (a
-//! continuable worker conversation), a managed workspace's Manager, and an
-//! administrator-defined custom role. Every holder declares the `addressee`
-//! choice and every call states it — including a holder that can address only
-//! one agent — and a value outside its set is refused.
+//! continuable worker conversation), a managed workspace's Manager, an
+//! administrator-defined custom role, and — for the owner's own Assistant alone —
+//! a guest account's own assistant, a one-way handover nothing answers. Every
+//! holder declares the `addressee` choice and every call states it — including a
+//! holder that can address only one agent — and a value outside its set is
+//! refused.
 //!
 //! The one caller with no agent session behind it is the command line
 //! (`mahbot send`): there the owner's own assistant is an address too — what an
@@ -40,7 +42,8 @@ enum Argument {
     Place,
     /// The branch a worker branch or a custom role continues.
     Branch,
-    /// A custom role's name.
+    /// The custom role a `role` call starts, or the account a `guest` call hands
+    /// to.
     Name,
 }
 
@@ -62,7 +65,7 @@ impl Argument {
         match self {
             Self::Place => "The folder this call names",
             Self::Branch => "The branch to continue or create",
-            Self::Name => "The custom role's name",
+            Self::Name => "The name the chosen address takes",
         }
     }
 }
@@ -80,14 +83,14 @@ struct Requirement {
     required: bool,
 }
 
-/// Exactly one addressee of a `send` call. [`Self::ALL`] is the dispatch tool's
-/// own set — the order is the interface order, the narrowest kind first; the
-/// command line's vocabulary leads with the owner's own assistant and lives in
-/// [`Self::COMMAND_LINE`].
+/// Exactly one addressee of a `send` call. [`Self::OFFERED`] is the dispatch
+/// tool's own set — the interface order, narrowest first; [`Self::COMMAND_LINE`]
+/// is what the command line may name (it leads with the owner's own assistant);
+/// [`Self::STRS`] is the narrower set a custom role's grant may name.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Addressee {
     /// The owner's own assistant — the command line's default address, and one
-    /// an agent is never offered (it is not in [`Self::ALL`]).
+    /// an agent is never offered.
     Assistant,
     /// A single worker run: make one scoped change, report back.
     Worker,
@@ -97,6 +100,9 @@ pub enum Addressee {
     Manager,
     /// An administrator-defined custom role.
     Role,
+    /// A guest account's own assistant, named by that account: the message runs
+    /// as the guest and nothing comes back.
+    Guest,
 }
 
 /// What the command line shows for its `--addressee` flag, word for word. It
@@ -108,31 +114,42 @@ pub(crate) const ADDRESSEE_FLAG_HELP: &str = "Who receives it: 'assistant' (your
      assistant — the same as naming none), 'worker' (one scoped worker run in the folder \
      `--place` names, your own workspace when it names none), 'worker_branch' (a \
      continuable worker conversation, needs `--branch`), 'manager' (the Manager of the \
-     project `--place` names — what a script aiming at a project should use), or 'role' \
-     (a custom role, needs `--name`). An address takes only its own flags: a flag the \
-     address does not take is refused rather than ignored — `--branch` with 'worker', or \
-     `--place` with 'assistant', fails the call";
+     project `--place` names — what a script aiming at a project should use), 'role' \
+     (a custom role, needs `--name`), or 'guest' (another account's own assistant, \
+     one-way — nothing comes back, needs `--name` with that account's name). An address \
+     takes only its own flags: a flag the address does not take is refused rather than \
+     ignored — `--branch` with 'worker', or `--place` with 'assistant', fails the call";
 
 impl Addressee {
     /// The argument naming the choice.
     pub const ARG: &'static str = "addressee";
 
-    /// Every addressee the dispatch tool itself offers, in interface order
-    /// (narrowest first). The vocabulary a GRANT is drawn from.
-    pub const ALL: [Self; 4] = [Self::Worker, Self::WorkerBranch, Self::Manager, Self::Role];
+    /// Every addressee an agent's holder can have, in interface order (narrowest
+    /// first) — the admin Assistant's set, since `guest` is no other holder's. A
+    /// GRANT draws from the narrower [`Self::STRS`].
+    pub const OFFERED: [Self; 5] = [
+        Self::Worker,
+        Self::WorkerBranch,
+        Self::Manager,
+        Self::Role,
+        Self::Guest,
+    ];
 
     /// Every addressee the COMMAND LINE may name: the tool's own set plus the
     /// owner's own assistant, which leads it. The holder decides which of them
     /// it offers.
-    pub const COMMAND_LINE: [Self; 5] = [
+    pub const COMMAND_LINE: [Self; 6] = [
         Self::Assistant,
         Self::Worker,
         Self::WorkerBranch,
         Self::Manager,
         Self::Role,
+        Self::Guest,
     ];
 
-    /// The wire spellings of [`Self::ALL`], in the same order.
+    /// The grantable addressees, in interface order — the vocabulary
+    /// [`crate::tools::grants::kinds_of`] hands a custom role's grant: never the
+    /// owner's own assistant (an address of the command line alone) nor `guest`.
     pub const STRS: &'static [&'static str] = &[
         Self::Worker.as_str(),
         Self::WorkerBranch.as_str(),
@@ -149,15 +166,13 @@ impl Addressee {
             Self::WorkerBranch => "worker_branch",
             Self::Manager => "manager",
             Self::Role => "role",
+            Self::Guest => "guest",
         }
     }
 
-    /// Parse a wire spelling — the whole vocabulary the command line may name;
-    /// the holder decides which of them it offers. This is the address vocabulary
-    /// of a CALL (the command line's); the vocabulary a GRANT is drawn from is the
-    /// narrower [`Self::STRS`], and a stored grant entry is validated against that
-    /// before it ever reaches here (see [`crate::tools::grants`]), so a custom role
-    /// can never be granted the owner's own assistant.
+    /// Parse a wire spelling — the whole vocabulary of a CALL, which is the
+    /// command line's; the holder decides which of them it offers. A stored grant
+    /// entry never reaches here unvalidated (see [`crate::tools::grants`]).
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Self::COMMAND_LINE.into_iter().find(|a| a.as_str() == value)
@@ -171,6 +186,7 @@ impl Addressee {
             Self::WorkerBranch => "continues a named worker branch",
             Self::Manager => "messages a project's Manager",
             Self::Role => "starts a custom role",
+            Self::Guest => "hands the message to a guest's own assistant, one-way",
         }
     }
 
@@ -222,6 +238,11 @@ impl Addressee {
                     required: true,
                 },
             ],
+            Self::Guest => &[Requirement {
+                arg: Argument::Name,
+                note: "the guest's account name, exactly as it is written",
+                required: true,
+            }],
         }
     }
 
@@ -321,14 +342,16 @@ impl SendTool {
         Self {
             dispatch_mode: DispatchMode::Async,
             caller_role,
-            kinds: Addressee::ALL.to_vec(),
+            kinds: Addressee::OFFERED.to_vec(),
             accepts_place: true,
         }
     }
 
     /// A custom role's variant: exactly the granted addressees, asynchronously,
     /// with the optional `place`. Never empty — a grant entry that named no kind
-    /// takes the narrowest addressee (`worker`).
+    /// takes the narrowest addressee (`worker`). Kinds come from
+    /// [`Addressee::STRS`] (see [`crate::tools::grants`]), so such a holder never
+    /// has the `guest` handover.
     #[must_use]
     pub fn granted(kinds: &[Addressee]) -> Self {
         let kinds = if kinds.is_empty() {
@@ -500,7 +523,7 @@ impl SendTool {
         if !self.declares(arg) {
             return None;
         }
-        let takers: Vec<(Addressee, &'static Requirement)> = Addressee::ALL
+        let takers: Vec<(Addressee, &'static Requirement)> = Addressee::OFFERED
             .into_iter()
             .filter(|addressee| self.kinds.contains(addressee))
             .filter_map(|addressee| {
@@ -538,10 +561,10 @@ impl SendTool {
             needed if needed < takers.len() => {
                 format!(
                     " Omit for the default; required for {}.",
-                    needed_by.join(", ")
+                    needed_by.join(" and ")
                 )
             }
-            _ => format!(" Required for {}.", needed_by.join(", ")),
+            _ => format!(" Required for {}.", needed_by.join(" and ")),
         };
         Some(format!("{} — {}.{tail}", arg.lead(), notes.join("; ")))
     }
@@ -560,7 +583,7 @@ impl Tool for SendTool {
             load_prompt("tool/send.md"),
             load_prompt("tool/send_addressee.md"),
         ];
-        for addressee in Addressee::ALL {
+        for addressee in Addressee::OFFERED {
             if !self.kinds.contains(&addressee) {
                 continue;
             }
@@ -645,7 +668,7 @@ impl Tool for SendTool {
             Addressee::Assistant => {
                 // Only the command line reaches this arm: the owner's own
                 // assistant is not one of the addressees an agent's holder
-                // declares (see [`Addressee::ALL`]), so an agent that names it
+                // declares (see [`Addressee::OFFERED`]), so an agent that names it
                 // is refused before any dispatch.
                 crate::agent::message_router::deliver_command_line_message(message.to_string())
                     .await?;
@@ -782,6 +805,37 @@ impl Tool for SendTool {
                     Self::answered_for(),
                 )
                 .await
+            }
+            Addressee::Guest => {
+                let name = super::get_str(&args, Argument::Name.as_str())?;
+                // The words of what happened here, not the account-creation rule
+                // (`users::refuse_admin_name`).
+                anyhow::ensure!(
+                    !crate::users::is_admin_name(name),
+                    "'{name}' is your own account — a `guest` call would be your assistant \
+                     messaging itself; name a guest account instead"
+                );
+                // Byte-exact matching: no case or composition folding anywhere on
+                // this path, and the refusal repeats the name as it was written.
+                anyhow::ensure!(
+                    crate::users::store().user_exists(name).await?,
+                    "no account is named '{name}' — a `guest` call takes an existing account's \
+                     name, exactly as it is written"
+                );
+                let content = crate::prompt::substitute(
+                    &crate::prompt::load_prompt("guest_message.md"),
+                    &[("{{message}}", message)],
+                );
+                crate::agent::message_router::route_guest_message(
+                    content,
+                    name,
+                    Self::answered_for(),
+                )
+                .await?;
+                Ok(format!(
+                    "Message handed to the assistant of '{name}', one-way: it runs as that \
+                     guest and nothing comes back."
+                ))
             }
         }
     }
@@ -940,6 +994,13 @@ mod tests {
                 .expect("a job must be routed within 20s")
                 .expect("the consumer must still be registered")
         }
+
+        /// Assert nothing was routed to this conversation — a handover is queued
+        /// before the call returns, so anything sent would already be here.
+        fn assert_nothing_routed(&mut self) {
+            assert!(self.unclaimed.is_empty(), "a job was routed here");
+            assert!(self.rx.try_recv().is_err(), "a job was routed here");
+        }
     }
 
     /// The kind of a durable round's job row, once the dispatch task has written
@@ -1011,10 +1072,11 @@ mod tests {
             .unwrap()
     }
 
-    /// The two dispatch tools really dispatch: every kind a holder has creates
-    /// the round or reaches the addressee it names, a worker branch is created,
-    /// continued in another folder and stopped, and a holder that lacks a kind is
-    /// refused it.
+    /// The two dispatch tools really dispatch: every round-creating kind a holder
+    /// has creates the round or reaches the addressee it names, a worker branch is
+    /// created, continued in another folder and stopped, and a holder that lacks a
+    /// kind is refused it. (The `guest` handover starts no round and reports
+    /// nothing — it is covered by `the_admin_hands_one_message_to_a_guest_assistant`.)
     #[tokio::test]
     #[serial_test::serial(provider, channel_registry, drain)]
     async fn every_dispatch_kind_is_dispatched() {
@@ -1443,7 +1505,7 @@ mod tests {
         );
 
         let worker_only = SendTool::granted(&[Addressee::Worker]);
-        for addressee in ["worker_branch", "manager", "role"] {
+        for addressee in ["worker_branch", "manager", "role", "guest"] {
             let err = dispatch(
                 &worker_only,
                 &caller,
@@ -2061,10 +2123,9 @@ mod tests {
     /// The addressees a holder's text may name: the choice declaration names
     /// every held addressee, and an argument's text names exactly the held
     /// addressees that take it.
-    fn assert_labels_follow_the_choice(kinds: &[Addressee]) {
-        let tool = SendTool::granted(kinds);
+    fn assert_labels_follow_the_choice(tool: &SendTool, kinds: &[Addressee]) {
         let description = tool.description();
-        for kind in Addressee::ALL {
+        for kind in Addressee::OFFERED {
             let labelled = format!("`{}`", kind.as_str());
             let named = kinds.contains(&kind);
             assert_eq!(
@@ -2091,7 +2152,7 @@ mod tests {
                     })
                     .unwrap_or_default()
             };
-            for kind in Addressee::ALL {
+            for kind in Addressee::OFFERED {
                 let labelled = format!("`{}`", kind.as_str());
                 assert_eq!(
                     text.contains(&labelled),
@@ -2105,8 +2166,8 @@ mod tests {
     /// The arguments a holder declares: `message` and the choice always, and one
     /// more where a held addressee takes it (and only then) — a requirement
     /// belongs to the choice that needs it.
-    fn assert_arguments_follow_the_addressees(kinds: &[Addressee]) {
-        let schema = SendTool::granted(kinds).parameters_schema();
+    fn assert_arguments_follow_the_addressees(tool: &SendTool, kinds: &[Addressee]) {
+        let schema = tool.parameters_schema();
         let properties = schema["properties"].as_object().unwrap();
         let mut expected: Vec<&str> = vec!["message", Addressee::ARG];
         for arg in Argument::ALL {
@@ -2148,10 +2209,11 @@ mod tests {
         assert_eq!(required, expected_required, "{kinds:?}");
     }
 
-    /// How an argument's text states whether it can be left out: named for the
-    /// choice that needs it, never as an unconditional requirement.
-    fn assert_requirements_are_named_per_choice(kinds: &[Addressee]) {
-        let schema = SendTool::granted(kinds).parameters_schema();
+    /// How an argument's text states whether it can be left out: one
+    /// `required for` phrase naming every choice that needs it, never an
+    /// unconditional requirement.
+    fn assert_requirements_are_named_per_choice(tool: &SendTool, kinds: &[Addressee]) {
+        let schema = tool.parameters_schema();
         let properties = schema["properties"].as_object().unwrap();
         for arg in Argument::ALL {
             let Some(text) = properties
@@ -2174,9 +2236,23 @@ mod tests {
                 "{kinds:?}: `{}` is not unconditional: {text}",
                 arg.as_str()
             );
-            for kind in needed {
-                let named = format!("required for `{}`", kind.as_str());
-                assert!(text.to_lowercase().contains(&named), "{kinds:?}: {text}");
+            if needed.is_empty() {
+                continue;
+            }
+            let lowered = text.to_lowercase();
+            let clause = lowered
+                .find("required for")
+                .map_or_else(String::new, |at| lowered[at..].to_string());
+            // The clause names every choice that needs the argument — and no
+            // choice that does not, so an over-broad requirement is caught too.
+            for kind in kinds {
+                let labelled = format!("`{}`", kind.as_str());
+                assert_eq!(
+                    clause.contains(&labelled),
+                    needed.contains(kind),
+                    "{kinds:?}: `{}` and {labelled}: {text}",
+                    arg.as_str()
+                );
             }
         }
     }
@@ -2185,8 +2261,7 @@ mod tests {
     /// arguments must be declared for every holder that can reach that arm —
     /// `get_str` cannot filter, so an undeclared one there would be read even
     /// though the interface never offers it. Swept over every holder.
-    fn assert_required_arguments_are_declared(kinds: &[Addressee]) {
-        let tool = SendTool::granted(kinds);
+    fn assert_required_arguments_are_declared(tool: &SendTool, kinds: &[Addressee]) {
         for kind in kinds {
             for requirement in kind.requirements() {
                 assert!(
@@ -2200,25 +2275,39 @@ mod tests {
     }
 
     /// A holder reads only the choices and the requirements it has. Swept over
-    /// EVERY holder and every argument (all non-empty subsets of
-    /// [`Addressee::ALL`]), so the class cannot come back one instance at a time:
-    /// a new addressee or argument joins the sweep by existing. The Engineer's
-    /// sync worker — the one holder that declares no `place` — sits outside the
-    /// subsets and is pinned by its own tests.
+    /// EVERY holder and every argument — every non-empty subset of the grant
+    /// vocabulary, which is what a custom role can hold, plus the admin
+    /// Assistant's own holder — so the class cannot come back one instance at a
+    /// time: a new grantable addressee or argument joins the sweep by existing,
+    /// and the admin holder is swept whole. The Engineer's sync worker — the one
+    /// holder that declares no `place` — sits outside the subsets and is pinned by
+    /// its own tests.
     #[test]
     fn a_holder_reads_only_the_choices_and_requirements_it_has() {
-        let all = Addressee::ALL;
-        for mask in 1u32..(1 << all.len()) {
-            let kinds: Vec<Addressee> = all
-                .iter()
-                .enumerate()
-                .filter(|(bit, _)| mask & (1 << bit) != 0)
-                .map(|(_, kind)| *kind)
-                .collect();
-            assert_labels_follow_the_choice(&kinds);
-            assert_arguments_follow_the_addressees(&kinds);
-            assert_requirements_are_named_per_choice(&kinds);
-            assert_required_arguments_are_declared(&kinds);
+        let grantable: Vec<Addressee> = Addressee::OFFERED
+            .into_iter()
+            .filter(|kind| Addressee::STRS.contains(&kind.as_str()))
+            .collect();
+        let mut holders: Vec<SendTool> = (1u32..(1 << grantable.len()))
+            .map(|mask| {
+                let kinds: Vec<Addressee> = grantable
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, _)| mask & (1 << bit) != 0)
+                    .map(|(_, kind)| *kind)
+                    .collect();
+                SendTool::granted(&kinds)
+            })
+            .collect();
+        // The one holder with the `guest` handover: the owner's own Assistant.
+        holders.push(SendTool::admin(Role::Assistant));
+
+        for tool in &holders {
+            let kinds = tool.kinds.as_slice();
+            assert_labels_follow_the_choice(tool, kinds);
+            assert_arguments_follow_the_addressees(tool, kinds);
+            assert_requirements_are_named_per_choice(tool, kinds);
+            assert_required_arguments_are_declared(tool, kinds);
         }
 
         // The prose itself, once: a choice holder reads each held addressee under
@@ -2316,18 +2405,25 @@ mod tests {
         );
     }
 
-    /// The three spellings of the address vocabulary are one list written three
-    /// ways: the grant vocabulary ([`Addressee::STRS`]) is [`Addressee::ALL`]'s
-    /// spellings, the command line's ([`Addressee::COMMAND_LINE`]) is that list led
-    /// by the owner's own assistant, and `parse` reads exactly the command line's.
-    /// A drift between them would mis-scope a grant (the assistant is not
-    /// grantable) or leave an accepted address out of the declarations.
+    /// The three vocabularies are one list written three ways: [`Addressee::STRS`]
+    /// is [`Addressee::OFFERED`] without `guest`, and [`Addressee::COMMAND_LINE`]
+    /// is that one led by the owner's own assistant. A drift either mis-scopes a
+    /// grant or drops an accepted address from the declarations.
     #[test]
     fn the_address_vocabularies_are_one_list() {
-        let all: Vec<&str> = Addressee::ALL.iter().map(|a| a.as_str()).collect();
-        assert_eq!(all, Addressee::STRS.to_vec(), "the grant vocabulary");
+        let offered: Vec<&str> = Addressee::OFFERED.iter().map(|a| a.as_str()).collect();
+        let grantable: Vec<&str> = offered
+            .iter()
+            .copied()
+            .filter(|spelling| *spelling != Addressee::Guest.as_str())
+            .collect();
+        assert_eq!(grantable, Addressee::STRS.to_vec(), "the grant vocabulary");
+        assert!(
+            !Addressee::STRS.contains(&Addressee::Assistant.as_str()),
+            "the owner's own assistant is never grantable"
+        );
         let mut command_line: Vec<&str> = vec![Addressee::Assistant.as_str()];
-        command_line.extend(all.iter().copied());
+        command_line.extend(offered.iter().copied());
         assert_eq!(
             command_line,
             Addressee::COMMAND_LINE
@@ -2391,6 +2487,8 @@ mod tests {
             ("worker", "branch"),
             ("worker", "name"),
             ("manager", "name"),
+            ("guest", "place"),
+            ("guest", "branch"),
         ] {
             let mut args = json!({ "message": "go", "addressee": addressee });
             args[flag] = json!(if flag == "place" { "/tmp" } else { "x" });
@@ -2432,7 +2530,7 @@ mod tests {
         .expect_err("an unknown addressee is refused");
         let err = err.to_string();
         assert!(
-            err.contains("worker, worker_branch, manager, role"),
+            err.contains("worker, worker_branch, manager, role, guest"),
             "{err}"
         );
 
@@ -2445,9 +2543,22 @@ mod tests {
         .expect_err("an agent session never names the owner's own assistant");
         let err = err.to_string();
         assert!(
-            err.contains("worker, worker_branch, manager, role"),
+            err.contains("worker, worker_branch, manager, role, guest"),
             "{err}"
         );
+
+        // The guest handover is the owner's Assistant's alone: a custom role's
+        // holder never reads it as one of its own choices.
+        let role_holder = SendTool::granted(&[Addressee::Role]);
+        let err = dispatch(
+            &role_holder,
+            &ws,
+            json!({ "message": "do it", "addressee": "guest", "name": "anyone" }),
+        )
+        .await
+        .expect_err("a custom role never acquires the guest handover");
+        let err = err.to_string();
+        assert!(err.contains("`addressee` must be one of role"), "{err}");
     }
 
     /// What decides is the marker the executor sets: a turn that ARRIVED over the
@@ -2485,7 +2596,7 @@ mod tests {
         .expect_err("an agent's turn never names the owner's own assistant");
         let err = err.to_string();
         assert!(
-            err.contains("worker, worker_branch, manager, role"),
+            err.contains("worker, worker_branch, manager, role, guest"),
             "{err}"
         );
     }
@@ -2674,5 +2785,142 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// The admin's Assistant hands one message to a guest's own Assistant: the
+    /// durable envelope runs as that guest, in their own personal workspace,
+    /// wrapped as a one-way `<owner-assistant-message>`, and NOTHING is routed to
+    /// the sender's conversation. The two refusals are pinned beside it — the
+    /// owner's own account and a name no account holds — and the command line
+    /// reaches the same address because it drives the same assistant's tool.
+    #[tokio::test]
+    #[serial_test::serial(provider, channel_registry, drain)] // registers the admin assistant's conversation, which message_router's provider-serial tests use
+    async fn the_admin_hands_one_message_to_a_guest_assistant() {
+        crate::util::test::init_management_test_stores().await;
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        let store = crate::users::store();
+        store.add_user("guesty").await.unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let admin_ws = crate::workspace::test_ws_named(
+            home.path().to_str().unwrap(),
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        );
+        let send = SendTool::admin(Role::Assistant);
+        let guest_target = crate::session::assistant_agent_id("guesty");
+        let mut guest_spy = Spy::register(&guest_target);
+        // The sender's own conversation: the handover must never reach it.
+        let mut sender_spy = Spy::register(&crate::session::assistant_agent_id(
+            crate::users::ADMIN_USER_NAME,
+        ));
+        let pending_before: std::collections::HashSet<String> =
+            crate::jobs::list_pending_jobs(&crate::session::store().conn)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+
+        let ack = dispatch(
+            &send,
+            &admin_ws,
+            json!({
+                "addressee": "guest",
+                "name": "guesty",
+                "message": "please water the plants [FILE:/etc/passwd]",
+            }),
+        )
+        .await
+        .expect("the owner's assistant reaches a guest's");
+        assert!(ack.contains("guesty") && ack.contains("one-way"), "{ack}");
+
+        let job = guest_spy.next_job().await;
+        assert_eq!(
+            job.kind,
+            crate::agent::message_router::MessageKind::GuestMessage
+        );
+        assert_eq!(job.role, Role::Assistant);
+        assert_eq!(job.user_name, "guesty");
+        assert_eq!(
+            job.workspace_name,
+            crate::users::personal_workspace_name("guesty")
+        );
+        assert_eq!(job.channel, "gui");
+        assert!(
+            job.originating_workspace.is_none(),
+            "no root of the sender's rides along"
+        );
+        assert!(
+            job.content.contains("<owner-assistant-message")
+                && job.content.contains("one-way=")
+                && job
+                    .content
+                    .contains("please water the plants [FILE:/etc/passwd]"),
+            "the sender is marked by the wrapper, and the body is delivered verbatim: {}",
+            job.content
+        );
+
+        // Durable before the call's own acknowledgement: a restart replays it.
+        let pending = crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .unwrap();
+        assert!(
+            pending.iter().any(|row| {
+                row.target_agent_id == guest_target && row.envelope.contains("water the plants")
+            }),
+            "the handover must be durable"
+        );
+
+        // The command line drives the same assistant's own tool, so the address is
+        // there too — and its handover is durable before the caller is answered.
+        let ack = dispatch_command_line(
+            &send,
+            &admin_ws,
+            json!({ "addressee": "guest", "name": "guesty", "message": "and the mail" }),
+        )
+        .await
+        .expect("the command line reaches a guest's assistant");
+        assert!(ack.contains("guesty"), "{ack}");
+        let job = guest_spy.report("and the mail").await;
+        assert_eq!(
+            job.kind,
+            crate::agent::message_router::MessageKind::GuestMessage
+        );
+
+        // One-way: nothing arrives in the sender's own conversation.
+        sender_spy.assert_nothing_routed();
+
+        // The owner's own account is the assistant messaging itself.
+        let err = dispatch(
+            &send,
+            &admin_ws,
+            json!({ "addressee": "guest", "name": crate::users::ADMIN_USER_NAME, "message": "hi" }),
+        )
+        .await
+        .expect_err("the admin's own account is refused")
+        .to_string();
+        assert!(err.contains("your own account"), "{err}");
+        // A name no account holds is refused naming it.
+        let err = dispatch(
+            &send,
+            &admin_ws,
+            json!({ "addressee": "guest", "name": "nobody_here", "message": "hi" }),
+        )
+        .await
+        .expect_err("an unknown account is refused")
+        .to_string();
+        assert!(err.contains("nobody_here"), "{err}");
+        // Leave the shared store as the test found it: only the rows this test
+        // created (a parallel test may be holding an envelope for this session).
+        let after = crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .unwrap();
+        for row in after {
+            if !pending_before.contains(&row.id) {
+                crate::jobs::delete_pending_job(&crate::session::store().conn, &row.id)
+                    .await
+                    .expect("delete this test's own envelope");
+            }
+        }
     }
 }

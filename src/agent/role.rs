@@ -397,8 +397,9 @@ impl Role {
         t.push(Box::new(ReadTool::new(file_access)));
         if is_admin {
             t.push(Box::new(ShellTool::new(ShellMode::Full)));
-            // The worker and the branch surface, and the Manager/custom-role
-            // addressees — one tool, chosen per call.
+            // The worker and the branch surface, the Manager/custom-role
+            // addressees, and the one-way handover to a guest's own assistant
+            // (the one address no other holder has) — one tool, chosen per call.
             t.push(Box::new(SendTool::admin(Role::Assistant)));
             // The admin's session is a trusted local session, so the
             // Assistant can also observe/act on the local GUI directly.

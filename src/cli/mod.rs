@@ -82,8 +82,9 @@ Usage:
                          grants, web search, custom roles)
   mahbot workspace <operation> [flags]
                          Work with the RUNNING product's workspaces and tickets
-  mahbot send [flags]    Hand one message to an agent and finish: one-way — the
-                         answer arrives in your assistant's conversation
+  mahbot send [flags]    Hand one message to an agent and finish — the answer
+                         arrives later in your assistant's conversation, or
+                         nothing does when the addressee is one-way
   mahbot document <operation> [flags]
                          Read a document with the RUNNING product's reader, or
                          produce one with its document tool
@@ -843,8 +844,8 @@ pub(crate) const FAMILIES: &[Family] = &[
         // as a failed operation, so it carries the current value and is refused
         // as the environment's class instead.
         protocol: crate::db::ipc::CALL_STORE,
-        purpose: "Hand one message to an agent and finish: one-way — no reply is waited for or \
-                  printed, and the answer arrives in your assistant's conversation",
+        purpose: "Hand one message to an agent and finish — an answer arrives later in your \
+                  assistant's conversation, and nothing does for the one-way 'guest' address",
         surface: Surface::Standalone(&[
             Flag {
                 arg: "message",
@@ -885,7 +886,9 @@ pub(crate) const FAMILIES: &[Family] = &[
                 arg: "name",
                 kind: FlagKind::Value,
                 secret: false,
-                purpose: "The custom role to start (it must exist)",
+                purpose: "The name the chosen address takes: for 'role', the custom role to \
+                          start (it must exist); for 'guest', the account name of the guest whose \
+                          own assistant receives the message",
             },
         ]),
     },
