@@ -360,14 +360,14 @@ pub(super) struct ActionOutput<T> {
 
 /// Chrome tool for fetching content from web pages.
 ///
-/// Each operation requires a `tab` name — separate chrome sessions
-/// (isolated via `--session`). Every session an agent run dispatches is
-/// resolved to the run's private namespace (`ChromeTool::resolve_session` plus
-/// `ChromeRunSessions`) and handed to that run's release, so concurrent runs of
-/// different ids can never collide on or address each other's sessions (see
-/// `run_session_namespace` for the same-id case and its transitional residue); tool
-/// output keeps showing the logical tab name. Operations on the same tab are
-/// serialized via a per-tab lock.
+/// `tab` is optional — it names the page in this run's private session, and an empty or
+/// missing value means the default page ([`TAB_ARG`]). Separate chrome sessions are isolated
+/// via `--session`: every session an agent run dispatches is resolved to the run's private
+/// namespace (`ChromeTool::resolve_session` plus `ChromeRunSessions`) and handed to that run's
+/// release, so concurrent runs of different ids can never collide on or address each other's
+/// sessions (see `run_session_namespace` for the same-id case and its transitional residue);
+/// tool output keeps showing the logical tab name. Operations on the same tab are serialized
+/// via a per-tab lock.
 #[derive(Default)]
 pub struct ChromeTool {
     /// Per-tab locks — only serializes operations on the same tab.
@@ -1379,8 +1379,7 @@ impl Tool for ChromeTool {
                 "action": { "oneOf": entries },
                 "tab": {
                     "type": "string",
-                    "description": "Page name in this run's private session \
-                     (empty = the default page)."
+                    "description": TAB_ARG
                 }
             },
             "required": ["action"]
@@ -1854,8 +1853,8 @@ impl ChromeTool {
                 _ => String::new(),
             };
             anyhow::anyhow!(
-                "Invalid chrome action arguments{hint}. Expected action to be {EXPECTED_ACTION_SHAPE}, \
-                 plus a \"tab\" string. Serde error: {e}"
+                "Invalid chrome action arguments{hint}. Expected action to be {EXPECTED_ACTION_SHAPE}. \
+                 {TAB_ARG}. Serde error: {e}"
             )
         })?;
 
@@ -2381,12 +2380,17 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
     \"selector\":\"...\",\"count\":int,\"op\":\"==\",\"predicate\":\"equals|contains|matches\",\"name\":\"...\",\"expected\":\"...\"}}, \
     {\"extract\":{\"schema\":{...},\"limit\":int}}";
 
+/// The one statement of what `tab` is, carried by the argument schema, both corrective errors
+/// and [`ChromeTool`]'s doc: optional, and an empty or missing value means the default page.
+const TAB_ARG: &str = "`tab` is optional — it names the page in this run's private session, and an \
+                       empty or missing value means the default page";
+
 /// Corrective error for an unrecoverable action shape, listing the exact
 /// expected form instead of raw serde text.
 fn corrective_action_error(received: &Value) -> String {
     format!(
-        "Invalid chrome action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}, \
-         plus a \"tab\" string. Received: {received}"
+        "Invalid chrome action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}. {TAB_ARG}. \
+         Received: {received}"
     )
 }
 

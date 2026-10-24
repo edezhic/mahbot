@@ -802,7 +802,9 @@ impl Tool for ComputerTool {
         // Serialize every GUI-touching action so concurrent agent runs can't race.
         let _lock = ACTION_LOCK.lock().await;
 
-        let output = dispatch(&action).await.map_err(framework_next_step)?;
+        let output = dispatch(&action)
+            .await
+            .map_err(|e| framework_next_step(&action, e))?;
         Ok(super::with_normalization_notes(output, &notes))
     }
 
@@ -920,18 +922,28 @@ async fn ensure_interactive_desktop() -> anyhow::Result<()> {
     ))
 }
 
-/// The one place a `framework-failed` answer gains its next step. The constructor stays
-/// plain because a framework failure raised during an actuation is folded into
-/// `applied but unconfirmed` (the input may already have landed), where "the call was
-/// abandoned" would be wrong.
-fn framework_next_step(err: anyhow::Error) -> anyhow::Error {
-    if core::is_framework_failed(&err) {
-        return anyhow::anyhow!(
-            "{err} — the call was abandoned, so re-observe or screenshot to check the target's \
-             state, then take another route or report it"
-        );
+/// The one place a `framework-failed` answer gains its next step, written for the call that
+/// failed: a listing or a cursor read is worth one retry, a capture is not helped by being
+/// taken again, and the rest check the surface first. The constructor stays plain because a
+/// framework failure raised during an actuation is folded into `applied but unconfirmed`
+/// (the input may already have landed), where "the call was abandoned" would be wrong.
+fn framework_next_step(action: &ComputerAction, err: anyhow::Error) -> anyhow::Error {
+    if !core::is_framework_failed(&err) {
+        return err;
     }
-    err
+    let next = match action {
+        ComputerAction::Apps {} | ComputerAction::Windows { .. } | ComputerAction::Cursor {} => {
+            "retry it once, and report it if it repeats"
+        }
+        ComputerAction::Screenshot { .. } | ComputerAction::Zoom { .. } => {
+            "re-observe the target if it is a window, then take another route or report it"
+        }
+        _ => {
+            "re-observe or screenshot to check the target's state, then take another route \
+              or report it"
+        }
+    };
+    anyhow::anyhow!("{err} — the call was abandoned, so {next}")
 }
 
 async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {

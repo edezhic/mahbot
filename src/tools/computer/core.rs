@@ -372,8 +372,8 @@ pub(crate) const ERR_FRAMEWORK_FAILED: &str = "framework-failed";
 pub(crate) const ERR_AMBIGUOUS_LOCATOR: &str = "ambiguous-locator";
 pub(crate) const ERR_NOT_MATCHED: &str = "not-matched";
 /// The surface a call names is gone: the window closed or was replaced.
-/// Deliberately not `not-matched`, whose guidance — coordinates or a screenshot of
-/// where it used to be — cannot help when the window no longer exists.
+/// Deliberately not `not-matched` (the name did not match; re-enumerate apps/windows): that
+/// would report a followed window's disappearance as a misnamed target.
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
     expect(dead_code)
