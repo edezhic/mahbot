@@ -1378,7 +1378,10 @@ async fn press_element(proxies: &Proxies<'_>) -> Result<Impact, anyhow::Error> {
             .join(", ");
         return Err(core::taxonomy_error(
             core::ERR_UNSUPPORTED,
-            format!("element has no press/open action; available actions: {available}"),
+            format!(
+                "element has no press/open action; available actions: {available} — click it by \
+                 coordinates instead"
+            ),
         ));
     };
     let ok = match action.do_action(idx as i32).await {

@@ -22,7 +22,11 @@
 //!
 //! The agent-facing description is the shared `src/prompt/tool/computer.md` plus
 //! only the running platform's own file ([`PLATFORM_DESCRIPTION`]): one
-//! installation is one platform, so no agent is handed another's caveats.
+//! installation is one platform, so no agent is handed another's caveats. It carries
+//! only what shapes an ordinary call — what the actions are, which surface one acts on,
+//! the coordinate space, the result states — because a caveat that matters only when a
+//! call goes wrong belongs in the failure that raises it, as one line saying what to do
+//! next, not in text every request carries.
 //!
 //! # Bounded by the product, not by the machine
 //!
@@ -38,14 +42,14 @@
 //! # Every argument is bounded
 //!
 //! Every [`ComputerAction`] argument is either a value from a declared set or bounded by
-//! a range or a length cap. Those bounds are stated in the schema and named by the
-//! refusal that enforces them, and they are checked before [`ACTION_LOCK`] is taken — so
-//! a bad call costs a round trip, never a wait behind the lock, a capture, a permission
-//! prompt or a lookup. An argument the chosen action cannot honour is refused with the
-//! form the action does accept rather than dropped: a field it does not take fails as
-//! [`check_action_fields`] says, and a combination it cannot honour — half a coordinate
-//! pair, a ref together with coordinates, a target on a pointer-less wheel — fails in
-//! [`validate_action`].
+//! a range or a length cap. Those bounds are stated in the schema or the description and
+//! named by the refusal that enforces them, and they are checked before [`ACTION_LOCK`]
+//! is taken — so a bad call costs a round trip, never a wait behind the lock, a capture,
+//! a permission prompt or a lookup. An argument the chosen action cannot honour is
+//! refused with the form the action does accept rather than dropped: a field it does not
+//! take fails as [`check_action_fields`] says, and a combination it cannot honour — half
+//! a coordinate pair, a ref together with coordinates, a target on a pointer-less wheel —
+//! fails in [`validate_action`].
 //!
 //! # No call waits forever
 //!
@@ -55,8 +59,8 @@
 //! job deadline and the walk's own. A bound that runs out always answers — naming the
 //! surface and saying whether anything was applied, since an abandoned actuation may have
 //! landed — so [`ACTION_LOCK`] is released by an answer and the next call proceeds; a
-//! responsive target never reaches one. Each backend's header states its mechanism, and
-//! the numbers the model is told are in the tool's prompt.
+//! responsive target never reaches one. Each backend's header states its mechanism; the
+//! figures themselves reach the model only in the answer that reports the bound it hit.
 //!
 //! # A session that cannot receive the call is refused, not served
 //!
@@ -77,10 +81,10 @@
 //!    same as before, the summary names its size and the PNG is attached.
 //! 2. `zoom` over a quarter of that screen: the same crop as before, no refusal.
 //! 3. `observe` a document or a browser page: the tree reads as before. A field
-//!    holding more than 2000 characters shows its first 120 and the header states
-//!    both cuts on macOS and Windows (`1 value cut at 2000 chars`, `1 value cut at
-//!    120 chars`); Linux reads a value only one character past the dump, so it
-//!    states the display cut alone.
+//!    holding more than 120 characters shows its first 120, marked with an ellipsis,
+//!    and the header counts the cut (`1 value cut at 120 chars`); macOS and Windows
+//!    also read past their own 2000-character value cap, counted the same way
+//!    (`1 value cut at 2000 chars`).
 //! 4. A refusal needs a call whose live buffers together exceed 128 Mi pixels — a
 //!    whole-desktop `zoom` on a wall of four or more 6K displays, or a framework
 //!    reporting an absurd geometry — so it is not reachable from an ordinary desktop:
@@ -133,7 +137,7 @@ use tracing::debug;
 // ── Action enum ─────────────────────────────────────────────────────────
 
 /// One computer tool call. All points/regions are normalized 0-1000 relative to
-/// the target surface (see the `## Coordinate contract` prompt section).
+/// the surface the call names (see the `## Which surface` prompt section).
 #[derive(Debug, Clone, Deserialize, Serialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 enum ComputerAction {
@@ -228,13 +232,6 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"observe\":{\"target\":\"a1\"}}, 
     {\"scroll\":{\"direction\":\"down\",\"amount\":3}}, \
     {\"drag\":{\"from\":[x,y],\"to\":[x,y]}}, {\"cursor\":{}}, {\"wait\":{\"seconds\":2}}";
 
-/// Schema text for the `target` field, shared by every action that takes one so
-/// the schema and the tool description cannot drift apart.
-const TARGET_FIELD: &str = "Target id (a1/w1) or \"screen\". Default: the surface this agent \
-     last observed or captured, initially the focused window of the frontmost app. A w-id names \
-     that one window or fails as surface-gone; an a-id means the application's own focused \
-     window.";
-
 /// Wheel ticks a `scroll` moves when `amount` is omitted.
 const DEFAULT_SCROLL_AMOUNT: u32 = 3;
 
@@ -248,113 +245,107 @@ const MODIFIERS: [&str; 4] = ["cmd", "ctrl", "alt", "shift"];
 /// One schema entry per [`ComputerAction`], built once: the model-facing schema and
 /// [`check_action_fields`] read the same entries, so the arguments a call may carry
 /// cannot drift from the interface the model is given.
+///
+/// The tool description carries what the arguments mean; an entry says only what its
+/// action does and which of its arguments the name alone does not settle.
 static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
     vec![
         super::action_entry_schema(
             "observe",
-            "Get the accessibility tree of a target surface with element refs (e1, e2, ...). Refs expire on re-observe. The result names the surface it is about.",
+            "Read the tree with element refs.",
             &[],
             &json!({
-                "target": {"type": "string", "description": TARGET_FIELD}
+                "target": {"type": "string"}
             }),
         ),
         super::action_entry_schema(
             "screenshot",
-            "Capture the target surface as a PNG and inject it as a native image; requires a vision-capable model. The result names the surface captured.",
+            "Capture a surface as an image.",
             &[],
             &json!({
-                "target": {"type": "string", "description": TARGET_FIELD}
+                "target": {"type": "string"}
             }),
         ),
         super::action_entry_schema(
             "zoom",
-            "Capture and crop a normalized region of the target surface as a PNG.",
+            "Capture a crop; [x0, y0, x1, y1] normalized.",
             &["region"],
             &json!({
-                "target": {"type": "string", "description": TARGET_FIELD},
-                "region": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}, "description": "Normalized [x0, y0, x1, y1] region (0-1000), relative to the target surface, enclosing a non-zero area."}
+                "target": {"type": "string"},
+                "region": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}
             }),
         ),
-        super::action_entry_schema(
-            "apps",
-            "List running GUI applications as a1-style targets.",
-            &[],
-            &json!({}),
-        ),
+        super::action_entry_schema("apps", "List applications as a1 ids.", &[], &json!({})),
         super::action_entry_schema(
             "windows",
-            "List windows, optionally filtered to an app, as w1-style targets. A w-id names that one window until it is gone.",
+            "List windows as w1 ids, optionally per app.",
             &[],
             &json!({
-                "app": {"type": "string", "description": "App name, pid, or a stored a-id to filter windows."}
+                "app": {"type": "string"}
             }),
         ),
         super::action_entry_schema(
             "click",
-            "Click by element ref (preferred) or normalized coordinates — never both. A coordinate click is pointer input: it lands on whatever is under that point.",
+            "Click a ref, or a point by x and y; button, double and modifiers apply to a \
+             point only.",
             &[],
             &json!({
-                "target": {"type": "string", "description": TARGET_FIELD},
-                "ref": {"type": "string", "description": "Element ref from the most recent observe; preferred over coordinates."},
-                "x": {"type": "number", "description": "Normalized 0-1000 X, relative to the target surface."},
-                "y": {"type": "number", "description": "Normalized 0-1000 Y, relative to the target surface."},
-                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button; coordinate clicks only. Default: left."},
-                "double": {"type": "boolean", "description": "Double-click; coordinate clicks only. Default: false."},
-                "modifiers": {"type": "array", "maxItems": MODIFIERS.len(), "items": {"enum": MODIFIERS}, "description": "Keyboard modifiers; apply only to coordinate clicks, one entry per modifier."}
+                "target": {"type": "string"},
+                "ref": {"type": "string"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                "double": {"type": "boolean"},
+                "modifiers": {"type": "array", "maxItems": MODIFIERS.len(), "items": {"enum": MODIFIERS}}
             }),
         ),
         super::action_entry_schema(
             "type",
-            "Set an element's value (with ref) or type into the focused element (without). Without a ref the named window is raised first and the call fails instead of typing elsewhere.",
+            "Set an element's value, or type into focus.",
             &["text"],
             &json!({
-                "text": {"type": "string", "description": "Text to set/type."},
-                "target": {"type": "string", "description": TARGET_FIELD},
-                "ref": {"type": "string", "description": "Element ref from the most recent observe; sets its value."}
+                "text": {"type": "string"},
+                "target": {"type": "string"},
+                "ref": {"type": "string"}
             }),
         ),
         super::action_entry_schema(
             "press",
-            "Press a keyboard chord, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\". The chord goes to the focused application.",
+            "Press a key chord, e.g. \"ctrl+c\".",
             &["keys"],
             &json!({
-                "keys": {"type": "string", "description": "Chord to press, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\"."}
+                "keys": {"type": "string"}
             }),
         ),
         super::action_entry_schema(
             "scroll",
-            "Scroll the target surface. Without x/y the wheel goes to whatever is under the pointer.",
+            "Scroll, optionally at a point.",
             &["direction"],
             &json!({
                 "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-                "amount": {"type": "integer", "minimum": 1, "maximum": core::MAX_SCROLL_AMOUNT, "description": format!("Scroll ticks, 1-{}. Default: {DEFAULT_SCROLL_AMOUNT}.", core::MAX_SCROLL_AMOUNT)},
-                "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\", used with x/y; without x/y the wheel goes to whatever is under the pointer and a target is an error."},
-                "x": {"type": "number", "description": "Normalized 0-1000 X anchor; provide both x and y together, or omit both."},
-                "y": {"type": "number", "description": "Normalized 0-1000 Y anchor; provide both x and y together, or omit both."}
+                "amount": {"type": "integer", "minimum": 1, "maximum": core::MAX_SCROLL_AMOUNT},
+                "target": {"type": "string"},
+                "x": {"type": "number"},
+                "y": {"type": "number"}
             }),
         ),
         super::action_entry_schema(
             "drag",
-            "Drag from one normalized point to another on the target surface.",
+            "Drag between two normalized points.",
             &["from", "to"],
             &json!({
-                "from": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}, "description": "[x, y] normalized 0-1000."},
-                "to": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}, "description": "[x, y] normalized 0-1000."},
-                "target": {"type": "string", "description": TARGET_FIELD}
+                "from": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}},
+                "to": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}},
+                "target": {"type": "string"}
             }),
         ),
-        super::action_entry_schema(
-            "cursor",
-            "Report the pointer position as normalized and absolute points.",
-            &[],
-            &json!({}),
-        ),
+        super::action_entry_schema("cursor", "Report the pointer position.", &[], &json!({})),
         super::action_entry_schema(
             "wait",
             "Pause before the next action.",
             &["seconds"],
             &json!({
-                "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": MAX_WAIT_SECS, "description": format!("Seconds to wait, in (0, {MAX_WAIT_SECS}].")}
+                "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": MAX_WAIT_SECS}
             }),
         ),
     ]
@@ -768,10 +759,8 @@ impl Tool for ComputerTool {
             "properties": {
                 "action": {
                     "description": format!(
-                        "One action per call. Every string argument is capped at {} characters \
-                         and every coordinate is normalized 0-{}; an argument outside a stated \
-                         range, or one the action does not take, fails the call.",
-                        core::MAX_ARG_CHARS, core::NORMALIZED_MAX
+                        "One action per call; each string argument is capped at {} characters.",
+                        core::MAX_ARG_CHARS
                     ),
                     "oneOf": Value::Array(ACTION_ENTRIES.clone()),
                 }
@@ -813,7 +802,7 @@ impl Tool for ComputerTool {
         // Serialize every GUI-touching action so concurrent agent runs can't race.
         let _lock = ACTION_LOCK.lock().await;
 
-        let output = dispatch(&action).await?;
+        let output = dispatch(&action).await.map_err(framework_next_step)?;
         Ok(super::with_normalization_notes(output, &notes))
     }
 
@@ -925,9 +914,24 @@ async fn ensure_interactive_desktop() -> anyhow::Result<()> {
         core::ERR_DESKTOP_UNAVAILABLE,
         format!(
             "{reason} — this call needs an interactive desktop, so nothing was delivered or read; \
-             tell the owner and run it again only once the session is back"
+             tell the owner and run it again only once the session is back. Listing apps and \
+             windows, and wait, still work"
         ),
     ))
+}
+
+/// The one place a `framework-failed` answer gains its next step. The constructor stays
+/// plain because a framework failure raised during an actuation is folded into
+/// `applied but unconfirmed` (the input may already have landed), where "the call was
+/// abandoned" would be wrong.
+fn framework_next_step(err: anyhow::Error) -> anyhow::Error {
+    if core::is_framework_failed(&err) {
+        return anyhow::anyhow!(
+            "{err} — the call was abandoned, so re-observe or screenshot to check the target's \
+             state, then take another route or report it"
+        );
+    }
+    err
 }
 
 async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
@@ -1227,9 +1231,7 @@ async fn observe(target: Option<&str>) -> anyhow::Result<String> {
                 backend().capture_unavailable_error()
             )
         } else {
-            "surface exposes few actionable elements — use screenshot (requires a vision-capable \
-             model)"
-                .to_string()
+            "surface exposes few actionable elements — use screenshot".to_string()
         };
         output.push_str(&note);
         output.push('\n');

@@ -819,7 +819,10 @@ fn ax_error(err: AXError, ctx: impl std::fmt::Display) -> anyhow::Error {
         | AXError::NotImplemented
         | AXError::ParameterizedAttributeUnsupported => core::taxonomy_error(
             core::ERR_UNSUPPORTED,
-            format!("unsupported accessibility operation: {ctx}"),
+            format!(
+                "unsupported accessibility operation: {ctx} — act on it by coordinates or use \
+                 another element"
+            ),
         ),
         // Plain (non-taxonomy) errors — not actionable by the model.
         _ => anyhow!("AX error {err:?}: {ctx}"),
@@ -2450,7 +2453,10 @@ fn press_element(element: &AXUIElement) -> Result<Impact, anyhow::Error> {
             .join(", ");
         Err(core::taxonomy_error(
             core::ERR_UNSUPPORTED,
-            format!("element has no press/open action; available actions: {available}"),
+            format!(
+                "element has no press/open action; available actions: {available} — click it by \
+                 coordinates instead"
+            ),
         ))
     }
 }

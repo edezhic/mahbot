@@ -114,8 +114,8 @@ pub(crate) const CAPTURE_BUDGET_PIXELS: u64 = 128 * 1024 * 1024;
 // Every exchange is bounded by a deadline the product chose, and every call by a bound on
 // top of that (the aggregate budget below on Linux and macOS, a job deadline on Windows),
 // so a target that does not answer costs a lost detail instead of the action lock. The
-// figures are these constants and each backend's header; what the model is told lives in
-// the tool's prompt.
+// figures are these constants and each backend's header; the model meets one only in the
+// failure that reports the bound it hit.
 
 /// How long ONE accessibility exchange may take before its target counts as not
 /// answering: the D-Bus method timeout on Linux and the AX messaging timeout on macOS,
@@ -381,9 +381,8 @@ pub(crate) const ERR_NOT_MATCHED: &str = "not-matched";
 pub(crate) const ERR_SURFACE_GONE: &str = "surface-gone";
 /// The target is mahbot's own interface and this platform cannot perform the
 /// operation on itself from inside the process. Deliberately distinct from
-/// `unsupported`, whose prompt guidance ("take another route … or coordinates")
-/// would keep the model spinning on a class the platform refuses for that
-/// operation.
+/// `unsupported`, whose failures name a route that would keep the model spinning
+/// on a class this platform refuses for that operation.
 #[cfg_attr(not(target_os = "windows"), expect(dead_code))]
 pub(crate) const ERR_SELF_TARGET: &str = "self-target";
 
@@ -411,11 +410,8 @@ pub(crate) fn framework_failed(what: &str, detail: impl fmt::Display) -> anyhow:
 }
 
 /// Whether `err` is the typed [`framework_failed`] failure — robust to a
-/// `.context()` layer added above it.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "windows")),
-    expect(dead_code)
-)]
+/// `.context()` layer added above it. Read by the tool's own answer path on every
+/// platform, since only macOS and Windows raise it.
 pub(crate) fn is_framework_failed(err: &anyhow::Error) -> bool {
     err.downcast_ref::<FrameworkFailed>().is_some()
 }
@@ -502,8 +498,8 @@ fn ceiling_refused(what: &str, width: u32, height: u32, held: u64) -> anyhow::Er
         ERR_DEGRADED,
         format!(
             "{what} needs {} MiB of RGBA ({width}x{height}) and this call already holds {} MiB \
-             of its {} MiB — name a smaller surface instead; a capture this large cannot be \
-             held whole",
+             of its {} MiB — a capture this large cannot be held whole; name a smaller surface \
+             if one exists",
             mib(u64::from(width) * u64::from(height)),
             mib(held),
             mib(CAPTURE_BUDGET_PIXELS),

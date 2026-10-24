@@ -143,8 +143,8 @@ from_reply! {
 }
 
 fn reply_mismatch() -> anyhow::Error {
-    // `unsupported` rather than `degraded`: the prompt tells the model to retry a
-    // `degraded` failure, and retrying cannot fix a wrong pairing inside this backend.
+    // `unsupported` rather than `degraded`: the degraded failures name a retry, and
+    // retrying cannot fix a wrong pairing inside this backend.
     core::taxonomy_error(
         core::ERR_UNSUPPORTED,
         "internal computer-use reply mismatch — a bug in this backend, not a retryable condition; \

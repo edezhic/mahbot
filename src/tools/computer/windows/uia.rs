@@ -526,7 +526,8 @@ fn set_value(element: &IUIAutomationElement, hwnd: HWND, text: &str) -> anyhow::
     if unsafe { element.CurrentIsPassword() }.is_ok_and(windows::core::BOOL::as_bool) {
         return Err(core::taxonomy_error(
             core::ERR_UNSUPPORTED,
-            "element is a password field — its value cannot be set through the accessibility channel",
+            "element is a password field — its value cannot be set through the accessibility \
+             channel; click it and use `type` without a ref",
         ));
     }
     // SAFETY: `element` is live on this apartment thread; the pattern, its read-only
@@ -627,7 +628,10 @@ fn map_uia_error(action: &str, error: &windows::core::Error) -> anyhow::Error {
         ),
         UIA_E_NOTSUPPORTED => core::taxonomy_error(
             core::ERR_UNSUPPORTED,
-            format!("failed to {action}: the control does not support it ({error})"),
+            format!(
+                "failed to {action}: the control does not support it — act on it by coordinates \
+                 or use another element ({error})"
+            ),
         ),
         _ => core::taxonomy_error(core::ERR_DEGRADED, format!("failed to {action}: {error}")),
     }
