@@ -80,6 +80,17 @@ pub(crate) const MAX_VALUE_CHARS: usize = 2000;
 )]
 pub(crate) const MAX_NAME_CHARS: usize = 200;
 
+/// The longest string one computer action accepts, in characters — `text`, `keys`,
+/// `target`, `app` and `ref` alike. Typing pays one synthetic event per character while
+/// the action lock is held, so a longer argument is refused before the call starts work
+/// instead of holding the tool for as long as it is big.
+pub(crate) const MAX_ARG_CHARS: usize = 2000;
+
+/// The scroll range in wheel ticks, on every platform: one tick is one notch, and it
+/// costs one wheel event on macOS and Windows but a press/release pair per tick on
+/// Linux — under the same lock. Zero is outside the range too: it names no motion.
+pub(crate) const MAX_SCROLL_AMOUNT: u32 = 100;
+
 /// Ceiling on the pixels ONE capture call may hold at once, chosen by the product
 /// rather than taken from what the machine reports. This process aborts on a failed
 /// allocation, so no figure the machine reports may decide how much is allocated:
@@ -595,6 +606,11 @@ impl<'de> Deserialize<'de> for Region {
                 let y1 = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::missing_field("y1"))?;
+                if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "a region is exactly [x0, y0, x1, y1] — extra values name nothing",
+                    ));
+                }
                 Ok(Region { x0, y0, x1, y1 })
             }
 
@@ -612,8 +628,8 @@ impl<'de> Deserialize<'de> for Region {
                         "y0" => y0 = Some(map.next_value()?),
                         "x1" => x1 = Some(map.next_value()?),
                         "y1" => y1 = Some(map.next_value()?),
-                        _ => {
-                            let _: de::IgnoredAny = map.next_value()?;
+                        other => {
+                            return Err(de::Error::unknown_field(other, &["x0", "y0", "x1", "y1"]));
                         }
                     }
                 }
@@ -1394,23 +1410,100 @@ pub(crate) fn parse_key_chord(chord: &str) -> anyhow::Result<(Vec<Modifier>, Str
     Ok((mods, key))
 }
 
-// ── Coordinate math ─────────────────────────────────────────────────────
+// ── Argument bounds ─────────────────────────────────────────────────────
+//
+// The tool checks every argument of an action here before it takes the action lock, and
+// each backend checks the bounds of the input it was handed at its own entry, so a bad
+// call costs a round trip rather than a lock: an argument outside its stated range is
+// refused with the range, and text past its cap with the count and the cap (never with
+// the rejected value, which would repeat the oversized payload back).
 
-/// Reject a normalized point that is not a finite 0-1000 coordinate.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
-    expect(dead_code)
-)]
-pub(crate) fn check_normalized(nx: f64, ny: f64) -> anyhow::Result<()> {
+/// Refuse a string argument longer than [`MAX_ARG_CHARS`], naming its length and the cap.
+pub(crate) fn check_arg_len(field: &str, value: &str) -> anyhow::Result<()> {
+    let len = value.chars().count();
+    if len > MAX_ARG_CHARS {
+        anyhow::bail!("{field} is too long: {len} chars (max {MAX_ARG_CHARS})");
+    }
+    Ok(())
+}
+
+/// Refuse a scroll magnitude outside `1..=MAX_SCROLL_AMOUNT`.
+pub(crate) fn check_scroll_amount(amount: u32) -> anyhow::Result<()> {
+    if !(1..=MAX_SCROLL_AMOUNT).contains(&amount) {
+        anyhow::bail!("scroll amount must be 1-{MAX_SCROLL_AMOUNT} ticks — got {amount}");
+    }
+    Ok(())
+}
+
+/// Refuse a normalized point outside 0-1000, naming the argument it came from.
+pub(crate) fn check_point(field: &str, nx: f64, ny: f64) -> anyhow::Result<()> {
     if !nx.is_finite()
         || !ny.is_finite()
         || !(0.0..=NORMALIZED_MAX).contains(&nx)
         || !(0.0..=NORMALIZED_MAX).contains(&ny)
     {
-        anyhow::bail!("out-of-bounds coordinates ({nx}, {ny}) — expected normalized 0-1000");
+        anyhow::bail!(
+            "{field} ({nx}, {ny}) is out of range — coordinates are normalized 0-{NORMALIZED_MAX}"
+        );
     }
     Ok(())
 }
+
+/// Refuse a region whose corners are outside 0-1000 or that encloses no area. Reversed
+/// corners name the same region (the corners are ordered where the region is mapped),
+/// so only a zero-extent one is refused — it would otherwise become a single pixel
+/// standing for an area the call never named.
+#[expect(clippy::float_cmp)] // an exact repeat of a corner encloses nothing
+pub(crate) fn check_region(region: &Region) -> anyhow::Result<()> {
+    for (field, v) in [
+        ("x0", region.x0),
+        ("y0", region.y0),
+        ("x1", region.x1),
+        ("y1", region.y1),
+    ] {
+        if !v.is_finite() || !(0.0..=NORMALIZED_MAX).contains(&v) {
+            anyhow::bail!(
+                "region corner {field} is {v} — corners are normalized 0-{NORMALIZED_MAX}"
+            );
+        }
+    }
+    if region.x0 == region.x1 || region.y0 == region.y1 {
+        anyhow::bail!(
+            "region [{}, {}, {}, {}] encloses no area — x0 and x1, and y0 and y1, must differ",
+            region.x0,
+            region.y0,
+            region.x1,
+            region.y1
+        );
+    }
+    Ok(())
+}
+
+/// The bounds a backend's input entry checks before it starts any work — every point,
+/// the scroll magnitude and the typed text — so no value it cannot honour reaches a
+/// platform call. A chord's length is bounded upstream with the action's own arguments;
+/// its syntax is the backend's to refuse.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) fn check_raw_input(input: &RawInput) -> anyhow::Result<()> {
+    match input {
+        RawInput::Click { point, .. } => check_point("click point", point.0, point.1),
+        RawInput::Scroll { point, amount, .. } => {
+            check_scroll_amount(*amount)?;
+            point.map_or(Ok(()), |(x, y)| check_point("scroll anchor", x, y))
+        }
+        RawInput::Drag { from, to } => {
+            check_point("drag start", from.0, from.1)?;
+            check_point("drag end", to.0, to.1)
+        }
+        RawInput::TypeText { text } => check_arg_len("text", text),
+        RawInput::KeyChord { .. } => Ok(()),
+    }
+}
+
+// ── Coordinate math ─────────────────────────────────────────────────────
 
 /// Map a normalized 0-1000 point to absolute global surface points on the target
 /// surface.
@@ -1423,7 +1516,7 @@ pub(crate) fn normalized_to_surface(
     ny: f64,
     geo: &SurfaceGeometry,
 ) -> anyhow::Result<(f64, f64)> {
-    check_normalized(nx, ny)?;
+    check_point("coordinates", nx, ny)?;
     Ok((
         geo.x + nx / NORMALIZED_MAX * geo.width,
         geo.y + ny / NORMALIZED_MAX * geo.height,
@@ -1462,11 +1555,7 @@ pub(crate) fn region_to_pixels(
     px_w: u32,
     px_h: u32,
 ) -> anyhow::Result<(u32, u32, u32, u32)> {
-    for v in [region.x0, region.y0, region.x1, region.y1] {
-        if !v.is_finite() || !(0.0..=NORMALIZED_MAX).contains(&v) {
-            anyhow::bail!("region_to_pixels: normalized coordinate {v} out of 0-1000 range");
-        }
-    }
+    check_region(region)?;
     let (x0, x1) = (region.x0.min(region.x1), region.x0.max(region.x1));
     let (y0, y1) = (region.y0.min(region.y1), region.y0.max(region.y1));
     let px = |n: f64, total: u32| -> u32 {
@@ -2360,6 +2449,50 @@ mod tests {
         assert_eq!(&dest[4 * 4 + 8..4 * 4 + 12], &[4, 5, 6, 255]);
     }
 
+    /// Every backend entry refuses the bounds it cannot honour before it starts work.
+    #[test]
+    fn raw_input_bounds_are_checked_at_the_backend_entry() {
+        let refused = [
+            RawInput::Click {
+                point: (NORMALIZED_MAX + 1.0, 0.0),
+                button: MouseButton::Left,
+                double: false,
+                modifiers: Vec::new(),
+            },
+            RawInput::Scroll {
+                point: None,
+                direction: ScrollDirection::Down,
+                amount: MAX_SCROLL_AMOUNT + 1,
+            },
+            RawInput::Scroll {
+                point: None,
+                direction: ScrollDirection::Down,
+                amount: 0,
+            },
+            RawInput::Drag {
+                from: (0.0, 0.0),
+                to: (0.0, -1.0),
+            },
+            RawInput::TypeText {
+                text: "t".repeat(MAX_ARG_CHARS + 1),
+            },
+        ];
+        for input in refused {
+            assert!(
+                check_raw_input(&input).is_err(),
+                "{input:?} must be refused"
+            );
+        }
+        assert!(
+            check_raw_input(&RawInput::Scroll {
+                point: Some((1.0, NORMALIZED_MAX)),
+                direction: ScrollDirection::Up,
+                amount: MAX_SCROLL_AMOUNT,
+            })
+            .is_ok()
+        );
+    }
+
     #[test]
     fn region_to_pixels_maps_orders_and_clamps() {
         // Normalized 200..=800 on a 1000px image → 200..=800 px.
@@ -2392,6 +2525,31 @@ mod tests {
             y1: 100.0,
         };
         assert!(region_to_pixels(&bad, 1000, 1000).is_err());
+        // A region enclosing no area is refused, never turned into one pixel.
+        let flat = Region {
+            x0: 100.0,
+            y0: 100.0,
+            x1: 900.0,
+            y1: 100.0,
+        };
+        assert!(region_to_pixels(&flat, 1000, 1000).is_err());
+        // A region object carries only its corners: an unknown key is a mistake, not
+        // a value to ignore.
+        assert!(
+            serde_json::from_value::<Region>(
+                serde_json::json!({"x0": 0, "y0": 0, "x1": 1, "y1": 1, "x2": 2})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Region>(
+                serde_json::json!({"x0": 0, "y0": 0, "x1": 1, "y1": 1})
+            )
+            .is_ok()
+        );
+        // The array form is four numbers: a fifth names nothing and is refused too.
+        assert!(serde_json::from_value::<Region>(serde_json::json!([0, 0, 1, 1, 2])).is_err());
+        assert!(serde_json::from_value::<Region>(serde_json::json!([0, 0, 1, 1])).is_ok());
         // A region beyond the image is clamped to the image bounds (>=1px).
         let big = Region {
             x0: 500.0,

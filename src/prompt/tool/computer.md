@@ -12,8 +12,10 @@ Observe and act on the local machine's GUI through the OS accessibility channel.
 * `press { keys: "ctrl+c" }` — press a keyboard chord (`"return"`, `"ctrl+c"`).
 * `scroll { direction: up|down|left|right, amount?, x+y? }` — scroll (x and y together, or neither).
 * `drag { from: [x, y], to: [x, y] }` — drag between two normalized points.
-* `cursor` — report the pointer position (normalized against the surface it names, plus absolute).
+* `cursor` — report the pointer position (normalized against the surface in effect, plus absolute). It takes no arguments.
 * `wait { seconds }` — pause before the next action (greater than 0, at most 10 seconds).
+
+An argument the chosen action cannot honour is an error, never something quietly dropped: a `target` on `press` or `cursor`, a `region` on `screenshot`, a `ref` together with `x`/`y`, or any field the action has no slot for — beside the action or inside it — fails the call and names the form it accepts. Drop the argument and retry.
 
 ## Result states
 

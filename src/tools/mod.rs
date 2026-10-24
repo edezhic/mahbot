@@ -93,9 +93,9 @@ pub(crate) fn effective_reference_max(catalog_max: i64) -> i64 {
 /// Canonical list of argument aliases for file path parameters.
 ///
 /// The aliases `"file"` and `"filename"` are remapped to `"path"` by
-/// [`normalize_tool_arguments`] — everywhere but the document tool, which names
-/// its own arguments and refuses one its action does not take, so an alias left
-/// as written is refused under the spelling the caller used.
+/// [`normalize_tool_arguments`] — everywhere but the document and computer tools,
+/// which name their own arguments and refuse one their action does not take, so an
+/// alias left as written is refused under the spelling the caller used.
 const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
 
 /// Check that a file's size is within `limit` bytes, naming `label` in the
@@ -1643,13 +1643,13 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
     };
 
     // Apply path-aliases (file/filename) for every tool call. Tools that do not
-    // take a "path" simply ignore the extra key — except the document tool, whose
-    // contract refuses every argument an action does not take: an alias is left
-    // as the caller wrote it, so a refusal names that spelling rather than a
-    // "path" the caller never passed. The `workspace` tool keeps the alias (its
+    // take a "path" simply ignore the extra key — except the tools whose contract
+    // refuses every argument an action does not take (document, computer): there an
+    // alias is left as the caller wrote it, so a refusal names that spelling rather
+    // than a "path" the caller never passed. The `workspace` tool keeps the alias (its
     // `add` takes the path); its `pause` / `resume` refuse a stray field, but by
     // that tool's own address rule rather than by the key's name.
-    if name != "document" {
+    if name != "document" && name != "computer" {
         for &alias in PATH_ALIAS_KEYS {
             remap_arg_key(obj, alias, "path");
         }
@@ -2346,12 +2346,12 @@ mod tests {
     /// exercises it — preventing any gap between the lookup path and the
     /// normalization path.
     ///
-    /// The document tool is the one exemption: it declares and enforces its own
-    /// argument names, so an alias is left as the caller wrote it and refused by
-    /// that name instead of being remapped into a `"path"` two of its actions do
-    /// not take. Remapped alias and ignored-or-refused extra key are separate
-    /// things: `workspace` takes the alias for its `add` while refusing a stray
-    /// field on `pause` / `resume` (`tools::workspace::a_misspelled_address_…`).
+    /// The document and computer tools are the exemptions: each declares and
+    /// enforces its own argument names, so an alias is left as the caller wrote it
+    /// and refused by that name instead of being remapped into a `"path"` its
+    /// actions do not take. Remapped alias and ignored-or-refused extra key are
+    /// separate things: `workspace` takes the alias for its `add` while refusing a
+    /// stray field on `pause` / `resume` (`tools::workspace::a_misspelled_address_…`).
     #[test]
     fn normalize_tool_call_remaps_all_path_aliases() {
         for &alias in PATH_ALIAS_KEYS {
@@ -2371,8 +2371,8 @@ mod tests {
                     name, *tool_name,
                     "tool name should not change for {tool_name} with alias {alias}"
                 );
-                // The alias is remapped to "path" for every tool but the document
-                // tool: tools that don't use "path" simply ignore the extra key.
+                // The alias is remapped to "path" for every tool but the document and
+                // computer tools: tools that don't use "path" simply ignore the extra key.
                 assert_eq!(
                     args["path"], "src/main.rs",
                     "alias {alias} should be remapped to 'path' for tool {tool_name}"
@@ -2388,11 +2388,20 @@ mod tests {
                 }
             }
         }
-        // The document tool's own contract names its arguments: an alias stays as
-        // the caller wrote it, for the boundary to refuse that spelling by name.
-        let (_, args) = normalize_tool_call("document", serde_json::json!({ "file": "a.pdf" }));
-        assert_eq!(args["file"], "a.pdf");
-        assert!(args.get("path").is_none());
+        // The document and computer tools' own contracts name their arguments: an
+        // alias stays as the caller wrote it, for the boundary to refuse that spelling
+        // by name.
+        for tool_name in ["document", "computer"] {
+            let (_, args) = normalize_tool_call(tool_name, serde_json::json!({ "file": "a.pdf" }));
+            assert_eq!(
+                args["file"], "a.pdf",
+                "{tool_name} must keep the caller's key"
+            );
+            assert!(
+                args.get("path").is_none(),
+                "{tool_name} must not invent 'path'"
+            );
+        }
     }
 
     // ── resolve_local_media_path tests ─────────────────────────────────────

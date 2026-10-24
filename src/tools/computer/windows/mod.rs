@@ -188,8 +188,8 @@ mod window;
 
 use self::thread::Call;
 use super::core::{
-    AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation, RawInput,
-    SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
+    self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation,
+    RawInput, SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
 };
 use async_trait::async_trait;
 use std::time::Duration;
@@ -297,6 +297,8 @@ impl Backend for WindowsBackend {
     }
 
     async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<Impact> {
+        // Argument bounds first, before the call reaches the interface thread.
+        core::check_raw_input(&input)?;
         let call = Call::RawInput {
             target: target.clone(),
             input,

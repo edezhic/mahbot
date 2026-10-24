@@ -35,6 +35,18 @@
 //! header, or marked by the ellipsis where the string is a label. The accounting and
 //! its reasoning live in [`core`].
 //!
+//! # Every argument is bounded
+//!
+//! Every [`ComputerAction`] argument is either a value from a declared set or bounded by
+//! a range or a length cap. Those bounds are stated in the schema and named by the
+//! refusal that enforces them, and they are checked before [`ACTION_LOCK`] is taken — so
+//! a bad call costs a round trip, never a wait behind the lock, a capture, a permission
+//! prompt or a lookup. An argument the chosen action cannot honour is refused with the
+//! form the action does accept rather than dropped: a field it does not take fails as
+//! [`check_action_fields`] says, and a combination it cannot honour — half a coordinate
+//! pair, a ref together with coordinates, a target on a pointer-less wheel — fails in
+//! [`validate_action`].
+//!
 //! # No call waits forever
 //!
 //! Every accessibility exchange is bounded by a deadline the product chose, and each
@@ -71,6 +83,12 @@
 //!    restarted at-spi (`kill` its bus launcher) is picked up by the next call, and a
 //!    target advertising an absurd child count is read without its children and says
 //!    so in the header.
+//! 6. An argument outside its stated bound is refused before anything happens: a
+//!    `scroll` with `amount: 1000` fails naming the tick range without moving the wheel,
+//!    a `type` over the string cap fails naming the cap without typing a character, and
+//!    `click { ref, x, y }` fails naming which one to drop without clicking. The bounds
+//!    themselves are covered by the unit tests on [`validate_action`] and
+//!    [`check_action_fields`], so this step confirms the live path only.
 
 mod core;
 mod linux;
@@ -83,7 +101,6 @@ mod stub;
 
 use self::core::{
     AppInfo, Backend, Capture, ElementAct, MouseButton, Region, ScrollDirection, TargetSpec,
-    taxonomy_error,
 };
 use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, UnwrapPoison};
 use crate::{Tool, Workspace};
@@ -204,6 +221,302 @@ const TARGET_FIELD: &str = "Target id (a1/w1) or \"screen\". Default: the surfac
      that one window or fails as surface-gone; an a-id means the application's own focused \
      window.";
 
+/// Wheel ticks a `scroll` moves when `amount` is omitted.
+const DEFAULT_SCROLL_AMOUNT: u32 = 3;
+
+/// Longest `wait` the tool will sit out, in seconds.
+const MAX_WAIT_SECS: f64 = 10.0;
+
+/// The modifiers a click names, one entry each in the schema — and the most entries a
+/// click may carry, since every entry costs a key event under the action lock.
+const MODIFIERS: [&str; 4] = ["cmd", "ctrl", "alt", "shift"];
+
+/// One schema entry per [`ComputerAction`], built once: the model-facing schema and
+/// [`check_action_fields`] read the same entries, so the arguments a call may carry
+/// cannot drift from the interface the model is given.
+static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    vec![
+        super::action_entry_schema(
+            "observe",
+            "Get the accessibility tree of a target surface with element refs (e1, e2, ...). Refs expire on re-observe. The result names the surface it is about.",
+            &[],
+            &json!({
+                "target": {"type": "string", "description": TARGET_FIELD}
+            }),
+        ),
+        super::action_entry_schema(
+            "screenshot",
+            "Capture the target surface as a PNG and inject it as a native image; requires a vision-capable model. The result names the surface captured.",
+            &[],
+            &json!({
+                "target": {"type": "string", "description": TARGET_FIELD}
+            }),
+        ),
+        super::action_entry_schema(
+            "zoom",
+            "Capture and crop a normalized region of the target surface as a PNG.",
+            &["region"],
+            &json!({
+                "target": {"type": "string", "description": TARGET_FIELD},
+                "region": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}, "description": "Normalized [x0, y0, x1, y1] region (0-1000), relative to the target surface, enclosing a non-zero area."}
+            }),
+        ),
+        super::action_entry_schema(
+            "apps",
+            "List running GUI applications as a1-style targets.",
+            &[],
+            &json!({}),
+        ),
+        super::action_entry_schema(
+            "windows",
+            "List windows, optionally filtered to an app, as w1-style targets. A w-id names that one window until it is gone.",
+            &[],
+            &json!({
+                "app": {"type": "string", "description": "App name, pid, or a stored a-id to filter windows."}
+            }),
+        ),
+        super::action_entry_schema(
+            "click",
+            "Click by element ref (preferred) or normalized coordinates — never both. A coordinate click is pointer input: it lands on whatever is under that point.",
+            &[],
+            &json!({
+                "target": {"type": "string", "description": TARGET_FIELD},
+                "ref": {"type": "string", "description": "Element ref from the most recent observe; preferred over coordinates."},
+                "x": {"type": "number", "description": "Normalized 0-1000 X, relative to the target surface."},
+                "y": {"type": "number", "description": "Normalized 0-1000 Y, relative to the target surface."},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button; coordinate clicks only. Default: left."},
+                "double": {"type": "boolean", "description": "Double-click; coordinate clicks only. Default: false."},
+                "modifiers": {"type": "array", "maxItems": MODIFIERS.len(), "items": {"enum": MODIFIERS}, "description": "Keyboard modifiers; apply only to coordinate clicks, one entry per modifier."}
+            }),
+        ),
+        super::action_entry_schema(
+            "type",
+            "Set an element's value (with ref) or type into the focused element (without). Without a ref the named window is raised first and the call fails instead of typing elsewhere.",
+            &["text"],
+            &json!({
+                "text": {"type": "string", "description": "Text to set/type."},
+                "target": {"type": "string", "description": TARGET_FIELD},
+                "ref": {"type": "string", "description": "Element ref from the most recent observe; sets its value."}
+            }),
+        ),
+        super::action_entry_schema(
+            "press",
+            "Press a keyboard chord, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\". The chord goes to the focused application.",
+            &["keys"],
+            &json!({
+                "keys": {"type": "string", "description": "Chord to press, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\"."}
+            }),
+        ),
+        super::action_entry_schema(
+            "scroll",
+            "Scroll the target surface. Without x/y the wheel goes to whatever is under the pointer.",
+            &["direction"],
+            &json!({
+                "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                "amount": {"type": "integer", "minimum": 1, "maximum": core::MAX_SCROLL_AMOUNT, "description": format!("Scroll ticks, 1-{}. Default: {DEFAULT_SCROLL_AMOUNT}.", core::MAX_SCROLL_AMOUNT)},
+                "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\", used with x/y; without x/y the wheel goes to whatever is under the pointer and a target is an error."},
+                "x": {"type": "number", "description": "Normalized 0-1000 X anchor; provide both x and y together, or omit both."},
+                "y": {"type": "number", "description": "Normalized 0-1000 Y anchor; provide both x and y together, or omit both."}
+            }),
+        ),
+        super::action_entry_schema(
+            "drag",
+            "Drag from one normalized point to another on the target surface.",
+            &["from", "to"],
+            &json!({
+                "from": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}, "description": "[x, y] normalized 0-1000."},
+                "to": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}, "description": "[x, y] normalized 0-1000."},
+                "target": {"type": "string", "description": TARGET_FIELD}
+            }),
+        ),
+        super::action_entry_schema(
+            "cursor",
+            "Report the pointer position as normalized and absolute points.",
+            &[],
+            &json!({}),
+        ),
+        super::action_entry_schema(
+            "wait",
+            "Pause before the next action.",
+            &["seconds"],
+            &json!({
+                "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": MAX_WAIT_SECS, "description": format!("Seconds to wait, in (0, {MAX_WAIT_SECS}].")}
+            }),
+        ),
+    ]
+});
+
+/// Refuse a field the action does not take, before serde would drop it: the schema
+/// declares `additionalProperties: false` for every action, so an unlisted argument is
+/// a mistake to report, not a value to ignore. `action_value` is the normalized tagged
+/// form (`{"click": {...}}`); shape errors are left to the deserializer.
+fn check_action_fields(action_value: &Value) -> anyhow::Result<()> {
+    let Some((name, payload)) = action_value.as_object().and_then(|o| o.iter().next()) else {
+        return Ok(());
+    };
+    let Some(payload) = payload.as_object() else {
+        return Ok(());
+    };
+    let Some(entry) = ACTION_ENTRIES
+        .iter()
+        .find(|entry| entry["properties"].get(name.as_str()).is_some())
+    else {
+        return Ok(());
+    };
+    let accepted = entry["properties"][name.as_str()]["properties"]
+        .as_object()
+        .map(|props| props.keys().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(extra) = payload.keys().find(|key| !accepted.contains(&key.as_str())) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "{name} does not take '{extra}' — its arguments are: {}",
+        if accepted.is_empty() {
+            "none".to_string()
+        } else {
+            accepted.join(", ")
+        }
+    )
+}
+
+/// Check every argument an action carries before the action lock is taken and before
+/// anything is captured, prompted for or looked up. Each string is within
+/// [`core::MAX_ARG_CHARS`], each number within its stated range, and a combination the
+/// action cannot honour is refused with the form it does accept.
+fn validate_action(action: &ComputerAction) -> anyhow::Result<()> {
+    match action {
+        ComputerAction::Observe { target } | ComputerAction::Screenshot { target } => {
+            check_opt_arg("target", target.as_deref())?;
+        }
+        ComputerAction::Zoom { target, region } => {
+            check_opt_arg("target", target.as_deref())?;
+            core::check_region(region)?;
+        }
+        ComputerAction::Apps {} | ComputerAction::Cursor {} => {}
+        ComputerAction::Windows { app } => check_opt_arg("app", app.as_deref())?,
+        ComputerAction::Click {
+            target,
+            reference,
+            x,
+            y,
+            button,
+            double,
+            modifiers,
+        } => {
+            check_opt_arg("target", target.as_deref())?;
+            check_opt_arg("ref", reference.as_deref())?;
+            match (reference, x, y) {
+                // An element press is one form: a button, a second click or a modifier
+                // would name a gesture the ref-based path does not perform.
+                (Some(reference), None, None) => {
+                    if modifiers.as_ref().is_some_and(|m| !m.is_empty())
+                        || button.is_some_and(|b| b != MouseButton::Left)
+                        || double.is_some_and(|d| d)
+                    {
+                        anyhow::bail!(
+                            "click on element {reference} takes no button, double or modifiers \
+                             beyond the plain left click — those belong to coordinate clicks; \
+                             drop them, or drop ref and give x and y to click a point"
+                        );
+                    }
+                }
+                (Some(_), _, _) => anyhow::bail!(
+                    "click takes a ref or x/y, never both — drop x and y to click the element, \
+                     or drop ref to click the point"
+                ),
+                (None, Some(x), Some(y)) => {
+                    core::check_point("click point", *x, *y)?;
+                    check_modifiers(modifiers.as_deref())?;
+                }
+                (None, x, y) => anyhow::bail!(
+                    "click needs a ref or both x and y — got {}",
+                    match (x, y) {
+                        (Some(_), None) => "x alone",
+                        (None, Some(_)) => "y alone",
+                        _ => "neither",
+                    }
+                ),
+            }
+        }
+        ComputerAction::Type {
+            text,
+            target,
+            reference,
+        } => {
+            core::check_arg_len("text", text)?;
+            check_opt_arg("target", target.as_deref())?;
+            check_opt_arg("ref", reference.as_deref())?;
+        }
+        ComputerAction::Press { keys } => core::check_arg_len("keys", keys)?,
+        ComputerAction::Scroll {
+            amount,
+            target,
+            x,
+            y,
+            ..
+        } => {
+            core::check_scroll_amount(amount.unwrap_or(DEFAULT_SCROLL_AMOUNT))?;
+            check_opt_arg("target", target.as_deref())?;
+            if coord_pair(*x, *y, "scroll anchor")?.is_none() && target.is_some() {
+                anyhow::bail!(
+                    "scroll without x and y does not address a surface — the wheel goes to \
+                     whatever is under the pointer; pass x and y to scroll the surface you \
+                     name, or drop target"
+                );
+            }
+        }
+        ComputerAction::Drag { from, to, target } => {
+            core::check_point("drag start", from.0, from.1)?;
+            core::check_point("drag end", to.0, to.1)?;
+            check_opt_arg("target", target.as_deref())?;
+        }
+        ComputerAction::Wait { seconds } => {
+            if !seconds.is_finite() || *seconds <= 0.0 || *seconds > MAX_WAIT_SECS {
+                anyhow::bail!("wait seconds must be in (0, {MAX_WAIT_SECS}] — got {seconds}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A coordinate pair argument: both members, or neither. Half a point cannot be
+/// mapped, so it names no position the action could honour.
+fn coord_pair(x: Option<f64>, y: Option<f64>, what: &str) -> anyhow::Result<Option<(f64, f64)>> {
+    match (x, y) {
+        (Some(x), Some(y)) => {
+            core::check_point(what, x, y)?;
+            Ok(Some((x, y)))
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("{what} needs both x and y, or neither")
+        }
+    }
+}
+
+/// Length-check an optional string argument.
+fn check_opt_arg(field: &str, value: Option<&str>) -> anyhow::Result<()> {
+    value.map_or(Ok(()), |value| core::check_arg_len(field, value))
+}
+
+/// Refuse a modifier list longer than the modifiers there are: a click holds each one
+/// or it does not, and every entry drives a key event under the action lock.
+fn check_modifiers(modifiers: Option<&[core::Modifier]>) -> anyhow::Result<()> {
+    let Some(modifiers) = modifiers else {
+        return Ok(());
+    };
+    if modifiers.len() > MODIFIERS.len() {
+        anyhow::bail!(
+            "click modifiers take at most {} entries, one for each of {} — got {}",
+            MODIFIERS.len(),
+            MODIFIERS.join(", "),
+            modifiers.len()
+        );
+    }
+    Ok(())
+}
+
 /// Corrective error for an unrecoverable action shape, echoing the exact
 /// expected form so the model can self-correct in one round-trip.
 fn corrective_action_error(received: &Value) -> String {
@@ -222,6 +535,15 @@ fn normalize_action(action: Value, args: &Value) -> Result<(Value, Option<String
             let (name, inner) = map.into_iter().next().expect("len == 1");
             if !ACTION_WIRE_NAMES.iter().any(|n| n == &name) {
                 return Err(corrective_action_error(&json!({name: inner})));
+            }
+            if let Some(extra) = args
+                .as_object()
+                .and_then(|o| o.keys().find(|k| k.as_str() != "action"))
+            {
+                return Err(format!(
+                    "unexpected argument '{extra}' beside the action — send the action and \
+                     nothing else at the top level"
+                ));
             }
             match inner {
                 Value::Object(o) => Ok((json!({name: o}), None)),
@@ -260,7 +582,15 @@ fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option
     if let Some(payload) = siblings.remove(name) {
         let note = format!("sibling '{name}' object used as action payload");
         return match payload {
-            Value::Object(o) => Ok((json!({name: o}), Some(note))),
+            Value::Object(o) => {
+                if let Some(extra) = siblings.keys().next() {
+                    return Err(format!(
+                        "unexpected argument '{extra}' beside the '{name}' payload — send the \
+                         payload or the flattened fields, not both"
+                    ));
+                }
+                Ok((json!({name: o}), Some(note)))
+            }
             _ => Err(corrective_action_error(&Value::Object(siblings))),
         };
     }
@@ -423,55 +753,13 @@ impl Tool for ComputerTool {
             "type": "object",
             "properties": {
                 "action": {
-                    "oneOf": [
-                        super::action_entry_schema("observe", "Get the accessibility tree of a target surface with element refs (e1, e2, ...). Refs expire on re-observe. The result names the surface it is about.", &[], &json!({
-                            "target": {"type": "string", "description": TARGET_FIELD}
-                        })),
-                        super::action_entry_schema("screenshot", "Capture the target surface as a PNG and inject it as a native image; requires a vision-capable model. The result names the surface captured.", &[], &json!({
-                            "target": {"type": "string", "description": TARGET_FIELD}
-                        })),
-                        super::action_entry_schema("zoom", "Capture and crop a normalized region of the target surface as a PNG.", &["region"], &json!({
-                            "target": {"type": "string", "description": TARGET_FIELD},
-                            "region": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}, "description": "Normalized [x0, y0, x1, y1] region (0-1000), relative to the target surface."}
-                        })),
-                        super::action_entry_schema("apps", "List running GUI applications as a1-style targets.", &[], &json!({})),
-                        super::action_entry_schema("windows", "List windows, optionally filtered to an app, as w1-style targets. A w-id names that one window until it is gone.", &[], &json!({
-                            "app": {"type": "string", "description": "App name, pid, or a stored a-id to filter windows."}
-                        })),
-                        super::action_entry_schema("click", "Click by element ref (preferred) or normalized coordinates. A coordinate click is pointer input: it lands on whatever is under that point.", &[], &json!({
-                            "target": {"type": "string", "description": TARGET_FIELD},
-                            "ref": {"type": "string", "description": "Element ref from the most recent observe; preferred over coordinates."},
-                            "x": {"type": "number", "description": "Normalized 0-1000 X, relative to the target surface."},
-                            "y": {"type": "number", "description": "Normalized 0-1000 Y, relative to the target surface."},
-                            "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button; coordinate clicks only. Default: left."},
-                            "double": {"type": "boolean", "description": "Double-click; coordinate clicks only. Default: false."},
-                            "modifiers": {"type": "array", "items": {"enum": ["cmd", "ctrl", "alt", "shift"]}, "description": "Keyboard modifiers; apply only to coordinate clicks."}
-                        })),
-                        super::action_entry_schema("type", "Set an element's value (with ref) or type into the focused element (without). Without a ref the named window is raised first and the call fails instead of typing elsewhere.", &["text"], &json!({
-                            "text": {"type": "string", "description": "Text to set/type."},
-                            "target": {"type": "string", "description": TARGET_FIELD},
-                            "ref": {"type": "string", "description": "Element ref from the most recent observe; sets its value."}
-                        })),
-                        super::action_entry_schema("press", "Press a keyboard chord, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\". The chord goes to the focused application.", &["keys"], &json!({
-                            "keys": {"type": "string", "description": "Chord to press, e.g. \"cmd+shift+t\", \"return\", \"ctrl+c\"."}
-                        })),
-                        super::action_entry_schema("scroll", "Scroll the target surface. Without x/y the wheel goes to whatever is under the pointer.", &["direction"], &json!({
-                            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-                            "amount": {"type": "integer", "description": "Scroll ticks. Default: 3."},
-                            "target": {"type": "string", "description": "Target id (a1/w1) or \"screen\", used with x/y; without x/y the wheel goes to whatever is under the pointer and a target is an error."},
-                            "x": {"type": "number", "description": "Normalized 0-1000 X anchor; provide both x and y together, or omit both."},
-                            "y": {"type": "number", "description": "Normalized 0-1000 Y anchor; provide both x and y together, or omit both."}
-                        })),
-                        super::action_entry_schema("drag", "Drag from one normalized point to another on the target surface.", &["from", "to"], &json!({
-                            "from": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}, "description": "[x, y] normalized 0-1000."},
-                            "to": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}, "description": "[x, y] normalized 0-1000."},
-                            "target": {"type": "string", "description": TARGET_FIELD}
-                        })),
-                        super::action_entry_schema("cursor", "Report the pointer position as normalized and absolute points.", &[], &json!({})),
-                        super::action_entry_schema("wait", "Pause before the next action (greater than 0, at most 10 seconds).", &["seconds"], &json!({
-                            "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Seconds to wait, in (0, 10]."}
-                        })),
-                    ]
+                    "description": format!(
+                        "One action per call. Every string argument is capped at {} characters \
+                         and every coordinate is normalized 0-{}; an argument outside a stated \
+                         range, or one the action does not take, fails the call.",
+                        core::MAX_ARG_CHARS, core::NORMALIZED_MAX
+                    ),
+                    "oneOf": Value::Array(ACTION_ENTRIES.clone()),
                 }
             },
             "required": ["action"],
@@ -491,12 +779,14 @@ impl Tool for ComputerTool {
             notes.push(format!("action normalized: {note}"));
         }
 
-        let action: ComputerAction = serde_json::from_value(action_value.clone()).map_err(|e| {
+        check_action_fields(&action_value)?;
+        let action: ComputerAction = serde_json::from_value(action_value).map_err(|e| {
             anyhow::anyhow!(
                 "Invalid computer action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}. \
                  Serde error: {e}"
             )
         })?;
+        validate_action(&action)?;
 
         debug!(action = ?action, "computer action");
 
@@ -668,9 +958,6 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
         }
         ComputerAction::Cursor {} => cursor().await?,
         ComputerAction::Wait { seconds } => {
-            if !seconds.is_finite() || *seconds <= 0.0 || *seconds > 10.0 {
-                anyhow::bail!("wait seconds must be in (0, 10] — got {seconds}");
-            }
             tokio::time::sleep(Duration::from_secs_f64(*seconds)).await;
             format!("waited {seconds}s")
         }
@@ -918,22 +1205,6 @@ async fn click(
     modifiers: Option<&[core::Modifier]>,
 ) -> anyhow::Result<String> {
     if let Some(reference) = reference {
-        // Reject only values that would change behavior vs the canonical element
-        // press: a non-left button, a double-click, or non-empty modifiers. An
-        // explicit Left button / false double-click / empty modifiers list are
-        // redundant with the one-form element press and are accepted.
-        if modifiers.is_some_and(|m| !m.is_empty())
-            || button.is_some_and(|b| b != MouseButton::Left)
-            || double.is_some_and(|d| d)
-        {
-            anyhow::bail!(
-                "{}",
-                taxonomy_error(
-                    core::ERR_UNSUPPORTED,
-                    "button/double/modifiers apply only to coordinate clicks",
-                )
-            );
-        }
         let (locator, cache_target) = core::resolve_ref(reference)?;
         ensure_ref_target_match(reference, target, &cache_target)?;
         let impact = backend()
@@ -944,7 +1215,7 @@ async fn click(
             impact,
         ));
     }
-    let (Some(x), Some(y)) = (x, y) else {
+    let Some((x, y)) = coord_pair(x, y, "click point")? else {
         anyhow::bail!("click requires an element ref (preferred) or normalized x/y coordinates");
     };
     let target = resolve_action_target(target)?;
@@ -1019,25 +1290,10 @@ async fn scroll(
     x: Option<f64>,
     y: Option<f64>,
 ) -> anyhow::Result<String> {
-    let amount = amount.unwrap_or(3);
-    if amount == 0 {
-        anyhow::bail!("scroll amount must be > 0");
-    }
-    let point = match (x, y) {
-        (Some(x), Some(y)) => Some((x, y)),
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!("scroll requires both x and y or neither");
-        }
-        (None, None) => None,
-    };
-    let Some(point) = point else {
-        if target.is_some() {
-            anyhow::bail!(
-                "scroll without x/y does not address a surface — the wheel goes to whatever is \
-                 under the pointer; pass x and y to scroll the surface you name"
-            );
-        }
-        // A point-less wheel is global input: no surface is resolved or raised.
+    let amount = amount.unwrap_or(DEFAULT_SCROLL_AMOUNT);
+    let Some(point) = coord_pair(x, y, "scroll anchor")? else {
+        // A point-less wheel is global input: no surface is resolved or raised, and the
+        // validator has already refused a target that names one.
         let impact = backend()
             .raw_input(
                 &TargetSpec::Focused,
@@ -1298,6 +1554,177 @@ mod tests {
         );
     }
 
+    /// One canonical tagged action, normalized and parsed as `execute` does.
+    #[expect(clippy::needless_pass_by_value)] // the payload is moved into the tagged form
+    fn parsed_action(name: &str, payload: Value) -> ComputerAction {
+        let args = json!({"action": {name: payload}});
+        let (normalized, _) = normalize_action(args["action"].clone(), &args)
+            .unwrap_or_else(|e| panic!("'{name}' should normalize: {e}"));
+        serde_json::from_value(normalized).unwrap_or_else(|e| panic!("'{name}' should parse: {e}"))
+    }
+
+    fn refusal(action: &ComputerAction) -> String {
+        validate_action(action)
+            .expect_err("the action should be refused")
+            .to_string()
+    }
+
+    /// Every numeric argument has a range and every string a cap; the refusal names it.
+    #[test]
+    fn an_argument_outside_its_range_is_refused_with_the_range() {
+        let err = refusal(&parsed_action(
+            "scroll",
+            json!({"direction": "down", "amount": core::MAX_SCROLL_AMOUNT + 1}),
+        ));
+        assert!(
+            err.contains(&format!("1-{}", core::MAX_SCROLL_AMOUNT)),
+            "{err}"
+        );
+        assert!(
+            validate_action(&parsed_action(
+                "scroll",
+                json!({"direction": "down", "amount": 0})
+            ))
+            .is_err()
+        );
+        assert!(validate_action(&parsed_action("scroll", json!({"direction": "down"}))).is_ok());
+
+        let err = refusal(&parsed_action(
+            "type",
+            json!({"text": "Z".repeat(core::MAX_ARG_CHARS + 1)}),
+        ));
+        assert!(
+            err.contains(&format!("max {}", core::MAX_ARG_CHARS)),
+            "{err}"
+        );
+        assert!(
+            !err.contains('Z'),
+            "the refused text is counted, never echoed: {err}"
+        );
+        assert!(validate_action(&parsed_action("type", json!({"text": "ok"}))).is_ok());
+
+        for seconds in [json!(0), json!(-1), json!(MAX_WAIT_SECS + 1.0)] {
+            assert!(
+                validate_action(&parsed_action("wait", json!({ "seconds": seconds }))).is_err()
+            );
+        }
+        assert!(validate_action(&parsed_action("wait", json!({"seconds": 1}))).is_ok());
+
+        assert!(
+            validate_action(&parsed_action(
+                "drag",
+                json!({"from": [0, core::NORMALIZED_MAX + 1.0], "to": [1, 1]})
+            ))
+            .is_err()
+        );
+        // A corner outside 0-1000, and a region no area: both refused before the capture.
+        assert!(
+            validate_action(&parsed_action(
+                "zoom",
+                json!({"region": [0, 0, core::NORMALIZED_MAX + 1.0, 10]})
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_action(&parsed_action(
+                "zoom",
+                json!({"region": [10, 10, 1000, 10]})
+            ))
+            .is_err()
+        );
+        // Reversed corners are the same region, so they stay accepted.
+        assert!(
+            validate_action(&parsed_action(
+                "zoom",
+                json!({"region": [1000, 1000, 0, 0]})
+            ))
+            .is_ok()
+        );
+
+        // More modifiers than there are modifiers: each entry costs a key event.
+        assert!(
+            validate_action(&parsed_action(
+                "click",
+                json!({"x": 1, "y": 1, "modifiers": ["cmd", "cmd", "ctrl", "alt", "shift"]})
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_action(&parsed_action(
+                "click",
+                json!({"x": 1, "y": 1, "modifiers": ["cmd", "shift"]})
+            ))
+            .is_ok()
+        );
+    }
+
+    /// An argument the action cannot honour is an error, not something dropped.
+    #[test]
+    fn an_argument_the_action_cannot_honour_is_refused() {
+        let err = {
+            let args = json!({"action": {"press": {"keys": "cmd+t", "target": "screen"}}});
+            let (normalized, _) = normalize_action(args["action"].clone(), &args).unwrap();
+            check_action_fields(&normalized).unwrap_err().to_string()
+        };
+        assert!(
+            err.contains("does not take 'target'") && err.contains("keys"),
+            "{err}"
+        );
+
+        let err = refusal(&parsed_action(
+            "click",
+            json!({"ref": "e3", "x": 10, "y": 10}),
+        ));
+        assert!(err.contains("never both"), "{err}");
+
+        // A gesture only the coordinate form performs, and the same defaults restated
+        // on an element click (the form the tool has always tolerated).
+        assert!(
+            validate_action(&parsed_action(
+                "click",
+                json!({"ref": "e3", "double": true})
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_action(&parsed_action(
+                "click",
+                json!({"ref": "e3", "button": "left", "double": false, "modifiers": []})
+            ))
+            .is_ok()
+        );
+
+        // Half a coordinate pair names no point, and a target with no point addresses
+        // no surface.
+        assert!(validate_action(&parsed_action("click", json!({"x": 5}))).is_err());
+        assert!(
+            validate_action(&parsed_action(
+                "scroll",
+                json!({"direction": "down", "x": 5})
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_action(&parsed_action(
+                "scroll",
+                json!({"direction": "down", "target": "a1"})
+            ))
+            .is_err()
+        );
+
+        // A field outside the action, whichever form the call used.
+        let flattened = json!({"action": "click", "x": 1, "y": 1, "text": "hi"});
+        let (normalized, note) = normalize_action(flattened["action"].clone(), &flattened).unwrap();
+        assert!(
+            note.is_some(),
+            "the flattened form is still tolerated with its note"
+        );
+        assert!(check_action_fields(&normalized).is_err());
+
+        let tagged = json!({"action": {"click": {"x": 1, "y": 1}}, "foo": 2});
+        assert!(normalize_action(tagged["action"].clone(), &tagged).is_err());
+    }
+
     #[test]
     fn parameters_schema_enum_lockstep() {
         let schema = ComputerTool.parameters_schema();
@@ -1332,6 +1759,43 @@ mod tests {
             assert!(
                 enum_names.contains(name),
                 "oneOf has an entry '{name}' that is not an enum variant"
+            );
+        }
+
+        // Every field a variant carries is declared in its schema entry, and every
+        // declared field is one the variant takes: a field serde would drop, and a
+        // field refused without a slot in the variant, both fail here.
+        for action_schema in action_schemas {
+            let Some((name, inner)) = action_schema["properties"]
+                .as_object()
+                .and_then(|props| props.iter().next())
+            else {
+                panic!("every schema entry names its action");
+            };
+            let declared = inner["properties"]
+                .as_object()
+                .expect("every action entry declares its arguments")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let payload = action_payload(name);
+            let wrapped = json!({name.as_str(): payload});
+            let action: ComputerAction =
+                serde_json::from_value(wrapped).expect("the schema payload deserializes");
+            let carried = match serde_json::to_value(&action).expect("a parsed action serializes") {
+                Value::Object(mut map) => map
+                    .remove(name.as_str())
+                    .and_then(|inner| {
+                        inner
+                            .as_object()
+                            .map(|fields| fields.keys().cloned().collect())
+                    })
+                    .unwrap_or_default(),
+                other => panic!("an action serializes to one tag, not {other}"),
+            };
+            assert_eq!(
+                declared, carried,
+                "'{name}': the schema declares {declared:?} but the variant carries {carried:?}"
             );
         }
 

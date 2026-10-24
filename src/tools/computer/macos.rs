@@ -1676,11 +1676,14 @@ fn scroll(
     amount: u32,
 ) -> Result<Impact, anyhow::Error> {
     let src = source();
+    // The tool bounds the amount before it gets here; the conversion is still total so
+    // no magnitude can wrap the direction.
+    let ticks = i32::try_from(amount).unwrap_or(i32::MAX);
     let (w1, w2) = match direction {
-        ScrollDirection::Down => (amount as i32, 0),
-        ScrollDirection::Up => (-(amount as i32), 0),
-        ScrollDirection::Right => (0, amount as i32),
-        ScrollDirection::Left => (0, -(amount as i32)),
+        ScrollDirection::Down => (ticks, 0),
+        ScrollDirection::Up => (-ticks, 0),
+        ScrollDirection::Right => (0, ticks),
+        ScrollDirection::Left => (0, -ticks),
     };
     let ev =
         CGEvent::new_scroll_wheel_event2(src.as_deref(), CGScrollEventUnit::Line, 2, w1, w2, 0)
@@ -1872,17 +1875,11 @@ fn ensure_window_receives(target: &TargetSpec, budget: &core::Budget) -> Result<
 /// Reject an argument mistake before any grant is requested: a call that can
 /// never succeed must not raise a system permission dialog.
 fn check_input_arguments(input: &RawInput) -> Result<(), anyhow::Error> {
+    core::check_raw_input(input)?;
+    // The chord's key is resolved here, so an unknown key is refused before any event.
     match input {
-        RawInput::Click { point, .. } => core::check_normalized(point.0, point.1),
-        RawInput::Scroll { point, .. } => {
-            point.map_or(Ok(()), |(x, y)| core::check_normalized(x, y))
-        }
-        RawInput::Drag { from, to } => {
-            core::check_normalized(from.0, from.1)?;
-            core::check_normalized(to.0, to.1)
-        }
         RawInput::KeyChord { chord } => lookup_key(&core::parse_key_chord(chord)?.1).map(|_| ()),
-        RawInput::TypeText { .. } => Ok(()),
+        _ => Ok(()),
     }
 }
 

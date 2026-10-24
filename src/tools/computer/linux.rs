@@ -1505,7 +1505,9 @@ fn press_failed(
 }
 
 fn scroll_params(direction: ScrollDirection, amount: u32) -> (i32, Axis) {
-    let a = amount as i32;
+    // The tool bounds the amount before it gets here; the conversion is still total so
+    // no magnitude can wrap the direction.
+    let a = i32::try_from(amount).unwrap_or(i32::MAX);
     match direction {
         ScrollDirection::Down => (a, Axis::Vertical),
         ScrollDirection::Up => (-a, Axis::Vertical),
@@ -2392,6 +2394,8 @@ impl Backend for LinuxBackend {
         target: &TargetSpec,
         input: RawInput,
     ) -> Result<Impact, anyhow::Error> {
+        // Argument bounds first, before the channel check or any window lookup.
+        core::check_raw_input(&input)?;
         if wayland_env() {
             return Err(core::taxonomy_error(
                 core::ERR_DEGRADED,
