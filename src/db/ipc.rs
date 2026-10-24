@@ -415,28 +415,12 @@ where
 }
 
 fn response_from_rows(rows: ReadonlyRows) -> QueryResponse {
-    // Read once for the whole reply: the config cannot change mid-answer, and a
-    // per-cell read would take the lock and clone the list thousands of times.
-    let secrets = crate::config::configured_secret_values();
     QueryResponse {
         columns: rows.columns,
         rows: rows
             .rows
             .into_iter()
-            .map(|row| {
-                row.iter()
-                    .map(|value| match WireValue::from_turso(value) {
-                        // Masked here, in the process that holds the config: the
-                        // command line reading the answer has none loaded, so a
-                        // projection that drops the key (an alias, an expression)
-                        // would otherwise arrive in clear.
-                        WireValue::Text(text) => WireValue::Text(
-                            crate::config::scrub_secret_values(&text, &secrets).into_owned(),
-                        ),
-                        other => other,
-                    })
-                    .collect()
-            })
+            .map(|row| row.iter().map(WireValue::from_turso).collect())
             .collect(),
         error: None,
         truncated: rows.truncated,

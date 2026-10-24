@@ -5087,7 +5087,6 @@ pub(crate) fn write_owned_spill(path: &std::path::Path, bytes: &[u8]) -> std::io
 }
 
 /// Write content to the agent temp directory with the given filename.
-/// Content should already be credential-scrubbed.
 fn write_to_spill(content: &str, filename: &str) -> Option<std::path::PathBuf> {
     let dir = agent_temp_dir()?;
     let path = dir.join(filename);
@@ -5098,8 +5097,8 @@ fn write_to_spill(content: &str, filename: &str) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// Write pre-scrubbed output to a random spill file.
-/// Caller is responsible for scrubbing credentials before calling this function.
+/// Write output to a random spill file. The spill applies no filtering: callers
+/// that handle credential-bearing text scrub it before calling.
 fn spill_output(output: &str) -> Option<std::path::PathBuf> {
     let filename = crate::tools::path::format_spill_filename();
     write_to_spill(output, &filename)

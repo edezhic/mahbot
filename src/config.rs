@@ -279,9 +279,9 @@ pub struct ConfigData {
     /// unfinished switch before the bot runs.
     pub telegram_local_server: Option<String>,
     /// `api_id` of the owner's Telegram application (`my.telegram.org`), read
-    /// only by that server. Secret: masked wherever config values are shown.
+    /// only by that server.
     pub telegram_api_id: Option<String>,
-    /// `api_hash` of the same application. Secret, masked like `api_id`.
+    /// `api_hash` of the same application.
     pub telegram_api_hash: Option<String>,
     /// Journal of a switch to or from the local server that has not finished
     /// yet (JSON, see `channels::telegram_local`). Present only while a switch
@@ -624,120 +624,6 @@ string_config_fields! {
     tts_language [or(DEFAULT_TTS_LANGUAGE)],
     wake_word_templates [non_empty],
     onboarding_state [non_empty],
-}
-
-/// The config keys whose values are secrets. Masking is applied by whoever renders
-/// a row, because only that side knows what it is printing: the debug table masks
-/// by key and by value, the daemon masks the cells of an IPC reply before they
-/// leave the process, and a tool result goes through the same renderer as the
-/// debug table. A GUI input masks by choosing a password widget; this list does
-/// not reach into the interface.
-pub(crate) const SECRET_CONFIG_KEYS: &[&str] = &[
-    CONFIG_KEY_PROVIDER_KEY,
-    CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
-    CONFIG_KEY_FIRECRAWL_KEY,
-    CONFIG_KEY_EXA_KEY,
-    CONFIG_KEY_TELEGRAM_BOT_TOKEN,
-    CONFIG_KEY_TELEGRAM_API_ID,
-    CONFIG_KEY_TELEGRAM_API_HASH,
-];
-
-/// Mask the values of [`SECRET_CONFIG_KEYS`] wherever `text` carries them, by key
-/// and then by value ([`scrub_secret_values`]).
-///
-/// The values are read from the live config on every call — a cached list would
-/// keep masking the secret it was built with while the current one went out in
-/// clear. A caller masking many strings reads [`configured_secret_values`] once and
-/// calls [`scrub_secret_values`] with it.
-pub(crate) fn scrub_secret_config_values(text: &str) -> std::borrow::Cow<'_, str> {
-    scrub_secret_values(text, &configured_secret_values())
-}
-
-/// Mask `values` in `text`, and the keys of [`SECRET_CONFIG_KEYS`] wherever they
-/// carry one.
-///
-/// The key pass matches the product's own output shapes — `key|value` (the debug
-/// pipe table), `key=value`, `key: value` — leaving everything else untouched.
-/// Shape-based masking ([`crate::util::scrub_credentials`]) cannot do this: a
-/// config dump separates columns with a pipe and names keys the regex does not
-/// know. Matching the known key names instead keeps ordinary text that merely
-/// mentions `token` or `hash` intact.
-///
-/// The value pass covers a projection that drops the key: `SELECT value FROM
-/// config_kv WHERE key='telegram_api_id'` prints the secret with nothing beside it
-/// to anchor on, so every occurrence of a known secret is replaced. No value is too
-/// short to take part — an `api_id` is a seven-digit number and still a secret — so
-/// the match is bounded to a whole token: a bare `1234567` is masked, while the
-/// same digits inside a longer number or word are not. An empty value never takes
-/// part: an alternative that matches nothing would put `[redacted]` at every word
-/// boundary of the text.
-pub(crate) fn scrub_secret_values<'a>(
-    text: &'a str,
-    values: &[String],
-) -> std::borrow::Cow<'a, str> {
-    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let pattern = PATTERN.get_or_init(|| {
-        let keys = SECRET_CONFIG_KEYS
-            .iter()
-            .map(|key| regex::escape(key))
-            .collect::<Vec<_>>()
-            .join("|");
-        regex::Regex::new(&format!(r"(?i)\b({keys})\b(\s*[:=|\t]\s*)[^\s|]+"))
-            .expect("secret-key config pattern is valid")
-    });
-    let masked = if pattern.is_match(text) {
-        std::borrow::Cow::Owned(pattern.replace_all(text, "$1$2[redacted]").into_owned())
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    };
-    // Longest first, so a value that also begins another one is replaced whole.
-    let mut values: Vec<&str> = values
-        .iter()
-        .map(String::as_str)
-        .filter(|value| !value.is_empty())
-        .collect();
-    if !values.iter().any(|value| masked.contains(value)) {
-        return masked;
-    }
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    let alternation = values
-        .iter()
-        .map(|value| regex::escape(value))
-        .collect::<Vec<_>>()
-        .join("|");
-    let whole = secret_value_pattern(&alternation);
-    std::borrow::Cow::Owned(whole.replace_all(&masked, "[redacted]").into_owned())
-}
-
-/// The word-bounded alternation of the value pass, rebuilt only when the set of
-/// secret values changes: a debug result is many cells, and compiling the pattern
-/// once per cell would cost more than the query.
-fn secret_value_pattern(alternation: &str) -> std::sync::Arc<regex::Regex> {
-    type Cached = Option<(String, std::sync::Arc<regex::Regex>)>;
-    static CACHED: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
-    let mut cached = CACHED.lock().unwrap_poison();
-    if let Some((joined, pattern)) = cached.as_ref()
-        && joined == alternation
-    {
-        return std::sync::Arc::clone(pattern);
-    }
-    let pattern = std::sync::Arc::new(
-        regex::Regex::new(&format!(r"\b(?:{alternation})\b"))
-            .expect("an escaped secret is a valid pattern"),
-    );
-    *cached = Some((alternation.to_string(), std::sync::Arc::clone(&pattern)));
-    pattern
-}
-
-/// The configured values of [`SECRET_CONFIG_KEYS`]: the secret list a caller
-/// masking many strings reads once.
-pub(crate) fn configured_secret_values() -> Vec<String> {
-    let config = CONFIG.read();
-    SECRET_CONFIG_KEYS
-        .iter()
-        .filter_map(|key| config.get_string_field(key))
-        .map(str::to_owned)
-        .collect()
 }
 
 impl ConfigData {
@@ -1707,77 +1593,6 @@ pub(crate) fn model_routing(model: &str, provider_order: Option<&str>) -> ModelR
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn secret_config_values_are_masked_in_every_pipe_and_assignment_shape() {
-        for (key, value) in [
-            ("telegram_api_hash", "0123456789abcdef0123456789abcdef"),
-            ("telegram_api_id", "1234567"),
-            ("telegram_bot_token", "1234567:AAH-secret"),
-        ] {
-            for separator in ["|", "=", ": "] {
-                let line = format!("{key}{separator}{value}");
-                let masked = scrub_secret_config_values(&line).into_owned();
-                assert!(!masked.contains(value), "{line} leaked: {masked}");
-                assert!(masked.contains("[redacted]"), "{masked}");
-            }
-        }
-        // Ordinary text naming the same words is untouched: the mask matches the
-        // config key, not a shape.
-        assert_eq!(
-            scrub_secret_config_values("the api_hash is never printed"),
-            "the api_hash is never printed"
-        );
-        assert_eq!(
-            scrub_secret_config_values("worker_model|some/model"),
-            "worker_model|some/model"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(config_persist)]
-    fn a_value_only_secret_projection_is_masked_by_value() {
-        // Masking by key cannot see a projection that selects the value alone,
-        // so the configured value itself is what the mask has to recognise.
-        let original = CONFIG.snapshot();
-        let hash = "0123456789abcdef0123456789abcdef";
-        let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
-        assert!(config.set_string_field(CONFIG_KEY_TELEGRAM_API_HASH, hash));
-        assert!(config.set_string_field(CONFIG_KEY_TELEGRAM_API_ID, "1234567"));
-        CONFIG.swap(config);
-
-        assert_eq!(scrub_secret_config_values(hash), "[redacted]");
-        // A row around the bare value is masked too, the value in place.
-        assert_eq!(
-            scrub_secret_config_values(&format!("value\n{hash}\n1 row")),
-            "value\n[redacted]\n1 row"
-        );
-        // A seven-digit api_id is a secret too: there is no length below which the
-        // value pass stops looking for it.
-        assert_eq!(scrub_secret_config_values("1234567"), "[redacted]");
-        // The digits inside a longer number are not that value, and are left alone.
-        assert_eq!(scrub_secret_config_values("12345678"), "12345678");
-
-        CONFIG.swap(original);
-    }
-
-    #[test]
-    fn an_empty_secret_value_masks_nothing() {
-        // A cleared key can be stored as an empty string. An empty alternative would
-        // match at every word boundary and turn every rendered row into noise.
-        let values = vec![
-            String::new(),
-            "0123456789abcdef0123456789abcdef".to_string(),
-        ];
-        assert_eq!(
-            scrub_secret_values("worker_model|some/model\n1 row", &values),
-            "worker_model|some/model\n1 row"
-        );
-        assert_eq!(
-            scrub_secret_values("0123456789abcdef0123456789abcdef", &values),
-            "[redacted]"
-        );
-    }
 
     #[test]
     fn onboarding_from_raw_maps_legacy_welcomed_to_finished() {

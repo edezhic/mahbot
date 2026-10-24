@@ -1513,21 +1513,24 @@ pub(crate) trait Tool: Send + Sync {
     ///    `web_search` is scrub-all too, except on a picture call, which scrubs
     ///    its own text — see its override.
     ///
-    /// 2. **Skip scrubbing entirely** (`false`) — shell and search tools.
+    /// 2. **Skip scrubbing entirely** (`false`) — shell, search and debug tools.
     ///    - The shell tool's internal `apply_profile_pipeline` already scrubs
     ///      stdout and stderr once at pipeline entry; returning `false` avoids
     ///      double-scrubbing. Implementers of tools that scrub internally **must**
     ///      return `false` from this method to prevent redundant scrubbing.
     ///    - The search tool returns source code content where credential patterns
     ///      are harmless and should be shown accurately to the model.
+    ///    - The debug query tool returns stored cells verbatim: a value in a row
+    ///      is the answer, not something to rewrite.
     ///
     /// 3. **Context-sensitive** — read tool. The read tool scrubs internally in
     ///    `read_resolved` based on the *resolved* path (see `scrub_if_sensitive`)
     ///    and returns `false` here, because an args-only decision cannot see
     ///    symlink targets or typo-recovered files (same pattern as shell).
     ///
-    /// **If your tool performs internal credential scrubbing**, override this
-    /// method to return `false` so the agent-level pass does not double-scrub.
+    /// **If your tool performs internal credential scrubbing, or returns stored
+    /// text as it is**, override this method to return `false` so the agent-level
+    /// pass neither double-scrubs nor rewrites the answer.
     fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
         true
     }

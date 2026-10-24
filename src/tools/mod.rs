@@ -365,12 +365,14 @@ use crate::util::scrub_credentials;
 ///        │    └─ returns false → output as-is
 /// ```
 ///
-/// Integration with shell tool's internal scrubbing:
+/// Integration with tools that handle credentials themselves:
 /// The shell tool's `apply_profile_pipeline` (shell/mod.rs) scrubs stdout and stderr
 /// at pipeline entry, so `ShellTool::should_scrub_output` returns `false` to prevent
 /// this function from double-scrubbing. See the `ShellTool::should_scrub_output` doc
 /// comment for the rationale. Any tool that performs its own credential scrubbing
 /// internally must follow the same pattern — return `false` from `should_scrub_output`.
+/// So does a tool whose output is stored text returned as it is, like the read-only
+/// `mahbot_debug` query surface: the cell is the answer, not something to rewrite.
 #[must_use]
 pub(crate) fn scrub_tool_output(
     tool: &dyn Tool,

@@ -43,9 +43,8 @@ impl Tool for MahbotDebugTool {
     }
 
     fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        // The tool scrubs the full result (inline preview AND the on-disk spill
-        // file) internally via `scrub_credentials` before spilling, so the
-        // agent-level pass is disabled to avoid double-scrubbing the preview.
+        // A result cell is returned as stored — the agent-level credential pass
+        // would rewrite the values this read-only surface exists to show.
         false
     }
 
@@ -62,14 +61,10 @@ impl Tool for MahbotDebugTool {
         .ok_or_else(|| anyhow!("the requested store '{db}' is not initialized"))?;
 
         let output = run_read_only_query(conn, query).await?;
-        // The spill helper's contract is that the caller scrubs credentials
-        // first; scrub the full result so the spill file (not just the inline
-        // preview) is redacted consistently. Large result sets are then spilled
-        // to a file so the agent reads the full output on demand instead of
-        // cluttering context.
-        let scrubbed = crate::util::scrub_credentials(&output);
+        // Large result sets are spilled to a file so the agent reads the full
+        // output on demand instead of cluttering context.
         Ok(crate::tools::shell::try_spill_to_file(
-            scrubbed,
+            output,
             TOOL_OUTPUT_BUDGET_BYTES,
         ))
     }
