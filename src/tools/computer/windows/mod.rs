@@ -5,13 +5,14 @@
 //! # One dedicated apartment thread
 //!
 //! Every accessibility and capture call runs as a job on ONE thread of its own,
-//! created lazily (the boot capture probe warms it) and initialized into a
+//! created lazily by the first call that needs it and initialized into a
 //! multithreaded apartment — `RoInitialize(RO_INIT_MULTITHREADED)` plus the
 //! `CUIAutomation8` client with bounded provider timeouts. Nothing in this module
 //! touches the agent's thread or the interface thread: the [`Backend`] methods
 //! only build a plain-data [`thread::Call`] and await its reply, so no COM
 //! interface ever crosses a thread boundary and the GUI cannot be blocked by a
-//! slow provider.
+//! slow provider. The desktop probe is the one contact outside it — see
+//! [`Backend::desktop_unavailable`].
 //!
 //! # No call may hang
 //!
@@ -121,8 +122,8 @@
 //! live instance elsewhere is not disturbed. Sign in to the dashboard as the
 //! admin and talk to the Assistant.
 //!
-//! 1. Launch: the dashboard starts, and step 2 works. (The boot probe only warms
-//!    this thread, so it proves itself by the first call succeeding; with
+//! 1. Launch: the dashboard starts, and step 2 works. (The boot capture probe does not
+//!    start this module's apartment thread — the first `apps` call does; with
 //!    `RUST_LOG=mahbot::tools::computer=debug` each action logs its arguments.)
 //! 2. Tool offered: ask the Assistant to `observe` with no target. The reply is a
 //!    `[Surface: app=… window=…]` tree — not "unknown tool" and not the stub's
@@ -158,10 +159,8 @@
 //!    `permission-denied` (Windows blocks accessibility reads into elevated
 //!    processes too — an honest answer, not a bug), while `screenshot { target:
 //!    "wN" }` still returns its frame. Finally lock the workstation (Win+L) and try
-//!    any action: `degraded: … secure desktop, the lock screen or a non-interactive
-//!    session …`, never a hang. A `screenshot` taken then reports the routes' own
-//!    failures (`… every route failed: …`): the desk probe stays cached for a minute
-//!    and step 7's capture refreshed it, so the channel is not re-diagnosed.
+//!    any action: `desktop-unavailable: … secure desktop, the lock screen or a
+//!    non-interactive session …`, never a hang, and `apps`/`windows` still list.
 //! 9. Structured-exception containment: `cargo test --lib tools::computer::windows`
 //!    on that machine, where all three `seh` tests must pass with the harness still
 //!    alive — were containment broken, the test process itself would die instead of
@@ -187,6 +186,7 @@ mod uia;
 mod window;
 
 use self::thread::Call;
+use self::window::SECURE_DESKTOP_REASON;
 use super::core::{
     self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation,
     RawInput, SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
@@ -209,9 +209,6 @@ use std::time::Duration;
 // (see [`thread::submit_act`]), because its input may still land; for a read it stays
 // an error, since nothing is left in flight.
 
-/// The capture-channel probe: whether an interactive desktop is attached
-/// (`window::interactive_desktop_available`), with no provider and no device work.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// App/window enumeration and geometry: plain Win32, no provider involved.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// A full accessibility read: the walk plus one transaction.
@@ -223,6 +220,21 @@ const ACT_TIMEOUT: Duration = Duration::from_secs(35);
 /// checks the budget before each display and waits no longer than what is left), then
 /// the GDI route runs.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(25);
+/// The desktop probe: a handful of user32 calls that need no apartment and no provider,
+/// bounded on a blocking thread so a desktop switch that wedges costs this and not the
+/// calling task's own budget. A probe that does not answer in time is "cannot tell".
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether an interactive desktop is attached, or `None` when the probe could not answer.
+async fn desktop_probe() -> Option<bool> {
+    tokio::time::timeout(
+        PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(window::interactive_desktop_available),
+    )
+    .await
+    .ok()?
+    .ok()
+}
 
 // ── Backend ─────────────────────────────────────────────────────────────
 
@@ -241,21 +253,36 @@ impl Backend for WindowsBackend {
         true
     }
 
-    /// Whether an interactive desktop is attached. Deliberately not about any
-    /// one window and never cached per target: a window that refuses capture
-    /// leaves the channel available for everything else.
-    async fn capture_available(&self) -> bool {
-        thread::submit(Call::ProbeCapture, PROBE_TIMEOUT)
-            .await
-            .unwrap_or(false)
+    /// Windows names the state itself: the input desktop is `Default` only while the
+    /// owner is looking at it, and any other name — `Winlogon`, `Screen-saver`, a
+    /// session that is not attached — is a desktop this process must not act into.
+    ///
+    /// The probe runs on a blocking thread of its own rather than through [`thread`]'s
+    /// apartment: it needs no COM and no provider, and an apartment thread the pool had to
+    /// abandon would read as this refusal instead of the hang it is.
+    async fn desktop_unavailable(&self) -> Option<String> {
+        (desktop_probe().await == Some(false)).then(|| SECURE_DESKTOP_REASON.to_string())
     }
 
+    /// Whether an interactive desktop is attached. Deliberately not about any
+    /// one window and never cached per target: a window that refuses capture
+    /// leaves the channel available for everything else. The same probe as
+    /// [`Self::desktop_unavailable`], and a probe that could not answer is taken as
+    /// available — the capture attempt then reports its own failure rather than a state
+    /// that was never observed.
+    async fn capture_available(&self) -> bool {
+        desktop_probe().await != Some(false)
+    }
+
+    /// The desktop can change between the gate and the capture, so this names the same
+    /// state the gate does: a retry cannot succeed either.
     fn capture_unavailable_error(&self) -> anyhow::Error {
         super::core::taxonomy_error(
-            super::core::ERR_DEGRADED,
-            "screen capture is unavailable: no interactive desktop is attached to this \
-             session (the secure desktop or the lock screen owns it, or the service runs \
-             without one) — the accessibility tree may still be readable",
+            super::core::ERR_DESKTOP_UNAVAILABLE,
+            format!(
+                "{SECURE_DESKTOP_REASON} — screen capture is unavailable there; ask the owner to \
+                 return to their desktop"
+            ),
         )
     }
 

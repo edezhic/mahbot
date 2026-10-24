@@ -13,17 +13,21 @@
 //! unwind that is not caught at the call ends the process, and the panic guard
 //! aborts on it outright. Every async [`Backend`] entry therefore runs behind
 //! [`with_platform`] — the blocking body off the async worker, behind
-//! [`catching_foreign`] — which turns such an exception into a `framework-failed`
-//! failure of the call. The AX C functions are not messages, so the bindings offer
-//! no per-site wrapper for them: the boundary of the call is the widest point an
-//! exception can still be caught at.
+//! [`catching_foreign`], inside an autorelease pool — which turns such an exception
+//! into a `framework-failed` failure of the call. The pool is not optional decoration:
+//! these calls run on tokio worker threads that have none of their own, so without it
+//! every object the frameworks autorelease along the way survives until the thread
+//! does. The AX C functions are not messages, so the bindings offer no per-site wrapper
+//! for them: the boundary of the call is the widest point an exception can still be
+//! caught at.
 //!
 //! What runs outside that boundary is guarded where it runs, and a failure there has
 //! no call left to fail, so it is logged and dropped: the grant prompt thread, the
-//! grant-name lookup of [`permission_error`], the main-queue exchange of
-//! [`on_ax_thread`] and the completion handlers the system invokes ([`contained`] —
-//! the waiter may already have given up). The one synchronous entry without a call to
-//! fail into, [`capture_unavailable_error`], guards its own platform contacts.
+//! grant-name lookup of [`permission_error`] (in a pool of its own), the main-queue
+//! exchange of [`on_ax_thread`] and the completion handlers the system invokes
+//! ([`contained`] — the waiter may already have given up). The one synchronous entry
+//! without a call to fail into, [`capture_unavailable_error`], guards its own platform
+//! contacts.
 //!
 //! Answers are checked before they are used: an AX array is filtered to the member
 //! type it is read as ([`typed_members`]) instead of being cast wholesale, an AX
@@ -33,6 +37,16 @@
 //! composite it builds to the call's budget; the framework's own texture is bounded
 //! by the same geometry, while the copy this tool keeps is the one budgeted — the
 //! reasoning lives in [`core::CAPTURE_BUDGET_PIXELS`].
+//!
+//! # A session that cannot receive the call
+//!
+//! Every API below happily creates input for a locked screen and reports it as
+//! delivered, and a still of one is a still of the lock screen. So the state is read
+//! from the system's own session record before any call that needs the desktop
+//! ([`desktop_unavailable_blocking`]): no session dictionary at all, an entry saying
+//! another logged-in user is on the console, and the lock flag. A running screensaver is
+//! deliberately not inferred — macOS publishes nothing for it here, and a false refusal
+//! on a working session would cost more than the call's own failure.
 //!
 //! # Deadlines
 //!
@@ -235,16 +249,18 @@ fn contained<T>(
 }
 
 /// One entry into the system from the async side: the blocking body off the async
-/// worker, behind the Objective-C firewall. `what` names the operation for the
-/// failure it reports.
+/// worker, behind the Objective-C firewall, inside an autorelease pool — this process's
+/// own, because the thread it runs on is a tokio worker with none. See the module header.
 fn with_platform<T>(
     what: &str,
     f: impl FnOnce() -> Result<T, anyhow::Error>,
 ) -> Result<T, anyhow::Error> {
     with_block_in_place(|| {
-        catching_foreign(what, || {
-            install_messaging_timeout();
-            f()
+        objc2::rc::autoreleasepool(|_pool| {
+            catching_foreign(what, || {
+                install_messaging_timeout();
+                f()
+            })
         })
     })
 }
@@ -463,17 +479,19 @@ fn responsible_app() -> String {
     };
     if let Some(bundle_id) = non_empty("__CFBundleIdentifier") {
         // The running application's localized name is what System Settings shows.
-        let id = NSString::from_str(&bundle_id);
-        let resolved = catching_foreign("resolve the responsible application", || {
-            Ok(
-                NSRunningApplication::runningApplicationsWithBundleIdentifier(&id)
-                    .iter()
-                    .find_map(|app| {
-                        app.localizedName()
-                            .map(|name| name.to_string())
-                            .filter(|name| !name.is_empty())
-                    }),
-            )
+        let resolved = objc2::rc::autoreleasepool(|_pool| {
+            let id = NSString::from_str(&bundle_id);
+            catching_foreign("resolve the responsible application", || {
+                Ok(
+                    NSRunningApplication::runningApplicationsWithBundleIdentifier(&id)
+                        .iter()
+                        .find_map(|app| {
+                            app.localizedName()
+                                .map(|name| name.to_string())
+                                .filter(|name| !name.is_empty())
+                        }),
+                )
+            })
         })
         .inspect_err(|e| tracing::warn!("computer use: {e:#}"))
         .ok()
@@ -1391,6 +1409,10 @@ fn app_pid(app: &AXUIElement) -> Result<u32, anyhow::Error> {
 }
 
 // ── Raw input (CGEvent) ──────────────────────────────────────────────────
+//
+// Every gesture builds all of its events before posting any, and posting cannot fail, so
+// a gesture that cannot be built delivers nothing and one that was delivered completes:
+// nothing here can leave a button or a key down partway.
 
 fn cg_mouse_button(button: MouseButton) -> CGMouseButton {
     match button {
@@ -1452,9 +1474,8 @@ fn keyboard_event(
         .ok_or_else(|| anyhow!("failed to create a keyboard event"))
 }
 
-/// Every event of the gesture is created before any is posted, so an event that
-/// cannot be made leaves nothing half-done: nothing was delivered, and the call is
-/// a plain failure rather than a click whose release never went out.
+/// A click, or a double click, of `button` at `point`. `modifiers` ride on the events as
+/// flags rather than as separate key events, so they can never be left held.
 fn click(
     point: CGPoint,
     button: MouseButton,
@@ -1593,8 +1614,6 @@ fn lookup_key(key: &str) -> Result<i64, anyhow::Error> {
     key_code(key).ok_or_else(|| anyhow!("unknown key '{key}' — supported keys: {KNOWN_KEYS}"))
 }
 
-/// One key tap: both events are built before either is posted, so a build failure
-/// delivers nothing.
 fn press_key(key: &str) -> Result<(), anyhow::Error> {
     let code = lookup_key(key)?;
     let src = source();
@@ -1612,8 +1631,8 @@ fn type_text(text: &str) -> Result<Impact, anyhow::Error> {
     fn type_char(src: Option<&CGEventSource>, ch: char) -> Result<(), anyhow::Error> {
         let mut buf = [0u16; 2];
         let encoded = ch.encode_utf16(&mut buf);
-        // Both events are built before either is posted, as in `press_key`: a build
-        // failure must not leave the character half-posted while it is counted untyped.
+        // Built before either is posted, so a failed build leaves the character unposted
+        // while it is counted untyped.
         let down = keyboard_event(src, 0, true)?;
         let up = keyboard_event(src, 0, false)?;
         for event in [&down, &up] {
@@ -1695,9 +1714,7 @@ fn scroll(
     Ok(Impact::Done)
 }
 
-/// The whole gesture — down, interpolation, up — is created before any of it is
-/// posted, so a gesture that cannot be built delivers nothing instead of leaving
-/// the button down mid-drag.
+/// The whole gesture — down, interpolated moves, up.
 fn drag(from: CGPoint, to: CGPoint) -> Result<Impact, anyhow::Error> {
     let src = source();
     let mut events = Vec::with_capacity(14);
@@ -2505,6 +2522,42 @@ fn map_action_err(err: AXError, ctx: &str) -> Result<Impact, anyhow::Error> {
     }
 }
 
+// ── Session state ────────────────────────────────────────────────────────
+
+/// One boolean entry of the session dictionary, or `None` when the entry is absent
+/// or is not a boolean — an unknown state, never a guessed one.
+fn session_flag(dict: &CFDictionary<CFString, CFType>, key: &str) -> Option<bool> {
+    let key = CFString::from_str(key);
+    let value = dict.get(&key)?;
+    Some(value.downcast_ref::<CFBoolean>()?.value())
+}
+
+/// Why this session cannot receive an interactive call, or `None` when it can — the
+/// three answers the module header names, read from this process's session dictionary.
+fn desktop_unavailable_blocking() -> Option<String> {
+    let Some(dict) = objc2_core_graphics::CGSessionCopyCurrentDictionary() else {
+        return Some(
+            "this process has no window-server session — there is no desktop to read or drive"
+                .to_string(),
+        );
+    };
+    // SAFETY: a CFDictionary's generic parameters are a phantom type over one layout,
+    // and this dictionary's documented keys are CFStrings whose values are CFTypes —
+    // which is exactly what the handle is told to expect before it is read.
+    let dict: CFRetained<CFDictionary<CFString, CFType>> =
+        unsafe { CFRetained::cast_unchecked(dict) };
+    if session_flag(&dict, "kCGSSessionOnConsoleKey") == Some(false) {
+        return Some(
+            "another logged-in user is on this Mac's screen — this session is not on the console"
+                .to_string(),
+        );
+    }
+    if session_flag(&dict, "CGSSessionScreenIsLocked") == Some(true) {
+        return Some("the screen is locked".to_string());
+    }
+    None
+}
+
 // ── Backend impl ─────────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
@@ -2512,6 +2565,18 @@ impl Backend for MacOsBackend {
     fn is_supported(&self) -> bool {
         // macOS 14 is the floor, so the capability itself is always present.
         true
+    }
+
+    /// No dictionary, an unreadable one, or a session that says nothing about itself is
+    /// answered by [`desktop_unavailable_blocking`]; a session-dictionary read that
+    /// raises is the one case that reads as "cannot tell", because the call it guards was
+    /// never delivered either way.
+    async fn desktop_unavailable(&self) -> Option<String> {
+        with_platform("read the session state", || {
+            Ok(desktop_unavailable_blocking())
+        })
+        .ok()
+        .flatten()
     }
 
     async fn capture_available(&self) -> bool {

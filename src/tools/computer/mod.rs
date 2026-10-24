@@ -58,6 +58,16 @@
 //! responsive target never reaches one. Each backend's header states its mechanism, and
 //! the numbers the model is told are in the tool's prompt.
 //!
+//! # A session that cannot receive the call is refused, not served
+//!
+//! A locked screen, a session another user switched away from and a machine with no
+//! interactive desktop cannot receive input and show nothing to read, so the calls that
+//! read or drive a surface ask [`Backend::desktop_unavailable`] first and fail with
+//! `desktop-unavailable` — naming the state, and saying that nothing was delivered or
+//! read. Listing applications and windows, and `wait`, need no desktop and keep working.
+//! The tag is not `degraded` on purpose: its guidance is to retry, and a retry into such
+//! a state cannot succeed, so the model would loop instead of telling the owner.
+//!
 //! # Manual check (run once on a machine of each platform)
 //!
 //! Computer use is offered only to the admin's Assistant, so what can be checked
@@ -89,6 +99,10 @@
 //!    `click { ref, x, y }` fails naming which one to drop without clicking. The bounds
 //!    themselves are covered by the unit tests on [`validate_action`] and
 //!    [`check_action_fields`], so this step confirms the live path only.
+//! 7. Lock the screen and call `screenshot` / `observe` / `press`: each fails with
+//!    `desktop-unavailable` naming the lock, while `apps` still lists. Unlock and the
+//!    same calls work again. A machine that cannot be locked (or a platform with no
+//!    signal for it) keeps working — that is the intended behaviour, not a gap.
 
 mod core;
 mod linux;
@@ -790,6 +804,12 @@ impl Tool for ComputerTool {
 
         debug!(action = ?action, "computer action");
 
+        // A session that cannot receive the call is refused before the lock: it costs no
+        // wait behind another agent's capture, and nothing was delivered or read.
+        if needs_desktop(&action) {
+            ensure_interactive_desktop().await?;
+        }
+
         // Serialize every GUI-touching action so concurrent agent runs can't race.
         let _lock = ACTION_LOCK.lock().await;
 
@@ -882,6 +902,33 @@ async fn captured_payload(
 }
 
 // ── Action dispatch ─────────────────────────────────────────────────────
+
+/// Whether an action needs the interactive desktop. Listing applications and windows and
+/// `wait` describe the session rather than receive anything from it, so they stay available
+/// while it is locked; everything else is written as an exclusion so an action added later
+/// is gated by default.
+fn needs_desktop(action: &ComputerAction) -> bool {
+    !matches!(
+        action,
+        ComputerAction::Apps {} | ComputerAction::Windows { .. } | ComputerAction::Wait { .. }
+    )
+}
+
+/// Refuse a call whose session cannot receive it, before any surface is resolved or
+/// captured and before [`ACTION_LOCK`] is taken. Deliberately outside the per-action
+/// code: a state refusal is the one answer `cursor` must not degrade into "no surface".
+async fn ensure_interactive_desktop() -> anyhow::Result<()> {
+    let Some(reason) = backend().desktop_unavailable().await else {
+        return Ok(());
+    };
+    Err(core::taxonomy_error(
+        core::ERR_DESKTOP_UNAVAILABLE,
+        format!(
+            "{reason} — this call needs an interactive desktop, so nothing was delivered or read; \
+             tell the owner and run it again only once the session is back"
+        ),
+    ))
+}
 
 async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
     let output = match action {
@@ -1436,10 +1483,8 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
     // A capture that produced pixels is an observation of that surface: later
     // calls with no target address it.
     core::set_last_surface(target.clone());
-    // Record the capture under the owning agent id (owner-deletes-at-end via the
-    // existing spill machinery) and stash it in the per-agent capture map, with the
-    // size it was taken at so the attachment can say when it had to reduce it.
-    crate::tools::shell::record_spill_owner(path.clone());
+    // Stash the capture under the owning agent id, with the size it was taken at so
+    // the attachment can say when it had to reduce it.
     CAPTURES.lock().unwrap_poison().insert(
         core::agent_key(),
         CaptureRecord {
@@ -1486,7 +1531,7 @@ fn encode_png(cap: Capture) -> anyhow::Result<PathBuf> {
             .with_context(|| format!("failed to create screenshot dir {}", dir.display()))?;
         let nonce = rand::random::<u64>();
         let path = dir.join(format!("screenshot_{nonce:016x}.png"));
-        std::fs::write(&path, &buf)
+        crate::tools::shell::write_owned_spill(&path, &buf)
             .with_context(|| format!("failed to write screenshot {}", path.display()))?;
         Ok::<PathBuf, anyhow::Error>(path)
     })

@@ -46,7 +46,6 @@ const TRANSACTION_TIMEOUT_MS: u32 = 10_000;
 /// One unit of work for the apartment thread. Plain data only: no COM handle is
 /// ever sent or shared across a thread boundary.
 pub(super) enum Call {
-    ProbeCapture,
     ListApps,
     ListWindows {
         app: Option<AppInfo>,
@@ -82,7 +81,6 @@ impl Call {
     /// the model less than the failure it reports.
     fn label(&self) -> String {
         match self {
-            Call::ProbeCapture => "the capture channel".to_string(),
             Call::ListApps => "the running applications".to_string(),
             Call::ListWindows { app } => match app {
                 Some(app) => format!("the windows of {}", app.name),
@@ -103,7 +101,6 @@ impl Call {
 /// method; nothing outside this module ever constructs or matches one. Boxed payloads
 /// keep the enum small enough to move cheaply across the channel.
 pub(super) enum Reply {
-    Flag(bool),
     Apps(Vec<AppInfo>),
     Windows(WindowListing),
     Window(Box<WindowInfo>),
@@ -135,7 +132,6 @@ macro_rules! from_reply {
 }
 
 from_reply! {
-    bool: Reply::Flag(value) => value,
     Vec<AppInfo>: Reply::Apps(value) => value,
     WindowListing: Reply::Windows(value) => value,
     WindowInfo: Reply::Window(value) => *value,
@@ -480,7 +476,6 @@ impl Ctx {
 
     fn execute(&mut self, call: Call) -> anyhow::Result<Reply> {
         match call {
-            Call::ProbeCapture => Ok(Reply::Flag(window::interactive_desktop_available())),
             Call::ListApps => Ok(Reply::Apps(window::enumerate_apps())),
             Call::ListWindows { app } => Ok(Reply::Windows(window::list_windows(app.as_ref()))),
             Call::FocusedWindow => Ok(Reply::Window(Box::new(window::focused_window()?))),

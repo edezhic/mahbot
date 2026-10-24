@@ -3,6 +3,33 @@
 //! Wayland stills via the Screenshot portal over zbus. All Rust-only: no
 //! system capture packages beyond the session's own daemons.
 //!
+//! # Which server this is
+//!
+//! Wayland is decided from the display server, not from an environment variable: an X
+//! connection that advertises `XWAYLAND` is XWayland, i.e. a Wayland session, and one
+//! without it is a real X server; `WAYLAND_DISPLAY` decides only a session with no X
+//! connection at all. A Wayland session therefore gets stills through the portal and no
+//! coordinate input, whether or not `WAYLAND_DISPLAY` is set.
+//!
+//! # Nothing left held, and nothing left behind
+//!
+//! Input synthesis is fire-and-forget: a gesture that stops partway reports what may still
+//! be held or half-applied rather than failing as if nothing happened, and the buttons a
+//! call pressed are let go on the way out — an error return or an unwind included, though a
+//! call abandoned inside a request of the server releases nothing until that request
+//! returns. The Screenshot portal's request is closed on every path, the timeout included;
+//! the image file it hands over is read and left where the portal put it, because only a
+//! file this tool created is ever deleted.
+//!
+//! # A locked session is refused
+//!
+//! Input into a locked session is synthesized and reported as delivered, and a still of
+//! it is a still of the lock screen, so the session's own lock state is asked first:
+//! systemd-logind's `LockedHint`, the one lock signal the system publishes for every
+//! desktop. A session that does not answer is not refused; the X screen saver's own state
+//! is deliberately not read, since a screen it blanked after an idle period with no
+//! locker is the ordinary session input still reaches.
+//!
 //! Surface geometry is PIXELS on Linux: X11 has no stable logical-point space and
 //! mixed-DPI makes physical↔logical translation unreliable — this is precisely
 //! why the tool is accessibility-first here.
@@ -28,9 +55,7 @@
 //! records it in the observation's header, and an application whose windows cannot
 //! be read is named as unread instead of appearing to have none. A node whose own
 //! accessibility proxy cannot be read is skipped with its subtree — an accepted
-//! limit of the AT-SPI walk. Input synthesis is fire-and-forget, so a gesture that
-//! was partly delivered reports what may still be held or half-applied rather than
-//! failing as if nothing happened.
+//! limit of the AT-SPI walk.
 //!
 //! Every accessibility exchange is bounded: the connection is this backend's own,
 //! opened with the product's method timeout ([`core::EXCHANGE_DEADLINE`]), so a target
@@ -190,7 +215,7 @@ impl LinuxBackend {
     ) -> Result<SurfaceGeometry, anyhow::Error> {
         match target {
             TargetSpec::Screen => {
-                if wayland_env() {
+                if wayland() {
                     // Zoom sizes itself from the last Screen capture so it never
                     // triggers a second portal dialog.
                     match *SCREEN_DIMS.lock().unwrap_poison() {
@@ -227,7 +252,7 @@ impl LinuxBackend {
         &self,
         budget: &CaptureBudget,
     ) -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
-        if wayland_env() {
+        if wayland() {
             let cap = portal_screenshot(budget).await?;
             let geo = SurfaceGeometry {
                 x: 0.0,
@@ -283,14 +308,112 @@ async fn registry_root(conn: &zbus::Connection) -> anyhow::Result<AccessibleProx
         .map_err(|e| dbus_err(e, "access registry root"))
 }
 
-// ── Pure helpers ─────────────────────────────────────────────────────────
+// ── Display server and session state ─────────────────────────────────────
 
-fn wayland_env() -> bool {
-    // XWayland (both `WAYLAND_DISPLAY` and `DISPLAY` set) still counts as
-    // Wayland: XTEST would only drive XWayland windows while native Wayland
-    // windows ignore it, so raw input must degrade.
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
+/// The display server this process is talking to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayServer {
+    X11,
+    Wayland,
 }
+
+static DISPLAY_SERVER: std::sync::OnceLock<DisplayServer> = std::sync::OnceLock::new();
+
+/// systemd-logind, whose per-session `LockedHint` is the desktop-agnostic lock signal.
+const LOGIND_DEST: &str = "org.freedesktop.login1";
+const LOGIND_PATH: &str = "/org/freedesktop/login1";
+
+/// How long the logind question may take, asked before every call that needs the
+/// desktop: a system bus that stops answering costs this and not the call's own budget.
+const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The system bus, kept across calls the way the accessibility connection is: the probe
+/// runs before every call that needs the desktop, so it must not pay a connect each time.
+/// A bus that went away is reopened, and nothing is cached when the connect fails.
+static SYSTEM_BUS: tokio::sync::Mutex<Option<zbus::Connection>> =
+    tokio::sync::Mutex::const_new(None);
+
+async fn system_bus() -> Option<zbus::Connection> {
+    let mut held = SYSTEM_BUS.lock().await;
+    if let Some(conn) = held.as_ref() {
+        if !conn.is_closed() {
+            return Some(conn.clone());
+        }
+        *held = None;
+    }
+    let conn = zbus::Connection::system().await.ok()?;
+    *held = Some(conn.clone());
+    Some(conn)
+}
+
+/// Which server this session is, from the probe the module header describes. The answer is
+/// kept for the life of the process — a session does not change server under it — while a
+/// probe that could not reach the server is retried by the next caller.
+fn display_server() -> Option<DisplayServer> {
+    if let Some(known) = DISPLAY_SERVER.get() {
+        return Some(*known);
+    }
+    let probed = with_block_in_place(probe_display_server)?;
+    let _ = DISPLAY_SERVER.set(probed);
+    Some(probed)
+}
+
+fn probe_display_server() -> Option<DisplayServer> {
+    if std::env::var_os("DISPLAY").is_some()
+        && let Ok((conn, _screen)) = x11rb::connect(None)
+    {
+        let xwayland = xproto::query_extension(&conn, b"XWAYLAND")
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some_and(|reply| reply.present);
+        return Some(if xwayland {
+            DisplayServer::Wayland
+        } else {
+            DisplayServer::X11
+        });
+    }
+    std::env::var_os("WAYLAND_DISPLAY").map(|_| DisplayServer::Wayland)
+}
+
+/// Whether this is a Wayland session — the branch every still and coordinate map takes.
+fn wayland() -> bool {
+    display_server() == Some(DisplayServer::Wayland)
+}
+
+/// `LockedHint` of this process's logind session, read under [`STATE_PROBE_TIMEOUT`]:
+/// logind is optional, so the answer is only ever what the session itself published.
+async fn locked_reason() -> Option<String> {
+    let locked = tokio::time::timeout(STATE_PROBE_TIMEOUT, async {
+        let conn = system_bus().await?;
+        let manager = zbus::Proxy::new(
+            &conn,
+            LOGIND_DEST,
+            LOGIND_PATH,
+            "org.freedesktop.login1.Manager",
+        )
+        .await
+        .ok()?;
+        // "self" is logind resolving the caller by pid, so a process that belongs to no
+        // session of its own (a user service) is answered with an error — "cannot tell".
+        let (session,): (zbus::zvariant::OwnedObjectPath,) =
+            manager.call("GetSession", &("self",)).await.ok()?;
+        let proxy = zbus::Proxy::new(
+            &conn,
+            LOGIND_DEST,
+            session.as_str(),
+            "org.freedesktop.login1.Session",
+        )
+        .await
+        .ok()?;
+        proxy.get_property::<bool>("LockedHint").await.ok()
+    })
+    .await
+    .ok()
+    .flatten()?;
+    locked.then(|| "the session's lock screen is active".to_string())
+}
+
+// ── Pure helpers ─────────────────────────────────────────────────────────
 
 /// AT-SPI `Role` → the lowercase string the core matches on. Most CamelCase enum
 /// names lowercase to the expected role; a few are remapped to the conventional
@@ -919,7 +1042,7 @@ async fn a11y_screen_extents(
 /// The pixel space stills and coordinate mapping use: the X11 virtual desktop, or
 /// the last portal capture's size on Wayland. `None` when it cannot be established.
 fn pixel_space() -> Option<(u32, u32)> {
-    if wayland_env() {
+    if wayland() {
         // Copied out of the cache, so no lock is held past this call.
         *SCREEN_DIMS.lock().unwrap_poison()
     } else {
@@ -965,7 +1088,7 @@ async fn a11y_pixel_scale(
         // Nothing was compared, so this is not a mismatch: the accessibility stack
         // did not report the screen at all. X11 still answers in the root's own
         // pixels, so 1:1 remains the right mapping there.
-        if !wayland_env() {
+        if !wayland() {
             return Ok(1.0);
         }
         return Err(core::taxonomy_error(
@@ -978,7 +1101,7 @@ async fn a11y_pixel_scale(
     };
     match core::a11y_scale(&extents, (width, height)) {
         Some(scale) => Ok(scale),
-        None if !wayland_env() => Ok(1.0),
+        None if !wayland() => Ok(1.0),
         None => Err(core::taxonomy_error(
             core::ERR_DEGRADED,
             format!(
@@ -1428,32 +1551,84 @@ fn enigo_key(name: &str) -> Result<Key, String> {
     Ok(key)
 }
 
+// ── Input synthesis ──────────────────────────────────────────────────────
+
+/// One call's synthesis session: the `Enigo` it drives and the mouse buttons it has
+/// pressed and not yet released. A button is recorded before it is pressed — a press that
+/// errors may still have reached the server — and released by [`Drop`]; enigo's own drop
+/// releases the keys it pressed.
+struct InputSession {
+    enigo: Enigo,
+    buttons: Vec<Button>,
+}
+
+impl InputSession {
+    fn new() -> Result<Self, anyhow::Error> {
+        let enigo =
+            Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init failed: {e}"))?;
+        Ok(Self {
+            enigo,
+            buttons: Vec::new(),
+        })
+    }
+
+    /// Press `button`, recorded BEFORE the attempt: a press that errors may still have
+    /// reached the server, so it must be released either way.
+    fn press_button(&mut self, button: Button) -> Result<(), enigo::InputError> {
+        self.buttons.push(button);
+        self.enigo.button(button, Direction::Press)
+    }
+
+    /// Release `button`; only a release that went through drops it from the held list.
+    fn release_button(&mut self, button: Button) -> Result<(), enigo::InputError> {
+        let released = self.enigo.button(button, Direction::Release);
+        if released.is_ok() {
+            self.buttons.retain(|held| *held != button);
+        }
+        released
+    }
+}
+
+impl Drop for InputSession {
+    /// Let go of every button this call left pressed. Failures are dropped with the
+    /// session — there is nothing left to report them to, and the result the call
+    /// returned already named what may be held.
+    fn drop(&mut self) {
+        for button in self.buttons.drain(..) {
+            let _ = self.enigo.button(button, Direction::Release);
+        }
+    }
+}
+
 /// Press `mods` in order. `Err` carries the index of the modifier whose press failed
 /// and that failure: it and every modifier before it may be down, so a caller that
 /// stops here must say so rather than report that nothing was delivered.
-fn press_modifiers(enigo: &mut Enigo, mods: &[Modifier]) -> Result<(), (usize, enigo::InputError)> {
+fn press_modifiers(
+    session: &mut InputSession,
+    mods: &[Modifier],
+) -> Result<(), (usize, enigo::InputError)> {
     for (i, m) in mods.iter().enumerate() {
-        if let Err(e) = enigo.key(enigo_mod_key(*m), Direction::Press) {
+        if let Err(e) = session.enigo.key(enigo_mod_key(*m), Direction::Press) {
             return Err((i, e));
         }
     }
     Ok(())
 }
 
-fn release_modifiers(enigo: &mut Enigo, mods: &[Modifier]) -> Result<(), anyhow::Error> {
+fn release_modifiers(session: &mut InputSession, mods: &[Modifier]) -> Result<(), anyhow::Error> {
     for m in mods.iter().rev() {
-        enigo
+        session
+            .enigo
             .key(enigo_mod_key(*m), Direction::Release)
             .map_err(input_err)?;
     }
     Ok(())
 }
 
-/// Name every modifier in `mods` for a result that has to say which may still be
-/// held down. Nothing in this tool can release a key it left down, so the note
-/// names what a held modifier costs and who can clear it.
-fn release_note(enigo: &mut Enigo, mods: &[Modifier]) -> Option<String> {
-    if mods.is_empty() || release_modifiers(enigo, mods).is_ok() {
+/// Release `mods` and, when that fails, name what a held modifier costs and who can
+/// clear it: the chord and every character typed after it would be modified.
+fn release_note(session: &mut InputSession, mods: &[Modifier]) -> Option<String> {
+    if mods.is_empty() || release_modifiers(session, mods).is_ok() {
         return None;
     }
     let names = mods
@@ -1482,8 +1657,8 @@ fn with_held(detail: String, held: Option<String>) -> String {
 
 /// The result of an actuation whose own input is delivered: done, unless letting go
 /// of the modifiers failed, which the result then has to say.
-fn done_after_release(enigo: &mut Enigo, mods: &[Modifier]) -> Impact {
-    match release_note(enigo, mods) {
+fn done_after_release(session: &mut InputSession, mods: &[Modifier]) -> Impact {
+    match release_note(session, mods) {
         None => Impact::Done,
         Some(note) => Impact::DoneWith(note),
     }
@@ -1493,14 +1668,14 @@ fn done_after_release(enigo: &mut Enigo, mods: &[Modifier]) -> Impact {
 /// says only what is known: the input did not go through, and a modifier a failed
 /// press left down has to be released before trying again.
 fn press_failed(
-    enigo: &mut Enigo,
+    session: &mut InputSession,
     mods: &[Modifier],
     what: &str,
     err: &enigo::InputError,
 ) -> anyhow::Error {
     core::taxonomy_error(
         core::ERR_DEGRADED,
-        with_held(format!("{what} ({err})"), release_note(enigo, mods)),
+        with_held(format!("{what} ({err})"), release_note(session, mods)),
     )
 }
 
@@ -1533,15 +1708,15 @@ fn input_err(e: enigo::InputError) -> anyhow::Error {
     anyhow!("input synthesis failed: {e}")
 }
 
-fn key_chord(enigo: &mut Enigo, chord: &str) -> Result<Impact, anyhow::Error> {
+fn key_chord(session: &mut InputSession, chord: &str) -> Result<Impact, anyhow::Error> {
     let (mods, key) = core::parse_key_chord(chord)?;
     let key = enigo_key(&key).map_err(anyhow::Error::msg)?;
     // Nothing of the chord is in the system before the modifiers are down, so a
     // failed modifier press is only a half-pressed chord: it and the ones before it
     // may be down, but no key of it has been delivered.
-    if let Err((failed, e)) = press_modifiers(enigo, &mods) {
+    if let Err((failed, e)) = press_modifiers(session, &mods) {
         return Err(press_failed(
-            enigo,
+            session,
             &mods[..=failed],
             "the chord did not go through — a modifier press failed",
             &e,
@@ -1550,8 +1725,8 @@ fn key_chord(enigo: &mut Enigo, chord: &str) -> Result<Impact, anyhow::Error> {
     // XTEST writes the key press before the release can fail, so a press that errors
     // may already have fired the chord: press and release are driven apart, and a
     // press failure is repaired by releasing the key again.
-    if let Err(e) = enigo.key(key, Direction::Press) {
-        let released = enigo.key(key, Direction::Release).is_ok();
+    if let Err(e) = session.enigo.key(key, Direction::Press) {
+        let released = session.enigo.key(key, Direction::Release).is_ok();
         let key_state = if released {
             "the chord may already have fired, and the key was released again"
         } else {
@@ -1559,19 +1734,19 @@ fn key_chord(enigo: &mut Enigo, chord: &str) -> Result<Impact, anyhow::Error> {
         };
         return Ok(Impact::Unconfirmed(with_held(
             format!("the chord's key press errored ({e}) — {key_state}"),
-            release_note(enigo, &mods),
+            release_note(session, &mods),
         )));
     }
-    if let Err(e) = enigo.key(key, Direction::Release) {
+    if let Err(e) = session.enigo.key(key, Direction::Release) {
         return Ok(Impact::Unconfirmed(with_held(
             format!(
                 "the chord's key went down but its release failed ({e}) — the key may still be \
                  held down"
             ),
-            release_note(enigo, &mods),
+            release_note(session, &mods),
         )));
     }
-    Ok(done_after_release(enigo, &mods))
+    Ok(done_after_release(session, &mods))
 }
 
 /// What a drag that stopped after the button went down leaves behind. `released`
@@ -1594,8 +1769,8 @@ fn drag_incomplete(fx: i32, fy: i32, released: bool) -> Impact {
 
 /// Let a button go again after a press that errored — the press may have been
 /// written before the call failed — and say how that ended.
-fn release_after_failed_press(enigo: &mut Enigo, button: Button) -> &'static str {
-    if enigo.button(button, Direction::Release).is_ok() {
+fn release_after_failed_press(session: &mut InputSession, button: Button) -> &'static str {
+    if session.release_button(button).is_ok() {
         "was released again"
     } else {
         "may still be held down"
@@ -1609,25 +1784,28 @@ fn release_after_failed_press(enigo: &mut Enigo, button: Button) -> &'static str
 /// names what may have landed or may still be held, because a second click is a
 /// second actuation.
 fn click(
-    enigo: &mut Enigo,
+    session: &mut InputSession,
     x: i32,
     y: i32,
     button: Button,
     double: bool,
     modifiers: &[Modifier],
 ) -> Result<Impact, anyhow::Error> {
-    enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)?;
-    if let Err((failed, e)) = press_modifiers(enigo, modifiers) {
+    session
+        .enigo
+        .move_mouse(x, y, Coordinate::Abs)
+        .map_err(input_err)?;
+    if let Err((failed, e)) = press_modifiers(session, modifiers) {
         return Err(press_failed(
-            enigo,
+            session,
             &modifiers[..=failed],
             "the click did not go through — a modifier press failed",
             &e,
         ));
     }
     for press in 0..(if double { 2 } else { 1 }) {
-        if let Err(e) = enigo.button(button, Direction::Press) {
-            let state = release_after_failed_press(enigo, button);
+        if let Err(e) = session.press_button(button) {
+            let state = release_after_failed_press(session, button);
             let detail = if press == 0 {
                 format!(
                     "the button press errored ({e}) — the target may have seen a click at ({x}, \
@@ -1641,31 +1819,31 @@ fn click(
             };
             return Ok(Impact::Unconfirmed(with_held(
                 detail,
-                release_note(enigo, modifiers),
+                release_note(session, modifiers),
             )));
         }
-        if let Err(e) = enigo.button(button, Direction::Release) {
+        if let Err(e) = session.release_button(button) {
             let detail = format!(
                 "the button was pressed but its release failed ({e}) — it may still be held down"
             );
             return Ok(Impact::Unconfirmed(with_held(
                 detail,
-                release_note(enigo, modifiers),
+                release_note(session, modifiers),
             )));
         }
     }
-    Ok(done_after_release(enigo, modifiers))
+    Ok(done_after_release(session, modifiers))
 }
 
 /// Type `text` one character at a time. Enigo writes a character's key press before
 /// its release can fail, so each half is driven apart: a press that errors may
 /// already have typed the character, and a release that errors leaves its key down.
-fn type_text(enigo: &mut Enigo, text: &str) -> Impact {
+fn type_text(session: &mut InputSession, text: &str) -> Impact {
     let total = text.chars().count();
     for (typed, ch) in text.chars().enumerate() {
         let key = Key::Unicode(ch);
-        if let Err(e) = enigo.key(key, Direction::Press) {
-            let state = if enigo.key(key, Direction::Release).is_ok() {
+        if let Err(e) = session.enigo.key(key, Direction::Press) {
+            let state = if session.enigo.key(key, Direction::Release).is_ok() {
                 "that character may already have been typed, and its key was released again"
             } else {
                 "that character may already have been typed and its key may still be held down"
@@ -1675,7 +1853,7 @@ fn type_text(enigo: &mut Enigo, text: &str) -> Impact {
                  ({e}) — {state}"
             ));
         }
-        if let Err(e) = enigo.key(key, Direction::Release) {
+        if let Err(e) = session.enigo.key(key, Direction::Release) {
             return Impact::Unconfirmed(format!(
                 "{} of {total} characters were typed, but the last one's key release failed ({e}) \
                  — its key may still be held down",
@@ -1689,7 +1867,7 @@ fn type_text(enigo: &mut Enigo, text: &str) -> Impact {
 /// One wheel tick is a press/release pair of a scroll button, and the ticks are
 /// driven apart for the same reason: a failure names how many landed and whether a
 /// wheel button is left down.
-fn scroll(enigo: &mut Enigo, length: i32, axis: Axis) -> Impact {
+fn scroll(session: &mut InputSession, length: i32, axis: Axis) -> Impact {
     let button = match (length.is_positive(), axis) {
         (true, Axis::Vertical) => Button::ScrollDown,
         (false, Axis::Vertical) => Button::ScrollUp,
@@ -1698,14 +1876,14 @@ fn scroll(enigo: &mut Enigo, length: i32, axis: Axis) -> Impact {
     };
     let ticks = length.abs();
     for tick in 0..ticks {
-        if let Err(e) = enigo.button(button, Direction::Press) {
-            let state = release_after_failed_press(enigo, button);
+        if let Err(e) = session.press_button(button) {
+            let state = release_after_failed_press(session, button);
             return Impact::Unconfirmed(format!(
                 "{tick} of {ticks} scroll ticks were sent before the next one's press errored \
                  ({e}) — its wheel button {state}"
             ));
         }
-        if let Err(e) = enigo.button(button, Direction::Release) {
+        if let Err(e) = session.release_button(button) {
             return Impact::Unconfirmed(format!(
                 "{} of {ticks} scroll ticks were sent, but the last one's release failed ({e}) — \
                  its wheel button may still be held down",
@@ -1720,8 +1898,7 @@ fn raw_input_blocking(
     input: RawInput,
     geo: Option<&SurfaceGeometry>,
 ) -> Result<Impact, anyhow::Error> {
-    let mut enigo =
-        Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init failed: {e}"))?;
+    let mut session = InputSession::new()?;
     match input {
         RawInput::Click {
             point,
@@ -1730,10 +1907,10 @@ fn raw_input_blocking(
             modifiers,
         } => {
             let (x, y) = pixel_point(point, geo)?;
-            click(&mut enigo, x, y, enigo_button(button), double, &modifiers)
+            click(&mut session, x, y, enigo_button(button), double, &modifiers)
         }
-        RawInput::TypeText { text } => Ok(type_text(&mut enigo, &text)),
-        RawInput::KeyChord { chord } => key_chord(&mut enigo, &chord),
+        RawInput::TypeText { text } => Ok(type_text(&mut session, &text)),
+        RawInput::KeyChord { chord } => key_chord(&mut session, &chord),
         RawInput::Scroll {
             point,
             direction,
@@ -1741,23 +1918,27 @@ fn raw_input_blocking(
         } => {
             if let Some((nx, ny)) = point {
                 let (x, y) = pixel_point((nx, ny), geo)?;
-                enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)?;
+                session
+                    .enigo
+                    .move_mouse(x, y, Coordinate::Abs)
+                    .map_err(input_err)?;
             }
             let (length, axis) = scroll_params(direction, amount);
-            Ok(scroll(&mut enigo, length, axis))
+            Ok(scroll(&mut session, length, axis))
         }
         RawInput::Drag { from, to } => {
             let (fx, fy) = pixel_point(from, geo)?;
             let (tx, ty) = pixel_point(to, geo)?;
             // The button goes down where the gesture starts: pressing at the
             // pointer's previous position would grab whatever window that was.
-            enigo
+            session
+                .enigo
                 .move_mouse(fx, fy, Coordinate::Abs)
                 .map_err(input_err)?;
             // As in a click, the press may have reached the server before the call
             // failed: the button can be down and the target may have seen a click.
-            if let Err(e) = enigo.button(Button::Left, Direction::Press) {
-                let state = release_after_failed_press(&mut enigo, Button::Left);
+            if let Err(e) = session.press_button(Button::Left) {
+                let state = release_after_failed_press(&mut session, Button::Left);
                 return Ok(Impact::Unconfirmed(format!(
                     "the drag's button press errored ({e}) at ({fx}, {fy}) — the button {state}, \
                      so the target may have taken it as a click"
@@ -1769,13 +1950,13 @@ fn raw_input_blocking(
                 let t = i as f64 / INTERP_STEPS as f64;
                 let x = (fx as f64 + (tx - fx) as f64 * t).round() as i32;
                 let y = (fy as f64 + (ty - fy) as f64 * t).round() as i32;
-                if enigo.move_mouse(x, y, Coordinate::Abs).is_err() {
-                    let released = enigo.button(Button::Left, Direction::Release).is_ok();
+                if session.enigo.move_mouse(x, y, Coordinate::Abs).is_err() {
+                    let released = session.release_button(Button::Left).is_ok();
                     return Ok(drag_incomplete(fx, fy, released));
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            if let Err(e) = enigo.button(Button::Left, Direction::Release) {
+            if let Err(e) = session.release_button(Button::Left) {
                 // Every step ran and the pointer reached `to`: only the release
                 // failed, which is what must not read as an unfinished gesture.
                 return Ok(Impact::Unconfirmed(format!(
@@ -1955,6 +2136,9 @@ const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const PORTAL_IFACE: &str = "org.freedesktop.portal.Screenshot";
 
+/// Every portal call is a `Request` object; its `Close` is how a call gives one back.
+const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
+
 /// Ceiling on the encoded file the Screenshot portal hands over. The portal chooses
 /// the image, so this is a FILE limit, separate from what the decode will honour
 /// (the shared raster envelope, itself capped by what the call has left): a PNG of
@@ -1985,8 +2169,11 @@ async fn portal_available() -> bool {
     .unwrap_or(false)
 }
 
-/// Single Screenshot-portal attempt: subscribe for the `Response` signal first
-/// (a fast compositor can't beat the subscription), then call, then wait.
+/// Single Screenshot-portal attempt: subscribe for the `Response` signal first (a fast
+/// compositor can't beat the subscription), then call and wait. The request path is
+/// predicted from the token and the caller's bus name before the call, so a `Screenshot`
+/// call that times out — leaving no reply to read it from — still has one to close, and
+/// [`PortalRequest`] closes it however the attempt ends.
 async fn portal_screenshot(budget: &CaptureBudget) -> Result<Capture, anyhow::Error> {
     let conn = zbus::Connection::session().await.map_err(|e| {
         core::taxonomy_error(
@@ -1997,26 +2184,114 @@ async fn portal_screenshot(budget: &CaptureBudget) -> Result<Capture, anyhow::Er
             ),
         )
     })?;
-    let rule = zbus::MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .interface("org.freedesktop.portal.Request")?
-        .member("Response")?
-        .build();
-    let mut stream = zbus::MessageStream::for_match_rule(rule, &conn, None)
-        .await
-        .map_err(|e| {
-            core::taxonomy_error(core::ERR_DEGRADED, format!("portal subscribe failed: {e}"))
-        })?;
     let token = format!(
         "mahbot_{}_{}",
         std::process::id(),
         PORTAL_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed)
     );
+    let mut request = PortalRequest::new(&conn, &token);
+    let outcome = screenshot_request(&conn, &token, &mut request, budget).await;
+    request.close().await;
+    outcome
+}
+
+/// One `Screenshot` request, closed however the call ends: explicitly on every path the
+/// call returns on, and from its own drop on the ones it cannot — an unwind out of the
+/// response handling, or a future dropped mid-call. The drop closes on a task of its own
+/// because a bus round trip cannot be awaited there; the portal also drops a request when
+/// the caller's connection goes away, so a missed task is not a leak.
+struct PortalRequest {
+    conn: zbus::Connection,
+    path: Option<zbus::zvariant::OwnedObjectPath>,
+}
+
+impl PortalRequest {
+    /// The request this call is about to open, at the path the portal will publish it
+    /// at — `None` when the caller's own bus name is not known, in which case only a
+    /// reply can name it.
+    fn new(conn: &zbus::Connection, token: &str) -> Self {
+        Self {
+            conn: conn.clone(),
+            path: request_path(conn, token),
+        }
+    }
+
+    /// Take the path the portal actually published, which is authoritative over the
+    /// predicted one.
+    fn adopt(&mut self, path: zbus::zvariant::OwnedObjectPath) {
+        self.path = Some(path);
+    }
+
+    async fn close(mut self) {
+        if let Some(path) = self.path.take() {
+            close_request(&self.conn, &path).await;
+        }
+    }
+}
+
+impl Drop for PortalRequest {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let conn = self.conn.clone();
+        handle.spawn(async move { close_request(&conn, &path).await });
+    }
+}
+
+/// Where the portal publishes this request's `Response`, from the caller's unique bus
+/// name (':' stripped, '.' as '_') and the token this tool chose: the one handle that
+/// exists before the call replies.
+fn request_path(conn: &zbus::Connection, token: &str) -> Option<zbus::zvariant::OwnedObjectPath> {
+    let sender = conn
+        .unique_name()?
+        .as_str()
+        .trim_start_matches(':')
+        .replace('.', "_");
+    format!("{PORTAL_PATH}/request/{sender}/{token}")
+        .try_into()
+        .ok()
+}
+
+/// Close the request, best-effort and bounded: the call's own answer is already
+/// decided by the time this runs, and a portal that ignores `Close` must not hold it.
+async fn close_request(conn: &zbus::Connection, path: &zbus::zvariant::ObjectPath<'_>) {
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        let proxy = zbus::Proxy::new(conn, PORTAL_BUS, path, REQUEST_IFACE)
+            .await
+            .ok()?;
+        proxy.call::<_, _, ()>("Close", &()).await.ok()
+    })
+    .await;
+}
+
+/// The `Screenshot` call and its response. The request's own path is adopted as soon as
+/// the portal replies, so the caller can close the request whatever the wait afterwards
+/// does with it.
+async fn screenshot_request(
+    conn: &zbus::Connection,
+    token: &str,
+    request: &mut PortalRequest,
+    budget: &CaptureBudget,
+) -> Result<Capture, anyhow::Error> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(REQUEST_IFACE)?
+        .member("Response")?
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, conn, None)
+        .await
+        .map_err(|e| {
+            core::taxonomy_error(core::ERR_DEGRADED, format!("portal subscribe failed: {e}"))
+        })?;
     let mut options = HashMap::new();
     options.insert("handle_token", zbus::zvariant::Value::from(token));
     options.insert("modal", zbus::zvariant::Value::from(false));
     options.insert("interactive", zbus::zvariant::Value::from(false));
-    let proxy = zbus::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, PORTAL_IFACE)
+    let proxy = zbus::Proxy::new(conn, PORTAL_BUS, PORTAL_PATH, PORTAL_IFACE)
         .await
         .map_err(|e| {
             core::taxonomy_error(
@@ -2044,6 +2319,7 @@ async fn portal_screenshot(budget: &CaptureBudget) -> Result<Capture, anyhow::Er
         )
     })?;
     let expected_path = req_path.as_str().to_owned();
+    request.adopt(req_path);
     let wait = async {
         while let Some(msg) = stream.next().await {
             let msg = msg.map_err(|e| {
@@ -2135,9 +2411,7 @@ async fn portal_response(
                 core::taxonomy_error(core::ERR_DEGRADED, format!("portal uri not a string: {e}"))
             })?;
             let path = core::portal_uri_to_path(&uri)?;
-            let read = read_portal_file(&path).await;
-            tokio::fs::remove_file(&path).await.ok();
-            let bytes = read?;
+            let bytes = read_portal_file(&path).await?;
             // Two ceilings on the decode: the shared raster envelope, and what is left of
             // this call's allowance (`remaining` counts RGBA pixels, four bytes each).
             // The refusal states the one that was applied.
@@ -2198,8 +2472,13 @@ impl Backend for LinuxBackend {
         gui && bus
     }
 
+    /// The session's own lock state — see [`locked_reason`].
+    async fn desktop_unavailable(&self) -> Option<String> {
+        locked_reason().await
+    }
+
     async fn capture_available(&self) -> bool {
-        if wayland_env() {
+        if wayland() {
             portal_available().await
         } else {
             with_block_in_place(|| x11_screen_geometry().is_ok())
@@ -2207,7 +2486,7 @@ impl Backend for LinuxBackend {
     }
 
     fn capture_unavailable_error(&self) -> anyhow::Error {
-        if wayland_env() {
+        if wayland() {
             core::taxonomy_error(
                 core::ERR_DEGRADED,
                 "Wayland capture unavailable (Screenshot portal missing or denied) — no manual \
@@ -2396,10 +2675,11 @@ impl Backend for LinuxBackend {
     ) -> Result<Impact, anyhow::Error> {
         // Argument bounds first, before the channel check or any window lookup.
         core::check_raw_input(&input)?;
-        if wayland_env() {
+        if wayland() {
             return Err(core::taxonomy_error(
                 core::ERR_DEGRADED,
-                "Wayland sessions do not support raw input synthesis (no XTEST); use ref-based \
+                "this is a Wayland session, which cannot receive synthesized input: XTEST would \
+                 reach only the XWayland windows, never the native ones on screen — use ref-based \
                  accessibility actions where the app exposes them",
             ));
         }
@@ -2423,7 +2703,7 @@ impl Backend for LinuxBackend {
     }
 
     async fn cursor_position(&self) -> Result<(f64, f64), anyhow::Error> {
-        if wayland_env() {
+        if wayland() {
             return Err(core::taxonomy_error(
                 core::ERR_DEGRADED,
                 "global pointer position is not exposed on Wayland",

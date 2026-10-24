@@ -57,6 +57,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 #[cfg(windows)]
@@ -3743,11 +3744,19 @@ pub(crate) fn cleanup_agent_spills(agent_id: &str) {
         // Only the recorded path goes: its parent may be a directory other runs
         // share (`uploads/`, the agent temp area), and removing one this run did
         // not create would race them.
-        let _ = if p.is_dir() {
+        let removed = if p.is_dir() {
             std::fs::remove_dir_all(&p)
         } else {
             std::fs::remove_file(&p)
         };
+        // Already gone is the normal case (a call that cleaned up after its own
+        // failure); anything else is worth a line, because the alternative is a file
+        // nothing will report again.
+        if let Err(e) = removed
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!("spill cleanup could not remove {}: {e}", p.display());
+        }
     }
 }
 
@@ -5061,14 +5070,31 @@ fn read_window(path: &Path, start: u64, len: u64) -> Option<String> {
     Some(strip_and_scrub(&bytes))
 }
 
+/// Write `bytes` to a spill file and register the path as the current call's the
+/// instant the file exists, before a byte is written: a file written partway (a full
+/// disk, a killed write) is then the run's spill too, so [`cleanup_agent_spills`]
+/// removes it and nothing depends on a sweep noticing it. The partial file is removed
+/// here as well, so a call that fails leaves nothing behind either.
+pub(crate) fn write_owned_spill(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    record_spill_owner(path.to_path_buf());
+    if let Err(e) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Write content to the agent temp directory with the given filename.
-/// Content should already be credential-scrubbed. The path is recorded under
-/// the owning agent id (owner-deletes-at-end).
+/// Content should already be credential-scrubbed.
 fn write_to_spill(content: &str, filename: &str) -> Option<std::path::PathBuf> {
     let dir = agent_temp_dir()?;
     let path = dir.join(filename);
-    std::fs::write(&path, content).ok()?;
-    record_spill_owner(path.clone());
+    if let Err(e) = write_owned_spill(&path, content.as_bytes()) {
+        tracing::debug!("spill write to {} failed: {e}", path.display());
+        return None;
+    }
     Some(path)
 }
 

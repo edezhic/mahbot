@@ -17,6 +17,11 @@ impl Backend for StubBackend {
         false
     }
 
+    /// Never reached: nothing here is advertised, so no call gets far enough to ask.
+    async fn desktop_unavailable(&self) -> Option<String> {
+        None
+    }
+
     async fn capture_available(&self) -> bool {
         false
     }

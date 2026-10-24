@@ -353,6 +353,8 @@ const INTERACTIVE_ROLES: &[&str] = &[
 pub(crate) const ERR_PERMISSION_DENIED: &str = "permission-denied";
 pub(crate) const ERR_UNSUPPORTED: &str = "unsupported";
 pub(crate) const ERR_DEGRADED: &str = "degraded";
+/// The session cannot receive the call at all — see [`Backend::desktop_unavailable`].
+pub(crate) const ERR_DESKTOP_UNAVAILABLE: &str = "desktop-unavailable";
 pub(crate) const ERR_STALE_ELEMENT: &str = "stale-element";
 /// The system's own framework (or, on Windows, a structured exception raised
 /// inside it) failed while serving the call: the call was abandoned and the
@@ -2321,6 +2323,12 @@ pub(crate) trait Backend: Send + Sync {
     /// Windows always can (no grant exists; the refusals are per window and per
     /// call), Linux needs a GUI session with a reachable session bus.
     fn is_supported(&self) -> bool;
+    /// Why this session cannot receive an interactive call — the state the owner has to
+    /// change, named in the error the model reads — or `None` when it can. Implementers
+    /// answer only from a signal the platform actually publishes: `None` is the answer for
+    /// a state the platform cannot tell, because a false refusal on a working session is
+    /// worse than the failure the call would report on its own.
+    async fn desktop_unavailable(&self) -> Option<String>;
     /// Prompt-free capture-channel probe (the screen-recording grant on macOS);
     /// the caller caches it with a TTL.
     async fn capture_available(&self) -> bool;

@@ -170,8 +170,8 @@ pub(super) fn screen_geometry() -> anyhow::Result<SurfaceGeometry> {
         );
         if width <= 0 || height <= 0 {
             return Err(core::taxonomy_error(
-                core::ERR_DEGRADED,
-                "no interactive desktop is attached — there is no screen to describe",
+                core::ERR_DESKTOP_UNAVAILABLE,
+                format!("{SECURE_DESKTOP_REASON} — there is no screen to describe"),
             ));
         }
         Ok(SurfaceGeometry {
@@ -337,11 +337,18 @@ fn ensure_input_desktop() -> anyhow::Result<()> {
     Err(secure_desktop_error())
 }
 
+/// What a session without an interactive desktop is, named once: the core gate
+/// ([`super::core::ERR_DESKTOP_UNAVAILABLE`]) and every Windows refusal spell it the
+/// same way.
+pub(super) const SECURE_DESKTOP_REASON: &str = "the UAC secure desktop, the lock screen or a \
+     non-interactive session owns the desktop";
+
 fn secure_desktop_error() -> anyhow::Error {
     core::taxonomy_error(
-        core::ERR_DEGRADED,
-        "the UAC secure desktop, the lock screen or a non-interactive session owns the desktop — \
-         nothing can be read or actuated there; ask the owner to return to their desktop",
+        core::ERR_DESKTOP_UNAVAILABLE,
+        format!(
+            "{SECURE_DESKTOP_REASON} — nothing can be read or actuated there; ask the owner to return to their desktop"
+        ),
     )
 }
 
