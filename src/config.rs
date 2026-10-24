@@ -92,8 +92,9 @@
 //! lazily purged on reload: [`reload_from_db`] logs each unknown key at
 //! `debug`, then best-effort deletes garbage rows (debug on success, warn
 //! on transient failure without failing boot) while the intentional shared
-//! namespaces written by other subsystems (the nightly-discovery marker and
-//! the temp-cleanup cadence state) are left untouched.
+//! namespaces written by other subsystems (the nightly-discovery marker, the
+//! temp-cleanup cadence state and the update notice's records) are left
+//! untouched.
 //! Downgrade resurrection is therefore lost — under the previous ghost policy
 //! orphans were retained and would re-appear on downgrade, now they are deleted
 //! on first reboot. New orphans cannot be created via the settings path because

@@ -31,9 +31,10 @@
 #                version from {base}/releases/latest/download/version.txt and never
 #                calls a hosting-service API
 #   changelog.txt: the body's list of changes, when there is one, so the product's
-#                updater can take it down beside the archive and tell the owner's
-#                assistant what the installed version brought; a release with
-#                nothing to list has no such file
+#                updater can take it down beside the archive — and a start that
+#                brought none can read it — to tell the owner's assistant what the
+#                installed version brought; a release with nothing to list has no
+#                such file
 #   licences:    LICENSE-MIT and LICENSE-APACHE, beside every release
 #
 # Every release also carries a body: a `### Changelog` heading over the titles of the

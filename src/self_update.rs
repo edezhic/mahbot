@@ -50,18 +50,28 @@
 //!   its root;
 //! * every release whose body lists changes also carries `changelog.txt` — the
 //!   same text — at `{base}/releases/download/v{version}/changelog.txt`, so an
-//!   update takes the list down with itself instead of reading the release page
-//!   after the restart.
+//!   update can take the list down with itself; the release page for the same tag
+//!   (`{base}/releases/tag/v{version}`) carries it too, and is what the notice
+//!   names when it could not be carried.
 //!
 //! No hosting-service API call is made anywhere — only those download URLs.
 //!
 //! ## Telling the admin's assistant what changed
 //!
 //! A downloaded update takes the release's change list down with itself, before
-//! the restart, and the first start of the new version hands it to the admin's
-//! assistant as one tagged message in its ordinary queue
-//! ([`announce_update_to_assistant`]). A build from source, a first install and
-//! a restart of the same version produce nothing.
+//! the restart ([`capture_update_announcement`]), and the first start of the new
+//! version hands it to the admin's assistant as one tagged message in its
+//! ordinary queue ([`announce_update_to_assistant`]). An update that brought no
+//! usable list — a failed fetch, one made by the install scripts, a release
+//! published before the list travelled with it — is answered from the release of
+//! the running version while the notice is composed; only when that also yields
+//! nothing does the notice say the list is unavailable, and it names the release
+//! page the list can be read on.
+//!
+//! The captured list is kept until a notice has actually been handed over, so a
+//! start that does not announce — a build from source, an unfinished setup, a
+//! process that stops early — still announces it later. A first install and a
+//! restart of the same version with nothing owed say nothing.
 //!
 //! ## Test-only hooks
 //!
@@ -1160,49 +1170,69 @@ pub(crate) const UPDATE_PENDING_CHANGELOG_KV_KEY: &str = "update_pending_changel
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PendingChangelog {
     version: String,
-    /// `None` when the release carried no list, or it could not be read: the
-    /// notice then says the list is unavailable rather than inventing one.
+    /// `None` when the update could not take the list down: the start asks the
+    /// release for it again while composing the notice.
     changes: Option<String>,
 }
 
 /// What a start must do about the update notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateNotice {
-    /// The same version started again: nothing to do.
+    /// Settle nothing: the same version started again, or an owed list that waits
+    /// for setup to finish.
     Unchanged,
-    /// Record this start as the last run, and say whether it also announces.
-    Record { announce: bool },
+    /// Record this start as the last run, telling no one.
+    RecordSilently,
+    /// Hand the notice over, then record the version and drop the list.
+    Announce,
 }
 
-/// The whole rule of which starts produce an update notice: a restart of the
-/// same version says nothing; a build from source never does, whatever its
-/// version string says; an installation that has not finished setup records the
-/// version because there is no assistant to tell; and a published copy with
-/// finished setup but no record at all is the first start of a version installed
-/// by a build that predates the record, so it announces with the list
-/// unavailable.
+/// The whole rule of which starts produce an update notice.
+///
+/// A restart of the same version says nothing — unless the update left a list
+/// for it, so a start that stopped between composing the notice and handing it
+/// over is repeated rather than silenced. A build from source never announces,
+/// whatever its version string says, and keeps what the update left behind for a
+/// copy that can show it. An installation that has not finished setup records the
+/// version of a first install, because there is no assistant to tell, but an
+/// update it was *given* waits: neither the version nor the list is touched, so
+/// the first start after setup announces it. A published copy with finished setup
+/// announces — including over a version record an older build wrote, which is a
+/// version installed by a build that predates the list travelling with it.
 fn update_notice_action(
     last_run: Option<&str>,
     current: &str,
     published: bool,
     onboarding_finished: bool,
+    owed_list: bool,
 ) -> UpdateNotice {
+    if !published {
+        return if last_run == Some(current) {
+            UpdateNotice::Unchanged
+        } else {
+            UpdateNotice::RecordSilently
+        };
+    }
+    if owed_list {
+        return if onboarding_finished {
+            UpdateNotice::Announce
+        } else {
+            UpdateNotice::Unchanged
+        };
+    }
     if last_run == Some(current) {
         UpdateNotice::Unchanged
+    } else if onboarding_finished {
+        UpdateNotice::Announce
     } else {
-        UpdateNotice::Record {
-            announce: published && onboarding_finished,
-        }
+        UpdateNotice::RecordSilently
     }
 }
 
 /// Write the version this start runs from, reporting a failed write rather than
 /// hiding it: the caller decides whether its own contract can go on.
-async fn record_notice_state(version: &str) -> bool {
-    match crate::config_db::store()
-        .set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, version)
-        .await
-    {
+async fn record_notice_state(store: &crate::config_db::ConfigStore, version: &str) -> bool {
+    match store.set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, version).await {
         Ok(()) => true,
         Err(e) => {
             warn!(error = %e, "Could not record the update notice state");
@@ -1226,8 +1256,8 @@ fn pending_changelog_from_str(raw: &str, version: &str) -> Option<PendingChangel
 
 /// The change list captured for `version`, when the record belongs to it. A
 /// record of another version is left in place: it belongs to a release that may
-/// still start. A failed read is an error so the caller can retry at the next
-/// start instead of burning the notice with "unavailable".
+/// still start. A failed read is an error, so the caller settles nothing on this
+/// start and decides again at the next one.
 async fn pending_changelog(
     store: &crate::config_db::ConfigStore,
     version: &str,
@@ -1239,8 +1269,9 @@ async fn pending_changelog(
 }
 
 /// The notice itself: one self-contained, tagged block carrying the version and
-/// the release's change list (or the plain statement that there is none).
-fn update_notice_text(version: &str, changes: Option<&str>) -> String {
+/// the release's change list, or — when there is no list to carry — the plain
+/// statement that it is unavailable and the release page it can be read on.
+fn update_notice_text(version: &str, changes: Option<&str>, release_page: &str) -> String {
     match changes {
         Some(changes) => crate::prompt::substitute(
             &crate::prompt::load_prompt("update_notice.md"),
@@ -1248,22 +1279,54 @@ fn update_notice_text(version: &str, changes: Option<&str>) -> String {
         ),
         None => crate::prompt::substitute(
             &crate::prompt::load_prompt("update_notice_unavailable.md"),
-            &[("{{version}}", version)],
+            &[("{{version}}", version), ("{{release_page}}", release_page)],
         ),
     }
 }
 
 /// Tell the admin's assistant once that the product was updated to this version,
-/// carrying the change list captured during the update.
+/// carrying that release's change list.
 ///
 /// Called once at daemon start, after the message pipeline is up: the notice
 /// enters the assistant's ordinary queue exactly as a message from the owner
-/// does, so it needs no special surface. The once-only record is written before
-/// the notice is handed over — a crash loses the notice rather than repeating
-/// it, and a restart of the same version finds nothing left to say.
+/// does, so it needs no special surface. See [`settle_update_notice`] for what
+/// this start may and may not settle.
 pub async fn announce_update_to_assistant() {
-    let current = VERSION;
-    let store = crate::config_db::store();
+    settle_update_notice(
+        crate::config_db::store(),
+        VERSION,
+        is_published_copy(),
+        crate::config::CONFIG.onboarding_stage() == crate::config::OnboardingState::Finished,
+        changelog_at_notice_time,
+        |content| {
+            crate::agent::message_router::post_assistant_notice(
+                &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+                crate::users::ADMIN_USER_NAME,
+                content,
+            );
+        },
+    )
+    .await;
+}
+
+/// One start's whole notice flow: read the durable state, decide what this start
+/// owes, obtain the change list the update did not bring, hand the notice over,
+/// and only then record the version and drop the list.
+///
+/// The store, the release fetch and the delivery are supplied by the caller so
+/// the flow can be exercised without the process-global store, the network and
+/// the assistant's queue.
+async fn settle_update_notice(
+    store: &crate::config_db::ConfigStore,
+    version: &str,
+    published: bool,
+    onboarding_finished: bool,
+    fetch_changes: impl AsyncFnOnce(&str) -> Option<String>,
+    deliver: impl FnOnce(String),
+) {
+    // Both reads settle what this start owes, so a failed one must not settle
+    // anything: nothing is recorded and nothing is dropped, and the next start
+    // decides again.
     let last_run = match store.get_kv(UPDATE_LAST_RUN_VERSION_KV_KEY).await {
         Ok(last_run) => last_run,
         Err(e) => {
@@ -1271,76 +1334,106 @@ pub async fn announce_update_to_assistant() {
             return;
         }
     };
-    let action = update_notice_action(
-        last_run.as_deref(),
-        current,
-        is_published_copy(),
-        crate::config::CONFIG.onboarding_stage() == crate::config::OnboardingState::Finished,
-    );
-    let announce = action == UpdateNotice::Record { announce: true };
-
-    // A captured list for this version is spent as soon as this start settles —
-    // announced now, or settled without one — so it is cleared below on every
-    // path. A failed read is only worth holding the notice back for when one is
-    // to be sent.
-    let pending = match pending_changelog(store, current).await {
+    let pending = match pending_changelog(store, version).await {
         Ok(pending) => pending,
         Err(e) => {
-            if announce {
-                warn!(
-                    error = %e,
-                    "Could not read the captured update change list — no notice is produced"
-                );
-                return;
-            }
-            None
+            warn!(
+                error = %e,
+                "Could not read the captured update change list — no notice is produced"
+            );
+            return;
         }
     };
-    // On a version this start settles, the once-only record goes down first:
-    // everything after it is hand-over, which a crash may lose but can never
-    // repeat.
-    if action != UpdateNotice::Unchanged && !record_notice_state(current).await {
-        return;
+    match update_notice_action(
+        last_run.as_deref(),
+        version,
+        published,
+        onboarding_finished,
+        pending.is_some(),
+    ) {
+        UpdateNotice::Unchanged => {}
+        UpdateNotice::RecordSilently => {
+            // Its outcome is only load-bearing where a notice follows the record;
+            // a failed write here is simply retried at the next start.
+            record_notice_state(store, version).await;
+        }
+        UpdateNotice::Announce => {
+            let release_page = release_page_url(&release_base_url(), version);
+            // Only a record that belongs to this version is spent at the end: one
+            // captured for another release is left for that release's start.
+            let captured = pending.is_some();
+            let changes = match pending.and_then(|pending| pending.changes) {
+                Some(changes) => Some(changes),
+                // Nothing usable travelled with the update: ask the release of
+                // the running version now, while the notice is composed.
+                None => fetch_changes(version).await,
+            };
+            if changes.is_none() {
+                warn!(
+                    version,
+                    release_page,
+                    "The release's change list could not be obtained — the notice points at the release page"
+                );
+            }
+            deliver(update_notice_text(
+                version,
+                changes.as_deref(),
+                &release_page,
+            ));
+            info!(version, "Told the admin assistant about the update");
+            // The once-only record goes down only after the hand-over, and the
+            // list only after the record: a start that stops in between repeats
+            // the notice, which is the lesser fault than silence.
+            if !record_notice_state(store, version).await {
+                return;
+            }
+            if captured && let Err(e) = store.delete_kv(UPDATE_PENDING_CHANGELOG_KV_KEY).await {
+                warn!(error = %e, "Could not clear the captured update change list");
+            }
+        }
     }
-    if pending.is_some()
-        && let Err(e) = store.delete_kv(UPDATE_PENDING_CHANGELOG_KV_KEY).await
-    {
-        warn!(error = %e, "Could not clear the captured update change list");
-    }
-    if !announce {
-        return;
-    }
-    let changes = pending.and_then(|pending| pending.changes);
-    let content = update_notice_text(current, changes.as_deref());
-    crate::agent::message_router::post_assistant_notice(
-        &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
-        crate::users::ADMIN_USER_NAME,
-        content,
-    );
-    info!(
-        version = current,
-        "Told the admin assistant about the update"
-    );
+}
+
+/// The release's change list, read while the notice is composed: the second and
+/// last time it is asked for, so a fetch that failed before the restart does not
+/// decide what the notice says.
+async fn changelog_at_notice_time(version: &str) -> Option<String> {
+    // The client's own deadline is the update transport's generous one; what
+    // bounds this read is [`CHANGELOG_TIMEOUT`] inside the fetch.
+    let client = match crate::util::http::build_download_client(DOWNLOAD_TIMEOUT) {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(error = %e, "Could not build the client that reads the release's change list");
+            return None;
+        }
+    };
+    fetch_release_changelog(&client, version).await
 }
 
 /// The URL of a release's change list — the release body's own text, published
-/// as an asset so the update can take it down before the restart.
-fn changelog_url(base: &str, version: &semver::Version) -> String {
+/// as an asset so an update can take it down before the restart and a start that
+/// has none can still read it.
+fn changelog_url(base: &str, version: &str) -> String {
     format!("{base}/releases/download/v{version}/changelog.txt")
 }
 
-/// How long the release's change list may take before the update goes on without
-/// it. The fetch runs beside the archive download, so this is the most an
-/// unreachable list can add to the update.
+/// The release page of `version` — where the same change list is published for a
+/// person to read, and what the notice names when it cannot carry the list.
+fn release_page_url(base: &str, version: &str) -> String {
+    format!("{base}/releases/tag/v{version}")
+}
+
+/// How long the release's change list may take before the update or the notice
+/// goes on without it. It is the real cap on both attempts: the HTTP client it is
+/// given outlives it, and this deadline fires first.
 const CHANGELOG_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Read a release's change list, if it carries one. A missing asset (a release
 /// published before the list travelled with the build) and an empty one are both
-/// `None`, which the notice renders as "unavailable".
-async fn fetch_release_changelog(
-    client: &reqwest::Client,
-    version: &semver::Version,
-) -> Option<String> {
+/// `None`. Asked once beside the archive download and again while the notice is
+/// composed, and nothing but `None` is remembered, so a failure here never marks
+/// the list unavailable for good.
+async fn fetch_release_changelog(client: &reqwest::Client, version: &str) -> Option<String> {
     let url = changelog_url(&release_base_url(), version);
     let fetch = async {
         let response = match client.get(&url).send().await {
@@ -1373,11 +1466,36 @@ async fn fetch_release_changelog(
 }
 
 /// Record the release's change list for the first start of `target`, while the
-/// update is still running: that start may be offline, and must not consume the
-/// notice with "unavailable" while the list exists.
-async fn capture_update_announcement(target: &semver::Version, changes: Option<String>) {
+/// update is still running: that start may be offline, and asks the release
+/// again rather than announcing "unavailable" while the list exists.
+///
+/// Only the download path captures, and the archive it installs is a release
+/// file with no build source on the owner's machine — a published copy — so the
+/// notice this record waits for is one that will actually be sent. What is
+/// recorded here survives until that notice has been handed over; see
+/// [`settle_update_notice`].
+async fn capture_update_announcement(
+    store: &crate::config_db::ConfigStore,
+    version: &str,
+    changes: Option<String>,
+) {
+    // A list already recorded for this version is never replaced, and a record
+    // that cannot be read is never written over: an update whose list came down
+    // the first time must not lose it to a second attempt whose fetch came back
+    // empty.
+    match pending_changelog(store, version).await {
+        Ok(Some(pending)) if pending.changes.is_some() => {
+            debug!(version, "The release's change list is already captured");
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "Could not read the captured update change list — it is left alone");
+            return;
+        }
+    }
     let pending = PendingChangelog {
-        version: target.to_string(),
+        version: version.to_string(),
         changes,
     };
     let value = match serde_json::to_string(&pending) {
@@ -1387,10 +1505,7 @@ async fn capture_update_announcement(target: &semver::Version, changes: Option<S
             return;
         }
     };
-    if let Err(e) = crate::config_db::store()
-        .set_kv(UPDATE_PENDING_CHANGELOG_KV_KEY, &value)
-        .await
-    {
+    if let Err(e) = store.set_kv(UPDATE_PENDING_CHANGELOG_KV_KEY, &value).await {
         warn!(error = %e, "Could not record the update change list");
     }
 }
@@ -1772,6 +1887,7 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
     let (os, arch) = crate::util::managed_bin::host_os_arch().map_err(|e| anyhow!("{e}"))?;
     let name = asset_name(&target, os, arch);
     let url = asset_url(&release_base_url(), &target, os, arch);
+    let version = target.to_string();
     let client = crate::util::http::build_download_client(DOWNLOAD_TIMEOUT)
         .context("Failed to build the download client for self-update")?;
     let archive = temp_dir.path().join(&name);
@@ -1791,7 +1907,7 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
             crate::util::http::DownloadSizeCheck::Exact,
             |_, _| {},
         ),
-        fetch_release_changelog(&client, &target),
+        fetch_release_changelog(&client, &version),
     );
     downloaded.with_context(|| format!("Failed to download {name}"))?;
     // The archive runs a zip for Windows and a tar.gz everywhere else — the
@@ -1857,9 +1973,9 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
 
     // 8. Record the release's change list for the first start of the new version
     //    — the list was taken down with the archive above, before the restart. A
-    //    release that carries none is recorded as unavailable; neither case can
-    //    fail the update.
-    capture_update_announcement(&target, changes).await;
+    //    release that carries none is recorded without one, and that start asks
+    //    the release again; neither case can fail the update.
+    capture_update_announcement(crate::config_db::store(), &version, changes).await;
 
     // 9. Notify: in place, then wrapping up before the restart (MUST be before
     //    the shutdown in finalize_update_and_restart — the Telegram channel must
@@ -2772,7 +2888,8 @@ mod tests {
 
     /// The asset-name and URL derivation is the contract the release workflow and
     /// the install scripts mirror, so it is pinned here: the platform tag, the
-    /// extension, and both URL shapes.
+    /// extension, and all three URL shapes — the version file, the change-list
+    /// asset and the release page the notice falls back to.
     #[test]
     fn test_release_asset_naming_and_urls() {
         let base = "https://example.test/owner/repo";
@@ -2792,7 +2909,9 @@ mod tests {
         }
 
         // The newest release is found through its own tiny file, an exact version
-        // through its tag; the change list travels with that same release.
+        // through its tag; the change list travels with that same release, and the
+        // page it was published on is what the notice names when it cannot carry
+        // the list.
         assert_eq!(
             latest_version_url(base),
             "https://example.test/owner/repo/releases/latest/download/version.txt"
@@ -2802,11 +2921,15 @@ mod tests {
             "https://example.test/owner/repo/releases/download/v1.2.3/mahbot-1.2.3-windows-x86_64.zip"
         );
         assert_eq!(
-            changelog_url(base, &version),
+            changelog_url(base, "1.2.3"),
             "https://example.test/owner/repo/releases/download/v1.2.3/changelog.txt"
         );
+        assert_eq!(
+            release_page_url(base, "1.2.3"),
+            "https://example.test/owner/repo/releases/tag/v1.2.3"
+        );
 
-        // A pre-release version — what a test release carries — uses the same two
+        // A pre-release version — what a test release carries — uses the same
         // shapes, so it needs no separate path.
         let test_release = semver::Version::parse("1.2.3-rc.1").unwrap();
         assert_eq!(
@@ -2816,60 +2939,294 @@ mod tests {
         );
     }
 
-    /// The notice's whole rule: a restart of the same version, a source build and
-    /// an unfinished setup say nothing; a published copy on a different version —
-    /// or the first start of one installed by a build that predates the record —
-    /// announces.
+    /// The notice's whole rule: a restart of the same version, a build from
+    /// source and a first install during setup say nothing; a published copy on a
+    /// different version — or the first start of one installed by a build that
+    /// predates the record — announces; a list the update left behind is
+    /// announced even over a version already recorded, and waits while setup is
+    /// unfinished.
     #[test]
     fn test_the_update_notice_is_only_for_a_downloaded_version_change() {
         let current = "1.2.3";
-        let case = |last, published, onboarding| {
-            update_notice_action(last, current, published, onboarding)
+        let case = |last, published, onboarding, owed| {
+            update_notice_action(last, current, published, onboarding, owed)
         };
 
-        // The version already ran: nothing to settle.
-        assert_eq!(case(Some(current), true, true), UpdateNotice::Unchanged);
-
-        // A first install, a build from source and an unfinished setup record the
-        // version without telling anyone.
+        // The version already ran with nothing owed: nothing to settle.
         assert_eq!(
-            case(None, false, true),
-            UpdateNotice::Record { announce: false }
+            case(Some(current), true, true, false),
+            UpdateNotice::Unchanged
+        );
+        // A build from source never announces, whatever its version string says.
+        assert_eq!(
+            case(Some(current), false, true, false),
+            UpdateNotice::Unchanged
         );
         assert_eq!(
-            case(None, true, false),
-            UpdateNotice::Record { announce: false }
+            case(Some("1.2.2"), false, true, false),
+            UpdateNotice::RecordSilently
         );
-        assert_eq!(
-            case(Some("1.2.2"), false, true),
-            UpdateNotice::Record { announce: false }
-        );
-        assert_eq!(
-            case(Some("1.2.2"), true, false),
-            UpdateNotice::Record { announce: false }
-        );
-
         // A published copy with finished setup on a new version — including the
-        // first start of one installed by a build that predates the record.
+        // first start of one installed by a build that predates the record —
+        // announces; a first install during setup and a new version during setup
+        // record only.
+        assert_eq!(case(None, true, true, false), UpdateNotice::Announce);
         assert_eq!(
-            case(None, true, true),
-            UpdateNotice::Record { announce: true }
+            case(Some("1.2.2"), true, true, false),
+            UpdateNotice::Announce
+        );
+        assert_eq!(case(None, true, false, false), UpdateNotice::RecordSilently);
+        assert_eq!(
+            case(Some("1.2.2"), true, false, false),
+            UpdateNotice::RecordSilently
+        );
+        // The list the update brought is announced even over a version this
+        // installation already recorded — a start that stopped before the
+        // hand-over is repeated — and it waits, unspent, while setup is
+        // unfinished.
+        assert_eq!(
+            case(Some(current), true, true, true),
+            UpdateNotice::Announce
+        );
+        assert_eq!(case(None, true, true, true), UpdateNotice::Announce);
+        // An owed list waits, unspent, while setup is unfinished: nothing is
+        // recorded and nothing is dropped.
+        assert_eq!(
+            case(Some("1.2.2"), true, false, true),
+            UpdateNotice::Unchanged
         );
         assert_eq!(
-            case(Some("1.2.2"), true, true),
-            UpdateNotice::Record { announce: true }
+            case(Some(current), true, false, true),
+            UpdateNotice::Unchanged
+        );
+        assert_eq!(case(None, true, false, true), UpdateNotice::Unchanged);
+        assert_eq!(
+            case(Some("1.2.2"), false, true, true),
+            UpdateNotice::RecordSilently
+        );
+        assert_eq!(
+            case(Some(current), false, true, true),
+            UpdateNotice::Unchanged
         );
     }
 
-    /// The rendered notice is one tagged, self-explanatory block in both states.
+    /// The rendered notice is one tagged, self-explanatory block in both states,
+    /// and without a list it names the release page that carries it.
     #[test]
     fn test_the_update_notice_carries_the_version_and_the_list() {
-        let with_list = update_notice_text("1.2.3", Some("* a new capability"));
+        let page = "https://example.test/owner/repo/releases/tag/v1.2.3";
+
+        let with_list = update_notice_text("1.2.3", Some("* a new capability"), page);
         assert!(with_list.starts_with("<product-update version=\"1.2.3\">"));
         assert!(with_list.contains("* a new capability"));
 
-        let without_list = update_notice_text("1.2.3", None);
+        let without_list = update_notice_text("1.2.3", None, page);
         assert!(without_list.starts_with("<product-update version=\"1.2.3\">"));
+        assert!(without_list.contains(page));
+    }
+
+    /// A list already captured for a version is never replaced by an attempt whose
+    /// fetch came back empty, and a record captured without one is filled in by a
+    /// later attempt that got it.
+    #[tokio::test]
+    async fn test_a_captured_list_is_never_replaced_by_an_empty_one() {
+        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        capture_update_announcement(&store, "1.2.3", Some("* a change".to_string())).await;
+        capture_update_announcement(&store, "1.2.3", None).await;
+        let raw = store
+            .get_kv(UPDATE_PENDING_CHANGELOG_KV_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = pending_changelog_from_str(&raw, "1.2.3").expect("the record holds");
+        assert_eq!(pending.changes.as_deref(), Some("* a change"));
+
+        capture_update_announcement(&store, "1.2.4", None).await;
+        capture_update_announcement(&store, "1.2.4", Some("* filled in".to_string())).await;
+        let raw = store
+            .get_kv(UPDATE_PENDING_CHANGELOG_KV_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = pending_changelog_from_str(&raw, "1.2.4").expect("the record holds");
+        assert_eq!(pending.changes.as_deref(), Some("* filled in"));
+    }
+
+    /// The reported failure: an update that brought no list — one made by a build
+    /// that predates the capture, by the install scripts, or by an update whose own
+    /// fetch failed — still announces the release's change list, read at the moment
+    /// the notice is composed.
+    #[tokio::test]
+    async fn test_a_notice_without_a_carried_list_reads_the_releases_own() {
+        // Nothing captured at all: the version record is the only trace of the
+        // update that installed this copy.
+        let (bare, _bare_dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        bare.set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, "1.2.2")
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        settle_update_notice(
+            &bare,
+            "1.2.3",
+            true,
+            true,
+            async |_| Some("* a new capability".to_string()),
+            |content| delivered.push(content),
+        )
+        .await;
+
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].contains("* a new capability"));
+        assert_eq!(
+            bare.get_kv(UPDATE_LAST_RUN_VERSION_KV_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1.2.3")
+        );
+
+        // A capture whose own fetch failed carries no list; the read at notice time
+        // is what fills it in.
+        let (failed, _failed_dir) =
+            crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        failed
+            .set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, "1.2.2")
+            .await
+            .unwrap();
+        failed
+            .set_kv(
+                UPDATE_PENDING_CHANGELOG_KV_KEY,
+                r#"{"version":"1.2.3","changes":null}"#,
+            )
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        settle_update_notice(
+            &failed,
+            "1.2.3",
+            true,
+            true,
+            async |_| Some("* a change the fetch missed".to_string()),
+            |content| delivered.push(content),
+        )
+        .await;
+
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].contains("* a change the fetch missed"));
+    }
+
+    /// A list the update captured outlives a start that does not announce: an
+    /// unfinished setup records nothing and drops nothing, and the next start of
+    /// the same version announces it.
+    #[tokio::test]
+    async fn test_a_start_that_does_not_announce_keeps_the_captured_list() {
+        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        store
+            .set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, "1.2.2")
+            .await
+            .unwrap();
+        let captured = r#"{"version":"1.2.3","changes":"* a change"}"#;
+        store
+            .set_kv(UPDATE_PENDING_CHANGELOG_KV_KEY, captured)
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        settle_update_notice(
+            &store,
+            "1.2.3",
+            true,
+            false,
+            async |_| None,
+            |content| delivered.push(content),
+        )
+        .await;
+        assert!(delivered.is_empty(), "an unfinished setup tells no one");
+        assert_eq!(
+            store
+                .get_kv(UPDATE_LAST_RUN_VERSION_KV_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1.2.2")
+        );
+        assert_eq!(
+            store
+                .get_kv(UPDATE_PENDING_CHANGELOG_KV_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(captured)
+        );
+
+        settle_update_notice(
+            &store,
+            "1.2.3",
+            true,
+            true,
+            async |_| None,
+            |content| delivered.push(content),
+        )
+        .await;
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].contains("* a change"));
+        assert_eq!(
+            store
+                .get_kv(UPDATE_LAST_RUN_VERSION_KV_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1.2.3")
+        );
+        assert!(
+            store
+                .get_kv(UPDATE_PENDING_CHANGELOG_KV_KEY)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A list that cannot be obtained at all is named as unavailable with the
+    /// release page it can be read on, and the failure is not remembered: a record
+    /// captured for another version is left for that version's own start.
+    #[tokio::test]
+    async fn test_an_unobtainable_list_names_the_release_page() {
+        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        store
+            .set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, "1.2.2")
+            .await
+            .unwrap();
+        let other = r#"{"version":"1.1.0","changes":"* an older change"}"#;
+        store
+            .set_kv(UPDATE_PENDING_CHANGELOG_KV_KEY, other)
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        settle_update_notice(
+            &store,
+            "1.2.3",
+            true,
+            true,
+            async |_| None,
+            |content| delivered.push(content),
+        )
+        .await;
+
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].contains("/releases/tag/v1.2.3"));
+        assert_eq!(
+            store
+                .get_kv(UPDATE_PENDING_CHANGELOG_KV_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(other),
+            "a list captured for another version is not spent"
+        );
     }
 
     /// The captured list is used only for the version it was taken for: a record

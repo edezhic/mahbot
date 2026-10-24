@@ -192,8 +192,8 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
 
     // An update delivered by the release pipeline leaves its change list behind
     // before the restart; this is the one place it reaches the admin assistant,
-    // through the same queue a message from the owner enters. The once-only
-    // record is written inside, before the notice is handed over.
+    // through the same queue a message from the owner enters. Everything the
+    // notice settles is recorded inside, after it has been handed over.
     tokio::spawn(mahbot::self_update::announce_update_to_assistant());
 
     Ok(log_store.as_ref().clone())

@@ -692,9 +692,10 @@ fn assistant_notice_job(content: String, user_name: &str) -> AgentJob {
 /// with no `pending_jobs` row.
 ///
 /// This is the at-most-once sibling of [`deliver_assistant_notice`]: a durable
-/// row is replayed at boot, so a producer that owns its own once-only record and
-/// writes it before calling here must never also persist the envelope — losing
-/// the notice in a crash is preferable to repeating it.
+/// row is replayed at boot, so a producer that owns its own bookkeeping must
+/// never also persist the envelope. It records nothing itself, so a caller that
+/// wants a repeat rather than a loss settles its own record only after this
+/// returns — the update notice does exactly that.
 pub(crate) fn post_assistant_notice(agent_id: &str, user_name: &str, content: String) {
     route(agent_id, assistant_notice_job(content, user_name));
 }
