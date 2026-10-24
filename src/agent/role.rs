@@ -287,6 +287,11 @@ use crate::tools::{
     VideoGenTool, WebSearchBackend, WebSearchTool, WorkspaceTool,
 };
 
+/// Tools in the admin Assistant's set that a custom role is never offered or
+/// built: the `computer` surface is the administrator's Assistant's alone. A
+/// stored entry naming one stays on the record and builds nothing.
+const CUSTOM_ROLE_WITHHELD_TOOLS: &[&str] = &["computer"];
+
 impl Role {
     /// Core read/search tools — plus the shell in `shell` mode when one is
     /// requested — for the inspector roles (Analyst, QA, Reviewer, Discovery,
@@ -341,6 +346,9 @@ impl Role {
     /// / pipeline tools, whose access level and `analyze` flavour also follow it.
     /// It narrows it in one place — `archive`, which exists only because a guest
     /// has no shell.
+    ///
+    /// A custom role's derivation ([`Self::custom_role_tools`]) starts from this
+    /// same set minus [`CUSTOM_ROLE_WITHHELD_TOOLS`].
     fn assistant_core_tools(is_admin: bool) -> Vec<Box<dyn Tool>> {
         // The optional `place` argument belongs to the admin's Assistant: a
         // guest's round always runs in its own workspace, and a custom role's
@@ -406,7 +414,8 @@ impl Role {
             // No structural authorization gate beyond `is_admin`, matching
             // the full shell widening; on macOS the three privacy grants
             // belong to the terminal the daemon runs from and are requested
-            // per call (see `tools/computer/macos.rs`).
+            // per call (see `tools/computer/macos.rs`). A custom role is never
+            // offered it ([`CUSTOM_ROLE_WITHHELD_TOOLS`]).
             t.push(Box::new(ComputerTool));
             // The admin config surface: the merged `mahbot_config`
             // setup tool and the read-only DB query tool. The admin's
@@ -419,6 +428,16 @@ impl Role {
             t.push(Box::new(WorkspaceTool));
         }
         t
+    }
+
+    /// The admin Assistant's own set as a custom role sees it: the same list
+    /// minus [`CUSTOM_ROLE_WITHHELD_TOOLS`]. Both the catalogue and the built
+    /// tool set start here, so neither can offer or build a withheld tool.
+    fn custom_role_base_tools() -> Vec<Box<dyn Tool>> {
+        Self::assistant_core_tools(true)
+            .into_iter()
+            .filter(|tool| !CUSTOM_ROLE_WITHHELD_TOOLS.contains(&tool.name()))
+            .collect()
     }
 
     /// Build the tool set for this role.
@@ -511,11 +530,11 @@ impl Role {
             }
             Role::Assistant => Self::assistant_core_tools(is_admin),
             // A custom role's tools come from its own record — the
-            // administrator's chosen subset of this static Assistant set
-            // ([`Role::custom_role_tools`], catalogued by
-            // [`Role::custom_role_tool_catalog`]) — so the static factory has
-            // none for it. The agent is built from the record at launch, never
-            // from here.
+            // administrator's chosen subset of this static Assistant set minus
+            // [`CUSTOM_ROLE_WITHHELD_TOOLS`] ([`Role::custom_role_tools`],
+            // catalogued by [`Role::custom_role_tool_catalog`]) — so the static
+            // factory has none for it. The agent is built from the record at
+            // launch, never from here.
             Role::Custom => Vec::new(),
         };
 
@@ -530,8 +549,9 @@ impl Role {
     }
 
     /// The tool set of a custom role: the subset of the admin Assistant's core
-    /// tools (at the admin's own strength) named by the role's record, plus the
-    /// configured `web_search` and the granted dispatch tools with their kinds.
+    /// tools (at the admin's own strength, minus [`CUSTOM_ROLE_WITHHELD_TOOLS`])
+    /// named by the role's record, plus the configured `web_search` and the
+    /// granted dispatch tools with their kinds.
     ///
     /// Each stored entry is `"tool"` (its narrowest kind) or `"tool:kind1,kind2"`
     /// (see [`crate::tools::grants`]). The two dispatch tools (`analyze`, `send`)
@@ -545,15 +565,16 @@ impl Role {
     /// A chosen tool the installation cannot serve right now (a platform-gated
     /// or configuration-dependent tool) is simply absent from the built list —
     /// the record keeps the choice, and the launch carries on with what it can
-    /// serve. The caller applies `is_advertised()` to the result (as
-    /// [`crate::agent::role_tools_and_specs`] does for every role).
+    /// serve. A stored entry naming a withheld tool is the same: it stays on the
+    /// record and builds nothing. The caller applies `is_advertised()` to the
+    /// result (as [`crate::agent::role_tools_and_specs`] does for every role).
     #[must_use]
     pub(crate) fn custom_role_tools(entries: &[String]) -> Vec<Box<dyn Tool>> {
         // One unparsable stored entry drops itself alone, never the record's
         // whole tool set.
         let grants = crate::tools::grants::parse_lossy(entries);
         let granted: Vec<&str> = grants.iter().map(|grant| grant.tool.as_str()).collect();
-        let mut tools: Vec<Box<dyn Tool>> = Self::assistant_core_tools(true)
+        let mut tools: Vec<Box<dyn Tool>> = Self::custom_role_base_tools()
             .into_iter()
             // The dispatch tools are rebuilt from their grants below, never taken
             // from the static admin set (the grants carry the kinds).
@@ -592,13 +613,14 @@ impl Role {
     }
 
     /// The catalog a custom role's tool subset is chosen from: the admin
-    /// Assistant's static core tool names plus `"web_search"` — offered even
-    /// before a provider is configured, so a role keeps its choice across a
-    /// provider change. This is the list the settings picker shows and
-    /// [`crate::custom_role::validate_tools_against`] accepts.
+    /// Assistant's static core tool names minus [`CUSTOM_ROLE_WITHHELD_TOOLS`],
+    /// plus `"web_search"` — offered even before a provider is configured, so a
+    /// role keeps its choice across a provider change. This is the list the
+    /// settings picker shows and [`crate::custom_role::validate_tools_against`]
+    /// accepts.
     #[must_use]
     pub(crate) fn custom_role_tool_catalog() -> Vec<&'static str> {
-        let mut names: Vec<&'static str> = Self::assistant_core_tools(true)
+        let mut names: Vec<&'static str> = Self::custom_role_base_tools()
             .iter()
             .map(|tool| tool.name())
             .collect();
@@ -720,15 +742,27 @@ mod tests {
     }
 
     /// A custom role's tools are exactly the chosen subset of the admin
-    /// Assistant's own set: a servable name builds, a name the installation
-    /// cannot serve is simply absent (the record keeps it), and `sleep` is part
-    /// of what a role may choose.
+    /// Assistant's own set minus computer use: a servable name builds, a name the
+    /// installation cannot serve is simply absent (the record keeps it), and
+    /// `sleep` is part of what a role may choose.
     #[test]
     fn custom_role_tools_are_the_chosen_subset_of_the_admin_set() {
         let catalog = Role::custom_role_tool_catalog();
         assert!(
             catalog.contains(&"sleep"),
             "sleep must be selectable — it is how a role ends a quiet turn"
+        );
+        // The catalogue loses only computer use; every other tool of the admin's
+        // own set stays choosable.
+        let mut expected: Vec<&str> = Role::assistant_core_tools(true)
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| *name != "computer")
+            .collect();
+        expected.push("web_search");
+        assert_eq!(
+            catalog, expected,
+            "the catalogue is the admin set minus computer use, plus web_search"
         );
         let all_names: Vec<String> = catalog.iter().map(ToString::to_string).collect();
         let built: Vec<&str> = Role::custom_role_tools(&all_names)
@@ -757,6 +791,31 @@ mod tests {
         chosen_names.sort_unstable();
         assert_eq!(chosen_names, vec!["read", "sleep"]);
         assert!(Role::custom_role_tools(&[]).is_empty());
+    }
+
+    /// Computer use stays with the administrator's Assistant: no custom role is
+    /// offered it, and a stored grant naming it keeps the record intact while
+    /// building nothing.
+    #[test]
+    fn computer_use_is_never_a_custom_roles_tool() {
+        assert!(
+            !Role::custom_role_tool_catalog().contains(&"computer"),
+            "computer use must not be offered to a custom role"
+        );
+        let built = |entries: &[&str]| -> Vec<&str> {
+            let entries: Vec<String> = entries.iter().map(|s| (*s).to_string()).collect();
+            Role::custom_role_tools(&entries)
+                .iter()
+                .map(|tool| tool.name())
+                .collect()
+        };
+        let withheld = built(&["computer"]);
+        assert!(
+            withheld.is_empty(),
+            "a stored `computer` grant must build nothing, got {withheld:?}"
+        );
+        // The withheld entry costs the record nothing else.
+        assert_eq!(built(&["read", "computer"]), vec!["read"]);
     }
 
     /// A granted dispatch tool is built with exactly the kinds its entry names,
@@ -1194,8 +1253,10 @@ mod tests {
         // static tool set and in no other role's. Every other role (and a
         // guest's Assistant) relies on delegation (chrome/analyze/shell) rather
         // than direct local GUI access, so the tool must never leak into their
-        // static toolset. (A custom role may choose `computer` from the
-        // catalogue derived from that admin set.)
+        // static toolset. A custom role cannot be granted it either
+        // ([`CUSTOM_ROLE_WITHHELD_TOOLS`]): its set is derived per record, never
+        // static, so that half is pinned by
+        // `computer_use_is_never_a_custom_roles_tool`.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for is_admin in [false, true] {

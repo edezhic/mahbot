@@ -687,8 +687,8 @@ fn sync_voice_state(enabled: bool) {
     }
 }
 
-/// Height of the custom-role tool picker's viewport — the catalogue is ~22
-/// entries, so the list is bounded instead of stretching the window to fit it.
+/// Height of the custom-role tool picker's viewport — the catalogue overflows
+/// the window, so the list is bounded instead of stretching it to fit.
 const TOOL_PICKER_HEIGHT: f32 = 260.0;
 
 /// Vertical space the custom-role window must leave to everything outside its

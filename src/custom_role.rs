@@ -321,12 +321,13 @@ fn validate_segment(value: &str, max_chars: usize, what: &str) -> Result<()> {
 /// role may be given ([`crate::Role::custom_role_tool_catalog`]). Each entry is
 /// `"tool"` (the tool with its narrowest kind) or `"tool:kind1,kind2"` (see
 /// [`crate::tools::grants`]); an empty subset is allowed, an unknown tool name,
-/// an unknown kind and a tool named twice are not.
+/// a tool a custom role cannot hold, an unknown kind and a tool named twice are
+/// not.
 ///
 /// Names the record ALREADY holds are exempt from the catalog check: a tool the
-/// catalog lists but this installation cannot serve right now stays on the
-/// record — the launch simply omits it — so editing another field must never
-/// drop it.
+/// catalog lists but this installation cannot serve right now, or one a custom
+/// role is no longer offered, stays on the record — the launch simply omits the
+/// tool — so editing another field must never drop it.
 pub(crate) fn validate_tools_against(tools: &[String], held: &[String]) -> Result<()> {
     let catalog = crate::Role::custom_role_tool_catalog();
     // parse() validates the grammar: an unknown kind, a kind on a kindless tool,
@@ -339,7 +340,7 @@ pub(crate) fn validate_tools_against(tools: &[String], held: &[String]) -> Resul
     for grant in &grants {
         anyhow::ensure!(
             held.contains(&grant.tool.as_str()) || catalog.contains(&grant.tool.as_str()),
-            "unknown tool '{}' for a custom role",
+            "tool '{}' is not available to a custom role",
             grant.tool
         );
     }
@@ -384,6 +385,14 @@ mod tests {
         assert!(
             validate_tools_against(&entries(&["gone"]), &entries(&["gone"])).is_ok(),
             "a name the record already holds stays valid"
+        );
+        assert!(
+            validate_tools_against(&entries(&["computer"]), &[]).is_err(),
+            "computer use is not offered to a custom role"
+        );
+        assert!(
+            validate_tools_against(&entries(&["computer"]), &entries(&["computer"])).is_ok(),
+            "a stored computer grant is left alone when the record is edited"
         );
     }
 
