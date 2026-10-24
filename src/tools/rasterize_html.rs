@@ -110,15 +110,18 @@ async fn capture(
     if let Some(hook) = capture_stand_in() {
         return hook(page_url);
     }
-    ChromeTool::ensure_available()
-        .await
-        .map_err(|error| anyhow::anyhow!("cannot render {name}: {error:#}"))?;
+    // Resolved before the gate so a definitively missing helper keeps the
+    // product's own install path: the gate's text is audience-neutral, and the
+    // rasteriser is the surface that still points at it.
     let cli = super::chrome_daemon::cli_path().ok_or_else(|| {
         anyhow::anyhow!(
             "cannot render {name}: the browser helper is not installed. {}",
             super::chrome_daemon::CHROME_USE_INSTALL_HINT
         )
     })?;
+    ChromeTool::ensure_available()
+        .await
+        .map_err(|error| anyhow::anyhow!("cannot render {name}: {error:#}"))?;
     let mut session = RenderSession::new(cli, render_session_name());
     // Only the steps are inside the budget: a refusal at any of them still
     // reaches the teardown below, and a stop that runs past the budget is not

@@ -51,7 +51,7 @@ use crate::chrome::contract::{
     eval_count, eval_result, expect_outcome, extract_net_error_code, extract_output,
     extract_snapshot_text, is_session_unresponsive_error, is_unreachable_tab_error,
     net_error_phrase, parse_error_page_probe, parse_first, sanitize_timeout_message,
-    self_launched_browser_error, self_launched_browser_note, truncated_output_error,
+    self_launched_browser_cli_error, self_launched_browser_note, truncated_output_error,
     unreachable_tab_message, with_condition_timeout_note,
 };
 use crate::chrome::files::OneFileTarget;
@@ -2334,7 +2334,7 @@ fn classify_step_output(
 fn self_launched_failure(resp: &ChromeResponse) -> Option<StepFailure> {
     self_launched_browser_note(resp).map(|note| StepFailure {
         kind: OutKind::Environment,
-        message: self_launched_browser_error(&note),
+        message: self_launched_browser_cli_error(&note),
     })
 }
 
@@ -3150,7 +3150,7 @@ async fn read_stdin_capped() -> Result<Vec<u8>, String> {
 ///
 /// The browser-replacement note is never one of these: [`classify_step_output`]
 /// already turned such an envelope into an Environment failure before it could
-/// reach here (see [`self_launched_browser_error`]).
+/// reach here (see [`self_launched_browser_cli_error`]).
 fn text_input_ok_envelope(action: &str, base: &Value, resp: ChromeResponse) -> OutEnvelope {
     let warning = chrome_use_warning(&resp);
     let mut payload = base.as_object().cloned().unwrap_or_default();
@@ -4643,7 +4643,7 @@ mod tests {
             panic!("a browser chrome-use started itself must not classify as success")
         };
         assert_eq!(f.kind, OutKind::Environment);
-        assert_eq!(f.message, self_launched_browser_error(note));
+        assert_eq!(f.message, self_launched_browser_cli_error(note));
 
         // The expect-style success path (envelope trusted over a non-zero exit)
         // applies the same rule.

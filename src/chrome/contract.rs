@@ -139,24 +139,45 @@ pub(crate) fn self_launched_browser_note(resp: &ChromeResponse) -> Option<String
 const SELF_LAUNCHED_BROWSER_PREFIX: &str =
     "chrome-use launched a browser of its own for this command";
 
-/// The failure text for a call whose envelope carried
-/// [`self_launched_browser_note`]: the tool's own note, what it means, and what
-/// to do next. Shared by both frontends so the two surfaces cannot drift.
+/// The failure a call whose envelope carried [`self_launched_browser_note`] gets:
+/// the tool's own note, what it means, and — per audience, since both frontends
+/// share the diagnosis — what to do next.
 ///
 /// This is NOT the daemon-down path: the daemon and the relay may be perfectly
 /// healthy, and what was lost is the connection to the owner's real browser — so
 /// the call must never be reported as a quiet success, and the daemon must not be
 /// marked unhealthy for it (a daemon restart cannot bring a gone browser back).
 #[must_use]
-pub(crate) fn self_launched_browser_error(note: &str) -> String {
+fn self_launched_browser_diagnosis(note: &str) -> String {
     format!(
         "{SELF_LAUNCHED_BROWSER_PREFIX} ({note}). The work ended up in \
          a browser chrome-use started itself, not the owner's real logged-in Chrome — the tool \
          could not resolve the connection to the real browser, so the page state this action \
-         assumed is not there and nothing read or written here happened in the owner's session. \
-         Retry the action; if it keeps happening the relay or the chrome-use extension is the \
-         problem rather than the page — the chrome daemon itself is healthy, so check the \
-         extension at chrome://extensions and the relay, then retry."
+         assumed is not there and nothing read or written here happened in the owner's session."
+    )
+}
+
+/// The tool's copy of [`self_launched_browser_diagnosis`], for the agent driving
+/// it: retry, then hand the diagnosis over as it came — repairing the extension or
+/// the relay is the owner's side, not an agent's job.
+#[must_use]
+pub(crate) fn self_launched_browser_error(note: &str) -> String {
+    format!(
+        "{}. Retry the action; if it keeps happening, report it as it came — the extension and \
+         the relay are the owner's side to repair, not this tool's.",
+        self_launched_browser_diagnosis(note)
+    )
+}
+
+/// The `mahbot chrome` CLI's copy of [`self_launched_browser_diagnosis`], for the
+/// person reading the command's failure: it keeps the repair path the tool's copy
+/// deliberately leaves out.
+#[must_use]
+pub(crate) fn self_launched_browser_cli_error(note: &str) -> String {
+    format!(
+        "{}. Retry the action; if it keeps happening, check the extension at \
+         chrome://extensions and the relay, then retry.",
+        self_launched_browser_diagnosis(note)
     )
 }
 

@@ -568,11 +568,12 @@ const CHROME_USE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// indefinitely.
 const CHROME_USE_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Install hint for the definitive not-found case — appended to every
-/// user-facing message that names the chrome-use CLI as missing. The helper is
-/// checked automatically on every product start and updated when a newer release
-/// exists, so if it is still missing the automatic install failed: check the logs
-/// and it will retry on the next start.
+/// Install hint for the definitive not-found failure, for the surface that shows a
+/// person the product's own install path — the page rasteriser, which resolves the
+/// helper before the audience-neutral gate. The chrome tool's agent-facing copy
+/// carries no install or repair steps. The helper is checked automatically on every
+/// product start and updated when a newer release exists, so if it is still missing
+/// the automatic install failed: check the logs and it will retry on the next start.
 pub(crate) const CHROME_USE_INSTALL_HINT: &str = "It is checked automatically every time the \
      product starts and updated when a newer release exists — if it is still \
      missing or broken the automatic install failed; check the logs and it will \
@@ -2073,57 +2074,67 @@ pub(crate) fn note_unhealthy(error: &str) {
     wake().notify_one();
 }
 
-/// Actionable error shown when the daemon is down. Names the classified cause
-/// with its concrete fix, and reflects whether auto-recovery is active or
-/// frozen by thrash protection.
+/// Appended to every integration-level failure the chrome tool's agent reads,
+/// whichever cause was classified: what it does about one — report it as it came
+/// rather than paraphrased, and leave the repair to the owner, since an agent
+/// cannot repair the helper, the native host or Chrome — plus the workaround for
+/// a page that can still be fetched without the browser. Deliberately no
+/// install/enable/launch/reinstall steps: the copy that carries those is
+/// [`report_cause`]'s.
+pub(crate) const REPORT_AS_IT_CAME: &str = " Report it as it came rather than paraphrased, and leave the \
+     repair to the owner — it is not something an agent can fix. Meanwhile `web_search` or \
+     `shell` with `curl` can fetch a page instead.";
+
+/// The down message for the agent driving the chrome tool: [`daemon_down_cause`]
+/// plus what the agent does about it ([`REPORT_AS_IT_CAME`]).
 pub(crate) fn daemon_down_message() -> String {
+    format!("{}{REPORT_AS_IT_CAME}", daemon_down_cause())
+}
+
+/// The cause as it was established and what auto-recovery is doing about it, with
+/// no report tail: what the shared readiness gate answers, since the page
+/// rasteriser reads it too and must not inherit the chrome tool's advice.
+fn daemon_down_cause() -> String {
     let answered = last_readiness().filter(|r| r.answered);
     let h = health().lock().unwrap_poison();
     if h.verdict == Some(ProbeOutcome::Unknown) {
-        return unknown_down_message(answered.as_ref());
+        return unknown_down_cause(answered.as_ref());
     }
     let failure = h.failure();
     let cause = match failure {
         Some(ProbeFailure::NotInstalled) => {
-            "The chrome-use extension or native host is not installed — the chrome daemon \
-             cannot run. Enable the chrome-use extension at chrome://extensions (the CLI is \
-             installed at the start of every run of the product); health recovers \
-             automatically once it is installed."
+            "The chrome-use extension or its native host is not installed, so the browser \
+             daemon cannot run."
         }
         Some(ProbeFailure::HostBroken) => {
-            "The chrome-use native host launcher is broken — run `chrome-use doctor` to see why; \
-             health recovers automatically once it is fixed."
+            "The chrome-use native host launcher is broken, so the browser daemon cannot run."
         }
         Some(ProbeFailure::ExtensionDisabled) => {
-            "The chrome-use extension is disabled — enable it at chrome://extensions. Daemon \
-             restarts cannot fix a Chrome-side disable; health recovers automatically once \
-             it is enabled."
+            "The chrome-use extension is disabled in Chrome, so nothing can reach the browser. \
+             No daemon restart fixes a Chrome-side disable."
         }
         Some(ProbeFailure::ExtensionAbsent) => {
-            "The chrome-use extension is not installed in Chrome — install/enable it from the \
-             Chrome Web Store. Daemon restarts and launches cannot fix an absent extension; \
-             health recovers automatically once it is installed."
+            "The chrome-use extension is not installed in Chrome, so nothing can reach the \
+             browser. Daemon restarts and launches cannot fix an absent extension."
         }
         Some(ProbeFailure::RelayDown)
             if h.launch_outcome == Some(ChromeLaunchOutcome::Launched) =>
         {
-            "The extension relay is down even after Chrome was auto-launched — Chrome is \
-             running, but the ab-connect extension is not republishing. If the extension is \
-             only installed in a non-default profile, install it in Chrome's default profile."
+            "Chrome is running, but the extension is not republishing its relay — the usual \
+             cause is the extension being installed only in a non-default profile."
         }
         Some(ProbeFailure::RelayDown) => {
-            "The chrome-use extension relay is down (the extension itself is enabled). \
-             Auto-recovery restarts the session daemons and waits for the extension to \
-             reconnect."
+            "The chrome-use extension is enabled but its relay is down, so nothing reaches the \
+             browser."
         }
         Some(ProbeFailure::ChromeNotRunning) => match h.launch_outcome {
             None | Some(ChromeLaunchOutcome::Launched) => "Chrome is not running.",
             Some(ChromeLaunchOutcome::Failed) => {
-                "Chrome is not running and the auto-launch attempt failed (binary not found or \
-                 could not start) — start Chrome manually."
+                "Chrome is not running and the auto-launch failed on this host (no browser \
+                 binary, or it could not start)."
             }
             Some(ChromeLaunchOutcome::NoDisplay) => {
-                "Chrome is not running and this host has no display — start Chrome manually."
+                "Chrome is not running and this host has no display."
             }
         },
         Some(ProbeFailure::UnreachableTab) => {
@@ -2139,48 +2150,39 @@ pub(crate) fn daemon_down_message() -> String {
         // must not produce restart-halt text here.
         match h.launch_outcome {
             Some(ChromeLaunchOutcome::NoDisplay) => {
-                " Auto-recovery is paused for this cause — no launch will be attempted; it \
-                 resumes automatically once a display is available."
+                " Auto-recovery is paused on this host until a display is available."
             }
             _ if h.launch_budget.halted => {
-                " Auto-recovery exhausted its launch attempts and is in a 30-minute cooldown \
-                 (thrash protection); it will retry after the cooldown — start Chrome manually \
-                 if Chrome stays down."
+                " Launch attempts are paused in a 30-minute cooldown after repeated failures; \
+                 they resume automatically after it."
             }
-            Some(ChromeLaunchOutcome::Failed) => {
-                " Auto-recovery will retry the launch with backoff."
-            }
+            Some(ChromeLaunchOutcome::Failed) => " Auto-recovery retries the launch with backoff.",
             None | Some(ChromeLaunchOutcome::Launched) => {
-                " Auto-recovery will launch Chrome, backing off between attempts — no manual \
-                 action is needed."
+                " Auto-recovery launches Chrome and keeps retrying, so a retry in a moment can \
+                 work."
             }
         }
     } else if h.restart_budget.halted {
-        " Auto-recovery exhausted its restart attempts and is in a 30-minute cooldown (thrash \
-         protection); it will retry after the cooldown."
+        " Restart attempts are paused in a 30-minute cooldown after repeated failures; they \
+         resume automatically after it."
     } else if failure.is_some_and(ProbeFailure::is_unfixable) {
-        " Auto-recovery is paused for this cause — no restart will be attempted; it resumes \
-         automatically once the underlying issue is resolved."
+        " Auto-recovery is paused for this cause and resumes once it is resolved."
     } else {
-        " Auto-recovery was triggered and will restart it automatically — no manual action is \
-         needed (note: the restart resets chrome sessions)."
+        " Auto-recovery restarts it automatically and retries (the restart resets chrome \
+         sessions), so retry once after that."
     };
-    format!(
-        "{cause}{recovery} While it's down, use web_search, or shell `curl` for page fetches, \
-         instead of the chrome tool."
-    )
+    format!("{cause}{recovery}")
 }
 
-/// The down message for an `Unknown` verdict: not health and not a classified
-/// down cause, so nothing is named as one and nothing is restarted. When the
-/// tool DID answer (a fact inside its answer was missing), the readiness
-/// snapshot's own refusal names what could not be established and is what the
-/// caller gets; only a silent tool — no answered snapshot behind the verdict —
-/// is reported as not having answered.
-fn unknown_down_message(answered: Option<&Readiness>) -> String {
-    const TAIL: &str = " No cause was established, so no restart is attempted; re-checking \
-                        continues automatically. While it's down, use web_search, or shell `curl` \
-                        for page fetches, instead of the chrome tool.";
+/// The down cause for an `Unknown` verdict: not health and not a classified down
+/// cause, so nothing is named as one and nothing is restarted. When the tool DID
+/// answer (a fact inside its answer was missing), the readiness snapshot's own
+/// refusal names what could not be established and is what the caller gets; only a
+/// silent tool — no answered snapshot behind the verdict — is reported as not
+/// having answered.
+fn unknown_down_cause(answered: Option<&Readiness>) -> String {
+    const TAIL: &str = " No cause was established, so nothing is restarted and re-checking \
+                        continues automatically.";
     answered.map_or_else(
         || {
             format!(
@@ -2193,15 +2195,16 @@ fn unknown_down_message(answered: Option<&Readiness>) -> String {
 }
 
 /// The gate's refusal as a caller should see it: the readiness refusal, plus
-/// [`daemon_down_message`] when the stored verdict classified a failure — the
-/// bare fact list says what is missing, and the classified cause names the
-/// concrete remedy for it (which an `Unknown` verdict has none of, so nothing is
-/// appended then).
+/// [`daemon_down_cause`] when the stored verdict classified a failure — the bare
+/// fact list says what is missing, and the classified cause names what recovery is
+/// doing (an `Unknown` verdict has no cause, so nothing is appended then). No
+/// report tail: the shared gate serves the chrome tool and the page rasteriser
+/// alike, and the chrome tool adds its own sentence ([`daemon_down_message`]).
 #[must_use]
 pub(crate) fn refusal_message(refusal: &str) -> String {
     let classified = health().lock().unwrap_poison().failure().is_some();
     if classified {
-        format!("{refusal} {}", daemon_down_message())
+        format!("{refusal} {}", daemon_down_cause())
     } else {
         refusal.to_string()
     }
@@ -3192,8 +3195,11 @@ mod tests {
         assert!(!msg.contains("relay is down"), "got: {msg}");
         assert!(!msg.contains("not installed"), "got: {msg}");
         // An Unknown verdict has no classified cause, so `refusal_message` adds
-        // nothing to the gate's own facts.
-        assert_eq!(refusal_message("the facts"), "the facts");
+        // nothing to the gate's own facts — and no report tail either: the gate is
+        // shared with the page rasteriser, so the agent's sentence is the chrome
+        // tool's to add.
+        let refusal = refusal_message("the facts");
+        assert_eq!(refusal, "the facts");
 
         // The tool DID answer and a fact inside its answer was missing: the
         // snapshot's own refusal is accurate and must be what the caller reads —
@@ -3211,11 +3217,13 @@ mod tests {
             "got: {msg}"
         );
         assert!(msg.contains("re-checking continues"), "got: {msg}");
-        // …and a CLASSIFIED verdict's remedy IS appended to the gate's facts.
+        // …and a CLASSIFIED verdict's cause IS appended to the gate's facts — as a
+        // cause, still without the chrome tool's report tail.
         set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
         let msg = refusal_message("the facts");
         assert!(msg.starts_with("the facts "), "got: {msg}");
         assert!(msg.contains("relay is down"), "got: {msg}");
+        assert!(!msg.contains("Report it as it came"), "got: {msg}");
         set_readiness_snapshot(None);
         reset_health();
     }
@@ -3254,10 +3262,13 @@ mod tests {
 
         // Plain relay drop — no launch was attempted, so the auto-launch caveat
         // must not leak into the message (it names the relay and the restart).
+        // Every integration cause ends with the one thing the agent does about it.
         set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
         let msg = daemon_down_message();
         assert!(msg.contains("relay is down"));
         assert!(!msg.contains("auto-launched"));
+        assert!(msg.contains("Report it as it came"), "got: {msg}");
+        assert!(msg.contains("leave the repair to the owner"), "got: {msg}");
 
         // Relay still down after a successful auto-launch — the durable caveat
         // (non-default profile) surfaces instead of the plain relay-drop text.
@@ -3265,7 +3276,7 @@ mod tests {
         set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
         record_launch_outcome(ChromeLaunchOutcome::Launched);
         let msg = daemon_down_message();
-        assert!(msg.contains("even after Chrome was auto-launched"));
+        assert!(msg.contains("not republishing its relay"));
         assert!(msg.contains("non-default profile"));
 
         // Chrome not running with no recorded launch — the tail promises a
@@ -3274,17 +3285,21 @@ mod tests {
         set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
         let msg = daemon_down_message();
         assert!(msg.contains("Chrome is not running."));
-        assert!(msg.contains("will launch Chrome"));
+        assert!(msg.contains("launches Chrome and keeps retrying"));
 
         // Chrome not running, last launch failed — the failed-attempt cause and
-        // the backoff retry tail both appear (the launch budget is not halted).
+        // the backoff retry tail both appear (the launch budget is not halted),
+        // and no repair step is handed to the agent.
         reset_health();
         set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
         record_launch_outcome(ChromeLaunchOutcome::Failed);
         let msg = daemon_down_message();
-        assert!(msg.contains("auto-launch attempt failed"));
-        assert!(msg.contains("start Chrome manually"));
-        assert!(msg.contains("retry the launch with backoff"));
+        assert!(msg.contains("auto-launch failed on this host"));
+        assert!(
+            msg.contains("retries the launch with backoff"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("start Chrome manually"), "got: {msg}");
 
         // Same failed launch but the budget is halted (thrash protection) — the
         // cooldown text supersedes the backoff retry promise.
@@ -3293,8 +3308,8 @@ mod tests {
         record_launch_outcome(ChromeLaunchOutcome::Failed);
         health().lock().unwrap_poison().launch_budget.halted = true;
         let msg = daemon_down_message();
-        assert!(msg.contains("exhausted its launch attempts"));
-        assert!(!msg.contains("retry the launch with backoff"));
+        assert!(msg.contains("Launch attempts are paused"));
+        assert!(!msg.contains("retries the launch with backoff"));
 
         // Chrome not running because there is no display — recovery is paused
         // for this cause instead of spending the launch budget.
@@ -3303,21 +3318,24 @@ mod tests {
         record_launch_outcome(ChromeLaunchOutcome::NoDisplay);
         let msg = daemon_down_message();
         assert!(msg.contains("no display"));
-        assert!(msg.contains("paused for this cause"));
+        assert!(msg.contains("paused on this host"));
 
-        // Absent extension — the Web Store fix and the paused recovery tail.
+        // Absent extension — the cause, the paused recovery tail, and neither an
+        // install step nor a repair path for the agent.
         reset_health();
         set_health(ProbeOutcome::Down(ProbeFailure::ExtensionAbsent));
         let msg = daemon_down_message();
-        assert!(msg.contains("Chrome Web Store"));
-        assert!(msg.contains("no restart will be attempted"));
+        assert!(msg.contains("not installed in Chrome"));
+        assert!(msg.contains("is paused for this cause"));
+        assert!(!msg.contains("Web Store"), "got: {msg}");
+        assert!(!msg.contains("chrome://"), "got: {msg}");
 
         // Wedged daemon — the generic down text plus the restart tail.
         reset_health();
         set_health(ProbeOutcome::Down(ProbeFailure::DaemonWedge));
         let msg = daemon_down_message();
         assert!(msg.contains("down or unresponsive"));
-        assert!(msg.contains("restart it automatically"));
+        assert!(msg.contains("restarts it automatically"));
         // Leave the singleton pristine for sibling health tests.
         reset_health();
     }

@@ -211,13 +211,13 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "open",
-            purpose: "Navigate to a URL (returns page content automatically)",
+            purpose: "navigate to a URL (returns the snapshot)",
             tool: Some(ToolParams {
                 required: &["url"],
                 properties: json!({
                     "url": {
                         "type": "string",
-                        "description": "URL to navigate to"
+                        "description": "http(s) URL to open"
                     }
                 }),
             }),
@@ -278,21 +278,21 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "wait",
-            purpose: "wait until a CSS selector matches, the URL matches a pattern, or text appears",
+            purpose: "wait for exactly one of selector/url/text",
             tool: Some(ToolParams {
                 required: &[],
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector to wait for (give exactly ONE of selector/url/text)"
+                        "description": "CSS selector"
                     },
                     "url": {
                         "type": "string",
-                        "description": "URL pattern to wait for (give exactly ONE of selector/url/text)"
+                        "description": "URL pattern"
                     },
                     "text": {
                         "type": "string",
-                        "description": "Text to wait for in the page (give exactly ONE of selector/url/text)"
+                        "description": "Text to appear"
                     }
                 }),
             }),
@@ -314,37 +314,37 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "expect",
-            purpose: "assert a page condition (visible/hidden/present/count/text/value/attr/url) with a bounded wait",
+            purpose: "assert a condition, PASS/FAIL",
             tool: Some(ToolParams {
                 required: &["condition"],
                 properties: json!({
                     "condition": {
                         "type": "string",
-                        "description": "Condition to assert: visible | hidden | present | count | text | value | attr | url"
+                        "description": "visible|hidden|present|count|text|value|attr|url"
                     },
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector the condition applies to (required for all conditions except url)"
+                        "description": "CSS selector (except url)"
                     },
                     "count": {
                         "type": "integer",
-                        "description": "Expected element count (condition 'count')"
+                        "description": "element count"
                     },
                     "op": {
                         "type": "string",
-                        "description": "Comparison for condition 'count': == != > < >= <= (default ==)"
+                        "description": "== != > < >= <= (default ==)"
                     },
                     "predicate": {
                         "type": "string",
-                        "description": "Comparison for text/value/attr/url: equals | contains | matches (default equals)"
+                        "description": "equals | contains | matches (default equals)"
                     },
                     "name": {
                         "type": "string",
-                        "description": "Attribute name for condition 'attr'"
+                        "description": "attribute name"
                     },
                     "expected": {
                         "type": "string",
-                        "description": "Expected value for text/value/attr; the URL pattern for url"
+                        "description": "expected value; pattern for url"
                     }
                 }),
             }),
@@ -363,13 +363,13 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "eval",
-            purpose: "Run JavaScript in the page context. Use to inspect element attributes, check state, or debug.",
+            purpose: "run JavaScript",
             tool: Some(ToolParams {
                 required: &["js"],
                 properties: json!({
                     "js": {
                         "type": "string",
-                        "description": "JavaScript to run in the page context"
+                        "description": "JavaScript, no top-level return"
                     }
                 }),
             }),
@@ -384,17 +384,17 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "extract",
-            purpose: "extract rows from the page with a JSON schema file",
+            purpose: "extract rows with a schema",
             tool: Some(ToolParams {
                 required: &["schema"],
                 properties: json!({
                     "schema": {
                         "type": "object",
-                        "description": "Extraction schema: an optional \"rows\" CSS selector key for row-list extraction plus a required \"fields\" object. Each field maps to a CSS selector string or {\"sel\": \"<css>\", \"get\": \"<getter>\", \"all\": true}; getter is \"text\" (default), \"html\", \"value\", or \"@<attribute>\" — attributes REQUIRE the \"@\" prefix (e.g. \"@href\"; a bare attribute name is rejected mahbot-side). Example: {\"rows\": \".card\", \"fields\": {\"title\": \".title\", \"url\": {\"sel\": \"a\", \"get\": \"@href\"}}}"
+                        "description": "{\"rows\": \"<css>\", \"fields\": {\"<name>\": \"<css>\" | {\"sel\": \"<css>\", \"get\": \"text|html|value|@attr\", \"all\": true}}}; \"all\" returns an array of every match; attributes need the \"@\""
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Trim rows mahbot-side; total still reports the honest count"
+                        "description": "trim rows; total keeps the count"
                     }
                 }),
             }),
@@ -413,19 +413,19 @@ fn build_actions() -> Vec<ActionDesc> {
                 ],
                 session_refusal: None,
                 kinds: STEP_KINDS_WITH_EMPTY,
-                details: "The schema follows chrome-use's grammar: an optional \"rows\" selector plus a required \"fields\" object (field name → CSS selector or {sel, get, all}). Field getters: \"text\" (default), \"html\", \"value\", or \"@<attribute>\" (e.g. \"@href\"); attributes require the \"@\" prefix, and unknown getters are rejected kind usage (rc 3) instead of chrome-use's silent textContent fallback. When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3). If the count eval fails (e.g. an invalid CSS rows selector), the action errors explicitly — chrome-use's dominant-container auto-detect fallback is deliberately NOT used, because the gate exists to avoid phantom rows.",
+                details: "The schema follows chrome-use's grammar: an optional \"rows\" selector plus a \"fields\" object (field name → CSS selector or {sel, get, all}); a flat schema with no \"fields\" is normalized instead of refused. Field getters: \"text\" (default), \"html\", \"value\", or \"@<attribute>\" (e.g. \"@href\"); attributes require the \"@\" prefix, and unknown getters are rejected kind usage (rc 3) instead of chrome-use's silent textContent fallback. When the schema's rows selector matches 0 elements, the empty region is reported honestly (kind empty, rc 0) without invoking chrome-use's phantom-row extract. An unreadable or invalid schema file is kind usage (rc 3). If the count eval fails (e.g. an invalid CSS rows selector), the action errors explicitly — chrome-use's dominant-container auto-detect fallback is deliberately NOT used, because the gate exists to avoid phantom rows.",
                 examples: &["mahbot chrome extract --schema-file products.json --limit 20"],
             }),
         },
         ActionDesc {
             name: "click",
-            purpose: "Click an element by ref or CSS selector",
+            purpose: "click an element",
             tool: Some(ToolParams {
                 required: &["selector"],
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "Element ref (@e1) or CSS selector to click. Refs come from the most recent snapshot on this tab — they become stale after any navigation or re-snapshot"
+                        "description": "Ref (@e1) or CSS selector"
                     }
                 }),
             }),
@@ -449,17 +449,17 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "fill",
-            purpose: "clear an input/textarea/contenteditable and fill it with text (read-back verified)",
+            purpose: "fill a field (read back)",
             tool: Some(ToolParams {
                 required: &["selector", "text"],
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector or ref (@e1) of the input/textarea/contenteditable to fill. Refs come from the most recent snapshot on this tab — they become stale after navigation or re-snapshot"
+                        "description": "CSS selector or ref (@e1)"
                     },
                     "text": {
                         "type": "string",
-                        "description": "Text to write — replaces the existing content. Use this for multiline/large text"
+                        "description": "text to write, replacing content"
                     }
                 }),
             }),
@@ -484,21 +484,21 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "type",
-            purpose: "type text character-by-character into an element (appends, does not clear)",
+            purpose: "type, appending (no clear)",
             tool: Some(ToolParams {
                 required: &["selector", "text"],
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector or ref (@e1) of the input/textarea/contenteditable to type into. Refs come from the most recent snapshot on this tab — they become stale after navigation or re-snapshot"
+                        "description": "CSS selector or ref (@e1) of the field"
                     },
                     "text": {
                         "type": "string",
-                        "description": "Text to type character-by-character, appending to existing content. Embedded newlines press Enter (which can submit a form) — use fill for multiline text"
+                        "description": "text to append (a newline presses Enter)"
                     },
                     "key_events": {
                         "type": "boolean",
-                        "description": "Send real per-character keyDown/keyUp instead of insertText — for autocomplete/combobox fields that only react to key events"
+                        "description": "send real key events (autocomplete fields)"
                     }
                 }),
             }),
@@ -522,17 +522,17 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "press",
-            purpose: "Press a keyboard key at the current focus (e.g. Enter to submit forms)",
+            purpose: "press a key",
             tool: Some(ToolParams {
                 required: &["key"],
                 properties: json!({
                     "key": {
                         "type": "string",
-                        "description": "Key to press (e.g. Enter, Tab, Escape, Control+a, ArrowDown)"
+                        "description": "key to press (e.g. Enter, Escape)"
                     },
                     "selector": {
                         "type": "string",
-                        "description": "Try to focus this element (CSS selector or ref @e1) before pressing. Focus moves only if it is focusable (input, textarea, select, button, ...); a non-focusable selector (e.g. body) is a silent no-op and the key lands wherever focus currently is"
+                        "description": "focus it first (non-focusable: the key lands where focus is)"
                     }
                 }),
             }),
@@ -560,18 +560,18 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "upload",
-            purpose: "attach local files to the page's file input",
+            purpose: "attach local files",
             tool: Some(ToolParams {
                 required: &["selector", "files"],
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector or ref (@e1) of the file input, of the label that pairs with it, or of a container holding it. Refs come from the most recent snapshot on this tab — they become stale after navigation or re-snapshot"
+                        "description": "file input or its label"
                     },
                     "files": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Local files to attach: absolute paths, or paths relative to your workspace. The result names the absolute file each one was read from. Several files need a target that accepts several"
+                        "description": "absolute or workspace-relative paths"
                     }
                 }),
             }),
@@ -612,17 +612,17 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "snapshot",
-            purpose: "Get accessibility snapshot with element refs (@e1, @e2, ...)",
+            purpose: "accessibility tree with refs",
             tool: Some(ToolParams {
                 required: &[],
                 properties: json!({
                     "interactive_only": {
                         "type": "boolean",
-                        "description": "Only show interactive elements (buttons, links, inputs)"
+                        "description": "Only interactive elements"
                     },
                     "compact": {
                         "type": "boolean",
-                        "description": "Remove empty structural elements. Default: true"
+                        "description": "drop empty structure (default true)"
                     },
                     "depth": {
                         "type": "integer",
@@ -634,13 +634,13 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "get_text",
-            purpose: "Get text content of an element (uses DOM textContent — includes script/style content)",
+            purpose: "get rendered text",
             tool: Some(ToolParams {
                 required: &["selector"],
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "Element ref (@e1) or CSS selector. Refs come from the most recent snapshot — always snapshot before calling get_text with a ref"
+                        "description": "CSS selector or ref (@e1)"
                     }
                 }),
             }),
@@ -648,13 +648,13 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "get_innertext",
-            purpose: "Get visible rendered text of an element (uses innerText — no script/style content)",
+            purpose: "innerText eval; prefer get_text",
             tool: Some(ToolParams {
                 required: &["selector"],
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "Element ref (@e1) or CSS selector. Uses innerText() — returns only visible rendered text, no script/style content"
+                        "description": "CSS selector or ref (@e1)"
                     }
                 }),
             }),
@@ -662,7 +662,7 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "get_url",
-            purpose: "Get current URL",
+            purpose: "get the current URL",
             tool: Some(ToolParams {
                 required: &[],
                 properties: json!({}),
@@ -671,37 +671,37 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "find",
-            purpose: "Find an element by semantic locator and perform an action",
+            purpose: "find an element and act",
             tool: Some(ToolParams {
                 required: &["by", "value", "action"],
                 properties: json!({
                     "by": {
                         "type": "string",
-                        "description": "Locator type: text (case-sensitive visible text match, second most reliable for buttons/links/headings), role (accessibility tree role, use 'name' field to filter — but name filter can fail even when snapshot shows a match; fall back to 'text' or 'first' if it fails), label (matches <label for='...'> only), placeholder (EXACT match of HTML placeholder attribute — not accessible name shown in snapshot), alt, title (exact HTML title attribute), testid, first (CSS selector — MOST reliable for any element type), last (CSS selector), nth (CSS selector + index). For text inputs: prefer `by: \"first\"` with CSS selector (e.g. `\"input\"`, `\"textarea\"`) — role-based textbox locators are unreliable."
+                        "description": "text | role | label (accessible label) | placeholder | alt | title | testid | first | last | nth"
                     },
                     "value": {
                         "type": "string",
-                        "description": "Locator match target. For 'text': substring to search for (case-sensitive); for 'placeholder': exact HTML placeholder attribute value (NOT what snapshot shows — check with eval); for 'role': role name ('button', 'link', 'textbox', 'heading'); for 'label': visible <label> text; for 'first'/'last'/'nth': CSS selector (e.g. 'input', 'button', 'form')"
+                        "description": "what to locate (CSS for first/last/nth)"
                     },
                     "action": {
                         "type": "string",
-                        "description": "Action to perform: click (click element), fill (clear field then type), hover (hover over element), check (check checkbox/radio button), text (get element text content — does NOT use the 'text' param; the 'text' param is only for 'fill'). Press Enter after filling to submit forms."
+                        "description": "click | fill | hover | check | text (reads the element)"
                     },
                     "text": {
                         "type": "string",
-                        "description": "Text to fill into the element (for action 'fill')"
+                        "description": "Text for action fill"
                     },
                     "name": {
                         "type": "string",
-                        "description": "Accessible name filter (for role-based finding, e.g. 'Submit'). Note: this filter can fail even when the snapshot shows a matching element. When it fails, retry with `by: \"text\"` or `by: \"first\"` with a CSS selector."
+                        "description": "name filter for role"
                     },
                     "exact": {
                         "type": "boolean",
-                        "description": "Require exact text match"
+                        "description": "Whole-string match"
                     },
                     "index": {
                         "type": "integer",
-                        "description": "Zero-based index for `by: \"nth\"`. Required when by is 'nth'."
+                        "description": "Zero-based, for nth"
                     }
                 }),
             }),
@@ -709,7 +709,7 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "screenshot",
-            purpose: "capture the current page as a PNG picture",
+            purpose: "capture the page as an image",
             tool: Some(ToolParams {
                 required: &[],
                 properties: json!({}),

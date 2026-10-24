@@ -55,10 +55,15 @@ enum ChromeAction {
     },
     /// Click an element by ref (`@e1`) or CSS selector.
     Click { selector: String },
-    /// Extract text content from an element by CSS selector.
+    /// Extract an element's rendered text by CSS selector or ref — the
+    /// `get text` verb, whose own reader is `innerText || textContent`: rendered
+    /// text, except for an element with no rendered text of its own, where the
+    /// `textContent` fallback can include rendered-out `<script>`/`<style>` content.
     GetText { selector: String },
-    /// Extract visible rendered text from an element by CSS selector
-    /// (uses `innerText()` — no `<script>` or `<style>` content).
+    /// Extract rendered text through an `innerText` eval, falling back to
+    /// `get text` when the eval fails or answers empty. Kept for callers that
+    /// ask for it; `get_text` is the preferred reader (it is the helper's own,
+    /// not page-world JS the page can redefine).
     #[serde(alias = "get_innertext", alias = "innertext")]
     GetInnerText { selector: String },
     /// Get current URL.
@@ -138,13 +143,13 @@ enum ChromeAction {
         limit: Option<usize>,
     },
     /// Find an element by semantic locator and perform an action.
-    /// See `name()` doc block or the tool description for usage.
     Find {
-        /// Locator type: text (case-sensitive substring, second most reliable),
-        /// role (accessibility tree role),
-        /// label (matches `<label for='...'>` only),
-        /// placeholder (exact HTML placeholder attribute, NOT aria-label),
-        /// alt, title (exact HTML title attribute), testid,
+        /// Locator type: text (rendered text, case-sensitive substring),
+        /// role (accessibility-tree role; `name` filters on the computed
+        /// accessible name), label (the control's accessible label, which
+        /// includes `aria-label`), placeholder/alt/title (those HTML
+        /// attributes, matched as substrings — the snapshot shows accessible
+        /// names, not these), testid,
         /// first (CSS selector — most reliable), last (CSS selector), nth (CSS selector + index).
         by: String,
         /// Locator value. For 'text': substring to search for; for 'role':
@@ -159,7 +164,7 @@ enum ChromeAction {
         /// Note: this filter can fail even when the snapshot shows a matching element.
         /// When it fails, retry with `by: "text"` or `by: "first"` with CSS.
         name: Option<String>,
-        /// Require exact text match.
+        /// Require whole-string text match instead of a substring.
         exact: Option<bool>,
         /// Zero-based index for `by: "nth"`. Required when `by` is "nth".
         index: Option<u32>,
@@ -230,6 +235,12 @@ const SETTLE_ISSUE_MESSAGE: &str = "the agent's browser tab group was not left n
 const CLI_UNAVAILABLE: &str = "chrome-use CLI is not available";
 const CLI_SPAWN_FAILED: &str = "Failed to execute chrome-use CLI";
 const CLI_BOUND_EXCEEDED: &str = "chrome-use did not answer within";
+
+/// The one wording for a helper that cannot be used — absent or unusable — shared
+/// by the availability gate and the dispatch's own lookup so one condition never
+/// reads two ways.
+const HELPER_UNUSABLE: &str = "the product's own copy of the helper is absent or unusable, \
+     so nothing can reach the browser.";
 
 /// The workspace a chrome-use dispatch records when the surface driving it has
 /// none of its own: link enrichment summarizes a channel message, not a
@@ -445,10 +456,14 @@ impl ChromeTool {
     /// Open a URL, wait for network idle, and extract clean visible text via
     /// `document.body.innerText` (JavaScript eval). Unlike the accessibility
     /// tree returned by the `Open` chrome action (which contains element refs,
-    /// ARIA roles, and indentation), this returns plain rendered text — no
+    /// ARIA roles, and indentation), the eval returns plain rendered text — no
     /// markup, no hidden content, no `<script>`/`<style>` noise.
     ///
-    /// Falls back to `textContent` if the JavaScript eval fails.
+    /// Falls back to the `get text` verb (whose own reader is the helper's
+    /// `innerText || textContent`) if the JavaScript eval fails or answers
+    /// empty; the returned text then carries a note saying so, and that
+    /// `textContent` side can surface rendered-out `<script>`/`<style>` text for
+    /// an element with no rendered text of its own.
     ///
     /// The tab stays open for the run — the product closes the run's tabs itself
     /// when the run ends, retrying until the browser says they are gone; the
@@ -457,7 +472,7 @@ impl ChromeTool {
     pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
         crate::util::http::validate_url(url)?;
 
-        Self::ensure_available().await?;
+        Self::require_browser().await?;
 
         // Lock is held for the entire navigate + extract sequence so
         // concurrent same-tab access doesn't race between navigation
@@ -573,46 +588,49 @@ impl ChromeTool {
     /// bailing on the cached verdict would leave the connection down for as long
     /// as its cached readiness snapshot stands (10 s). When the gate refuses and
     /// the stored verdict classified a cause,
-    /// [`super::chrome_daemon::refusal_message`] appends that cause's concrete
-    /// remedy to the fact list.
+    /// [`super::chrome_daemon::refusal_message`] names what recovery is doing
+    /// about it.
+    ///
+    /// The texts are audience-neutral — the page rasteriser shares this gate — so
+    /// the chrome tool's own actions go through [`Self::require_browser`], which
+    /// adds the agent's sentence.
     pub(super) async fn ensure_available() -> anyhow::Result<()> {
         match super::chrome_daemon::cli_probe().await {
             super::chrome_daemon::CliStatus::Available => {}
             super::chrome_daemon::CliStatus::Missing => {
-                anyhow::bail!(
-                    "{CLI_UNAVAILABLE}. {}",
-                    super::chrome_daemon::CHROME_USE_INSTALL_HINT
-                );
+                anyhow::bail!("{CLI_UNAVAILABLE}: {HELPER_UNUSABLE}");
             }
             super::chrome_daemon::CliStatus::Transient(failure) => {
-                let msg = match failure {
-                    super::chrome_daemon::CliProbeFailure::Spawn(reason) => format!(
-                        "chrome-use CLI check could not spawn the binary ({reason}) — a \
-                         temporary failure (e.g. system resource exhaustion), not a missing \
-                         install. Retry shortly."
+                use super::chrome_daemon::CliProbeFailure;
+                let cause = match failure {
+                    CliProbeFailure::Spawn(reason) => format!(
+                        "the helper could not be started ({reason}) — a host failure rather \
+                         than a missing install; retry shortly."
                     ),
-                    super::chrome_daemon::CliProbeFailure::BadVersion(status) => format!(
-                        "chrome-use CLI is installed but its `--version` check failed \
-                         ({status}) — the install looks broken. The product replaces the \
-                         copy at the helper's own install directory with the newest \
-                         release when it starts; where that directory cannot be written \
-                         the copy stays as it is and the failure is recorded. Check the \
-                         logs for it, or reinstall manually via the chrome-use CLI if you \
-                         want hands-on control."
+                    CliProbeFailure::BadVersion(status) => format!(
+                        "the product's own copy of the helper is unusable — its `--version` \
+                         check failed ({status})."
                     ),
-                    super::chrome_daemon::CliProbeFailure::Timeout => {
-                        "chrome-use CLI probe timed out — the binary is present but \
-                         unresponsive. Retry shortly; if this persists the CLI may be wedged."
-                            .to_string()
-                    }
+                    CliProbeFailure::Timeout => "the helper probe timed out — the binary is \
+                         present but unresponsive; retry shortly."
+                        .to_string(),
                 };
-                anyhow::bail!(msg);
+                anyhow::bail!(cause);
             }
         }
         if let Err(refusal) = super::chrome_daemon::ensure_ready_for_actions().await {
             anyhow::bail!("{}", super::chrome_daemon::refusal_message(&refusal));
         }
         Ok(())
+    }
+
+    /// [`Self::ensure_available`] as this tool's agent reads it: the gate's
+    /// audience-neutral text plus [`super::chrome_daemon::REPORT_AS_IT_CAME`], added
+    /// once here so no probe-failure branch can omit it.
+    async fn require_browser() -> anyhow::Result<()> {
+        Self::ensure_available()
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}{}", super::chrome_daemon::REPORT_AS_IT_CAME))
     }
 
     /// Declared chrome-side condition-wait deadlines, forwarded to chrome-use
@@ -802,12 +820,8 @@ impl ChromeTool {
         tab: &str,
         workspace: &str,
     ) -> anyhow::Result<ActionOutput<ChromeResponse>> {
-        let cli = super::chrome_daemon::cli_path().with_context(|| {
-            format!(
-                "{CLI_UNAVAILABLE}. {}",
-                super::chrome_daemon::CHROME_USE_INSTALL_HINT
-            )
-        })?;
+        let cli = super::chrome_daemon::cli_path()
+            .ok_or_else(|| anyhow::anyhow!("{CLI_UNAVAILABLE}: {HELPER_UNUSABLE}"))?;
         let session = self.resolve_session(tab);
         self.chrome_sessions.track(&session);
 
@@ -1062,9 +1076,11 @@ impl ChromeTool {
         Ok(())
     }
 
-    /// Extract visible rendered text via `innerText`, falling back to `get text`
-    /// (`textContent`) when eval fails or returns empty. The leftover flag is the
-    /// same record every chrome-use call carries
+    /// Extract visible rendered text via `innerText`, falling back to the
+    /// `get text` verb when eval fails or returns empty. The fallback note says
+    /// which reader answered, since `get text` is the helper's own and can
+    /// differ from the page-world eval. The leftover flag is the same record
+    /// every chrome-use call carries
     /// ([`ActionOutput::leftover_pipes`]), over all the calls this action ran.
     async fn get_inner_text(
         &self,
@@ -1072,8 +1088,7 @@ impl ChromeTool {
         tab: &str,
         workspace: &str,
     ) -> anyhow::Result<ActionOutput<String>> {
-        const FALLBACK_NOTE: &str =
-            "(used get text fallback — textContent, may include script/style text)";
+        const FALLBACK_NOTE: &str = "(answered by the get text fallback, not the innerText eval)";
 
         let js = inner_text_eval_js(selector);
         let mut leftover_pipes = false;
@@ -1348,9 +1363,8 @@ impl Tool for ChromeTool {
 
     fn parameters_schema(&self) -> Value {
         // oneOf entry order follows the shared registry (which is ordered for
-        // the CLI help), so it may differ from the pre-registry hand-built
-        // order; descriptions and structure are unchanged and the set is
-        // pinned by `parameters_schema_has_all_actions`.
+        // the CLI help), so it may differ from the order the hand-built schema
+        // used; the set is pinned by `parameters_schema_has_all_actions`.
         let entries: Vec<Value> = crate::chrome::actions::ACTIONS
             .iter()
             .filter_map(|a| {
@@ -1365,23 +1379,11 @@ impl Tool for ChromeTool {
                 "action": { "oneOf": entries },
                 "tab": {
                     "type": "string",
-                    "description": "Logical name for this chrome session. \
-                     Missing or empty uses the run's default tab — the product \
-                     closes the run's tabs itself when the run ends, retrying \
-                     until the browser says they are gone; a leftover it \
-                     cannot close, and a host-level gap it cannot decide from, \
-                     are reported on its Issues view rather than left as a \
-                     cleanup for the agent or the owner. \
-                     Sessions live in a private \
-                     per-run namespace, so a name here never addresses another \
-                     run's session — and a run re-driven under its own identity \
-                     re-attaches the names it was working with. Use an explicit \
-                     name (e.g. \"docs\", \"github\") only to keep multiple pages \
-                     open simultaneously. Same tab = serialized operations on \
-                     that page."
+                    "description": "Page name in this run's private session \
+                     (empty = the default page)."
                 }
             },
-            "required": ["action", "tab"]
+            "required": ["action"]
         })
     }
 
@@ -1398,7 +1400,7 @@ impl Tool for ChromeTool {
             anyhow::bail!("{}", Self::cap_closed_tab_message(&tab));
         }
 
-        Self::ensure_available().await?;
+        Self::require_browser().await?;
 
         Self::validate_find(&action)?;
 
@@ -1890,9 +1892,8 @@ impl ChromeTool {
                     valid.join(", ")
                 );
             }
-            // chrome-use 1.5.101 rejects focus/type/uncheck with 'Unknown
-            // subaction' despite --help listing them — only advertise/resolve
-            // the subset that actually dispatches.
+            // mahbot's own allowlist: only the sub-actions this tool models are
+            // accepted, so a helper-side one it does not offer is refused here.
             let valid_actions = ["click", "hover", "fill", "check", "text"];
             if !valid_actions.contains(&find_action.as_str()) {
                 anyhow::bail!(
@@ -2090,12 +2091,13 @@ impl ChromeTool {
 
     /// Accept the model-facing extract schema: a JSON object, or a string
     /// holding JSON text (models frequently double-encode). The object must
-    /// follow chrome-use's grammar — an optional `"rows"` selector string plus
-    /// a required `"fields"` object (field name → CSS selector or
-    /// `{sel, get, all}`). A flat schema with per-field keys at the top level
-    /// is normalized into `"fields"` and the correction is reported as a note.
-    /// Array-shaped objects (`{items: [...]}`) are rejected — wrapping them
-    /// into `fields` would hand chrome-use a malformed schema.
+    /// follow chrome-use's grammar — an optional `"rows"` selector string and a
+    /// `"fields"` object (field name → CSS selector or `{sel, get, all}`). An
+    /// absent `"fields"` (a flat schema with per-field keys at the top level, or
+    /// a rows-only schema) is synthesized from the other keys and the correction
+    /// is reported as a note. Array-shaped objects (`{items: [...]}`) are
+    /// rejected — wrapping them into `fields` would hand chrome-use a malformed
+    /// schema.
     fn normalize_extract_schema(schema: &Value) -> anyhow::Result<(Value, Option<String>)> {
         let parsed = match schema {
             Value::Object(_) => schema.clone(),
@@ -2302,6 +2304,11 @@ fn parse_run_output(
 
 /// Enhance chrome-use error messages with actionable hints for known
 /// failure patterns.
+///
+/// The navigation hint exists because chrome-use's own `navigation_incomplete`
+/// answer already says to re-check with `get url`/`snapshot` and not to repeat the
+/// open, and recommends its CLI flag (`open <url> --wait-until none`), which this
+/// tool does not offer: the agent gets the wait it can actually make instead.
 fn enhance_chrome_error(msg: String) -> String {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("unknown ref")
@@ -2310,6 +2317,11 @@ fn enhance_chrome_error(msg: String) -> String {
         format!(
             "{msg}. Hint: refs become stale after any navigation or DOM change. \
              Take a fresh snapshot before using refs again."
+        )
+    } else if lower.contains("navigation_incomplete") {
+        format!(
+            "{msg}. Hint: this tool has no `--wait-until` — wait for what you need with `wait` \
+             (`url`, `text` or a CSS selector) or `expect` rather than opening the URL again."
         )
     } else {
         msg
@@ -2939,11 +2951,11 @@ mod tests {
         }
     }
 
-    // ── validate_find: runtime-rejected actions ───────────────────────────
+    // ── validate_find: refused actions ────────────────────────────────────
 
-    /// focus/type/uncheck are listed by `chrome-use --help` but 1.5.101
-    /// rejects them at runtime with 'Unknown subaction' — validate_find must
-    /// reject them up front.
+    /// focus/type/uncheck are mahbot's own refusal (the tool does not model
+    /// their argument shapes), not the helper's: validate_find rejects them up
+    /// front.
     #[test]
     fn validate_find_rejects_runtime_unsupported_actions() {
         for bad_action in ["focus", "type", "uncheck"] {
