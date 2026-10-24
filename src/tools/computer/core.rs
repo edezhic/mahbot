@@ -383,9 +383,11 @@ pub(crate) const ERR_FRAMEWORK_FAILED: &str = "framework-failed";
 )]
 pub(crate) const ERR_AMBIGUOUS_LOCATOR: &str = "ambiguous-locator";
 pub(crate) const ERR_NOT_MATCHED: &str = "not-matched";
-/// The surface a call names is gone: the window closed or was replaced.
-/// Deliberately not `not-matched` (the name did not match; re-enumerate apps/windows): that
-/// would report a followed window's disappearance as a misnamed target.
+/// The surface a call names is gone: the window closed or was replaced, or the
+/// application it belongs to quit. Deliberately not `not-matched` (the name did not
+/// match; re-enumerate apps/windows): that would report a followed surface's
+/// disappearance as a misnamed target. Raised through [`surface_gone`] and
+/// [`app_absent`], whose typed [`Gone`] is what the tool reads to drop a dead id.
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
     expect(dead_code)
@@ -441,19 +443,107 @@ impl fmt::Display for FrameworkFailed {
 
 impl std::error::Error for FrameworkFailed {}
 
+/// The `surface-gone` family as a type: a surface a call named was confirmed gone —
+/// a window that closed or was replaced, an application that quit. TYPED so the tool
+/// drops the bookmark that id holds without reading message text. A surface that
+/// still exists but has no window right now is deliberately not this (see
+/// [`app_absent`]): it keeps its id, because a window may open later.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+#[derive(Debug)]
+struct Gone(anyhow::Error);
+
+impl fmt::Display for Gone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for Gone {}
+
+/// Whether `err` is a [`Gone`] — the surface this call named no longer exists.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) fn is_surface_gone(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Gone>().is_some()
+}
+
 /// The `surface-gone` failure for a window of `app_name` (see [`ERR_SURFACE_GONE`]).
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
     expect(dead_code)
 )]
 pub(crate) fn surface_gone(app_name: &str) -> anyhow::Error {
-    taxonomy_error(
+    anyhow::Error::new(Gone(taxonomy_error(
         ERR_SURFACE_GONE,
         format!(
             "the window of '{app_name}' this target names can no longer be identified — it \
-             closed or was replaced; enumerate windows again"
+             closed, was replaced, or its application quit; list windows again with the \
+             'windows' action"
         ),
-    )
+    )))
+}
+
+/// What a call established about the application an `a` id names, when it found no
+/// window to act on. Each state is its own answer: claiming one when the call
+/// observed another would tell the model something it cannot see on screen.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AppAbsence {
+    /// Not running: the surface this id names has gone.
+    Quit,
+    /// Running, with no window to act on right now.
+    Windowless,
+    /// No window, and the platform could not establish whether the application still
+    /// runs: a Linux application that exposes no accessibility tree and one that has
+    /// quit look the same from here.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows", test)),
+        expect(dead_code)
+    )]
+    Unreachable,
+}
+
+/// The `surface-gone` refusal for an `a` id that found no window to act on, worded
+/// for what the call established. [`AppAbsence::Quit`] is a typed [`Gone`] — the
+/// application this id names died, so the id is dropped — while a running
+/// application keeps its id.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) fn app_absent(app_name: &str, absence: AppAbsence) -> anyhow::Error {
+    match absence {
+        AppAbsence::Quit => anyhow::Error::new(Gone(taxonomy_error(
+            ERR_SURFACE_GONE,
+            format!(
+                "'{app_name}' is no longer running — the application this identifier names has \
+                 quit; the 'apps' action lists what is running now"
+            ),
+        ))),
+        AppAbsence::Windowless => taxonomy_error(
+            ERR_SURFACE_GONE,
+            format!(
+                "'{app_name}' is running but has no window to act on — the 'windows' action lists \
+                 its windows"
+            ),
+        ),
+        AppAbsence::Unreachable => taxonomy_error(
+            ERR_SURFACE_GONE,
+            format!(
+                "no window of '{app_name}' could be found, and this call could not establish \
+                 whether the application is still running — the 'apps' action lists what is \
+                 reachable"
+            ),
+        ),
+    }
 }
 
 /// The `degraded` failure for a minimized window: it has no visible pixels, and
@@ -1824,7 +1914,13 @@ pub(crate) fn window_capture_rect(
     ))
 }
 
-// ── Element-ref lifecycle ───────────────────────────────────────────────
+// ── State that outlives one call ────────────────────────────────────────
+//
+// Two lifetimes. Element references belong to the turn and are cleared when it ends.
+// Application and window ids, and the surface last observed or captured, belong to
+// the session: only [`end_session`] ends them early, and a process restart ends them
+// by ending the memory. A call outside an agent run has no session, so nothing
+// session-scoped is stored for it at all.
 
 /// Cached observation with the refs resolved against it.
 struct ObservationCache {
@@ -1835,19 +1931,18 @@ struct ObservationCache {
 static LAST_OBSERVATION: LazyLock<Mutex<HashMap<String, ObservationCache>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The surface each agent last observed or captured (see [`last_surface`]).
+/// The surface each session last observed or captured (see [`last_surface`]).
 static LAST_SURFACE: LazyLock<Mutex<HashMap<String, TargetSpec>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The per-agent registry key, derived from the tool-context agent id. Task-
-/// locals are alive throughout a tool-call task (read synchronously here; no
-/// spawns cross this boundary). Outside an agent run (management, tests) the key
-/// falls back to the diagnostics role so those callers share one bucket.
+/// The per-agent registry key, derived from the tool-context agent id. Task-locals
+/// are alive throughout a tool-call task (read synchronously here; no spawns cross
+/// this boundary). Outside an agent run (management, tests) the key falls back to
+/// the diagnostics role, so the turn-scoped tables still have one bucket to use;
+/// nothing session-scoped is filed under it (`crate::agent::current_agent_id`).
 #[must_use]
 pub(crate) fn agent_key() -> String {
-    crate::agent::CURRENT_TOOL_AGENT_ID
-        .try_with(Clone::clone)
-        .unwrap_or(None)
+    crate::agent::current_agent_id()
         .unwrap_or_else(|| crate::agent::role::DIAGNOSTICS_ROLE.to_string())
 }
 
@@ -1907,23 +2002,26 @@ pub(crate) fn resolve_ref(reference: &str) -> anyhow::Result<(Locator, TargetSpe
     Ok((locator.clone(), cache.target.clone()))
 }
 
-/// The target pinned by the calling agent's most recent observation or capture.
-/// A call with no explicit target addresses it, so a focus shift between
-/// observe and the action never retargets a different surface. `None` means
-/// nothing has been pinned yet.
+/// The surface the calling session last observed or captured. A call with no
+/// explicit target addresses it, so a focus shift between observe and the action
+/// never retargets a different surface; it lasts as long as the session's ids do, so
+/// a later turn still addresses the surface the model last saw, and a call whose
+/// surface is gone fails instead of silently using whatever is frontmost. `None`
+/// means nothing has been pinned yet.
 #[must_use]
 pub(crate) fn last_surface() -> Option<TargetSpec> {
-    let key = agent_key();
     let guard = LAST_SURFACE.lock().unwrap_poison();
-    guard.get(&key).cloned()
+    guard.get(&crate::agent::current_agent_id()?).cloned()
 }
 
 /// Pin the surface the calling agent last observed or captured. Only a call that
-/// succeeded pins: a failed observation leaves the previous surface in place.
+/// succeeded pins: a failed observation leaves the previous surface in place. A call
+/// with no session pins nothing, since no later call could read it.
 pub(crate) fn set_last_surface(target: TargetSpec) {
-    let key = agent_key();
-    let mut guard = LAST_SURFACE.lock().unwrap_poison();
-    guard.insert(key, target);
+    let Some(key) = crate::agent::current_agent_id() else {
+        return;
+    };
+    LAST_SURFACE.lock().unwrap_poison().insert(key, target);
 }
 
 // ── Target registry ─────────────────────────────────────────────────────
@@ -1937,55 +2035,61 @@ enum IdClass {
 }
 
 impl IdClass {
-    fn prefix(self) -> char {
-        match self {
+    /// The class an argument of one of this tool's id shapes names (`a12`, `w3`).
+    /// `None` for anything else, so a name or a pid is never read as an id.
+    fn of_id(text: &str) -> Option<Self> {
+        let mut chars = text.chars();
+        let class = match chars.next()? {
+            'a' => Self::App,
+            'w' => Self::Window,
+            _ => return None,
+        };
+        let rest = chars.as_str();
+        (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())).then_some(class)
+    }
+
+    /// The next id of this class. Opaque to the model: the digits carry the process
+    /// and the count, and only equality with a stored entry ever matters.
+    fn mint(self) -> String {
+        let counter = match self {
+            Self::App => &NEXT_APP,
+            Self::Window => &NEXT_WINDOW,
+        };
+        let next = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let prefix = match self {
             Self::App => 'a',
             Self::Window => 'w',
-        }
-    }
-}
-
-/// Most ids kept per agent, and — through the macOS backend — most window handles
-/// kept per agent, so an id in the registry always has a handle to resolve
-/// through. A long run that enumerates a churning desktop drops its oldest
-/// entries; a dropped id then reads as unknown, which is a safe error.
-pub(crate) const MAX_STORED_TARGETS: usize = 512;
-
-/// One agent's ids: the surfaces they name, and the counters that mint them.
-#[derive(Default)]
-struct TargetRegistry {
-    /// `(id, surface)` in the order minted.
-    entries: Vec<(String, TargetSpec)>,
-    /// Counters are never rewound, so an id is never handed to another surface.
-    next_app: usize,
-    next_window: usize,
-}
-
-impl TargetRegistry {
-    fn mint(&mut self, class: IdClass) -> String {
-        let counter = match class {
-            IdClass::App => &mut self.next_app,
-            IdClass::Window => &mut self.next_window,
         };
-        *counter += 1;
-        format!("{}{counter}", class.prefix())
-    }
-
-    fn position_of(&self, surface: &TargetSpec) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|(_, stored)| stored == surface)
-    }
-
-    fn insert(&mut self, id: String, surface: TargetSpec) {
-        self.entries.push((id, surface));
-        if self.entries.len() > MAX_STORED_TARGETS {
-            self.entries.remove(0);
-        }
+        format!("{prefix}{next}")
     }
 }
 
-static TARGETS: LazyLock<Mutex<HashMap<String, TargetRegistry>>> =
+/// Where this process's numbering starts: the epoch time in milliseconds at the moment
+/// it first minted an id. Live ids therefore stay above every id an earlier process
+/// handed out, so an id a durable conversation still holds reads as unknown after a
+/// restart instead of naming a surface minted after it.
+static ID_BASE: LazyLock<u64> = LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().try_into().unwrap_or(u64::MAX)
+        })
+});
+
+/// The id counters, seeded from [`ID_BASE`]. They only ever move forward — a listing
+/// and a reset both leave them where they are — so an id is never handed to a second
+/// surface.
+static NEXT_APP: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(*ID_BASE));
+static NEXT_WINDOW: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(*ID_BASE));
+
+/// One session's ids: `(id, surface)` in the order minted.
+type SessionTargets = Vec<(String, TargetSpec)>;
+
+/// The ids each session holds, keyed by the session's agent id. Nothing is evicted
+/// from it: the table holds only surfaces the caller listed or observed, an entry dies
+/// with its surface ([`forget_target`]) or with the session ([`end_session`]), and no
+/// size limit ever costs the caller an id it was given.
+static TARGETS: LazyLock<Mutex<HashMap<String, SessionTargets>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Store one enumeration's applications and return their `a` ids, in the same
@@ -2006,20 +2110,24 @@ pub(crate) fn store_window_targets(windows: &[TargetSpec]) -> Vec<String> {
 /// still names that surface (and the backend reports it gone) rather than silently
 /// naming whatever took its place.
 fn store_targets(class: IdClass, surfaces: &[TargetSpec]) -> Vec<String> {
-    let key = agent_key();
+    let Some(key) = crate::agent::current_agent_id() else {
+        // No session, so no later call could resolve what this one mints: the ids go
+        // out for the listing to print and nothing is kept.
+        return surfaces.iter().map(|_| class.mint()).collect();
+    };
     let mut guard = TARGETS.lock().unwrap_poison();
-    let registry = guard.entry(key).or_default();
+    let entries = guard.entry(key).or_default();
     let mut ids = Vec::with_capacity(surfaces.len());
     for surface in surfaces {
-        if let Some(position) = registry.position_of(surface) {
+        if let Some(position) = entries.iter().position(|(_, stored)| stored == surface) {
             // Same surface: keep its id, refresh what messages read from it.
-            let (id, stored) = &mut registry.entries[position];
+            let (id, stored) = &mut entries[position];
             ids.push(id.clone());
             *stored = surface.clone();
             continue;
         }
-        let id = registry.mint(class);
-        registry.insert(id.clone(), surface.clone());
+        let id = class.mint();
+        entries.push((id.clone(), surface.clone()));
         ids.push(id);
     }
     ids
@@ -2028,14 +2136,24 @@ fn store_targets(class: IdClass, surfaces: &[TargetSpec]) -> Vec<String> {
 /// Look up a stored target id without erroring (used when an argument may or
 /// may not be a target id).
 pub(crate) fn get_target(id: &str) -> Option<TargetSpec> {
-    let key = agent_key();
     let guard = TARGETS.lock().unwrap_poison();
-    let registry = guard.get(&key)?;
-    registry
-        .entries
+    let entries = guard.get(&crate::agent::current_agent_id()?)?;
+    entries
         .iter()
         .find(|(stored, _)| stored == id)
         .map(|(_, surface)| surface.clone())
+}
+
+/// Drop the id a call confirmed gone, so the table follows only surfaces that still
+/// exist. An id that is not stored is ignored.
+pub(crate) fn forget_target(id: &str) {
+    let Some(key) = crate::agent::current_agent_id() else {
+        return;
+    };
+    let mut guard = TARGETS.lock().unwrap_poison();
+    if let Some(entries) = guard.get_mut(&key) {
+        entries.retain(|(stored, _)| stored != id);
+    }
 }
 
 /// Resolve a target id or the `"screen"` literal. `None` → [`TargetSpec::Focused`].
@@ -2046,28 +2164,59 @@ pub(crate) fn resolve_target(target: Option<&str>) -> anyhow::Result<TargetSpec>
     if target == "screen" {
         return Ok(TargetSpec::Screen);
     }
-    get_target(target).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown target '{target}' — it is not a stored app/window id; enumerate targets \
-             with 'apps' (a1-style) or 'windows' (w1-style) first"
-        )
-    })
+    get_target(target).ok_or_else(|| unknown_identifier(target))
 }
 
-/// Remove an agent's cached observation, pinned surface and target entries.
-/// Called at agent-run end so a stale per-agent registry never leaks across runs
-/// (see [`crate::tools::computer::cleanup_agent_state`]). No-op for unknown keys.
-pub(crate) fn clear_agent_state(key: &str) {
-    {
-        let mut guard = LAST_OBSERVATION.lock().unwrap_poison();
-        guard.remove(key);
-    }
-    {
-        let mut guard = LAST_SURFACE.lock().unwrap_poison();
-        guard.remove(key);
-    }
-    let mut guard = TARGETS.lock().unwrap_poison();
+/// Whether `text` has the shape of an id this tool mints (`a1`, `w12`), so an
+/// argument that is not a stored id can still be told apart from a name or a pid.
+#[must_use]
+pub(crate) fn is_identifier(text: &str) -> bool {
+    IdClass::of_id(text).is_some()
+}
+
+/// The refusal for an argument that is not a target this tool knows. An id of this
+/// tool's shape says that the tool no longer knows a surface by it, and gives the
+/// listing that mints ids of its class; anything else says what a target may be.
+/// Neither claims anything about an application's state: what a lookup can say is
+/// that the id is unknown, not that an application quit.
+pub(crate) fn unknown_identifier(arg: &str) -> anyhow::Error {
+    let (what, next) = match IdClass::of_id(arg) {
+        Some(IdClass::App) => (
+            "an application",
+            "list applications again with the 'apps' action",
+        ),
+        Some(IdClass::Window) => ("a window", "list windows again with the 'windows' action"),
+        None => {
+            return anyhow!(
+                "unknown target '{arg}' — a target is an id printed by the 'apps' or 'windows' \
+                 action, or \"screen\""
+            );
+        }
+    };
+    anyhow!(
+        "unknown identifier '{arg}' — the tool no longer knows {what} by this id; {next} and use \
+         the id it prints"
+    )
+}
+
+/// Clear the state one turn owns, at agent-run end: element refs belong to the
+/// observation they came from and expire with the next one, so they never outlive
+/// the run. Stored ids and the last observed or captured surface are deliberately
+/// kept — [`end_session`] is what ends those.
+pub(crate) fn cleanup_turn(key: &str) {
+    let mut guard = LAST_OBSERVATION.lock().unwrap_poison();
     guard.remove(key);
+}
+
+/// End everything a session minted: its application and window ids and the surface
+/// it last observed or captured. This is the single statement of what a reset does,
+/// and the tool's `end_session` its single caller — reached only where the session
+/// store deletes the conversation, which every reset path goes through (`/clear`, the
+/// Sessions page, the maintainer's cleanup). A service restart ends the same state by
+/// ending the process.
+pub(crate) fn end_session(key: &str) {
+    TARGETS.lock().unwrap_poison().remove(key);
+    LAST_SURFACE.lock().unwrap_poison().remove(key);
 }
 
 // ── Tree rendering ──────────────────────────────────────────────────────
@@ -2374,6 +2523,14 @@ pub(crate) trait Backend: Send + Sync {
     /// Windows of one application (or of every application). A failed read of one
     /// application is reported in [`WindowListing::unread`], never as an empty list.
     async fn list_windows(&self, app: Option<&AppInfo>) -> anyhow::Result<WindowListing>;
+    /// Whether the application these [`AppInfo`] name is still running: `Some(false)`
+    /// only when this platform positively established that it is not, `None` when it
+    /// cannot tell. The `windows` action asks it for an `a` id before listing, so an
+    /// application that went away is reported as gone rather than as one with no
+    /// windows.
+    async fn app_running(&self, _app: &AppInfo) -> Option<bool> {
+        None
+    }
     /// Focused window of the frontmost application (the DEFAULT surface).
     async fn focused_window(&self) -> anyhow::Result<WindowInfo>;
     /// Surface geometry for a target (Screen: virtual-desktop bounding rect).
@@ -3018,21 +3175,96 @@ mod tests {
     fn resolve_target_resolves_focused_screen_stored_and_unknown() {
         assert_eq!(resolve_target(None).unwrap(), TargetSpec::Focused);
         assert_eq!(resolve_target(Some("screen")).unwrap(), TargetSpec::Screen);
+        in_session("resolve-target-test", || {
+            let app = TargetSpec::App {
+                app_pid: Some(42),
+                app_name: "Safari".to_string(),
+            };
+            let ids = store_app_targets(std::slice::from_ref(&app));
+            assert_eq!(ids.len(), 1);
+            assert_eq!(resolve_target(Some(&ids[0])).unwrap(), app);
+            let err = resolve_target(Some("w9999")).unwrap_err();
+            assert!(format!("{err}").contains("unknown"), "{err}");
+            // A lookup that failed is not a surface that died: nothing may treat it as one.
+            assert!(!is_surface_gone(&err));
+        });
+    }
 
+    /// Only a surface a call confirmed gone is reported as gone: a running application
+    /// keeps its id, so its refusal must not read as a dead surface.
+    #[test]
+    fn only_a_surface_confirmed_gone_is_typed_as_gone() {
+        assert!(is_surface_gone(&surface_gone("Beta")));
+        assert!(is_surface_gone(&app_absent("Beta", AppAbsence::Quit)));
+        assert!(!is_surface_gone(&app_absent(
+            "Beta",
+            AppAbsence::Windowless
+        )));
+        assert!(!is_surface_gone(&app_absent(
+            "Beta",
+            AppAbsence::Unreachable
+        )));
+    }
+
+    /// An id outlives the turn that minted it and ends with the session: a turn-end
+    /// keeps it, a call that confirmed the surface gone drops that one, and a reset
+    /// drops everything the session minted.
+    #[serial_test::serial(targets)]
+    #[test]
+    fn ids_last_for_the_session_not_for_the_turn() {
+        let key = "session-lifetime-test";
         let app = TargetSpec::App {
-            app_pid: Some(42),
-            app_name: "Safari".to_string(),
+            app_pid: Some(9),
+            app_name: "Beta".to_string(),
         };
-        let ids = store_app_targets(std::slice::from_ref(&app));
-        assert_eq!(ids.len(), 1);
-        assert_eq!(resolve_target(Some(&ids[0])).unwrap(), app);
-        let err = resolve_target(Some("w9999")).unwrap_err();
-        assert!(format!("{err}").contains("unknown target"));
+        let window = TargetSpec::Window {
+            app_pid: Some(9),
+            app_name: "Beta".to_string(),
+            key: WindowKey::new("k9"),
+            label: "notes".to_string(),
+        };
+        in_session(key, || {
+            let app_id = store_app_targets(std::slice::from_ref(&app))[0].clone();
+            let window_id = store_window_targets(std::slice::from_ref(&window))[0].clone();
+            set_last_surface(window.clone());
+
+            // The turn ends: the ids and the pinned surface are still there.
+            cleanup_turn(key);
+            assert_eq!(resolve_target(Some(&app_id)).unwrap(), app);
+            assert_eq!(resolve_target(Some(&window_id)).unwrap(), window);
+            assert_eq!(last_surface(), Some(window.clone()));
+
+            // Only the id whose surface a call confirmed gone stops resolving.
+            forget_target(&window_id);
+            assert!(resolve_target(Some(&window_id)).is_err());
+            assert_eq!(resolve_target(Some(&app_id)).unwrap(), app);
+
+            // The session ends: nothing minted under it resolves any more.
+            end_session(key);
+            assert!(resolve_target(Some(&app_id)).is_err());
+            assert_eq!(last_surface(), None);
+
+            // Numbering survives the reset, so a pre-reset id can never name a
+            // surface the new session minted.
+            let fresh = store_app_targets(std::slice::from_ref(&app))[0].clone();
+            assert_ne!(fresh, app_id);
+            assert!(resolve_target(Some(&app_id)).is_err());
+        });
     }
 
     #[serial_test::serial(targets)]
     #[test]
     fn store_targets_keeps_ids_for_seen_surfaces_and_never_reuses_them() {
+        in_session("target-identity-test", ids_follow_surfaces);
+    }
+
+    /// Run `body` as a call inside a session: session-scoped state is stored only for
+    /// a call that has one, so a test exercising it must run as an agent would.
+    fn in_session<T>(key: &'static str, body: impl FnOnce() -> T) -> T {
+        crate::agent::CURRENT_TOOL_AGENT_ID.sync_scope(Some(key.to_string()), body)
+    }
+
+    fn ids_follow_surfaces() {
         let window = |name: &str, key: &str| TargetSpec::Window {
             app_pid: Some(7),
             app_name: name.to_string(),

@@ -19,7 +19,10 @@ use super::super::core::{
     self, AppInfo, SurfaceGeometry, TargetSpec, UnreadWindows, WindowInfo, WindowKey, WindowListing,
 };
 use std::sync::{Once, OnceLock};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, HWND, LPARAM, POINT, RECT, STILL_ACTIVE,
+    WIN32_ERROR,
+};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
@@ -29,7 +32,7 @@ use windows::Win32::System::StationsAndDesktops::{
     OpenInputDesktop, UOI_NAME,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    GetCurrentProcessId, GetExitCodeProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::HiDpi::{
@@ -103,11 +106,54 @@ pub(super) fn resolve(target: &TargetSpec) -> anyhow::Result<TargetWindow> {
             let window = windows
                 .iter()
                 .find(|w| w.active)
-                .or_else(|| windows.first())
-                .ok_or_else(|| core::surface_gone(app_name))?;
+                .or_else(|| windows.first());
+            let Some(window) = window else {
+                return Err(absent_app(*app_pid, app_name));
+            };
             describe(window.hwnd)
         }
         TargetSpec::Window { app_name, key, .. } => resolve_key(app_name, key),
+    }
+}
+
+/// The refusal for an `a` id that names no window right now: the application quit, is
+/// running without a window, or could not be asked. The three are kept apart because
+/// only the first one means the surface is gone.
+fn absent_app(app_pid: Option<u32>, app_name: &str) -> anyhow::Error {
+    match app_pid.and_then(process_alive) {
+        Some(true) => core::app_absent(app_name, core::AppAbsence::Windowless),
+        Some(false) => core::app_absent(app_name, core::AppAbsence::Quit),
+        None => core::app_absent(app_name, core::AppAbsence::Unreachable),
+    }
+}
+
+/// Whether the process `pid` still exists: `Some(false)` only when the system says the
+/// pid names no process or that the process has exited, `Some(true)` when it is still
+/// running, and `None` when this process may not query it (an elevated application) —
+/// an answer that is not a fact about the application, so its caller says so instead of
+/// claiming a quit.
+pub(super) fn process_alive(pid: u32) -> Option<bool> {
+    if pid == 0 {
+        return Some(false);
+    }
+    let mut exit_code = 0u32;
+    // SAFETY: no pointer crosses this call except the exit-code out-parameter, which
+    // points at live local storage; the handle is closed before returning.
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(process) => {
+                // A pid whose process object is still referenced opens fine: the exit
+                // code is what tells a live process from a finished one.
+                let alive = GetExitCodeProcess(process, &raw mut exit_code).is_ok()
+                    && exit_code == STILL_ACTIVE.0.cast_unsigned();
+                let _ = CloseHandle(process);
+                Some(alive)
+            }
+            Err(error) if WIN32_ERROR::from_error(&error) == Some(ERROR_INVALID_PARAMETER) => {
+                Some(false)
+            }
+            Err(_) => None,
+        }
     }
 }
 

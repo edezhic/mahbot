@@ -165,7 +165,7 @@ use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
     SCStreamErrorCode, SCWindow,
 };
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::time::Duration;
@@ -1042,7 +1042,7 @@ fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
 /// target registry. The element itself is the identity: it answers with the
 /// window's live title, frame and process, so nothing here has to re-find a
 /// window by title or by its place in an enumeration. The owner is the agent
-/// that enumerated it, so the cap can drop one agent's handles only.
+/// that enumerated it, so the session that ends drops its own handles only.
 struct HeldWindow {
     element: CFRetained<AXUIElement>,
     owner: String,
@@ -1055,24 +1055,19 @@ struct HeldWindow {
 // AX calls safe, and none are performed.
 unsafe impl Send for HeldWindow {}
 
-/// Held windows by token. Ordered by token, so the first entry is the oldest.
-static HELD_WINDOWS: LazyLock<Mutex<BTreeMap<u64, HeldWindow>>> =
-    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+/// Held windows by token.
+static HELD_WINDOWS: LazyLock<Mutex<HashMap<u64, HeldWindow>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static NEXT_WINDOW_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// Cap on windows retained per owning agent — the same number the target registry
-/// keeps ([`core::MAX_STORED_TARGETS`]) — so a live id always has a handle to
-/// resolve through. Beyond it that agent's oldest are dropped; an id whose token
-/// went with them reads as a window that can no longer be identified, which is an
-/// honest error rather than a wrong window.
-const MAX_HELD_WINDOWS: usize = core::MAX_STORED_TARGETS;
 
 /// The identity of `window`: the token it already holds, else a fresh one.
 /// `CFEqual` compares accessibility elements by the object they address, so the
 /// same window is recognised across enumerations even though every enumeration
-/// hands back a new element reference. Tokens are per agent, so one agent's cleanup
-/// can never drop a handle another agent's id resolves through. An element id an
+/// hands back a new element reference. Tokens are per agent, so a session's reset can
+/// never drop a handle another session's id resolves through. A handle is dropped
+/// when a call confirms its window gone, or with the session — never to make room,
+/// so a live id always has the handle it resolves through. An element id an
 /// application recycles after its window closed is the one case this cannot tell
 /// apart; catching it would need a liveness probe per held window on every listing.
 ///
@@ -1084,9 +1079,7 @@ fn window_key(window: &AXUIElement, owner: &str) -> WindowKey {
         .iter()
         .find(|(_, existing)| existing.owner == owner && &*existing.element == window)
         .map(|(token, _)| *token);
-    let token = if let Some(token) = known {
-        token
-    } else {
+    let token = known.unwrap_or_else(|| {
         let token = NEXT_WINDOW_TOKEN.fetch_add(1, Ordering::Relaxed);
         held.insert(
             token,
@@ -1095,28 +1088,16 @@ fn window_key(window: &AXUIElement, owner: &str) -> WindowKey {
                 owner: owner.to_string(),
             },
         );
-        // Tokens increase monotonically, so the owner's first tokens are its
-        // oldest. Collected first: removing while iterating would hold a borrow.
-        let mine: Vec<u64> = held
-            .iter()
-            .filter(|(_, entry)| entry.owner == owner)
-            .map(|(token, _)| *token)
-            .collect();
-        for token in mine
-            .iter()
-            .take(mine.len().saturating_sub(MAX_HELD_WINDOWS))
-        {
-            held.remove(token);
-        }
         token
-    };
+    });
     WindowKey::new(format!("ax:{token}"))
 }
 
 /// The window a stored key names, refusing rather than substituting another one.
 /// A token that no longer resolves, or an element whose window is gone, is
 /// `surface-gone`: the call is about a window this process can no longer
-/// identify.
+/// identify. A handle whose window is confirmed gone is dropped here, so the table
+/// follows only windows that still exist.
 fn window_by_key(
     key: &WindowKey,
     app_name: &str,
@@ -1138,7 +1119,10 @@ fn window_by_key(
     // `surface-gone` would send the model re-enumerating a window that is still there.
     match attribute_value(&window, &axc(AX_ROLE)) {
         Ok(_) => Ok(window),
-        Err(AXError::InvalidUIElement) => Err(core::surface_gone(app_name)),
+        Err(AXError::InvalidUIElement) => {
+            HELD_WINDOWS.lock().unwrap_poison().remove(&token);
+            Err(core::surface_gone(app_name))
+        }
         Err(_) => Err(core::unanswered(
             &core::surface_label(app_name, None),
             "for its role",
@@ -1146,7 +1130,8 @@ fn window_by_key(
     }
 }
 
-/// Drop every window `agent` holds: its ids are gone with its registry entries.
+/// Drop every window `agent` holds: its session ended, so the ids these handles
+/// resolve through ended with it.
 pub(crate) fn forget_agent_windows(agent: &str) {
     let mut held = HELD_WINDOWS.lock().unwrap_poison();
     held.retain(|_, entry| entry.owner != agent);
@@ -1220,10 +1205,26 @@ fn app_display_name(pid: u32, app: &AXUIElement) -> String {
         .unwrap_or_else(|| attribute_name(app, &axc(AX_TITLE)).unwrap_or_default())
 }
 
+/// Whether the application is still running, from the workspace's own record: by pid
+/// when the id carries one, else by localized name — the source [`running_app_pid`]
+/// and `list_apps` both use. It answers the one question a window read cannot: an
+/// `a` id whose application quit says so, instead of blaming a window that closed.
+fn app_running(pid: Option<u32>, name: &str) -> bool {
+    match pid {
+        Some(pid) => NSWorkspace::sharedWorkspace()
+            .runningApplications()
+            .iter()
+            .any(|app| app.processIdentifier() == pid as i32),
+        None => running_app_pid(name).is_some(),
+    }
+}
+
 fn app_element(pid: Option<u32>, name: &str) -> Result<CFRetained<AXUIElement>, anyhow::Error> {
     let pid = match pid {
         Some(p) => p,
-        None => running_app_pid(name).ok_or_else(|| core::surface_gone(name))?,
+        None => {
+            running_app_pid(name).ok_or_else(|| core::app_absent(name, core::AppAbsence::Quit))?
+        }
     };
     // SAFETY: `pid` is a running app (or stale); AXUIElementCreateApplication
     // always returns a non-null element — attribute reads surface InvalidUIElement.
@@ -1341,7 +1342,12 @@ fn resolve_window(
             app_name,
         } => {
             // An a-id names the application's own focused window and is
-            // deliberately re-resolved per call, so it follows that window.
+            // deliberately re-resolved per call, so it follows that window. An
+            // application that is gone has no window to re-resolve, and the answer
+            // says that rather than blaming a window.
+            if !app_running(*pinned, app_name) {
+                return Err(core::app_absent(app_name, core::AppAbsence::Quit));
+            }
             let app = app_element(*pinned, app_name)?;
             let pid = app_pid(&app)?;
             ensure_ax_thread(pid)?;
@@ -1353,7 +1359,7 @@ fn resolve_window(
                 None => read_windows(&app, app_name)?
                     .into_iter()
                     .next()
-                    .ok_or_else(|| core::surface_gone(app_name))?,
+                    .ok_or_else(|| core::app_absent(app_name, core::AppAbsence::Windowless))?,
             };
             Ok((window, app))
         }
@@ -2726,6 +2732,10 @@ impl Backend for MacOsBackend {
             out.dedup_by(|a, b| a.pid == b.pid);
             Ok(out)
         })
+    }
+
+    async fn app_running(&self, app: &AppInfo) -> Option<bool> {
+        with_platform("check application", || Ok(app_running(app.pid, &app.name))).ok()
     }
 
     async fn list_windows(&self, app: Option<&AppInfo>) -> Result<WindowListing, anyhow::Error> {

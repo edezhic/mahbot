@@ -79,8 +79,9 @@ pub(crate) fn tool_identity() -> anyhow::Result<(String, String)> {
 }
 
 /// The calling agent's session id as the task-local carries it, `None` outside an
-/// agent run and for the empty id a turn can carry — the one read above.
-fn current_agent_id() -> Option<String> {
+/// agent run and for the empty id a turn can carry — the one read above, and what the
+/// computer tool files its session-scoped state under.
+pub(crate) fn current_agent_id() -> Option<String> {
     CURRENT_TOOL_AGENT_ID
         .try_with(Option::clone)
         .ok()
@@ -2915,9 +2916,9 @@ impl Drop for RunEndCleanup {
         // Owner-deletes-at-end: remove the spill files this agent run created
         // (safe on macOS — the run is over, nothing will read them again).
         crate::tools::shell::cleanup_agent_spills(&self.agent_id);
-        // Drop the per-agent computer registry entries (observation/target/
-        // capture) so they never leak into a later run.
-        crate::tools::computer::cleanup_agent_state(&self.agent_id);
+        // Drop what this turn's computer use owns (its capture and element refs).
+        // Its application/window ids last for the session, not the run.
+        crate::tools::computer::cleanup_turn_state(&self.agent_id);
         // Hand the run's chrome sessions to the release queue, under the run's own
         // agent id so a leftover report can name the run it came from. The tracker's
         // own `Drop` unregisters the run's namespace once the run's last owner goes.

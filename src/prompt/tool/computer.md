@@ -9,6 +9,7 @@ Observe and act on the local GUI: read accessibility trees, click, type, press, 
 With no `target`, a call acts on the surface you last observed or captured, before that on the focused window of the frontmost application. A successful `observe`, `screenshot` or `zoom` that names a target makes that surface current (a `"screen"` capture leaves the screen current); a failed one leaves it as it was.
 
 A `w` id names exactly one window: it follows that window and fails as `surface-gone` once it is gone, never falling back to another window of the same application. An `a` id is the application's focused window at the moment of the call; `"screen"` is the whole desktop.
+An `a` or `w` id keeps naming the same application or window for the whole session, across turns; only resetting the conversation or restarting the service ends it. A listing keeps the id of a surface it already named, and a new surface gets a new id. An id the tool no longer knows says so — list again.
 
 Points and regions are normalized 0–1000 of the surface the call names; a region is `[x0, y0, x1, y1]`. A ref belongs to the surface it was observed on. An observation's header names its surface.
 

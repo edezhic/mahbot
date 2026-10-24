@@ -656,6 +656,12 @@ async fn surface_identity(
     (app_name, window.name().await.ok())
 }
 
+/// The application object an `a` id names, found by name (this desktop exposes no
+/// pid) among the applications that publish an accessibility tree.
+///
+/// Not appearing there is not the same as having quit: a running application that
+/// publishes nothing looks identical from here, so the refusal says the surface is
+/// gone without claiming which — and keeps the id, since nothing confirmed its death.
 async fn resolve_app_object(
     conn: &zbus::Connection,
     app_name: &str,
@@ -673,7 +679,7 @@ async fn resolve_app_object(
     by_name
         .or(by_pid)
         .map(|(r, _)| r.clone())
-        .ok_or_else(|| core::surface_gone(app_name))
+        .ok_or_else(|| core::app_absent(app_name, core::AppAbsence::Unreachable))
 }
 
 /// Whether the element advertises more children than [`core::MAX_CHILDREN`]. Read
@@ -906,7 +912,7 @@ async fn app_current_window(
     wins.into_iter()
         .next()
         .map(|w| w.object_ref)
-        .ok_or_else(|| core::surface_gone(app_name))
+        .ok_or_else(|| core::app_absent(app_name, core::AppAbsence::Windowless))
 }
 
 /// The one window reporting active/focused across every application. An application

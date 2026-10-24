@@ -31,6 +31,23 @@
 //! work ([`capture_known_available`]), and the accessibility listing or a retry is named
 //! otherwise.
 //!
+//! # Identifiers last for the session
+//!
+//! `apps` and `windows` answer with opaque ids (`a1754…`, `w1754…`) that later actions
+//! take as a target. An id names that one surface for the whole session — across turns,
+//! across the owner's replies — and is never handed to another surface, however many
+//! applications launch or quit in between: a surface gets a new id when it appears,
+//! and an id never points at something else. A reset ends them ([`end_session`], called
+//! where the session store deletes the conversation) and so does a restart; nothing else
+//! does, and no listing evicts a live one.
+//!
+//! Every use re-checks the surface against the live system before acting, and the two
+//! ways it can be absent are answered differently: a surface that has gone — a window
+//! that closed, an application that quit — is `surface-gone` naming it, while an id the
+//! tool no longer knows says exactly that and names the listing that mints ids again. A
+//! failed lookup never claims an application is not running. Element refs are not ids:
+//! they belong to the observation they came from and expire with the next one.
+//!
 //! # Bounded by the product, not by the machine
 //!
 //! This process aborts on a failed allocation, so no figure the machine reports may
@@ -110,6 +127,12 @@
 //!    `desktop-unavailable` naming the lock, while `apps` still lists. Unlock and the
 //!    same calls work again. A machine that cannot be locked (or a platform with no
 //!    signal for it) keeps working — that is the intended behaviour, not a gap.
+//! 8. An id survives the turn that minted it: `apps` then `windows` in one turn, let the
+//!    owner answer, then act by the `a`/`w` id in the next — the same surface is
+//!    addressed, with no re-listing. Then reset the conversation (`/clear`) and use that
+//!    id again: it is refused as one the tool no longer knows, never as a closed window
+//!    or an application that is not running. The split itself is covered by the unit
+//!    tests on [`core::cleanup_turn`] and [`core::end_session`].
 
 mod core;
 mod linux;
@@ -278,10 +301,10 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
                 "region": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}
             }),
         ),
-        super::action_entry_schema("apps", "List applications as a1 ids.", &[], &json!({})),
+        super::action_entry_schema("apps", "List applications with their ids.", &[], &json!({})),
         super::action_entry_schema(
             "windows",
-            "List windows as w1 ids, optionally per app.",
+            "List windows with their ids, optionally per app.",
             &[],
             &json!({
                 "app": {"type": "string"}
@@ -702,13 +725,24 @@ struct CaptureRecord {
     height: u32,
 }
 
-/// Drop an agent's per-agent registry entries (observation/target/capture) at
-/// agent-run end, so state never leaks across runs. Called from the agent's
-/// run-end cleanup guard (`RunEndCleanup`) with the agent's id string (matching
-/// [`core::agent_key`]'s task-local value).
-pub(crate) fn cleanup_agent_state(agent_key: &str) {
+/// Drop the state one turn owns when its agent run ends: the capture waiting to be
+/// attached and the element refs of its last observation. Application and window
+/// ids and the last observed or captured surface are kept — [`end_session`] is what
+/// ends those. Called from the agent's run-end cleanup guard (`RunEndCleanup`) with
+/// the agent's id string (matching [`core::agent_key`]'s task-local value).
+pub(crate) fn cleanup_turn_state(agent_key: &str) {
     CAPTURES.lock().unwrap_poison().remove(agent_key);
-    core::clear_agent_state(agent_key);
+    core::cleanup_turn(agent_key);
+}
+
+/// End everything a reset session minted: its application and window ids, the
+/// surface it last observed or captured, and — on macOS — the window handles those
+/// ids resolved through, which have to go with them or a live id would read as a
+/// closed window. The only caller is the session store's delete, where every reset
+/// converges; a service restart ends the same state by ending the process. See
+/// [`core::end_session`] for the lifetime itself.
+pub(crate) fn end_session(agent_key: &str) {
+    core::end_session(agent_key);
     #[cfg(target_os = "macos")]
     macos::forget_agent_windows(agent_key);
 }
@@ -812,9 +846,13 @@ impl Tool for ComputerTool {
         // Serialize every GUI-touching action so concurrent agent runs can't race.
         let _lock = ACTION_LOCK.lock().await;
 
-        let output = dispatch(&action)
-            .await
-            .map_err(|e| framework_next_step(&action, e))?;
+        let result = dispatch(&action).await;
+        // A failure that confirmed the surface gone drops the id it was asked
+        // through, so the table follows only surfaces that still exist.
+        if let Err(err) = &result {
+            forget_confirmed_gone(&action, err);
+        }
+        let output = result.map_err(|e| framework_next_step(&action, e))?;
         Ok(output)
     }
 
@@ -1064,7 +1102,7 @@ fn unpinned_clause(target: &TargetSpec, input: &core::RawInput) -> &'static str 
 }
 
 /// The surface an action addresses: the explicit target, else the surface this
-/// agent last observed or captured, else — with nothing pinned yet — whatever the
+/// session last observed or captured, else — with nothing pinned yet — whatever the
 /// system has focused. Coordinate actions use it so a focus shift between observe
 /// and the action never lands them on a different surface than the refs came from.
 fn resolve_action_target(target: Option<&str>) -> anyhow::Result<TargetSpec> {
@@ -1084,6 +1122,34 @@ async fn resolve_surface(target: Option<&str>) -> anyhow::Result<TargetSpec> {
             Ok(TargetSpec::from_window(&win))
         }
         other => Ok(other),
+    }
+}
+
+/// Drop the id a failed call was asked through when the failure confirmed that
+/// surface gone. Only a confirmed death counts: a busy or unanswering surface keeps
+/// its id, and an identifier the call never named (a ref action, a global key chord)
+/// has none to drop. This is what keeps the table following the desktop without any
+/// polling — nothing is remembered about a surface that no longer exists.
+fn forget_confirmed_gone(action: &ComputerAction, err: &anyhow::Error) {
+    if !core::is_surface_gone(err) {
+        return;
+    }
+    let named = match action {
+        ComputerAction::Windows { app } => app.as_deref(),
+        ComputerAction::Observe { target }
+        | ComputerAction::Screenshot { target }
+        | ComputerAction::Zoom { target, .. }
+        | ComputerAction::Click { target, .. }
+        | ComputerAction::Type { target, .. }
+        | ComputerAction::Scroll { target, .. }
+        | ComputerAction::Drag { target, .. } => target.as_deref(),
+        ComputerAction::Apps {}
+        | ComputerAction::Press { .. }
+        | ComputerAction::Cursor {}
+        | ComputerAction::Wait { .. } => None,
+    };
+    if let Some(id) = named {
+        core::forget_target(id.trim());
     }
 }
 
@@ -1112,7 +1178,16 @@ async fn apps() -> anyhow::Result<String> {
 
 async fn windows(app: Option<&str>) -> anyhow::Result<String> {
     let app_info = match app {
-        Some(arg) => Some(resolve_app(arg).await?),
+        Some(arg) => {
+            let info = resolve_app(arg).await?;
+            // An id outlives the run that minted it, so the application it names is
+            // confirmed against the running system before the listing can present a
+            // quit application as one without windows.
+            if backend().app_running(&info).await == Some(false) {
+                return Err(core::app_absent(&info.name, core::AppAbsence::Quit));
+            }
+            Some(info)
+        }
         None => None,
     };
     let listing = backend().list_windows(app_info.as_ref()).await?;
@@ -1179,6 +1254,12 @@ async fn resolve_app(arg: &str) -> anyhow::Result<AppInfo> {
     {
         return Ok(AppInfo { pid, name });
     }
+    // Something shaped like one of this tool's ids is read as an id even when the
+    // session no longer knows it: calling it a missing application would blame the
+    // wrong thing. A name or a pid keeps the route below and its own refusal.
+    if core::is_identifier(trimmed) {
+        return Err(core::unknown_identifier(trimmed));
+    }
     let apps = backend().list_apps().await?;
     if let Ok(pid) = trimmed.parse::<u32>() {
         return apps
@@ -1193,20 +1274,30 @@ async fn resolve_app(arg: &str) -> anyhow::Result<AppInfo> {
     Err(no_app_error(trimmed, &apps))
 }
 
+/// The refusal for an app argument that matches no running application: the
+/// candidates are the first few names and a count of the rest, so a truncated list
+/// is never presented as the whole set.
 fn no_app_error(name: &str, apps: &[AppInfo]) -> anyhow::Error {
     if apps.is_empty() {
         anyhow::anyhow!(
             "no running applications found — start '{name}' or list apps with the 'apps' action"
         )
     } else {
+        const SHOWN: usize = 3;
         let candidates = apps
             .iter()
-            .take(3)
+            .take(SHOWN)
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        let more = apps.len().saturating_sub(SHOWN);
+        let rest = if more == 0 {
+            String::new()
+        } else {
+            format!(" and {more} more")
+        };
         anyhow::anyhow!(
-            "no running application matches '{name}' — running apps: {candidates}; use the \
+            "no running application matches '{name}' — running apps: {candidates}{rest}; use the \
              'apps' action for exact ids"
         )
     }

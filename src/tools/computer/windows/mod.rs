@@ -295,6 +295,12 @@ impl Backend for WindowsBackend {
         thread::submit(Call::ListWindows { app }, LIST_TIMEOUT).await
     }
 
+    /// A plain process query, run here rather than through the apartment: it needs no
+    /// COM and no provider, and it answers a single truthy question about one pid.
+    async fn app_running(&self, app: &AppInfo) -> Option<bool> {
+        app.pid.and_then(window::process_alive)
+    }
+
     async fn focused_window(&self) -> anyhow::Result<WindowInfo> {
         thread::submit(Call::FocusedWindow, LIST_TIMEOUT).await
     }

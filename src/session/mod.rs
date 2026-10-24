@@ -1081,8 +1081,12 @@ impl SessionStore {
         // maintainer's self-cleanup) goes through here, so this is where a
         // launch folder's search engine — held for the session's lifetime and
         // referenced by nothing else (see `workspace_index::release_path_named_engine`)
-        // is released. Read the recorded folder before the rows go; release it
-        // only for a real removal.
+        // is released, and where the computer tool's session ends: the conversation
+        // this id addressed is gone, so the application/window ids minted under it are
+        // too (see `tools::computer::end_session`). Read the recorded folder before the
+        // rows go. The ids go even when the conversation had no row to delete — a
+        // reset is what it is, whether or not the session had stored a message — while
+        // the engine is released only for a real removal.
         let workspace = self.session_workspace_name(agent_id).await;
         let tx = self.conn.begin_tx().await?;
         let deleted = tx
@@ -1097,6 +1101,7 @@ impl SessionStore {
         )
         .await?;
         tx.commit().await?;
+        crate::tools::computer::end_session(agent_id);
         if deleted > 0
             && let Some(workspace) = workspace
         {
