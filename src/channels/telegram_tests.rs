@@ -1182,10 +1182,16 @@ async fn a_hand_over_at_the_declared_size_is_complete() {
 #[test]
 fn every_local_hand_over_failure_reaches_the_owner_as_itself() {
     let outside: anyhow::Error = LocalHandOver::Outside.into();
-    assert_eq!(download_failure_reason(&outside), LOCAL_FILE_OUTSIDE_REASON);
+    assert_eq!(
+        download_failure_reason(&outside, TransferLimits::LOCAL),
+        LOCAL_FILE_OUTSIDE_REASON
+    );
 
     let missing: anyhow::Error = LocalHandOver::Missing.into();
-    assert_eq!(download_failure_reason(&missing), LOCAL_FILE_MISSING_REASON);
+    assert_eq!(
+        download_failure_reason(&missing, TransferLimits::LOCAL),
+        LOCAL_FILE_MISSING_REASON
+    );
 
     let incomplete: anyhow::Error = LocalHandOver::Incomplete {
         got: 3,
@@ -1193,14 +1199,20 @@ fn every_local_hand_over_failure_reaches_the_owner_as_itself() {
     }
     .into();
     assert_eq!(
-        download_failure_reason(&incomplete),
+        download_failure_reason(&incomplete, TransferLimits::LOCAL),
         local_file_incomplete_reason(3, 9)
     );
 
+    // Only a failure nothing recognises is still the transport's own refusal, and
+    // it hints at the bot-download cap only in the mode that has one.
     let unknown = anyhow::anyhow!("the staging disk went away");
     assert_eq!(
-        download_failure_reason(&unknown),
-        TELEGRAM_TRANSFER_REFUSED_REASON
+        download_failure_reason(&unknown, TransferLimits::CLOUD),
+        "Telegram refused the transfer (it may exceed what the bot can download)"
+    );
+    assert_eq!(
+        download_failure_reason(&unknown, TransferLimits::LOCAL),
+        "Telegram refused the transfer"
     );
 }
 
@@ -1211,7 +1223,7 @@ fn the_refusal_limit_is_the_one_the_mode_has() {
     assert!(declared_size_refusal(TransferLimits::CLOUD, 20 * 1024 * 1024 + 1).is_some());
     assert!(declared_size_refusal(TransferLimits::LOCAL, 20 * 1024 * 1024 + 1).is_none());
     assert_eq!(TransferLimits::LOCAL.upload, 2000 * 1024 * 1024);
-    assert_eq!(TransferLimits::CLOUD.upload, FILE_MAX_BYTES);
+    assert_eq!(TransferLimits::CLOUD.upload, 50 * 1024 * 1024);
 }
 
 /// Boundaries of the declared-size gate: exactly at the cloud's limit passes,

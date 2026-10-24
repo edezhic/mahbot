@@ -2213,7 +2213,6 @@ impl DocumentTool {
     /// every reserved output exists, describe what was produced, and list the
     /// `[FILE:…]` markers. A failed run removes the reservations so no empty
     /// placeholder is left behind.
-    #[expect(clippy::too_many_lines)] // the one reply builder: verify, describe, and every note an operation can raise
     async fn deliver(
         &self,
         request: Value,
@@ -2266,22 +2265,6 @@ impl DocumentTool {
 
         let names: Vec<String> = outputs.iter().map(|path| file_name_of(path)).collect();
         let mut text = describe(prefix, &names, &sizes);
-        let oversized: Vec<String> = outputs
-            .iter()
-            .zip(&sizes)
-            .filter(|(_, size)| **size > crate::util::FILE_MAX_BYTES)
-            .map(|(path, _)| file_name_of(path))
-            .collect();
-        if !oversized.is_empty() {
-            text = super::with_note(
-                &text,
-                &format!(
-                    "[over the {} MB send limit — may not be delivered: {}]",
-                    megabytes(crate::util::FILE_MAX_BYTES),
-                    oversized.join(", ")
-                ),
-            );
-        }
         if !outcome.missing.is_empty() {
             text = super::with_note(
                 &text,
@@ -2346,8 +2329,7 @@ impl DocumentTool {
         // `missing` (placeholders left unchanged), `unsupported` (characters the
         // font cannot draw), `placeholders == Some(0)` (nothing was substituted)
         // and `outcome.lossy` (the kit's own losses) are the statements that part
-        // of what was asked is not in the produced file. The send-limit note above
-        // informs about delivery and is not partiality.
+        // of what was asked is not in the produced file.
         let partial = outcome.lossy
             || !outcome.missing.is_empty()
             || !outcome.unsupported.is_empty()
@@ -2374,10 +2356,9 @@ async fn resolve_input(ws: &Workspace, path: &str, access: PathAccess) -> Result
             resolved.display()
         );
     }
-    // The product's own file limit, the same one an input to a conversion or an
-    // outgoing attachment meets. Without it an oversized file is read whole by
-    // the kit and ends as a killed run — a caller's own file reported as a
-    // mahbot-side fault.
+    // The product's own conversion limit, not a transfer limit: the kit loads an
+    // input whole. Without it an oversized file is read whole by the kit and ends
+    // as a killed run — a caller's own file reported as a mahbot-side fault.
     if meta.len() > crate::util::FILE_MAX_BYTES {
         anyhow::bail!(
             "usage: {} is over the {} MB limit for a document operation, got {} — hint: shrink \

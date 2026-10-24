@@ -211,9 +211,9 @@ pub(crate) fn inline_marker_refusal(kind: MediaMarkerKind) -> String {
 
 /// Why a resolved local target cannot be delivered as `kind`, or `None` when it
 /// can: an image must carry a native raster signature, any other kind only needs
-/// to name an existing regular file. Telegram runs its authoritative image
-/// decode after this; the desktop cannot, because a decode on the render thread
-/// is not worth a frame.
+/// to name an existing regular file. No size cap applies — an outgoing
+/// attachment's only size gate is the transport's own, and the desktop transfers
+/// nothing at all.
 #[must_use]
 pub(crate) fn local_refusal(kind: MediaMarkerKind, path: &Path) -> Option<&'static str> {
     if kind == MediaMarkerKind::Image {
@@ -241,13 +241,11 @@ fn local_target_refusal(path: &Path) -> Option<&'static str> {
 }
 
 /// Why a local image target cannot be delivered, or `None` when it is a regular
-/// file within the shared input cap whose head carries a native raster
-/// signature. Metadata plus a bounded head read — no decode — so the desktop can
-/// ask this on the render thread. Telegram runs the authoritative decode
-/// ([`classify_media_image_target`]) after it, so a corrupt raster that passes
-/// the signature is refused there as `it is not an image.`, while the desktop
-/// shows the viewer's placeholder; that divergence is deliberate and must not be
-/// "fixed" with a decode on the render thread.
+/// file whose head carries a native raster signature. Metadata plus a bounded
+/// head read — no decode — so the desktop can ask this on the render thread.
+/// A file that passes the signature without decoding is still delivered as the
+/// attachment it was named: the desktop shows the viewer's placeholder for it,
+/// and the transport carries it as a document.
 #[must_use]
 fn image_target_refusal(path: &Path) -> Option<&'static str> {
     use std::io::Read as _;
@@ -257,12 +255,6 @@ fn image_target_refusal(path: &Path) -> Option<&'static str> {
     let Ok(mut file) = std::fs::File::open(path) else {
         return Some(UNREADABLE_REASON);
     };
-    let Ok(metadata) = file.metadata() else {
-        return Some(UNREADABLE_REASON);
-    };
-    if metadata.len() > crate::util::INBOUND_IMAGE_MAX_INPUT_BYTES {
-        return Some(TOO_LARGE_REASON);
-    }
     let mut head = [0_u8; 16];
     let Ok(read) = file.read(&mut head) else {
         return Some(UNREADABLE_REASON);
@@ -286,7 +278,6 @@ pub(crate) const UNREADABLE_REASON: &str = "it could not be read.";
 pub(crate) const INLINE_PAYLOAD_REASON: &str = "it carries an inline payload, not a file.";
 pub(crate) const NOT_AN_IMAGE_REASON: &str = "it is not an image.";
 pub(crate) const NOT_A_FILE_REASON: &str = "it is not a regular file.";
-pub(crate) const TOO_LARGE_REASON: &str = "it is too large to send.";
 pub(crate) const INVALID_ADDRESS_REASON: &str = "it is not a valid address.";
 pub(crate) const FILE_URL_REASON: &str = "an address is not a local file.";
 
@@ -825,6 +816,21 @@ mod tests {
 
         let _ = std::fs::remove_file(&png);
         let _ = std::fs::remove_file(&text);
+    }
+
+    #[test]
+    fn an_oversized_raster_is_not_refused_as_a_target() {
+        // The transport's own upload limit is the only size gate on an outgoing
+        // attachment, so the inbound decode budget must not refuse one. Sparse, so
+        // the test costs no disk.
+        let png = write_temp_png("oversized");
+        std::fs::File::options()
+            .write(true)
+            .open(&png)
+            .and_then(|file| file.set_len(crate::util::INBOUND_IMAGE_MAX_INPUT_BYTES + 1))
+            .expect("a sparse oversized raster");
+        assert_eq!(local_refusal(MediaMarkerKind::Image, &png), None);
+        let _ = std::fs::remove_file(&png);
     }
 
     #[test]

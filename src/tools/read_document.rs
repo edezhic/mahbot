@@ -67,8 +67,8 @@ async fn document_target(path: &Path) -> anyhow::Result<Option<String>> {
     if !crate::document::needs_extraction(&head, name) {
         return Ok(None);
     }
-    // The inbound product cap, not the read tool's own 10 MB text cap (both
-    // are stated in the read prompts).
+    // The conversion cap, not the read tool's own 10 MB text cap (both are
+    // stated in the read prompts).
     crate::tools::check_size_within(
         &meta,
         crate::util::FILE_MAX_BYTES,

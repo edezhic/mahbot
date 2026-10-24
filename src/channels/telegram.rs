@@ -13,7 +13,7 @@ use crate::pipeline::board::{Ticket, TicketPhase};
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::util::media_target::{self, MarkerTarget, MediaTarget};
 use crate::util::{
-    FILE_MAX_BYTES, MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, is_http_url, parse_media_marker,
+    MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, is_http_url, parse_media_marker,
 };
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
@@ -39,9 +39,9 @@ const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 180;
 
 /// Per-request timeout for a media transfer, overriding the channel client's
-/// one-minute default: [`FILE_MAX_BYTES`] in either direction takes longer than
-/// a minute over a slow link. Still bounded, so a stalled transfer cannot hold
-/// the request open forever.
+/// one-minute default: the cloud's 50 MB upload takes longer than a minute over
+/// a slow link. Still bounded, so a stalled transfer cannot hold the request open
+/// forever. The local server sets its own day-long bound instead.
 const MEDIA_TRANSFER_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
@@ -1005,18 +1005,14 @@ fn marker_outcome(
 
     // Images, audio and video deliberately accept any location on disk — only
     // `[FILE:...]` is workspace-confined. The kind's own gate still applies: an
-    // image marker must name a real raster, not a directory, a text file or an
-    // over-cap file.
+    // image marker must name a file whose head carries a raster signature, not a
+    // directory or a text file. Nothing is decoded here: a local image goes out
+    // as a document, so a large or unusual-but-valid raster is delivered rather
+    // than refused on a budget that belongs to the receiving side.
     if let Some(reason) = media_target::local_refusal(marker_kind, &path) {
         return refused(target, reason);
     }
-    let resolved = path.to_string_lossy();
-    if marker_kind == MediaMarkerKind::Image
-        && media_target::classify_media_image_target(&resolved) != MediaTarget::LocalImage
-    {
-        return refused(target, media_target::NOT_AN_IMAGE_REASON);
-    }
-    MarkerOutcome::Attach(resolved.into_owned())
+    MarkerOutcome::Attach(path.to_string_lossy().into_owned())
 }
 
 /// Parse `[KIND:path]` media markers from a message, returning cleaned text
@@ -1106,7 +1102,7 @@ impl TransferLimits {
     /// The cloud's limits.
     const CLOUD: Self = Self {
         download: Some(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES),
-        upload: FILE_MAX_BYTES,
+        upload: TELEGRAM_CLOUD_MAX_UPLOAD_BYTES,
         request: Some(MEDIA_TRANSFER_TIMEOUT),
     };
 
@@ -1184,6 +1180,9 @@ async fn get_me(
 /// gate reuses it as the automatic-processing bound.
 pub(crate) const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
+/// The largest file the cloud Bot API accepts per upload.
+const TELEGRAM_CLOUD_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
+
 /// The largest file a local Bot API server accepts per upload.
 const TELEGRAM_LOCAL_MAX_UPLOAD_BYTES: u64 = 2000 * 1024 * 1024;
 
@@ -1211,11 +1210,16 @@ fn telegram_download_limit_reason(download: u64) -> String {
 }
 
 /// User-facing reason when Telegram declared no size (or one under the limit)
-/// but the `getFile`/download step still failed — in practice the download
-/// limit the transport does not always report. Naming no figure keeps it
-/// independent of [`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES`].
-const TELEGRAM_TRANSFER_REFUSED_REASON: &str =
-    "Telegram refused the transfer (it may exceed what the bot can download)";
+/// but the `getFile`/download step still failed. Naming no figure keeps it
+/// independent of [`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES`], and the download cap is
+/// hinted only where the mode has one — the local server has none at all.
+fn transfer_refused_reason(limits: TransferLimits) -> &'static str {
+    if limits.download.is_some() {
+        "Telegram refused the transfer (it may exceed what the bot can download)"
+    } else {
+        "Telegram refused the transfer"
+    }
+}
 
 /// User-facing reason when the download ran into [`MEDIA_TRANSFER_TIMEOUT`]:
 /// the request was stopped on this side, so it is not described as a refusal by
@@ -1428,7 +1432,7 @@ async fn wait_for_hand_over(path: &Path, expected: Option<u64>) -> anyhow::Resul
 ///
 /// The local hand-over's own failures come after those, in its own words
 /// ([`LocalHandOver`]). Anything unrecognised is still the transport's refusal.
-fn download_failure_reason(error: &anyhow::Error) -> String {
+fn download_failure_reason(error: &anyhow::Error, limits: TransferLimits) -> String {
     // The transport first: a `reqwest` error wraps the socket's own io error, so
     // testing io first would report a broken connection as a local write failure.
     if let Some(e) = error
@@ -1452,7 +1456,7 @@ fn download_failure_reason(error: &anyhow::Error) -> String {
         .chain()
         .find_map(|cause| cause.downcast_ref::<LocalHandOver>())
         .map_or_else(
-            || TELEGRAM_TRANSFER_REFUSED_REASON.to_string(),
+            || transfer_refused_reason(limits).to_string(),
             LocalHandOver::reason,
         )
 }
@@ -2670,7 +2674,7 @@ impl TelegramChannel {
         {
             tracing::warn!("Failed to download attachment: {e}");
             let _ = tokio::fs::remove_dir_all(&save_dir).await;
-            let reason = download_failure_reason(&e);
+            let reason = download_failure_reason(&e, self.limits());
             let outcome = if reason == ATTACHMENT_SAVE_REFUSED_REASON {
                 NOT_STORED
             } else {
@@ -4205,12 +4209,10 @@ impl Channel for TelegramChannel {
         // blocks or affects message delivery.
         self.spawn_menu_refresh(chat_id);
 
-        // Look for inline attachment markers like [IMAGE:path/to/file.png].
-        // Marker parsing now runs the shared classifier, whose local-file branch
-        // is a blocking raster decode — offload it so a Tokio worker is not
-        // parked while a local image is decoded for attachment. A relative target
-        // resolves against `message.file_roots`; every marker either arrives or
-        // leaves a refusal notice, never raw markup.
+        // Look for inline attachment markers like [IMAGE:path/to/file.png]. The
+        // gates under it stat and head-read local files, so it runs off the async
+        // worker. A relative target resolves against `message.file_roots`; every
+        // marker either arrives or leaves a refusal notice, never raw markup.
         let (text_without_markers, attachments, refusals) =
             crate::util::with_block_in_place(|| {
                 parse_attachment_markers(content, &message.file_roots, self.limits())

@@ -824,8 +824,10 @@ const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;
 /// Input-size ceiling for the inbound-photo decode, aligned with the
 /// reference-image path's [`MAX_REFERENCE_INPUT_BYTES`] pattern: a decoded
 /// bitmap can be far larger than its compressed file, so over-cap files are
-/// refused from metadata BEFORE the file is read. Shared by the media-target
-/// classifier and the GUI render path so a single 50 MiB cap cannot drift.
+/// refused from metadata BEFORE the file is read. Shared by the inbound
+/// compression, the media-target classifier and the GUI render path so a single
+/// 50 MiB decode cap cannot drift. A decode budget, never a transfer limit: no
+/// outgoing attachment is refused on it.
 pub(crate) const INBOUND_IMAGE_MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Result of bounded inbound-image compression, with the post-EXIF/post-resize
@@ -1271,9 +1273,10 @@ const TRANSCRIBABLE_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mpeg", "mov", "webm"];
 /// (never locally decoded).
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif"];
 
-/// The product-level cap on one file in either direction, enforced by mahbot
-/// itself in both directions; Telegram's own download limit is stricter and
-/// lives in `telegram.rs`.
+/// The product-level cap on one file wherever the product itself bounds one: the
+/// desktop composer's attach limit, the read tool's document-container cap and
+/// the document tool's input cap. Not a transfer limit — what the transport
+/// carries is decided by `telegram.rs`, which follows the configured mode.
 pub(crate) const FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// The daemon-owned temp root for inbound attachments — the Telegram receive

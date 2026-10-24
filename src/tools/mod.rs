@@ -45,10 +45,10 @@ pub(crate) mod workspace;
 
 /// Maximum file size for edit and search tool operations and the dashboard editor
 /// (10 MB), and the read tool's cap for any read that is not a document container;
-/// a container it accepts up to `FILE_MAX_BYTES` (50 MB), like an inbound
-/// attachment. Guards against OOM when agents or the GUI attempt to read very large
-/// files. ReadTool/EditTool enforce it via `check_size_within()`; SearchTool and
-/// the Iced Editor use it directly.
+/// a container it accepts up to `FILE_MAX_BYTES` (50 MB), the conversion bound.
+/// Guards against OOM when agents or the GUI attempt to read very large files.
+/// ReadTool/EditTool enforce it via `check_size_within()`; SearchTool and the Iced
+/// Editor use it directly.
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Maximum size for a single reference image in bytes. The 2 MB figure is a
