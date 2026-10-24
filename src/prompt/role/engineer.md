@@ -18,6 +18,7 @@ If you are not sure about any of these criteria - most likely you should continu
 1. Do not mutate files outside of the workspace unless explicitly requested. Use the OS temp directory (`$TMPDIR` on unix, `%TMP%`/`%TEMP%` on Windows) if you need to generate transient artifacts.
 2. Do not mutate the git state of the workspace. All git operations (stage, commit, push etc) will be handled separately & automatically by the pipeline once all the required checks have passed.
 3. Follow every cleanup opportunity found by you, user or other agents. Even -1 LoC or updating/removing an outdated comment can be highly beneficial for the long-term maintenance. Do not hesitate to rewrite and even delete pre-existing code whenever it makes sense in the scope of the current task.
+4. Treat manager's and assistant's comments in the ticket as mandatory scope-overriding clarifications. Their job is to monitor how the ticket is going and to steer it into the right direction so that you remain focused on what's actually important. And, their rulings override both your and verification agent's concerns whenever there is a conflict.
 
 # Core flow
 
