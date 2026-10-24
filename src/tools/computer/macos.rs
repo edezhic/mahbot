@@ -149,8 +149,8 @@ use objc2_application_services::{
     AXValueType, kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFRange, CFRetained, CFString, CFType, CGPoint, CGRect,
-    CGSize, ConcreteType, Type,
+    CFArray, CFBoolean, CFDictionary, CFRange, CFRetained, CFString, CFType, CFURL, CGPoint,
+    CGRect, CGSize, ConcreteType, Type,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext, CGDirectDisplayID,
@@ -160,7 +160,7 @@ use objc2_core_graphics::{
     CGPreflightScreenCaptureAccess, CGRequestPostEventAccess, CGRequestScreenCaptureAccess,
     CGScrollEventUnit,
 };
-use objc2_foundation::{NSArray, NSError, NSString};
+use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
     SCStreamErrorCode, SCWindow,
@@ -283,6 +283,7 @@ const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
 const AX_FOCUSED: &str = "AXFocused";
 const AX_PRESS: &str = "AXPress";
 const AX_OPEN: &str = "AXOpen";
+const AX_URL: &str = "AXURL";
 const AX_RAISE: &str = "AXRaise";
 const AX_MINIMIZED: &str = "AXMinimized";
 
@@ -970,9 +971,9 @@ fn build_tree(
         core::taxonomy_error(
             core::ERR_DEGRADED,
             format!(
-                "{} did not answer for its accessibility root, so nothing was read — retry, \
-                 or use screenshot instead",
-                budget.target()
+                "{} did not answer for its accessibility root, so nothing was read — {}",
+                budget.target(),
+                core::unanswered_next_step()
             ),
         )
     })?;
@@ -1368,10 +1369,7 @@ fn resolve_window(
             ensure_ax_thread(app_pid(&app)?)?;
             Ok((window_by_key(key, app_name)?, app))
         }
-        TargetSpec::Screen => Err(core::taxonomy_error(
-            core::ERR_UNSUPPORTED,
-            "observe targets an accessibility surface — use screenshot for the screen",
-        )),
+        TargetSpec::Screen => Err(core::screen_observe_error()),
     }
 }
 
@@ -1892,6 +1890,29 @@ fn ensure_window_receives(target: &TargetSpec, budget: &core::Budget) -> Result<
     Err(core::not_brought_forward(target.describe()))
 }
 
+/// The same proof for a window the caller already holds: bring it forward and confirm the
+/// window server delivers input to it. A pointer double click is aimed at the screen, so it
+/// lands on whatever window is in front — the element's own window is raised and checked
+/// before the click rather than clicked blind, and the call is refused when the surface never
+/// receives input.
+fn bring_window_forward(
+    window: &AXUIElement,
+    surface: &str,
+    budget: &core::Budget,
+) -> Result<(), anyhow::Error> {
+    raise_window(window)?;
+    for attempt in 0..=core::RAISE_SETTLE_STEPS {
+        if attempt > 0 {
+            sleep_millis(core::RAISE_SETTLE_MS);
+        }
+        budget.check()?;
+        if window_receives_input(window) {
+            return Ok(());
+        }
+    }
+    Err(core::not_brought_forward(surface))
+}
+
 /// Reject an argument mistake before any grant is requested: a call that can
 /// never succeed must not raise a system permission dialog.
 fn check_input_arguments(input: &RawInput) -> Result<(), anyhow::Error> {
@@ -2143,11 +2164,12 @@ fn capture_filter_to_rgba(
     capture_image_to_rgba(&image, budget)
 }
 
-/// Turn a CGImage into top-down RGBA bytes. CG contexts use a bottom-left
-/// origin, so the image is flipped (translate+scale) before drawing to yield
-/// top-down rows. The buffer is the call's: its geometry goes through
-/// [`core::capture_size`], and it is charged to `budget` with a fallible reserve,
-/// then filled in one copy from the context's own pixels.
+/// Turn a CGImage into top-down RGBA bytes. A bitmap context stores its first row
+/// at the top, and drawing an upright image into it with the identity transform
+/// keeps that order; a CTM flip would mirror Y and hand every caller an upside-down
+/// still (and a zoom cropped from the wrong band). The buffer is the call's: its
+/// geometry goes through [`core::capture_size`], and it is charged to `budget` with a
+/// fallible reserve, then filled in one copy from the context's own pixels.
 fn capture_image_to_rgba(
     image: &CGImage,
     budget: &CaptureBudget,
@@ -2171,8 +2193,6 @@ fn capture_image_to_rgba(
         )
     }
     .ok_or_else(|| anyhow!("failed to create bitmap context"))?;
-    CGContext::translate_ctm(Some(&ctx), 0.0, h as f64);
-    CGContext::scale_ctm(Some(&ctx), 1.0, -1.0);
     CGContext::draw_image(
         Some(&ctx),
         CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w as f64, h as f64)),
@@ -2424,7 +2444,19 @@ fn capture_available_blocking() -> bool {
 
 // ── Element actions ──────────────────────────────────────────────────────
 
-fn press_element(element: &AXUIElement) -> Result<Impact, anyhow::Error> {
+/// Perform a reference's press: its own `AXPress`, else its `AXOpen`. An element that
+/// offers `open` has two further routes, for the platform that advertises the action and
+/// then refuses it (Finder's desktop icons answer `kAXErrorAttributeUnsupported`): open
+/// the item it points at, or double click at its position once the window is proven to
+/// receive input. `center` is the element's frame centre in screen coordinates, when it has
+/// one; `surface` names the window in the refusal.
+fn press_element(
+    element: &AXUIElement,
+    window: &AXUIElement,
+    center: Option<(f64, f64)>,
+    surface: &str,
+    budget: &core::Budget,
+) -> Result<Impact, anyhow::Error> {
     let names = raw_action_names(element).map_err(|e| ax_error(e, "read element actions"))?;
     let Some(names) = names else {
         return Err(core::taxonomy_error(
@@ -2433,32 +2465,93 @@ fn press_element(element: &AXUIElement) -> Result<Impact, anyhow::Error> {
              on it by coordinates instead of by ref",
         ));
     };
-    if names.iter().any(|a| a == AX_PRESS) {
-        // SAFETY: AXPress was verified to exist on the element.
-        map_action_err(
-            unsafe { element.perform_action(&axc(AX_PRESS)) },
-            "perform press",
-        )
-    } else if names.iter().any(|a| a == AX_OPEN) {
-        // SAFETY: AXOpen was verified to exist on the element.
-        map_action_err(
-            unsafe { element.perform_action(&axc(AX_OPEN)) },
-            "perform open",
-        )
-    } else {
-        let available = names
-            .iter()
-            .map(|a| normalize_action_name(a))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(core::taxonomy_error(
+    let open_capable = names.iter().any(|a| a == AX_OPEN);
+    let press_capable = names.iter().any(|a| a == AX_PRESS);
+    if !open_capable && !press_capable {
+        let available = action_list(&names);
+        return Err(core::taxonomy_error(
             core::ERR_UNSUPPORTED,
             format!(
                 "element has no press/open action; available actions: {available} — click it by \
                  coordinates instead"
             ),
-        ))
+        ));
     }
+    for (advertised, action, label) in [
+        (press_capable, AX_PRESS, "press"),
+        (open_capable, AX_OPEN, "open"),
+    ] {
+        if !advertised {
+            continue;
+        }
+        // SAFETY: the action was verified to be one this element advertises.
+        let err = unsafe { element.perform_action(&axc(action)) };
+        if !unsupported_action(err) {
+            return map_action_err(err, label);
+        }
+    }
+    // Only an open-capable element has a further route: a refused press has no
+    // equivalent this tool can prove, so it keeps the refusal below.
+    if open_capable {
+        if open_pointed_at(element) {
+            return Ok(Impact::DoneWith(
+                "the element refused its own action, so the item it points at was opened"
+                    .to_string(),
+            ));
+        }
+        if let Some((x, y)) = center {
+            ensure(Grant::Input)?;
+            bring_window_forward(window, surface, budget)?;
+            click(CGPoint::new(x, y), MouseButton::Left, true, &[])?;
+            return Ok(Impact::DoneWith(
+                "the element refused its own action, so it was double clicked at its position"
+                    .to_string(),
+            ));
+        }
+    }
+    let available = action_list(&names);
+    Err(core::taxonomy_error(
+        core::ERR_UNSUPPORTED,
+        format!(
+            "the element advertises {available} but the accessibility API refused it — click it \
+             by coordinates instead"
+        ),
+    ))
+}
+
+fn action_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|a| normalize_action_name(a))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// An advertised action the platform answers with "unsupported" is one this element
+/// does not really perform, so the next route is tried instead of reporting it.
+fn unsupported_action(err: AXError) -> bool {
+    matches!(
+        err,
+        AXError::AttributeUnsupported | AXError::ActionUnsupported
+    )
+}
+
+/// Open the item an element points at, for a reference whose own action was refused.
+/// The link is the item itself (a file URL for Finder's icons), so the platform opens
+/// it exactly as the element's own action would.
+fn open_pointed_at(element: &AXUIElement) -> bool {
+    let Some(value) = attribute_value(element, &axc(AX_URL)).ok() else {
+        return false;
+    };
+    let text = if let Some(url) = value.downcast_ref::<CFURL>() {
+        url.string().to_string()
+    } else if let Some(text) = value.downcast_ref::<CFString>() {
+        text.to_string()
+    } else {
+        return false;
+    };
+    NSURL::URLWithString(&NSString::from_str(&text))
+        .is_some_and(|url| NSWorkspace::sharedWorkspace().openURL(&url))
 }
 
 fn set_element_value(element: &AXUIElement, text: &str) -> Result<Impact, anyhow::Error> {
@@ -2472,10 +2565,14 @@ fn set_element_value(element: &AXUIElement, text: &str) -> Result<Impact, anyhow
     }
     let cf: CFRetained<CFType> = CFRetained::from(CFString::from_str(text));
     // SAFETY: `cf` is a valid CFString (a CFType).
-    map_action_err(
-        unsafe { element.set_attribute_value(&axc(AX_VALUE), &cf) },
-        "set value",
-    )
+    let err = unsafe { element.set_attribute_value(&axc(AX_VALUE), &cf) };
+    if unsupported_action(err) {
+        return Err(core::taxonomy_error(
+            core::ERR_UNSUPPORTED,
+            "set value — element does not support SetValue; use click by ref then type without ref",
+        ));
+    }
+    map_action_err(err, "set value")
 }
 
 fn act_on_element_blocking(
@@ -2497,24 +2594,26 @@ fn act_on_element_blocking(
     let (root, handles, _truncation) = build_tree(&window, origin, &budget)?;
     let matched = core::resolve_locator_checked(&root, locator)?;
     let element = &handles[core::pre_order_index(&root, matched)];
+    // The element's own centre in screen coordinates, for the press the platform can
+    // only perform as a pointer double click. The tree stores frames window-relative,
+    // so the window origin puts them back on the screen.
+    let center = matched
+        .frame
+        .map(|(x, y, w, h)| (origin.0 + x + w / 2.0, origin.1 + y + h / 2.0));
     match act {
-        ElementAct::Press => press_element(element),
+        ElementAct::Press => press_element(element, &window, center, &label, &budget),
         ElementAct::SetValue { text } => set_element_value(element, text),
     }
 }
 
 /// Map the result of an AX ACTION onto the outcome the model is owed. The one
 /// action-specific arm is `CannotComplete`: the request reached the target without
-/// confirmation, so it is the middle outcome, [`Impact::Unconfirmed`].
+/// confirmation, so it is the middle outcome, [`Impact::Unconfirmed`]. An action the
+/// platform answers with [`unsupported_action`] never reaches here — each caller answers it
+/// with its own next route, or with a refusal written in the words of the action it asked for.
 fn map_action_err(err: AXError, ctx: &str) -> Result<Impact, anyhow::Error> {
     match err {
         AXError::Success => Ok(Impact::Done),
-        AXError::AttributeUnsupported => Err(core::taxonomy_error(
-            core::ERR_UNSUPPORTED,
-            format!(
-                "{ctx} — element does not support SetValue; use click by ref then type without ref"
-            ),
-        )),
         AXError::InvalidUIElement => Err(core::taxonomy_error(
             core::ERR_STALE_ELEMENT,
             format!("{ctx} — window closed or changed — re-enumerate"),
@@ -2836,6 +2935,7 @@ fn window_title(window: &AXUIElement) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_core_graphics::{CGBitmapInfo, CGColorRenderingIntent, CGDataProvider};
 
     /// The evidence for this backend's exception route: a framework call that
     /// raises must come back as a failed call, and raising it must not kill the
@@ -2871,6 +2971,63 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert_eq!(names, vec!["AXPress".to_string()]);
+    }
+
+    /// The capture conversion must keep the source's row order. A still whose rows
+    /// were reversed puts the menu bar at the bottom, and nothing else in this module
+    /// looks at a pixel; four distinct corners make a Y mirror visible in the first and
+    /// last rows (and an X mirror in the columns).
+    #[test]
+    fn a_capture_keeps_the_source_row_and_column_order() {
+        let corners: [u8; 16] = [
+            255, 0, 0, 255, // top-left: red
+            0, 255, 0, 255, // top-right: green
+            0, 0, 255, 255, // bottom-left: blue
+            255, 255, 255, 255, // bottom-right: white
+        ];
+        // SAFETY: the provider borrows `corners` for at least as long as it lives,
+        // and the RGBA8 layout is the one described to the image below.
+        let provider = unsafe {
+            CGDataProvider::with_data(
+                std::ptr::null_mut(),
+                corners.as_ptr().cast(),
+                corners.len(),
+                None,
+            )
+        }
+        .expect("a data provider over the fixture pixels");
+        let space = CGColorSpace::new_device_rgb().expect("a device RGB space");
+        let info = CGBitmapInfo(
+            CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0,
+        );
+        // SAFETY: a 2x2 RGBA8 image over `provider`, which outlives it, with a null
+        // decode array as documented.
+        let image = unsafe {
+            CGImage::new(
+                2,
+                2,
+                8,
+                32,
+                8,
+                Some(&space),
+                info,
+                Some(&provider),
+                std::ptr::null(),
+                false,
+                CGColorRenderingIntent::RenderingIntentDefault,
+            )
+        }
+        .expect("a 2x2 fixture image");
+        let capture = capture_image_to_rgba(&image, &core::CaptureBudget::default())
+            .expect("the fixture converts");
+        // One comparison pins the whole buffer: a Y mirror swaps the red/blue and the
+        // green/white pairs, an X mirror swaps the green/blue pair, and the length is the
+        // 2x2 image's.
+        assert_eq!(
+            &capture.rgba[..],
+            &corners[..],
+            "corners: top-left red, top-right green, bottom-left blue, bottom-right white"
+        );
     }
 
     #[test]

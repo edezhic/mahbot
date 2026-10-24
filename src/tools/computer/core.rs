@@ -31,8 +31,9 @@ use std::time::{Duration, Instant};
 /// Maximum normalized coordinate value, inclusive on both axes ([`NORMALIZED_MAX`]).
 pub(crate) const NORMALIZED_MAX: f64 = 1000.0;
 
-/// Surfaces exposing fewer than this many interactive elements are "AX-thin" —
-/// the model is nudged toward screenshots over the accessibility tree.
+/// Surfaces exposing fewer than this many interactive elements are "AX-thin": the
+/// result says so, and offers the route that is available at that moment — a still
+/// when stills are known to work, else the references the observation lists.
 pub(crate) const AX_THIN_INTERACTIVE_ELEMENTS: usize = 5;
 
 /// Node ceiling of one tree read — prevents unbounded output. A read that
@@ -262,11 +263,11 @@ impl Budget {
             )
         } else {
             format!(
-                "{} stopped answering accessibility requests — the {} was abandoned after {}s; \
-                 retry, or use screenshot instead",
+                "{} stopped answering accessibility requests — the {} was abandoned after {}s; {}",
                 self.target,
                 self.what,
-                self.limit.as_secs()
+                self.limit.as_secs(),
+                unanswered_next_step()
             )
         }
     }
@@ -300,6 +301,17 @@ pub(crate) fn name_surface(budget: &mut Budget, app_name: &str, title: Option<&s
     label
 }
 
+/// The step a surface that stopped answering leaves the caller: a still when stills
+/// are known to work, and otherwise the retry that needs no capture channel. The one
+/// owner of that choice, so every refusal that ends this way agrees.
+pub(crate) fn unanswered_next_step() -> &'static str {
+    if super::capture_known_available() {
+        "retry, or use screenshot instead"
+    } else {
+        "retry it"
+    }
+}
+
 /// The failure for a surface that did not answer one of the reads a call makes before
 /// it can show, act on or capture anything. Both AT-SPI and AX report an unanswered
 /// request as a missing value, so a target that stopped answering is named — with what
@@ -310,8 +322,8 @@ pub(crate) fn unanswered(surface: &str, what: &str) -> anyhow::Error {
     taxonomy_error(
         ERR_DEGRADED,
         format!(
-            "{surface} did not answer {what} — it may be busy or hung; retry, or use screenshot \
-             instead"
+            "{surface} did not answer {what} — it may be busy or hung; {}",
+            unanswered_next_step()
         ),
     )
 }
@@ -682,9 +694,13 @@ pub(crate) struct UiNode {
 #[derive(Debug, Clone)]
 pub(crate) enum Impact {
     Done,
-    /// Delivered, with one thing the result must still say: a modifier the call
-    /// could not release again, which may still be held down.
-    #[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code))]
+    /// Delivered, with one thing the result must still say: a modifier the call could
+    /// not release again (which may still be held down), or the platform route a
+    /// reference's own refused action was replaced with.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", test)),
+        expect(dead_code)
+    )]
     DoneWith(String),
     /// Carries what is known: how much went through, and why it stopped.
     Unconfirmed(String),
@@ -2092,8 +2108,8 @@ fn count_stats(node: &UiNode) -> (usize, usize) {
     (total, interactive)
 }
 
-/// True when the surface exposes very few actionable elements — the signal to
-/// switch from the accessibility tree to screenshots.
+/// True when the surface exposes very few actionable elements — the signal that the
+/// observation is thin, which the result then says with the route that works there.
 #[must_use]
 pub(crate) fn is_ax_thin(obs: &Observation) -> bool {
     count_interactive(obs) < AX_THIN_INTERACTIVE_ELEMENTS
@@ -2255,6 +2271,25 @@ pub(crate) fn resolve_locator_checked<'a>(
     }
 }
 
+/// Shared refusal for observing the `screen` target: an observation reads an
+/// accessibility surface, and the screen itself is read by a still — named only when
+/// stills are known to work, since listing the windows always does. The one wording,
+/// so the three backends cannot drift apart.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    expect(dead_code)
+)]
+pub(crate) fn screen_observe_error() -> anyhow::Error {
+    taxonomy_error(
+        ERR_UNSUPPORTED,
+        if super::capture_known_available() {
+            "observe targets an accessibility surface — use screenshot for the screen"
+        } else {
+            "observe targets an accessibility surface — use apps/windows to pick one"
+        },
+    )
+}
+
 /// Shared refusal for acting on the `screen` target: acting addresses an element
 /// of a window. Linux and macOS pre-check it; Windows lets its own target
 /// resolution raise it, so the wording is the same everywhere.
@@ -2265,7 +2300,11 @@ pub(crate) fn resolve_locator_checked<'a>(
 pub(crate) fn screen_act_error() -> anyhow::Error {
     taxonomy_error(
         ERR_UNSUPPORTED,
-        "act targets a window — use apps/windows to pick one (use screenshot for the screen)",
+        if super::capture_known_available() {
+            "act targets a window — use apps/windows to pick one (use screenshot for the screen)"
+        } else {
+            "act targets a window — use apps/windows to pick one"
+        },
     )
 }
 
@@ -2693,7 +2732,7 @@ mod tests {
         );
         // count_interactive counts the two buttons (actions) and treats root/group as non-interactive.
         assert_eq!(count_interactive(&obs), 2);
-        // 2 < AX_THIN_INTERACTIVE_ELEMENTS → the surface is AX-thin (screenshot signal).
+        // 2 < AX_THIN_INTERACTIVE_ELEMENTS → the surface is AX-thin.
         assert!(is_ax_thin(&obs));
     }
 

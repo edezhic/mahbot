@@ -83,10 +83,7 @@ const VALUE_ROLES: &[&str] = &[
 
 pub(super) fn observe(uia: &IUIAutomation, target: &TargetSpec) -> anyhow::Result<Observation> {
     if matches!(target, TargetSpec::Screen) {
-        return Err(core::taxonomy_error(
-            core::ERR_UNSUPPORTED,
-            "observe targets an accessibility surface — use screenshot for the screen",
-        ));
+        return Err(core::screen_observe_error());
     }
     let resolved = window::resolve(target)?;
     // The title is read before the walk: a walk that spends its budget has to name

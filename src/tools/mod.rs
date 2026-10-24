@@ -238,13 +238,11 @@ pub(crate) fn get_dispatch_message(args: &serde_json::Value) -> anyhow::Result<&
     Ok(message)
 }
 
-/// Prepend a note about argument normalization so the model can see what was
-/// silently corrected (e.g. flattened fields, XML wrapping).
-pub(crate) fn with_normalization_notes(output: String, notes: &[String]) -> String {
-    if notes.is_empty() {
-        return output;
-    }
-    format!("[normalized] {}\n{output}", notes.join("; "))
+/// Record one argument the tool corrected before running, so a call that was silently
+/// reshaped can still be diagnosed — in the log, never in the caller's result. The note
+/// describes the reshaping only: never the payload, which may be text the owner typed.
+pub(crate) fn log_normalization_note(tool: &str, note: &str) {
+    tracing::info!(tool, note, "tool arguments were normalized");
 }
 
 /// Append a bracketed note (`[exit status: 3]`, `[leftover process] …`) under

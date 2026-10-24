@@ -26,7 +26,10 @@
 //! only what shapes an ordinary call — what the actions are, which surface one acts on,
 //! the coordinate space, the result states — because a caveat that matters only when a
 //! call goes wrong belongs in the failure that raises it, as one line saying what to do
-//! next, not in text every request carries.
+//! next, not in text every request carries. That next step names only a route that works
+//! in the state the call found: a screenshot is offered only when stills are known to
+//! work ([`capture_known_available`]), and the accessibility listing or a retry is named
+//! otherwise.
 //!
 //! # Bounded by the product, not by the machine
 //!
@@ -668,6 +671,15 @@ pub(crate) fn cached_capture_available() -> Option<bool> {
     Some(*ok)
 }
 
+/// Whether a still is known to work right now — the only state in which a result
+/// offers a screenshot as the way forward. Unknown counts as "no": a cached answer is
+/// kept for at most [`CAPTURE_PROBE_TTL`], and after that it is gone, so advice must
+/// never treat either state as permission to recommend a still. Checking it costs no
+/// platform work, so it is safe under [`ACTION_LOCK`].
+pub(crate) fn capture_known_available() -> bool {
+    cached_capture_available() == Some(true)
+}
+
 // ── Process-wide action serialization ───────────────────────────────────
 
 static ACTION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -770,8 +782,6 @@ impl Tool for ComputerTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: Value) -> anyhow::Result<String> {
-        let mut notes: Vec<String> = Vec::new();
-
         let action_value = args
             .get("action")
             .cloned()
@@ -779,7 +789,7 @@ impl Tool for ComputerTool {
         let (action_value, normalized_note) =
             normalize_action(action_value, &args).map_err(anyhow::Error::msg)?;
         if let Some(note) = normalized_note {
-            notes.push(format!("action normalized: {note}"));
+            super::log_normalization_note("computer", &note);
         }
 
         check_action_fields(&action_value)?;
@@ -805,7 +815,7 @@ impl Tool for ComputerTool {
         let output = dispatch(&action)
             .await
             .map_err(|e| framework_next_step(&action, e))?;
-        Ok(super::with_normalization_notes(output, &notes))
+        Ok(output)
     }
 
     /// The tool's text is a real result (a surface summary, an action's outcome),
@@ -939,8 +949,12 @@ fn framework_next_step(action: &ComputerAction, err: anyhow::Error) -> anyhow::E
             "re-observe the target if it is a window, then take another route or report it"
         }
         _ => {
-            "re-observe or screenshot to check the target's state, then take another route \
-              or report it"
+            if capture_known_available() {
+                "re-observe or screenshot to check the target's state, then take another route \
+                 or report it"
+            } else {
+                "re-observe to check the target's state, then take another route or report it"
+            }
         }
     };
     anyhow::anyhow!("{err} — the call was abandoned, so {next}")
@@ -1235,17 +1249,14 @@ async fn observe(target: Option<&str>) -> anyhow::Result<String> {
     // counts), so compose the full output here and scrub it BEFORE any spill.
     let mut output = core::render_tree(&obs);
     if core::is_ax_thin(&obs) {
-        // An AX-thin surface with an unavailable capture channel combines both
-        // diagnoses in one note — the screenshot fallback would dead-end.
-        let note = if cached_capture_available() == Some(false) {
-            format!(
-                "surface exposes few actionable elements AND screen capture is unavailable: {}",
-                backend().capture_unavailable_error()
-            )
+        // A hint may only name a route that works at this moment: a still when stills
+        // are known to work, and otherwise the references it lists and the window listing.
+        output.push_str("surface exposes few actionable elements — ");
+        output.push_str(if capture_known_available() {
+            "use screenshot"
         } else {
-            "surface exposes few actionable elements — use screenshot".to_string()
-        };
-        output.push_str(&note);
+            "act on the references it lists, or use apps/windows for another surface"
+        });
         output.push('\n');
     }
     // Spill ONLY the fully scrubbed output; try_spill_to_file returns the input

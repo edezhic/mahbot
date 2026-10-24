@@ -265,9 +265,14 @@ pub(super) fn ensure_actuation_allowed(hwnd: Option<HWND>) -> anyhow::Result<()>
     let app = process_name(pid).unwrap_or_else(|| format!("pid {pid}"));
     Err(core::permission_denied(format!(
         "{} belongs to {app} (pid {pid}), which runs elevated — this non-elevated process cannot \
-         send it input or drive its accessibility elements (Windows blocks both); a capture of \
-         the window may still work — ask the owner to run that application without elevation",
-        core::window_description("", &title)
+         send it input or drive its accessibility elements (Windows blocks both); {}ask the owner \
+         to run that application without elevation",
+        core::window_description("", &title),
+        if super::super::capture_known_available() {
+            "a capture of the window may still work — "
+        } else {
+            ""
+        }
     )))
 }
 

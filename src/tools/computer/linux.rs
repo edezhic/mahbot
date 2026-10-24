@@ -227,8 +227,13 @@ impl LinuxBackend {
                         }),
                         None => Err(core::taxonomy_error(
                             core::ERR_DEGRADED,
-                            "no cached Wayland screen size — capture the screen first; \
-                             accessibility observe/act remain available",
+                            if super::capture_known_available() {
+                                "no cached Wayland screen size — capture the screen first; \
+                                 accessibility observe/act remain available"
+                            } else {
+                                "no cached Wayland screen size — accessibility observe/act remain \
+                                 available"
+                            },
                         )),
                     }
                 } else {
@@ -982,10 +987,7 @@ async fn resolve_window(
     budget: &core::Budget,
 ) -> Result<(ObjectRefOwned, AppInfo), anyhow::Error> {
     match target {
-        TargetSpec::Screen => Err(core::taxonomy_error(
-            core::ERR_UNSUPPORTED,
-            "observe targets an accessibility surface — use screenshot for the screen",
-        )),
+        TargetSpec::Screen => Err(core::screen_observe_error()),
         TargetSpec::Focused => {
             let w = resolve_focused_window(conn, budget).await?;
             Ok((w.object_ref, w.app_info))
@@ -1053,9 +1055,16 @@ fn pixel_space() -> Option<(u32, u32)> {
 }
 
 /// What to do instead when an accessibility space cannot be mapped into pixels: the
-/// one tail every refusal in [`a11y_pixel_scale`] ends with.
-const A11Y_UNMAPPED_GUIDANCE: &str = "capture target: \"screen\" first — its still and zoom \
-     always work — and prefer ref actions, which need no pixels";
+/// one tail every refusal in [`a11y_pixel_scale`] ends with. A capture is named only
+/// when stills are known to work; ref actions need no pixels either way.
+fn a11y_unmapped_guidance() -> &'static str {
+    if super::capture_known_available() {
+        "capture target: \"screen\" first — its still and zoom always work — and prefer ref \
+         actions, which need no pixels"
+    } else {
+        "prefer ref actions, which need no pixels"
+    }
+}
 
 /// The scale between accessibility extents and the pixel space `pixels` describes —
 /// the one owner of that reconciliation, so a crop and a coordinate map can never
@@ -1080,7 +1089,8 @@ async fn a11y_pixel_scale(
             core::ERR_DEGRADED,
             format!(
                 "the screen's pixel size is not known, so accessibility extents cannot be mapped \
-                 into it — {A11Y_UNMAPPED_GUIDANCE}"
+                 into it — {}",
+                a11y_unmapped_guidance()
             ),
         ));
     };
@@ -1095,7 +1105,8 @@ async fn a11y_pixel_scale(
             core::ERR_DEGRADED,
             format!(
                 "the accessibility stack did not report the screen's geometry, so its coordinates \
-                 cannot be mapped into the captured pixels — {A11Y_UNMAPPED_GUIDANCE}"
+                 cannot be mapped into the captured pixels — {}",
+                a11y_unmapped_guidance()
             ),
         ));
     };
@@ -1106,7 +1117,8 @@ async fn a11y_pixel_scale(
             core::ERR_DEGRADED,
             format!(
                 "the accessibility extents could not be reconciled with the {width}x{height} \
-                 screen pixels, so nothing was mapped — {A11Y_UNMAPPED_GUIDANCE}"
+                 screen pixels, so nothing was mapped — {}",
+                a11y_unmapped_guidance()
             ),
         )),
     }
@@ -1292,9 +1304,9 @@ async fn build_tree(
         return Err(core::taxonomy_error(
             core::ERR_DEGRADED,
             format!(
-                "{} did not answer for its accessibility root, so nothing was read — \
-                 retry, or use screenshot instead",
-                budget.target()
+                "{} did not answer for its accessibility root, so nothing was read — {}",
+                budget.target(),
+                core::unanswered_next_step()
             ),
         ));
     };
@@ -2603,10 +2615,7 @@ impl Backend for LinuxBackend {
 
     async fn observe(&self, target: &TargetSpec) -> Result<Observation, anyhow::Error> {
         if matches!(target, TargetSpec::Screen) {
-            return Err(core::taxonomy_error(
-                core::ERR_UNSUPPORTED,
-                "observe needs a window target — use apps/windows to pick one",
-            ));
+            return Err(core::screen_observe_error());
         }
         let conn = self.conn().await?;
         // One clock for the whole observation, resolution included, so the budget the

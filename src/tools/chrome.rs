@@ -1388,6 +1388,9 @@ impl Tool for ChromeTool {
 
     async fn execute(&self, ws: &Workspace, args: Value) -> anyhow::Result<String> {
         let (tab, action, normalized_notes) = Self::normalize_call(&args)?;
+        for note in &normalized_notes {
+            super::log_normalization_note("chrome", note);
+        }
 
         debug!(tab, action = ?action, "chrome action");
 
@@ -1410,9 +1413,7 @@ impl Tool for ChromeTool {
         // The workspace is carried onto the durable rows below.
         let workspace = ws.as_path().to_string_lossy().into_owned();
 
-        let outcome = self
-            .run_step(&tab, action, &normalized_notes, &workspace)
-            .await;
+        let outcome = self.run_step(&tab, action, &workspace).await;
         // The cosmetic tail rides the step, inside the same per-tab lock: the
         // step's own result is already decided and is never changed by it.
         self.settle_step_group(&tab, outcome.as_ref().err()).await;
@@ -1462,7 +1463,6 @@ impl ChromeTool {
         &self,
         tab: &str,
         action: ChromeAction,
-        normalized_notes: &[String],
         workspace: &str,
     ) -> anyhow::Result<String> {
         // The elapsed time of the chrome-use dispatch this action runs (it may be
@@ -1487,7 +1487,7 @@ impl ChromeTool {
                 format!("[Tab: {tab}] {output}")
             };
             ActionOutput {
-                output: super::with_normalization_notes(body, normalized_notes),
+                output: body,
                 leftover_pipes,
             }
         } else if let ChromeAction::Screenshot { .. } = &action {
@@ -1496,7 +1496,7 @@ impl ChromeTool {
                 leftover_pipes,
             } = self.capture_screenshot(tab, workspace).await?;
             ActionOutput {
-                output: super::with_normalization_notes(output, normalized_notes),
+                output,
                 leftover_pipes,
             }
         } else if let ChromeAction::Upload { selector, files } = &action {
@@ -1505,28 +1505,21 @@ impl ChromeTool {
                 leftover_pipes,
             } = self.upload(selector, files, tab, workspace).await?;
             ActionOutput {
-                output: super::with_normalization_notes(output, normalized_notes),
+                output,
                 leftover_pipes,
             }
         } else if let ChromeAction::Extract { schema, limit } = &action {
             let (schema, schema_note) = Self::normalize_extract_schema(schema)?;
-            let ActionOutput {
-                output,
-                leftover_pipes,
-            } = self.run_extract(&schema, *limit, tab, workspace).await?;
-            let mut notes = normalized_notes.to_vec();
-            notes.extend(schema_note);
-            ActionOutput {
-                output: super::with_normalization_notes(output, &notes),
-                leftover_pipes,
+            if let Some(note) = &schema_note {
+                super::log_normalization_note("chrome", note);
             }
+            self.run_extract(&schema, *limit, tab, workspace).await?
         } else {
             let ActionOutput {
                 output: (response, snapshot),
                 leftover_pipes,
             } = self.run_action(&action, tab, workspace).await?;
-            let body =
-                Self::format_action_output(&action, tab, response, &snapshot, normalized_notes);
+            let body = Self::format_action_output(&action, tab, response, &snapshot);
             ActionOutput {
                 output: body,
                 leftover_pipes,
@@ -1838,9 +1831,9 @@ impl ChromeTool {
             .ok_or_else(|| anyhow::anyhow!(corrective_action_error(args)))?;
         let (action_value, normalized_note) =
             normalize_action(action_value, args).map_err(|e| anyhow::anyhow!(e))?;
-        if let Some(note) = normalized_note {
-            normalized_notes.push(format!("action normalized: {action_value} ({note})"));
-        }
+        // The note names the reshaping, never the reshaped action: a `fill` carries text the
+        // owner typed, and a note is written to the log store.
+        normalized_notes.extend(normalized_note);
 
         let action: ChromeAction = serde_json::from_value(action_value.clone()).map_err(|e| {
             // Give a more helpful message when the LLM uses wrong field names,
@@ -1996,14 +1989,12 @@ impl ChromeTool {
     }
 
     /// Shape the raw [`ChromeResponse`] into the LLM-facing text: the
-    /// per-action data extraction, the `[Tab: {tab}]` framing, and the
-    /// normalization notes.
+    /// per-action data extraction and the `[Tab: {tab}]` framing.
     fn format_action_output(
         action: &ChromeAction,
         tab: &str,
         response: ChromeResponse,
         snapshot: &str,
-        notes: &[String],
     ) -> String {
         use std::fmt::Write as _;
         // This shared path renders the text-input warnings only (`type` read-back
@@ -2085,7 +2076,7 @@ impl ChromeTool {
             );
         }
 
-        super::with_normalization_notes(output, notes)
+        output
     }
 
     /// Accept the model-facing extract schema: a JSON object, or a string
@@ -4000,7 +3991,6 @@ mod tests {
             "default",
             response,
             "",
-            &[],
         );
         assert!(out.contains("hello"), "output: {out}");
         assert!(
@@ -4020,7 +4010,6 @@ mod tests {
             "default",
             response,
             "",
-            &[],
         );
         assert!(out.contains('{'), "should fall back to pretty-print: {out}");
     }
@@ -4100,7 +4089,6 @@ mod tests {
             "default",
             response,
             "",
-            &[],
         );
         assert!(
             out.contains("chrome-use warning"),
@@ -4138,7 +4126,6 @@ mod tests {
             "default",
             response,
             "",
-            &[],
         );
         assert!(
             !out.contains("chrome-use warning"),
