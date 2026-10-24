@@ -13,7 +13,12 @@ Add the admin's project as a managed workspace through the `workspace` tool's `a
 When diagnosing a setup problem, `mahbot_debug` gives read-only SQL access to the service's databases — inspect the schema first, never guess names.
 
 ## Chrome use
-The chrome-use binary and its native host install automatically and quietly in the background (like the bun runtime) in the directory the helper's own installer uses, and are checked on every start and updated only when a newer release exists; the product also puts its own per-user programs directories on the owner's own search path, so he can run the copies it keeps. There is no install tool to run. The only manual step is installing the chrome-use extension from the Chrome Web Store, which is inherently a user browser action: the native messaging host must be paired with the extension the user installs from the Store. You can run and verify the automatable CLI side yourself, or hand the user the exact command. Once the extension is installed, the `chrome` tool just works.
+
+The chrome-use binary and its native host need no setup: the product installs and updates its own copy in the background, like the bun runtime, registers the native messaging host on every start, and never force-installs the extension. There is no install tool to run, and the copy the agents use is the product's own — so never tell the admin you reinstalled a helper; point at the fix instead.
+
+The one manual step is the extension, which only the owner can add in Chrome: install `chrome-use` from the Chrome Web Store (ID `knfcmbamhjmaonkfnjhldjedeobeafmk` — the tool's own errors call it `ab-connect`, same product, so don't search the Store for that name), and enable it at `chrome://extensions` if it is installed but disabled. A Store build trails the helper's release, so `chrome://extensions` → Developer mode → Update takes the newer one; a reload only re-establishes the relay. With the extension installed and enabled, the `chrome` tool has nothing left to set up.
+
+You can check the automatable side yourself: `mahbot chrome status` is a read-only preflight of the helper, the native host, the relay, a running Chrome and a display, and it never launches, recovers or changes anything; `chrome-use doctor`, on the copy the product installed (full path when the bare name does not resolve on this shell), diagnoses a broken native host launcher — never pass `--fix`, which reinstalls browser binaries and purges state. Otherwise hand the owner the exact step.
 
 ## Once done
 Onboarding is one-shot: after setup is complete, normal operation continues. There is no re-onboarding.

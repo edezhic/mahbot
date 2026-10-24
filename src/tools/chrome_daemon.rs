@@ -2100,9 +2100,9 @@ pub(crate) fn daemon_down_message() -> String {
              it is enabled."
         }
         Some(ProbeFailure::ExtensionAbsent) => {
-            "The chrome-use extension is not installed in Chrome — install/enable the ab-connect \
-             extension from the Chrome Web Store. Daemon restarts and launches cannot fix an \
-             absent extension; health recovers automatically once it is installed."
+            "The chrome-use extension is not installed in Chrome — install/enable it from the \
+             Chrome Web Store. Daemon restarts and launches cannot fix an absent extension; \
+             health recovers automatically once it is installed."
         }
         Some(ProbeFailure::RelayDown)
             if h.launch_outcome == Some(ChromeLaunchOutcome::Launched) =>
@@ -2902,9 +2902,8 @@ fn report_cause(failure: ProbeFailure) {
              until it is enabled."
         ),
         ProbeFailure::ExtensionAbsent => warn!(
-            "chrome-use extension is not installed in Chrome — install/enable the \
-             ab-connect extension from the Chrome Web Store. Auto-recovery paused \
-             until it is installed."
+            "chrome-use extension is not installed in Chrome — install/enable it from \
+             the Chrome Web Store. Auto-recovery paused until it is installed."
         ),
         ProbeFailure::RelayDown => warn!(
             "chrome-use extension relay is down (the extension is enabled) — waiting \
