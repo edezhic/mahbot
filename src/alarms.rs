@@ -64,6 +64,7 @@ pub(crate) struct Alarm {
     pub user_name: String,
     /// `"one-shot"` or `"periodic"`.
     pub kind: String,
+    /// The message the alarm fires or launches with — the card's description.
     pub text: String,
     /// Optional custom-tool check to run at fire time (triggered alarm).
     pub trigger: Option<StoredTrigger>,
@@ -132,18 +133,21 @@ impl Trigger {
         serde_json::to_string(self).expect("a trigger is always serializable")
     }
 
+    /// The arguments as they are shown, `None` when the tool takes none.
+    fn args_json(&self) -> Option<String> {
+        (!self.args.is_empty()).then(|| {
+            serde_json::to_string(&self.args)
+                .expect("a trigger's arguments are always serializable")
+        })
+    }
+
     /// The trigger as it is shown: the tool's name followed by its arguments,
     /// nothing but the name when it has none.
     fn render(&self) -> String {
-        if self.args.is_empty() {
-            return self.tool.clone();
+        match self.args_json() {
+            Some(args) => format!("{} {args}", self.tool),
+            None => self.tool.clone(),
         }
-        format!(
-            "{} {}",
-            self.tool,
-            serde_json::to_string(&self.args)
-                .expect("a trigger's arguments are always serializable")
-        )
     }
 }
 
@@ -190,6 +194,23 @@ impl StoredTrigger {
         match self {
             Self::Tool(trigger) => trigger.render(),
             Self::Unreadable => UNREADABLE_TRIGGER.to_string(),
+        }
+    }
+
+    /// The check's tool name alone — the alarm card's headline — or the marker
+    /// when there is nothing readable to name.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Tool(trigger) => &trigger.tool,
+            Self::Unreadable => UNREADABLE_TRIGGER,
+        }
+    }
+
+    /// The arguments shown beside the name, `None` when the check has none.
+    pub(crate) fn args_json(&self) -> Option<String> {
+        match self {
+            Self::Tool(trigger) => trigger.args_json(),
+            Self::Unreadable => None,
         }
     }
 }

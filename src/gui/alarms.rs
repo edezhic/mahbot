@@ -149,30 +149,70 @@ fn group_by_owner(alarms: &[Alarm]) -> Vec<(&str, Vec<&Alarm>)> {
 
 /// One alarm as its own card — the log row's surface, padding and width — with
 /// a right-click menu whose single item deletes it.
+///
+/// An alarm that runs a check headlines the check: the tool's name in the type
+/// the alarm's own text uses, its arguments kept beside it small and secondary,
+/// and the text demoted under that line. A plain reminder keeps its text as the
+/// headline. The countdown sits beside whichever line leads.
 fn render_alarm(alarm: &Alarm, now: DateTime<Local>) -> Element<'_, AlarmsMessage> {
+    let mut headline = row![];
+    let mut demoted_text = None;
+    match &alarm.trigger {
+        None => {
+            headline = headline.push(
+                text(&alarm.text)
+                    .size(theme::TEXT_14)
+                    .color(theme::TEXT_PRIMARY)
+                    .width(Length::Fill),
+            );
+        }
+        Some(trigger) => {
+            let mut check = row![
+                text(trigger.name())
+                    .size(theme::TEXT_14)
+                    .color(theme::TEXT_PRIMARY)
+            ]
+            .spacing(theme::SPACE_6)
+            .align_y(Alignment::Center);
+            // The arguments are shown exactly as stored: they are the same
+            // values that reach the assistant's prompt and the firing notice.
+            // Folded at any glyph so one long JSON token cannot run under the
+            // countdown.
+            if let Some(args) = trigger.args_json() {
+                check = check.push(
+                    text(args)
+                        .size(theme::TEXT_11)
+                        .font(super::JETBRAINS_MONO)
+                        .color(theme::TEXT_SECONDARY)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                );
+            }
+            headline = headline.push(check.width(Length::Fill));
+            // An empty alarm text draws nothing, so the row ends after the
+            // check line rather than showing a blank rung.
+            if !alarm.text.trim().is_empty() {
+                demoted_text = Some(
+                    text(&alarm.text)
+                        .size(theme::TEXT_13)
+                        .color(theme::TEXT_SECONDARY)
+                        .width(Length::Fill),
+                );
+            }
+        }
+    }
     let mut entry = Column::new().spacing(theme::SPACE_2).push(
-        row![
-            text(&alarm.text)
-                .size(theme::TEXT_14)
-                .color(theme::TEXT_PRIMARY)
-                .width(Length::Fill),
-            text(format_next_fire(&alarm.next_fire_at, now))
-                .size(theme::TEXT_12)
-                .font(super::JETBRAINS_MONO)
-                .color(theme::TEXT_SECONDARY),
-        ]
-        .spacing(theme::SPACE_12)
-        .align_y(Alignment::Start),
+        headline
+            .push(
+                text(format_next_fire(&alarm.next_fire_at, now))
+                    .size(theme::TEXT_12)
+                    .font(super::JETBRAINS_MONO)
+                    .color(theme::TEXT_SECONDARY),
+            )
+            .spacing(theme::SPACE_12)
+            .align_y(Alignment::Start),
     );
-    if let Some(trigger) = &alarm.trigger {
-        // The arguments are shown exactly as stored: they are the same values
-        // that reach the assistant's prompt and the firing notice.
-        entry = entry.push(
-            text(trigger.render())
-                .size(theme::TEXT_11)
-                .font(super::JETBRAINS_MONO)
-                .color(theme::TEXT_MUTED),
-        );
+    if let Some(demoted_text) = demoted_text {
+        entry = entry.push(demoted_text);
     }
     if let Some(target) = alarm.role_target() {
         // The role the alarm is addressed to, worded exactly as the assistant
