@@ -946,7 +946,7 @@ fn resolve_file_target(
     }
 
     // The plain spelling, not the platform's verbatim form: this value becomes
-    // the attachment's `target`, which reaches the delivery log.
+    // the attachment's `target`.
     Ok(crate::util::strip_verbatim_prefix(&canonical))
 }
 
@@ -3036,8 +3036,8 @@ impl TelegramChannel {
         let route = attachment_route(kind, target);
 
         // A failure is returned, not papered over with a bare link: the caller
-        // reports every failed attachment to the user with a reason. The record
-        // is written once, below, on success only.
+        // reports every failed attachment to the user with a reason. The delivery
+        // line is written once, below, on success only.
         let (file, bytes, source_url) = match route {
             AttachmentRoute::ByAddress => {
                 self.send_media_by_url(chat_id, thread_id, kind, target)
@@ -3067,8 +3067,8 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Post a pre-built media request and check its status. Success is recorded
-    /// by the caller, which knows what was delivered and how.
+    /// Post a pre-built media request and check its status. Success is left to the
+    /// caller, which knows what was delivered and how.
     async fn send_media(
         &self,
         api_method: &'static str,
@@ -3253,14 +3253,15 @@ async fn stream_capped(
     Ok(())
 }
 
-/// One record per delivered attachment: what went out, on which route, and from
-/// where. WARN is the level the log store keeps — INFO is swept after hours —
-/// and a delivery has no other durable trace.
+/// One line per delivered attachment: what went out, on which route, and from
+/// where. Debug level: a successful delivery is routine, not a fault, so ordinary
+/// operation keeps no record of it — the accepted cost — while every failure is
+/// still recorded.
 ///
 /// `file` is the name the delivery carries: the path of a local file, the name the
 /// product gave a fetched upload, or the name an address's last segment suggests
 /// for a send Telegram fetches itself. `source_url` is that address for both
-/// remote routes, so every remote delivery answers one query. Both are recorded
+/// remote routes, so one line describes a remote delivery. Both are redacted
 /// by [`crate::util::http::redact_address`]: no query, no fragment — a signed
 /// URL's credentials must not outlive the delivery, exactly as they are kept out
 /// of the chat and out of the errors logged on the same path. `bytes` is how many
@@ -3282,7 +3283,7 @@ fn record_attachment_delivery(
     };
     let file = crate::util::http::redact_address(file);
     let source_url = source_url.map(crate::util::http::redact_address);
-    tracing::warn!(
+    tracing::debug!(
         chat_id,
         kind = kind.label(),
         file,

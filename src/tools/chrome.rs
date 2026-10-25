@@ -1570,8 +1570,8 @@ impl ChromeTool {
     /// Resolve the tab for a call. An explicit non-empty tab passes through as the
     /// logical name; missing/empty falls back to the per-run default logical session,
     /// which [`ChromeTool::resolve_session`] maps into this run's namespace (a function
-    /// of the agent id — see [`run_session_namespace`]). Defaulting is echoed in tool
-    /// output (the note carries the logical name only).
+    /// of the agent id — see [`run_session_namespace`]). Defaulting is reported as a
+    /// normalization note (the note carries the logical name only).
     fn normalize_tab(args: &Value) -> (String, Option<String>) {
         if let Some(tab) = super::get_opt_str(args, "tab").filter(|s| !s.is_empty()) {
             (tab.to_string(), None)
@@ -1832,7 +1832,7 @@ impl ChromeTool {
         let (action_value, normalized_note) =
             normalize_action(action_value, args).map_err(|e| anyhow::anyhow!(e))?;
         // The note names the reshaping, never the reshaped action: a `fill` carries text the
-        // owner typed, and a note is written to the log store.
+        // owner typed, and a note is only ever logged.
         normalized_notes.extend(normalized_note);
 
         let action: ChromeAction = serde_json::from_value(action_value.clone()).map_err(|e| {
@@ -2389,8 +2389,8 @@ fn corrective_action_error(received: &Value) -> String {
 /// `{"variant": {...}}` tagged form that `ChromeAction` deserializes from.
 ///
 /// Recoverable shapes are mapped to their canonical equivalent and a note
-/// describing the correction is returned (so silent acceptance stays visible
-/// in tool output). Unrecoverable shapes produce a corrective error.
+/// describing the correction is returned, so a silently reshaped call stays
+/// diagnosable. Unrecoverable shapes produce a corrective error.
 fn normalize_action(action: Value, args: &Value) -> Result<(Value, Option<String>), String> {
     match action {
         // Canonical tagged object: {"open": {...}} or {"open": "https://..."}.
@@ -3201,7 +3201,7 @@ mod tests {
         assert_eq!(normalized, *expected, "normalized action mismatch");
         assert!(
             note.is_some(),
-            "recoverable shape should echo a normalization note"
+            "recoverable shape should report a normalization note"
         );
     }
 
@@ -3328,13 +3328,13 @@ mod tests {
 
     #[test]
     fn missing_or_empty_tab_defaults_to_logical_default() {
-        // Missing tab → the stable logical default, echoed in tool output.
+        // Missing tab → the stable logical default, reported as a note.
         // (Per-run physical uniqueness of that default is covered by
         // session_resolution_namespaces_per_agent_run.)
         let (tab, note) =
             ChromeTool::normalize_tab(&json!({"action":{"open":{"url":"https://example.com"}}}));
         assert_eq!(tab, DEFAULT_TAB);
-        assert!(note.is_some(), "defaulting should be echoed in tool output");
+        assert!(note.is_some(), "defaulting should be reported as a note");
         // Empty tab → the same default.
         let (tab2, note) =
             ChromeTool::normalize_tab(&json!({"tab":"","action":{"open":{"url":"x"}}}));

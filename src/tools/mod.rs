@@ -238,11 +238,11 @@ pub(crate) fn get_dispatch_message(args: &serde_json::Value) -> anyhow::Result<&
     Ok(message)
 }
 
-/// Record one argument the tool corrected before running, so a call that was silently
-/// reshaped can still be diagnosed — in the log, never in the caller's result. The note
-/// describes the reshaping only: never the payload, which may be text the owner typed.
+/// Record one argument the tool corrected before running: debug level, so a reshaped call
+/// stays explainable with the log filter opened and costs ordinary operation nothing. The
+/// note describes the reshaping only: never the payload, which may be text the owner typed.
 pub(crate) fn log_normalization_note(tool: &str, note: &str) {
-    tracing::info!(tool, note, "tool arguments were normalized");
+    tracing::debug!(tool, note, "tool arguments were normalized");
 }
 
 /// Append a bracketed note (`[exit status: 3]`, `[leftover process] …`) under
