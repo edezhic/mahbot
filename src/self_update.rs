@@ -2335,8 +2335,10 @@ pub async fn resolve_admin_telegram_target() -> Option<String> {
 /// Delivery does not depend on a registered listener: the transport send falls
 /// back to a one-off channel on the base the current mode serves when none is
 /// registered, which is exactly the case of a switch having taken the listener
-/// away. A target is therefore the only thing that can be missing; a send that
-/// fails is logged and otherwise left alone.
+/// away. A send that fails is logged and otherwise left alone, and this never
+/// waits: a base the local mode has not published yet fails it like any other
+/// send, so the one notice that must arrive waits for the transport itself (see
+/// [`announce_startup`]).
 pub async fn notify_admin(message: &str, target: Option<&str>) {
     let Some(recipient) = target else {
         return;
@@ -2391,6 +2393,26 @@ pub fn back_online_message(started_paused: bool) -> String {
     } else {
         message
     }
+}
+
+/// Tell the owner this process is up, with the start-up line above.
+///
+/// The notice waits for the transport first: the self-hosted mode is stored
+/// configuration, while the address it needs is published only once the server
+/// this same process starts has answered, so a self-hosted start always opens a
+/// window in which nothing can be sent. The wait is this notice's own — the shared
+/// [`notify_admin`] serves the whole update flow, which must not wait — and only
+/// shutdown ends it, so a server slow to come up delays the notice rather than
+/// losing it.
+pub async fn announce_startup(started_paused: bool) {
+    let Some(target) = resolve_admin_telegram_target().await else {
+        return;
+    };
+    // A wait that ends with the process is a notice nobody is left to read.
+    if !crate::channels::telegram::wait_for_transport().await {
+        return;
+    }
+    notify_admin(&back_online_message(started_paused), Some(&target)).await;
 }
 
 /// Reply used when a command requires the admin. Used by both

@@ -3939,6 +3939,28 @@ fn test_update_notification_texts_render_as_plain_single_messages() {
     assert_eq!(split_message_for_telegram(&html).len(), 1);
 }
 
+/// The start-up notice is produced before a self-hosted start has a transport, so
+/// it waits for one: the wait ends once a base exists, not on a timer of its own.
+#[tokio::test]
+async fn test_wait_until_a_transport_exists() {
+    let ready = std::sync::Arc::new(AtomicBool::new(false));
+    let published = std::sync::Arc::clone(&ready);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        published.store(true, Ordering::SeqCst);
+    });
+
+    let waited = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_until(|| ready.load(Ordering::SeqCst)),
+    )
+    .await;
+    assert!(
+        matches!(waited, Ok(true)),
+        "the wait must end once a base exists"
+    );
+}
+
 // ── Telegram intake checks ──────────────────────────────────────────
 //
 // The intake's own guarantee — an event the platform handed over is never lost

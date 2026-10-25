@@ -178,17 +178,10 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
         "MahBot initialized — dashboard ready"
     );
 
-    // The admin's Telegram target is only needed by the detached "back online"
-    // notice below, so the lookup is not on the path to readiness: it runs
-    // inside the task that sends the notice.
-    tokio::spawn(async move {
-        let admin_target = mahbot::self_update::resolve_admin_telegram_target().await;
-        mahbot::self_update::notify_admin(
-            &mahbot::self_update::back_online_message(start_paused),
-            admin_target.as_deref(),
-        )
-        .await;
-    });
+    // The admin's "back online" notice is detached from startup, and so is the
+    // wait it takes for a transport to exist: a self-hosted start opens with the
+    // local Bot API server not yet published, and the notice leaves once it is.
+    tokio::spawn(mahbot::self_update::announce_startup(start_paused));
 
     // An update delivered by the release pipeline leaves its change list behind
     // before the restart; this is the one place it reaches the admin assistant,

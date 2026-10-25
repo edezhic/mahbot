@@ -1075,6 +1075,37 @@ fn active_base() -> Option<String> {
     }
 }
 
+/// The wait between two checks for a base, before it doubles.
+const TRANSPORT_WAIT_FIRST: Duration = Duration::from_millis(100);
+
+/// What that wait doubles towards: a server that never comes up must not cost ten
+/// checks a second for the life of the process.
+const TRANSPORT_WAIT_CAP: Duration = Duration::from_secs(5);
+
+/// Wait until the transport has a base to send on — the cloud always has one, the
+/// local mode only once its server has published an endpoint — for as long as that
+/// takes. Only shutdown ends the wait, and `false` says so: a transport that has
+/// not come up yet is not a fault, so nothing is reported and the caller's send is
+/// never attempted.
+#[must_use]
+pub(crate) async fn wait_for_transport() -> bool {
+    wait_until(|| active_base().is_some()).await
+}
+
+/// The wait itself, over any predicate, so a check can drive it without the mode
+/// and endpoint globals. It re-asks rather than waiting for a signal: the base
+/// moves with the serving mode as well as with the published endpoint.
+async fn wait_until(ready: impl Fn() -> bool) -> bool {
+    let mut wait = TRANSPORT_WAIT_FIRST;
+    while !ready() {
+        if !crate::shutdown::sleep_or_shutdown(wait).await {
+            return false;
+        }
+        wait = wait.saturating_mul(2).min(TRANSPORT_WAIT_CAP);
+    }
+    true
+}
+
 /// What one transfer may be in the mode in force.
 ///
 /// The cloud caps a bot at 20 MB per download and 50 MB per upload; the local
