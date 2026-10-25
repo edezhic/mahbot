@@ -287,9 +287,7 @@ pub(super) async fn install(release: Release) -> Result<Version, String> {
     // Proven before it replaces a working copy: a checksum-valid artifact can still
     // be unable to run (a missing library, the wrong runtime), and placing it would
     // leave nothing but a copy that fails every attempt — with no version to
-    // compare, the update check would never repair it either. The mode is set first
-    // because an archive need not carry one.
-    crate::util::managed_bin::set_executable(&fresh)?;
+    // compare, the update check would never repair it either.
     if super::server::reported_version_at(&fresh).await.is_none() {
         return Err("the downloaded server binary could not run".to_string());
     }

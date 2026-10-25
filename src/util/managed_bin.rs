@@ -1,5 +1,8 @@
-//! Generic managed-binary release mechanics shared by the rust-installed tool
-//! managers (chrome-use via `chrome_daemon`, the managed bun runtime).
+//! Generic managed-binary release mechanics shared by every installer that fetches
+//! a prebuilt artifact: the rust-installed tool managers (chrome-use via
+//! `chrome_daemon`, the managed bun runtime), the self-hosted Telegram Bot API
+//! server (`channels::telegram_local`) and the product's own ffmpeg pair
+//! (`crate::ffmpeg`).
 //!
 //! Each tool is installed at the location its own installer uses — the bun
 //! runtime in its own standard user dir (`~/.bun/bin`), the browser helper
@@ -218,18 +221,22 @@ fn swap_binary_in_place(fresh: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
-/// The rename-aside swap used on Windows, where a running exe cannot be
-/// overwritten or deleted but CAN be renamed: move `dest` aside, rename the
-/// prepared `tmp` copy into place, and restore the aside if the final rename
-/// fails. Aside removal is best-effort — while the old binary still runs it
-/// cannot be removed; the next successful swap clears it. Platform-neutral
-/// plain `fs::rename`/`remove_file`, so it is unit-testable on every OS.
+/// The rename-aside swap: move `dest` aside, rename the prepared `tmp` copy into
+/// place, and restore the aside if the final rename fails. On Windows it is what
+/// makes replacing a running exe possible at all — one cannot be overwritten or
+/// deleted, but it CAN be renamed — and the ffmpeg installer swaps a whole directory
+/// through it for the same reason: a half-placed copy must never stand where a whole
+/// one did. `dest` must exist; the swap starts by moving it aside.
+///
+/// Aside removal is best-effort — while the old copy is still in use it cannot be
+/// removed; the next successful swap clears it. Platform-neutral plain
+/// `fs::rename`/`remove_file`/`remove_dir_all`, so it is unit-testable on every OS.
 ///
 /// Failure messages carry no path (the location may be one the owner's own
 /// package manager keeps), only the failing step and its io kind.
-fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
+pub(crate) fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
     let aside = dest.with_extension("old");
-    let _ = fs::remove_file(&aside);
+    remove_any(&aside);
     fs::rename(dest, &aside)
         .map_err(|e| format!("the installed copy could not be moved aside ({})", e.kind()))?;
     if let Err(e) = fs::rename(tmp, dest) {
@@ -248,8 +255,18 @@ fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
             e.kind()
         ));
     }
-    let _ = fs::remove_file(&aside);
+    remove_any(&aside);
     Ok(())
+}
+
+/// Remove whatever sits at `path`, best effort: a file a failed swap left beside its
+/// destination, or the directory an ffmpeg install swaps out.
+fn remove_any(path: &Path) {
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    } else {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Put the freshly extracted `fresh` binary at `dest`, creating the directory it
@@ -370,21 +387,52 @@ fn report_failure(tool: &str, present: &impl Fn() -> bool, missing: bool, reason
 // ── Archive extraction ──────────────────────────────────────────────
 
 /// Extract the single `file_name` binary from a tar.gz release archive into
-/// `dir` and return its path. The entry is matched by file name at any depth
-/// but always written to `<dir>/<file_name>`, so a nested vendor layout still
-/// lands correctly; `Err` when the archive has no such regular-file entry.
-///
-/// Failure messages name the operation and the io kind, never a path.
+/// `dir` and return its path — [`extract_named_files_tar_gz`] with one name.
 pub(crate) fn extract_single_file_tar_gz(
     archive: &Path,
     dir: &Path,
     file_name: &str,
 ) -> Result<PathBuf, String> {
+    let path = sole(extract_named_files_tar_gz(archive, dir, &[file_name])?);
+    set_executable(&path)?;
+    Ok(path)
+}
+
+/// Extract the single `file_name` binary from a zip release archive into `dir`
+/// and return its path — [`extract_named_files_zip`] with one name.
+pub(crate) fn extract_single_file_zip(
+    archive: &Path,
+    dir: &Path,
+    file_name: &str,
+) -> Result<PathBuf, String> {
+    let path = sole(extract_named_files_zip(archive, dir, &[file_name])?);
+    set_executable(&path)?;
+    Ok(path)
+}
+
+/// The one path a one-name extraction yields: the collector returns a path per name
+/// or the reason the archive does not carry it.
+fn sole(mut paths: Vec<PathBuf>) -> PathBuf {
+    paths.pop().expect("one name, one path")
+}
+
+/// Extract every name in `names` from a tar.gz release archive into `dir` and
+/// return their paths in that order. An entry is matched by file name at any depth
+/// but always written to `<dir>/<name>`, so a nested vendor layout still lands
+/// correctly; `Err` names the first name that is not there as a regular file. The
+/// files land as the archive carried them — a caller extracting programs beside
+/// text makes the programs executable itself.
+///
+/// Failure messages name the operation and the io kind, never a path.
+pub(crate) fn extract_named_files_tar_gz(
+    archive: &Path,
+    dir: &Path,
+    names: &[&str],
+) -> Result<Vec<PathBuf>, String> {
     let file = fs::File::open(archive)
         .map_err(|e| format!("the release archive could not be opened ({})", e.kind()))?;
     let mut tar_archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    let out_path = dir.join(file_name);
-    let mut unpacked = false;
+    let mut extracted: Vec<Option<PathBuf>> = vec![None; names.len()];
     let entries = tar_archive
         .entries()
         .map_err(|e| format!("the release archive could not be read ({})", e.kind()))?;
@@ -403,50 +451,47 @@ pub(crate) fn extract_single_file_tar_gz(
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        if path.file_name().is_some_and(|n| n == OsStr::new(file_name)) {
-            // `unpack` writes exactly to `out_path` (the entry's own internal
-            // path is ignored), keeping the returned path correct for any
-            // archive layout.
-            entry.unpack(&out_path).map_err(|e| {
-                format!(
-                    "{file_name} could not be extracted from the release archive ({})",
-                    e.kind()
-                )
-            })?;
-            unpacked = true;
+        let Some(index) = index_of(&path, names) else {
+            continue;
+        };
+        let name = names[index];
+        let out_path = dir.join(name);
+        // `unpack` writes exactly to `out_path` (the entry's own internal path is
+        // ignored), keeping the returned path correct for any archive layout.
+        entry.unpack(&out_path).map_err(|e| {
+            format!(
+                "{name} could not be extracted from the release archive ({})",
+                e.kind()
+            )
+        })?;
+        extracted[index] = Some(out_path);
+        if extracted.iter().all(Option::is_some) {
             break;
         }
     }
-    if !unpacked {
-        return Err(format!("archive contains no {file_name} binary"));
-    }
-
-    // The freshly extracted binary must be executable.
-    set_executable(&out_path)?;
-    Ok(out_path)
+    collected(names, extracted)
 }
 
-/// Extract the single `file_name` binary from a zip release archive into
-/// `dir` and return its path. The entry is matched by file name at any depth
-/// (zip archives use `/` separators internally) but always written to the
-/// fixed `<dir>/<file_name>` — never the entry's internal path — so a nested
-/// `bun-<target>/` vendor layout still lands correctly; `Err` when the
-/// archive has no such regular-file entry.
+/// Extract every name in `names` from a zip release archive into `dir` and return
+/// their paths in that order. An entry is matched by file name at any depth (zip
+/// archives use `/` separators internally) but always written to the fixed
+/// `<dir>/<name>` — never the entry's internal path — so a nested `bun-<target>/`
+/// vendor layout still lands correctly; `Err` names the first name that is not
+/// there as a regular file.
 ///
 /// Failure messages name the operation and a reason the archive library's own
 /// error yields — the io kind it wraps, or its own short sentence for a malformed
 /// archive or a missing entry — never a path.
-pub(crate) fn extract_single_file_zip(
+pub(crate) fn extract_named_files_zip(
     archive: &Path,
     dir: &Path,
-    file_name: &str,
-) -> Result<PathBuf, String> {
+    names: &[&str],
+) -> Result<Vec<PathBuf>, String> {
     let file = fs::File::open(archive)
         .map_err(|e| format!("the release archive could not be opened ({})", e.kind()))?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| format!("the release archive could not be read ({})", zip_reason(&e)))?;
-    let out_path = dir.join(file_name);
-    let mut unpacked = false;
+    let mut extracted: Vec<Option<PathBuf>> = vec![None; names.len()];
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| {
             format!(
@@ -457,29 +502,42 @@ pub(crate) fn extract_single_file_zip(
         if !entry.is_file() {
             continue;
         }
-        if Path::new(entry.name())
-            .file_name()
-            .is_some_and(|n| n == OsStr::new(file_name))
-        {
-            let mut out_file = fs::File::create(&out_path)
-                .map_err(|e| format!("{file_name} could not be written ({})", e.kind()))?;
-            std::io::copy(&mut entry, &mut out_file).map_err(|e| {
-                format!(
-                    "{file_name} could not be extracted from the release archive ({})",
-                    e.kind()
-                )
-            })?;
-            unpacked = true;
+        let Some(index) = index_of(Path::new(entry.name()), names) else {
+            continue;
+        };
+        let name = names[index];
+        let out_path = dir.join(name);
+        let mut out_file = fs::File::create(&out_path)
+            .map_err(|e| format!("{name} could not be written ({})", e.kind()))?;
+        std::io::copy(&mut entry, &mut out_file).map_err(|e| {
+            format!(
+                "{name} could not be extracted from the release archive ({})",
+                e.kind()
+            )
+        })?;
+        extracted[index] = Some(out_path);
+        if extracted.iter().all(Option::is_some) {
             break;
         }
     }
-    if !unpacked {
-        return Err(format!("archive contains no {file_name} binary"));
-    }
+    collected(names, extracted)
+}
 
-    // The freshly extracted binary must be executable.
-    set_executable(&out_path)?;
-    Ok(out_path)
+/// The position in `names` an archive entry's file name matches, ignoring the
+/// entry's own internal path.
+fn index_of(path: &Path, names: &[&str]) -> Option<usize> {
+    let file_name = path.file_name()?;
+    names.iter().position(|name| file_name == OsStr::new(name))
+}
+
+/// The extracted paths in `names` order, or the one sentence naming the first name
+/// the archive did not carry.
+fn collected(names: &[&str], extracted: Vec<Option<PathBuf>>) -> Result<Vec<PathBuf>, String> {
+    extracted
+        .into_iter()
+        .zip(names)
+        .map(|(path, name)| path.ok_or_else(|| format!("the release archive carries no {name}")))
+        .collect()
 }
 
 /// A path-free reason for a failed zip operation: the io kind when the archive

@@ -74,6 +74,12 @@ pub(crate) mod pdf_marks;
 // story names.
 pub(crate) mod reader_output;
 
+// ── Video ────────────────────────────────────────────────────────────────
+// The product's own ffmpeg and ffprobe — installed from the product's own
+// release stream, never the owner's copy — and the three operations they serve:
+// probing, JPEG frames and 16 kHz mono WAV.
+pub mod ffmpeg;
+
 // ── Providers and model I/O ──────────────────────────────────────────────
 // A standalone benchmark for OpenRouter models, run outside the product.
 pub mod bench_openrouter;

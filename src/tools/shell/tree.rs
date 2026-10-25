@@ -119,8 +119,10 @@
 //! engine's own probe (`tools::shell::grep_engine::probe_engine`); the
 //! self-hosted Telegram Bot API server (`channels::telegram_local::server::spawn`
 //! for the process it supervises, and `channels::telegram_local::server::reported_version_at`
-//! for the artifact's own `--version`); and the file
-//! manager (`gui::reveal_in_file_manager`).
+//! for the artifact's own `--version`); the file manager
+//! (`gui::reveal_in_file_manager`); and the product's own ffmpeg pair
+//! (`ffmpeg::run_tool`, which every one of its probes, frames, WAV and the
+//! downloaded copy's own `-version` goes through).
 //!
 //! Not covered, on purpose: the terminal the owner opens inside the app
 //! (`gui::shell`, spawned through a pseudoconsole) and the owner's own browser
@@ -627,7 +629,7 @@ mod tests {
     /// The number of spawn sites the sweep must see — the module docs' inventory,
     /// counted. A site that constant and that inventory do not account for fails
     /// the sweep, and a scan that stopped reading the tree finds far fewer.
-    const SPAWN_SITES: usize = 18;
+    const SPAWN_SITES: usize = 19;
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()

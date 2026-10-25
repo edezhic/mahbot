@@ -450,8 +450,12 @@ fn asset_url(base: &str, version: &semver::Version, os: &str, arch: &str) -> Str
 /// x86_64, and Windows 11 on ARM — every Windows 10 on ARM is below the ARM64
 /// file). A system below its floor has no file that can load, so it has no file for
 /// it at all — the same refusal as an os/arch with no file published.
-const MACOS_FLOOR: (u32, u32) = (14, 0);
-const GLIBC_FLOOR: (u32, u32) = (2, 35);
+///
+/// The macOS and Linux floors are shared with every other prebuilt artifact the
+/// product ships (`ffmpeg`), because a checksum-correct archive that needs a newer
+/// system still cannot start.
+pub(crate) const MACOS_FLOOR: (u32, u32) = (14, 0);
+pub(crate) const GLIBC_FLOOR: (u32, u32) = (2, 35);
 const WINDOWS_X86_64_FLOOR: u32 = 17_763;
 const WINDOWS_ARM64_FLOOR: u32 = 22_000;
 

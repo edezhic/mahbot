@@ -441,6 +441,14 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::bun::run_bun_management(),
     );
 
+    // The product's own ffmpeg and ffprobe (`mahbot::ffmpeg`). Its pin is a
+    // compile-time constant, so nothing is looked up: a missing copy, and one that
+    // does not report the pinned version, are both installed. A failure is recorded,
+    // retried on the next start, and never removes a copy that already works.
+    spawn_cancellable(&mut tasks, &shutdown_token, "ffmpeg-install", async {
+        mahbot::ffmpeg::install_on_start().await;
+    });
+
     // macOS-only voice-assistant pipeline: runs in the background, managing
     // wake-word detection, command recording, transcription, and routing.
     #[cfg(target_os = "macos")]
