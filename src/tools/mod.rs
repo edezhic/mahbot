@@ -32,6 +32,9 @@ pub(crate) mod rasterize_html;
 pub(crate) mod read;
 pub(crate) mod read_document;
 pub(crate) mod research;
+// One short phrase spoken aloud — macOS only, where the speech engine lives.
+#[cfg(target_os = "macos")]
+pub(crate) mod say;
 pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod send;
@@ -199,6 +202,8 @@ pub(crate) use mahbot_config::MahbotConfigTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
 pub(crate) use rasterize::RasterizeTool;
 pub(crate) use read::ReadTool;
+#[cfg(target_os = "macos")]
+pub(crate) use say::SayTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
 pub(crate) use send::{Addressee, SendTool};

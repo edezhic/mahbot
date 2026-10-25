@@ -604,12 +604,9 @@ fn init_message_pipeline(
         .set(chat_tx)
         .expect("CHAT_BROADCAST already set — should be first init");
 
-    // macOS-only TTS listener: subscribes to CHAT_BROADCAST and triggers audio
-    // playback for matching agent responses.
-    #[cfg(target_os = "macos")]
-    mahbot::audio::tts::init_listener();
-
-    // Initialize the channel registry (empty — channels register below).
+    // Nothing subscribes to CHAT_BROADCAST to speak: the only speech is the
+    // admin Assistant's `say` tool, which calls the engine itself. Initialize
+    // the channel registry (empty — channels register below).
     let _ = mahbot::CHANNEL_REGISTRY.set(mahbot::ChannelRegistry::default());
 
     // The Telegram channel starts as a task of its own: which Bot API it talks to

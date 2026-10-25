@@ -3577,11 +3577,11 @@ mod tests {
 
     /// The instance serves a tool by NAME only when a family publishes it, so
     /// the owner's other tools are not reachable through the channel however
-    /// privileged the socket is. The three named below are the checkpoint: a
+    /// privileged the socket is. The tools named below are the checkpoint: a
     /// family that ever publishes one of them changes this list deliberately.
     #[test]
     fn tools_no_family_publishes_are_not_served_by_name() {
-        for tool in ["shell", "edit", "analyze"] {
+        for tool in ["shell", "edit", "analyze", "say"] {
             assert!(
                 !fronts_tool(tool),
                 "'{tool}' is published by no family, so the channel must not serve it by name"

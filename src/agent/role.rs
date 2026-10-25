@@ -231,9 +231,24 @@ impl Role {
     #[must_use]
     pub fn role_description_for(&self, is_admin: bool) -> String {
         if *self == Role::Assistant && is_admin {
-            crate::prompt::load_prompt("role/assistant_admin.md")
+            let say_note = Self::say_tool_note();
+            crate::prompt::substitute(
+                &crate::prompt::load_prompt("role/assistant_admin.md"),
+                &[("{{say_tool}}", say_note.trim())],
+            )
         } else {
             self.role_description()
+        }
+    }
+
+    /// The admin Assistant's note about the `say` tool, spliced into
+    /// `role/assistant_admin.md` where the tool exists: a platform without the
+    /// speech engine offers neither the tool nor the sentence.
+    fn say_tool_note() -> String {
+        if cfg!(target_os = "macos") {
+            crate::prompt::load_prompt("role/assistant_admin_say.md")
+        } else {
+            String::new()
         }
     }
 
@@ -277,6 +292,8 @@ impl Role {
 use crate::Tool;
 use crate::Workspace;
 use crate::config::CONFIG;
+#[cfg(target_os = "macos")]
+use crate::tools::SayTool;
 use crate::tools::path::PathAccess;
 use crate::tools::{
     AddAlarmTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ArchiveTool, ChromeTool,
@@ -288,9 +305,10 @@ use crate::tools::{
 };
 
 /// Tools in the admin Assistant's set that a custom role is never offered or
-/// built: the `computer` surface is the administrator's Assistant's alone. A
-/// stored entry naming one stays on the record and builds nothing.
-const CUSTOM_ROLE_WITHHELD_TOOLS: &[&str] = &["computer"];
+/// built: the `computer` surface and the `say` voice are the administrator's
+/// Assistant's alone. A stored entry naming one stays on the record and builds
+/// nothing.
+const CUSTOM_ROLE_WITHHELD_TOOLS: &[&str] = &["computer", "say"];
 
 impl Role {
     /// Core read/search tools — plus the shell in `shell` mode when one is
@@ -343,9 +361,9 @@ impl Role {
     ///
     /// `is_admin` widens the set exactly as it does for the Assistant: the
     /// admin-only shell / send / computer / config
-    /// / pipeline tools, whose access level and `analyze` flavour also follow it.
-    /// It narrows it in one place — `archive`, which exists only because a guest
-    /// has no shell.
+    /// / pipeline / voice tools, whose access level and `analyze` flavour also
+    /// follow it. It narrows it in one place — `archive`, which exists only
+    /// because a guest has no shell.
     ///
     /// A custom role's derivation ([`Self::custom_role_tools`]) starts from this
     /// same set minus [`CUSTOM_ROLE_WITHHELD_TOOLS`].
@@ -426,6 +444,12 @@ impl Role {
             // The admin's own project view: list / add / board / ticket /
             // comment / pause / resume over the managed workspaces.
             t.push(Box::new(WorkspaceTool));
+            // The voice: one short phrase spoken aloud on this machine, asked
+            // for by the admin's own Assistant. A custom role is never offered
+            // it ([`CUSTOM_ROLE_WITHHELD_TOOLS`]), and a platform without the
+            // speech engine has no tool to build at all.
+            #[cfg(target_os = "macos")]
+            t.push(Box::new(SayTool));
         }
         t
     }
@@ -449,11 +473,12 @@ impl Role {
     ///
     /// `is_admin` says whether the triggering account is the admin. It widens
     /// the Assistant's toolset with `shell`, `send`,
-    /// `computer`, `mahbot_config`, `mahbot_debug` and
-    /// `workspace`, and removes the guest-only `archive`.
+    /// `computer`, `mahbot_config`, `mahbot_debug`, `workspace` and (on macOS)
+    /// `say`, and removes the guest-only `archive`.
     /// Every other role's toolset is byte-identical regardless of its value.
     /// `computer` is offered on the platforms that have the capability
-    /// (Linux, macOS and Windows); [`Tool::is_advertised`] decides the rest.
+    /// (Linux, macOS and Windows), `say` only where the speech engine lives
+    /// (macOS); [`Tool::is_advertised`] decides the rest.
     ///
     /// `chrome_sessions` is the run-scoped tracker shared with the agent's
     /// `ChromeTool`: every session the run opens is handed to the run-end
@@ -752,17 +777,17 @@ mod tests {
             catalog.contains(&"sleep"),
             "sleep must be selectable — it is how a role ends a quiet turn"
         );
-        // The catalogue loses only computer use; every other tool of the admin's
-        // own set stays choosable.
+        // The catalogue loses exactly the withheld tools; every other tool of
+        // the admin's own set stays choosable.
         let mut expected: Vec<&str> = Role::assistant_core_tools(true)
             .iter()
             .map(|tool| tool.name())
-            .filter(|name| *name != "computer")
+            .filter(|name| !CUSTOM_ROLE_WITHHELD_TOOLS.contains(name))
             .collect();
         expected.push("web_search");
         assert_eq!(
             catalog, expected,
-            "the catalogue is the admin set minus computer use, plus web_search"
+            "the catalogue is the admin set minus {CUSTOM_ROLE_WITHHELD_TOOLS:?}, plus web_search"
         );
         let all_names: Vec<String> = catalog.iter().map(ToString::to_string).collect();
         let built: Vec<&str> = Role::custom_role_tools(&all_names)
@@ -1188,6 +1213,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn say_is_the_admin_assistants_alone() {
+        // Acceptance pin: the voice belongs to the admin's own Assistant — no
+        // guest, no Manager, no worker, no analyst — and a custom role cannot
+        // choose it, because it is withheld by name.
+        let ws = crate::workspace::test_ws("test");
+        for role in Role::iter() {
+            for is_admin in [false, true] {
+                let has = role
+                    .tools(&ws, is_admin, test_sessions())
+                    .iter()
+                    .any(|t| t.name() == "say");
+                assert_eq!(
+                    has,
+                    role == crate::Role::Assistant && is_admin,
+                    "{}{} say-tool availability",
+                    role.as_str(),
+                    if is_admin { " (admin)" } else { "" }
+                );
+            }
+        }
+        assert!(
+            !Role::custom_role_tool_catalog().contains(&"say"),
+            "a custom role must not be offered the voice"
+        );
     }
 
     #[test]

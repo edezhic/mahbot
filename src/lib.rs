@@ -136,7 +136,7 @@ pub(crate) mod prompt;
 
 // ── Media ────────────────────────────────────────────────────────────────
 // Microphone-to-meaning on macOS: wake word, voice commands, local
-// transcription, read-aloud TTS and cues.
+// transcription, the `say` tool's speech output and cues.
 #[cfg(target_os = "macos")]
 pub mod audio;
 // The `mahbot audio` command line: a recording into text, text into a spoken

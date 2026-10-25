@@ -331,7 +331,7 @@ candle-core = "0.11.0"
 # support, and no audio feature has a fallback anywhere. Linux and Windows
 # builds must not pull any of them in.
 qwen-asr = { version = "0.11.0", default-features = false, features = ["blas", "vdsp"] }
-# Read-aloud playback and the wake-word recording cues.
+# Spoken-phrase playback and the wake-word recording cues.
 rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
 # Neural voice activity detection (replaces RMS-based VAD).
 earshot = "1.2"

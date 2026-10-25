@@ -23,7 +23,7 @@
 //! [`exempt_from_slowdown`] does not keep the display on, does not keep the machine from
 //! entering its own low-power state at the normal time, and adds no keep-awake assertion of
 //! any kind — the macOS option set is the arm of the activity family that leaves the
-//! sleep-disabling bit out (`OPTIONS`). Voice input and read-aloud take no part in this:
+//! sleep-disabling bit out (`OPTIONS`). Voice input and speech output take no part in this:
 //! they do not run through this module, and nothing here adds or removes a keep-awake of
 //! theirs. A platform that instead suspends desktop applications once the display turns off
 //! (modern standby) takes the service with the machine: that is accepted, and it is not

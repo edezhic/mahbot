@@ -2,21 +2,21 @@
 //!
 //! # Overview
 //!
-//! This module provides automatic TTS synthesis for the admin's assistant
-//! replies. Synthesis runs **asynchronously** and **non-blocking** — the
-//! message delivery completes immediately, and any audio playback happens in
-//! the background.
+//! This is the speech engine behind the `say` tool
+//! ([`crate::tools::SayTool`]): one short phrase the admin's Assistant asks to
+//! have spoken, rendered and played on the machine the product runs on.
+//! Synthesis runs **asynchronously** and **non-blocking** — [`say_phrase`]
+//! returns as soon as the phrase is handed to the engine, and playback happens
+//! in the background.
 //!
-//! TTS is **not** a tool that agents call. It is background infrastructure,
-//! exactly like the voice wake-word system, that automatically speaks a
-//! response when:
+//! Nothing is spoken by itself: an assistant reply, an alarm or a confirmation
+//! reaches the engine only through a `say` call. A phrase is then spoken when:
 //!
-//! 1. The response is attributed to the admin's own account — every other
-//!    account's messages stay silent.
-//! 2. The responding agent is the Assistant — the only role any account routes
-//!    to.
-//! 3. TTS is enabled in config.
-//! 4. The Supertonic 3 model files are cached and loaded.
+//! 1. Speech output is enabled in config ([`is_config_enabled`]).
+//! 2. The Supertonic 3 model files are cached and loaded.
+//! 3. An audio output device could be opened.
+//!
+//! A newer phrase replaces the one still being spoken ([`cancel_playback`]).
 //!
 //! # Pipeline (Supertonic 3)
 //!
@@ -53,8 +53,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use std::time::Duration;
@@ -73,13 +71,13 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const DEFAULT_TOTAL_STEPS: usize = 8;
 const SPEED_FACTOR: f32 = 1.05;
 const MAX_CHUNK_LENGTH: usize = 300;
-/// The seed every reading the product speaks is rendered with: fixed, so the
+/// The seed every phrase the product speaks is rendered with: fixed, so the
 /// same text and voice always give the same waveform — the file the command
-/// line writes and the app's own read-aloud are then the same audio.
+/// line writes and the phrase the app speaks are then the same audio.
 const PLAYBACK_SEED: u64 = 42;
-/// The pause between two spoken parts, in milliseconds: the read-aloud path
-/// waits it out between parts, and a reading rendered to a file carries the
-/// same pause written into its audio.
+/// The pause between two spoken parts, in milliseconds: playback waits it out
+/// between parts, and a reading rendered to a file carries the same pause
+/// written into its audio.
 const TTS_CHUNK_SILENCE_MS: u64 = 300;
 // Timeout per-chunk receive: guards against hung synthesis (ONNX deadlock).
 const SYNTHESIS_CHUNK_TIMEOUT: Duration = Duration::from_mins(5);
@@ -142,8 +140,8 @@ pub(crate) const ALL_VOICE_STYLE_NAMES: &[&str] = &[
 
 /// The speech model's own language tags: the 31 languages upstream publishes
 /// plus `na`, its language-agnostic fallback. A language the product spells is
-/// always one of these — the read-aloud setting's own value is put in the tag
-/// as it stands, and the command line's `--language` is read against this list.
+/// always one of these — the speech-output setting's own value is put in the
+/// tag as it stands, and the command line's `--language` is read against this list.
 pub(crate) const TTS_LANGUAGES: &[&str] = &[
     "en", "ko", "ja", "ar", "bg", "cs", "da", "de", "el", "es", "et", "fi", "fr", "hi", "hr", "hu",
     "id", "it", "lt", "lv", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "tr", "uk", "vi", "na",
@@ -166,9 +164,9 @@ static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 /// Incremented when the first chunk begins playback in `speak_async()`,
 /// and decremented after the last chunk finishes plus the reverb tail delay
 /// ([`PLAYBACK_REVERB_TAIL_MS`]).  Using a counter (rather than a boolean)
-/// correctly handles overlapping `speak()` calls: if a new TTS response
-/// starts before the previous one's reverb tail expires, the count stays
-/// above zero and wake word detection remains suppressed.
+/// correctly handles overlapping `speak()` calls: if a new phrase starts
+/// before the previous one's reverb tail expires, the count stays above zero
+/// and wake word detection remains suppressed.
 ///
 /// Read by the voice pipeline to suppress wake word detection during TTS
 /// output, preventing false triggers from the system hearing its own speech.
@@ -201,7 +199,7 @@ pub static DOWNLOAD_EVENTS: OnceLock<broadcast::Sender<TtsDownloadEvent>> = Once
 /// Wrapper around rodio's audio output.
 ///
 /// rodio 0.22 splits output into a `MixerDeviceSink` (owns the cpal stream)
-/// and a `Mixer` handle (a cheap `Arc` clone). Read-aloud creates its players
+/// and a `Mixer` handle (a cheap `Arc` clone). Playback creates its players
 /// from the mixer via `Player::connect_new(&mixer)`; the wake-word cues
 /// ([`crate::audio::cue`]) append their source to the same mixer. The sink is
 /// created lazily by `open_audio_output()` and never touched again. Both
@@ -221,18 +219,6 @@ static AUDIO_OUTPUT: OnceLock<AudioOutputWrapper> = OnceLock::new();
 /// (and relatively costly) `open_default_sink` call is never raced by
 /// concurrent players attempting to open the device at once.
 static AUDIO_OUTPUT_OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Test-only counter of `speak()` calls. Incremented at the very start of
-/// `speak()`, before the `is_enabled()` guard. Used by `test_init_listener_*`
-/// tests to verify that the broadcast subscriber correctly dispatches to `speak()`.
-#[cfg(test)]
-pub(crate) static SPEAK_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Test-only: when set, [`ensure_audio_output()`] returns `false` without
-/// touching the OS audio device, so tests exercise dispatch logic without
-/// risking an environment-dependent device-open stall.
-#[cfg(test)]
-static TEST_AUDIO_DEVICE_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
 // ── TTS JSON config ───────────────────────────────────────────────────
 
@@ -311,11 +297,6 @@ pub fn is_config_enabled() -> bool {
 }
 
 #[must_use]
-fn is_enabled() -> bool {
-    is_config_enabled() && STATE.load(Ordering::Acquire) == ModelState::Ready
-}
-
-#[must_use]
 pub fn models_ready() -> bool {
     STATE.is_ready()
 }
@@ -339,9 +320,9 @@ pub fn audio_output_ready() -> bool {
 /// Open the OS audio output device on demand (idempotent, best-effort).
 /// Returns whether output is ready.
 ///
-/// Nothing opens the device at init: read-aloud opens it when it is enabled
-/// (after config load, on the Settings enable toggle, before playback), and the
-/// wake-word cues open it independently of read-aloud via
+/// Nothing opens the device at init: the speech-enabled boot and the Settings
+/// enable toggle open it, a phrase that finds it closed kicks an open through
+/// [`say_phrase`], and the wake-word cues open it independently via
 /// [`ensure_audio_output_silent()`] (when the microphone starts, and before a
 /// cue).
 ///
@@ -361,8 +342,8 @@ pub(crate) fn ensure_audio_output_silent() -> bool {
     open_audio_output(false)
 }
 
-/// Mixer of the shared output device, for playback that is not read-aloud (the
-/// wake-word cues). `None` until the device has been opened.
+/// Mixer of the shared output device, for playback that is not a spoken phrase
+/// (the wake-word cues). `None` until the device has been opened.
 pub(crate) fn playback_mixer() -> Option<rodio::mixer::Mixer> {
     AUDIO_OUTPUT.get().map(|output| output.mixer.clone())
 }
@@ -372,10 +353,6 @@ pub(crate) fn playback_mixer() -> Option<rodio::mixer::Mixer> {
 fn open_audio_output(warn_on_failure: bool) -> bool {
     if AUDIO_OUTPUT.get().is_some() {
         return true;
-    }
-    #[cfg(test)]
-    if TEST_AUDIO_DEVICE_SUPPRESSED.load(Ordering::Acquire) {
-        return false;
     }
     // Serialize concurrent opens and re-check inside the guard: another thread
     // may have won the race and populated AUDIO_OUTPUT already.
@@ -453,47 +430,67 @@ pub(crate) fn test_set_state(state: u8) {
     STATE.store(ModelState::from_u8(state), Ordering::Release);
 }
 
-/// Test-only RAII guard: suppresses OS audio-device opens for its lifetime
-/// ([`ensure_audio_output()`] returns `false`), so a panicking test cannot
-/// leak the suppression into later tests.
-#[cfg(test)]
-struct SuppressAudioDeviceGuard;
+// ── The `say` tool's entry point ─────────────────────────────────────
 
-#[cfg(test)]
-impl SuppressAudioDeviceGuard {
-    fn new() -> Self {
-        TEST_AUDIO_DEVICE_SUPPRESSED.store(true, Ordering::Release);
-        Self
-    }
+/// What became of one [`say_phrase`] call.
+pub(crate) enum SayOutcome {
+    /// The phrase was handed to the engine; playback runs in the background.
+    Speaking,
+    /// Speech output is switched off for this user — nothing was spoken.
+    SpeechOff,
+    /// The engine is not up, so nothing was spoken; its bring-up was kicked.
+    NotReady(NotReady),
 }
 
-#[cfg(test)]
-impl Drop for SuppressAudioDeviceGuard {
-    fn drop(&mut self) {
-        TEST_AUDIO_DEVICE_SUPPRESSED.store(false, Ordering::Release);
-    }
+/// Why the engine could not speak a phrase right now.
+pub(crate) enum NotReady {
+    /// The model set is not loaded yet — loading or fetching runs on the side.
+    ModelsMissing,
+    /// The last model fetch failed; a retry has just been started.
+    DownloadFailed,
+    /// No audio output device could be opened.
+    NoAudioDevice,
 }
 
-/// Speak `text` with the default voice (M1).
+/// Speak one short phrase for the admin's Assistant, and return at once: the
+/// phrase is rendered and played in the background, never waited for here.
 ///
-/// Spawns a background task that synthesizes audio, plays it via rodio
-/// (the audio output path), then returns. Silently ignored if TTS is
-/// disabled, models aren't ready, audio output is unavailable, or text is empty.
-///
-/// **Note:** This does NOT trigger model initialization. Models must be loaded
-/// beforehand by [`init_global()`] + [`try_load_cached()`] / [`spawn_download()`].
-/// If models are not in `ModelState::Ready` this call is a silent no-op.
+/// This is the product's whole speech output — nothing reaches [`speak`]
+/// otherwise. Whatever is missing is brought up the way the Settings toggle
+/// brings it up, on the side and never waited for: a model set that is not
+/// loaded starts the same download ([`spawn_or_retry_download`], which retries a
+/// failed one), and a device that is not open is opened on the blocking pool
+/// (retried by every later call), because enumerating output devices can stall.
+pub(crate) fn say_phrase(text: &str) -> SayOutcome {
+    if !is_config_enabled() {
+        return SayOutcome::SpeechOff;
+    }
+    // Read before the retry below resets a failed fetch to a fresh attempt.
+    let fetch_failed = download_failed();
+    if !models_ready() {
+        spawn_or_retry_download();
+        return SayOutcome::NotReady(if fetch_failed {
+            NotReady::DownloadFailed
+        } else {
+            NotReady::ModelsMissing
+        });
+    }
+    if !audio_output_ready() {
+        // Detached on purpose: the open outlives this answer, and a blocking task
+        // cannot be cancelled.
+        drop(tokio::task::spawn_blocking(ensure_audio_output));
+        return SayOutcome::NotReady(NotReady::NoAudioDevice);
+    }
+    speak(text);
+    SayOutcome::Speaking
+}
+
+/// Hand `text` to the engine: spawns a background task that synthesizes the
+/// audio, plays it through the shared output device, then returns. Called only
+/// by [`say_phrase`], which has established that speech is enabled, the models
+/// are loaded and the output device is open.
 fn speak(text: &str) {
-    #[cfg(test)]
-    SPEAK_COUNT.fetch_add(1, Ordering::Release);
-
-    if text.trim().is_empty() || !is_enabled() {
-        return;
-    }
-    // Playback cannot work without an output device; opening (or retrying a
-    // previously-failed open) here keeps the device closed until TTS actually
-    // needs it.
-    if !ensure_audio_output() {
+    if text.trim().is_empty() {
         return;
     }
     // Cancel any previous playback before starting new synthesis.
@@ -557,76 +554,10 @@ pub fn init_global() -> Result<()> {
 
     // The OS audio output device is intentionally NOT opened here: it is opened
     // lazily on demand via [`ensure_audio_output()`] once something actually
-    // needs it — the read-aloud enable path (after config load, on the Settings
-    // toggle, before playback) or the wake-word cues ([`crate::audio::cue`]),
-    // which share the same device independently of read-aloud.
+    // needs it — a spoken phrase ([`say_phrase`]), the speech-enabled boot and
+    // the Settings enable toggle, or the wake-word cues ([`crate::audio::cue`]),
+    // which share the same device.
     Ok(())
-}
-
-/// Subscribe to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and speak the admin's
-/// own assistant replies aloud.
-///
-/// This is the TTS trigger mechanism — it replaces what was previously an
-/// ad-hoc conditional in `broadcast_and_persist_agent_response` with a
-/// clean observer pattern: the TTS module subscribes to chat events and
-/// decides for itself when to speak, rather than being invoked directly
-/// from shared infrastructure.
-///
-/// The listener checks:
-/// 1. The event is an agent message (`direction == Agent`)
-/// 2. TTS is globally enabled and models are loaded
-/// 3. The responding agent is the Assistant — the only role any account routes
-///    to
-/// 4. The message is attributed to the admin's own account
-///    ([`crate::users::is_admin_name`]) — another account's messages, and
-///    messages with no attributable account, stay silent
-///
-/// The account test is deliberately the only discriminator: the channel a
-/// message arrived on is irrelevant, so the replies to the admin's voice input
-/// and Telegram messages are spoken exactly like his GUI ones, and so are the
-/// Assistant's confirmations addressed to him.
-///
-/// Must be called **after** [`crate::CHAT_BROADCAST`] has been initialized
-/// (i.e. after `init_message_pipeline`).
-pub fn init_listener() {
-    let Some(tx) = crate::CHAT_BROADCAST.get() else {
-        warn!("TTS: CHAT_BROADCAST not initialized — listener not started");
-        return;
-    };
-    let mut rx = tx.subscribe();
-
-    tokio::spawn(async move {
-        loop {
-            use crate::{ChatDirection, ChatEvent};
-
-            match rx.recv().await {
-                Ok(ChatEvent::Message {
-                    direction: ChatDirection::Agent,
-                    user_name,
-                    agent_role: Some(ref role_name),
-                    content,
-                    transient,
-                    ..
-                }) if is_enabled()
-                    && !transient
-                    && role_name == crate::Role::Assistant.as_str()
-                    && crate::users::is_admin_name(&user_name) =>
-                {
-                    speak(&content);
-                }
-                Ok(_) => {
-                    // Not an agent GUI message — ignore
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("TTS listener lagged by {n} messages");
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    info!("TTS listener: CHAT_BROADCAST closed, shutting down");
-                    break;
-                }
-            }
-        }
-    });
 }
 
 /// List available voice style names (e.g., "M1.json", "F1.json", etc.).
@@ -908,8 +839,8 @@ fn load_engine(dir: &Path) -> Result<TtsEngine> {
 ///
 /// A set is complete for this call when the ONNX files are on disk AND that ONE
 /// style file loads — [`try_load_cached`] asks for the default style instead,
-/// because the app reads aloud in one voice only, and a caller who asked for
-/// another voice must not pay for the whole set again on every run.
+/// because the app speaks in one voice only, and a caller who asked for another
+/// voice must not pay for the whole set again on every run.
 ///
 /// This prepares the engine for ONE operation and expects nothing to be up yet:
 /// [`init_global`] is called under the guard that asks whether the global is
@@ -1151,7 +1082,7 @@ fn preprocess_text(text: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
 
     // Media markers are display/plumbing artifacts, never speech — every kind
-    // goes, so neither a path nor a base64 data URI is read aloud.
+    // goes, so neither a path nor a base64 data URI is spoken.
     let text = crate::util::MEDIA_MARKER_RE.replace_all(text, " ");
     let mut s: String = text.as_ref().nfkd().collect();
     s = strip_markdown(&s);
@@ -1556,8 +1487,8 @@ fn synthesize_part(
 
 /// Wrap text in a language tag for the Supertonic 3 model.
 ///
-/// The language is the caller's — the read-aloud setting's value (defaults to
-/// `"na"`, the model's language-agnostic fallback) or the command line's
+/// The language is the caller's — the speech-output setting's value (defaults
+/// to `"na"`, the model's language-agnostic fallback) or the command line's
 /// `--language` — and is one of [`TTS_LANGUAGES`].
 fn wrap_lang_tag(text: &str, lang: &str) -> String {
     format!("<{lang}>{text}</{lang}>")
@@ -1655,9 +1586,8 @@ pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
 /// uncompressed WAV at the engine's own sample rate.
 ///
 /// The voice comes from [`ensure_ready_once`], loaded for this reading already.
-/// Unlike the read-aloud path, a part that fails to render fails the whole
-/// reading: a file delivered with a part missing would be a lie about what the
-/// text says.
+/// Unlike playback, a part that fails to render fails the whole reading: a
+/// file delivered with a part missing would be a lie about what the text says.
 pub(crate) async fn render_speech_wav(text: &str, voice: Voice, lang: &str) -> Result<Vec<u8>> {
     let processed = preprocess_text(text);
 
@@ -1670,8 +1600,8 @@ pub(crate) async fn render_speech_wav(text: &str, voice: Voice, lang: &str) -> R
             dp: style_dp,
             ttl: style_ttl,
         } = voice;
-        // The pause the read-aloud path waits out between parts, in samples: the
-        // same duration, written into the audio instead.
+        // The pause playback waits out between parts, in samples: the same
+        // duration, written into the audio instead.
         let gap = usize::try_from(u64::from(sample_rate) * TTS_CHUNK_SILENCE_MS / 1000)
             .unwrap_or_default();
         let mut pcm: Vec<f32> = Vec::new();
@@ -1704,7 +1634,7 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
     // Process text (lightweight, no blocking I/O)
     let processed = preprocess_text(&text);
 
-    // The read-aloud language, read once: the synthesis itself runs on a
+    // The speech-output language, read once: the synthesis itself runs on a
     // blocking thread that must not touch the config.
     let lang = CONFIG.tts_language();
 
@@ -2467,154 +2397,53 @@ mod tests {
         (&inner.0, &inner.1)
     }
 
-    // ── init_listener ────────────────────────────────────────────────
+    // ── say_phrase ───────────────────────────────────────────────────
     //
-    // These tests verify that init_listener() correctly dispatches to
-    // speak() when a matching ChatEvent::Message arrives on CHAT_BROADCAST,
-    // and that the guard conditions (is_enabled, the admin account) are
-    // respected.
+    // What the tool's one entry point into the engine answers while speech is
+    // off and while the model set is not loaded. Neither case reaches the audio
+    // device, and neither starts a download (a Loading set is left as it is).
 
-    /// Broadcast an agent `ChatEvent::Message` from `user_name` to
-    /// CHAT_BROADCAST. Panics if CHAT_BROADCAST is not initialized.
-    fn broadcast_test_event(user_name: &str, agent_role: Option<&str>) {
-        let tx = crate::CHAT_BROADCAST.get().unwrap();
-        let _ = tx.send(crate::ChatEvent::Message {
-            message_id: "test-tts".to_string(),
-            user_name: user_name.to_string(),
-            content: "Ignore — test event.".to_string(),
-            direction: crate::ChatDirection::Agent,
-            timestamp: String::new(),
-            channel: "gui".to_string(),
-            agent_role: agent_role.map(String::from),
-            workspace: "test".to_string(),
-            optimistic_id: None,
-            transient: false,
-            reply_reference: None,
-        });
-    }
-
-    /// Initialize the broadcast plus the enabled TTS state the listener
-    /// guards on, and start a listener. Returns the previous model state,
-    /// which the caller restores.
-    async fn start_enabled_listener() -> ModelState {
-        crate::util::test::init_test_stores().await;
-        // CHAT_BROADCAST is idempotent — safe to call from parallel tests
-        crate::CHAT_BROADCAST.get_or_init(|| {
-            let (tx, _rx) = tokio::sync::broadcast::channel(256);
-            tx
-        });
-
+    /// Run `say_phrase` under a known config and state, restoring both
+    /// afterwards.
+    fn say_under(config: &str, state: ModelState) -> SayOutcome {
+        let snapshot = CONFIG.snapshot();
         let prev_state = STATE.load(Ordering::Acquire);
-        STATE.store(ModelState::Ready, Ordering::Release);
-        let _ = crate::config::CONFIG.set_string_field("tts_enabled", "true");
-
-        SPEAK_COUNT.store(0, Ordering::Release);
-        init_listener();
-        // Give the listener time to subscribe before we send
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        prev_state
+        assert!(
+            CONFIG.set_string_field("tts_enabled", config),
+            "tts_enabled is a known config key"
+        );
+        STATE.store(state, Ordering::Release);
+        let outcome = say_phrase("A short phrase.");
+        STATE.store(prev_state, Ordering::Release);
+        CONFIG.swap(snapshot);
+        outcome
     }
 
-    /// Wait up to 500ms for `speak()` to be called; returns whether it was.
-    async fn wait_for_speak() -> bool {
-        for _ in 0..25 {
-            if SPEAK_COUNT.load(Ordering::Acquire) > 0 {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    #[test]
+    #[serial_test::serial(tts)]
+    fn say_refuses_while_speech_is_off() {
+        for config in ["", "false"] {
+            assert!(
+                matches!(say_under(config, ModelState::Ready), SayOutcome::SpeechOff),
+                "`tts_enabled = '{config}'` must be reported as speech output off"
+            );
         }
-        false
     }
 
-    #[tokio::test]
+    /// Not-ready is an answer like the others, and it names what is missing: a
+    /// model set still loading is never waited for inside the call. (A failed
+    /// fetch and an unstarted set both kick the download, which a test must not
+    /// do, so only the state that is already loading is pinned here.)
+    #[test]
     #[serial_test::serial(tts)]
-    async fn test_init_listener_dispatches_speak() {
-        // Suppress OS audio-device open so this test exercises dispatch logic
-        // without touching the real CoreAudio device (environment-dependent stall).
-        let _audio_suppression = SuppressAudioDeviceGuard::new();
-        let prev_state = start_enabled_listener().await;
-
-        // Broadcast a matching event: the admin's assistant message
-        broadcast_test_event(crate::users::ADMIN_USER_NAME, Some("assistant"));
-
+    fn say_reports_a_model_set_that_is_not_loaded() {
         assert!(
-            wait_for_speak().await,
-            "speak() should have been called after matching ChatEvent::Message"
+            matches!(
+                say_under("true", ModelState::Loading),
+                SayOutcome::NotReady(NotReady::ModelsMissing)
+            ),
+            "a loading model set must be reported as missing, not waited for"
         );
-
-        // Restore global state for other tests (audio-device suppression is
-        // lifted by the guard's drop)
-        STATE.store(prev_state, Ordering::Release);
-    }
-
-    /// Only the admin's own conversation is spoken: a guest account's message —
-    /// whatever kind — and a message with no attributable account must both stay
-    /// silent, while the admin's own is still spoken by the same listener (the
-    /// in-test positive control keeps this from passing vacuously).
-    #[tokio::test]
-    #[serial_test::serial(tts)]
-    async fn test_init_listener_silences_other_accounts() {
-        let _audio_suppression = SuppressAudioDeviceGuard::new();
-        let prev_state = start_enabled_listener().await;
-
-        // Another account's assistant reply, and an unattributed message.
-        broadcast_test_event("guest", Some("assistant"));
-        broadcast_test_event("", Some("assistant"));
-
-        // A conservative wait: a wrongly-called speak() is still observed even
-        // under heavy scheduling delay.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(
-            SPEAK_COUNT.load(Ordering::Acquire),
-            0,
-            "speak() must NOT be called for a non-admin or unattributed account"
-        );
-
-        // Positive control: the same listener still speaks the admin's message.
-        broadcast_test_event(crate::users::ADMIN_USER_NAME, Some("assistant"));
-        assert!(
-            wait_for_speak().await,
-            "the admin's own assistant message must still be spoken"
-        );
-
-        STATE.store(prev_state, Ordering::Release);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(tts)]
-    async fn test_init_listener_skips_when_disabled() {
-        // Ensure TTS is disabled (default state: ModelState::Uninit)
-        let prev_state = STATE.load(Ordering::Acquire);
-        STATE.store(ModelState::Uninit, Ordering::Release);
-
-        crate::util::test::init_test_stores().await;
-
-        crate::CHAT_BROADCAST.get_or_init(|| {
-            let (tx, _rx) = tokio::sync::broadcast::channel(256);
-            tx
-        });
-
-        SPEAK_COUNT.store(0, Ordering::Release);
-        init_listener();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Broadcast the same matching event, from the admin so only the
-        // enabled guard can keep the listener silent.
-        broadcast_test_event(crate::users::ADMIN_USER_NAME, Some("assistant"));
-
-        // Wait enough time for processing (negative test — the wait is a
-        // conservative restore of the original 200 ms so a wrongly-called
-        // speak() is still observed even under heavy scheduling delay)
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        assert_eq!(
-            SPEAK_COUNT.load(Ordering::Acquire),
-            0,
-            "speak() must NOT be called when TTS is disabled"
-        );
-
-        STATE.store(prev_state, Ordering::Release);
     }
 
     // ── Playback-active flag tests ──────────────────────────────────────

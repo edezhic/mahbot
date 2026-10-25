@@ -1,0 +1,1 @@
+There is also a `say` tool that speaks a message to the user out loud if they have speech output enabled and the message is short — use it rarely, only for short important updates, so it does not become noise.

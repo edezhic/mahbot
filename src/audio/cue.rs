@@ -6,11 +6,11 @@
 //! — so they never consult an operating-system sound API, library, theme or
 //! preference.
 //!
-//! Cue playback deliberately bypasses [`crate::audio::tts`]'s read-aloud path:
-//! the cues play with read-aloud off, and they must not raise the TTS playback
-//! flag that makes the voice pipeline drop microphone audio.  A host without an
-//! audio output device is skipped silently rather than warned about on every
-//! activation.
+//! Cue playback deliberately bypasses [`crate::audio::tts`]'s spoken-phrase
+//! path: the cues play with speech output off, and they must not raise the TTS
+//! playback flag that makes the voice pipeline drop microphone audio.  A host
+//! without an audio output device is skipped silently rather than warned about
+//! on every activation.
 
 use crate::audio::tts;
 use std::io::Cursor;
@@ -78,7 +78,7 @@ pub fn warm_up() {
 
 /// The shared output mixer, opening the device on first use.
 ///
-/// Unlike the read-aloud path this opens the device silently and latches a
+/// Unlike a spoken phrase this opens the device silently and latches a
 /// failure, so a host without audio output neither warns nor re-probes a costly
 /// device open on every activation.
 fn output_mixer() -> Option<rodio::mixer::Mixer> {

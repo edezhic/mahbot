@@ -3641,7 +3641,7 @@ impl SettingsState {
                     .style(theme::toggler_style),
                 tts_status,
             ),
-            Some("Reads the admin's own assistant replies aloud"),
+            Some("Lets the assistant speak short updates aloud"),
         );
 
         // ── Wake-word enrollment UI (below the three rows) ──

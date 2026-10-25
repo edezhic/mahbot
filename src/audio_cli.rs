@@ -10,14 +10,14 @@
 //! command compiles everywhere, and where the engine does not exist it refuses
 //! both operations, naming the platform.
 //!
-//! The product's read-aloud switches are not this command's. They govern what the
-//! app does with its own replies and its own voice notes, while these operations
-//! are explicit requests carrying their own voice, language and destination
-//! (defaults and all) — nothing is read from the settings, and nothing is changed
-//! there. `speak` renders its file through the very path the app reads aloud
-//! through, so a file made here sounds like the product speaking; that path must
-//! also draw the same text, so a part of the text that fails to render fails the
-//! command rather than being left out of the file.
+//! The product's speech-output switch is not this command's: it governs what the
+//! app says aloud, while these operations are explicit requests carrying their
+//! own voice, language and destination (defaults and all) — nothing is read from
+//! the settings, and nothing is changed there. `speak` renders its file through
+//! the very path the app speaks a phrase through, so a file made here sounds like
+//! the product speaking; that path must also draw the same text, so a part of the
+//! text that fails to render fails the command rather than being left out of the
+//! file.
 //!
 //! The four exit classes are the product's own ([`crate::cli::Exit`]), and what
 //! separates them is who judges. This command judges the words it read and the
@@ -285,7 +285,7 @@ const ENGINE_HELP: &str = "\nA frontend onto the product's own speech engine: ev
      while the product is up does not disturb it. The first use of an operation fetches the \
      models it needs, once, saying so on standard error; if it cannot obtain them, it fails \
      rather than trying again.\n\
-     \nThe product's voice switches govern what the app itself reads aloud and transcribes; \
+     \nThe product's voice switches govern what the app itself speaks and transcribes; \
      these operations are explicit requests with their own voice, language and destination — \
      they neither need those switches nor change them.\n";
 
@@ -717,7 +717,7 @@ mod engine {
     /// engine does not know it.
     ///
     /// The engine's own codes are the product's spelling of a language (the
-    /// read-aloud setting's values), so a code is matched against them as it
+    /// speech-output setting's values), so a code is matched against them as it
     /// stands; an unnamed language is the engine's language-agnostic default
     /// ([`crate::config::DEFAULT_TTS_LANGUAGE`]), never the setting's value.
     pub(super) fn resolve_language(named: Option<&str>) -> Option<String> {

@@ -57,10 +57,9 @@ pub async fn stop_telegram_server() {
 /// (registered users and raw reply targets) and the macOS voice notice in
 /// `crate::audio::voice`.
 ///
-/// TTS audio playback is handled separately by `crate::audio::tts::init_listener()`
-/// (macOS-only), which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST)
-/// and triggers speech for the admin's own assistant messages.  This function
-/// does not itself invoke any TTS logic.
+/// No speech happens here or on any event this function broadcasts: the only
+/// way the product speaks is the admin Assistant's `say` tool, which calls into
+/// `crate::audio::tts` itself.
 ///
 /// Takes primitive fields rather than [`crate::SendMessage`], so the per-agent
 /// consumer loop can call it with a [`crate::users::UserRecord`].
