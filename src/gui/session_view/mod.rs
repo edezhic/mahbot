@@ -187,14 +187,14 @@ pub(crate) fn build_ledger_with_sources(
     (entries, sources)
 }
 
-/// A transcript body parsed for display: its markdown items, the `[FILE:…]`
-/// markers it contains, in body order (the viewer turns each marker's rendered
-/// label into a click), and whether an undeliverable marker became a refusal —
-/// carried so the collapse measurement of the same body resolves under the
-/// context it was parsed with.
+/// A transcript body parsed for display: its markdown items, the attachments it
+/// carries in body order (the viewer draws them as one block above the text and
+/// turns a file row's click into a reveal), and whether an undeliverable marker
+/// became a refusal — carried so the collapse measurement of the same body
+/// resolves under the context it was parsed with.
 pub(crate) struct ParsedBody {
     pub items: Vec<markdown::Item>,
-    pub files: Vec<media_markers::FileMarker>,
+    pub attachments: Vec<media_markers::MediaAttachment>,
     pub refusals: bool,
 }
 
@@ -231,7 +231,7 @@ pub(crate) fn parse_entry_bodies(
             let with_breaks = markdown_breaks::hard_breaks(&escaped);
             Some(ParsedBody {
                 items: markdown::parse(&with_breaks).collect(),
-                files: rendered.files,
+                attachments: rendered.attachments,
                 refusals,
             })
         })

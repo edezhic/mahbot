@@ -82,8 +82,14 @@ use futures_util::StreamExt;
 /// cards and footer responsive.
 const RUNTIME_REFRESH_COALESCE: Duration = Duration::from_millis(250);
 
-/// Longest remote name the footer's sync control shows before eliding it.
-const SYNC_REMOTE_NAME_MAX_CHARS: usize = 16;
+/// The left nav rail's fixed width, in px: the content area starts to its right.
+const SIDEBAR_RAIL_WIDTH: f32 = 56.0;
+
+/// The portions the Home page's chat and its ticket column split the content
+/// area by. The column's share also sizes a fresh window's opening width (see
+/// [`ticket_column_share`]).
+const CHAT_COLUMN_PORTION: u16 = 7;
+const TICKET_COLUMN_PORTION: u16 = 3;
 
 /// How long an exit requested before boot finished waits for the boot task to
 /// deliver its result before the exit path runs anyway. The boot is the only
@@ -665,6 +671,26 @@ pub(crate) fn is_dashboard_shortcut(
 
 // ── Dashboard state ──────────────────────────────────────────────
 
+/// Where the window's one start-up width decision stands. A fresh window opens
+/// without the ticket column's width ([`WindowState::opening_size`]), because a
+/// fresh board normally has nothing to show; the board's first read takes the
+/// default width back when the column is drawn after all. Nothing resizes the
+/// window after that decision — a column appearing or disappearing later
+/// changes the layout, never the window.
+#[derive(Clone, Copy)]
+enum StartupWidth {
+    /// Nothing to decide: a saved geometry opened at the size it was closed
+    /// with, or the decision is already made.
+    Settled,
+    /// Owed, waiting for the window's own report of the size it opened at. The
+    /// requested size is not that size — the platform rounds it to its pixel
+    /// grid and keeps it on screen.
+    AwaitingReport,
+    /// Owed, with the opening size in [`Dashboard::last_size`]: a width the
+    /// window was not at is the user's own drag, which wins over the decision.
+    Owed,
+}
+
 pub struct Dashboard {
     ready: bool,
     boot_error: Option<String>,
@@ -678,6 +704,8 @@ pub struct Dashboard {
     /// Tracked window geometry for persist-on-close.
     last_size: iced::Size,
     last_position: iced::Point,
+    /// Where the one start-up width decision stands (see [`StartupWidth`]).
+    startup_width: StartupWidth,
     /// Toast notification stack.
     toasts: Vec<Toast>,
 
@@ -772,16 +800,24 @@ pub struct Dashboard {
 }
 
 impl Dashboard {
+    /// The dashboard before its boot task finishes. `window` is the geometry the
+    /// window opens with (`WindowState::opening_size`); a fresh one leaves the
+    /// start-up width owed (see `StartupWidth`).
     #[must_use]
-    pub fn loading() -> Self {
+    pub fn loading(window: &WindowState) -> Self {
         Self {
             ready: false,
             boot_error: None,
             exit_after_boot: false,
             page: Page::Home,
             log_store: None,
-            last_size: iced::Size::new(1500.0, 800.0),
+            last_size: window.opening_size(),
             last_position: iced::Point::new(-1.0, -1.0),
+            startup_width: if window.restored {
+                StartupWidth::Settled
+            } else {
+                StartupWidth::AwaitingReport
+            },
             toasts: Vec::new(),
             workspaces: HashMap::new(),
             workspaces_error: None,
@@ -898,6 +934,26 @@ impl Dashboard {
     /// Persist the current window position and size.
     fn persist_window_state(&self) {
         save_window_state(self.last_position, self.last_size);
+    }
+
+    /// Take the one start-up width decision, on the board's first read (see
+    /// [`StartupWidth`]): the width to resize to, once. A board with nothing to
+    /// show takes none — the narrow opening already fits it — while one that
+    /// draws the column takes the default width back.
+    fn take_startup_width(&mut self) -> Option<iced::Size> {
+        let owed = !matches!(self.startup_width, StartupWidth::Settled);
+        self.startup_width = StartupWidth::Settled;
+        if !owed || self.board_state.has_nothing_to_show() {
+            return None;
+        }
+        Some(iced::Size::new(DEFAULT_WINDOW_WIDTH, self.last_size.height))
+    }
+
+    fn settle_startup_width(&mut self) -> Task<Message> {
+        let Some(size) = self.take_startup_width() else {
+            return Task::none();
+        };
+        iced::window::latest().and_then(move |id| iced::window::resize(id, size))
     }
 
     /// Act on a request for the product to exit: name the route that asked, then start the wait
@@ -1430,6 +1486,26 @@ impl Dashboard {
             }
             Message::WindowEvent(_, event) => match event {
                 window::Event::Resized(new_size) => {
+                    match self.startup_width {
+                        // The window's first report of its size is the one the
+                        // platform gave it, not a resize.
+                        StartupWidth::AwaitingReport => {
+                            self.startup_width = StartupWidth::Owed;
+                        }
+                        // A width the window was not at is the user's own drag —
+                        // before the board's first read included — while a
+                        // report of the width it already has is the platform's
+                        // again. Only the width decides: the decision is about
+                        // the width.
+                        #[expect(
+                            clippy::float_cmp,
+                            reason = "the platform reports a width exactly; a different width is not an approximate one"
+                        )]
+                        StartupWidth::Owed if new_size.width != self.last_size.width => {
+                            self.startup_width = StartupWidth::Settled;
+                        }
+                        StartupWidth::Settled | StartupWidth::Owed => {}
+                    }
                     self.last_size = new_size;
                     Task::none()
                 }
@@ -1527,7 +1603,21 @@ impl Dashboard {
                 {
                     return self.open_ticket_commit_diff(workspace_name, commit_hash.clone());
                 }
-                self.board_state.update(msg).map(Message::Board)
+                // An applied read outcome is when the one start-up width decision
+                // is taken (see [`StartupWidth`]); a delta carries no board state
+                // to decide it, and an outcome the board dropped as stale carries
+                // none either — a newer read is still on its way.
+                let read = match &msg {
+                    board::BoardMessage::Refreshed { generation, .. }
+                    | board::BoardMessage::RefreshError { generation, .. } => Some(*generation),
+                    _ => None,
+                };
+                let board = self.board_state.update(msg).map(Message::Board);
+                if read.is_some_and(|generation| self.board_state.applied_read(generation)) {
+                    let width = self.settle_startup_width();
+                    return Task::batch([board, width]);
+                }
+                board
             }
             Message::Sessions(msg) => self
                 .sessions_state
@@ -2085,8 +2175,9 @@ impl Dashboard {
     /// [`Self::sync_workspace_surfaces`]).
     ///
     /// The ticket sidebar is deliberately not one of the surfaces this touches:
-    /// it lists every workspace's tickets, so a switch must leave it — its
-    /// search included — exactly as it is.
+    /// it lists every workspace's tickets — never the selected project's — so a
+    /// switch, including one onto the personal folder, must leave it (its search
+    /// included) exactly as it is.
     fn propagate_workspace_selection(&mut self, name: &str) -> Task<Message> {
         // Notify the Home page of the selection as stored, with no
         // substitution, so the composer's send carries the same choice the
@@ -2233,6 +2324,49 @@ impl Dashboard {
             || self.git_state.is_modal_open()
     }
 
+    /// The Home page: the chat, and the ticket column beside it while the board
+    /// has a ticket to show. The chat is the row's first child either way — a
+    /// root that flipped shape with the column would be rebuilt on the flip,
+    /// taking the chat's scroll position and the composer's caret and draft with
+    /// it — and a lone fill portion still spans the row.
+    fn home_page(&self) -> Element<'_, Message> {
+        let home_view = self.home_state.view(self.draining).map(Message::Home);
+        // Wrap chat area in a right-click context menu with "Reset session".
+        // Per-bubble ContextMenus (Copy message, see home.rs) capture bubble
+        // right-clicks; this outer menu is the fallback for empty-space ones.
+        let home_view: Element<'_, Message> = ContextMenu::new(
+            home_view,
+            vec![menus::MenuItem::new(
+                "Reset session".into(),
+                Message::Home(home::HomeMessage::ClearChat),
+            )],
+        )
+        .into();
+        let mut columns =
+            row![container(home_view).width(Length::FillPortion(CHAT_COLUMN_PORTION))];
+        if !self.board_state.has_nothing_to_show() {
+            let sidebar = ticket_sidebar(&self.board_state);
+            // Sidebar right-click menu: the two bulk actions over the list the
+            // sidebar shows — each label carries that all-workspaces scope, so it
+            // is read before acting. Pausing is offered only when a queued ticket
+            // is listed.
+            let mut menu_items = vec![menus::MenuItem::new(
+                "Archive done & cancelled (all workspaces)".into(),
+                Message::Board(board::BoardMessage::ArchiveAllCompleted),
+            )];
+            if self.board_state.has_queued_tickets() {
+                menu_items.push(menus::MenuItem::new(
+                    "Pause all queued tickets (all workspaces)".into(),
+                    Message::Board(board::BoardMessage::PauseAllQueued),
+                ));
+            }
+            let sidebar: Element<'_, Message> = ContextMenu::new(sidebar, menu_items).into();
+            columns =
+                columns.push(container(sidebar).width(Length::FillPortion(TICKET_COLUMN_PORTION)));
+        }
+        columns.into()
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, Message> {
         if let Some(err) = &self.boot_error {
@@ -2278,41 +2412,8 @@ impl Dashboard {
         let footer = self.footer_view();
         let content = match self.page {
             Page::Home => {
-                let home_view = self.home_state.view(self.draining).map(Message::Home);
-                let sidebar = ticket_sidebar(&self.board_state);
-                // Wrap chat area in a right-click context menu with
-                // "Reset session". Per-bubble ContextMenus (Copy message,
-                // see home.rs) capture bubble right-clicks; this outer
-                // menu is the fallback for empty-space right-clicks.
-                let home_view: Element<'_, Message> = ContextMenu::new(
-                    home_view,
-                    vec![menus::MenuItem::new(
-                        "Reset session".into(),
-                        Message::Home(home::HomeMessage::ClearChat),
-                    )],
-                )
-                .into();
-                // Sidebar right-click menu: the two bulk actions over the list
-                // the sidebar shows — each label carries that all-workspaces
-                // scope, so it is read before acting. Pausing is offered only
-                // when a queued ticket is listed.
-                let mut menu_items = vec![menus::MenuItem::new(
-                    "Archive done & cancelled (all workspaces)".into(),
-                    Message::Board(board::BoardMessage::ArchiveAllCompleted),
-                )];
-                if self.board_state.has_queued_tickets() {
-                    menu_items.push(menus::MenuItem::new(
-                        "Pause all queued tickets (all workspaces)".into(),
-                        Message::Board(board::BoardMessage::PauseAllQueued),
-                    ));
-                }
-                let sidebar: Element<'_, Message> = ContextMenu::new(sidebar, menu_items).into();
-                let base = row![
-                    container(home_view).width(Length::FillPortion(7)),
-                    container(sidebar).width(Length::FillPortion(3))
-                ];
                 let modal = self.board_state.render_modal_overlay().map(Message::Board);
-                iced::widget::stack([base.into(), modal]).into()
+                iced::widget::stack([self.home_page(), modal]).into()
             }
             Page::Logs => self.logs_state.view().map(Message::Logs),
             Page::Sessions => self
@@ -2524,9 +2625,11 @@ fn render_diff_modal<'a>(
 // ── Ticket sidebar (Home page, right side) ────────────────────────
 
 /// Ticket sidebar shown on the right side of the Home page.
-/// Displays every workspace's non-archived tickets, grouped by phase. A
-/// right-click context menu on this panel offers the two bulk actions over
-/// that list — archiving its done and cancelled tickets, pausing its queued
+/// Displays every workspace's non-archived tickets, grouped by phase — absent
+/// entirely while there is no such ticket to show
+/// ([`board::BoardState::has_nothing_to_show`]), so the chat takes the whole
+/// width. A right-click context menu on this panel offers the two bulk actions
+/// over that list — archiving its done and cancelled tickets, pausing its queued
 /// ones.
 fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     let search_active = !board_state.search_query.text().is_empty();
@@ -2673,11 +2776,10 @@ impl Dashboard {
     pub fn subscription(&self) -> iced::Subscription<Message> {
         // Window events are subscribed from the start, before boot completes —
         // a close request included: it must reach the dashboard in every state
-        // (see `request_exit`). Pre-boot Resized/Moved events update
-        // last_size/last_position, which are persisted to window-state.json on
-        // close — without them, closing a never-resized window would overwrite
-        // the restored geometry with the hardcoded defaults (iced does not
-        // replay missed window events).
+        // (see `request_exit`). Resized also carries the start-up width decision
+        // (see `StartupWidth`), and both it and Moved keep last_size and
+        // last_position at the geometry the window really has, which a close
+        // persists (iced does not replay missed window events).
         //
         // The platform's quit requests are subscribed from the start for the
         // same reason: the platform can ask before boot has finished.
@@ -3079,7 +3181,7 @@ impl Dashboard {
             self.render_sidebar_bottom_nav(),
         ];
         container(col.spacing(theme::SPACE_2))
-            .width(Length::Fixed(56.0))
+            .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
             .height(Length::Fill)
             .style(theme::surface_container_style)
             .padding(theme::PAD_4)
@@ -3419,9 +3521,9 @@ impl Dashboard {
         .into()
     }
 
-    /// Render the git sync control: the push destination, the commits a push
-    /// would carry, and the commits a pull would take from the branch's own
-    /// update source.
+    /// Render the git sync control: the commits a push would carry (with the
+    /// destination the tooltip names) and the commits a pull would take from the
+    /// branch's own update source.
     ///
     /// Visible whenever there is anything to push or pull — a branch that can be
     /// pushed is never hidden because its tracked upstream is fetch-only or
@@ -3452,16 +3554,6 @@ impl Dashboard {
                 if target.commits > 0 {
                     parts.push(Self::sync_metric(icon, target.commits));
                 }
-                // Name the destination the count belongs to.
-                parts.push(
-                    text(crate::util::truncate(
-                        &target.remote,
-                        SYNC_REMOTE_NAME_MAX_CHARS,
-                    ))
-                    .size(theme::TEXT_16)
-                    .color(theme::TEXT_SECONDARY)
-                    .into(),
-                );
                 if publish {
                     format!(
                         "Publish a new branch to {} ({} commits): it has no such branch yet, \
@@ -3509,8 +3601,12 @@ impl Dashboard {
                 }
             }
         };
+        // A spacer separates a push count from the pull count; with nothing to
+        // push the row starts at the pull metric, so it must not lead.
         if state.behind > 0 && !publish {
-            parts.push(Space::new().width(theme::SPACE_8).into());
+            if !parts.is_empty() {
+                parts.push(Space::new().width(theme::SPACE_8).into());
+            }
             parts.push(Self::sync_metric(
                 lucide::arrow_down::<iced::Theme, iced::Renderer>(),
                 state.behind,
@@ -3803,13 +3899,18 @@ fn footer_status_label(label: String) -> Element<'static, Message> {
     .into()
 }
 
-/// Persisted window geometry.
+/// Persisted window geometry: the last size and position the window reported.
 #[derive(serde::Deserialize)]
 pub struct WindowState {
     pub width: f32,
     pub height: f32,
     pub x: i32,
     pub y: i32,
+    /// Whether a geometry was actually read from the state file, rather than
+    /// falling back to [`WindowState::default`]: a saved geometry opens as it
+    /// was saved, a fresh one as [`WindowState::opening_size`] derives it.
+    #[serde(skip)]
+    restored: bool,
 }
 
 impl WindowState {
@@ -3819,15 +3920,51 @@ impl WindowState {
     pub const fn position(&self) -> iced::window::Position {
         iced::window::Position::Specific(iced::Point::new(self.x as f32, self.y as f32))
     }
+
+    /// The size the window opens at: a saved geometry as it was saved, a fresh
+    /// one without the ticket column's share, so the chat's line length is the
+    /// one it has beside the column in the default window (the board's first
+    /// read then settles the one width decision, `StartupWidth`).
+    #[must_use]
+    pub fn opening_size(&self) -> iced::Size {
+        let full = iced::Size::new(self.width, self.height);
+        if self.restored {
+            return full;
+        }
+        iced::Size::new(
+            (full.width - ticket_column_share(full.width)).max(MIN_WINDOW_WIDTH),
+            full.height,
+        )
+    }
+}
+
+/// The window's default size in px, sized for the Home page with its ticket
+/// column beside the chat.
+const DEFAULT_WINDOW_WIDTH: f32 = 1500.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
+
+/// The window's minimum size, shared with the platform settings so the one
+/// width the app derives ([`WindowState::opening_size`]) stays a usable window.
+pub const MIN_WINDOW_WIDTH: f32 = 800.0;
+pub const MIN_WINDOW_HEIGHT: f32 = 500.0;
+
+/// The width the ticket column takes of a window `width` px wide: its portion
+/// of the content area beside the nav rail, which is exactly what the chat
+/// gains back when the column is absent.
+#[must_use]
+fn ticket_column_share(width: f32) -> f32 {
+    (width - SIDEBAR_RAIL_WIDTH) * f32::from(TICKET_COLUMN_PORTION)
+        / f32::from(CHAT_COLUMN_PORTION + TICKET_COLUMN_PORTION)
 }
 
 impl Default for WindowState {
     fn default() -> Self {
         Self {
-            width: 1500.0,
-            height: 800.0,
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
             x: -1,
             y: -1,
+            restored: false,
         }
     }
 }
@@ -3843,7 +3980,11 @@ pub fn read_window_state() -> WindowState {
     };
     std::fs::read_to_string(dir.join(WINDOW_STATE_FILE))
         .ok()
-        .and_then(|json| serde_json::from_str(&json).ok())
+        .and_then(|json| serde_json::from_str::<WindowState>(&json).ok())
+        .map(|state| WindowState {
+            restored: true,
+            ..state
+        })
         .unwrap_or_default()
 }
 
@@ -4153,9 +4294,188 @@ mod tests {
     /// A ready dashboard so post-ready handlers (e.g. `WorkspacesReloaded`)
     /// run instead of the `!ready` guard.
     fn ready_dashboard() -> Dashboard {
-        let mut dash = Dashboard::loading();
+        let mut dash = Dashboard::loading(&WindowState::default());
         dash.ready = true;
         dash
+    }
+
+    /// The board's read outcome for a board with no ticket, as the refresh the
+    /// dashboard dispatched would report it.
+    fn empty_board() -> board::BoardMessage {
+        board::BoardMessage::Refreshed {
+            tickets: Vec::new(),
+            generation: 0,
+        }
+    }
+
+    /// The board's read outcome for a board holding one ticket.
+    fn board_with_a_ticket() -> board::BoardMessage {
+        board::BoardMessage::Refreshed {
+            tickets: vec![TicketFixture::new("T-1", TicketPhase::Backlog).build()],
+            generation: 0,
+        }
+    }
+
+    fn resize(width: f32, height: f32) -> Message {
+        Message::WindowEvent(
+            iced::window::Id::unique(),
+            window::Event::Resized(iced::Size::new(width, height)),
+        )
+    }
+
+    /// A fresh window opens at the width the chat needs: the area the chat gets
+    /// without the ticket column is the area it has beside the column in the
+    /// default window, and it is never a window below the minimum.
+    #[test]
+    fn a_fresh_window_opens_without_the_ticket_column() {
+        let fresh = WindowState::default().opening_size();
+        let beside_column =
+            DEFAULT_WINDOW_WIDTH - SIDEBAR_RAIL_WIDTH - ticket_column_share(DEFAULT_WINDOW_WIDTH);
+        let without_column = fresh.width - SIDEBAR_RAIL_WIDTH;
+        assert!(
+            (without_column - beside_column).abs() < 0.01,
+            "{without_column} vs {beside_column}"
+        );
+        assert!(fresh.width >= MIN_WINDOW_WIDTH && fresh.height >= MIN_WINDOW_HEIGHT);
+    }
+
+    /// The width the first board read resolves the window to: a board with
+    /// nothing to show leaves the narrow opening as it is, one that draws the
+    /// column takes the default width back, a failed read keeps both the column
+    /// and the width, and the decision is taken once.
+    #[test]
+    fn the_start_up_width_follows_the_board() {
+        let default_window = Some(iced::Size::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT));
+
+        let mut dash = ready_dashboard();
+        let _ = dash.board_state.update(empty_board());
+        assert_eq!(dash.take_startup_width(), None, "the narrow opening fits");
+
+        let mut dash = ready_dashboard();
+        let _ = dash.board_state.update(board_with_a_ticket());
+        assert_eq!(dash.take_startup_width(), default_window);
+        assert_eq!(
+            dash.take_startup_width(),
+            None,
+            "the decision is taken once"
+        );
+
+        let mut dash = ready_dashboard();
+        let _ = dash.board_state.update(board::BoardMessage::RefreshError {
+            error: "db down".to_string(),
+            generation: 0,
+        });
+        assert_eq!(
+            dash.take_startup_width(),
+            default_window,
+            "a failed read keeps the column, and the width with it"
+        );
+    }
+
+    /// The dashboard takes the decision on a board read that applied; an outcome
+    /// the board dropped as stale decides nothing — a newer read is still on its
+    /// way.
+    #[test]
+    fn only_an_applied_board_read_settles_the_start_up_width() {
+        let mut dash = ready_dashboard();
+        let _ = dash.update(Message::Board(empty_board()));
+        assert!(matches!(dash.startup_width, StartupWidth::Settled));
+
+        let mut dash = ready_dashboard();
+        let _ = dash.board_state.refresh(); // a newer read is in flight
+        let _ = dash.update(Message::Board(empty_board()));
+        assert!(matches!(dash.startup_width, StartupWidth::AwaitingReport));
+    }
+
+    /// The decision survives the platform's own reports of the size it gave the
+    /// window — the requested width rounded to its pixel grid, then the same
+    /// size again — and yields to a width the user drags before the first read.
+    /// A height-only drag decides nothing: the decision is about the width.
+    #[test]
+    fn the_start_up_width_survives_the_creation_reports() {
+        let mut dash = Dashboard::loading(&WindowState::default());
+        let _ = dash.update(resize(1067.0, 800.0));
+        let _ = dash.update(resize(1067.0, 800.0));
+        assert!(
+            matches!(dash.startup_width, StartupWidth::Owed),
+            "still owed"
+        );
+
+        let mut dash = Dashboard::loading(&WindowState::default());
+        let _ = dash.update(resize(1067.0, 800.0));
+        let _ = dash.update(resize(1067.0, 700.0));
+        assert!(
+            matches!(dash.startup_width, StartupWidth::Owed),
+            "a height-only drag is not a width"
+        );
+
+        let mut dash = Dashboard::loading(&WindowState::default());
+        let _ = dash.update(resize(1067.0, 800.0));
+        let _ = dash.update(resize(900.0, 800.0));
+        assert!(
+            matches!(dash.startup_width, StartupWidth::Settled),
+            "the drag is the user's"
+        );
+    }
+
+    /// The shape of a widget tree: every node's tag with its children's. iced
+    /// reconciles positionally, so a node keeps its state across a redraw only
+    /// while the subtrees under it keep this shape.
+    fn tree_shape(tree: &iced::advanced::widget::tree::Tree) -> Shape {
+        Shape {
+            tag: tree.tag,
+            children: tree.children.iter().map(tree_shape).collect(),
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Shape {
+        tag: iced::advanced::widget::tree::Tag,
+        children: Vec<Shape>,
+    }
+
+    /// The Home page keeps its shape when the ticket column comes and goes: the
+    /// column is pushed after the chat, never around it, so the chat's subtree is
+    /// identical either way and iced reconciles it in place — its scroll
+    /// position and the composer's caret and draft survive the flip.
+    #[test]
+    fn the_ticket_column_does_not_reshape_the_home_page() {
+        // The composer draws the voice status, which a started instance has.
+        #[cfg(target_os = "macos")]
+        let _ = crate::audio::voice::init_global();
+
+        let mut dash = ready_dashboard();
+        let _ = dash.update(Message::Board(empty_board()));
+        let without = dash.home_page();
+        assert_eq!(without.as_widget().children().len(), 1, "the chat alone");
+        let chat = tree_shape(&without.as_widget().children()[0]);
+        drop(without);
+
+        let _ = dash.update(Message::Board(board_with_a_ticket()));
+        let with = dash.home_page();
+        assert_eq!(
+            with.as_widget().children().len(),
+            2,
+            "the chat and the column"
+        );
+        assert_eq!(tree_shape(&with.as_widget().children()[0]), chat);
+    }
+
+    /// A saved geometry is its own answer: nothing is owed, so no board read
+    /// resizes the window.
+    #[test]
+    fn a_saved_geometry_opens_as_saved() {
+        let saved = WindowState {
+            width: 1000.0,
+            height: 700.0,
+            x: 10,
+            y: 10,
+            restored: true,
+        };
+        let mut dash = Dashboard::loading(&saved);
+        assert_eq!(dash.last_size, iced::Size::new(1000.0, 700.0));
+        let _ = dash.update(Message::Board(board_with_a_ticket()));
+        assert_eq!(dash.take_startup_width(), None);
     }
 
     /// The conversation's first load is dispatched by the app opening — it hangs
@@ -4693,7 +5013,7 @@ mod tests {
     /// failure is carried so the picker / Settings list can render it.
     #[test]
     fn boot_workspace_read_failure_completes_with_error_state() {
-        let mut dash = Dashboard::loading();
+        let mut dash = Dashboard::loading(&WindowState::default());
 
         let _ =
             dash.apply_boot_workspaces(Err("boot read failed".to_string()), "personal:admin", 0);
@@ -4712,7 +5032,7 @@ mod tests {
     /// outcome is dropped.
     #[test]
     fn late_boot_read_does_not_replace_a_newer_reload() {
-        let mut dash = Dashboard::loading();
+        let mut dash = Dashboard::loading(&WindowState::default());
         let read_generation = dash.workspaces_reload_gen;
         dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
         dash.workspaces_reload_gen = read_generation + 1; // a reload answered

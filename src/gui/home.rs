@@ -13,9 +13,7 @@ use crate::channels::reply::{agent_author_label, normalize_reply_text};
 use chrono::{DateTime, Utc};
 use futures_util::SinkExt;
 use iced::widget::rule;
-#[cfg(target_os = "macos")]
-use iced::widget::tooltip;
-use iced::widget::{Column, Id, Space, button, column, container, row, scrollable, text};
+use iced::widget::{Column, Id, Space, button, column, container, row, scrollable, text, tooltip};
 use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 use std::collections::HashSet;
@@ -70,8 +68,9 @@ struct DisplayMessage {
     pub reply_reference: Option<ReplyReference>,
     /// Pre-parsed markdown items for rendering.
     pub md_items: Vec<iced::widget::markdown::Item>,
-    /// `[FILE:…]` markers of the raw content, in order.
-    pub file_markers: Vec<super::media_markers::FileMarker>,
+    /// The body's attachments (pictures, named files), in body order — drawn as
+    /// one block above the text.
+    pub attachments: Vec<super::media_markers::MediaAttachment>,
     /// True when this is an optimistic placeholder pushed before the pipeline
     /// confirmation arrives. The `ChatEvent::Message` handler replaces these.
     pub is_optimistic: bool,
@@ -98,7 +97,7 @@ fn display_message(
     is_optimistic: bool,
 ) -> DisplayMessage {
     use iced::widget::markdown;
-    let (md_items, file_markers) = if direction == ChatDirection::Divider {
+    let (md_items, attachments) = if direction == ChatDirection::Divider {
         (Vec::new(), Vec::new())
     } else {
         let workspace = HomeState::conversation_workspace_path();
@@ -110,7 +109,7 @@ fn display_message(
             },
         );
         let processed = super::markdown_breaks::hard_breaks(&rendered.text);
-        (markdown::parse(&processed).collect(), rendered.files)
+        (markdown::parse(&processed).collect(), rendered.attachments)
     };
     DisplayMessage {
         id,
@@ -121,7 +120,7 @@ fn display_message(
         timestamp,
         reply_reference,
         md_items,
-        file_markers,
+        attachments,
         is_optimistic,
     }
 }
@@ -169,6 +168,23 @@ fn discard_staged(dirs: Vec<String>) {
         return;
     }
     tokio::spawn(async move { super::attachment::discard(&dirs).await });
+}
+
+/// Open the platform's own file chooser for the composer's attach button:
+/// several files at once, no type filtered (anything can be dropped on the
+/// window today), and a folder ignored by the intake. A cancelled chooser
+/// changes nothing. It is a native modal, so it runs on a blocking thread and
+/// the window keeps painting while it is up.
+///
+/// The dialog API has no failure of its own — a chooser that never appeared and
+/// a cancelled one both come back empty — so with neither a desktop portal nor
+/// `zenity` to run it, the button does nothing and says nothing. The failure
+/// that reaches the composer is the blocking thread dying, a platform dialog
+/// panic included.
+async fn pick_attachment_files() -> Result<Option<Vec<std::path::PathBuf>>, String> {
+    tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_files())
+        .await
+        .map_err(|error| format!("The file chooser could not be opened: {error}"))
 }
 
 /// Broadcast a transient GUI chat event via
@@ -270,6 +286,27 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     .style(theme::surface_container_style)
     .width(Length::Fill)
     .into()
+}
+
+/// Composer attach button: opens the platform's file chooser, so a file can be
+/// attached without knowing that dragging or pasting it works. It sits in the
+/// composer action toolbar before the send button and is inert while the
+/// composer itself is (the graceful drain disables both).
+fn attach_control(disabled: bool) -> Element<'static, HomeMessage> {
+    super::widgets::icon_tooltip_button(
+        lucide::paperclip::<iced::Theme, iced::Renderer>()
+            .size(theme::TEXT_14)
+            .color(if disabled {
+                theme::TEXT_MUTED
+            } else {
+                theme::TEXT_SECONDARY
+            }),
+        "attach files",
+        (!disabled).then_some(HomeMessage::PickAttachments),
+        theme::PAD_3,
+        theme::icon_button_style(disabled),
+        tooltip::Position::Top,
+    )
 }
 
 /// Composer mic button: starts a voice message recording for the Assistant.
@@ -394,6 +431,11 @@ pub enum HomeMessage {
         attachments: Vec<super::attachment::Attachment>,
         refused: Vec<String>,
     },
+    /// The attach button asked for the platform's file chooser.
+    PickAttachments,
+    /// The file chooser returned: the files picked, nothing for a cancelled
+    /// chooser, or why it could not open at all.
+    AttachmentsPicked(Result<Option<Vec<std::path::PathBuf>>, String>),
     /// Remove the attachment at this index from the composer.
     RemoveAttachment(usize),
     /// The page has been drawn — hand the keyboard to the composer.
@@ -1004,19 +1046,23 @@ impl HomeState {
 
                     let is_user = msg.direction == ChatDirection::User;
 
-                    // Render markdown content
-                    let content: Element<'_, HomeMessage> = if msg.md_items.is_empty() {
-                        super::widgets::selectable_text(&msg.content, theme::TEXT_PRIMARY)
-                            .size(theme::TEXT_13)
-                            .into()
-                    } else {
-                        super::media_markers::selectable_markdown_view(
-                            &msg.md_items,
-                            theme::markdown_settings(),
-                            &msg.file_markers,
-                        )
-                        .map(HomeMessage::LinkClicked)
-                    };
+                    // The body as two blocks: the attachments it carries (one
+                    // group, in body order) above its whole text. Nothing draws
+                    // a picture inline, so no text can be swallowed by one.
+                    let content: Element<'_, HomeMessage> = super::media_markers::body(
+                        &msg.attachments,
+                        &msg.md_items,
+                        theme::markdown_settings(),
+                        HomeMessage::LinkClicked,
+                        // Nothing parsed and nothing to draw: the raw content
+                        // stands in (an empty body, or one whose only content
+                        // the preprocessing strips).
+                        || {
+                            super::widgets::selectable_text(&msg.content, theme::TEXT_PRIMARY)
+                                .size(theme::TEXT_13)
+                                .into()
+                        },
+                    );
 
                     // Build bubble body: role icon header for agents, or just content for users.
                     let bubble_body: Element<'_, HomeMessage> = if is_user {
@@ -1161,11 +1207,13 @@ impl HomeState {
         let voice_status = crate::audio::voice::get_status();
 
         // ── Input area ───────────────────────────────────────────
-        // Controls for the composer action toolbar: the mic button.
+        // Controls for the composer action toolbar: the mic on macOS, then the
+        // attach button — both inert while the composer is (a drain).
         #[cfg(target_os = "macos")]
-        let controls: Vec<Element<'_, HomeMessage>> = vec![mic_control(&voice_status)];
+        let controls: Vec<Element<'_, HomeMessage>> =
+            vec![mic_control(&voice_status), attach_control(draining)];
         #[cfg(not(target_os = "macos"))]
-        let controls: Vec<Element<'_, HomeMessage>> = Vec::new();
+        let controls: Vec<Element<'_, HomeMessage>> = vec![attach_control(draining)];
 
         // Composer strip matches the BG_BASE chat pane so the empty space around
         // the rounded bubble blends with the page instead of showing a gray panel;
@@ -1294,6 +1342,23 @@ impl HomeState {
                 attachments,
                 refused,
             } => self.attach(attachments, &refused),
+            HomeMessage::PickAttachments => {
+                Task::perform(pick_attachment_files(), HomeMessage::AttachmentsPicked)
+            }
+            HomeMessage::AttachmentsPicked(result) => {
+                // The chooser took the keyboard; the composer takes it back
+                // whether files arrived, the choice was cancelled, or the chooser
+                // never opened.
+                self.arm_composer_focus();
+                match result {
+                    Ok(Some(paths)) => {
+                        let (attachments, refused) = super::attachment::intake(paths);
+                        self.attach(attachments, &refused)
+                    }
+                    Ok(None) => Task::none(),
+                    Err(error) => Task::done(HomeMessage::Toast(ToastMessage::Error(error))),
+                }
+            }
             HomeMessage::RemoveAttachment(index) => {
                 if index < self.attachments.len() {
                     self.attachments.remove(index);
@@ -2239,7 +2304,7 @@ mod tests {
             timestamp: None,
             reply_reference: None,
             md_items: Vec::new(),
-            file_markers: Vec::new(),
+            attachments: Vec::new(),
             is_optimistic,
         }
     }
@@ -3005,7 +3070,7 @@ mod tests {
                 snippet: "original quote".to_string(),
             }),
             md_items: Vec::new(),
-            file_markers: Vec::new(),
+            attachments: Vec::new(),
             is_optimistic: true,
         });
 

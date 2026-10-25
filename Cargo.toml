@@ -59,6 +59,13 @@ tokio-util = { version = "0.7", default-features = false }
 # Native GUI dashboard
 iced = { version = "0.14", default-features = false, features = ["tokio", "wgpu", "markdown", "advanced", "image-without-codecs"] }
 iced_fonts = { version = "0.3", default-features = false, features = ["lucide", "advanced_text"] }
+# The composer's attach button opens the platform's own file chooser: the macOS
+# open panel, the Windows common dialog, and on Linux the desktop's own chooser
+# over the XDG portal — falling back to a `zenity` process when no portal is
+# running, so no GTK. The portal feature builds without system packages. No
+# default features: the portal's window-identification helper needs Wayland
+# protocol crates the product does not otherwise build.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # The same markdown parser iced_widget uses (resolved to the lock's 0.12.2 —
 # no new crates). The Sessions transcript pre-scans it to find HTML regions
 # (angle-bracket tag blocks) and escape only those, so they render as literal

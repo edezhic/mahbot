@@ -165,11 +165,10 @@ pub struct BoardState {
     description_md: Option<Vec<markdown::Item>>,
     /// Cached parsed markdown for comments (re-parsed when ticket changes).
     comments_md: Vec<(usize, Vec<markdown::Item>)>,
-    /// Bumped on every refresh request by [`Self::refresh`]. The
-    /// [`BoardMessage::Refreshed`] handler drops a stale snapshot whose
-    /// generation no longer matches, so an older in-flight read cannot
-    /// overwrite the newest one.
-    pub(crate) board_generation: u64,
+    /// Bumped on every refresh request by [`Self::refresh`]. A read outcome is
+    /// applied only while its generation still matches, so an older in-flight
+    /// read cannot overwrite the newest one (see [`Self::applied_read`]).
+    board_generation: u64,
     /// Ticket ids a CDC delta archived/removed since the last baseline. A
     /// baseline snapshot read before such a delta must not re-add the ticket,
     /// so `apply_refreshed` skips these ids from the snapshot.
@@ -324,6 +323,14 @@ impl BoardState {
         self.undo_stack.clear();
     }
 
+    /// Whether a read outcome carrying `generation` is the board's current read
+    /// — the shape both [`BoardMessage::Refreshed`] and
+    /// [`BoardMessage::RefreshError`] apply through, so a caller can tell an
+    /// applied read from one that lost its race.
+    pub(crate) fn applied_read(&self, generation: u64) -> bool {
+        generation == self.board_generation
+    }
+
     /// Request a full board snapshot — every workspace's non-archived
     /// tickets. Bumps [`Self::board_generation`] so only the newest request's
     /// snapshot applies.
@@ -360,6 +367,14 @@ impl BoardState {
     /// offered — at least one non-archived Queued ticket is listed.
     pub(crate) fn has_queued_tickets(&self) -> bool {
         self.queued_tickets().next().is_some()
+    }
+
+    /// Whether the board has been read successfully and holds no ticket to show
+    /// — the one state in which the Home page omits its ticket column. A board
+    /// that has not loaded yet and a failed read are not empty: each renders in
+    /// the column instead of hiding it.
+    pub(crate) fn has_nothing_to_show(&self) -> bool {
+        self.load_state.has_loaded() && self.load_state.error().is_none() && self.tickets.is_empty()
     }
 
     /// Workspaces to drain for the bulk pause: the distinct workspaces of the
@@ -872,7 +887,7 @@ impl BoardState {
                 // Stale-generation guard: drop a snapshot whose refresh was
                 // superseded by a newer one so it cannot clobber the
                 // current list.
-                if generation == self.board_generation {
+                if self.applied_read(generation) {
                     self.apply_refreshed(tickets);
                 }
                 Task::none()
@@ -881,7 +896,7 @@ impl BoardState {
                 // Stale-result guard, mirroring `Refreshed`: a failed read for a
                 // refresh the board has since superseded must not paint its
                 // failure over the current list.
-                if generation == self.board_generation {
+                if self.applied_read(generation) {
                     self.load_state.fail(error);
                 }
                 Task::none()
@@ -3200,6 +3215,30 @@ mod tests {
         state.search_query = super::super::common::SingleLineEditorState::new("foo");
         state.search_results = vec![ticket_in("ws1", "t2", TicketPhase::Backlog, false)];
         assert!(state.has_queued_tickets());
+    }
+
+    // ── The ticket column's own presence ─────────────────────────
+
+    #[test]
+    fn the_ticket_column_is_hidden_only_by_a_loaded_empty_board() {
+        let mut state = BoardState::new();
+        // Not read yet: the column renders its "Loading…" state.
+        assert!(!state.has_nothing_to_show());
+
+        state.load_state.start_loading();
+        assert!(!state.has_nothing_to_show());
+
+        state.load_state.finish_loading();
+        assert!(state.has_nothing_to_show(), "a read, empty board hides it");
+
+        // A failed read never hides the column: the failure renders in it.
+        state.load_state.fail("db hiccup".to_string());
+        assert!(!state.has_nothing_to_show());
+
+        // A ticket to show keeps it, whatever the read state says.
+        state.load_state.clear_error();
+        state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Backlog, false)];
+        assert!(!state.has_nothing_to_show());
     }
 
     #[test]

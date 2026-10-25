@@ -1299,10 +1299,13 @@ fn thinking_block<'a>(
 
 /// The message/narration body with the 3-line collapse rule: a collapsed
 /// element shows a plain clickable preview; an expanded (or short) element
-/// shows the markdown body parsed from `md`. `content` is the plain text used
-/// for the collapse measurement (at the bubble body width); `md` is the parsed
-/// body (markdown items, file markers and whether its markers became refusals)
-/// for the expanded view. Narration bodies render italic at
+/// draws the body through [`media_markers::body`] — its attachments as one
+/// group above its whole text, never interleaved and neither ever dropped.
+/// `content` is the plain text used for the collapse measurement (at the bubble
+/// body width; the measurement runs the same preprocessing and takes
+/// `display_text()`, so preview and expanded agree); `md` is the parsed body
+/// (markdown items, attachments and whether its markers became refusals) for
+/// the expanded view. Narration bodies render italic at
 /// [`theme::NARRATION_TEXT_SIZE`]; user/assistant bodies stay at
 /// [`theme::MARKDOWN_TEXT_SIZE`] regular.
 fn body_block<'a>(
@@ -1326,6 +1329,14 @@ fn body_block<'a>(
     } else {
         theme::FONT_REGULAR
     };
+    // The unadorned body: what an unparsed message draws, and what a parsed one
+    // falls back to when the composition leaves nothing to show.
+    let plain = || {
+        selectable_text(content, theme::TEXT_PRIMARY)
+            .size(size)
+            .font(font)
+            .into()
+    };
     let expanded: Element<'a, SessionsMessage> = if let Some(parsed) = md {
         let settings = if is_narration {
             theme::narration_markdown_settings()
@@ -1333,20 +1344,22 @@ fn body_block<'a>(
             theme::markdown_settings()
         };
         let workspace = ctx.workspace_root.clone();
-        media_markers::selectable_markdown_view(&parsed.items, settings, &parsed.files).map(
-            move |url| match media_markers::file_link_target(&url) {
-                Some(target) => SessionsMessage::RevealFile {
-                    target: target.to_string(),
-                    workspace: workspace.clone(),
-                },
-                None => SessionsMessage::LinkClicked(url),
+        let link_message = move |url: String| match media_markers::file_link_target(&url) {
+            Some(target) => SessionsMessage::RevealFile {
+                target: target.to_string(),
+                workspace: workspace.clone(),
             },
+            None => SessionsMessage::LinkClicked(url),
+        };
+        media_markers::body(
+            &parsed.attachments,
+            &parsed.items,
+            settings,
+            link_message,
+            plain,
         )
     } else {
-        selectable_text(content, theme::TEXT_PRIMARY)
-            .size(size)
-            .font(font)
-            .into()
+        plain()
     };
     let el = collapsible_text_block(
         collapses,
@@ -1649,6 +1662,7 @@ mod tests {
         )];
         state.entry_md = session_view::parse_entry_bodies(&state.entries, None);
         assert_eq!(state.workspace_root, None);
+        assert!(state.entry_md[0].as_ref().unwrap().attachments.is_empty());
         assert!(
             state.entry_md[0]
                 .as_ref()
@@ -1679,12 +1693,21 @@ mod tests {
             "an assistant body is the product's own reply"
         );
         let expected = photo.to_string_lossy().into_owned();
+        assert_eq!(
+            parsed.attachments,
+            vec![media_markers::MediaAttachment {
+                image: Some(expected),
+                label: "🖼️ poster.png".to_string(),
+                reveal: None,
+            }],
+            "the reassembled body must carry the picture as an attachment"
+        );
         assert!(
-            parsed.items.iter().any(|item| matches!(
-                item,
-                iced::widget::markdown::Item::Image { url, .. } if url.as_str() == expected
-            )),
-            "the reassembled body must draw the picture: {:?}",
+            parsed
+                .items
+                .iter()
+                .all(|item| !matches!(item, iced::widget::markdown::Item::Image { .. })),
+            "no markdown image may reach the text: {:?}",
             parsed.items
         );
     }

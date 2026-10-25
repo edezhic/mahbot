@@ -926,10 +926,14 @@ fn main() -> Result<()> {
     // The icon on the surfaces the window itself does not carry.
     mahbot::app_icon::install_desktop_integration();
 
+    // The geometry the window opens at, and the dashboard's own copy of it: a
+    // close persists the last size the window reported, and a fresh window's
+    // start-up width is settled by the board's first read (see `StartupWidth`).
+    let window_settings = dashboard_window_settings(&window_state);
     iced::application(
         move || {
             (
-                Dashboard::loading(),
+                Dashboard::loading(&window_state),
                 iced::Task::perform(
                     bootstrap_mahbot_safe(start_paused, slowdown),
                     DashboardMessage::Boot,
@@ -947,7 +951,7 @@ fn main() -> Result<()> {
     .default_font(JETBRAINS_MONO)
     .subscription(Dashboard::subscription)
     .theme(Dashboard::theme)
-    .window(dashboard_window_settings(&window_state))
+    .window(window_settings)
     .exit_on_close_request(false)
     .run()
     // Returning here with an error leaves without the teardown below — one of the exits
@@ -965,13 +969,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The dashboard window's own settings: the geometry this account was last closed
-/// with, and the icon and announced name the platform's identity surfaces need.
+/// The dashboard window's own settings: the geometry it opens with
+/// ([`mahbot::gui::WindowState::opening_size`], a saved one or the narrower
+/// default a fresh window starts with), and the icon and announced name the
+/// platform's identity surfaces need.
 fn dashboard_window_settings(state: &mahbot::gui::WindowState) -> iced::window::Settings {
     iced::window::Settings {
-        size: iced::Size::new(state.width, state.height),
+        size: state.opening_size(),
         position: state.position(),
-        min_size: Some(iced::Size::new(800.0, 500.0)),
+        min_size: Some(iced::Size::new(
+            mahbot::gui::MIN_WINDOW_WIDTH,
+            mahbot::gui::MIN_WINDOW_HEIGHT,
+        )),
         // The window's own icon where the platform has one (the title bar on
         // Windows and X11); macOS and Wayland carry no window icon and ignore it.
         icon: mahbot::app_icon::window_icon(),

@@ -17,8 +17,9 @@
 //!   places them unwrapped in a horizontally scrollable block); fence
 //!   delimiter lines count too — a 2-line code block with fences measures 4
 //!   and collapses, a deliberate over-collapse in the collapse direction;
-//! - media markers are reduced to short text placeholders before measuring,
-//!   so base64 data-URI blobs cannot skew the count.
+//! - media markers and pictures are extracted into their attachments before
+//!   measuring, and their labels measure in the place the expanded body draws
+//!   them (above the text), so a base64 data-URI blob cannot skew the count.
 //!
 //! Preview extraction is BiDi-safe: cosmic-text lays glyphs out in visual
 //! order (L2 reordering), so an RTL run can appear with decreasing byte
@@ -40,7 +41,6 @@
 //! width by [`crate::gui::sessions::SessionsState`].
 
 use std::sync::Arc;
-use std::sync::LazyLock;
 
 use cosmic_text::{Attrs, AttrsList, BufferLine, Family, LineEnding, Shaping, Wrap};
 use iced::advanced::graphics::text::cosmic_text;
@@ -49,7 +49,6 @@ use crate::gui::media_markers;
 use crate::gui::text_rendering::with_font_system;
 #[cfg(test)]
 use crate::gui::theme::MARKDOWN_TEXT_SIZE;
-use crate::util::file_name_or_path;
 
 /// Line budget: any message rendering more than this many wrapped lines is
 /// collapsed to a [`MAX_PREVIEW_LINES`]-line preview by default.
@@ -187,13 +186,15 @@ pub(crate) fn width_bucket(width: f32) -> u32 {
 ///
 /// `display_text` is the raw message body (the same text that the Sessions
 /// ledger's `parse_entry_bodies` feeds to `markdown::parse`); media-marker
-/// preprocessing and image placeholder reduction happen here, under the same
-/// [`media_markers::MarkerContext`] the render uses so a notice and an image
-/// measure as what they render. The source is owned as [`Arc<str>`] so a
-/// width-bucket change can re-measure without copying the (potentially hundreds
-/// of KB) display text again. `font_size` is the body size the text renders at
-/// (body or narration), used for wrap and preview-line-budget shaping and
-/// heading scaling.
+/// preprocessing happens here, under the same [`media_markers::MarkerContext`]
+/// the render uses so a notice and a picture measure as what they render. The
+/// measured text is [`media_markers::Preprocessed::display_text`] — the
+/// attachment labels above the text, the order the expanded body draws — so a
+/// base64 payload counts as one short label instead of a blob of characters.
+/// The source is owned as [`Arc<str>`] so a width-bucket change can re-measure
+/// without copying the (potentially hundreds of KB) display text again.
+/// `font_size` is the body size the text renders at (body or narration), used
+/// for wrap and preview-line-budget shaping and heading scaling.
 pub(crate) fn measure_message(
     display_text: impl Into<Arc<str>>,
     markers: &media_markers::MarkerContext<'_>,
@@ -202,8 +203,9 @@ pub(crate) fn measure_message(
     font_size: f32,
 ) -> MessageMeasure {
     let source = display_text.into();
-    let processed: Arc<str> =
-        placeholder_media(&media_markers::preprocess(&source, markers).text).into();
+    let processed: Arc<str> = media_markers::preprocess(&source, markers)
+        .display_text()
+        .into();
     measure_processed(source, processed, width, content_len, font_size)
 }
 
@@ -530,40 +532,6 @@ fn setext_heading_size(current: &str, next: Option<&str>, font_size: f32) -> Opt
         .then(|| heading_sizes(font_size)[usize::from(ch == b'-')])
 }
 
-/// Replace markdown image syntax (`![alt](url)`) with a short text
-/// placeholder (`🖼️ filename`), so images — and especially base64 data-URI
-/// blobs — count as a bounded token rather than raw text. Audio/video
-/// markers are already short text after [`media_markers::preprocess`] and
-/// pass through untouched.
-fn placeholder_media(processed: &str) -> String {
-    IMAGE_PLACEHOLDER_RE
-        .replace_all(processed, |caps: &regex::Captures| {
-            // A quoted destination is captured without its `<>`.
-            let url = caps
-                .get(1)
-                .or_else(|| caps.get(2))
-                .map_or("", |url| url.as_str());
-            let label = if url.starts_with("data:") {
-                // Base64 data-URI images have no filename — generic label.
-                "image"
-            } else {
-                file_name_or_path(url)
-            };
-            format!("🖼️ {label}")
-        })
-        .into_owned()
-}
-
-/// Matches markdown image syntax as produced by `media_markers::preprocess`
-/// (`![Image](path)`) and raw `![alt](url)` in agent text. The destination is
-/// either `<>`-quoted — how `media_markers::image_item` writes a path with a
-/// space or a parenthesis — or bare, which closes at the first `)`, where
-/// pulldown-cmark stops reading it too.
-static IMAGE_PLACEHOLDER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"!\[[^\]]*\]\((?:<([^>]*)>|([^)]*))\)")
-        .expect("image placeholder regex must compile")
-});
-
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -671,24 +639,22 @@ mod tests {
     }
 
     #[test]
-    fn blank_lines_kept_in_preview() {
-        // Blank source lines are rendered lines: a collapsing message
-        // previews exactly its first 3 lines, blank lines included — not the
-        // compacted "a\nb\nc".
-        for text in ["a\n\nb\n", "a\n\nb\nc"] {
+    fn blank_lines_are_measured_where_the_body_has_them() {
+        // Blank source lines are rendered lines, and nothing trims them before
+        // measuring: they count toward the budget and preview as the blank
+        // lines they are, leading and trailing ones included.
+        for (text, preview) in [
+            ("a\n\nb\nc", "a\n\nb"),
+            ("a\n\nb\nc\nd", "a\n\nb"),
+            ("\n\na\n\nb", "\n\na"),
+            ("a\n\nb\n", "a\n\nb"),
+        ] {
             let m = measure(text);
             assert!(m.wrapped_lines > 3, "{text:?}: {} lines", m.wrapped_lines);
-            let preview = m.preview.expect("4-line message must collapse");
-            assert_eq!(preview, "a\n\nb");
-            assert_preview_lines(&preview, 3);
+            let shown = m.preview.expect("the message must collapse");
+            assert_eq!(shown, preview, "{text:?}");
+            assert_preview_lines(&shown, 3);
         }
-        // Leading blanks are kept too: "\n\na\n\nb" (5 lines) previews as the
-        // first 3 rendered lines "", "", "a".
-        let m = measure("\n\na\n\nb");
-        assert!(m.wrapped_lines > 3, "{} lines", m.wrapped_lines);
-        let preview = m.preview.expect("5-line message must collapse");
-        assert_eq!(preview, "\n\na");
-        assert_preview_lines(&preview, 3);
     }
 
     #[test]
@@ -842,10 +808,9 @@ mod tests {
     }
 
     #[test]
-    fn base64_data_uri_reduced_to_placeholder() {
-        // A valid native data-URI image marker is reduced to a short
-        // `🖼️ image` placeholder rather than its base64 payload being counted
-        // as token text.
+    fn a_picture_measures_as_its_label_not_its_payload() {
+        // An extracted picture contributes one label line to the measured
+        // text — never its base64 payload, which would skew the count.
         let png = {
             let img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
             let mut buf = Vec::new();
@@ -856,59 +821,12 @@ mod tests {
         let uri = format!("data:image/png;base64,{}", STANDARD.encode(&png));
         let text = format!("before [IMAGE:{uri}] after");
         let m = measure(&text);
-        // Two short words + "🖼️ image" placeholder — fits within the budget.
+        // Two short words plus the label — fits within the budget.
         assert!(m.wrapped_lines <= 3, "{} lines", m.wrapped_lines);
         assert!(m.preview.is_none());
-        // The placeholder must not contain the raw base64 blob.
-        let measured = placeholder_media(&media_markers::preprocess(&text, &agent_markers()).text);
-        assert!(!measured.contains("base64"));
-        assert!(measured.contains("🖼️ image"));
-    }
-
-    #[test]
-    fn image_marker_placeholder_uses_filename() {
-        let dir = tempfile::tempdir().unwrap();
-        let cap = dir.path().join("cap.png");
-        let img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
-        let mut buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-            .expect("test PNG must encode");
-        std::fs::write(&cap, &buf).unwrap();
-
-        let text = format!("see [IMAGE:{}] below", cap.display());
-        let m = measure(&text);
-        assert_eq!(m.wrapped_lines, 1);
-        assert!(m.preview.is_none());
-        let measured = placeholder_media(&media_markers::preprocess(&text, &agent_markers()).text);
-        assert!(measured.contains("🖼️ cap.png"), "got: {measured:?}");
-    }
-
-    #[test]
-    fn spaced_image_marker_placeholder_names_the_file() {
-        // A resolved picture in a path with a space or a parenthesis renders as
-        // a `<>`-quoted destination; the measurement must name it like any other.
-        let dir = tempfile::tempdir().unwrap();
-        let png = {
-            let img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
-            let mut buf = Vec::new();
-            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-                .expect("test PNG must encode");
-            buf
-        };
-        for name in ["my file.png", "my (1).png"] {
-            std::fs::write(dir.path().join(name), &png).unwrap();
-            let markers = media_markers::MarkerContext {
-                workspace: Some(dir.path()),
-                refusals: true,
-            };
-            let measured = placeholder_media(
-                &media_markers::preprocess(&format!("[IMAGE:{name}]"), &markers).text,
-            );
-            assert!(
-                measured.contains(&format!("🖼️ {name}")),
-                "got: {measured:?}"
-            );
-        }
+        let measured = media_markers::preprocess(&text, &agent_markers()).display_text();
+        assert!(!measured.contains("base64"), "got: {measured:?}");
+        assert_eq!(measured, "🖼️ image\nbefore after");
     }
 
     #[test]
