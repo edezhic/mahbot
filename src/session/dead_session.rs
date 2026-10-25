@@ -19,6 +19,18 @@
 //!   / re-executing) before the next LLM call, so recovery continues the
 //!   interrupted work.
 //!
+//! # Poll cadence
+//!
+//! Recovery is checked once a minute for the first `STARTUP_WINDOW` after
+//! start — the window in which a restart actually matters — and once every
+//! `POLL_INTERVAL` afterwards: an agent lost while the process keeps running is
+//! rare, so the steady-state cadence is deliberately coarse.
+//!
+//! A candidate is recovered only once its last message is at least
+//! `STALE_GRACE_PERIOD` old, so an interrupted turn resumes about two minutes
+//! after it was cut, while a session abandoned under a running process waits
+//! for the next cycle in effect.
+//!
 //! # Exclusion list
 //!
 //! The poller skips `manager_*` (Manager has its own lifecycle) plus every
@@ -37,16 +49,16 @@
 //! toward the per-session retry cap.  There is no "success feedback" from
 //! the consumer loop — the agent executes asynchronously, so routing
 //! success ≠ recovery success.  A persistently failing agent (rate-limited,
-//! API errors) will hit `MAX_RETRIES` after approximately 5.7 hours
-//! (accounting for adaptive backoff: first wait ~20 min, ~40 min per
-//! subsequent attempt) and be permanently given up.
+//! API errors) will hit `MAX_RETRIES` after roughly six hours of adaptive
+//! backoff (first wait ~20 min, ~40 min per subsequent attempt, each attempt
+//! landing on the next poll cycle) and be permanently given up.
 //! The session becoming healthy is detected naturally on the next poll
 //! cycle when the last message is an assistant reply (condition 1 no longer
 //! holds).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
@@ -58,8 +70,14 @@ use crate::{ChatRole, Role};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-/// Interval between poller cycles.
-const POLL_INTERVAL: Duration = Duration::from_mins(5); // 5 minutes
+/// Interval between poller cycles once the startup window has passed.
+const POLL_INTERVAL: Duration = Duration::from_mins(10);
+
+/// Interval between poller cycles during the startup window.
+const STARTUP_POLL_INTERVAL: Duration = Duration::from_mins(1);
+
+/// How long after start the poller keeps `STARTUP_POLL_INTERVAL`.
+const STARTUP_WINDOW: Duration = Duration::from_mins(5);
 
 /// Maximum consecutive recovery attempts before giving up on a session.
 const MAX_RETRIES: u8 = 10;
@@ -76,7 +94,7 @@ const MAX_BACKOFF_MINUTES: i64 = 40;
 /// message (user message, terminal tool frame, or dangling tool-call frame)
 /// is at least this old.
 /// Prevents races with agents that are still spawning or loading.
-const STALE_GRACE_PERIOD: Duration = Duration::from_mins(5);
+const STALE_GRACE_PERIOD: Duration = Duration::from_mins(2);
 
 // ── Retry tracker (in-memory) ───────────────────────────────────────────────
 
@@ -169,12 +187,23 @@ static DEAD_SESSION_TRACKER: std::sync::LazyLock<DeadSessionTracker> =
 
 /// Run the dead-session recovery poller loop.
 ///
+/// Cycles run once a minute for the first `STARTUP_WINDOW`, then once every
+/// `POLL_INTERVAL`. The first cycle is a minute in, never at once:
+/// `spawn_background_tasks` starts this task before `init_message_pipeline`, so
+/// an immediate scan could route a recovery into a half-built pipeline.
+///
 /// Follows the established background-task pattern: cooperative shutdown via
 /// [`crate::shutdown::sleep_or_shutdown_or_drain`], single-failure isolation
 /// via `tracing::warn!`.
 pub async fn run_dead_session_recovery_loop() {
+    let started = Instant::now();
     loop {
-        if !crate::shutdown::sleep_or_shutdown_or_drain(POLL_INTERVAL).await {
+        let interval = if started.elapsed() < STARTUP_WINDOW {
+            STARTUP_POLL_INTERVAL
+        } else {
+            POLL_INTERVAL
+        };
+        if !crate::shutdown::sleep_or_shutdown_or_drain(interval).await {
             break;
         }
         if let Err(e) = recover_dead_sessions().await {
@@ -792,7 +821,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Backdate the session so the 5-minute grace period passes.
+        // Backdate the session so the recovery grace period passes.
         let past = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
         conn.execute(
             "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = ?2",
