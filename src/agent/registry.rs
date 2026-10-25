@@ -130,6 +130,12 @@ pub struct AgentHandle {
     /// time. `None` between phases — the agent's card is the single tracker
     /// for these calls (no separate registry rows are ever created for them).
     pub activity: Option<String>,
+    /// Whether a workspace-pause freeze was signalled for this run
+    /// ([`AgentRegistry::cancel_by_workspace_pause`]), taken at `list()` time.
+    /// A frozen agent stops at its next LLM round boundary, so it is not
+    /// working: the Sessions page keeps its row in place instead of pinning it
+    /// to the top. Cleared on unpause (`clear_workspace_pause`).
+    pub paused: bool,
 }
 
 /// Agent identity + registry generation propagated to tool execution via a
@@ -224,6 +230,7 @@ impl AgentRegistry {
             started_at: Utc::now(),
             generation,
             activity: None,
+            paused: false,
         };
         let mut map = self.inner.lock().unwrap_poison();
         // Replacing an old agent cancels the old token — the new agent is a
@@ -355,17 +362,23 @@ impl AgentRegistry {
     /// `ticket_id = None`) are intentionally left running so a pause only halts
     /// the ticket pipeline.
     pub fn cancel_by_workspace_pause(&self, workspace_name: &str) {
+        let mut changed = false;
         {
             let map = self.inner.lock().unwrap_poison();
             for entry in map.values() {
                 if entry.handle.workspace_name == workspace_name && entry.handle.ticket_id.is_some()
                 {
-                    entry.pause_stop.store(true, Ordering::SeqCst);
+                    changed |= !entry.pause_stop.swap(true, Ordering::SeqCst);
                 }
             }
         }
         // No cancel token fired: the pause is cooperative — each agent stops at
-        // the next LLM round boundary (see the llm_loop round-top check).
+        // the next LLM round boundary (see the llm_loop round-top check). The
+        // publish is what lets a live view show the freeze (the registry's
+        // membership did not change).
+        if changed {
+            publish(RuntimeEvent::Registries);
+        }
     }
 
     /// Clear the cooperative pause-stop flag for every agent in a workspace.
@@ -373,11 +386,17 @@ impl AgentRegistry {
     /// (and had not yet reached the LLM round boundary) does not bail "frozen"
     /// at a boundary after the workspace has resumed.
     pub fn clear_workspace_pause(&self, workspace_name: &str) {
-        let map = self.inner.lock().unwrap_poison();
-        for entry in map.values() {
-            if entry.handle.workspace_name == workspace_name {
-                entry.pause_stop.store(false, Ordering::SeqCst);
+        let mut changed = false;
+        {
+            let map = self.inner.lock().unwrap_poison();
+            for entry in map.values() {
+                if entry.handle.workspace_name == workspace_name {
+                    changed |= entry.pause_stop.swap(false, Ordering::SeqCst);
+                }
             }
+        }
+        if changed {
+            publish(RuntimeEvent::Registries);
         }
     }
 
@@ -414,6 +433,7 @@ impl AgentRegistry {
             .map(|e| {
                 let mut handle = e.handle.clone();
                 handle.activity.clone_from(&e.activity);
+                handle.paused = e.pause_stop.load(Ordering::SeqCst);
                 handle
             })
             .collect()

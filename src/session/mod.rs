@@ -155,10 +155,10 @@ crate::columns! {
 // sm.message_count, sm.token_length, sm.role, sm.user_name, sm.workspace_name,
 // sm.custom_role, sm.custom_identifier, sm.launch_stopped).
 // Counts are read from the denormalized metadata column — NOT from a JOIN over
-// the `sessions` message table (the list query runs on Sessions-page navigation
-// and from the dead-session recovery poller; scanning the full message table
-// per refresh was the largest repeated query in the system). The count is
-// maintained in the same transaction as message writes
+// the `sessions` message table (the list re-reads on every runtime tick while
+// the Sessions page is open, and from the dead-session recovery poller; scanning
+// the full message table per refresh was the largest repeated query in the
+// system). The count is maintained in the same transaction as message writes
 // (see `insert_messages_in_transaction`). It is NOT backfilled: sessions that
 // predate the metadata column default to 0. Schema: `db/migrations.rs`.
 crate::columns! {
@@ -626,9 +626,9 @@ fn session_metadata_row(row: &Row) -> Result<SessionMetadata> {
 /// column (maintained in the same transaction as message writes; NOT backfilled —
 /// sessions predating the metadata column default to 0). The historical
 /// LEFT JOIN + GROUP BY over the full `sessions`
-/// table was the largest repeated query in the system (this list refreshes on
-/// Sessions-page navigation and from the dead-session recovery poller) and has
-/// been removed. Ordering and filtering are unchanged.
+/// table was the largest repeated query in the system (this list re-reads on
+/// every runtime tick while the Sessions page is open, and from the dead-session
+/// recovery poller) and has been removed. Ordering and filtering are unchanged.
 async fn list_sessions_where(
     conn: &db::Connection,
     where_clause: &str,
@@ -1166,31 +1166,6 @@ impl SessionStore {
     pub(crate) async fn list_sessions_with_metadata_checked(&self) -> Result<Vec<SessionMetadata>> {
         self.conn
             .query_map_strict(&sessions_list_sql(""), (), session_metadata_row)
-            .await
-    }
-
-    /// Metadata for `agent_ids` only — the Sessions page's live-membership
-    /// read. It looks up an agent that started working after the page was
-    /// opened and is therefore absent from the list; metadata columns only, so
-    /// no transcript is ever read. An agent that has not stored its first
-    /// message yet has no row and is simply absent from the result.
-    pub(crate) async fn list_sessions_with_metadata_for_ids(
-        &self,
-        agent_ids: &[String],
-    ) -> Result<Vec<SessionMetadata>> {
-        if agent_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let params: Vec<Value> = agent_ids.iter().cloned().map(Value::Text).collect();
-        self.conn
-            .query_map_strict(
-                &sessions_list_sql(&format!(
-                    "WHERE sm.agent_id IN ({})",
-                    db::sql_in_placeholders(params.len())
-                )),
-                params,
-                session_metadata_row,
-            )
             .await
     }
 

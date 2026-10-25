@@ -1115,7 +1115,7 @@ impl Dashboard {
                 let board_refresh = self.board_state.refresh().map(Message::Board);
                 Task::batch([snap, board_refresh])
             }
-            Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
+            Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
             // The Alarms page renders nothing but its polled list, so entering
             // it starts a read rather than a render of stale entries.
             Page::Alarms => self.alarms_state.refresh().map(Message::Alarms),

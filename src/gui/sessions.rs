@@ -1,4 +1,10 @@
 //! Sessions dashboard page — view and manage conversation sessions.
+//!
+//! The list is a live projection of the registry, not a snapshot: a session
+//! whose agent is running is pinned to the top of the list for as long as it
+//! runs — including an agent that has not stored its first message yet — and the
+//! rows are re-read on every runtime tick rather than only on page entry, so the
+//! page converges on its own. See [`session_rows`].
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -69,8 +75,8 @@ struct TranscriptCtx<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionsMessage {
-    Refreshed(Vec<SessionMetadata>),
-    RefreshError(String),
+    /// A finished list read — page entry and the runtime tick alike.
+    Settled(Result<Vec<SessionMetadata>, String>),
     SelectSession(String),
     SessionMessages(String, Vec<ChatMessage>),
     /// A transcript read failure. `key` is the session the failed read
@@ -135,21 +141,19 @@ pub(crate) enum SessionsMessage {
         deleted: usize,
     },
 
-    /// Coalesced runtime-change tick (250 ms): refresh the cached list labels,
-    /// add sessions whose agent started working after the page was opened, and
-    /// merge the selected session's live transcript when its agent is running.
+    /// Coalesced runtime-change tick (250 ms): re-read the list so rows that
+    /// appear, grow or finish converge, refresh the cached rows and their
+    /// relative-time labels, and merge the selected session's live transcript
+    /// when its agent is running.
     RuntimeChanged,
-
-    /// Result of the live-membership read started for running agents the list
-    /// was missing. A failed read is silent — the next runtime tick retries.
-    LiveSessionsRead(Result<Vec<SessionMetadata>, String>),
 }
 
 #[derive(Debug, Clone)]
 struct CachedSessionItem {
     agent_id: String,
-    /// Agent role parsed from the metadata role string; `None` renders the
-    /// title without an icon.
+    /// Agent role parsed from the metadata role string (`None` renders the
+    /// title without an icon); for a running agent without a stored row, the
+    /// role the registry reports.
     role: Option<crate::Role>,
     /// User name when present (Some and non-empty), otherwise the workspace
     /// name (may be empty if both are absent). Workspace-scoped roles ignore
@@ -166,13 +170,32 @@ struct CachedSessionItem {
     /// The named branch this continuable session continues, when the branch was
     /// named — a custom role's identifier, or a worker branch's name.
     custom_identifier: Option<String>,
-    /// Pre-formatted message count string.
-    msg_count_label: String,
+    /// Pre-formatted message count, `None` only for a running agent whose first
+    /// message is not stored yet — its row is synthesised from the registry, so
+    /// there is no count and no session to delete.
+    msg_count_label: Option<String>,
     /// Pre-formatted compact token count (same format as the Running Agents
     /// card), when the session ever recorded a provider-reported length.
     token_label: Option<String>,
     /// Pre-formatted timestamp string.
     timestamp_label: String,
+    /// What the session's agent is doing right now.
+    activity: SessionActivity,
+}
+
+/// What a session's agent is doing right now — the whole difference between a
+/// row pinned on top of the list and a row in its last-activity place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionActivity {
+    /// No agent holds the session.
+    Idle,
+    /// A registered agent is working in it: the row is pinned to the top of the
+    /// list and carries the spinner.
+    Working,
+    /// A registered agent was frozen by a workspace pause. It stops at its next
+    /// round boundary, so it is not working: the row keeps its place and shows
+    /// the state instead of the spinner.
+    Paused,
 }
 
 impl CachedSessionItem {
@@ -235,6 +258,133 @@ fn custom_role_title(name: &str, identifier: Option<&str>) -> String {
     format!("{}{suffix}", crate::util::truncate(name, room))
 }
 
+/// The session list's rows, in display order.
+///
+/// A session whose agent is working is pinned to the top for as long as it runs
+/// (ordered by run start, so the block stays still while the runs go on) and
+/// settles into its last-activity place once it stops: a run in progress must
+/// never be lost below the fold of a long list, and the list is not re-sorted
+/// between a run's start and its end. A paused (frozen) agent is not working, so
+/// its row keeps its normal place.
+///
+/// A registered agent whose first message is not stored yet has no row of its
+/// own and gets a synthesised one from what the registry knows — its role, its
+/// project and that it is working. Rows are keyed by `agent_id`, so the
+/// synthesised row is replaced by the stored one as soon as the first message
+/// lands.
+fn session_rows(
+    sessions: &[SessionMetadata],
+    agents: &[crate::agent::registry::AgentHandle],
+    now: chrono::DateTime<chrono::Local>,
+) -> Vec<CachedSessionItem> {
+    let mut live: HashMap<&str, &crate::agent::registry::AgentHandle> = agents
+        .iter()
+        .map(|handle| (handle.agent_id.as_str(), handle))
+        .collect();
+    let mut rows: Vec<ListRow> = Vec::with_capacity(sessions.len() + agents.len());
+    for session in sessions {
+        let handle = live.remove(session.agent_id.as_str());
+        let activity = session_activity(handle);
+        let name = session
+            .user_name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .or_else(|| session.workspace_name.as_deref().filter(|n| !n.is_empty()))
+            .unwrap_or("");
+        rows.push(ListRow {
+            pinned_at: pinned_at(handle, activity),
+            last_activity: session.last_activity,
+            row: CachedSessionItem {
+                agent_id: session.agent_id.clone(),
+                role: session
+                    .role
+                    .as_deref()
+                    .and_then(|r| r.parse::<crate::Role>().ok()),
+                title: crate::util::truncate(name, CARD_TITLE_MAX_CHARS),
+                workspace_name: session.workspace_name.clone().filter(|n| !n.is_empty()),
+                custom_role: session.custom_role.clone(),
+                custom_identifier: session.custom_identifier.clone(),
+                msg_count_label: Some(format!("{} msgs", session.message_count)),
+                token_label: session.token_length.map(theme::format_compact_tokens),
+                timestamp_label: theme::format_relative_time(
+                    &session.last_activity.to_rfc3339(),
+                    now,
+                ),
+                activity,
+            },
+        });
+    }
+    // What remains in `live` has no stored row yet.
+    for handle in live.into_values() {
+        let activity = session_activity(Some(handle));
+        let workspace_name = Some(handle.workspace_name.clone()).filter(|n| !n.is_empty());
+        // A personal workspace is titled by its user, like a stored row is.
+        let title = workspace_name
+            .as_deref()
+            .and_then(crate::users::personal_user_name)
+            .unwrap_or(handle.workspace_name.as_str());
+        rows.push(ListRow {
+            pinned_at: pinned_at(Some(handle), activity),
+            last_activity: handle.started_at,
+            row: CachedSessionItem {
+                agent_id: handle.agent_id.clone(),
+                role: handle.role.parse::<crate::Role>().ok(),
+                title: crate::util::truncate(title, CARD_TITLE_MAX_CHARS),
+                workspace_name,
+                custom_role: None,
+                custom_identifier: None,
+                msg_count_label: None,
+                token_label: None,
+                timestamp_label: theme::format_relative_time(&handle.started_at.to_rfc3339(), now),
+                activity,
+            },
+        });
+    }
+    // A running row sorts by the run's start; the rest keep last-activity order
+    // (a synthesised row has no stored activity of its own, so its start stands
+    // in for one).
+    rows.sort_by(|a, b| match (a.pinned_at, b.pinned_at) {
+        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.row.agent_id.cmp(&b.row.agent_id)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b
+            .last_activity
+            .cmp(&a.last_activity)
+            .then_with(|| a.row.agent_id.cmp(&b.row.agent_id)),
+    });
+    rows.into_iter().map(|ListRow { row, .. }| row).collect()
+}
+
+/// One row of the list with the two keys its order is decided by.
+struct ListRow {
+    row: CachedSessionItem,
+    /// Start of the run the row is pinned for; `None` when it keeps its
+    /// last-activity place.
+    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The row's last activity, or the run's start for a synthesised row.
+    last_activity: chrono::DateTime<chrono::Utc>,
+}
+
+/// What a session's agent is doing right now, from the live registry alone.
+fn session_activity(handle: Option<&crate::agent::registry::AgentHandle>) -> SessionActivity {
+    match handle {
+        Some(handle) if handle.paused => SessionActivity::Paused,
+        Some(_) => SessionActivity::Working,
+        None => SessionActivity::Idle,
+    }
+}
+
+/// The pin key of a row: the start of the run it is pinned for, `None` when it
+/// keeps its last-activity place.
+fn pinned_at(
+    handle: Option<&crate::agent::registry::AgentHandle>,
+    activity: SessionActivity,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    handle
+        .filter(|_| activity == SessionActivity::Working)
+        .map(|handle| handle.started_at)
+}
+
 /// The root a transcript's relative `[FILE:…]` markers resolve against: the
 /// session's own workspace. A personal workspace is synthetic (never in the
 /// map), so it resolves by name; a stored name that is itself an absolute path
@@ -250,8 +400,10 @@ fn workspace_root_for(name: &str, workspaces: &HashMap<String, Workspace>) -> Op
 }
 
 pub(crate) struct SessionsState {
-    sessions: Vec<SessionMetadata>,
-    load_state: super::common::AsyncLoadState,
+    /// The stored session rows, re-read on page entry and on every runtime tick
+    /// so rows that appear, grow or finish converge without the user leaving the
+    /// page.
+    sessions: super::common::PolledList<SessionMetadata>,
     selected_session: Option<String>,
     /// The flat session ledger built from the selected session's messages.
     entries: Vec<SessionEntry>,
@@ -291,13 +443,15 @@ pub(crate) struct SessionsState {
     /// Mutated during layout (the bubble width is only known there), hence
     /// `RefCell`.
     measure_cache: RefCell<HashMap<(usize, usize), MessageMeasure>>,
-    /// Cached session list display data. Rebuilt when `sessions` changes and
-    /// on each runtime-change tick (to refresh relative-time labels).
-    /// `view()` builds widgets from this data on every frame.
+    /// Cached session list display data. Rebuilt whenever the row set changes —
+    /// a settled read or a runtime tick (which also moves relative-time labels
+    /// and the live rows). `view()` builds widgets from this data on every
+    /// frame.
     cached_session_items: Option<Vec<CachedSessionItem>>,
-    /// Whether a live-membership read is in flight. One read per gap, not one
-    /// per tick.
-    membership_load_in_flight: bool,
+    /// A read was asked for while one was in flight: its rows are stale by the
+    /// time they land, so one more read follows the settled one. This is what
+    /// makes the last event of a burst count.
+    refresh_pending: bool,
 
     // ── Transcript viewport fields ───────────────────────────────
     /// Stable scrollable ID for the transcript area, preserves scroll position
@@ -310,8 +464,7 @@ pub(crate) struct SessionsState {
 impl SessionsState {
     pub(crate) fn new() -> Self {
         Self {
-            sessions: Vec::new(),
-            load_state: super::common::AsyncLoadState::new(),
+            sessions: super::common::PolledList::new(),
             selected_session: None,
             entries: Vec::new(),
             entry_md: Vec::new(),
@@ -323,26 +476,31 @@ impl SessionsState {
             pending_collapses: HashSet::new(),
             measure_cache: RefCell::new(HashMap::new()),
             cached_session_items: None,
-            membership_load_in_flight: false,
+            refresh_pending: false,
             scrollable_id: Id::new("session_transcript_scroll"),
             auto_scroll_enabled: false,
         }
     }
 
-    /// Refresh the session list.
-    pub(crate) fn refresh() -> Task<SessionsMessage> {
+    /// Re-read the session list: entering the page, every runtime tick, and
+    /// after a delete or truncation, so a session created, grown, removed or
+    /// finished while the page is open converges on its own. A read already in
+    /// flight makes this a no-op that queues one more read for when it settles,
+    /// so ticks never pile up and the last change of a burst is never lost. A
+    /// failed read keeps the rows already on screen.
+    pub(crate) fn refresh(&mut self) -> Task<SessionsMessage> {
+        if !self.sessions.begin() {
+            self.refresh_pending = true;
+            return Task::none();
+        }
         Task::perform(
-            async move {
-                let store = crate::session::store();
-                store
+            async {
+                crate::session::store()
                     .list_sessions_with_metadata_checked()
                     .await
                     .map_err(|e| e.to_string())
             },
-            |res| match res {
-                Ok(sessions) => SessionsMessage::Refreshed(sessions),
-                Err(e) => SessionsMessage::RefreshError(e),
-            },
+            SessionsMessage::Settled,
         )
     }
 
@@ -356,10 +514,8 @@ impl SessionsState {
         workspaces: &HashMap<String, Workspace>,
     ) -> Task<SessionsMessage> {
         match msg {
-            SessionsMessage::Refreshed(sessions) => {
-                self.sessions = sessions;
-                // A fresh full read supersedes any in-flight membership probe.
-                self.membership_load_in_flight = false;
+            SessionsMessage::Settled(result) => {
+                self.sessions.settle(result);
                 // The selected session's workspace may only be named now: adopt
                 // it so its relative marker targets resolve, and re-parse the
                 // bodies already loaded.
@@ -370,13 +526,11 @@ impl SessionsState {
                     );
                 }
                 self.rebuild_session_cache();
-                self.load_state.clear_error();
-                self.load_state.finish_loading();
-                // Catches a session created while this list read was in flight.
-                self.refresh_live_membership()
-            }
-            SessionsMessage::RefreshError(e) => {
-                self.load_state.fail(e);
+                // Changes that landed while this read was in flight are older
+                // than the read's own rows: one more read settles them.
+                if std::mem::take(&mut self.refresh_pending) {
+                    return self.refresh();
+                }
                 Task::none()
             }
             SessionsMessage::SelectSession(key) => {
@@ -480,19 +634,23 @@ impl SessionsState {
                 },
             ),
             SessionsMessage::SessionDeleted(key, deleted) => {
-                self.sessions.retain(|s| s.agent_id != key);
+                self.sessions.entries_mut().retain(|s| s.agent_id != key);
                 self.rebuild_session_cache();
                 if self.selected_session.as_deref() == Some(&key) {
                     self.clear_selection();
                 }
+                // A read in flight may predate the delete and would put the row
+                // back; refreshing here settles the store's own answer.
+                let refresh = self.refresh();
                 // Only claim a "Deleted" success when a real row removal
                 // happened; an already-absent session (cleaned up elsewhere)
                 // just vanishes from the list without an inaccurate toast.
-                if deleted {
+                let toast = if deleted {
                     Task::done(SessionsMessage::Toast(ToastMessage::Deleted))
                 } else {
                     Task::none()
-                }
+                };
+                Task::batch([refresh, toast])
             }
             SessionsMessage::TruncateSession(entry) => {
                 let Some(key) = self.selected_session.clone() else {
@@ -545,26 +703,23 @@ impl SessionsState {
                     self.measure_cache
                         .borrow_mut()
                         .retain(|(i, _), _| *i < entry);
-                    // The card's count renders from the list snapshot, which
-                    // otherwise refreshes only on page navigation.
-                    if let Some(session) = self.sessions.iter_mut().find(|s| s.agent_id == key) {
+                    // The card's count renders from the list snapshot: drop the
+                    // removed messages here and let the store confirm both the
+                    // count and the cut (a read in flight may predate them).
+                    if let Some(session) = self
+                        .sessions
+                        .entries_mut()
+                        .iter_mut()
+                        .find(|s| s.agent_id == key)
+                    {
                         session.message_count = session.message_count.saturating_sub(deleted);
                     }
                     self.rebuild_session_cache();
+                    return self.refresh();
                 }
                 Task::none()
             }
             SessionsMessage::RuntimeChanged => self.on_runtime_changed(workspaces),
-            SessionsMessage::LiveSessionsRead(result) => {
-                self.membership_load_in_flight = false;
-                match result {
-                    Ok(sessions) => self.absorb_live_sessions(sessions),
-                    Err(error) => {
-                        tracing::debug!(error = %error, "live session membership read failed");
-                    }
-                }
-                Task::none()
-            }
             SessionsMessage::Toast(_) | SessionsMessage::LinkClicked(_) => Task::none(),
             SessionsMessage::RevealFile { target, workspace } => Task::perform(
                 // The reveal stats and spawns a launcher: keep it out of the
@@ -618,107 +773,31 @@ impl SessionsState {
         self.measure_cache.borrow_mut().clear();
     }
 
-    /// Rebuild the cached session list display data. Called when `self.sessions`
-    /// changes and on each runtime-change tick (to refresh relative-time labels).
-    /// `view()` builds widgets from this data on every frame.
+    /// Rebuild the cached session list display data from the settled rows and
+    /// the live registry. `view()` builds widgets from this data on every frame.
     fn rebuild_session_cache(&mut self) {
-        let now = chrono::Local::now();
-        let items: Vec<CachedSessionItem> = self
-            .sessions
-            .iter()
-            .map(|s| {
-                let role = s
-                    .role
-                    .as_deref()
-                    .and_then(|r| r.parse::<crate::Role>().ok());
-                let name = s
-                    .user_name
-                    .as_deref()
-                    .filter(|n| !n.is_empty())
-                    .or_else(|| s.workspace_name.as_deref().filter(|n| !n.is_empty()))
-                    .unwrap_or("");
-                CachedSessionItem {
-                    agent_id: s.agent_id.clone(),
-                    role,
-                    title: crate::util::truncate(name, CARD_TITLE_MAX_CHARS),
-                    workspace_name: s.workspace_name.clone().filter(|n| !n.is_empty()),
-                    custom_role: s.custom_role.clone(),
-                    custom_identifier: s.custom_identifier.clone(),
-                    msg_count_label: format!("{} msgs", s.message_count),
-                    token_label: s.token_length.map(theme::format_compact_tokens),
-                    timestamp_label: theme::format_relative_time(
-                        &s.last_activity.to_rfc3339(),
-                        now,
-                    ),
-                }
-            })
-            .collect();
+        let items = session_rows(
+            self.sessions.entries(),
+            &crate::agent::registry::AGENT_REGISTRY.list(),
+            chrono::Local::now(),
+        );
         self.cached_session_items = if items.is_empty() { None } else { Some(items) };
     }
 
-    /// Coalesced runtime-change tick: refresh the cached relative-time labels,
-    /// add sessions whose agent started working since the page was opened, and
-    /// merge the selected session's live transcript into the view.
+    /// Coalesced runtime-change tick: re-read the list, rebuild the display data
+    /// and merge the selected session's live transcript into the view.
+    ///
+    /// The registry publishes this tick on every agent start and stop, which is
+    /// the whole of the list's convergence: rows are re-read here rather than on
+    /// a timer because a session is only ever created or grown by a running
+    /// agent. Being event-driven also keeps the order still while agents work —
+    /// nothing re-sorts under the cursor between a run's start and its end.
     fn on_runtime_changed(
         &mut self,
         workspaces: &HashMap<String, Workspace>,
     ) -> Task<SessionsMessage> {
         self.rebuild_session_cache();
-        Task::batch([
-            self.merge_selected_transcript(workspaces),
-            self.refresh_live_membership(),
-        ])
-    }
-
-    /// Add running agents' sessions the list does not hold yet, so a session
-    /// that starts working while the page is open appears without re-entering
-    /// it. Metadata only — never a transcript — and only for the missing ids,
-    /// so a tick with no gap issues no read. A registered agent whose first
-    /// message is not stored yet has no row; it keeps the gap open and is
-    /// re-probed on later ticks (one primary-key lookup). Failure is silent:
-    /// the next tick retries.
-    fn refresh_live_membership(&mut self) -> Task<SessionsMessage> {
-        // Before the first successful list read the page has no membership
-        // baseline to complete, and `Refreshed` runs this itself once it does.
-        if self.membership_load_in_flight || !self.load_state.has_loaded() {
-            return Task::none();
-        }
-        let listed: HashSet<&str> = self.sessions.iter().map(|s| s.agent_id.as_str()).collect();
-        let missing: Vec<String> = crate::agent::registry::AGENT_REGISTRY
-            .list()
-            .into_iter()
-            .map(|handle| handle.agent_id)
-            .filter(|id| !listed.contains(id.as_str()))
-            .collect();
-        if missing.is_empty() {
-            return Task::none();
-        }
-        self.membership_load_in_flight = true;
-        Task::perform(
-            async move {
-                crate::session::store()
-                    .list_sessions_with_metadata_for_ids(&missing)
-                    .await
-                    .map_err(|e| e.to_string())
-            },
-            SessionsMessage::LiveSessionsRead,
-        )
-    }
-
-    /// Append the live-membership result, skipping rows the list already holds
-    /// (a full refresh may have landed in between). Existing rows keep their
-    /// position: the list is re-sorted only on the next page entry.
-    fn absorb_live_sessions(&mut self, sessions: Vec<SessionMetadata>) {
-        let listed: HashSet<&str> = self.sessions.iter().map(|s| s.agent_id.as_str()).collect();
-        let added: Vec<SessionMetadata> = sessions
-            .into_iter()
-            .filter(|s| !listed.contains(s.agent_id.as_str()))
-            .collect();
-        if added.is_empty() {
-            return;
-        }
-        self.sessions.extend(added);
-        self.rebuild_session_cache();
+        Task::batch([self.merge_selected_transcript(workspaces), self.refresh()])
     }
 
     /// The root the selected session's relative marker targets resolve against:
@@ -727,7 +806,12 @@ impl SessionsState {
     fn selected_workspace_root(&self, workspaces: &HashMap<String, Workspace>) -> Option<PathBuf> {
         self.selected_session
             .as_deref()
-            .and_then(|key| self.sessions.iter().find(|session| session.agent_id == key))
+            .and_then(|key| {
+                self.sessions
+                    .entries()
+                    .iter()
+                    .find(|session| session.agent_id == key)
+            })
             .and_then(|session| session.workspace_name.as_deref())
             .and_then(|name| workspace_root_for(name, workspaces))
     }
@@ -813,126 +897,138 @@ impl SessionsState {
         let mut content = column![];
 
         // Error display — inset to align with the vscroll-wrapped list below.
-        content = widgets::push_error_banner_inset(content, self.load_state.error());
+        content = widgets::push_error_banner_inset(content, self.sessions.error());
 
-        if self.load_state.loading() && !self.load_state.has_loaded() {
+        if !self.sessions.loaded() {
             content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
-        } else if self.sessions.is_empty() {
-            // A failed read must not masquerade as a legitimately empty list:
-            // the error banner above is the only thing rendered.
-            if self.load_state.error().is_none() {
-                content = content.push(widgets::empty_state_placeholder(
-                    lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
-                    "No sessions",
-                    theme::TEXT_MUTED,
-                ));
-            }
-        } else {
-            // Session list on the left side — built from cached display data.
-            // The cache is rebuilt when `self.sessions` changes (in
-            // `Refreshed`) and on each runtime-change tick (to refresh
-            // relative-time labels); cards are rebuilt from it on every frame.
+        } else if let Some(cached) = self.cached_session_items.as_ref() {
+            // Session list on the left side — built from cached display data
+            // (rebuilt on every settled read and runtime tick); cards are
+            // rebuilt from it on every frame.
             let mut session_list = Column::new().spacing(theme::SPACE_4);
-            if let Some(ref cached) = self.cached_session_items {
-                for item in cached {
-                    let is_selected = self.selected_session.as_deref() == Some(&item.agent_id);
+            for item in cached {
+                let is_selected = self.selected_session.as_deref() == Some(&item.agent_id);
 
-                    let mut title_row = iced::widget::Row::new()
-                        .width(Length::Fill)
-                        .spacing(theme::SPACE_6)
-                        .align_y(Alignment::Center);
-                    if let Some(role) = item.role {
-                        title_row = title_row.push(
-                            theme::role_icon(&role)
-                                .size(theme::TEXT_14)
-                                .color(theme::role_badge_color_for(&role).0),
-                        );
-                    }
-                    let title_color = if is_selected {
-                        theme::ACCENT
-                    } else {
-                        theme::TEXT_PRIMARY
-                    };
+                let mut title_row = iced::widget::Row::new()
+                    .width(Length::Fill)
+                    .spacing(theme::SPACE_6)
+                    .align_y(Alignment::Center);
+                if let Some(role) = item.role {
                     title_row = title_row.push(
-                        text(item.display_title(workspaces))
-                            .size(theme::TEXT_13)
-                            .color(title_color),
+                        theme::role_icon(&role)
+                            .size(theme::TEXT_14)
+                            .color(theme::role_badge_color_for(&role).0),
                     );
-                    if crate::agent::registry::AGENT_REGISTRY.contains(item.agent_id.as_str()) {
+                }
+                let title_color = if is_selected {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_PRIMARY
+                };
+                title_row = title_row.push(
+                    text(item.display_title(workspaces))
+                        .size(theme::TEXT_13)
+                        .color(title_color),
+                );
+                match item.activity {
+                    SessionActivity::Working => {
                         title_row = title_row
                             .push(Space::new().width(Length::Fill))
                             .push(super::spinner(theme::TEXT_14));
                     }
+                    // A frozen agent produces nothing: its row keeps its place
+                    // and says so rather than spinning.
+                    SessionActivity::Paused => {
+                        title_row = title_row
+                            .push(Space::new().width(Length::Fill))
+                            .push(text("paused").size(theme::TEXT_11).color(theme::TEXT_MUTED));
+                    }
+                    SessionActivity::Idle => {}
+                }
 
-                    let sess_row: Element<'_, SessionsMessage> = ContextMenu::new(
-                        container(
-                            column![
-                                row![
-                                    button(
-                                        container(
-                                            column![
-                                                title_row,
-                                                {
-                                                    // Meta row: messages left / tokens center /
-                                                    // time right, spread via two Fill gaps
-                                                    // across the card. Sessions that never
-                                                    // recorded a token length leave the center
-                                                    // empty.
-                                                    let mut meta_row = iced::widget::Row::new()
-                                                        .width(Length::Fill)
-                                                        .push(
-                                                            text(&item.msg_count_label)
-                                                                .size(theme::TEXT_11)
-                                                                .color(theme::TEXT_SECONDARY),
-                                                        )
-                                                        .push(Space::new().width(Length::Fill));
-                                                    if let Some(token) = &item.token_label {
-                                                        meta_row = meta_row.push(
-                                                            text(token)
-                                                                .size(theme::TEXT_11)
-                                                                .color(theme::TEXT_SECONDARY),
-                                                        );
-                                                    }
-                                                    meta_row
-                                                        .push(Space::new().width(Length::Fill))
-                                                        .push(
-                                                            text(&item.timestamp_label)
-                                                                .size(theme::TEXT_11)
-                                                                .color(theme::TEXT_SECONDARY),
-                                                        )
-                                                },
-                                                text(&item.agent_id)
+                // A synthesised row (a run whose first message is not stored
+                // yet) has no count of its own: it says what it is doing
+                // instead.
+                let count_label = item
+                    .msg_count_label
+                    .as_deref()
+                    .or((item.activity == SessionActivity::Working).then_some("working"));
+
+                let card = container(
+                    column![
+                        row![
+                            button(
+                                container(
+                                    column![
+                                        title_row,
+                                        {
+                                            // Meta row: messages left / tokens center /
+                                            // time right, spread via two Fill gaps
+                                            // across the card. Sessions that never
+                                            // recorded a token length leave the center
+                                            // empty.
+                                            let mut meta_row =
+                                                iced::widget::Row::new().width(Length::Fill);
+                                            if let Some(count) = count_label {
+                                                meta_row = meta_row.push(
+                                                    text(count)
+                                                        .size(theme::TEXT_11)
+                                                        .color(theme::TEXT_SECONDARY),
+                                                );
+                                            }
+                                            meta_row =
+                                                meta_row.push(Space::new().width(Length::Fill));
+                                            if let Some(token) = &item.token_label {
+                                                meta_row = meta_row.push(
+                                                    text(token)
+                                                        .size(theme::TEXT_11)
+                                                        .color(theme::TEXT_SECONDARY),
+                                                );
+                                            }
+                                            meta_row.push(Space::new().width(Length::Fill)).push(
+                                                text(&item.timestamp_label)
                                                     .size(theme::TEXT_11)
-                                                    .color(theme::TEXT_MUTED),
-                                            ]
-                                            .width(Length::Fill)
-                                            .spacing(theme::SPACE_2),
-                                        )
-                                        .padding(theme::PAD_6)
-                                        .width(Length::Fill),
-                                    )
+                                                    .color(theme::TEXT_SECONDARY),
+                                            )
+                                        },
+                                        text(&item.agent_id)
+                                            .size(theme::TEXT_11)
+                                            .color(theme::TEXT_MUTED),
+                                    ]
                                     .width(Length::Fill)
-                                    .style(theme::button_text)
-                                    .on_press(
-                                        SessionsMessage::SelectSession(item.agent_id.clone())
-                                    ),
-                                ]
-                                .width(Length::Fill)
-                                .align_y(Alignment::Center),
-                            ]
-                            .spacing(theme::SPACE_2),
-                        )
-                        .style(theme::surface_card_style),
+                                    .spacing(theme::SPACE_2),
+                                )
+                                .padding(theme::PAD_6)
+                                .width(Length::Fill),
+                            )
+                            .width(Length::Fill)
+                            .style(theme::button_text)
+                            .on_press(SessionsMessage::SelectSession(item.agent_id.clone())),
+                        ]
+                        .width(Length::Fill)
+                        .align_y(Alignment::Center),
+                    ]
+                    .spacing(theme::SPACE_2),
+                )
+                .style(theme::surface_card_style);
+
+                // A synthesised row has no stored session behind it, so there is
+                // nothing to delete.
+                let sess_row: Element<'_, SessionsMessage> = if item.msg_count_label.is_some() {
+                    ContextMenu::new(
+                        card,
                         vec![MenuItem::with_icon(
                             iced_fonts::lucide::advanced_text::trash,
                             "Delete".into(),
                             SessionsMessage::DeleteSession(item.agent_id.clone()),
                         )],
                     )
-                    .into();
+                    .into()
+                } else {
+                    card.into()
+                };
 
-                    session_list = session_list.push(sess_row);
-                }
+                session_list = session_list.push(sess_row);
             }
 
             let session_scroll =
@@ -959,8 +1055,8 @@ impl SessionsState {
                     .into()
             } else if self.selected_session.is_some() {
                 // Truncate targets stored rows and is offered only on an idle
-                // session — the same AGENT_REGISTRY membership that marks an
-                // active session with the list spinner above.
+                // session — registered membership is what disables it, so a
+                // frozen agent (registered, but not working) keeps it off too.
                 let truncatable = self.entry_rows.is_some()
                     && self
                         .selected_session
@@ -1017,6 +1113,14 @@ impl SessionsState {
                 ]
                 .height(Length::Fill),
             );
+        } else if self.sessions.error().is_none() {
+            // A failed read must not masquerade as a legitimately empty list:
+            // the error banner above is the only thing rendered.
+            content = content.push(widgets::empty_state_placeholder(
+                lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
+                "No sessions",
+                theme::TEXT_MUTED,
+            ));
         }
 
         widgets::page(content)
@@ -1150,7 +1254,9 @@ fn element_measurement(
 
 /// The collapsed-preview-versus-full content of a collapsible element: when
 /// it can collapse and is collapsed, a [`MAX_PREVIEW_LINES`]-line preview
-/// (in `size`/`font`) with a small "ellipsis" marker for the hidden content;
+/// (in `size`/`font`) with an "ellipsis" cue for the hidden content on its own
+/// line under the preview, flush left — never trailing the last preview line,
+/// where only a line that happens to wrap would put it on a line of its own;
 /// otherwise the caller's `expanded` element. Callers wrap the result in
 /// [`click_toggle`] — never nesting two toggle areas (a nested double-toggle
 /// cancels out).
@@ -1165,14 +1271,13 @@ fn collapsible_text_block(
 ) -> Element<'_, SessionsMessage> {
     if collapses && !is_expanded {
         let preview = preview.expect("a collapsing element always has a preview");
-        row![
+        column![
             selectable_text(preview, color).size(size).font(font),
             lucide::ellipsis::<iced::Theme, iced::Renderer>()
                 .size(theme::TEXT_11)
                 .color(theme::TEXT_MUTED),
         ]
-        .spacing(theme::SPACE_4)
-        .align_y(Alignment::Start)
+        .spacing(theme::SPACE_2)
         .into()
     } else {
         expanded
@@ -1580,10 +1685,10 @@ mod tests {
         }
     }
 
-    fn metadata(agent_id: &str) -> SessionMetadata {
+    fn metadata(agent_id: &str, last_activity: chrono::DateTime<chrono::Utc>) -> SessionMetadata {
         SessionMetadata {
             agent_id: agent_id.to_string(),
-            last_activity: chrono::Utc::now(),
+            last_activity,
             message_count: 1,
             token_length: None,
             role: Some("engineer".to_string()),
@@ -1592,6 +1697,27 @@ mod tests {
             custom_role: None,
             custom_identifier: None,
             launch_stopped: false,
+        }
+    }
+
+    fn agent(
+        agent_id: &str,
+        role: &str,
+        workspace: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::agent::registry::AgentHandle {
+        crate::agent::registry::AgentHandle {
+            agent_id: agent_id.to_string(),
+            role: role.to_string(),
+            ticket_id: None,
+            workspace_path: format!("/ws/{workspace}"),
+            workspace_name: workspace.to_string(),
+            parent_key: None,
+            parent_label: None,
+            started_at,
+            generation: 0,
+            activity: None,
+            paused: false,
         }
     }
 
@@ -1625,24 +1751,57 @@ mod tests {
     }
 
     #[test]
-    fn live_sessions_are_appended_without_reordering_or_duplicating() {
+    fn running_sessions_are_pinned_above_last_activity_order() {
+        let now = chrono::Utc::now();
         let mut state = SessionsState::new();
-        state.sessions = vec![metadata("old_a"), metadata("old_b")];
+        state.sessions.settle(Ok(vec![
+            metadata("a", now - chrono::Duration::minutes(10)),
+            metadata("b", now - chrono::Duration::minutes(5)),
+            metadata("c", now),
+        ]));
 
-        // `old_a` came back again (a full refresh landed in between); only the
-        // genuinely new row is added, after the existing ones.
-        state.absorb_live_sessions(vec![metadata("new"), metadata("old_a")]);
+        let rows = session_rows(
+            state.sessions.entries(),
+            &[
+                agent("a", "engineer", "ws", now - chrono::Duration::minutes(1)),
+                // Started while the page was open, before its first message
+                // landed: registered, but with no stored row of its own.
+                agent("zz", "analyst", "ws", now),
+            ],
+            now.into(),
+        );
 
-        let ids: Vec<&str> = state.sessions.iter().map(|s| s.agent_id.as_str()).collect();
-        assert_eq!(ids, ["old_a", "old_b", "new"]);
-        let cached: Vec<&str> = state
-            .cached_session_items
-            .as_ref()
-            .expect("list cache rebuilt")
-            .iter()
-            .map(|i| i.agent_id.as_str())
-            .collect();
-        assert_eq!(cached, ["old_a", "old_b", "new"]);
+        let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
+        // Running rows on top (oldest run first), then the rest by last
+        // activity.
+        assert_eq!(ids, ["a", "zz", "c", "b"]);
+        assert_eq!(rows[1].msg_count_label, None, "no stored row, no count");
+        assert_eq!(
+            rows[1].title, "ws",
+            "a synthesised row is titled by project"
+        );
+        assert_eq!(
+            rows[1].role,
+            "analyst".parse::<crate::Role>().ok(),
+            "and carries its role"
+        );
+    }
+
+    #[test]
+    fn a_paused_agent_keeps_its_last_activity_place() {
+        let now = chrono::Utc::now();
+        let sessions = [
+            metadata("a", now - chrono::Duration::minutes(10)),
+            metadata("b", now),
+        ];
+        let mut paused = agent("a", "engineer", "ws", now);
+        paused.paused = true;
+
+        let rows = session_rows(&sessions, &[paused], now.into());
+        let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
+
+        assert_eq!(ids, ["b", "a"], "a frozen run is not pinned");
+        assert_eq!(rows[1].activity, SessionActivity::Paused);
     }
 
     #[test]
@@ -1682,9 +1841,11 @@ mod tests {
                 ..Workspace::default()
             },
         )]);
-        state.sessions = vec![metadata("s1")];
-        let sessions = state.sessions.clone();
-        let _ = state.update(SessionsMessage::Refreshed(sessions), &workspaces);
+        state
+            .sessions
+            .settle(Ok(vec![metadata("s1", chrono::Utc::now())]));
+        let sessions = state.sessions.entries().to_vec();
+        let _ = state.update(SessionsMessage::Settled(Ok(sessions)), &workspaces);
 
         assert_eq!(state.workspace_root.as_deref(), Some(tmp.path()));
         let parsed = state.entry_md[0].as_ref().unwrap();
@@ -1773,7 +1934,7 @@ mod tests {
         assert_eq!(state.selected_error.as_deref(), Some("read failed"));
         assert!(!state.selected_loading);
         assert!(
-            state.load_state.error().is_none(),
+            state.sessions.error().is_none(),
             "a transcript failure must not surface in the session-list banner"
         );
 
@@ -1819,9 +1980,10 @@ mod tests {
             workspace_name: workspace.map(str::to_string),
             custom_role: None,
             custom_identifier: None,
-            msg_count_label: String::new(),
+            msg_count_label: None,
             token_label: None,
             timestamp_label: String::new(),
+            activity: SessionActivity::Idle,
         }
     }
 

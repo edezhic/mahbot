@@ -1204,6 +1204,7 @@ mod tests {
             started_at: Utc::now(),
             generation: 0,
             activity: None,
+            paused: false,
         }
     }
 
