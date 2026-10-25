@@ -16,7 +16,8 @@
 //! window, else its frontmost one.
 
 use super::super::core::{
-    self, AppInfo, SurfaceGeometry, TargetSpec, UnreadWindows, WindowInfo, WindowKey, WindowListing,
+    self, AppInfo, AppListing, SurfaceGeometry, TargetSpec, UnreadWindows, WindowInfo, WindowKey,
+    WindowListing,
 };
 use std::sync::{Once, OnceLock};
 use windows::Win32::Foundation::{
@@ -39,10 +40,11 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor, GetForegroundWindow, GetSystemMetrics,
-    GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SetForegroundWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
+    EnumWindows, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GetAncestor, GetForegroundWindow,
+    GetGUIThreadInfo, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetForegroundWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -103,14 +105,10 @@ pub(super) fn resolve(target: &TargetSpec) -> anyhow::Result<TargetWindow> {
         }
         TargetSpec::App { app_pid, app_name } => {
             let windows = app_windows(*app_pid, app_name);
-            let window = windows
-                .iter()
-                .find(|w| w.active)
-                .or_else(|| windows.first());
-            let Some(window) = window else {
+            let Some(hwnd) = app_window(&windows) else {
                 return Err(absent_app(*app_pid, app_name));
             };
-            describe(window.hwnd)
+            describe(hwnd)
         }
         TargetSpec::Window { app_name, key, .. } => resolve_key(app_name, key),
     }
@@ -229,6 +227,35 @@ pub(super) fn screen_geometry() -> anyhow::Result<SurfaceGeometry> {
     }
 }
 
+/// The application of the foreground window, or `None` when no window has the foreground.
+pub(super) fn foreground_app_name() -> Option<String> {
+    let hwnd = foreground()?;
+    Some(app_name(pid_of(hwnd), &title_of(hwnd)))
+}
+
+/// The window a point lies over, attributed to the process that owns it — what a
+/// coordinate click is checked against at the moment it is sent. `None` when no window is
+/// there at all (the desktop itself), and when the window found cannot be attributed to an
+/// application: a vanished window leaves pid 0, and a point over an application this process
+/// cannot name is reported as unchecked rather than guessed at.
+pub(super) fn window_at_point(x: i32, y: i32) -> Option<core::WindowAtPoint> {
+    let hwnd = top_level_at(x, y)?;
+    let pid = pid_of(hwnd);
+    if pid == 0 {
+        return None;
+    }
+    let title = title_of(hwnd);
+    Some(core::WindowAtPoint {
+        app_pid: Some(pid),
+        app_name: app_name(pid, &title),
+        title,
+        // The frame is how the window the caller addressed is told apart from this one,
+        // so it is read exactly as the caller's own resolution reads it. A frame that
+        // cannot be read leaves the window recognisable by pid alone.
+        frame: surface_of(hwnd).ok(),
+    })
+}
+
 /// The window a screen coordinate lands on, for the elevated-window check.
 pub(super) fn top_level_at(x: i32, y: i32) -> Option<HWND> {
     // SAFETY: the point is passed by value; a null handle means no window there.
@@ -251,7 +278,7 @@ pub(super) fn foreground() -> Option<HWND> {
 
 /// Refuse input aimed at a window that is not in front: typing, a drag or a wheel at
 /// a point would land in whatever is. Windows may refuse the foreground change this
-/// follows (a background process), and then the honest answer is to click first.
+/// follows (a background process), and then the input is not delivered at all.
 pub(super) fn ensure_foreground(hwnd: HWND) -> anyhow::Result<()> {
     // SAFETY: no arguments; the handle is only compared, never dereferenced.
     if unsafe { GetForegroundWindow() } == hwnd {
@@ -267,7 +294,8 @@ pub(super) fn ensure_foreground(hwnd: HWND) -> anyhow::Result<()> {
 /// Bring a window to the foreground before input aimed at it. Best-effort: Windows
 /// may refuse foreground changes for a background process. Every pinned action —
 /// typing, a drag, a wheel at a point — then verifies with [`ensure_foreground`] and
-/// fails honestly; a coordinate click is deliberately unpinned and only raises.
+/// fails honestly. A coordinate click is not pinned: it raises, and is checked against the
+/// window actually under its point before anything is posted.
 pub(super) fn activate(hwnd: HWND) {
     // SAFETY: no arguments; the handle is only compared, never dereferenced.
     if unsafe { GetForegroundWindow() } == hwnd {
@@ -456,11 +484,22 @@ struct Enumerated {
     surface: anyhow::Result<SurfaceGeometry>,
 }
 
-/// Every running application that owns at least one top-level window, in
+/// The running applications, with the one in front named. The application in front is the
+/// foreground window's — the one source both listings read, so a listing of the
+/// applications and a listing of the windows cannot disagree about what is in front. A
+/// machine with no window in front names none.
+pub(super) fn list_apps() -> AppListing {
+    AppListing {
+        apps: apps_of(&top_level_windows()),
+        frontmost: foreground_app_name(),
+    }
+}
+
+/// Every running application that owns at least one listed top-level window, in
 /// front-to-back order.
-pub(super) fn enumerate_apps() -> Vec<AppInfo> {
+fn apps_of(windows: &[Enumerated]) -> Vec<AppInfo> {
     let mut apps: Vec<AppInfo> = Vec::new();
-    for win in top_level_windows() {
+    for win in windows {
         // Name as well as pid: one host process (a UWP frame host) serves several apps.
         if apps
             .iter()
@@ -470,7 +509,7 @@ pub(super) fn enumerate_apps() -> Vec<AppInfo> {
         }
         apps.push(AppInfo {
             pid: Some(win.pid),
-            name: win.app_name,
+            name: win.app_name.clone(),
         });
     }
     apps
@@ -496,6 +535,21 @@ pub(super) fn list_windows(app: Option<&AppInfo>) -> WindowListing {
     };
     let mut listing = WindowListing::default();
     let mut lost: Vec<LostFrames> = Vec::new();
+    // The application in front is the foreground window's — the same source the
+    // applications listing reads, so the two cannot disagree, and the filtered list need
+    // not contain that window at all.
+    listing.frontmost = foreground_app_name();
+    // In an all-applications listing only the foreground window is marked, because a
+    // background application's focused window cannot be read there; a single-application
+    // listing asks that application's own thread instead, so it marks its active window
+    // even when the application is not in front. The two sources are exclusive, so a
+    // single-application listing never marks two windows — and when neither can name one
+    // (see [`marked_window_of`]) it marks no window rather than guessing.
+    let focused_of_app = if app.is_some() {
+        marked_window_of(&windows)
+    } else {
+        None
+    };
     for win in windows {
         let surface = match win.surface {
             Ok(surface) => surface,
@@ -514,14 +568,24 @@ pub(super) fn list_windows(app: Option<&AppInfo>) -> WindowListing {
                 continue;
             }
         };
+        // The enumeration is front to back, so the place among the windows actually
+        // listed is the place in that order.
+        let rank = Some(listing.windows.len() + 1);
         listing.windows.push(WindowInfo {
             app_pid: Some(win.pid),
             app_name: win.app_name,
             title: win.title,
             key: window_key(win.hwnd, win.pid),
             surface,
+            focused: match focused_of_app {
+                Some(focused) => focused == win.hwnd,
+                None => win.active,
+            },
+            rank,
         });
     }
+    // Every listed window's rank is attributed: the enumeration is front to back.
+    listing.order = core::WindowOrder::All;
     listing.unread = lost
         .into_iter()
         .map(|entry| UnreadWindows {
@@ -541,29 +605,65 @@ pub(super) fn list_windows(app: Option<&AppInfo>) -> WindowListing {
     listing
 }
 
-/// The focused window of the frontmost application.
-pub(super) fn focused_window() -> anyhow::Result<WindowInfo> {
-    // SAFETY: no arguments and no out-pointer; a null handle is refused below.
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0.is_null() {
-        return Err(core::taxonomy_error(
-            core::ERR_DEGRADED,
-            "no foreground window found — the session is locked, the UAC secure desktop is up, or \
-             no window has focus; ask the owner to return to their desktop, or enumerate \
-             apps/windows to pick a surface",
-        ));
-    }
-    let resolved = describe(hwnd)?;
-    // The key is the handle itself, so a foreground window outside the filtered
-    // listing (a tool palette, an untitled surface) needs no position in it to be
-    // addressable later.
+/// The concrete window a target names right now, as the rest of the backend reports it.
+pub(super) fn window_info(target: &TargetSpec) -> anyhow::Result<WindowInfo> {
+    let resolved = resolve(target)?;
     Ok(WindowInfo {
         app_pid: Some(resolved.pid),
         app_name: resolved.app_name,
         title: resolved.title,
-        key: window_key(hwnd, resolved.pid),
+        key: window_key(resolved.hwnd, resolved.pid),
         surface: resolved.surface,
+        focused: false,
+        rank: None,
     })
+}
+
+/// The window a single-application listing marks `[focused]`: the application's own active
+/// window (asked of its thread, which reads it even when the application is not in front),
+/// else the one of its windows that is the foreground window. A mark the listing cannot
+/// place is no mark: `None` when neither source names a window the listing shows, so the
+/// application is listed without one rather than marked by a guess.
+fn marked_window_of(windows: &[Enumerated]) -> Option<HWND> {
+    let first = windows.first()?;
+    active_window_of_application(first.hwnd)
+        // An untitled or tool window is filtered out of the enumeration, and a mark on a
+        // window the caller cannot see would name nothing it can act on.
+        .filter(|hwnd| windows.iter().any(|win| win.hwnd == *hwnd))
+        .or_else(|| windows.iter().find(|win| win.active).map(|win| win.hwnd))
+}
+
+/// The window an `a` id names: what [`TargetSpec::App`] resolves to. It is the window the
+/// listing marks whenever a mark could be placed ([`marked_window_of`]), and only when it
+/// could not is it the application's frontmost window — its first listed one. `None` only
+/// when the application has no listed window at all, which the caller refuses as an absent
+/// application.
+fn app_window(windows: &[Enumerated]) -> Option<HWND> {
+    marked_window_of(windows).or_else(|| windows.first().map(|win| win.hwnd))
+}
+
+/// The window an application holds as active in its own input queue. This is the one
+/// way to name a background application's focused window: the foreground window belongs
+/// to whichever application is in front, so a listing that must say what another
+/// application has focused has to ask that application's thread.
+///
+/// `None` when the thread does not answer — it has exited, or its window is on another
+/// desktop — which the listing states as a mark it cannot place rather than guessing.
+fn active_window_of_application(hwnd: HWND) -> Option<HWND> {
+    // SAFETY: no out-pointer beyond the structure below, which the call fills; the thread
+    // id belongs to the window's own process and the call only reads its state.
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread == 0 {
+        return None;
+    }
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a live structure of the size its `cbSize` states, which is the
+    // shape this call writes.
+    unsafe { GetGUIThreadInfo(thread, &raw mut info) }.ok()?;
+    (!info.hwndActive.0.is_null()).then_some(info.hwndActive)
 }
 
 /// One application's top-level windows (by pid when known, else by name), in

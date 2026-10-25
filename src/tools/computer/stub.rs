@@ -3,8 +3,8 @@
 //! advertised here, because the capability itself is absent.
 
 use super::core::{
-    self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation,
-    RawInput, SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
+    self, Actuation, AppInfo, AppListing, Backend, Capture, CaptureBudget, ElementAct, Impact,
+    Locator, Observation, RawInput, SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
 };
 
 pub(crate) static STUB_BACKEND: StubBackend = StubBackend;
@@ -33,7 +33,7 @@ impl Backend for StubBackend {
         )
     }
 
-    async fn list_apps(&self) -> anyhow::Result<Vec<AppInfo>> {
+    async fn list_apps(&self) -> anyhow::Result<AppListing> {
         Err(Self::unsupported("list_apps"))
     }
 
@@ -41,8 +41,8 @@ impl Backend for StubBackend {
         Err(Self::unsupported("list_windows"))
     }
 
-    async fn focused_window(&self) -> anyhow::Result<WindowInfo> {
-        Err(Self::unsupported("focused_window"))
+    async fn surface_window(&self, _target: &TargetSpec) -> anyhow::Result<WindowInfo> {
+        Err(Self::unsupported("surface_window"))
     }
 
     async fn surface_geometry(&self, _target: &TargetSpec) -> anyhow::Result<SurfaceGeometry> {
@@ -62,7 +62,7 @@ impl Backend for StubBackend {
         Err(Self::unsupported("act_on_element"))
     }
 
-    async fn raw_input(&self, _target: &TargetSpec, _input: RawInput) -> anyhow::Result<Impact> {
+    async fn raw_input(&self, _target: &TargetSpec, _input: RawInput) -> anyhow::Result<Actuation> {
         Err(Self::unsupported("raw_input"))
     }
 

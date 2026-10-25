@@ -76,8 +76,36 @@
 //! Input pinned to a window — typed text, a drag, a wheel at a point — is raised
 //! and then verified to be the window the server would deliver to
 //! ([`ensure_window_receives`]); when it could not be brought forward the call
-//! fails with nothing sent. Keyboard chords, a wheel with no point and a coordinate
-//! click are global input and are described as such.
+//! fails with nothing sent. Keyboard chords and a wheel with no point are global
+//! input and are described as such.
+//!
+//! # What is in front, and what lies under a point
+//!
+//! Two questions have no per-application accessibility answer, and each is asked of the one
+//! system that does answer it. *Which window is in front of which* comes from the compositor's
+//! own on-screen list ([`compositor_windows`]), which is ordered front to back and names each
+//! window's process and frame; a listing attributes that order to the windows it actually
+//! read, as their places among them, and counts the ones that found no entry — a minimized
+//! window has no on-screen entry — as unplaced rather than declaring the whole order unknown.
+//!
+//! *What window lies under a point* comes from the system's own hit test
+//! ([`window_at_point`]): the element a click there would reach, and through it the
+//! application and the window it belongs to. That question cannot be answered by comparing
+//! frames: the Dock's window spans the whole display while its bar and icons are only part of
+//! it, so a geometry test either misses a point over the Dock or refuses every point on the
+//! display. Every window the hit test resolves is in the way, because a click there really
+//! would go there — the Dock, the menu bar, a popover, a panel and an unnameable owner
+//! included, since a refusal the caller can retry beats a click that lands somewhere
+//! unexpected. There is no exclusion to make: the window server's backstop surface is not an
+//! accessibility element, so a point over it answers nothing at all and is reported as not
+//! checkable rather than as clear.
+//!
+//! The addressed window itself is recognised by its frame ([`core::same_frame`]), never by
+//! its title: a frame is one coordinate system both reads share, while a title is text each
+//! system spells its own way. A frame read inconsistently — a window mid-animation, a panel
+//! whose accessibility frame excludes its shadow — can therefore name the addressed window
+//! itself as another window of its application: accepted, since the click is sent and the
+//! note is not a refusal.
 //!
 //! # Availability
 //!
@@ -133,9 +161,9 @@
 )]
 
 use super::core::{
-    self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Modifier,
-    MouseButton, Observation, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, Truncation,
-    UiNode, UnreadWindows, WindowInfo, WindowKey, WindowListing,
+    self, AppInfo, AppListing, Backend, Capture, CaptureBudget, ElementAct, FocusedElement, Impact,
+    Locator, Modifier, MouseButton, Observation, RawInput, ScrollDirection, SurfaceGeometry,
+    TargetSpec, Truncation, UiNode, UnreadWindows, WindowInfo, WindowKey, WindowListing,
 };
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::anyhow;
@@ -149,16 +177,18 @@ use objc2_application_services::{
     AXValueType, kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFRange, CFRetained, CFString, CFType, CFURL, CGPoint,
-    CGRect, CGSize, ConcreteType, Type,
+    CFArray, CFBoolean, CFDictionary, CFNumber, CFRange, CFRetained, CFString, CFType, CFURL,
+    CGPoint, CGRect, CGSize, ConcreteType, Type,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext, CGDirectDisplayID,
     CGDisplayBounds, CGError, CGEvent, CGEventField, CGEventFlags, CGEventSource,
     CGEventSourceStateID, CGEventTapLocation, CGEventType, CGGetActiveDisplayList, CGImage,
     CGImageAlphaInfo, CGImageByteOrderInfo, CGMouseButton, CGPreflightPostEventAccess,
-    CGPreflightScreenCaptureAccess, CGRequestPostEventAccess, CGRequestScreenCaptureAccess,
-    CGScrollEventUnit,
+    CGPreflightScreenCaptureAccess, CGRectMakeWithDictionaryRepresentation,
+    CGRequestPostEventAccess, CGRequestScreenCaptureAccess, CGScrollEventUnit,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
+    kCGWindowOwnerPID,
 };
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_screen_capture_kit::{
@@ -279,8 +309,12 @@ const AX_POSITION: &str = "AXPosition";
 const AX_SIZE: &str = "AXSize";
 const AX_CHILDREN: &str = "AXChildren";
 const AX_WINDOWS: &str = "AXWindows";
+const AX_WINDOW: &str = "AXWindow";
 const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
 const AX_FOCUSED: &str = "AXFocused";
+/// The application's focused element — the one input reaches. Read per application, never
+/// from the system-wide element (see [`frontmost_app`]).
+const AX_FOCUSED_ELEMENT: &str = "AXFocusedUIElement";
 const AX_PRESS: &str = "AXPress";
 const AX_OPEN: &str = "AXOpen";
 const AX_URL: &str = "AXURL";
@@ -842,8 +876,6 @@ fn ax_window_error(err: AXError, ctx: impl std::fmt::Display) -> anyhow::Error {
 
 // ── AX tree walk ─────────────────────────────────────────────────────────
 
-const MAX_DEPTH: usize = 25;
-
 /// True when the element is a secure (e.g. password) field. macOS reports the
 /// secure marker in either AXRole or AXSubrole — a password field is
 /// AXTextField with the marker in AXSubrole — so both are checked. One predicate
@@ -913,7 +945,7 @@ fn walk_element(
     let focused = attribute_bool(element, &axc(AX_FOCUSED)).unwrap_or(false);
 
     let mut children = Vec::new();
-    if depth < MAX_DEPTH {
+    if depth < core::MAX_TREE_DEPTH {
         budget.check()?;
         for child in attribute_children(element) {
             if let Some(child_node) = walk_element(
@@ -931,7 +963,7 @@ fn walk_element(
     } else if !attribute_children(element).is_empty() {
         // The node's subtree is not read. Only a node that has one is a cut, so a
         // leaf at the ceiling is not reported as a truncation.
-        truncation.cut_depth(MAX_DEPTH);
+        truncation.cut_depth(core::MAX_TREE_DEPTH);
     }
     Ok(Some(UiNode {
         role,
@@ -1148,6 +1180,190 @@ fn refuse_minimized(window: &AXUIElement) -> Result<(), anyhow::Error> {
     ))
 }
 
+// ── The window server's order, and the system's hit test ─────────────────
+//
+// The two questions the module header names, each answered by the system that can answer
+// it: the order by the compositor's on-screen list, what lies under a point by the
+// accessibility hit test. Both are read here; neither is inferred from the other.
+
+/// A value of the compositor's dictionary as an integer.
+fn compositor_number(dict: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
+    dict.get(key)?.downcast_ref::<CFNumber>()?.as_i64()
+}
+
+/// A value of the compositor's dictionary as a rectangle.
+fn compositor_frame(
+    dict: &CFDictionary<CFString, CFType>,
+    key: &CFString,
+) -> Option<SurfaceGeometry> {
+    let bounds = dict.get(key)?;
+    let bounds = bounds.downcast_ref::<CFDictionary>()?;
+    let mut rect = CGRect::ZERO;
+    // SAFETY: `bounds` is a CFDictionary of the kind CGRectMakeWithDictionaryRepresentation
+    // documents, and `rect` is a valid out-pointer.
+    let ok = unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds), &raw mut rect) };
+    ok.then_some(SurfaceGeometry {
+        x: rect.origin.x,
+        y: rect.origin.y,
+        width: rect.size.width,
+        height: rect.size.height,
+    })
+}
+
+/// The windows the window server has on screen, front to back, as the process that owns each
+/// and its frame — what a listing's windows are matched against to be ranked. `None` when the
+/// list itself cannot be read: a listing then says it could not attribute an order instead of
+/// inventing one.
+///
+/// Every level is kept, since an application's popover, menu or floating panel sits above the
+/// normal level and still comes before the windows it covers. An entry whose process or bounds
+/// cannot be read is dropped: nothing can be matched against it, and its absence changes no
+/// other window's place.
+fn compositor_windows() -> Option<Vec<(u32, SurfaceGeometry)>> {
+    // SAFETY: both statics are plain CFString constants the framework owns.
+    let (owner, bounds) = unsafe { (kCGWindowOwnerPID, kCGWindowBounds) };
+    let list = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        kCGNullWindowID,
+    )?;
+    let mut out = Vec::new();
+    // SAFETY: an array's members are Core Foundation objects and `CFType` is the root of
+    // them all — the cast makes no claim about a member's own type, which the `downcast`
+    // below checks.
+    let members: CFRetained<CFArray<CFType>> = unsafe { CFRetained::cast_unchecked(list) };
+    for entry in members.iter() {
+        let Ok(dict) = entry.downcast::<CFDictionary>() else {
+            continue;
+        };
+        // SAFETY: a dictionary's generic parameters are a phantom type over one layout,
+        // and the compositor's documented keys are CFStrings whose values are CFTypes —
+        // exactly what the handle is told to expect before it is read.
+        let dict: CFRetained<CFDictionary<CFString, CFType>> =
+            unsafe { CFRetained::cast_unchecked(dict) };
+        let pid = compositor_number(&dict, owner).and_then(|pid| u32::try_from(pid).ok());
+        if let (Some(pid), Some(frame)) = (pid, compositor_frame(&dict, bounds)) {
+            out.push((pid, frame));
+        }
+    }
+    Some(out)
+}
+
+/// Attribute the compositor's front-to-back order to the windows a listing just read: a
+/// listed window matches the first compositor entry with its process and frame, and its
+/// rank is that window's place among the windows that found one. Answers what the listing
+/// could establish about the order — a failed read of the list is kept apart from a window
+/// that simply has no on-screen entry.
+///
+/// A window that found no entry is common and not a failure to order the rest: a minimized
+/// window, or one on another space, keeps its accessibility record and has no on-screen
+/// entry, so it is counted as unplaced instead of declaring the whole listing's order
+/// unknown. The comparison is a frame one, within [`core::POSITION_TOLERANCE`]: the two
+/// systems report one window's rectangle separately and do not always agree to the point.
+fn attribute_order(windows: &mut [WindowInfo]) -> core::WindowOrder {
+    let Some(compositor) = compositor_windows() else {
+        // The list could not be read this time: nothing was ranked, and the answer says the
+        // read failed — never that no window has a place, and never that the platform cannot
+        // attribute an order at all.
+        return core::WindowOrder::Unread;
+    };
+    // (compositor position, index among the listed windows) for every listed window.
+    let mut matched = Vec::with_capacity(windows.len());
+    let mut taken = vec![false; compositor.len()];
+    for (index, window) in windows.iter().enumerate() {
+        let Some(pid) = window.app_pid else {
+            continue;
+        };
+        // Each compositor entry stands for at most one listed window, so two windows that
+        // share a title and a frame still get their own place in the order.
+        let Some(position) =
+            compositor
+                .iter()
+                .enumerate()
+                .position(|(index, (entry_pid, frame))| {
+                    !taken[index] && *entry_pid == pid && core::same_frame(frame, &window.surface)
+                })
+        else {
+            continue;
+        };
+        taken[position] = true;
+        matched.push((position, index));
+    }
+    // Ranks are places among the windows this listing read, not indices into the whole
+    // compositor list: a frontmost listed window is #1 even when unlisted windows of other
+    // processes sit ahead of it.
+    matched.sort_unstable();
+    for (rank, (_, index)) in matched.iter().enumerate() {
+        windows[*index].rank = Some(rank + 1);
+    }
+    if matched.len() == windows.len() {
+        core::WindowOrder::All
+    } else {
+        core::WindowOrder::Partial
+    }
+}
+
+/// The window a screen point lies over, from the system's own hit test: the accessibility
+/// element a click there would reach, and through it the application and the window it
+/// belongs to. `None` when the hit test cannot answer — nothing is at the point, or the read
+/// failed — so the click goes and its answer says the point could not be checked. The window
+/// server's backstop surface is not an accessibility element, so it never answers here and
+/// needs no exclusion.
+///
+/// The window's frame is read from the element's `AXWindow`, exactly as the addressed
+/// window's own frame is, so the two are compared in one coordinate system. An element with
+/// no window of its own — a menu-bar item, a Dock tile — names the application alone.
+fn window_at_point(point: (f64, f64), budget: &core::Budget) -> Option<core::WindowAtPoint> {
+    budget.check().ok()?;
+    let mut element: *const AXUIElement = std::ptr::null();
+    // SAFETY: the system-wide element is this process's own accessibility client, the point
+    // is passed by value, and `element` is a live local the call fills with a +1 retained
+    // object on success.
+    let err = unsafe {
+        AXUIElement::new_system_wide().copy_element_at_position(
+            point.0 as f32,
+            point.1 as f32,
+            std::ptr::NonNull::new(&mut element as *mut *const AXUIElement).unwrap(),
+        )
+    };
+    if err != AXError::Success {
+        return None;
+    }
+    // SAFETY: a successful copy returns a +1 retained element (Create rule).
+    let element = unsafe { CFRetained::from_raw(std::ptr::NonNull::new(element.cast_mut())?) };
+    let pid = app_pid(&element).ok()?;
+    let app_name = app_name_for_pid(pid);
+    let window = attribute_value(&element, &axc(AX_WINDOW))
+        .ok()
+        .and_then(|value| value.downcast::<AXUIElement>().ok());
+    let (title, frame) = match window {
+        Some(window) => (
+            window_title(&window).unwrap_or_default(),
+            window_frame(&window, budget).ok(),
+        ),
+        None => (String::new(), None),
+    };
+    Some(core::WindowAtPoint {
+        app_pid: Some(pid),
+        app_name,
+        title,
+        frame,
+    })
+}
+
+/// The application name a pid belongs to, as every other answer spells it.
+fn app_name_for_pid(pid: u32) -> String {
+    NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .find(|app| app.processIdentifier() == pid as i32)
+        .and_then(|app| app.localizedName().map(|name| name.to_string()))
+        .filter(|name| !name.is_empty())
+        // The list can name a process CoreGraphics reports without a running
+        // application (a helper, a system surface): the pid is what the caller can match
+        // against, so it is never guessed at.
+        .unwrap_or_else(|| format!("pid {pid}"))
+}
+
 // ── Window resolution ────────────────────────────────────────────────────
 
 /// The frontmost application's AX element, resolved through `NSWorkspace`.
@@ -1175,6 +1391,42 @@ fn focused_window_of_app(app: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
         .ok()?
         .downcast::<AXUIElement>()
         .ok()
+}
+
+/// The element holding an application's focus, by kind and name. `None` when it cannot be
+/// read: an application with no focused element, one that stops answering, or our own
+/// interface reached from a worker thread — whose exchange belongs on the main queue and
+/// is not worth that wait for a note. The one budget bounds the whole read: it runs on
+/// every action's answer, so a target that hangs between its attribute reads costs the
+/// call one ceiling rather than one per read.
+fn focused_element_of_app(app: &AXUIElement, budget: &core::Budget) -> Option<FocusedElement> {
+    if ensure_ax_thread(app_pid(app).ok()?).is_err() {
+        return None;
+    }
+    budget.check().ok()?;
+    let element = attribute_value(app, &axc(AX_FOCUSED_ELEMENT))
+        .ok()?
+        .downcast::<AXUIElement>()
+        .ok()?;
+    budget.check().ok()?;
+    let kind = attribute_name(&element, &axc(AX_ROLE)).unwrap_or_default();
+    // The name is exactly what the tree prints for the same element (its title), so the
+    // report can be read against the observation it came from.
+    let name = attribute_name(&element, &axc(AX_TITLE));
+    Some(FocusedElement { kind, name })
+}
+
+/// The application in front, as its process and the name the workspace gives it. One read,
+/// so the `[focused]` mark and the "frontmost application" line of a listing can never name
+/// different applications; it answers even for an application the listing does not show (a
+/// menu-bar accessory, a process with no enumerable window), with no accessibility read.
+fn frontmost_identity() -> Option<(u32, String)> {
+    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    let name = app
+        .localizedName()
+        .map(|name| name.to_string())
+        .filter(|name| !name.is_empty())?;
+    Some((app.processIdentifier() as u32, name))
 }
 
 fn running_app_pid(name: &str) -> Option<u32> {
@@ -1264,12 +1516,16 @@ fn windows_of_app(
     app_name: &str,
     owner: &str,
     budget: &core::Budget,
+    mark_focused: bool,
 ) -> Result<Vec<WindowInfo>, anyhow::Error> {
     // SAFETY: `pid` is a running app (or stale); AXUIElementCreateApplication
     // always returns a non-null element — attribute reads surface InvalidUIElement.
     let app = unsafe { AXUIElement::new_application(pid as libc::pid_t) };
     budget.check()?;
     let windows = read_windows(&app, app_name)?;
+    // One read names the application's focused window; it is asked only where the
+    // answer is one the caller can use (see the listing's `mark_focused`).
+    let focused = mark_focused.then(|| focused_window_of_app(&app)).flatten();
     let mut out = Vec::new();
     for window in &windows {
         budget.check()?;
@@ -1286,12 +1542,15 @@ fn windows_of_app(
         if title.is_empty() && (frame.width <= 0.0 || frame.height <= 0.0) {
             continue;
         }
+        let is_focused = focused.as_ref().is_some_and(|focused| *focused == *window);
         out.push(WindowInfo {
             app_pid: Some(pid),
             app_name: app_name.to_string(),
             title,
             key: window_key(window, owner),
             surface: frame,
+            focused: is_focused,
+            rank: None,
         });
     }
     Ok(out)
@@ -1864,6 +2123,41 @@ fn activate_window(target: &TargetSpec, budget: &core::Budget) -> Result<bool, a
     raise_window(&window)
 }
 
+/// The application, and the live frame, of the surface a click addresses. The frame is
+/// read rather than taken from the enumeration snapshot: the note about "another window of
+/// the same application" must recognise the addressed window itself, whose title the two
+/// systems spell differently, and a frame is the one thing they agree on. A read that fails
+/// leaves the application it can still be named by, and no frame — which the check reports as
+/// uncheckable rather than clear.
+///
+/// The caller answers the screen before reaching here (its points belong to no window), so
+/// the screen's absence of an addressed application is stated once, below.
+fn live_surface_identity(
+    target: &TargetSpec,
+    budget: &core::Budget,
+) -> (Option<u32>, Option<core::SurfaceGeometry>) {
+    match resolve_window(target, budget) {
+        // The frame, not the title: it is what the hit test reads for the window under the
+        // point, so the two are compared in one coordinate system and a title the two
+        // systems spell differently can never decide the answer.
+        Ok((window, app)) => (app_pid(&app).ok(), window_frame(&window, budget).ok()),
+        // A window spec without a pid is one whose application could not be identified —
+        // never the frontmost process, which would attribute its point to whatever happens to
+        // be in front; `core::UnderPoint::classify` answers that as the unknown case.
+        Err(_) => (
+            match target {
+                TargetSpec::Focused => frontmost_identity().map(|(pid, _)| pid),
+                TargetSpec::App { app_pid, .. } => {
+                    app_pid.or_else(|| frontmost_identity().map(|(pid, _)| pid))
+                }
+                TargetSpec::Window { app_pid, .. } => *app_pid,
+                TargetSpec::Screen => None,
+            },
+            None,
+        ),
+    }
+}
+
 /// Whether `window` is where the window server delivers input right now: its
 /// application is frontmost and the window is that application's focused one.
 fn window_receives_input(window: &AXUIElement) -> bool {
@@ -1930,7 +2224,11 @@ fn check_input_arguments(input: &RawInput) -> Result<(), anyhow::Error> {
     }
 }
 
-fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<Impact, anyhow::Error> {
+fn raw_input_blocking(
+    target: &TargetSpec,
+    input: &RawInput,
+    placed: &mut Option<core::Placement>,
+) -> Result<core::Actuation, anyhow::Error> {
     let pinned = core::pinned_input(target, input);
     // A chord goes to whatever already has focus, so nothing is raised for it.
     let raises = !matches!(input, RawInput::KeyChord { .. });
@@ -1944,8 +2242,9 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<Impact, a
             let (window, _app) = resolve_window(target, &raise)?;
             raise_window(&window).map(|_| ())
         })?;
+        let verify = lookup.clone();
         with_target(target, move |target| {
-            ensure_window_receives(target, &lookup)
+            ensure_window_receives(target, &verify)
         })?;
     } else if raises {
         let raise = lookup.clone();
@@ -1962,37 +2261,77 @@ fn raw_input_blocking(target: &TargetSpec, input: &RawInput) -> Result<Impact, a
             double,
             modifiers,
         } => {
-            let (x, y) = core::normalized_to_surface(
-                point.0,
-                point.1,
-                &surface_geometry_with(target, geometry)?,
-            )?;
-            click(CGPoint::new(x, y), *button, *double, modifiers)
+            let surface = surface_geometry_with(target, geometry)?;
+            let (x, y) = core::normalized_to_surface(point.0, point.1, &surface)?;
+            let local = core::surface_local((x, y), &surface);
+            let placement = core::Placement {
+                geometry: surface,
+                from: local,
+                to: None,
+            };
+            // Where the point is put, recorded before the event is posted: an exception
+            // raised by the posting itself must not lose a position that is already fixed.
+            *placed = Some(placement);
+            // The check runs here, at the moment the event is posted and after the raise
+            // above: only now is "in front" the state the click meets. A window of another
+            // application means nothing is sent. The screen's points belong to no window, so
+            // nothing is read for them.
+            let (addressed_pid, addressed_frame, under) = if matches!(target, TargetSpec::Screen) {
+                (None, None, None)
+            } else {
+                let (pid, frame) = live_surface_identity(target, &lookup);
+                (pid, frame, self::window_at_point((x, y), &lookup))
+            };
+            let note = core::click_under_point(&core::ClickCheck {
+                surface: target,
+                local,
+                geometry: &surface,
+                addressed_pid,
+                addressed_frame: addressed_frame.as_ref(),
+                under: under.as_ref(),
+            })?;
+            let impact = click(CGPoint::new(x, y), *button, *double, modifiers)?;
+            let impact = match note {
+                Some(note) => core::impact_note(impact, note),
+                None => impact,
+            };
+            // The point the event was posted at, from the geometry read that mapped it, so
+            // the answer states the position the click used and not a second one.
+            Ok(core::Actuation::at(impact, placement))
         }
-        RawInput::TypeText { text } => type_text(text),
-        RawInput::KeyChord { chord } => key_chord(chord),
+        RawInput::TypeText { text } => type_text(text).map(core::Actuation::of),
+        RawInput::KeyChord { chord } => key_chord(chord).map(core::Actuation::of),
         RawInput::Scroll {
             point,
             direction,
             amount,
         } => {
-            let p = if let Some((nx, ny)) = point {
-                let (x, y) = core::normalized_to_surface(
-                    *nx,
-                    *ny,
-                    &surface_geometry_with(target, geometry)?,
-                )?;
-                Some(CGPoint::new(x, y))
-            } else {
-                None
+            let Some((nx, ny)) = point else {
+                return scroll(None, *direction, *amount).map(core::Actuation::of);
             };
-            scroll(p, *direction, *amount)
+            let surface = surface_geometry_with(target, geometry)?;
+            let (x, y) = core::normalized_to_surface(*nx, *ny, &surface)?;
+            let placement = core::Placement {
+                geometry: surface,
+                from: core::surface_local((x, y), &surface),
+                to: None,
+            };
+            *placed = Some(placement);
+            let impact = scroll(Some(CGPoint::new(x, y)), *direction, *amount)?;
+            Ok(core::Actuation::at(impact, placement))
         }
         RawInput::Drag { from, to } => {
             let surface = surface_geometry_with(target, geometry)?;
             let (fx, fy) = core::normalized_to_surface(from.0, from.1, &surface)?;
             let (tx, ty) = core::normalized_to_surface(to.0, to.1, &surface)?;
-            drag(CGPoint::new(fx, fy), CGPoint::new(tx, ty))
+            let placement = core::Placement {
+                geometry: surface,
+                from: core::surface_local((fx, fy), &surface),
+                to: Some(core::surface_local((tx, ty), &surface)),
+            };
+            *placed = Some(placement);
+            let impact = drag(CGPoint::new(fx, fy), CGPoint::new(tx, ty))?;
+            Ok(core::Actuation::at(impact, placement))
         }
     }
 }
@@ -2450,16 +2789,32 @@ fn capture_available_blocking() -> bool {
 
 // ── Element actions ──────────────────────────────────────────────────────
 
+/// Where a refused element press may have to synthesise a click: the element's own frame
+/// (surface-local) and the window's origin on screen, which is what maps it back.
+struct PressPoint {
+    frame: (f64, f64, f64, f64),
+    origin: (f64, f64),
+}
+
+impl PressPoint {
+    /// The element's centre, in screen coordinates and in the surface's own points.
+    fn centre(&self) -> ((f64, f64), (f64, f64)) {
+        let (x, y, w, h) = self.frame;
+        let local = (x + w / 2.0, y + h / 2.0);
+        ((self.origin.0 + local.0, self.origin.1 + local.1), local)
+    }
+}
+
 /// Perform a reference's press: its own `AXPress`, else its `AXOpen`. An element that
 /// offers `open` has two further routes, for the platform that advertises the action and
 /// then refuses it (Finder's desktop icons answer `kAXErrorAttributeUnsupported`): open
 /// the item it points at, or double click at its position once the window is proven to
-/// receive input. `center` is the element's frame centre in screen coordinates, when it has
-/// one; `surface` names the window in the refusal.
+/// receive input. `point` is where the element sits, when it has a frame; `surface` names
+/// the window in the refusal.
 fn press_element(
     element: &AXUIElement,
     window: &AXUIElement,
-    center: Option<(f64, f64)>,
+    point: Option<&PressPoint>,
     surface: &str,
     budget: &core::Budget,
 ) -> Result<Impact, anyhow::Error> {
@@ -2505,14 +2860,24 @@ fn press_element(
                     .to_string(),
             ));
         }
-        if let Some((x, y)) = center {
+        if let Some(point) = point {
             ensure(Grant::Input)?;
             bring_window_forward(window, surface, budget)?;
+            let ((x, y), local) = point.centre();
             click(CGPoint::new(x, y), MouseButton::Left, true, &[])?;
-            return Ok(Impact::DoneWith(
-                "the element refused its own action, so it was double clicked at its position"
-                    .to_string(),
-            ));
+            // A synthesised click is a point action, so it says where the point was put:
+            // the element's own centre in the surface's points, against the size read now
+            // — the one thing only this rare route needs.
+            let placed = match window_frame(window, budget) {
+                Ok(frame) => core::placed_point(local, &frame),
+                Err(_) => format!(
+                    "({:.1}, {:.1}) of the surface, whose size could not be read",
+                    local.0, local.1
+                ),
+            };
+            return Ok(Impact::DoneWith(format!(
+                "the element refused its own action, so it was double clicked at {placed}"
+            )));
         }
     }
     let available = action_list(&names);
@@ -2598,18 +2963,20 @@ fn act_on_element_blocking(
     let origin =
         window_origin(&window).map_err(|_| core::unanswered(&label, "for its position"))?;
     let (root, handles, _truncation) = build_tree(&window, origin, &budget)?;
-    let matched = core::resolve_locator_checked(&root, locator)?;
+    // The ref is acted on only if it is still what the caller saw: the same kind, the
+    // same name and the same place on the surface. Nothing is sent otherwise.
+    let (matched, confirmed) = core::resolve_locator_confirmed(&root, locator)?;
     let element = &handles[core::pre_order_index(&root, matched)];
-    // The element's own centre in screen coordinates, for the press the platform can
-    // only perform as a pointer double click. The tree stores frames window-relative,
-    // so the window origin puts them back on the screen.
-    let center = matched
-        .frame
-        .map(|(x, y, w, h)| (origin.0 + x + w / 2.0, origin.1 + y + h / 2.0));
-    match act {
-        ElementAct::Press => press_element(element, &window, center, &label, &budget),
+    // The element's own frame, for the press the platform can only perform as a pointer
+    // double click: the tree stores frames window-relative, and the window's origin puts
+    // them back on the screen. Read only where an element has a frame at all — a press
+    // that never needs the synthesised route pays nothing for it.
+    let point = matched.frame.map(|frame| PressPoint { frame, origin });
+    let impact = match act {
+        ElementAct::Press => press_element(element, &window, point.as_ref(), &label, &budget),
         ElementAct::SetValue { text } => set_element_value(element, text),
-    }
+    }?;
+    Ok(core::impact_note(impact, confirmed.note(locator)))
 }
 
 /// Map the result of an AX ACTION onto the outcome the model is owed. The one
@@ -2713,7 +3080,7 @@ impl Backend for MacOsBackend {
         .unwrap_or_else(std::convert::identity)
     }
 
-    async fn list_apps(&self) -> Result<Vec<AppInfo>, anyhow::Error> {
+    async fn list_apps(&self) -> Result<AppListing, anyhow::Error> {
         with_platform("list applications", || {
             let mut out = Vec::new();
             for app in NSWorkspace::sharedWorkspace().runningApplications() {
@@ -2730,7 +3097,14 @@ impl Backend for MacOsBackend {
             }
             out.sort_by(|a, b| a.name.cmp(&b.name));
             out.dedup_by(|a, b| a.pid == b.pid);
-            Ok(out)
+            // The workspace names the frontmost application without an accessibility
+            // read, and names one that is not among the listed regular applications —
+            // exactly the case a listing must not leave the caller to guess at.
+            let frontmost = frontmost_identity().map(|(_, name)| name);
+            Ok(AppListing {
+                apps: out,
+                frontmost,
+            })
         })
     }
 
@@ -2761,6 +3135,13 @@ impl Backend for MacOsBackend {
             };
             let mut listing = WindowListing::default();
             let owner = core::agent_key();
+            // The frontmost application is read once — one read, so the mark and the line
+            // cannot name different applications — and it decides which application's focused
+            // window is worth a read: a background application's cannot receive input, so
+            // marking it would name something the caller cannot use.
+            let frontmost = frontmost_identity();
+            let mark_focused_pid = frontmost.as_ref().map(|(pid, _)| *pid);
+            listing.frontmost = frontmost.map(|(_, name)| name);
             // One clock for the whole enumeration, and one slice of it per application:
             // a hung application costs its own part rather than the healthy ones read
             // before and after it.
@@ -2795,7 +3176,10 @@ impl Backend for MacOsBackend {
                 // The copy outlives the closure, so the listing can ask afterwards whether
                 // it was this application's share that ran out.
                 let share = app_budget.clone();
-                match on_ax_thread(pid, move || windows_of_app(pid, &name, &owner, &app_budget)) {
+                let mark_focused = app.is_some() || mark_focused_pid == Some(pid);
+                match on_ax_thread(pid, move || {
+                    windows_of_app(pid, &name, &owner, &app_budget, mark_focused)
+                }) {
                     Ok(rows) => listing.windows.extend(rows),
                     // A spent share is one skipped application, said on the line naming it.
                     Err(e) => listing.unread.push(UnreadWindows {
@@ -2804,27 +3188,30 @@ impl Backend for MacOsBackend {
                     }),
                 }
             }
+            // The order is attributed to the windows actually listed; a window that found no
+            // compositor entry — a minimized one, one on another space — is counted, never
+            // treated as a hole in an order that covers the rest, and a list that could not be
+            // read is stated as the failed read it is.
+            listing.order = attribute_order(&mut listing.windows);
             Ok(listing)
         })
         .map_err(degraded_read)
     }
 
-    async fn focused_window(&self) -> Result<WindowInfo, anyhow::Error> {
-        with_platform("read the focused window", || {
+    async fn surface_window(&self, target: &TargetSpec) -> Result<WindowInfo, anyhow::Error> {
+        let target = target.clone();
+        with_platform("resolve the surface", move || {
             ensure(Grant::Accessibility)?;
             let owner = core::agent_key();
-            let budget = core::Budget::new(
-                core::LIST_BUDGET,
-                "focused-window search",
-                "the running applications",
-            );
-            with_target(&TargetSpec::Focused, move |target| {
+            let budget = core::Budget::new(core::LIST_BUDGET, "surface lookup", target.describe());
+            with_target(&target, move |target| {
                 let (window, app) = resolve_window(target, &budget)?;
                 budget.check()?;
                 let pid = app_pid(&app)?;
                 let app_name = resolved_app_name(target, &app)?;
                 let title = window_title(&window);
                 let label = resolved_surface_label(target, &app, title.as_deref())?;
+                budget.check()?;
                 Ok(WindowInfo {
                     app_pid: Some(pid),
                     app_name,
@@ -2832,6 +3219,8 @@ impl Backend for MacOsBackend {
                     key: window_key(&window, &owner),
                     surface: window_frame(&window, &budget)
                         .map_err(|_| core::unanswered(&label, "for its frame"))?,
+                    focused: false,
+                    rank: None,
                 })
             })
         })
@@ -2893,12 +3282,17 @@ impl Backend for MacOsBackend {
         &self,
         target: &TargetSpec,
         input: RawInput,
-    ) -> Result<Impact, anyhow::Error> {
-        match with_platform("synthesize input", || {
+    ) -> Result<core::Actuation, anyhow::Error> {
+        // The position the call placed is kept outside the firewall: it is worked out before
+        // the event is posted, so an exception raised by the posting itself still answers
+        // where the point was put.
+        let mut placed = None;
+        let result = with_platform("synthesize input", || {
             check_input_arguments(&input)?;
             ensure(Grant::Input)?;
-            raw_input_blocking(target, &input)
-        }) {
+            raw_input_blocking(target, &input, &mut placed)
+        });
+        match result {
             // An own-window exchange that timed out before any event was posted:
             // nothing was actuated, so it is a plain retryable failure.
             Err(e) if e.downcast_ref::<AxBusy>().is_some() => Err(core::taxonomy_error(
@@ -2907,10 +3301,13 @@ impl Backend for MacOsBackend {
             )),
             // An exception raised under the call: the events already posted stay
             // posted, so this may have landed and is not a failure.
-            Err(e) if core::is_framework_failed(&e) => Ok(Impact::Unconfirmed(format!(
-                "the system raised an exception while the input was being synthesized, so part of \
-                 it may already have been delivered — {e}"
-            ))),
+            Err(e) if core::is_framework_failed(&e) => {
+                let impact = Impact::Unconfirmed(format!(
+                    "the system raised an exception while the input was being synthesized, so \
+                     part of it may already have been delivered — {e}"
+                ));
+                Ok(core::Actuation::placed(impact, placed))
+            }
             other => other,
         }
     }
@@ -2922,6 +3319,42 @@ impl Backend for MacOsBackend {
             let p = CGEvent::location(Some(&event));
             Ok((p.x, p.y))
         })
+    }
+
+    /// The focused element of the addressed application, read from that application's own
+    /// element. Best-effort by contract: a grant that is gone, a target that stops
+    /// answering or an application with no focus answers `None`, which the action's report
+    /// states as a read that did not establish it.
+    async fn focused_element(&self, target: Option<&TargetSpec>) -> Option<FocusedElement> {
+        let target = target.cloned();
+        with_platform("read the focused element", move || {
+            // One budget for the whole probe: it answers every action, so a target that
+            // stops answering between its reads costs one ceiling instead of one per read.
+            let budget = core::Budget::new(
+                core::LIST_BUDGET,
+                "focused element",
+                target.as_ref().map_or_else(
+                    || "the focused application".to_string(),
+                    core::TargetSpec::describe,
+                ),
+            );
+            let focused = match &target {
+                Some(
+                    TargetSpec::Window {
+                        app_pid, app_name, ..
+                    }
+                    | TargetSpec::App { app_pid, app_name },
+                ) => app_element(*app_pid, app_name)
+                    .ok()
+                    .and_then(|app| focused_element_of_app(&app, &budget)),
+                _ => frontmost_app()
+                    .ok()
+                    .and_then(|app| focused_element_of_app(&app, &budget)),
+            };
+            Ok(focused)
+        })
+        .ok()
+        .flatten()
     }
 
     async fn capture(

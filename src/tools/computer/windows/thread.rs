@@ -7,25 +7,30 @@
 //! it, which is why the caller side of this module needs no `unsafe` and no `Send`
 //! wrappers.
 //!
-//! An abandoned job is an accepted limit: the action lock cannot outlive the
-//! deadline that keeps the product responsive, so a job stuck in a provider may
-//! still finish on the leaked thread after its caller was told it timed out. A
-//! timed-out actuation is therefore answered as [`Impact::Unconfirmed`], never as a
-//! failure; a timed-out read has nothing in flight, so its deadline stays an error,
+//! An abandoned job that had already started is an accepted limit: the action lock
+//! cannot outlive the deadline that keeps the product responsive, so a job stuck in a
+//! provider may still finish on the leaked thread after its caller was told it timed
+//! out. A timed-out actuation is therefore answered as [`Impact::Unconfirmed`], never as
+//! a failure; a timed-out read has nothing in flight, so its deadline stays an error,
 //! and a job whose thread stopped mid-call answers the same unconfirmed way as a
-//! deadline for the same reason. Each thread a hang leaves behind is counted (see
-//! [`LEAKED_THREADS`]) and the count is reported in the deadline's answer — the one
-//! failure that produced it — so a run that keeps hanging shows what it costs instead
-//! of leaking silently.
+//! deadline for the same reason. A job whose deadline expired while it was still queued
+//! behind another call never runs at all: it is marked abandoned by the same swap the thread
+//! uses to take it, so nothing of it is in flight, nothing was delivered and no thread is
+//! retired. Both entry points answer it as the plain `degraded` failure it is (see
+//! [`JobFailure::NotStarted`]) — the shared thread is still the healthy one, and only a
+//! genuine hang is a reason to leak it. Each thread a hang leaves behind
+//! is counted (see [`LEAKED_THREADS`]) and the count is reported in the deadline's answer
+//! — the one failure that produced it — so a run that keeps hanging shows what it costs
+//! instead of leaking silently.
 
 use super::super::core::{
-    self, AppInfo, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation, RawInput,
-    SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
+    self, Actuation, AppInfo, AppListing, Capture, CaptureBudget, ElementAct, FocusedElement,
+    Impact, Locator, Observation, RawInput, SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
 };
 use super::capture::CaptureContext;
 use super::{input, seh, uia, window};
 use crate::util::UnwrapPoison;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -47,10 +52,15 @@ const TRANSACTION_TIMEOUT_MS: u32 = 10_000;
 /// ever sent or shared across a thread boundary.
 pub(super) enum Call {
     ListApps,
+    FocusedElement {
+        target: Option<TargetSpec>,
+    },
     ListWindows {
         app: Option<AppInfo>,
     },
-    FocusedWindow,
+    SurfaceWindow {
+        target: TargetSpec,
+    },
     SurfaceGeometry {
         target: TargetSpec,
     },
@@ -86,8 +96,12 @@ impl Call {
                 Some(app) => format!("the windows of {}", app.name),
                 None => "the open windows".to_string(),
             },
-            Call::FocusedWindow => "the focused window".to_string(),
-            Call::SurfaceGeometry { target }
+            Call::FocusedElement { target } => match target {
+                Some(target) => format!("the focus on {}", target.describe()),
+                None => "the focused element".to_string(),
+            },
+            Call::SurfaceWindow { target }
+            | Call::SurfaceGeometry { target }
             | Call::Observe { target }
             | Call::Act { target, .. }
             | Call::RawInput { target, .. }
@@ -101,12 +115,15 @@ impl Call {
 /// method; nothing outside this module ever constructs or matches one. Boxed payloads
 /// keep the enum small enough to move cheaply across the channel.
 pub(super) enum Reply {
-    Apps(Vec<AppInfo>),
+    Apps(AppListing),
+    Focus(Option<FocusedElement>),
     Windows(WindowListing),
     Window(Box<WindowInfo>),
     Geometry(SurfaceGeometry),
     Observation(Box<Observation>),
-    Act(Impact),
+    /// What an actuating call delivered — and, when it put the pointer somewhere, where.
+    /// An element action answers [`Actuation::of`], because it places no point of its own.
+    Input(Box<Actuation>),
     Point(f64, f64),
     Capture(Box<Capture>),
 }
@@ -132,12 +149,13 @@ macro_rules! from_reply {
 }
 
 from_reply! {
-    Vec<AppInfo>: Reply::Apps(value) => value,
+    AppListing: Reply::Apps(value) => value,
+    Option<FocusedElement>: Reply::Focus(value) => value,
     WindowListing: Reply::Windows(value) => value,
     WindowInfo: Reply::Window(value) => *value,
     SurfaceGeometry: Reply::Geometry(value) => value,
     Observation: Reply::Observation(value) => *value,
-    Impact: Reply::Act(value) => value,
+    Actuation: Reply::Input(value) => *value,
     (f64, f64): Reply::Point(x, y) => (x, y),
     Capture: Reply::Capture(value) => *value,
 }
@@ -152,10 +170,43 @@ fn reply_mismatch() -> anyhow::Error {
     )
 }
 
+/// What a submitted job is doing, as one value both sides agree on: the caller that gave up
+/// and the thread that was about to run it settle it with one compare-and-swap each, so a
+/// job is never executed after its caller was told nothing was delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum JobState {
+    /// Waiting in the channel.
+    Queued = 0,
+    /// Taken by the thread, which is running it now and may still complete.
+    Running = 1,
+    /// Its caller's deadline expired while it was still queued: it must not run at all.
+    Abandoned = 2,
+}
+
+impl JobState {
+    /// Move `state` from `from` to `to`, answering whether this side won.
+    fn settle(state: &AtomicU8, from: Self, to: Self) -> bool {
+        state
+            .compare_exchange(from as u8, to as u8, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
+
 struct Job {
     call: Call,
     reply: tokio::sync::oneshot::Sender<anyhow::Result<Reply>>,
+    /// The handshake above: a job the thread has begun may still complete, while one still
+    /// queued when its caller gave up never runs.
+    state: Arc<AtomicU8>,
+    /// Where an actuating job put its point, published by the job as it maps it — before it
+    /// posts anything — so a call that never answers still reports the position it used.
+    /// Only [`submit_act`] fills this in.
+    placed: Option<Arc<PlacementMemo>>,
 }
+
+/// Where an actuating call placed its point, written by the thread as the call maps it.
+pub(super) type PlacementMemo = Mutex<Option<core::Placement>>;
 
 // ── The thread ──────────────────────────────────────────────────────────
 
@@ -170,12 +221,12 @@ struct Worker {
 
 static WORKER: LazyLock<Mutex<Option<Worker>>> = LazyLock::new(|| Mutex::new(None));
 
-/// Threads a hang left behind. Windows offers no safe way to interrupt a thread
-/// blocked inside a provider, so every expired deadline leaks one MTA thread with its
-/// apartment and UIA client. The count is reported in that deadline's answer and
-/// logged with it: unbounded in principle, visible in practice. A thread that exited on
-/// its own is not counted — and no other answer carries the count, since nothing is left
-/// running for it.
+/// Threads a genuine hang left behind. Windows offers no safe way to interrupt a thread
+/// blocked inside a provider, so a deadline that expires while the thread is running a job
+/// leaks one MTA thread with its apartment and UIA client. The count is reported in that
+/// deadline's answer and logged with it: unbounded in principle, visible in practice. A
+/// job that never started retires nothing and is not counted — and no other answer carries
+/// the count, since nothing is left running for it.
 static LEAKED_THREADS: AtomicU64 = AtomicU64::new(0);
 
 /// Why a call's reply never arrived. The two entry points below differ only in
@@ -186,30 +237,45 @@ enum JobFailure {
     /// The reply channel died: the thread caught a structured exception or exited
     /// while running the job.
     Stopped,
-    /// The deadline expired and the job was abandoned on the leaked thread, which
-    /// may still run it.
+    /// The deadline expired while the thread was running the job, which was abandoned on
+    /// the leaked thread and may still complete.
     Deadline {
         timeout: Duration,
         /// What the abandoned call was addressed to, read before the call moved onto
         /// the thread.
         label: String,
     },
+    /// The deadline expired while the job was still queued behind another call: it never
+    /// started, so nothing is in flight, nothing was delivered and no thread was retired.
+    NotStarted {
+        timeout: Duration,
+        /// What the call that never started was addressed to.
+        label: String,
+    },
 }
 
 /// Submit one call and wait for its reply under `timeout` — the only way a call
-/// reaches the apartment thread. The bookkeeping is here, once: an abandoned
-/// thread is marked dead so the next call starts a fresh apartment, and the wedged
-/// one exits on its own once the provider answers.
-async fn job_reply(call: Call, timeout: Duration) -> Result<Reply, JobFailure> {
+/// reaches the apartment thread. The bookkeeping is here, once: a job abandoned while the
+/// thread was running it marks the thread dead, so the next call starts a fresh apartment
+/// and the wedged one exits on its own once the provider answers; a job abandoned while
+/// still queued behind another call retires nothing, because that thread is healthy.
+async fn job_reply(
+    call: Call,
+    timeout: Duration,
+    placed: Option<Arc<PlacementMemo>>,
+) -> Result<Reply, JobFailure> {
     // Named before the call is moved onto the thread: the deadline error must say what
     // it was addressed to, and there is nothing left to ask once it is abandoned.
     let label = call.label();
     let (tx, alive) = sender().map_err(JobFailure::Call)?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let state = Arc::new(AtomicU8::new(JobState::Queued as u8));
     if tx
         .send(Job {
             call,
             reply: reply_tx,
+            state: Arc::clone(&state),
+            placed,
         })
         .is_err()
     {
@@ -228,6 +294,13 @@ async fn job_reply(call: Call, timeout: Duration) -> Result<Reply, JobFailure> {
             // nothing is still running, so nothing is leaked here.
             alive.store(false, Ordering::SeqCst);
             Err(JobFailure::Stopped)
+        }
+        // Giving up is a race with the thread picking the job up, and the swap settles it:
+        // winning means the job will never run (the thread skips an abandoned one), so
+        // nothing was delivered; losing means it is already running and may still complete,
+        // which retires the thread.
+        Err(_) if JobState::settle(&state, JobState::Queued, JobState::Abandoned) => {
+            Err(JobFailure::NotStarted { timeout, label })
         }
         Err(_) => {
             leak(&alive);
@@ -266,7 +339,7 @@ fn leaked_note() -> String {
 /// Submit one read-shaped call and await the payload it answers with: every
 /// abandoned reply has nothing in flight, so all of them are failures.
 pub(super) async fn submit<T: FromReply>(call: Call, timeout: Duration) -> anyhow::Result<T> {
-    match job_reply(call, timeout).await {
+    match job_reply(call, timeout, None).await {
         Ok(reply) => T::from_reply(reply),
         Err(JobFailure::Call(e)) => Err(e),
         // Nothing was left running here, so this answer never carries the leak count.
@@ -283,33 +356,69 @@ pub(super) async fn submit<T: FromReply>(call: Call, timeout: Duration) -> anyho
                 leaked_note()
             ),
         )),
+        Err(JobFailure::NotStarted { timeout, label }) => Err(not_started(timeout, &label)),
     }
 }
 
-/// Submit one actuating call. Only a job that never reached the thread, or one the
-/// thread itself refused, is a failure here; a deadline that expires, a thread that
-/// stops mid-job and a framework exception all answer [`Impact::Unconfirmed`].
-pub(super) async fn submit_act(call: Call, timeout: Duration) -> anyhow::Result<Impact> {
-    match job_reply(call, timeout).await {
-        Ok(reply) => Impact::from_reply(reply),
-        // Foreign code faulted while the job ran: where it stopped is unknown.
-        Err(JobFailure::Call(e)) if core::is_framework_failed(&e) => {
-            Ok(Impact::Unconfirmed(format!(
-                "the system raised a structured exception while the call was running, so its input \
-             may be partly applied — {e}"
-            )))
+/// The failure of a job that never reached the thread's call: it waited behind another
+/// job for its whole deadline. Nothing of it ran, so nothing was delivered and no thread
+/// was retired — both entry points answer it as the plain failure it is.
+fn not_started(timeout: Duration, label: &str) -> anyhow::Error {
+    core::taxonomy_error(
+        core::ERR_DEGRADED,
+        format!(
+            "{label} did not start within {}s — the shared accessibility thread was busy with \
+             another call, so this one never started and nothing was delivered; retry",
+            timeout.as_secs()
+        ),
+    )
+}
+
+/// Submit one actuating call — an element action or a batch of input, which both answer
+/// from this one submission. Only a job that never reached the thread, one the thread
+/// itself refused, or one that never started is a failure; a deadline that expires while
+/// the thread runs the job, a thread that stops mid-job and a framework exception all
+/// answer [`Impact::Unconfirmed`], because the input may still land. Such an answer keeps
+/// the placement the job had already published when it mapped its point, so a call that
+/// ended without an answer still says where the input was put.
+pub(super) async fn submit_act(call: Call, timeout: Duration) -> anyhow::Result<Actuation> {
+    let placed: Arc<PlacementMemo> = Arc::new(Mutex::new(None));
+    match job_reply(call, timeout, Some(Arc::clone(&placed))).await {
+        Ok(reply) => Actuation::from_reply(reply),
+        Err(failure) => {
+            let impact = actuation_failure(failure)?;
+            // A job that had already mapped its point published it before posting, so an
+            // answer that never arrived still states the position the input used.
+            Ok(Actuation::placed(
+                impact,
+                placed.lock().unwrap_poison().take(),
+            ))
         }
-        Err(JobFailure::Call(e)) => Err(e),
-        Err(JobFailure::Stopped) => Ok(Impact::Unconfirmed(String::from(
+    }
+}
+
+/// The one failure mapping of an actuating call.
+fn actuation_failure(failure: JobFailure) -> anyhow::Result<Impact> {
+    match failure {
+        // Foreign code faulted while the job ran: where it stopped is unknown.
+        JobFailure::Call(e) if core::is_framework_failed(&e) => Ok(Impact::Unconfirmed(format!(
+            "the system raised a structured exception while the call was running, so its input \
+             may be partly applied — {e}"
+        ))),
+        JobFailure::Call(e) => Err(e),
+        JobFailure::Stopped => Ok(Impact::Unconfirmed(String::from(
             "the computer-use thread stopped while running the call, so its input may or may not \
              have been delivered",
         ))),
-        Err(JobFailure::Deadline { timeout, label }) => Ok(Impact::Unconfirmed(format!(
+        JobFailure::Deadline { timeout, label } => Ok(Impact::Unconfirmed(format!(
             "{label} did not answer within {}s, so the call was abandoned while the job may still \
              complete on the leaked thread — the input may land after this answer{}",
             timeout.as_secs(),
             leaked_note()
         ))),
+        // Nothing of the job ran, so nothing of it can land: this is not an unconfirmed
+        // actuation but a call that was never delivered.
+        JobFailure::NotStarted { timeout, label } => Err(not_started(timeout, &label)),
     }
 }
 
@@ -367,7 +476,13 @@ fn run(rx: &Receiver<Job>, alive: &AtomicBool) {
             retire(rx, alive, &message);
             break;
         }
-        match seh::guard(|| ctx.execute(job.call)) {
+        // The one swap that decides whether this job runs at all: a caller that gave up
+        // while the job was queued has already marked it abandoned, and then nothing may be
+        // executed on its behalf — its answer said nothing was delivered.
+        if !JobState::settle(&job.state, JobState::Queued, JobState::Running) {
+            continue;
+        }
+        match seh::guard(|| ctx.execute(job.call, job.placed.as_deref())) {
             Ok(result) => {
                 // A caller that gave up has dropped its receiver; that is expected.
                 let _ = job.reply.send(result);
@@ -474,11 +589,17 @@ impl Ctx {
         })
     }
 
-    fn execute(&mut self, call: Call) -> anyhow::Result<Reply> {
+    fn execute(&mut self, call: Call, placed: Option<&PlacementMemo>) -> anyhow::Result<Reply> {
         match call {
-            Call::ListApps => Ok(Reply::Apps(window::enumerate_apps())),
+            Call::ListApps => Ok(Reply::Apps(window::list_apps())),
+            Call::FocusedElement { target } => Ok(Reply::Focus(uia::focused_element(
+                &self.uia,
+                target.as_ref(),
+            ))),
             Call::ListWindows { app } => Ok(Reply::Windows(window::list_windows(app.as_ref()))),
-            Call::FocusedWindow => Ok(Reply::Window(Box::new(window::focused_window()?))),
+            Call::SurfaceWindow { target } => {
+                Ok(Reply::Window(Box::new(window::window_info(&target)?)))
+            }
             Call::SurfaceGeometry { target } => {
                 Ok(Reply::Geometry(window::surface_geometry(&target)?))
             }
@@ -489,10 +610,12 @@ impl Ctx {
                 target,
                 locator,
                 act,
-            } => Ok(Reply::Act(uia::act_on_element(
+            } => Ok(Reply::Input(Box::new(Actuation::of(uia::act_on_element(
                 &self.uia, &target, &locator, &act,
-            )?)),
-            Call::RawInput { target, input } => Ok(Reply::Act(input::raw_input(&target, input)?)),
+            )?)))),
+            Call::RawInput { target, input } => Ok(Reply::Input(Box::new(input::raw_input(
+                &target, input, placed,
+            )?))),
             Call::CursorPosition => {
                 let (x, y) = input::cursor_position()?;
                 Ok(Reply::Point(x, y))

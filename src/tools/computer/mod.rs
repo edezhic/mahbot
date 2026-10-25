@@ -46,7 +46,19 @@
 //! that closed, an application that quit — is `surface-gone` naming it, while an id the
 //! tool no longer knows says exactly that and names the listing that mints ids again. A
 //! failed lookup never claims an application is not running. Element refs are not ids:
-//! they belong to the observation they came from and expire with the next one.
+//! they belong to the full observation they came from, are replaced only by the next
+//! full observation of that same surface, and expire with the turn that minted them
+//! ([`core::cleanup_turn`]).
+//!
+//! # What is in front, what the tool remembers, what an action answers
+//!
+//! A listing names the frontmost application, marks the focused window and gives a
+//! front-to-back order only where the platform can attribute one
+//! ([`core::WindowListing`]); one record per surface ([`core::Look`]) is what a narrow
+//! look, a change answer and every statement about that surface are measured against; and
+//! input answers what it could observe afterwards, best-effort and without ever claiming
+//! the effect ([`answer`]). A coordinate click is additionally checked at the moment it is
+//! sent ([`core::UnderPoint`]); raising and delivery are unchanged.
 //!
 //! # Bounded by the product, not by the machine
 //!
@@ -133,6 +145,29 @@
 //!    id again: it is refused as one the tool no longer knows, never as a closed window
 //!    or an application that is not running. The split itself is covered by the unit
 //!    tests on [`core::cleanup_turn`] and [`core::end_session`].
+//! 9. The listings say what is in front: put one application in front and run `apps` —
+//!    the last line names it; then run `windows` — its focused window carries
+//!    `[focused]`, a single application's listing says whether it is in front, and the
+//!    order line is present only where the platform can attribute one. Linux names the
+//!    frontmost application from the active state of its windows and no order at all,
+//!    which is its honest answer.
+//! 10. Narrow looks and change answers read what was already observed: `observe` a page,
+//!     then `observe { kind: "button" }` — the flat list says it covers part of the
+//!     surface; mistype the kind and the answer names the kinds present; then
+//!     `observe { changed: true }` — nothing changed, or what did, against the age of the
+//!     observation. Neither replaces the remembered look: `observe { ref: "e2" }` after
+//!     them still resolves. The state itself is covered by the unit tests on
+//!     [`core::render_narrow`], [`core::render_changes`] and [`core::remember_look`].
+//! 11. Every delivered action reports after itself: a `click` on a point answers with the
+//!     resolved point, the surface's size, the input values, the focused element and
+//!     whether the surface sits where the remembered observation found it; move the window
+//!     between two calls and the second says it moved. Click a point covered by another
+//!     application's window — its own body, its popover, its open menu (macOS, Windows):
+//!     nothing is sent and the answer names that application; cover it with the addressed
+//!     application's own dialog and the click goes, named as another window of that
+//!     application. On macOS the same holds for the Dock's icons and a menu-bar item of
+//!     another application, which refuse and name them, while a point inside the addressed
+//!     window's body is sent with no note; Linux checks nothing and says so.
 
 mod core;
 mod linux;
@@ -154,6 +189,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -167,8 +203,17 @@ use tracing::debug;
 #[derive(Debug, Clone, Deserialize, Serialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 enum ComputerAction {
+    /// Read a surface. With no narrowing argument this is a full observation, which is
+    /// the only thing that records a surface and mints refs; `ref`, `depth` and `kind`
+    /// narrow it to part of the tree already read, and `changed` answers what differs
+    /// from that recorded look. See [`observe`].
     Observe {
         target: Option<String>,
+        #[serde(rename = "ref")]
+        reference: Option<String>,
+        depth: Option<usize>,
+        kind: Option<String>,
+        changed: Option<bool>,
     },
     Screenshot {
         target: Option<String>,
@@ -250,6 +295,7 @@ fn wire_name(action: &ComputerAction) -> String {
 }
 
 const EXPECTED_ACTION_SHAPE: &str = "one of: {\"observe\":{\"target\":\"a1\"}}, \
+    {\"observe\":{\"changed\":true}}, {\"observe\":{\"ref\":\"e3\",\"kind\":\"button\"}}, \
     {\"screenshot\":{\"target\":\"screen\"}}, \
     {\"zoom\":{\"target\":\"a1\",\"region\":[x0,y0,x1,y1]}}, {\"apps\":{}}, \
     {\"windows\":{\"app\":\"Safari\"}}, \
@@ -278,10 +324,14 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
     vec![
         super::action_entry_schema(
             "observe",
-            "Read the tree with element refs.",
+            "Read a surface's tree with element refs; narrow it, or ask what changed.",
             &[],
             &json!({
-                "target": {"type": "string"}
+                "target": {"type": "string"},
+                "ref": {"type": "string"},
+                "depth": {"type": "integer", "minimum": 1, "maximum": core::MAX_TREE_DEPTH},
+                "kind": {"type": "string"},
+                "changed": {"type": "boolean"}
             }),
         ),
         super::action_entry_schema(
@@ -417,9 +467,17 @@ fn check_action_fields(action_value: &Value) -> anyhow::Result<()> {
 /// action cannot honour is refused with the form it does accept.
 fn validate_action(action: &ComputerAction) -> anyhow::Result<()> {
     match action {
-        ComputerAction::Observe { target } | ComputerAction::Screenshot { target } => {
+        ComputerAction::Observe {
+            target,
+            reference,
+            depth,
+            kind,
+            changed,
+        } => {
             check_opt_arg("target", target.as_deref())?;
+            check_observation(reference.as_deref(), *depth, kind.as_deref(), *changed)?;
         }
+        ComputerAction::Screenshot { target } => check_opt_arg("target", target.as_deref())?,
         ComputerAction::Zoom { target, region } => {
             check_opt_arg("target", target.as_deref())?;
             core::check_region(region)?;
@@ -434,42 +492,15 @@ fn validate_action(action: &ComputerAction) -> anyhow::Result<()> {
             button,
             double,
             modifiers,
-        } => {
-            check_opt_arg("target", target.as_deref())?;
-            check_opt_arg("ref", reference.as_deref())?;
-            match (reference, x, y) {
-                // An element press is one form: a button, a second click or a modifier
-                // would name a gesture the ref-based path does not perform.
-                (Some(reference), None, None) => {
-                    if modifiers.as_ref().is_some_and(|m| !m.is_empty())
-                        || button.is_some_and(|b| b != MouseButton::Left)
-                        || double.is_some_and(|d| d)
-                    {
-                        anyhow::bail!(
-                            "click on element {reference} takes no button, double or modifiers \
-                             beyond the plain left click — those belong to coordinate clicks; \
-                             drop them, or drop ref and give x and y to click a point"
-                        );
-                    }
-                }
-                (Some(_), _, _) => anyhow::bail!(
-                    "click takes a ref or x/y, never both — drop x and y to click the element, \
-                     or drop ref to click the point"
-                ),
-                (None, Some(x), Some(y)) => {
-                    core::check_point("click point", *x, *y)?;
-                    check_modifiers(modifiers.as_deref())?;
-                }
-                (None, x, y) => anyhow::bail!(
-                    "click needs a ref or both x and y — got {}",
-                    match (x, y) {
-                        (Some(_), None) => "x alone",
-                        (None, Some(_)) => "y alone",
-                        _ => "neither",
-                    }
-                ),
-            }
-        }
+        } => check_click(
+            target.as_deref(),
+            reference.as_deref(),
+            *x,
+            *y,
+            *button,
+            *double,
+            modifiers.as_deref(),
+        )?,
         ComputerAction::Type {
             text,
             target,
@@ -507,6 +538,80 @@ fn validate_action(action: &ComputerAction) -> anyhow::Result<()> {
                 anyhow::bail!("wait seconds must be in (0, {MAX_WAIT_SECS}] — got {seconds}");
             }
         }
+    }
+    Ok(())
+}
+
+/// The three arguments that narrow an observation, and the one that replaces it with a
+/// change answer: a bounded depth, a kind to match, and no mixing of the two questions.
+fn check_observation(
+    reference: Option<&str>,
+    depth: Option<usize>,
+    kind: Option<&str>,
+    changed: Option<bool>,
+) -> anyhow::Result<()> {
+    check_opt_arg("ref", reference)?;
+    check_opt_arg("kind", kind)?;
+    if let Some(depth) = depth
+        && !(1..=core::MAX_TREE_DEPTH).contains(&depth)
+    {
+        let max = core::MAX_TREE_DEPTH;
+        anyhow::bail!("observe depth must be 1-{max} levels below the surface — got {depth}");
+    }
+    if changed.unwrap_or(false) && (reference.is_some() || depth.is_some() || kind.is_some()) {
+        anyhow::bail!(
+            "observe takes changed on its own: it answers what differs from the recorded look, \
+             which a ref, depth or kind would narrow — drop them, or drop changed to look at \
+             part of the tree"
+        );
+    }
+    Ok(())
+}
+
+/// A click is one of two forms, and neither carries the other's arguments: a press by
+/// ref, or a point with a button, a second click and modifiers.
+fn check_click(
+    target: Option<&str>,
+    reference: Option<&str>,
+    x: Option<f64>,
+    y: Option<f64>,
+    button: Option<MouseButton>,
+    double: Option<bool>,
+    modifiers: Option<&[core::Modifier]>,
+) -> anyhow::Result<()> {
+    check_opt_arg("target", target)?;
+    check_opt_arg("ref", reference)?;
+    match (reference, x, y) {
+        // An element press is one form: a button, a second click or a modifier would
+        // name a gesture the ref-based path does not perform.
+        (Some(reference), None, None) => {
+            if modifiers.is_some_and(|m| !m.is_empty())
+                || button.is_some_and(|b| b != MouseButton::Left)
+                || double.is_some_and(|d| d)
+            {
+                anyhow::bail!(
+                    "click on element {reference} takes no button, double or modifiers beyond the \
+                     plain left click — those belong to coordinate clicks; drop them, or drop ref \
+                     and give x and y to click a point"
+                );
+            }
+        }
+        (Some(_), _, _) => anyhow::bail!(
+            "click takes a ref or x/y, never both — drop x and y to click the element, or drop ref \
+             to click the point"
+        ),
+        (None, Some(x), Some(y)) => {
+            core::check_point("click point", x, y)?;
+            check_modifiers(modifiers)?;
+        }
+        (None, x, y) => anyhow::bail!(
+            "click needs a ref or both x and y — got {}",
+            match (x, y) {
+                (Some(_), None) => "x alone",
+                (None, Some(_)) => "y alone",
+                _ => "neither",
+            }
+        ),
     }
     Ok(())
 }
@@ -843,17 +948,22 @@ impl Tool for ComputerTool {
             ensure_interactive_desktop().await?;
         }
 
-        // Serialize every GUI-touching action so concurrent agent runs can't race.
-        let _lock = ACTION_LOCK.lock().await;
-
-        let result = dispatch(&action).await;
+        // Serialize every GUI-touching action so concurrent agent runs can't race. The
+        // probes an answer makes after the input was delivered run outside it: a slow
+        // probe must not lengthen another action's wait, and on Windows it must not count
+        // against the deadline that decides whether the action itself was confirmed.
+        let result = {
+            let _lock = ACTION_LOCK.lock().await;
+            dispatch(&action).await
+        };
         // A failure that confirmed the surface gone drops the id it was asked
         // through, so the table follows only surfaces that still exist.
         if let Err(err) = &result {
             forget_confirmed_gone(&action, err);
         }
-        let output = result.map_err(|e| framework_next_step(&action, e))?;
-        Ok(output)
+        let delivered = result.map_err(|e| framework_next_step(&action, e))?;
+        let answer = answer(delivered).await;
+        Ok(crate::util::scrub_credentials(&answer))
     }
 
     /// The tool's text is a real result (a surface summary, an action's outcome),
@@ -998,15 +1108,35 @@ fn framework_next_step(action: &ComputerAction, err: anyhow::Error) -> anyhow::E
     anyhow::anyhow!("{err} — the call was abandoned, so {next}")
 }
 
-async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
-    let output = match action {
-        ComputerAction::Apps {} => apps().await?,
-        ComputerAction::Windows { app } => windows(app.as_deref()).await?,
-        // observe scrubs internally (pre-spill); everything else is scrubbed once
-        // at the dispatch boundary below.
-        ComputerAction::Observe { target } => return observe(target.as_deref()).await,
-        ComputerAction::Screenshot { target } => capture(target.as_deref(), None).await?,
-        ComputerAction::Zoom { target, region } => capture(target.as_deref(), Some(region)).await?,
+async fn dispatch(action: &ComputerAction) -> anyhow::Result<Delivered> {
+    match action {
+        ComputerAction::Apps {} => Ok(Delivered::Read(apps().await?)),
+        ComputerAction::Windows { app } => Ok(Delivered::Read(windows(app.as_deref()).await?)),
+        // An observation spills and scrubs its own tree before handing it over; every
+        // answer is scrubbed once more at the boundary, which is also where the
+        // post-action report is appended.
+        ComputerAction::Observe {
+            target,
+            reference,
+            depth,
+            kind,
+            changed,
+        } => {
+            observe(
+                target.as_deref(),
+                reference.as_deref(),
+                *depth,
+                kind.clone(),
+                changed.unwrap_or(false),
+            )
+            .await
+        }
+        ComputerAction::Screenshot { target } => {
+            Ok(Delivered::Read(capture(target.as_deref(), None).await?))
+        }
+        ComputerAction::Zoom { target, region } => Ok(Delivered::Read(
+            capture(target.as_deref(), Some(region)).await?,
+        )),
         ComputerAction::Click {
             target,
             reference,
@@ -1025,79 +1155,192 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<String> {
                 *double,
                 modifiers.as_deref(),
             )
-            .await?
+            .await
         }
         ComputerAction::Type {
             text,
             target,
             reference,
-        } => type_text(text, target.as_deref(), reference.as_deref()).await?,
-        ComputerAction::Press { keys } => {
-            // A chord is global input: it goes to the focused application, so no
-            // surface is resolved and none is raised on its behalf.
-            let impact = backend()
-                .raw_input(
-                    &TargetSpec::Focused,
-                    core::RawInput::KeyChord {
-                        chord: keys.clone(),
-                    },
-                )
-                .await?;
-            core::impact_text(
-                format!("pressed chord: {keys} — a chord goes to the focused application"),
-                impact,
-            )
-        }
+        } => type_text(text, target.as_deref(), reference.as_deref()).await,
+        ComputerAction::Press { keys } => press(keys).await,
         ComputerAction::Scroll {
             direction,
             amount,
             target,
             x,
             y,
-        } => scroll(*direction, *amount, target.as_deref(), *x, *y).await?,
-        ComputerAction::Drag { from, to, target } => {
-            let target = resolve_action_target(target.as_deref())?;
-            let gesture = core::RawInput::Drag {
-                from: *from,
-                to: *to,
-            };
-            let impact = backend().raw_input(&target, gesture.clone()).await?;
-            core::impact_text(
-                format!(
-                    "dragged from {from:?} to {to:?}{}{}",
-                    on_surface(&target),
-                    unpinned_clause(&target, &gesture)
-                ),
-                impact,
-            )
-        }
-        ComputerAction::Cursor {} => cursor().await?,
+        } => scroll(*direction, *amount, target.as_deref(), *x, *y).await,
+        ComputerAction::Drag { from, to, target } => drag(*from, *to, target.as_deref()).await,
+        ComputerAction::Cursor {} => Ok(Delivered::Read(cursor().await?)),
         ComputerAction::Wait { seconds } => {
             tokio::time::sleep(Duration::from_secs_f64(*seconds)).await;
-            format!("waited {seconds}s")
+            Ok(Delivered::Read(format!("waited {seconds}s")))
         }
-    };
-    Ok(crate::util::scrub_credentials(&output))
+    }
 }
 
-/// The surface clause of an action result: `""` when the call named no surface
-/// (the focused window), else `" on <surface>"`. Every action states the surface it
-/// addressed this one way, so a result never varies by action.
-fn on_surface(target: &TargetSpec) -> String {
+/// A chord is global input: it goes to the focused application, so no surface is
+/// resolved and none is raised on its behalf.
+async fn press(keys: &str) -> anyhow::Result<Delivered> {
+    let actuation = backend()
+        .raw_input(
+            &TargetSpec::Focused,
+            core::RawInput::KeyChord {
+                chord: keys.to_string(),
+            },
+        )
+        .await?;
+    Ok(Delivered::Global(core::impact_text(
+        format!("pressed chord: {keys} — a chord goes to the focused application"),
+        actuation.impact,
+    )))
+}
+
+/// A drag states both ends of its gesture in the surface's own points: where it started,
+/// where it ended, and the surface they were mapped through — as the backend that posted
+/// them reported it.
+async fn drag(from: (f64, f64), to: (f64, f64), target: Option<&str>) -> anyhow::Result<Delivered> {
+    let surface = resolve_in_place(target).await?;
+    let gesture = core::RawInput::Drag { from, to };
+    let actuation = backend().raw_input(&surface, gesture.clone()).await?;
+    let mut text = match &actuation.placed {
+        Some(placed) => format!(
+            "dragged {}{} — input {} to {}",
+            placed.describe(),
+            on_surface(&surface, Some(placed)),
+            point_text(from),
+            point_text(to)
+        ),
+        None => format!(
+            "dragged{}{UNREAD_POSITION} — input {} to {}",
+            on_surface(&surface, None),
+            point_text(from),
+            point_text(to)
+        ),
+    };
+    text.push_str(unpinned_clause(&surface, &gesture));
+    Ok(Delivered::OnSurface {
+        text: core::impact_text(text, actuation.impact),
+        surface,
+    })
+}
+
+/// What one call delivered, and therefore what its answer still owes the caller.
+///
+/// A read (an observation, a listing, a crop) is answered as it is. Input delivered to a
+/// surface carries that surface, so its answer reports what could be observed after it —
+/// read only once the action lock is released. Input that addresses no surface (a key
+/// chord, a wheel at no point) reports the focus only.
+enum Delivered {
+    Read(String),
+    OnSurface { text: String, surface: TargetSpec },
+    Global(String),
+}
+
+/// A point as an answer states the input the call gave: the normalized pair, so a
+/// coordinate is never quoted without the scale it was read in.
+fn point_text(point: (f64, f64)) -> String {
+    format!(
+        "({}, {}) of 0-{:.0}",
+        point.0,
+        point.1,
+        core::NORMALIZED_MAX
+    )
+}
+
+/// The surface clause of an action result: the surface the call named, or — when it named
+/// none — the window the input was actually mapped through, named by where that window sits
+/// (its size is already in the placement the same answer states). `""` when the call named
+/// no surface and the backend resolved none.
+fn on_surface(target: &TargetSpec, placed: Option<&core::Placement>) -> String {
     match target {
-        TargetSpec::Focused => String::new(),
+        TargetSpec::Focused => placed.map_or_else(String::new, |placed| {
+            let geo = placed.geometry;
+            format!(" on the focused window at ({}, {})", geo.x, geo.y)
+        }),
         other => format!(" on {}", other.describe()),
     }
 }
 
 /// The clause a pointer gesture appends when it is not pinned to the surface: its
-/// coordinates were mapped there, but the input lands wherever the pointer is.
-/// Pinned input omits it, having been delivered to the surface it named.
+/// coordinates were mapped there, but the input lands wherever the pointer is. Pinned
+/// input omits it, having been delivered to the surface it named.
+///
+/// A coordinate click carries no such clause: what it lands on is checked at the moment
+/// it is sent ([`core::UnderPoint`]), so the clause survives only where it is still true
+/// — a drag and a wheel at a point.
 fn unpinned_clause(target: &TargetSpec, input: &core::RawInput) -> &'static str {
     if core::pinned_input(target, input) {
         ""
     } else {
         " — the input goes to whatever is under its coordinates"
+    }
+}
+
+/// The final text of one call: what it did, and — for input that was delivered — what
+/// could be observed after it.
+///
+/// Every part of the report is read best-effort: a probe that fails or cannot answer is
+/// stated as unread, never turned into a failure of an action that already happened,
+/// and never used to widen the answer into "applied but unconfirmed". The answer states
+/// what it saw; it never claims that the intended effect occurred.
+async fn answer(delivered: Delivered) -> String {
+    match delivered {
+        Delivered::Read(text) => text,
+        Delivered::Global(text) => {
+            let focus = focus_text(None).await;
+            format!("{text}\n[After: no surface addressed — {focus}]")
+        }
+        Delivered::OnSurface { text, surface } => {
+            let focus = focus_text(Some(&surface)).await;
+            let state = surface_state(&surface).await;
+            format!("{text}\n[After: {} — {focus}; {state}]", surface.describe())
+        }
+    }
+}
+
+/// The element that holds the focus, as the answer states it: by kind and name, or the
+/// plain statement that this read did not establish it.
+async fn focus_text(surface: Option<&TargetSpec>) -> String {
+    match backend().focused_element(surface).await {
+        Some(element) => format!("focus: {}", element.describe()),
+        // The read failed this time — a target that does not answer, or one with no focused
+        // element. Every platform here can answer for some targets, so this is never stated
+        // as an incapability of the platform.
+        None => "focus: could not be read this time".to_string(),
+    }
+}
+
+/// Why there is no remembered look of a surface, said as the answers say it. One clause for
+/// every case — never observed, dropped for newer surfaces, discarded after the surface was
+/// confirmed gone — because all three are true of it and the answer is not the place to
+/// explain the cache's internals.
+fn no_look() -> String {
+    format!(
+        "the tool keeps the {} most recently observed surfaces and holds no remembered look of \
+         this one",
+        core::MAX_LOOKS
+    )
+}
+
+/// Whether the surface still sits where its remembered look found it — the one thing an
+/// action's answer may say about movement, measured against that single record.
+async fn surface_state(surface: &TargetSpec) -> String {
+    let Some((remembered, taken)) = core::remembered_geometry(surface) else {
+        return format!("nothing to compare against — {}", no_look());
+    };
+    match backend().surface_geometry(surface).await {
+        Ok(now) => match core::geometry_change(&remembered, &now) {
+            Some(change) => format!(
+                "the surface {change} since the observation taken {}",
+                core::look_age(taken)
+            ),
+            None => format!(
+                "the surface sits where the observation taken {} found it",
+                core::look_age(taken)
+            ),
+        },
+        Err(_) => "whether the surface moved could not be read".to_string(),
     }
 }
 
@@ -1112,13 +1355,34 @@ fn resolve_action_target(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     Ok(core::last_surface().unwrap_or(TargetSpec::Focused))
 }
 
-/// [`resolve_action_target`] with the last resort made concrete: a call that ends
-/// up on the focused window names that window, so its result — and the surface it
-/// pins — is about the one surface it actually used.
+/// [`resolve_action_target`] with the surface made concrete: a call that ends up on the
+/// focused window, or on an application id, names the one window it addresses. Everything
+/// recorded about a surface — the remembered look, the order a listing gives it — is about
+/// one window, so an application address is made concrete before anything is stored, and
+/// an application id that now names a different window has nothing to compare against
+/// rather than a fabricated move. This is [`resolve_in_place`] plus the focused surface,
+/// which a read or a point action needs named.
 async fn resolve_surface(target: Option<&str>) -> anyhow::Result<TargetSpec> {
+    let surface = resolve_in_place(target).await?;
+    if !matches!(surface, TargetSpec::Focused) {
+        return Ok(surface);
+    }
+    let win = backend().surface_window(&surface).await?;
+    Ok(TargetSpec::from_window(&win))
+}
+
+/// The surface an action that may go to whatever holds the focus addresses — typing, a
+/// drag, a wheel at a point. It is resolved exactly once and the input is delivered through
+/// what it resolved: an `a` id is made concrete, so the window the answer is about is the
+/// window that receives the input, while a call that names nothing and has observed
+/// nothing keeps addressing the focused surface, as global input always has.
+///
+/// Nothing here can fail for a surface that cannot be *named*: the only read is the one an
+/// `a` id owes anyway.
+async fn resolve_in_place(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     match resolve_action_target(target)? {
-        TargetSpec::Focused => {
-            let win = backend().focused_window().await?;
+        app @ TargetSpec::App { .. } => {
+            let win = backend().surface_window(&app).await?;
             Ok(TargetSpec::from_window(&win))
         }
         other => Ok(other),
@@ -1126,17 +1390,19 @@ async fn resolve_surface(target: Option<&str>) -> anyhow::Result<TargetSpec> {
 }
 
 /// Drop the id a failed call was asked through when the failure confirmed that
-/// surface gone. Only a confirmed death counts: a busy or unanswering surface keeps
-/// its id, and an identifier the call never named (a ref action, a global key chord)
-/// has none to drop. This is what keeps the table following the desktop without any
-/// polling — nothing is remembered about a surface that no longer exists.
+/// surface gone, and forget the remembered look of that surface however the call
+/// addressed it — by an id, by a ref, or as the surface it last used. Only a confirmed
+/// death counts: a busy or unanswering surface keeps both, and an identifier the call
+/// never named (a global key chord) has neither to drop. This is what keeps the tables
+/// following the desktop without any polling — nothing is remembered about a surface
+/// that no longer exists.
 fn forget_confirmed_gone(action: &ComputerAction, err: &anyhow::Error) {
     if !core::is_surface_gone(err) {
         return;
     }
     let named = match action {
         ComputerAction::Windows { app } => app.as_deref(),
-        ComputerAction::Observe { target }
+        ComputerAction::Observe { target, .. }
         | ComputerAction::Screenshot { target }
         | ComputerAction::Zoom { target, .. }
         | ComputerAction::Click { target, .. }
@@ -1148,15 +1414,39 @@ fn forget_confirmed_gone(action: &ComputerAction, err: &anyhow::Error) {
         | ComputerAction::Cursor {}
         | ComputerAction::Wait { .. } => None,
     };
+    let by_ref = match action {
+        ComputerAction::Click {
+            reference: Some(reference),
+            ..
+        }
+        | ComputerAction::Type {
+            reference: Some(reference),
+            ..
+        } => core::resolve_ref(reference).ok().map(|(_, target)| target),
+        _ => None,
+    };
+    // The surface to forget: the one the ref belongs to (which may not be the surface this
+    // session last used), else the id the call named, else — for a call that named its
+    // surface by name or pid, which never had an id — that application's own records. The
+    // session's last surface is the fallback only when the call named none: forgetting it
+    // for a surface the call did name would drop an unrelated record.
+    if let Some(surface) = by_ref.or_else(|| named.and_then(|arg| core::get_target(arg.trim()))) {
+        core::forget_look(&surface);
+    } else if let Some(arg) = named {
+        core::forget_look_of_app_argument(arg);
+    } else if let Some(surface) = core::last_surface() {
+        core::forget_look(&surface);
+    }
     if let Some(id) = named {
         core::forget_target(id.trim());
     }
 }
 
 async fn apps() -> anyhow::Result<String> {
-    let apps = backend().list_apps().await?;
+    let listing = backend().list_apps().await?;
     // An a-id targets the app's own focused window, re-resolved at act time.
-    let surfaces = apps
+    let surfaces = listing
+        .apps
         .iter()
         .map(|app| TargetSpec::App {
             app_pid: app.pid,
@@ -1164,15 +1454,37 @@ async fn apps() -> anyhow::Result<String> {
         })
         .collect::<Vec<_>>();
     let ids = core::store_app_targets(&surfaces);
-    let mut lines = Vec::with_capacity(apps.len());
-    for (app, id) in apps.iter().zip(&ids) {
+    let mut lines = Vec::with_capacity(listing.apps.len());
+    for (app, id) in listing.apps.iter().zip(&ids) {
         let pid = app.pid.map_or_else(|| "?".to_string(), |p| p.to_string());
         lines.push(format!("[{id}] {} (pid {pid})", app.name));
     }
     if lines.is_empty() {
-        Ok("no apps found".to_string())
-    } else {
-        Ok(lines.join("\n"))
+        lines.push("no apps found".to_string());
+    }
+    let names = listing
+        .apps
+        .iter()
+        .map(|app| app.name.as_str())
+        .collect::<Vec<_>>();
+    lines.push(frontmost_line(listing.frontmost.as_deref(), &names));
+    Ok(lines.join("\n"))
+}
+
+/// The line that names what is in front — the one thing a listing must never leave the
+/// caller to infer, including when that application is not among those listed (a
+/// menu-bar accessory, a process with no enumerable window).
+fn frontmost_line(frontmost: Option<&str>, listed: &[&str]) -> String {
+    match frontmost {
+        None => "frontmost application: unknown — the application in front could not be named"
+            .to_string(),
+        Some(name) => {
+            if listed.iter().any(|app| app.eq_ignore_ascii_case(name)) {
+                format!("frontmost application: {name}")
+            } else {
+                format!("frontmost application: {name} (not in the list above)")
+            }
+        }
     }
 }
 
@@ -1197,28 +1509,45 @@ async fn windows(app: Option<&str>) -> anyhow::Result<String> {
         .map(TargetSpec::from_window)
         .collect::<Vec<_>>();
     let ids = core::store_window_targets(&surfaces);
-    Ok(render_windows(&listing, &ids))
+    Ok(render_windows(&listing, &ids, app_info.as_ref()))
 }
 
-/// The listing as the model reads it: one line per window, then one line per set of
-/// windows that is not listed. A failed read is never presented as an absence, and
-/// the note never claims anything about the windows listed above it — an application
-/// can have both.
-fn render_windows(listing: &core::WindowListing, ids: &[String]) -> String {
+/// The listing as the model reads it: one line per window, then what the platform could
+/// establish about the set — its order, the application in front and, for a single
+/// application, whether it is that one — then one line per set of windows that is not
+/// listed. A failed read is never presented as an absence, and the note never claims
+/// anything about the windows listed above it — an application can have both.
+fn render_windows(
+    listing: &core::WindowListing,
+    ids: &[String],
+    requested: Option<&AppInfo>,
+) -> String {
     let mut lines = listing
         .windows
         .iter()
         .zip(ids)
         .map(|(win, id)| {
-            format!(
-                "[{id}] {} — \"{}\" {}x{} @ ({}, {})",
+            // The place in the order and the focused mark sit beside the identity: two
+            // windows that share a title and a position still stand apart by the id and,
+            // where the platform has one, by their place in the order.
+            let mut line = format!("[{id}] ");
+            if let Some(rank) = win.rank {
+                let _ = write!(line, "#{rank} ");
+            }
+            let _ = write!(
+                line,
+                "{} — \"{}\" {}x{} @ ({}, {})",
                 win.app_name,
                 win.title,
                 win.surface.width,
                 win.surface.height,
                 win.surface.x,
                 win.surface.y
-            )
+            );
+            if win.focused {
+                line.push_str(" [focused]");
+            }
+            line
         })
         .collect::<Vec<_>>();
     if lines.is_empty() {
@@ -1231,6 +1560,63 @@ fn render_windows(listing: &core::WindowListing, ids: &[String]) -> String {
             .to_string(),
         );
     }
+    // An order that is not complete says which kind of incompleteness it is: a failed read
+    // names the read, a platform that cannot attribute an order says that, and a listing
+    // whose windows simply have no place says how many of the listed ones it covers.
+    if !listing.windows.is_empty() {
+        match listing.order {
+            core::WindowOrder::All => {}
+            core::WindowOrder::Unknown => lines.push(
+                "front-to-back order: unknown — the platform could not attribute one to the \
+                 windows listed"
+                    .to_string(),
+            ),
+            core::WindowOrder::Unread => lines.push(
+                "front-to-back order: unknown — the list it is attributed from could not be read \
+                 this time"
+                    .to_string(),
+            ),
+            core::WindowOrder::Partial => {
+                let total = listing.windows.len();
+                let unplaced = listing
+                    .windows
+                    .iter()
+                    .filter(|window| window.rank.is_none())
+                    .count();
+                let ranked = total - unplaced;
+                lines.push(if ranked == 0 {
+                    "front-to-back order: unknown — no listed window has an on-screen entry to be \
+                     ranked by"
+                        .to_string()
+                } else {
+                    format!(
+                        "front-to-back order: given for {ranked} of the {total} listed windows (#1 \
+                         is in front); {unplaced} {} no on-screen entry",
+                        if unplaced == 1 { "has" } else { "have" }
+                    )
+                });
+            }
+        }
+    }
+    lines.push(if let Some(app) = requested {
+        match listing.frontmost.as_deref() {
+            None => format!(
+                "whether {} is frontmost: unknown — the application in front could not be named",
+                app.name
+            ),
+            Some(front) if front.eq_ignore_ascii_case(&app.name) => {
+                format!("{} is frontmost", app.name)
+            }
+            Some(front) => format!("{} is not frontmost — {front} is", app.name),
+        }
+    } else {
+        let names = listing
+            .windows
+            .iter()
+            .map(|win| win.app_name.as_str())
+            .collect::<Vec<_>>();
+        frontmost_line(listing.frontmost.as_deref(), &names)
+    });
     lines.extend(listing.unread.iter().map(|unread| {
         format!(
             "windows not listed for {}: {}",
@@ -1260,7 +1646,7 @@ async fn resolve_app(arg: &str) -> anyhow::Result<AppInfo> {
     if core::is_identifier(trimmed) {
         return Err(core::unknown_identifier(trimmed));
     }
-    let apps = backend().list_apps().await?;
+    let apps = backend().list_apps().await?.apps;
     if let Ok(pid) = trimmed.parse::<u32>() {
         return apps
             .iter()
@@ -1305,7 +1691,9 @@ fn no_app_error(name: &str, apps: &[AppInfo]) -> anyhow::Error {
 
 /// A ref-based action pins the observed surface; an explicit target that
 /// resolves to a DIFFERENT surface is almost always a mistake (the model kept
-/// both arguments). An equal target is fine.
+/// both arguments). An equal target is fine, and so is an application id whose
+/// application is the ref's — the ref itself names the window the caller saw, and that is
+/// what the action is delivered to.
 fn ensure_ref_target_match(
     reference: &str,
     target: Option<&str>,
@@ -1315,7 +1703,9 @@ fn ensure_ref_target_match(
         return Ok(());
     };
     let given = core::resolve_target(Some(t))?;
-    if given != *cache_target {
+    let same_app =
+        matches!(given, TargetSpec::App { .. }) && core::same_application(&given, cache_target);
+    if given != *cache_target && !same_app {
         anyhow::bail!(
             "ref {reference} belongs to the surface observed for {} — drop the target argument \
              or re-observe the target you want",
@@ -1325,37 +1715,134 @@ fn ensure_ref_target_match(
     Ok(())
 }
 
-async fn observe(target: Option<&str>) -> anyhow::Result<String> {
-    // A concrete surface, never `Focused`: the observation pins THIS window, so a
-    // later action re-resolves it (and fails honestly if it is gone) instead of
-    // whatever happens to be focused then.
-    let target = resolve_surface(target).await?;
-    let obs = backend().observe(&target).await?;
-    // Only a successful observation moves the pin; a failed one leaves the
-    // surface this agent last observed in place.
-    core::set_last_surface(target.clone());
-    core::store_observation(target, &obs);
+/// Read a surface — the whole of it, part of what is already known of it, or what
+/// changed on it.
+///
+/// A **full** observation (`target` only, or a call in which nothing narrows) is the one
+/// thing that records a surface: it pins the surface a later target-less call addresses,
+/// mints the refs the caller may act on, and replaces the remembered look every later
+/// statement about that surface is measured against. It replaces all three together, and
+/// a failed observation replaces nothing.
+///
+/// A **narrow** look (`ref`, `depth`, `kind`) reads the remembered look instead of the
+/// platform: it shows part of a tree the tool already holds, says that it covers part of
+/// the surface, and replaces nothing — not the look, not the refs. On a surface never
+/// fully observed there is nothing to narrow, and the answer says so.
+///
+/// A **change** answer (`changed`) reads the surface afresh and compares it against the
+/// remembered look: what appeared, disappeared, moved and changed, against what and how
+/// old. It replaces nothing either. With no remembered look there is nothing to compare
+/// against, so the call is an ordinary full observation: it records the surface and its
+/// refs like any other.
+async fn observe(
+    target: Option<&str>,
+    reference: Option<&str>,
+    depth: Option<usize>,
+    kind: Option<String>,
+    changed: bool,
+) -> anyhow::Result<Delivered> {
+    // The surface a ref names is the one it was observed on, so a narrow look by ref never
+    // resolves a different one; every other form resolves the surface concretely, never
+    // `Focused`, so what is recorded is the window this call actually read.
+    let (surface, at) = match reference {
+        Some(reference) => {
+            let (locator, cache_target) = core::resolve_ref(reference)?;
+            ensure_ref_target_match(reference, target, &cache_target)?;
+            (cache_target, Some(locator))
+        }
+        None => (resolve_surface(target).await?, None),
+    };
+    let narrow = core::Narrow { at, depth, kind };
 
-    // render_tree emits the "[Surface: ...]" header (with node/interactive
-    // counts), so compose the full output here and scrub it BEFORE any spill.
-    let mut output = core::render_tree(&obs);
-    if core::is_ax_thin(&obs) {
-        // A hint may only name a route that works at this moment: a still when stills
-        // are known to work, and otherwise the references it lists and the window listing.
-        output.push_str("surface exposes few actionable elements — ");
-        output.push_str(if capture_known_available() {
-            "use screenshot"
-        } else {
-            "act on the references it lists, or use apps/windows for another surface"
-        });
-        output.push('\n');
+    if changed {
+        return Ok(Delivered::Read(observe_changed(&surface).await?));
     }
-    // Spill ONLY the fully scrubbed output; try_spill_to_file returns the input
-    // unchanged when under budget, so no separate pre-check is needed.
-    Ok(crate::tools::shell::try_spill_to_file(
-        crate::util::scrub_credentials(&output),
+    if narrow.is_narrow() {
+        let refs_valid = core::refs_belong_to(&surface);
+        // The record is shared, so the view is rendered with no lock held.
+        let Some(look) = core::with_look(&surface) else {
+            return Ok(Delivered::Read(spill(&format!(
+                "nothing to narrow — {}; run observe on it, or drop ref, depth and kind to read \
+                 it now",
+                no_look()
+            ))));
+        };
+        let answer = core::render_narrow(&look, &narrow, refs_valid)?;
+        return Ok(Delivered::Read(spill(&answer)));
+    }
+
+    let obs = backend().observe(&surface).await?;
+    let counts = core::counts(&obs.root);
+    // Rendered before the observation is remembered: the record owns the tree, so nothing
+    // is copied and the answer is built from the read itself.
+    let full = render_full(&obs, counts);
+    record_observation(&surface, obs, counts);
+    Ok(Delivered::Read(spill(&full)))
+}
+
+/// The change answer: what differs from the surface's remembered look, or an ordinary
+/// full observation when there is nothing to compare against.
+async fn observe_changed(surface: &TargetSpec) -> anyhow::Result<String> {
+    let obs = backend().observe(surface).await?;
+    let counts = core::counts(&obs.root);
+    if let Some(look) = core::with_look(surface) {
+        return Ok(spill(&core::render_changes(&look, &obs, counts)));
+    }
+    let mut output = render_full(&obs, counts);
+    let _ = writeln!(
+        output,
+        "nothing to compare against — {}; it is now recorded and its refs are the ones to act on",
+        no_look()
+    );
+    record_observation(surface, obs, counts);
+    Ok(spill(&output))
+}
+
+/// Record a full observation: the surface a later target-less call addresses, the refs
+/// the caller may act on now, and the remembered look later statements are measured
+/// against. One place writes all three, so no path can record one without the others.
+fn record_observation(surface: &TargetSpec, obs: core::Observation, counts: core::Counts) {
+    core::set_last_surface(surface.clone());
+    core::store_observation(surface.clone(), &obs);
+    core::remember_look(surface, obs, counts);
+}
+
+/// The full observation as the model reads it, with the thin-surface hint when the tree
+/// barely describes what is on screen. The hint fires here and nowhere else: a narrow
+/// look and a change answer are views of a tree, not a statement about the surface.
+fn render_full(obs: &core::Observation, counts: core::Counts) -> String {
+    let mut output = core::render_tree(obs, counts);
+    if counts.interactive < core::AX_THIN_INTERACTIVE_ELEMENTS {
+        let _ = writeln!(
+            output,
+            "surface exposes few actionable elements — {} interactive of {} nodes read: {}",
+            counts.interactive,
+            counts.nodes,
+            // A hint may only name a route that works at this moment: a still when stills
+            // are known to work, a statement that they are unavailable when that is known,
+            // and neither when availability is unknown.
+            match cached_capture_available() {
+                Some(true) => "use screenshot to see the rest",
+                Some(false) => {
+                    "stills are unavailable here, so act on the references it lists, or use \
+                     apps/windows for another surface"
+                }
+                None => {
+                    "act on the references it lists, or use apps/windows for another surface"
+                }
+            }
+        );
+    }
+    output
+}
+
+/// Hand the answer to the spill budget, scrubbed first: the tree is the one result that
+/// can be large enough to be written to a file instead of returned whole.
+fn spill(output: &str) -> String {
+    crate::tools::shell::try_spill_to_file(
+        crate::util::scrub_credentials(output),
         TOOL_OUTPUT_BUDGET_BYTES,
-    ))
+    )
 }
 
 async fn click(
@@ -1366,44 +1853,65 @@ async fn click(
     button: Option<MouseButton>,
     double: Option<bool>,
     modifiers: Option<&[core::Modifier]>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Delivered> {
     if let Some(reference) = reference {
         let (locator, cache_target) = core::resolve_ref(reference)?;
         ensure_ref_target_match(reference, target, &cache_target)?;
         let impact = backend()
             .act_on_element(&cache_target, &locator, ElementAct::Press)
             .await?;
-        return Ok(core::impact_text(
-            format!("clicked element {reference}{}", on_surface(&cache_target)),
-            impact,
-        ));
+        return Ok(Delivered::OnSurface {
+            text: core::impact_text(
+                format!(
+                    "clicked element {reference}{}",
+                    on_surface(&cache_target, None)
+                ),
+                impact,
+            ),
+            surface: cache_target,
+        });
     }
     let Some((x, y)) = coord_pair(x, y, "click point")? else {
         anyhow::bail!("click requires an element ref (preferred) or normalized x/y coordinates");
     };
-    let target = resolve_action_target(target)?;
+    // A concrete surface: its own points are what the point is mapped through, what the
+    // window under the point is compared against, and what the answer names.
+    let target = resolve_surface(target).await?;
     let input = core::RawInput::Click {
         point: (x, y),
         button: button.unwrap_or(MouseButton::Left),
         double: double.unwrap_or(false),
         modifiers: modifiers.unwrap_or_default().to_vec(),
     };
-    let impact = backend().raw_input(&target, input.clone()).await?;
-    Ok(core::impact_text(
-        format!(
-            "clicked at ({x}, {y}){}{}",
-            on_surface(&target),
-            unpinned_clause(&target, &input)
+    // What the point lies over is checked by the backend at the moment it sends, after
+    // its own raise: only there is "in front" the state the click meets. The same call
+    // reports the position it actually put, so the answer never quotes a point from a
+    // different read of the surface than the one the click used.
+    let actuation = backend().raw_input(&target, input.clone()).await?;
+    let mut text = match &actuation.placed {
+        Some(placed) => format!(
+            "clicked at {}{}",
+            placed.describe(),
+            on_surface(&target, Some(placed))
         ),
-        impact,
-    ))
+        None => format!("clicked{}{UNREAD_POSITION}", on_surface(&target, None)),
+    };
+    let _ = write!(text, " — input {}", point_text((x, y)));
+    Ok(Delivered::OnSurface {
+        text: core::impact_text(text, actuation.impact),
+        surface: target,
+    })
 }
+
+/// What a point action's answer says when the call ended without an answer: the position it
+/// was asked to put could not be read, so nothing is claimed about where it went.
+const UNREAD_POSITION: &str = " — its position could not be read";
 
 async fn type_text(
     text: &str,
     target: Option<&str>,
     reference: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Delivered> {
     if let Some(reference) = reference {
         let (locator, cache_target) = core::resolve_ref(reference)?;
         ensure_ref_target_match(reference, target, &cache_target)?;
@@ -1416,34 +1924,41 @@ async fn type_text(
                 },
             )
             .await?;
-        return Ok(core::impact_text(
-            format!(
-                "set value on element {reference} in {}",
-                cache_target.describe()
+        return Ok(Delivered::OnSurface {
+            text: core::impact_text(
+                format!(
+                    "set value on element {reference} in {}",
+                    cache_target.describe()
+                ),
+                impact,
             ),
-            impact,
-        ));
+            surface: cache_target,
+        });
     }
-    let target = resolve_action_target(target)?;
+    // Typing without a ref goes to whatever holds the focus. The surface is resolved once
+    // and the input delivered through it: an `a` id becomes the window that receives the
+    // text, while a call with nothing observed yet keeps the global typing it has always
+    // done.
+    let surface = resolve_in_place(target).await?;
     let input = core::RawInput::TypeText {
         text: text.to_string(),
     };
-    let impact = backend().raw_input(&target, input.clone()).await?;
-    // Typing is pinned only on a named window; with `screen` or nothing observed
-    // yet it goes to the focused element, so the result must not claim a surface
-    // it never reached.
-    Ok(core::impact_text(
-        format!(
-            "typed text ({} chars){}",
-            text.chars().count(),
-            if core::pinned_input(&target, &input) {
-                on_surface(&target)
-            } else {
-                " — the text goes to the focused element".to_string()
-            }
+    let actuation = backend().raw_input(&surface, input.clone()).await?;
+    Ok(Delivered::OnSurface {
+        text: core::impact_text(
+            format!(
+                "typed text ({} chars){}",
+                text.chars().count(),
+                if core::pinned_input(&surface, &input) {
+                    on_surface(&surface, None)
+                } else {
+                    " — the text goes to the focused element".to_string()
+                }
+            ),
+            actuation.impact,
         ),
-        impact,
-    ))
+        surface,
+    })
 }
 
 async fn scroll(
@@ -1452,12 +1967,12 @@ async fn scroll(
     target: Option<&str>,
     x: Option<f64>,
     y: Option<f64>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Delivered> {
     let amount = amount.unwrap_or(DEFAULT_SCROLL_AMOUNT);
     let Some(point) = coord_pair(x, y, "scroll anchor")? else {
         // A point-less wheel is global input: no surface is resolved or raised, and the
         // validator has already refused a target that names one.
-        let impact = backend()
+        let actuation = backend()
             .raw_input(
                 &TargetSpec::Focused,
                 core::RawInput::Scroll {
@@ -1467,31 +1982,38 @@ async fn scroll(
                 },
             )
             .await?;
-        return Ok(core::impact_text(
+        return Ok(Delivered::Global(core::impact_text(
             format!(
                 "scrolled {amount} ticks {direction:?} — a point-less wheel goes to whatever is \
                  under the pointer"
             ),
-            impact,
-        ));
+            actuation.impact,
+        )));
     };
-    let target = resolve_action_target(target)?;
+    let surface = resolve_in_place(target).await?;
     let input = core::RawInput::Scroll {
         point: Some(point),
         direction,
         amount,
     };
-    let impact = backend().raw_input(&target, input.clone()).await?;
-    Ok(core::impact_text(
-        format!(
-            "scrolled {amount} ticks {direction:?} at ({}, {}){}{}",
-            point.0,
-            point.1,
-            on_surface(&target),
-            unpinned_clause(&target, &input)
+    let actuation = backend().raw_input(&surface, input.clone()).await?;
+    let mut text = match &actuation.placed {
+        Some(placed) => format!(
+            "scrolled {amount} ticks {direction:?} at {}{}",
+            placed.describe(),
+            on_surface(&surface, Some(placed))
         ),
-        impact,
-    ))
+        None => format!(
+            "scrolled {amount} ticks {direction:?}{}{UNREAD_POSITION}",
+            on_surface(&surface, None)
+        ),
+    };
+    let _ = write!(text, " — input {}", point_text(point));
+    text.push_str(unpinned_clause(&surface, &input));
+    Ok(Delivered::OnSurface {
+        text: core::impact_text(text, actuation.impact),
+        surface,
+    })
 }
 
 /// The surface a `cursor` reading is relative to, with its geometry: a concrete
@@ -1523,7 +2045,7 @@ async fn cursor() -> anyhow::Result<String> {
         let (nx, ny) = core::surface_to_normalized(ax, ay, &geo)?;
         Ok(format!(
             "cursor at normalized ({nx:.1}, {ny:.1}){} — absolute ({ax:.1}, {ay:.1})",
-            on_surface(&target)
+            on_surface(&target, None)
         ))
     } else {
         Ok(format!(
@@ -1680,38 +2202,170 @@ mod tests {
         }
     }
 
+    fn window_info(title: &str, focused: bool, rank: Option<usize>) -> core::WindowInfo {
+        core::WindowInfo {
+            app_pid: Some(10),
+            app_name: "Chrome".to_string(),
+            title: title.to_string(),
+            key: core::WindowKey::new(format!("k{title}")),
+            surface: core::SurfaceGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            focused,
+            rank,
+        }
+    }
+
+    fn app(name: &str) -> AppInfo {
+        AppInfo {
+            pid: Some(10),
+            name: name.to_string(),
+        }
+    }
+
     /// The unread note sits on its own line, so it can neither run into the last
     /// window line nor claim that an application has nothing listed when it does.
     #[test]
     fn window_listing_puts_each_unread_note_on_its_own_line() {
         let listing = core::WindowListing {
-            windows: vec![core::WindowInfo {
-                app_pid: Some(10),
-                app_name: "Chrome".to_string(),
-                title: "Start".to_string(),
-                key: core::WindowKey::new("k"),
-                surface: core::SurfaceGeometry {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 800.0,
-                    height: 600.0,
-                },
-            }],
+            windows: vec![window_info("Start", false, Some(2))],
             unread: vec![unread_explorer()],
+            frontmost: Some("Chrome".to_string()),
+            order: core::WindowOrder::All,
         };
         assert_eq!(
-            render_windows(&listing, &["w1".to_string()]),
-            "[w1] Chrome — \"Start\" 800x600 @ (0, 0)\n\
+            render_windows(&listing, &["w1".to_string()], None),
+            "[w1] #2 Chrome — \"Start\" 800x600 @ (0, 0)\n\
+             frontmost application: Chrome\n\
              windows not listed for Explorer: one read timed out"
         );
         // A listing where nothing could be read is a failure, not "no windows".
         let nothing = core::WindowListing {
             windows: Vec::new(),
             unread: vec![unread_explorer()],
+            frontmost: None,
+            order: core::WindowOrder::Unknown,
         };
         assert_eq!(
-            render_windows(&nothing, &[]),
-            "no windows could be read\nwindows not listed for Explorer: one read timed out"
+            render_windows(&nothing, &[], None),
+            "no windows could be read\n\
+             frontmost application: unknown — the application in front could not be named\n\
+             windows not listed for Explorer: one read timed out"
+        );
+    }
+
+    /// A listing says what the platform could establish about the set: a front-to-back
+    /// order only where it is attributable to the windows listed, the focused window of
+    /// the requested application, and whether that application is the one in front.
+    #[test]
+    fn window_listing_states_order_focus_and_the_application_in_front() {
+        let unordered = core::WindowListing {
+            windows: vec![window_info("Inbox", false, None)],
+            unread: Vec::new(),
+            frontmost: Some("Notes".to_string()),
+            order: core::WindowOrder::Unknown,
+        };
+        assert_eq!(
+            render_windows(&unordered, &["w1".to_string()], Some(&app("Chrome"))),
+            "[w1] Chrome — \"Inbox\" 800x600 @ (0, 0)\n\
+             front-to-back order: unknown — the platform could not attribute one to the windows \
+             listed\n\
+             Chrome is not frontmost — Notes is"
+        );
+
+        // The frontmost application's own listing marks its focused window.
+        let focused = core::WindowListing {
+            windows: vec![window_info("Inbox", true, Some(1))],
+            unread: Vec::new(),
+            frontmost: Some("Chrome".to_string()),
+            order: core::WindowOrder::All,
+        };
+        assert_eq!(
+            render_windows(&focused, &["w1".to_string()], Some(&app("Chrome"))),
+            "[w1] #1 Chrome — \"Inbox\" 800x600 @ (0, 0) [focused]\nChrome is frontmost"
+        );
+
+        // Where the platform cannot name the frontmost application, the listing says so.
+        let unknown = core::WindowListing {
+            windows: vec![window_info("Inbox", false, None)],
+            unread: Vec::new(),
+            frontmost: None,
+            order: core::WindowOrder::Unknown,
+        };
+        assert!(
+            render_windows(&unknown, &["w1".to_string()], Some(&app("Chrome"))).contains(
+                "whether Chrome is frontmost: unknown — the application in front could not be named"
+            )
+        );
+    }
+
+    /// A listing's order statement says which kind of incompleteness it is: a partial order
+    /// counts what it covers, a failed read of the list names the read, and neither claims a
+    /// platform incapability.
+    #[test]
+    fn a_partial_or_unread_order_says_which_it_is() {
+        let partial = core::WindowListing {
+            windows: vec![
+                window_info("Inbox", false, Some(1)),
+                window_info("Sent", false, None),
+                window_info("Drafts", false, None),
+            ],
+            unread: Vec::new(),
+            frontmost: Some("Chrome".to_string()),
+            order: core::WindowOrder::Partial,
+        };
+        assert!(
+            render_windows(&partial, &["w1".into(), "w2".into(), "w3".into()], None).contains(
+                "front-to-back order: given for 1 of the 3 listed windows (#1 is in front); 2 \
+                     have no on-screen entry"
+            )
+        );
+        let none_ranked = core::WindowListing {
+            windows: vec![
+                window_info("Inbox", false, None),
+                window_info("Sent", false, None),
+                window_info("Drafts", false, None),
+            ],
+            order: core::WindowOrder::Partial,
+            ..partial
+        };
+        assert!(
+            render_windows(&none_ranked, &["w1".into(), "w2".into(), "w3".into()], None).contains(
+                "front-to-back order: unknown — no listed window has an on-screen entry to be \
+                 ranked by"
+            )
+        );
+        // A list that could not be read is a failed read, not a fact about the windows.
+        let unread = core::WindowListing {
+            windows: vec![window_info("Inbox", false, None)],
+            unread: Vec::new(),
+            frontmost: Some("Chrome".to_string()),
+            order: core::WindowOrder::Unread,
+        };
+        assert!(render_windows(&unread, &["w1".to_string()], None).contains(
+            "front-to-back order: unknown — the list it is attributed from could not be read \
+                 this time"
+        ));
+    }
+
+    /// The applications listing names what is in front, including an application it
+    /// could not list among those shown.
+    #[test]
+    fn an_app_listing_names_the_frontmost_application_even_unlisted() {
+        assert_eq!(
+            frontmost_line(Some("Mail"), &["Mail", "Notes"]),
+            "frontmost application: Mail"
+        );
+        assert_eq!(
+            frontmost_line(Some("Dock"), &["Mail"]),
+            "frontmost application: Dock (not in the list above)"
+        );
+        assert_eq!(
+            frontmost_line(None, &["Mail"]),
+            "frontmost application: unknown — the application in front could not be named"
         );
     }
 
@@ -1871,6 +2525,36 @@ mod tests {
                 json!({"direction": "down", "target": "a1"})
             ))
             .is_err()
+        );
+
+        // An observation either narrows what is already known or asks what changed, and
+        // its depth is bounded like every other argument.
+        assert!(
+            validate_action(&parsed_action("observe", json!({"depth": 0}))).is_err(),
+            "a depth of 0 shows nothing"
+        );
+        assert!(
+            validate_action(&parsed_action(
+                "observe",
+                json!({"depth": core::MAX_TREE_DEPTH + 1})
+            ))
+            .is_err()
+        );
+        let err = refusal(&parsed_action(
+            "observe",
+            json!({"changed": true, "kind": "button"}),
+        ));
+        assert!(
+            err.contains("changed on its own"),
+            "the two questions are refused together: {err}"
+        );
+        assert!(validate_action(&parsed_action("observe", json!({"changed": true}))).is_ok());
+        assert!(
+            validate_action(&parsed_action(
+                "observe",
+                json!({"ref": "e3", "depth": 2, "kind": "button"})
+            ))
+            .is_ok()
         );
 
         // A field outside the action, whichever form the call used.

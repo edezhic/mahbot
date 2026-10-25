@@ -5,9 +5,12 @@
 //! refuse a foreground change to a background process). Input that is pinned to a
 //! named window — typing, a drag, a wheel at a point — then verifies the window is
 //! actually in front and refuses rather than reporting a success that landed
-//! elsewhere; a coordinate click, a point-less wheel and a key chord are
-//! deliberately unpinned and go where the system sends them. Coordinates are
-//! physical pixels throughout, matching the UIA tree and the capture.
+//! elsewhere; a coordinate click, a point-less wheel and a key chord are not pinned, in
+//! the sense that their delivery to the named window is not verified. A coordinate click
+//! is still checked at the moment it is sent: a window of another application under the
+//! point refuses the call as `blocked`, so nothing is posted into a window the call never
+//! addressed. Coordinates are physical pixels throughout, matching the UIA tree and the
+//! capture.
 //!
 //! Every batch is refused before it is sent when the secure desktop is up or the
 //! window belongs to an elevated process (see [`super::window`]); a batch Windows
@@ -23,6 +26,7 @@ use super::super::core::{
     self, Impact, Modifier, MouseButton, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec,
 };
 use super::window;
+use crate::util::UnwrapPoison;
 use anyhow::anyhow;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -55,7 +59,11 @@ const KNOWN_KEYS: &str = "return/enter, tab, space, delete/backspace, forwarddel
 
 // ── Raw input ───────────────────────────────────────────────────────────
 
-pub(super) fn raw_input(target: &TargetSpec, input: RawInput) -> anyhow::Result<Impact> {
+pub(super) fn raw_input(
+    target: &TargetSpec,
+    input: RawInput,
+    placed: Option<&super::thread::PlacementMemo>,
+) -> anyhow::Result<core::Actuation> {
     let pinned = core::pinned_input(target, &input);
     match input {
         RawInput::Click {
@@ -63,13 +71,13 @@ pub(super) fn raw_input(target: &TargetSpec, input: RawInput) -> anyhow::Result<
             button,
             double,
             modifiers,
-        } => click(target, point, button, double, &modifiers),
+        } => click(target, point, button, double, &modifiers, placed),
         RawInput::TypeText { text } => {
             let resolved = resolve_window(target)?;
             // Typing goes to whatever holds focus, so that is the window the refusal
             // is about.
             activate_target(&Aim::of(resolved.as_ref(), window::foreground), pinned)?;
-            send(&type_events(&text))
+            send(&type_events(&text)).map(core::Actuation::of)
         }
         RawInput::KeyChord { chord } => {
             // A chord is global: it goes to whatever already has focus (as on
@@ -78,14 +86,14 @@ pub(super) fn raw_input(target: &TargetSpec, input: RawInput) -> anyhow::Result<
             let (modifiers, key) = core::parse_key_chord(&chord)?;
             let key = vk_for(&key)?;
             window::ensure_actuation_allowed(window::foreground())?;
-            send(&chord_events(&modifiers, key))
+            send(&chord_events(&modifiers, key)).map(core::Actuation::of)
         }
         RawInput::Scroll {
             point,
             direction,
             amount,
-        } => scroll(target, point, direction, amount, pinned),
-        RawInput::Drag { from, to } => drag(target, from, to, pinned),
+        } => scroll(target, point, direction, amount, pinned, placed),
+        RawInput::Drag { from, to } => drag(target, from, to, pinned, placed),
     }
 }
 
@@ -153,9 +161,10 @@ impl<'a> Aim<'a> {
 /// Check the two refusals before input, and raise a window target. Pinned input —
 /// typed text, a drag, a wheel at a point on a named window — is meant for that very
 /// window, so a foreground change Windows refused fails the call here instead of
-/// reporting a success that would land in whatever is in front; unpinned input (a
-/// coordinate click, a point-less wheel) only raises, because it goes where the
-/// system sends it.
+/// reporting a success that would land in whatever is in front. A point-less wheel is not
+/// pinned either — it goes to whatever is under the pointer — so it only raises. A
+/// coordinate click raises too, and then checks the window under its point before anything
+/// is posted, which is what keeps it out of another application's window.
 fn activate_target(aim: &Aim<'_>, pinned: bool) -> anyhow::Result<()> {
     match aim {
         Aim::Window(resolved) => {
@@ -194,17 +203,39 @@ fn click(
     button: MouseButton,
     double: bool,
     modifiers: &[Modifier],
-) -> anyhow::Result<Impact> {
+    placed: Option<&super::thread::PlacementMemo>,
+) -> anyhow::Result<core::Actuation> {
     let resolved = resolve_window(target)?;
     let geometry = surface_of(resolved.as_ref())?;
-    let (x, y) = core::normalized_to_surface(point.0, point.1, &geometry)?;
-    let (x, y) = (round_i32(x), round_i32(y));
-    // A coordinate click is pointer input, never pinned: raise, but the click lands
-    // on whatever is under the point.
+    let (fx, fy) = core::normalized_to_surface(point.0, point.1, &geometry)?;
+    let (x, y) = (round_i32(fx), round_i32(fy));
+    let placement = core::Placement {
+        geometry,
+        from: core::surface_local((fx, fy), &geometry),
+        to: None,
+    };
+    record_placement(placed, placement);
+    // A coordinate click is pointer input, never pinned: raise the named window, then
+    // ask what actually lies at the point before posting anything.
     activate_target(
         &Aim::of(resolved.as_ref(), || window::top_level_at(x, y)),
         false,
     )?;
+    // The check runs here, at the moment the events are posted: a window of another
+    // application means nothing is sent, and the answer names it. The screen's points belong
+    // to no window, so nothing is read for them.
+    let under = match target {
+        TargetSpec::Screen => None,
+        _ => window::window_at_point(x, y),
+    };
+    let note = core::click_under_point(&core::ClickCheck {
+        surface: target,
+        local: placement.from,
+        geometry: &placement.geometry,
+        addressed_pid: resolved.as_ref().map(|resolved| resolved.pid),
+        addressed_frame: resolved.as_ref().map(|resolved| &resolved.surface),
+        under: under.as_ref(),
+    })?;
     set_cursor(x, y)?;
     let (down, up) = match button {
         MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -218,7 +249,12 @@ fn click(
         events.push(mouse_event(0, 0, 0, up));
     }
     push_modifiers(&mut events, modifiers, true);
-    send(&events)
+    let impact = send(&events)?;
+    let impact = match note {
+        Some(note) => core::impact_note(impact, note),
+        None => impact,
+    };
+    Ok(core::Actuation::at(impact, placement))
 }
 
 fn scroll(
@@ -227,16 +263,25 @@ fn scroll(
     direction: ScrollDirection,
     amount: u32,
     pinned: bool,
-) -> anyhow::Result<Impact> {
+    placed: Option<&super::thread::PlacementMemo>,
+) -> anyhow::Result<core::Actuation> {
     let resolved = resolve_window(target)?;
-    let at = match point {
-        Some((nx, ny)) => {
-            let geometry = surface_of(resolved.as_ref())?;
-            let (x, y) = core::normalized_to_surface(nx, ny, &geometry)?;
-            Some((round_i32(x), round_i32(y)))
-        }
-        None => None,
-    };
+    // The pixel the wheel is put at and the surface position the answer states come from
+    // the one geometry this call maps through.
+    let mut at = None;
+    let mut placement = None;
+    if let Some((nx, ny)) = point {
+        let geometry = surface_of(resolved.as_ref())?;
+        let (x, y) = core::normalized_to_surface(nx, ny, &geometry)?;
+        at = Some((round_i32(x), round_i32(y)));
+        let gesture = core::Placement {
+            geometry,
+            from: core::surface_local((x, y), &geometry),
+            to: None,
+        };
+        placement = Some(gesture);
+        record_placement(placed, gesture);
+    }
     // The elevation refusal is about the window the wheel lands on: the one under the
     // point. Only a `screen`-targeted wheel reaches this probe (a point-less wheel is
     // dispatched to the focused surface, whose window the window arm checks), and that
@@ -263,7 +308,8 @@ fn scroll(
     } else {
         MOUSEEVENTF_HWHEEL
     };
-    send(&[mouse_event(0, 0, data, flags)])
+    let impact = send(&[mouse_event(0, 0, data, flags)])?;
+    Ok(core::Actuation::placed(impact, placement))
 }
 
 fn drag(
@@ -271,11 +317,18 @@ fn drag(
     from: (f64, f64),
     to: (f64, f64),
     pinned: bool,
-) -> anyhow::Result<Impact> {
+    placed: Option<&super::thread::PlacementMemo>,
+) -> anyhow::Result<core::Actuation> {
     let resolved = resolve_window(target)?;
     let geometry = surface_of(resolved.as_ref())?;
     let (fx, fy) = core::normalized_to_surface(from.0, from.1, &geometry)?;
     let (tx, ty) = core::normalized_to_surface(to.0, to.1, &geometry)?;
+    let placement = core::Placement {
+        geometry,
+        from: core::surface_local((fx, fy), &geometry),
+        to: Some(core::surface_local((tx, ty), &geometry)),
+    };
+    record_placement(placed, placement);
     // The gesture starts at `from`, so that is the landing a screen-target drag is
     // checked against — the same rule a click uses.
     activate_target(
@@ -299,25 +352,49 @@ fn drag(
                 Ok(_) => "the button was released again".to_string(),
                 Err(err) => format!("the button may still be held down ({err:#})"),
             };
-            return Ok(Impact::Unconfirmed(format!(
-                "the drag started (the button went down at ({}, {})) but the pointer could not be \
-                 moved further — {e}; {released}",
-                round_i32(fx),
-                round_i32(fy)
-            )));
+            // The start is where the pointer went down, and it is known: the answer states it
+            // rather than saying the position could not be read.
+            return Ok(core::Actuation::at(
+                Impact::Unconfirmed(format!(
+                    "the drag started (the button went down at ({}, {})) but the pointer could \
+                     not be moved further — {e}; {released}",
+                    round_i32(fx),
+                    round_i32(fy)
+                )),
+                // The start is the only end this gesture placed.
+                core::Placement {
+                    geometry,
+                    from: core::surface_local((fx, fy), &geometry),
+                    to: None,
+                },
+            ));
         }
         std::thread::sleep(DRAG_STEP_PAUSE);
     }
     // The gesture ran to its end, so only the release is in question: a refusal
     // leaves the button this call pressed down, which the model must know.
-    let released = match send(&[mouse_event(0, 0, 0, MOUSEEVENTF_LEFTUP)]) {
-        Ok(impact) => return Ok(impact),
-        Err(err) => format!("{err:#}"),
+    let impact = match send(&[mouse_event(0, 0, 0, MOUSEEVENTF_LEFTUP)]) {
+        Ok(impact) => impact,
+        Err(err) => {
+            // Both ends were placed before the release was refused, so the answer states them.
+            return Ok(core::Actuation::at(
+                Impact::Unconfirmed(format!(
+                    "the drag ran to its end but the button's release was refused ({err:#}) — the \
+                     button may still be held down"
+                )),
+                placement,
+            ));
+        }
     };
-    Ok(Impact::Unconfirmed(format!(
-        "the drag ran to its end but the button's release was refused ({released}) — the button \
-         may still be held down"
-    )))
+    Ok(core::Actuation::at(impact, placement))
+}
+
+/// Publish where this call puts its point, before anything is posted: an answer that never
+/// arrives still states the position the input used, instead of losing one already fixed.
+fn record_placement(placed: Option<&super::thread::PlacementMemo>, placement: core::Placement) {
+    if let Some(placed) = placed {
+        *placed.lock().unwrap_poison() = Some(placement);
+    }
 }
 
 fn set_cursor(x: i32, y: i32) -> anyhow::Result<()> {

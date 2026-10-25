@@ -53,6 +53,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_ToolTipControlTypeId, UIA_TreeControlTypeId, UIA_TreeItemControlTypeId, UIA_ValuePatternId,
     UIA_WindowControlTypeId,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
 use windows::core::BSTR;
 
 /// How long one walk may spend before it gives up — inside the caller's
@@ -66,8 +67,6 @@ pub(super) const WALK_DEADLINE: Duration = Duration::from_secs(10);
 /// than the renderer's `core::MAX_TREE_NODES`; reaching it stops the walk and is
 /// recorded as the walk's own ceiling.
 const MAX_NODES: usize = 2000;
-/// Depth per walk — a guard against provider cycles, like the other backends'.
-const MAX_DEPTH: usize = 25;
 
 /// Roles whose value is worth a second cross-process read.
 const VALUE_ROLES: &[&str] = &[
@@ -127,18 +126,72 @@ pub(super) fn act_on_element(
         core::window_description(&resolved.app_name, &resolved.title),
     );
     let tree = build_tree(uia, &element, resolved.surface, &budget)?;
-    let node = core::resolve_locator_checked(&tree.root, locator)?;
-    let index = core::pre_order_index(&tree.root, node);
+    // The ref is acted on only if it is still what the caller saw: same kind, same name,
+    // same place on the surface. Nothing is sent otherwise.
+    let (matched, confirmed) = core::resolve_locator_confirmed(&tree.root, locator)?;
+    let index = core::pre_order_index(&tree.root, matched);
     let element = tree.handles.get(index).ok_or_else(|| {
         core::taxonomy_error(
             core::ERR_STALE_ELEMENT,
             "element is no longer in the window's tree — re-observe and use a fresh ref",
         )
     })?;
-    match act {
-        ElementAct::Press => press(element, resolved.hwnd),
+    let impact = match act {
+        ElementAct::Press => press(element, &resolved),
         ElementAct::SetValue { text } => set_value(element, resolved.hwnd, text),
+    }?;
+    Ok(core::impact_note(impact, confirmed.note(locator)))
+}
+
+/// The element that holds the keyboard focus, attributed to the surface the call
+/// addressed when it can be: the element must belong to the resolved window's process (a
+/// different process is another application's focus, and the answer is `None`), and when
+/// it reports a non-NULL native window handle, that handle's root ancestor must be the
+/// resolved window. The handle alone cannot be compared with the top-level one: a classic
+/// Win32 control reports its own child handle there, and a WPF-style element reports NULL,
+/// so a NULL handle whose process matches is accepted — there is nothing further to
+/// compare. Best-effort throughout: a property that cannot be read answers `None` rather
+/// than an error, and the report then says the focus could not be read instead of naming a
+/// focus that is not this surface's.
+pub(super) fn focused_element(
+    uia: &IUIAutomation,
+    target: Option<&TargetSpec>,
+) -> Option<core::FocusedElement> {
+    // SAFETY: `uia` is the client built on this apartment thread; the element comes back
+    // owned. A focus that was removed before the call returns is an answer we do not have.
+    let element = unsafe { uia.GetFocusedElement() }.ok()?;
+    if let Some(target) = target
+        && !matches!(target, TargetSpec::Screen)
+    {
+        let resolved = window::resolve(target).ok()?;
+        // SAFETY: `element` is live; the process id is returned by value.
+        let pid = unsafe { element.CurrentProcessId() }.ok()?;
+        if pid.cast_unsigned() != resolved.pid {
+            return None;
+        }
+        // SAFETY: `element` is live; the handle is returned by value.
+        let hwnd = unsafe { element.CurrentNativeWindowHandle() }.ok()?;
+        if !hwnd.0.is_null() {
+            // SAFETY: `hwnd` is an OS handle this frame does not own, checked non-null just
+            // above; `GA_ROOT` only answers an ancestor, null when the window has none.
+            let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+            let root = if root.0.is_null() { hwnd } else { root };
+            if root != resolved.hwnd {
+                return None;
+            }
+        }
     }
+    // SAFETY: `element` is live; both properties are returned by value.
+    let control_type = unsafe { element.CurrentControlType() }.map_or(0, |id| id.0);
+    let kind = role_and_actions(control_type).0;
+    let name = unsafe { element.CurrentName() }
+        .ok()
+        .map(|name| name.to_string())
+        .filter(|name| !name.is_empty());
+    Some(core::FocusedElement {
+        kind: kind.to_string(),
+        name,
+    })
 }
 
 fn window_element(
@@ -209,13 +262,13 @@ impl Walk<'_> {
         // The child probe below is another provider call, and so is every sibling read
         // after it: none may start once the walk has spent its budget.
         self.budget.check()?;
-        if depth >= MAX_DEPTH {
+        if depth >= core::MAX_TREE_DEPTH {
             // The node's subtree is not read. Only a node that has one is a cut, so a
             // leaf at the ceiling is not reported as a truncation.
             // SAFETY: `element` is a live element of this walk and `self.walker` is the
             // walker of the same client; the probe discards the child it returns.
             if unsafe { self.walker.GetFirstChildElement(element) }.is_ok() {
-                self.truncation.cut_depth(MAX_DEPTH);
+                self.truncation.cut_depth(core::MAX_TREE_DEPTH);
             }
             return Ok(node);
         }
@@ -389,7 +442,10 @@ fn role_and_actions(control_type: i32) -> (&'static str, &'static [&'static str]
 /// Press an element the way a user would: the first accessibility action it actually
 /// supports, in the order a screen reader tries them, and — only when it supports
 /// none at all — a click on its own point.
-fn press(element: &IUIAutomationElement, hwnd: HWND) -> anyhow::Result<Impact> {
+fn press(
+    element: &IUIAutomationElement,
+    resolved: &window::TargetWindow,
+) -> anyhow::Result<Impact> {
     // SAFETY: every `unsafe` block below is one method on the pattern that `attempt`
     // obtained from this element — each is owned here, alive for its call, and runs on
     // the thread that owns it.
@@ -445,10 +501,19 @@ fn press(element: &IUIAutomationElement, hwnd: HWND) -> anyhow::Result<Impact> {
              coordinates",
         )
     })?;
-    // The click lands on whatever is at that point, so the window must be in front.
-    window::activate(hwnd);
-    window::ensure_foreground(hwnd)?;
-    input::click_absolute(point.x, point.y)
+    // A synthesised click is a point action, so the window it lands in must be in front;
+    // the answer then states where the point was put, in the surface's own pixels.
+    window::activate(resolved.hwnd);
+    window::ensure_foreground(resolved.hwnd)?;
+    let impact = input::click_absolute(point.x, point.y)?;
+    let local = core::surface_local((f64::from(point.x), f64::from(point.y)), &resolved.surface);
+    Ok(core::impact_note(
+        impact,
+        format!(
+            "the element supports no press action, so it was clicked at {}",
+            core::placed_point(local, &resolved.surface)
+        ),
+    ))
 }
 
 /// One pattern's action, when the element supports the pattern.

@@ -1,14 +1,17 @@
 //! Platform-agnostic core of the Computer (GUI observe/act) tool.
 //!
 //! Owns the shared types, coordinate math, the element-ref/observation lifecycle,
-//! the target registry, tree rendering, and the [`Backend`] trait. Contains no
-//! platform imports — `macos.rs`/`linux.rs`/`windows`/`stub.rs` implement
+//! the remembered look of each surface and the views built over it ([`render_narrow`],
+//! [`render_changes`]), the target registry, tree rendering, and the [`Backend`] trait.
+//! Contains no platform imports — `macos.rs`/`linux.rs`/`windows`/`stub.rs` implement
 //! [`Backend`].
 //!
-//! Two honesty rules live here because every backend owes them: a read states
-//! every ceiling it hit ([`Truncation`], rendered into the observation header), and
-//! an actuating call states which of the three outcomes it reached ([`Impact`],
-//! rendered by [`impact_text`]).
+//! Three honesty rules live here because every backend owes them: a read states every
+//! ceiling it hit ([`Truncation`], rendered into the observation header); an actuating call
+//! states which of the three outcomes it reached ([`Impact`], rendered by [`impact_text`])
+//! and, when it placed a point, where that point went ([`Actuation`], taken from the
+//! geometry the backend posted through); and a statement about what a surface is or was is
+//! measured against the one remembered look of it — never against a second copy.
 //!
 //! Items carrying a platform-scoped `expect(dead_code)` are the ones only a real
 //! backend — or a test — calls: on a platform whose backend is the stub they
@@ -42,6 +45,14 @@ pub(crate) const AX_THIN_INTERACTIVE_ELEMENTS: usize = 5;
 /// per property), so only the backends that use this one compile it.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) const MAX_TREE_NODES: usize = 4000;
+
+/// Depth every tree read walks to. The backends stop there and record the cut, so a
+/// narrow look cannot ask for levels the read could not have produced.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) const MAX_TREE_DEPTH: usize = 25;
 
 /// Ceiling on the children ONE node may contribute. A target that advertises an
 /// absurd child list — a spreadsheet's cell list is the classic case, a count near
@@ -399,6 +410,15 @@ pub(crate) const ERR_SURFACE_GONE: &str = "surface-gone";
 /// on a class this platform refuses for that operation.
 #[cfg_attr(not(target_os = "windows"), expect(dead_code))]
 pub(crate) const ERR_SELF_TARGET: &str = "self-target";
+/// The point a click was aimed at lies over another application's window, so
+/// nothing was sent. Deliberately its own word: it is the only refusal a plain
+/// repeat clears, because the covering window may go away on its own and every call
+/// raises the addressed window again.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) const ERR_BLOCKED: &str = "blocked";
 
 /// Build a taxonomy-prefixed error: `"<kind>: <msg>"`. The message MUST start
 /// with the taxonomy word so the model can branch on the category.
@@ -575,9 +595,184 @@ pub(crate) fn not_brought_forward(surface: impl fmt::Display) -> anyhow::Error {
         ERR_DEGRADED,
         format!(
             "{surface} could not be brought to the front — the input would have gone to another \
-             window, so nothing was sent; bring the window forward (click it) and repeat the action"
+             window, so nothing was sent; bring the window forward and repeat the action"
         ),
     )
+}
+
+/// The window a screen point lies over, as far as a platform can attribute one.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WindowAtPoint {
+    pub app_pid: Option<u32>,
+    pub app_name: String,
+    pub title: String,
+    /// Its frame on the screen, where the platform reports one. The frame is how one
+    /// window is recognised across two systems that spell its title differently.
+    pub frame: Option<SurfaceGeometry>,
+}
+
+impl WindowAtPoint {
+    /// Model-facing name of this window, never an empty pair of quotes.
+    #[must_use]
+    pub(crate) fn describe(&self) -> String {
+        window_description(&self.app_name, &self.title)
+    }
+}
+
+/// What a click's answer says when the call names the screen: its points belong to no
+/// window, so nothing was checked.
+pub(crate) const SCREEN_POINT_NOTE: &str =
+    "the click names the screen, so the window under the point was not checked";
+
+/// What a click's answer says on a platform that cannot attribute a window to a point: the
+/// landing could not be checked, and the click was sent.
+pub(crate) const UNCHECKED_POINT_NOTE: &str =
+    "the window under the point was not identified, so the click's landing could not be checked";
+
+/// What the point of a coordinate click would land on, decided at the moment the
+/// click is sent. Only a platform that can attribute a window to an application decides
+/// the three middle cases; a platform that cannot still says which of the outer two it is.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum UnderPoint {
+    /// The call named the screen, whose points no window owns: nothing is checked.
+    Screen,
+    /// The platform cannot attribute the window at that point: the click goes, and
+    /// the answer says the point could not be checked.
+    Unknown,
+    /// The point lies over the addressed application's own window, its dialog, its
+    /// menu or its tooltip: none of those is an obstacle.
+    Clear,
+    /// The point lies over another window of the addressed application. The click
+    /// goes; the answer names that window.
+    ThatWindow(WindowAtPoint),
+    /// The point lies over another application's window — nothing may be sent.
+    Blocked(WindowAtPoint),
+}
+
+impl UnderPoint {
+    /// Decide from what the platform answered. `None` is "the platform could not
+    /// say": the click goes, and the answer says the point was not checked.
+    ///
+    /// Two windows are first told apart by the process that owns them: a different process
+    /// is another application whatever the frames say — two maximized windows of two
+    /// applications share a frame exactly. Within one application the addressed window
+    /// itself is recognised by its frame (a title could not: the systems that report one
+    /// window's title spell it differently), and another of that application's windows — its
+    /// own dialog, menu or tooltip — is not an obstacle. An element with no window of its own
+    /// that belongs to the addressed application is that application's too, so it is not an
+    /// obstacle either. A window that cannot be attributed to either application is the
+    /// unknown case: the click goes and the answer says the point was not checked, never the
+    /// silent "clear" that would claim a check that never happened.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows", test)),
+        expect(dead_code)
+    )]
+    #[must_use]
+    pub(crate) fn classify(
+        surface: &TargetSpec,
+        addressed_pid: Option<u32>,
+        addressed_frame: Option<&SurfaceGeometry>,
+        at: Option<&WindowAtPoint>,
+    ) -> Self {
+        if matches!(surface, TargetSpec::Screen) {
+            return Self::Screen;
+        }
+        let Some(at) = at else {
+            return Self::Unknown;
+        };
+        match (addressed_pid, at.app_pid) {
+            (Some(addressed), Some(over)) if addressed != over => Self::Blocked(at.clone()),
+            (Some(_), Some(_)) => match (addressed_frame, at.frame.as_ref()) {
+                (Some(addressed), Some(over)) if same_frame(addressed, over) => Self::Clear,
+                (Some(_), Some(_)) => Self::ThatWindow(at.clone()),
+                // The application is the same, so nothing of another application is in the
+                // way; only which of its windows the point is on cannot be said, and an
+                // element with no window of its own — a menu-bar item — is exactly that.
+                _ => Self::Clear,
+            },
+            // The owner of one of the two windows could not be read, so the point cannot be
+            // attributed to the addressed application or to another one.
+            _ => Self::Unknown,
+        }
+    }
+
+    /// What a click's answer owes about the point it was sent to: `Ok(None)` nothing to
+    /// disclose, `Ok(Some(note))` a clause beside a click that was sent, `Err` the refusal
+    /// of a click that must not be sent. One match decides all three, so a refusal and a
+    /// note can never be two spellings of the same case.
+    fn disclosure(&self, check: &ClickCheck<'_>) -> anyhow::Result<Option<String>> {
+        match self {
+            Self::Clear => Ok(None),
+            Self::Screen => Ok(Some(SCREEN_POINT_NOTE.to_string())),
+            Self::Unknown => Ok(Some(UNCHECKED_POINT_NOTE.to_string())),
+            Self::ThatWindow(at) => Ok(Some(format!(
+                "the point lay over {}, another window of the same application",
+                at.describe()
+            ))),
+            // The refusal states the surface and the position the point was resolved against,
+            // names the application in the way, says nothing was sent, and gives the two routes
+            // that work: an element of the addressed surface, reachable without a point at all,
+            // or the same click once that window is out of the way — the platform raises the
+            // addressed window again on every call.
+            Self::Blocked(at) => Err(taxonomy_error(
+                ERR_BLOCKED,
+                format!(
+                    "nothing was sent — the point at {} on {} lay over {}, which belongs to \
+                     another application, so the click would have landed there; act on an \
+                     element of the surface instead, or click again once that window is out of \
+                     the way",
+                    placed_point(check.local, check.geometry),
+                    check.surface.describe(),
+                    at.describe()
+                ),
+            )),
+        }
+    }
+}
+
+/// Everything a coordinate click's check is decided from, gathered at the moment the
+/// events would be posted: the surface the point was resolved against, the position in
+/// that surface's own points, and the window the platform attributes to that point.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) struct ClickCheck<'a> {
+    /// The surface the point was resolved against, as the answer names it. The screen is
+    /// one of the cases it decides, so nothing else records whether this call names it.
+    pub surface: &'a TargetSpec,
+    /// The position, in that surface's own points.
+    pub local: (f64, f64),
+    pub geometry: &'a SurfaceGeometry,
+    /// The addressed application, as far as the platform can attribute one.
+    pub addressed_pid: Option<u32>,
+    /// The addressed window's own frame, which is what tells it apart from another
+    /// window of the same application.
+    pub addressed_frame: Option<&'a SurfaceGeometry>,
+    /// The window under the point, when the platform can attribute one.
+    pub under: Option<&'a WindowAtPoint>,
+}
+
+/// Run the check a coordinate click owes at the moment it is sent: an `Err` is the
+/// refusal (nothing may be posted), and `Ok(note)` is the clause the answer carries —
+/// `None` when there is nothing to disclose. Every backend calls this after its own
+/// raise, with whatever it could read about the window under the point.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+pub(crate) fn click_under_point(check: &ClickCheck<'_>) -> anyhow::Result<Option<String>> {
+    UnderPoint::classify(
+        check.surface,
+        check.addressed_pid,
+        check.addressed_frame,
+        check.under,
+    )
+    .disclosure(check)
 }
 
 /// Build the `permission-denied` failure as a TYPED error: its text is the usual
@@ -747,7 +942,11 @@ impl<'de> Deserialize<'de> for Region {
 }
 
 /// Lightweight element reference: a DFS path from the tree root plus the
-/// role/name snapshot captured at observe time (NOT a platform handle).
+/// role/name/frame snapshot captured at observe time (NOT a platform handle).
+///
+/// The frame is surface-local, so it is what tells "the same element, moved with its
+/// window" (unchanged) from "a reflow inside the window put something else here"
+/// (changed) — see [`confirm_locator`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Locator {
     /// Child-index path from the root node.
@@ -756,6 +955,8 @@ pub(crate) struct Locator {
     pub role: String,
     /// Accessible name, if any.
     pub name: Option<String>,
+    /// Surface-local `(x, y, w, h)` the element occupied when it was observed.
+    pub frame: Option<(f64, f64, f64, f64)>,
 }
 
 /// A node in the accessibility tree. `frame` is surface-local `(x, y, w, h)` in
@@ -787,10 +988,6 @@ pub(crate) enum Impact {
     /// Delivered, with one thing the result must still say: a modifier the call could
     /// not release again (which may still be held down), or the platform route a
     /// reference's own refused action was replaced with.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "macos", test)),
-        expect(dead_code)
-    )]
     DoneWith(String),
     /// Carries what is known: how much went through, and why it stopped.
     Unconfirmed(String),
@@ -810,6 +1007,86 @@ pub(crate) fn impact_text(done: String, impact: Impact) -> String {
              before repeating it, and never repeat it blind, because a second attempt would act \
              twice."
         ),
+    }
+}
+
+/// Add one fact to an outcome without changing what the outcome itself says: a delivered
+/// call stays delivered, and an unconfirmed one stays unconfirmed (a failed probe must not
+/// turn a delivered action into an ambiguous one).
+#[must_use]
+pub(crate) fn impact_note(impact: Impact, note: String) -> Impact {
+    match impact {
+        Impact::Done => Impact::DoneWith(note),
+        Impact::DoneWith(existing) => Impact::DoneWith(format!("{existing}; {note}")),
+        Impact::Unconfirmed(detail) => Impact::Unconfirmed(format!("{detail}; {note}")),
+    }
+}
+
+/// What one input call delivered, and — when it put the pointer at a point — where that
+/// point was put. The geometry and the position come from the backend that posted the
+/// event, so an answer can never quote a point derived from a different read of the
+/// surface than the one the input itself used.
+#[derive(Debug, Clone)]
+pub(crate) struct Actuation {
+    pub impact: Impact,
+    pub placed: Option<Placement>,
+}
+
+/// The geometry a point action was mapped through, and the positions in that surface's
+/// own points: one for a click or a wheel, both ends of a drag.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Placement {
+    pub geometry: SurfaceGeometry,
+    /// Where the gesture started.
+    pub from: (f64, f64),
+    /// Where a drag ended — `None` for a click, a wheel, and a drag whose end was never
+    /// placed.
+    pub to: Option<(f64, f64)>,
+}
+
+impl Placement {
+    /// The gesture as an answer states it: one position for a click or a wheel, both ends of
+    /// a drag, each in the surface's own points and against its size.
+    #[must_use]
+    pub(crate) fn describe(&self) -> String {
+        match self.to {
+            Some(to) => format!(
+                "from {} to {}",
+                placed_point(self.from, &self.geometry),
+                placed_point(to, &self.geometry)
+            ),
+            None => placed_point(self.from, &self.geometry),
+        }
+    }
+}
+
+impl Actuation {
+    /// A call that placed no point: typing, a key chord, a wheel with no point.
+    #[must_use]
+    pub(crate) fn of(impact: Impact) -> Self {
+        Self {
+            impact,
+            placed: None,
+        }
+    }
+
+    /// A call that placed a point, as the surface it was mapped through reported it.
+    #[must_use]
+    pub(crate) fn at(impact: Impact, placement: Placement) -> Self {
+        Self {
+            impact,
+            placed: Some(placement),
+        }
+    }
+
+    /// A call that may have placed a point before its answer was lost: the placement it
+    /// published before posting, when it got that far.
+    #[must_use]
+    pub(crate) fn placed(impact: Impact, placement: Option<Placement>) -> Self {
+        Self {
+            impact,
+            placed: placement,
+        }
     }
 }
 
@@ -1050,6 +1327,34 @@ pub(crate) struct Observation {
 pub(crate) struct WindowListing {
     pub windows: Vec<WindowInfo>,
     pub unread: Vec<UnreadWindows>,
+    /// The application in front, when the listing could name one.
+    pub frontmost: Option<String>,
+    /// What could be established about the order of the windows listed.
+    pub order: WindowOrder,
+}
+
+/// What a listing established about the front-to-back order of the windows it read
+/// (see [`WindowInfo::rank`]). The three ways of not having a complete order are kept
+/// apart, because one is a failed read and the others are facts about the windows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowOrder {
+    /// This platform cannot attribute an order to the windows listed.
+    #[default]
+    Unknown,
+    /// Every listed window has a place: `rank` runs 1..n.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows", test)),
+        expect(dead_code)
+    )]
+    All,
+    /// The windows that have a place are ranked 1..; the listed windows without a `rank`
+    /// have no entry in the on-screen list this platform ranks by.
+    #[cfg_attr(not(any(target_os = "macos", test)), expect(dead_code))]
+    Partial,
+    /// The list the order is attributed from could not be read this time: nothing was
+    /// ranked, and the answer says the read failed rather than that no window has a place.
+    #[cfg_attr(not(any(target_os = "macos", test)), expect(dead_code))]
+    Unread,
 }
 
 /// Part of a listing that is not listed, and why: per application, with the count of
@@ -1066,6 +1371,16 @@ pub(crate) struct UnreadWindows {
 pub(crate) struct AppInfo {
     pub pid: Option<u32>,
     pub name: String,
+}
+
+/// What one application listing produced.
+#[derive(Debug, Default)]
+pub(crate) struct AppListing {
+    pub apps: Vec<AppInfo>,
+    /// The application in front — also when it is not among `apps` (a menu-bar accessory,
+    /// a process with no enumerable window): the one claim a listing must never leave to
+    /// the reader's guess. `None` is stated as "could not be named", never as a guess.
+    pub frontmost: Option<String>,
 }
 
 /// Backend-defined identity of one window surface. Opaque to the core: each
@@ -1093,6 +1408,14 @@ pub(crate) struct WindowInfo {
     /// Identity of this window (see [`WindowKey`]).
     pub key: WindowKey,
     pub surface: SurfaceGeometry,
+    /// This is the application's focused window. Only the frontmost application's
+    /// focused window is marked in an all-applications listing: a background
+    /// application's cannot receive input, so naming it would claim something the
+    /// caller cannot use.
+    pub focused: bool,
+    /// Place in the front-to-back order (1 is in front), when the platform let it be
+    /// attributed to this window. See [`WindowListing::order`].
+    pub rank: Option<usize>,
 }
 
 /// Plain RGBA pixel data (Send-safe, no platform handles).
@@ -1333,6 +1656,18 @@ impl TargetSpec {
     }
 }
 
+/// Whether two targets name the same application — the comparison a ref's surface allows:
+/// an application id is its application, whatever window it has focused now.
+#[must_use]
+pub(crate) fn same_application(a: &TargetSpec, b: &TargetSpec) -> bool {
+    match (a.app(), b.app()) {
+        (Some((a_pid, a_name)), Some((b_pid, b_name))) => {
+            (a_pid == b_pid && a_pid.is_some()) || a_name.eq_ignore_ascii_case(b_name)
+        }
+        _ => false,
+    }
+}
+
 /// How a window surface is named in results and errors — the one spelling, so a
 /// backend that holds a resolved window names it exactly as its target would. An
 /// empty title is an untitled window, never an empty pair of quotes.
@@ -1443,10 +1778,11 @@ pub(crate) enum RawInput {
 /// gesture and a wheel aimed at a point, and only when the call names a window (a
 /// `w` id or an `a` id) rather than the focused window or the screen.
 ///
-/// Everything else is global input — a key chord, a wheel with no point and a
-/// click at a point go where the system sends them — and no result may report it
-/// as having acted on the observed surface. The one definition of that rule, so
-/// the three backends cannot drift apart.
+/// Everything else is global input — a key chord and a wheel with no point go wherever
+/// the focus is — and no result may report it as having acted on the observed surface. A
+/// click at a point is not listed here: it is sent to the point, and what lies under that
+/// point is checked separately at the moment it is sent ([`UnderPoint`]). This is the one
+/// definition of that rule, so the three backends cannot drift apart.
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows", test)),
     expect(dead_code)
@@ -1625,6 +1961,24 @@ pub(crate) fn normalized_to_surface(
         geo.x + nx / NORMALIZED_MAX * geo.width,
         geo.y + ny / NORMALIZED_MAX * geo.height,
     ))
+}
+
+/// A global point in the surface's own frame — the coordinates an answer states and the
+/// frame an element's own position is measured in. Delivery needs the global point
+/// ([`normalized_to_surface`]); this is the same point as the caller reads it.
+#[must_use]
+pub(crate) fn surface_local(global: (f64, f64), geo: &SurfaceGeometry) -> (f64, f64) {
+    (global.0 - geo.x, global.1 - geo.y)
+}
+
+/// Where a point action put the point, as every answer and refusal states it: the
+/// position in the surface's own points and that surface's size.
+#[must_use]
+pub(crate) fn placed_point(local: (f64, f64), geo: &SurfaceGeometry) -> String {
+    format!(
+        "({:.1}, {:.1}) of {:.0}x{:.0}",
+        local.0, local.1, geo.width, geo.height
+    )
 }
 
 /// Map an absolute global surface point to normalized 0-1000 coordinates against
@@ -1916,19 +2270,49 @@ pub(crate) fn window_capture_rect(
 
 // ── State that outlives one call ────────────────────────────────────────
 //
-// Two lifetimes. Element references belong to the turn and are cleared when it ends.
-// Application and window ids, and the surface last observed or captured, belong to
+// Three lifetimes. Element references and the observation they were minted from
+// belong to the turn and are cleared when it ends. Application and window ids, the
+// surface last observed or captured, and the remembered look of each surface belong to
 // the session: only [`end_session`] ends them early, and a process restart ends them
 // by ending the memory. A call outside an agent run has no session, so nothing
 // session-scoped is stored for it at all.
 
-/// Cached observation with the refs resolved against it.
+/// Cached observation with the refs resolved against it — the refs the caller may act
+/// on right now, replaced by every successful full observation and cleared at turn end.
 struct ObservationCache {
     target: TargetSpec,
     refs: HashMap<String, Locator>,
 }
 
 static LAST_OBSERVATION: LazyLock<Mutex<HashMap<String, ObservationCache>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How many surfaces one session keeps a remembered look for. Small on purpose: a record
+/// is a whole tree — up to [`MAX_TREE_NODES`] nodes of names and values — so four of them
+/// are the few megabytes the tool may hold, and the product, not the machine, bounds it.
+pub(crate) const MAX_LOOKS: usize = 4;
+
+/// What one full observation showed of one surface: the baseline every statement
+/// about that surface having moved, resized or changed is measured against.
+///
+/// One record per surface, and the session's records are ordered most recently
+/// observed first, so the least recently looked at is dropped first. Only a full
+/// observation writes one ([`remember_look`]): a still, a capture, a narrow look and a
+/// change answer replace nothing, and a full observation that failed reaches here only
+/// after it returned.
+#[derive(Debug)]
+pub(crate) struct Look {
+    pub target: TargetSpec,
+    /// The observation itself — the tree a narrow look or a change answer reads. Its
+    /// fields are the observation's, not a second copy of them.
+    pub obs: Observation,
+    pub counts: Counts,
+    pub taken_at: Instant,
+}
+
+/// The remembered look of each session's surfaces (see [`Look`]). A record is shared, not
+/// cloned per reader, so a view built from it can be rendered after the lock is released.
+static LOOKS: LazyLock<Mutex<HashMap<String, Vec<Arc<Look>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The surface each session last observed or captured (see [`last_surface`]).
@@ -1947,8 +2331,8 @@ pub(crate) fn agent_key() -> String {
 }
 
 /// Walk the tree in DFS pre-order assigning refs `e1`, `e2`, … and replace the
-/// whole cache for the calling agent, returning the element count.
-pub(crate) fn store_observation(target: TargetSpec, obs: &Observation) -> usize {
+/// whole cache for the calling agent.
+pub(crate) fn store_observation(target: TargetSpec, obs: &Observation) {
     let mut refs = HashMap::new();
     let mut counter = 0usize;
     let mut path = Vec::new();
@@ -1957,7 +2341,6 @@ pub(crate) fn store_observation(target: TargetSpec, obs: &Observation) -> usize 
     let key = agent_key();
     let mut guard = LAST_OBSERVATION.lock().unwrap_poison();
     guard.insert(key, cache);
-    counter
 }
 
 fn assign_refs(
@@ -1973,6 +2356,7 @@ fn assign_refs(
             path: path.clone(),
             role: node.role.clone(),
             name: node.name.clone(),
+            frame: node.frame,
         },
     );
     for (idx, child) in node.children.iter().enumerate() {
@@ -2000,6 +2384,106 @@ pub(crate) fn resolve_ref(reference: &str) -> anyhow::Result<(Locator, TargetSpe
         )
     })?;
     Ok((locator.clone(), cache.target.clone()))
+}
+
+/// Remember `obs` as the look of `target`'s surface: the record every later statement
+/// about that surface having moved, resized or changed is measured against.
+///
+/// Only a full observation that succeeded calls this, and it replaces the previous
+/// record of the same surface — a surface's record is keyed by the window it was taken
+/// from, so an application identifier that now names another window has nothing to
+/// compare against rather than a fabricated move. When the session holds more than
+/// [`MAX_LOOKS`] surfaces, the least recently looked at is dropped. The observation is
+/// moved in, so the caller renders it before remembering it rather than after.
+pub(crate) fn remember_look(target: &TargetSpec, obs: Observation, counts: Counts) {
+    let look = Look {
+        target: target.clone(),
+        obs,
+        counts,
+        taken_at: Instant::now(),
+    };
+    let mut guard = LOOKS.lock().unwrap_poison();
+    let entries = guard.entry(agent_key()).or_default();
+    entries.retain(|existing| existing.target != *target);
+    entries.insert(0, Arc::new(look));
+    entries.truncate(MAX_LOOKS);
+}
+
+/// Read one surface's remembered look. Reading never reorders: only a full observation
+/// counts as looking at a surface, which is exactly the order [`remember_look`] keeps, so
+/// the surface a full set drops first is the one least recently *looked at*.
+///
+/// The record comes back shared, so a caller that builds a view of it (a narrow look, a
+/// change answer) holds no lock while doing so.
+pub(crate) fn with_look(target: &TargetSpec) -> Option<Arc<Look>> {
+    let guard = LOOKS.lock().unwrap_poison();
+    let entries = guard.get(&agent_key())?;
+    entries.iter().find(|look| look.target == *target).cloned()
+}
+
+/// The remembered look's geometry and when it was taken, for an action's statement
+/// about the surface having moved: `None` is "nothing to compare against".
+pub(crate) fn remembered_geometry(target: &TargetSpec) -> Option<(SurfaceGeometry, Instant)> {
+    with_look(target).map(|look| (look.obs.surface, look.taken_at))
+}
+
+/// Forget the remembered look of a surface confirmed gone — however the call addressed
+/// it: by an id, by a ref, or as the surface it last observed. A window takes its own
+/// record; an application that quit takes every record of its windows. A surface this
+/// session never observed is ignored.
+pub(crate) fn forget_look(target: &TargetSpec) {
+    forget_where(|look| match target {
+        TargetSpec::Window { .. } => look.target == *target,
+        TargetSpec::App { .. } => same_application(&look.target, target),
+        TargetSpec::Focused | TargetSpec::Screen => false,
+    });
+}
+
+/// Forget the remembered look of an application a failed call named without an id — by
+/// its name or its pid. That is all such a call identified it by, and it is the surface
+/// confirmed gone; falling back to the session's last surface here would forget an
+/// unrelated record.
+pub(crate) fn forget_look_of_app_argument(arg: &str) {
+    let name = arg.trim();
+    let pid = name.parse::<u32>().ok();
+    forget_where(|look| {
+        let named_by_pid = pid.is_some_and(|pid| {
+            look.target
+                .app()
+                .is_some_and(|(look_pid, _)| look_pid == Some(pid))
+        });
+        named_by_pid || look.obs.app_name.eq_ignore_ascii_case(name)
+    });
+}
+
+/// Drop every remembered look the predicate selects.
+fn forget_where(gone: impl Fn(&Look) -> bool) {
+    let mut guard = LOOKS.lock().unwrap_poison();
+    if let Some(entries) = guard.get_mut(&agent_key()) {
+        entries.retain(|look| !gone(look));
+    }
+}
+
+/// How long ago a remembered look was taken, as the answers state it.
+#[must_use]
+pub(crate) fn look_age(since: Instant) -> String {
+    let secs = since.elapsed().as_secs();
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s}s ago"),
+        (m, s) => format!("{m}m {s}s ago"),
+    }
+}
+
+/// Whether the caller's live refs belong to `target` — the one condition under which a
+/// narrow look may print refs. The refs a caller holds come from the latest full
+/// observation and end with the turn, so a narrow look in a later turn prints none and
+/// says that acting needs a fresh observation.
+#[must_use]
+pub(crate) fn refs_belong_to(target: &TargetSpec) -> bool {
+    let guard = LAST_OBSERVATION.lock().unwrap_poison();
+    guard
+        .get(&agent_key())
+        .is_some_and(|cache| cache.target == *target)
 }
 
 /// The surface the calling session last observed or captured. A call with no
@@ -2199,24 +2683,26 @@ pub(crate) fn unknown_identifier(arg: &str) -> anyhow::Error {
     )
 }
 
-/// Clear the state one turn owns, at agent-run end: element refs belong to the
-/// observation they came from and expire with the next one, so they never outlive
-/// the run. Stored ids and the last observed or captured surface are deliberately
-/// kept — [`end_session`] is what ends those.
+/// Clear the state one turn owns, at agent-run end: element refs belong to the full
+/// observation they came from — replaced by the next one, and gone with the turn that
+/// minted them — so they never outlive the run. Stored ids, the remembered looks and the
+/// last observed or captured surface are deliberately kept: they last as long as the
+/// session, and [`end_session`] is what ends those.
 pub(crate) fn cleanup_turn(key: &str) {
     let mut guard = LAST_OBSERVATION.lock().unwrap_poison();
     guard.remove(key);
 }
 
-/// End everything a session minted: its application and window ids and the surface
-/// it last observed or captured. This is the single statement of what a reset does,
-/// and the tool's `end_session` its single caller — reached only where the session
-/// store deletes the conversation, which every reset path goes through (`/clear`, the
-/// Sessions page, the maintainer's cleanup). A service restart ends the same state by
-/// ending the process.
+/// End everything a session minted: its application and window ids, the surface it last
+/// observed or captured, and every remembered look. This is the single statement of what
+/// a reset does, and the tool's `end_session` its single caller — reached only where the
+/// session store deletes the conversation, which every reset path goes through
+/// (`/clear`, the Sessions page, the maintainer's cleanup). A service restart ends the
+/// same state by ending the process.
 pub(crate) fn end_session(key: &str) {
     TARGETS.lock().unwrap_poison().remove(key);
     LAST_SURFACE.lock().unwrap_poison().remove(key);
+    LOOKS.lock().unwrap_poison().remove(key);
 }
 
 // ── Tree rendering ──────────────────────────────────────────────────────
@@ -2237,52 +2723,79 @@ fn is_interactive(node: &UiNode) -> bool {
         .any(|r| r.eq_ignore_ascii_case(role))
 }
 
-/// Number of interactive nodes in the whole tree.
-#[must_use]
-pub(crate) fn count_interactive(obs: &Observation) -> usize {
-    count_stats(&obs.root).1
+/// How many elements a tree holds, and how many of them are interactive — the numbers
+/// every view's header prints. Computed once per observation, so an answer, the
+/// thin-surface hint and the remembered record cannot disagree about one tree.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Counts {
+    pub nodes: usize,
+    pub interactive: usize,
 }
 
-/// (total nodes, interactive nodes) across the whole tree, in one pre-order
-/// walk. Used by [`render_tree`] for its header counts and by
-/// [`count_interactive`] so the walk is single-sourced.
-fn count_stats(node: &UiNode) -> (usize, usize) {
-    let mut total = 1usize;
-    let mut interactive = usize::from(is_interactive(node));
-    for child in &node.children {
-        let (t, i) = count_stats(child);
-        total += t;
-        interactive += i;
+/// [`Counts`] of one tree, in a single pre-order walk.
+#[must_use]
+pub(crate) fn counts(root: &UiNode) -> Counts {
+    fn walk(node: &UiNode, counts: &mut Counts) {
+        counts.nodes += 1;
+        counts.interactive += usize::from(is_interactive(node));
+        for child in &node.children {
+            walk(child, counts);
+        }
     }
-    (total, interactive)
+    let mut counts = Counts {
+        nodes: 0,
+        interactive: 0,
+    };
+    walk(root, &mut counts);
+    counts
 }
 
-/// True when the surface exposes very few actionable elements — the signal that the
-/// observation is thin, which the result then says with the route that works there.
+/// How close two positions must be to count as the same place. A few points absorbs
+/// the sub-pixel difference two reads of the same control can report, without hiding a
+/// reflow that moved it somewhere the caller would click wrong.
+pub(crate) const POSITION_TOLERANCE: f64 = 2.0;
+
+/// Whether two surface-local positions name the same place (see
+/// [`POSITION_TOLERANCE`]).
 #[must_use]
-pub(crate) fn is_ax_thin(obs: &Observation) -> bool {
-    count_interactive(obs) < AX_THIN_INTERACTIVE_ELEMENTS
+pub(crate) fn same_place(a: (f64, f64), b: (f64, f64)) -> bool {
+    (a.0 - b.0).abs() <= POSITION_TOLERANCE && (a.1 - b.1).abs() <= POSITION_TOLERANCE
 }
 
-/// Render the observation as an indented element tree with pre-order refs. The
-/// header carries the node/interactive totals (computed in one pre-walk, so they
-/// describe everything that was read) and states every ceiling the read hit — a
-/// tree that was cut short must never read as complete.
+/// Whether two extents name the same size (see [`POSITION_TOLERANCE`]).
 #[must_use]
-pub(crate) fn render_tree(obs: &Observation) -> String {
-    let (node_count, interactive_count) = count_stats(&obs.root);
+pub(crate) fn same_size(a: &SurfaceGeometry, b: &SurfaceGeometry) -> bool {
+    (a.width - b.width).abs() <= POSITION_TOLERANCE
+        && (a.height - b.height).abs() <= POSITION_TOLERANCE
+}
+
+/// Whether two extents name the same rectangle — the one definition of "the same frame",
+/// which is how one window is recognised across two systems that report it separately.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    expect(dead_code)
+)]
+#[must_use]
+pub(crate) fn same_frame(a: &SurfaceGeometry, b: &SurfaceGeometry) -> bool {
+    same_place((a.x, a.y), (b.x, b.y)) && same_size(a, b)
+}
+
+/// Render the observation as an indented element tree with pre-order refs. The header
+/// carries the node/interactive totals ([`counts`], computed once by the caller so every
+/// view of one tree agrees) and states every ceiling the read hit — a tree that was cut
+/// short must never read as complete.
+#[must_use]
+pub(crate) fn render_tree(obs: &Observation, counts: Counts) -> String {
     let mut tree = String::new();
     let mut counter = 0usize;
     let mut values_cut = 0usize;
     render_node(&obs.root, 0, &mut tree, &mut counter, &mut values_cut);
 
-    let surf = &obs.surface;
-    let title = obs.window_title.as_deref().unwrap_or("");
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "[Surface: app=\"{}\" window=\"{}\" {}x{} @ ({}, {}) — {} nodes, {} interactive]",
-        obs.app_name, title, surf.width, surf.height, surf.x, surf.y, node_count, interactive_count
+    let mut out = surface_header(
+        &obs.app_name,
+        obs.window_title.as_deref(),
+        &obs.surface,
+        counts,
     );
     for statement in obs.truncation.statements(values_cut) {
         out.push_str(&statement);
@@ -2290,6 +2803,59 @@ pub(crate) fn render_tree(obs: &Observation) -> String {
     }
     out.push_str(&tree);
     out
+}
+
+/// The header every view of a tree opens with: which surface it is, how big it is, and how
+/// much of it was read. One spelling, so a full look, a narrow look and a change answer
+/// describe one surface alike.
+fn surface_header(
+    app_name: &str,
+    title: Option<&str>,
+    surface: &SurfaceGeometry,
+    counts: Counts,
+) -> String {
+    format!(
+        "[Surface: app=\"{app_name}\" window=\"{}\" {}x{} @ ({}, {}) — {} nodes, {} interactive]\n",
+        title.unwrap_or(""),
+        surface.width,
+        surface.height,
+        surface.x,
+        surface.y,
+        counts.nodes,
+        counts.interactive
+    )
+}
+
+/// One element as every view prints it: the same fields in the same order, with a ref
+/// when the view has one to print, and no line ending — so a full look, a narrow look and
+/// a change answer describe one element alike, and the change answer compares exactly what
+/// those views print. Returns whether the value had to be cut to the display cap.
+fn push_node_line(out: &mut String, node: &UiNode, depth: usize, reference: Option<usize>) -> bool {
+    let indent = "  ".repeat(depth);
+    let _ = write!(out, "{indent}");
+    if let Some(number) = reference {
+        let _ = write!(out, "[e{number}] ");
+    }
+    let _ = write!(out, "{}", normalized_role(&node.role));
+    if let Some(name) = &node.name {
+        let _ = write!(out, " \"{name}\"");
+    }
+    if !node.actions.is_empty() {
+        let _ = write!(out, " actions=[{}]", node.actions.join(","));
+    }
+    if let Some((x, y, _, _)) = node.frame {
+        let _ = write!(out, " @ ({x}, {y})");
+    }
+    let mut cut = false;
+    if let Some(value) = &node.value {
+        let shown = crate::util::truncate(value, RENDER_VALUE_CHARS);
+        cut = shown != *value;
+        let _ = write!(out, " value=\"{shown}\"");
+    }
+    if node.focused {
+        out.push_str(" focused");
+    }
+    cut
 }
 
 fn render_node(
@@ -2300,31 +2866,583 @@ fn render_node(
     values_cut: &mut usize,
 ) {
     *counter += 1;
-    let indent = "  ".repeat(depth);
-    let mut line = format!("{indent}[e{counter}] {}", normalized_role(&node.role));
-    if let Some(name) = &node.name {
-        let _ = write!(line, " \"{name}\"");
+    if push_node_line(out, node, depth, Some(*counter)) {
+        *values_cut += 1;
     }
-    if !node.actions.is_empty() {
-        let _ = write!(line, " actions=[{}]", node.actions.join(","));
-    }
-    if let Some((x, y, _, _)) = node.frame {
-        let _ = write!(line, " @ ({x}, {y})");
-    }
-    if let Some(value) = &node.value {
-        let v = crate::util::truncate(value, RENDER_VALUE_CHARS);
-        if v != *value {
-            *values_cut += 1;
-        }
-        let _ = write!(line, " value=\"{v}\"");
-    }
-    if node.focused {
-        line.push_str(" focused");
-    }
-    out.push_str(&line);
     out.push('\n');
     for child in &node.children {
         render_node(child, depth + 1, out, counter, values_cut);
+    }
+}
+
+// ── Narrow looks and change answers ─────────────────────────────────────
+//
+// Both read the remembered look of one surface ([`Look`]) and neither replaces it: a
+// narrow look is a view of a tree the tool already holds, and a change answer is a
+// comparison against that tree — nothing here reads the platform or writes a record.
+
+/// How a narrow look is limited, after its arguments were resolved.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Narrow {
+    /// Start from this node's subtree instead of the surface root.
+    pub at: Option<Locator>,
+    /// Levels to show, counting the root of the look as the first.
+    pub depth: Option<usize>,
+    /// One kind, matched without regard to case against the kind strings the
+    /// surface's own observation prints.
+    pub kind: Option<String>,
+}
+
+impl Narrow {
+    #[must_use]
+    pub(crate) fn is_narrow(&self) -> bool {
+        self.at.is_some() || self.depth.is_some() || self.kind.is_some()
+    }
+}
+
+/// One node of a remembered tree, with everything the two views below need: its place
+/// in the tree, its pre-order index (the ref name it would have) and the node itself.
+struct Placed<'a> {
+    index: usize,
+    depth: usize,
+    path: Vec<usize>,
+    node: &'a UiNode,
+}
+
+/// Walk a tree in pre-order, collecting each node's index, depth and path.
+fn placed(root: &UiNode) -> Vec<Placed<'_>> {
+    fn rec<'a>(node: &'a UiNode, depth: usize, path: &mut Vec<usize>, out: &mut Vec<Placed<'a>>) {
+        out.push(Placed {
+            index: out.len(),
+            depth,
+            path: path.clone(),
+            node,
+        });
+        for (idx, child) in node.children.iter().enumerate() {
+            path.push(idx);
+            rec(child, depth + 1, path, out);
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
+    rec(root, 0, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The tree path as the views print it: `1.4.2` from the surface root — the children of
+/// the root are `1`, `2`, … in the order they print — so an element can be found again by
+/// eye even when no ref is shown.
+fn path_text(path: &[usize]) -> String {
+    if path.is_empty() {
+        "the root".to_string()
+    } else {
+        path.iter()
+            .map(|index| (index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
+/// How many items a list inside one answer prints before it counts the rest: the kinds an
+/// answer names when a kind matched nothing, and the elements each change category shows.
+const MAX_LISTED: usize = 12;
+
+/// The kinds present in a tree, most frequent first, for an answer that has to name
+/// them: a kind that matches nothing is a mistake to correct, not an empty surface.
+fn kinds_present<'a>(nodes: impl Iterator<Item = &'a UiNode>) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for node in nodes {
+        let kind = normalized_role(&node.role);
+        match counts
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(kind))
+        {
+            Some((_, count)) => *count += 1,
+            None => counts.push((kind.to_string(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let shown = counts.len().min(MAX_LISTED);
+    let mut text = counts[..shown]
+        .iter()
+        .map(|(name, count)| format!("{name} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if counts.len() > shown {
+        let _ = write!(text, " and {} more kinds", counts.len() - shown);
+    }
+    text
+}
+
+/// Render a narrow look over a remembered tree: the subtree beneath a ref, the levels
+/// to a depth, or a flat list of one kind — always stating that it covers part of the
+/// surface. `refs_valid` says whether the caller's live refs belong to this surface and
+/// this turn; when they do not, no ref is printed (it would not resolve) and the answer
+/// says that acting needs a fresh observation.
+pub(crate) fn render_narrow(
+    look: &Look,
+    narrow: &Narrow,
+    refs_valid: bool,
+) -> anyhow::Result<String> {
+    let nodes = placed(&look.obs.root);
+    let mut out = surface_header(
+        &look.obs.app_name,
+        look.obs.window_title.as_deref(),
+        &look.obs.surface,
+        look.counts,
+    );
+    match &narrow.kind {
+        Some(kind) => render_kind_list(&mut out, &nodes, narrow, kind, refs_valid)?,
+        None => render_subtree(&mut out, look.counts.nodes, &nodes, narrow, refs_valid)?,
+    }
+    Ok(out)
+}
+
+/// The place a narrow look starts from: the node beneath a ref, or the surface root.
+fn narrow_base(nodes: &[Placed<'_>], at: Option<&Locator>) -> anyhow::Result<(Vec<usize>, usize)> {
+    let Some(locator) = at else {
+        return Ok((Vec::new(), 0));
+    };
+    let found = nodes
+        .iter()
+        .find(|placed| placed.path == locator.path && node_matches(placed.node, locator))
+        .ok_or_else(|| {
+            taxonomy_error(
+                ERR_STALE_ELEMENT,
+                format!(
+                    "the element at {} is no longer {} — run observe again for refs that match \
+                     this surface",
+                    path_text(&locator.path),
+                    locator_describe(locator)
+                ),
+            )
+        })?;
+    Ok((found.path.clone(), found.depth))
+}
+
+/// Whether a node is inside the part of the tree this look covers: beneath the ref and
+/// within the depth asked for.
+fn inside_look(placed: &Placed<'_>, base: &(Vec<usize>, usize), depth: Option<usize>) -> bool {
+    let (base_path, base_depth) = base;
+    placed.path.starts_with(base_path)
+        && placed.depth >= *base_depth
+        && placed.depth - base_depth < depth.unwrap_or(usize::MAX)
+}
+
+/// The flat list one kind narrows to. A kind that matches nothing is a mistake to
+/// correct, so the answer names the kinds the surface does have.
+fn render_kind_list(
+    out: &mut String,
+    nodes: &[Placed<'_>],
+    narrow: &Narrow,
+    kind: &str,
+    refs_valid: bool,
+) -> anyhow::Result<()> {
+    let base = narrow_base(nodes, narrow.at.as_ref())?;
+    let covered = nodes
+        .iter()
+        .filter(|placed| inside_look(placed, &base, narrow.depth))
+        .collect::<Vec<&Placed<'_>>>();
+    let matched = covered
+        .iter()
+        .filter(|placed| normalized_role(&placed.node.role).eq_ignore_ascii_case(kind))
+        .copied()
+        .collect::<Vec<&Placed<'_>>>();
+    if matched.is_empty() {
+        let _ = writeln!(
+            out,
+            "[Narrow: no element of kind \"{kind}\" in this part of the surface — kinds present: \
+             {}. The look covers part of the surface only]",
+            kinds_present(covered.iter().map(|placed| placed.node))
+        );
+        return Ok(());
+    }
+    let _ = writeln!(
+        out,
+        "[Narrow: elements of kind \"{kind}\" — {} of {} nodes; it covers part of the surface only]",
+        matched.len(),
+        covered.len()
+    );
+    for placed in matched {
+        push_node_line(out, placed.node, 0, refs_valid.then_some(placed.index + 1));
+        let _ = writeln!(out, " — at path {}", path_text(&placed.path));
+    }
+    push_refs_note(out, refs_valid);
+    Ok(())
+}
+
+/// The tree a narrow look shows: the subtree beneath a ref, cut to the depth asked for.
+fn render_subtree(
+    out: &mut String,
+    total: usize,
+    nodes: &[Placed<'_>],
+    narrow: &Narrow,
+    refs_valid: bool,
+) -> anyhow::Result<()> {
+    let base = narrow_base(nodes, narrow.at.as_ref())?;
+    let base_depth = base.1;
+    let shown = nodes
+        .iter()
+        .filter(|placed| inside_look(placed, &base, narrow.depth))
+        .collect::<Vec<_>>();
+    let _ = writeln!(
+        out,
+        "[Narrow: {} beneath {} — {} of {} nodes; it covers part of the surface only]",
+        match narrow.depth {
+            Some(depth) => format!("{depth} {}", counted(depth, "level", "levels")),
+            None => "the subtree".to_string(),
+        },
+        match &narrow.at {
+            Some(locator) => path_text(&locator.path),
+            None => "the surface root".to_string(),
+        },
+        shown.len(),
+        total
+    );
+    for placed in shown {
+        push_node_line(
+            out,
+            placed.node,
+            placed.depth - base_depth,
+            refs_valid.then_some(placed.index + 1),
+        );
+        out.push('\n');
+    }
+    push_refs_note(out, refs_valid);
+    Ok(())
+}
+
+/// The line a narrow look or change answer carries when its elements have no refs: they
+/// are for reading only, and acting needs a full observation in this turn.
+fn push_refs_note(out: &mut String, refs_valid: bool) {
+    if !refs_valid {
+        out.push_str(
+            "[No refs: they expire with the turn that made them — run observe for refs to act on]\n",
+        );
+    }
+}
+
+/// How an element a ref names is described in a refusal.
+fn locator_describe(locator: &Locator) -> String {
+    match &locator.name {
+        Some(name) => format!("{} \"{name}\"", normalized_role(&locator.role)),
+        None => normalized_role(&locator.role).to_string(),
+    }
+}
+
+/// One element as the observation prints it — the whole comparison key of a change
+/// answer. Two elements are the same element when their kind and name match, paired in
+/// the order they appear; that is why a rename reads as one element gone and another
+/// appeared. Everything is what the printed line carries and is borrowed from the tree,
+/// so a change answer over two large trees allocates only the one lowercased kind it
+/// pairs by, the values it shows and the paths it names.
+struct PrintedNode<'a> {
+    node: &'a UiNode,
+    /// The kind as the view prints it.
+    kind: &'a str,
+    /// The lowercased form the pairing compares, computed once per node.
+    match_kind: String,
+    /// The value as the printed line shows it, cut at [`RENDER_VALUE_CHARS`]: a change
+    /// past the cut is invisible here exactly as it is in the line.
+    value: Option<String>,
+    /// Whether the value had to be cut to the printed length.
+    value_cut: bool,
+    path: Vec<usize>,
+}
+
+impl PrintedNode<'_> {
+    fn describe(&self) -> String {
+        match &self.node.name {
+            Some(name) => format!("{} \"{name}\"", self.kind),
+            None => self.kind.to_string(),
+        }
+    }
+
+    fn where_text(&self) -> String {
+        let path = path_text(&self.path);
+        match self.node.frame {
+            Some((x, y, _, _)) => format!(" at ({x}, {y}), path {path}"),
+            None => format!(" at path {path}"),
+        }
+    }
+}
+
+fn printed_nodes(root: &UiNode) -> Vec<PrintedNode<'_>> {
+    placed(root)
+        .into_iter()
+        .map(|placed| {
+            let (value, value_cut) = match placed.node.value.as_deref() {
+                Some(value) => {
+                    let shown = crate::util::truncate(value, RENDER_VALUE_CHARS);
+                    let cut = shown != value;
+                    (Some(shown), cut)
+                }
+                None => (None, false),
+            };
+            let kind = normalized_role(&placed.node.role);
+            PrintedNode {
+                node: placed.node,
+                kind,
+                match_kind: kind.to_lowercase(),
+                value,
+                value_cut,
+                path: placed.path,
+            }
+        })
+        .collect()
+}
+
+/// A pair whose place on the surface differs, with both positions: only an element that
+/// carries a position on both sides can be reported as moved.
+struct Moved<'a> {
+    node: &'a PrintedNode<'a>,
+    from: (f64, f64),
+    to: (f64, f64),
+}
+
+/// What one change answer found: elements that appeared and disappeared, and the pairs
+/// that moved, changed value, changed their actions or changed focus.
+#[derive(Default)]
+struct Changes<'a> {
+    appeared: Vec<&'a PrintedNode<'a>>,
+    disappeared: Vec<&'a PrintedNode<'a>>,
+    moved: Vec<Moved<'a>>,
+    revalued: Vec<(&'a PrintedNode<'a>, &'a PrintedNode<'a>)>,
+    actions_changed: Vec<(&'a PrintedNode<'a>, &'a PrintedNode<'a>)>,
+    refocused: Vec<&'a PrintedNode<'a>>,
+}
+
+impl Changes<'_> {
+    fn is_empty(&self) -> bool {
+        self.appeared.is_empty()
+            && self.disappeared.is_empty()
+            && self.moved.is_empty()
+            && self.revalued.is_empty()
+            && self.actions_changed.is_empty()
+            && self.refocused.is_empty()
+    }
+}
+
+/// Pair the trees by kind and name in the order they print, then classify each pair.
+/// An element that carries no position on either side can appear or disappear but is
+/// never reported as moved.
+///
+/// The pairing is a queue per identity, so it is linear in the size of the trees: a
+/// change answer over a tree of thousands of nodes holds no more than the two trees
+/// themselves.
+fn diff_trees<'a>(before: &'a [PrintedNode<'a>], after: &'a [PrintedNode<'a>]) -> Changes<'a> {
+    type Identity<'a> = (&'a str, Option<&'a str>);
+    let mut unpaired: HashMap<Identity<'_>, std::collections::VecDeque<(usize, &'a PrintedNode)>> =
+        HashMap::new();
+    for (position, node) in before.iter().enumerate() {
+        unpaired
+            .entry((node.match_kind.as_str(), node.node.name.as_deref()))
+            .or_default()
+            .push_back((position, node));
+    }
+    let mut changes = Changes::default();
+    let mut paired: Vec<(&PrintedNode, &PrintedNode)> = Vec::new();
+    for node in after {
+        match unpaired
+            .get_mut(&(node.match_kind.as_str(), node.node.name.as_deref()))
+            .and_then(std::collections::VecDeque::pop_front)
+        {
+            Some((_, old)) => paired.push((old, node)),
+            None => changes.appeared.push(node),
+        }
+    }
+    // Whatever no element of the new tree claimed disappeared, in the order it was read.
+    let mut gone = unpaired
+        .into_values()
+        .flatten()
+        .collect::<Vec<(usize, &PrintedNode)>>();
+    gone.sort_unstable_by_key(|(position, _)| *position);
+    changes.disappeared = gone.into_iter().map(|(_, node)| node).collect();
+    for (old, new) in paired {
+        if let (Some(a), Some(b)) = (old.node.frame, new.node.frame)
+            && !same_place((a.0, a.1), (b.0, b.1))
+        {
+            changes.moved.push(Moved {
+                node: new,
+                from: (a.0, a.1),
+                to: (b.0, b.1),
+            });
+        }
+        if old.value != new.value {
+            changes.revalued.push((old, new));
+        }
+        if old.node.actions != new.node.actions {
+            changes.actions_changed.push((old, new));
+        }
+        if old.node.focused != new.node.focused {
+            changes.refocused.push(new);
+        }
+    }
+    changes
+}
+
+/// Report what changed on one surface since its remembered look.
+///
+/// `now` is a fresh full observation of the same surface, compared against `look` and
+/// then dropped: the change answer replaces nothing.
+pub(crate) fn render_changes(look: &Look, now: &Observation, counts: Counts) -> String {
+    let before = printed_nodes(&look.obs.root);
+    let after = printed_nodes(&now.root);
+    let changes = diff_trees(&before, &after);
+    let mut out = surface_header(
+        &now.app_name,
+        now.window_title.as_deref(),
+        &now.surface,
+        counts,
+    );
+    // The comparison states every ceiling the read it compares reached, exactly as the
+    // full observation would: a tree that was cut short must never read as a surface whose
+    // tail disappeared.
+    let values_cut = after.iter().filter(|node| node.value_cut).count();
+    for statement in now.truncation.statements(values_cut) {
+        out.push_str(&statement);
+        out.push('\n');
+    }
+    let _ = writeln!(
+        out,
+        "[Changes since the observation of this surface taken {}: {} appeared, {} disappeared, {} \
+         moved, {} changed value, {} changed actions, {} changed focus]",
+        look_age(look.taken_at),
+        changes.appeared.len(),
+        changes.disappeared.len(),
+        changes.moved.len(),
+        changes.revalued.len(),
+        changes.actions_changed.len(),
+        changes.refocused.len()
+    );
+    if changes.is_empty() {
+        let _ = writeln!(
+            out,
+            "nothing changed on this surface since the observation taken {}",
+            look_age(look.taken_at)
+        );
+        return out;
+    }
+    push_changes(&mut out, &changes);
+    out.push_str(
+        "[No refs: a change answer compares, it does not hand out references — run observe for \
+         refs to act on]\n",
+    );
+    out
+}
+
+/// The six categories of a change answer, in the order the rule names them.
+fn push_changes(out: &mut String, changes: &Changes<'_>) {
+    push_change_section(
+        out,
+        "appeared",
+        changes
+            .appeared
+            .iter()
+            .map(|node| format!("{}{}", node.describe(), node.where_text())),
+    );
+    push_change_section(
+        out,
+        "disappeared",
+        changes
+            .disappeared
+            .iter()
+            .map(|node| format!("{}{}", node.describe(), node.where_text())),
+    );
+    push_change_section(
+        out,
+        "moved",
+        changes.moved.iter().map(|moved| {
+            format!(
+                "{} from ({}, {}) to ({}, {})",
+                moved.node.describe(),
+                moved.from.0,
+                moved.from.1,
+                moved.to.0,
+                moved.to.1
+            )
+        }),
+    );
+    push_change_section(
+        out,
+        "changed value",
+        changes.revalued.iter().map(|(old, new)| {
+            // Both sides as the observation prints them: a side with no value says so
+            // rather than borrowing a pair of quotes the observation never printed.
+            let shown = |value: Option<&str>| match value {
+                Some(value) => format!("\"{value}\""),
+                None => "no value".to_string(),
+            };
+            format!(
+                "{} — {} → {}",
+                new.describe(),
+                shown(old.value.as_deref()),
+                shown(new.value.as_deref())
+            )
+        }),
+    );
+    push_change_section(
+        out,
+        "changed actions",
+        changes.actions_changed.iter().map(|(old, new)| {
+            format!(
+                "{} — actions [{}] → [{}]",
+                new.describe(),
+                old.node.actions.join(","),
+                new.node.actions.join(",")
+            )
+        }),
+    );
+    push_change_section(
+        out,
+        "changed focus",
+        changes.refocused.iter().map(|node| {
+            format!(
+                "{} is {}",
+                node.describe(),
+                if node.node.focused {
+                    "focused now"
+                } else {
+                    "no longer focused"
+                }
+            )
+        }),
+    );
+}
+
+/// One category of a change answer, with the rest counted rather than printed.
+fn push_change_section(out: &mut String, title: &str, lines: impl Iterator<Item = String>) {
+    let lines = lines.collect::<Vec<_>>();
+    if lines.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{title}:");
+    for line in lines.iter().take(MAX_LISTED) {
+        let _ = writeln!(out, "  {line}");
+    }
+    if lines.len() > MAX_LISTED {
+        let _ = writeln!(out, "  … and {} more", lines.len() - MAX_LISTED);
+    }
+}
+
+/// How a surface's extent changed since it was remembered, or `None` when it did not:
+/// `None` is the one answer that lets an action's result say the surface is as it was.
+#[must_use]
+pub(crate) fn geometry_change(before: &SurfaceGeometry, now: &SurfaceGeometry) -> Option<String> {
+    let (dx, dy) = (now.x - before.x, now.y - before.y);
+    let moved = !same_place((before.x, before.y), (now.x, now.y));
+    let resized = !same_size(before, now);
+    match (moved, resized) {
+        (false, false) => None,
+        (true, false) => Some(format!("moved by ({dx:.1}, {dy:.1})")),
+        (false, true) => Some(format!(
+            "resized from {}x{} to {}x{}",
+            before.width, before.height, now.width, now.height
+        )),
+        (true, true) => Some(format!(
+            "moved by ({dx:.1}, {dy:.1}) and resized from {}x{} to {}x{}",
+            before.width, before.height, now.width, now.height
+        )),
     }
 }
 
@@ -2396,28 +3514,64 @@ pub(crate) fn resolve_locator<'a>(root: &'a UiNode, locator: &Locator) -> Locato
     search_locator(root, locator)
 }
 
-/// Resolve a locator, mapping the ambiguous/not-found outcomes to their
-/// taxonomy errors — the shared failure contract of every backend's
-/// `act_on_element`.
+/// Resolve a ref and confirm it is still the element the caller saw (see
+/// [`confirm_locator`]) — the one contract every backend's `act_on_element` follows
+/// before it sends anything. The note is what the action's answer appends when the
+/// position could not be compared; an `Err` is a refusal, and nothing was sent.
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
 )]
-pub(crate) fn resolve_locator_checked<'a>(
+pub(crate) fn resolve_locator_confirmed<'a>(
     root: &'a UiNode,
     locator: &Locator,
-) -> Result<&'a UiNode, anyhow::Error> {
+) -> Result<(&'a UiNode, LocatorConfirmation), anyhow::Error> {
     match resolve_locator(root, locator) {
-        LocatorMatch::Path(node) | LocatorMatch::Unique(node) => Ok(node),
+        LocatorMatch::Path(node) | LocatorMatch::Unique(node) => {
+            Ok((node, confirm_locator(node, locator)?))
+        }
         LocatorMatch::Ambiguous => Err(taxonomy_error(
             ERR_AMBIGUOUS_LOCATOR,
-            "locator matches multiple elements — re-observe and pick a more specific ref",
+            format!(
+                "more than one element now matches {} — nothing was sent; run observe again and \
+                 act on the ref it prints now",
+                locator_describe(locator)
+            ),
         )),
-        LocatorMatch::NotFound => Err(taxonomy_error(
-            ERR_NOT_MATCHED,
-            "element no longer matches its locator — re-observe",
-        )),
+        LocatorMatch::NotFound => {
+            let now = node_at_path(root, &locator.path);
+            Err(taxonomy_error(
+                ERR_STALE_ELEMENT,
+                match now {
+                    Some(node) => format!(
+                        "{} is no longer on this surface — {} sits where it was; nothing was sent, \
+                         so run observe again and act on what it prints now",
+                        locator_describe(locator),
+                        locator_describe(&Locator {
+                            path: locator.path.clone(),
+                            role: node.role.clone(),
+                            name: node.name.clone(),
+                            frame: node.frame,
+                        })
+                    ),
+                    None => format!(
+                        "{} is no longer on this surface — nothing was sent; run observe again and \
+                         act on what it prints now",
+                        locator_describe(locator)
+                    ),
+                },
+            ))
+        }
     }
+}
+
+/// The node at a recorded child-index path, if the path still leads somewhere.
+fn node_at_path<'a>(root: &'a UiNode, path: &[usize]) -> Option<&'a UiNode> {
+    let mut node = root;
+    for idx in path {
+        node = node.children.get(*idx)?;
+    }
+    Some(node)
 }
 
 /// Shared refusal for observing the `screen` target: an observation reads an
@@ -2471,6 +3625,64 @@ fn node_matches(node: &UiNode, locator: &Locator) -> bool {
     role_ok && name_ok
 }
 
+/// How a ref stood up to the check before it was acted on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LocatorConfirmation {
+    /// Still the element the observation showed: the same kind, the same name and the
+    /// same place on the surface.
+    SamePlace,
+    /// The same kind and name, but its position could not be compared — either side of
+    /// the observation carries none.
+    PositionUnconfirmed,
+}
+
+impl LocatorConfirmation {
+    /// What an action's answer says about the ref it acted on. Always stated: the caller
+    /// asked for an element, so whether that element was where it expected is part of
+    /// what the action could observe.
+    #[must_use]
+    pub(crate) fn note(self, locator: &Locator) -> String {
+        match self {
+            Self::SamePlace => format!(
+                "{} is still where the observation showed it",
+                locator_describe(locator)
+            ),
+            Self::PositionUnconfirmed => format!(
+                "{} matched by kind and name, but a position could not be compared — one side of \
+                 the read carries none — so its place could not be confirmed",
+                locator_describe(locator)
+            ),
+        }
+    }
+}
+
+/// Whether a freshly read node is still the element the ref was minted for: the same
+/// kind, the same name, and — measured against the surface, so a window that merely
+/// moved does not invalidate anything — the same place on it. `Err` is the refusal
+/// naming what changed, and nothing has been sent. This is what keeps a press from
+/// landing on whatever reflowed into the element's old place.
+pub(crate) fn confirm_locator(
+    node: &UiNode,
+    locator: &Locator,
+) -> anyhow::Result<LocatorConfirmation> {
+    let (Some((x, y, _, _)), Some(frame)) = (node.frame, locator.frame) else {
+        return Ok(LocatorConfirmation::PositionUnconfirmed);
+    };
+    if same_place((frame.0, frame.1), (x, y)) {
+        return Ok(LocatorConfirmation::SamePlace);
+    }
+    Err(taxonomy_error(
+        ERR_STALE_ELEMENT,
+        format!(
+            "{} is no longer where the observation showed it — it was at ({}, {}) and is now at \
+             ({x}, {y}); nothing was sent, so run observe again and act on what it prints now",
+            locator_describe(locator),
+            frame.0,
+            frame.1
+        ),
+    ))
+}
+
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux", target_os = "windows", test)),
     expect(dead_code)
@@ -2500,6 +3712,25 @@ fn search_locator<'a>(root: &'a UiNode, locator: &Locator) -> LocatorMatch<'a> {
 
 // ── Backend trait ───────────────────────────────────────────────────────
 
+/// The element that holds the keyboard focus on a surface, by kind and name — what an
+/// action's answer can honestly say about where its input went.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FocusedElement {
+    pub kind: String,
+    pub name: Option<String>,
+}
+
+impl FocusedElement {
+    #[must_use]
+    pub(crate) fn describe(&self) -> String {
+        let kind = normalized_role(&self.kind);
+        match &self.name {
+            Some(name) if !name.is_empty() => format!("{kind} \"{name}\""),
+            _ => format!("an unnamed {kind}"),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait Backend: Send + Sync {
     /// Whether the platform can serve the tool at all — the advertisement gate,
@@ -2519,7 +3750,7 @@ pub(crate) trait Backend: Send + Sync {
     /// Actionable diagnosis for an unavailable capture channel (missing grant,
     /// or an OS too old for stills).
     fn capture_unavailable_error(&self) -> anyhow::Error;
-    async fn list_apps(&self) -> anyhow::Result<Vec<AppInfo>>;
+    async fn list_apps(&self) -> anyhow::Result<AppListing>;
     /// Windows of one application (or of every application). A failed read of one
     /// application is reported in [`WindowListing::unread`], never as an empty list.
     async fn list_windows(&self, app: Option<&AppInfo>) -> anyhow::Result<WindowListing>;
@@ -2531,8 +3762,12 @@ pub(crate) trait Backend: Send + Sync {
     async fn app_running(&self, _app: &AppInfo) -> Option<bool> {
         None
     }
-    /// Focused window of the frontmost application (the DEFAULT surface).
-    async fn focused_window(&self) -> anyhow::Result<WindowInfo>;
+    /// The concrete window a target names right now: an application id re-resolves to the
+    /// window that application has focused, and `Focused` to the frontmost application's.
+    /// Every statement about a surface — the remembered look it is measured against, the
+    /// order it holds in a listing — is about one window, so an application address is
+    /// made concrete before anything is recorded about it.
+    async fn surface_window(&self, target: &TargetSpec) -> anyhow::Result<WindowInfo>;
     /// Surface geometry for a target (Screen: virtual-desktop bounding rect).
     async fn surface_geometry(&self, target: &TargetSpec) -> anyhow::Result<SurfaceGeometry>;
     /// AX tree of a window target (Screen target: `unsupported` error).
@@ -2543,10 +3778,17 @@ pub(crate) trait Backend: Send + Sync {
         locator: &Locator,
         act: ElementAct,
     ) -> anyhow::Result<Impact>;
-    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<Impact>;
+    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<Actuation>;
     /// Pointer position in ABSOLUTE global surface points (logical points on
     /// macOS, physical pixels on Linux and Windows).
     async fn cursor_position(&self) -> anyhow::Result<(f64, f64)>;
+    /// Which element holds the keyboard focus on `target`'s surface — `None` when this read
+    /// could not establish it, which the action's answer states as unread instead of
+    /// guessing. A best-effort probe: it runs after the action's input was delivered, so it
+    /// may not fail or reinterpret anything.
+    async fn focused_element(&self, _target: Option<&TargetSpec>) -> Option<FocusedElement> {
+        None
+    }
     /// RGBA pixels of a target surface (window capture, or full virtual desktop for
     /// Screen). Every buffer this produces is charged to `budget` — the call's one
     /// allowance, so a surface the machine reports as enormous is refused instead
@@ -2615,6 +3857,16 @@ mod tests {
             root,
             truncation: Truncation::default(),
         }
+    }
+
+    /// [`sample_observation`] with the positions a real read reports, so the views that
+    /// compare places have something to compare.
+    fn framed_observation() -> Observation {
+        let mut obs = sample_observation();
+        obs.root.frame = Some((0.0, 0.0, 800.0, 600.0));
+        obs.root.children[0].frame = Some((10.0, 10.0, 80.0, 24.0));
+        obs.root.children[1].children[0].frame = Some((10.0, 50.0, 80.0, 24.0));
+        obs
     }
 
     #[test]
@@ -2859,7 +4111,8 @@ mod tests {
     #[test]
     fn render_tree_assigns_pre_order_refs_and_flags() {
         let obs = sample_observation();
-        let text = render_tree(&obs);
+        let counts = counts(&obs.root);
+        let text = render_tree(&obs, counts);
         let lines: Vec<&str> = text.lines().collect();
         assert!(
             lines[0].starts_with(
@@ -2887,10 +4140,12 @@ mod tests {
             "got {}",
             lines[4]
         );
-        // count_interactive counts the two buttons (actions) and treats root/group as non-interactive.
-        assert_eq!(count_interactive(&obs), 2);
-        // 2 < AX_THIN_INTERACTIVE_ELEMENTS → the surface is AX-thin.
-        assert!(is_ax_thin(&obs));
+        // The counts are the two buttons (actions); root/group are non-interactive, and
+        // fewer interactive elements than the thin-surface threshold is what makes the
+        // full observation say so.
+        assert_eq!(counts.interactive, 2);
+        assert_eq!(counts.nodes, 4);
+        assert!(counts.interactive < AX_THIN_INTERACTIVE_ELEMENTS);
     }
 
     #[test]
@@ -2929,7 +4184,7 @@ mod tests {
                 }),
             },
         };
-        let text = render_tree(&obs);
+        let text = render_tree(&obs, counts(&obs.root));
         assert!(text.contains("value=\""), "value should render");
         assert!(!text.contains(&long), "long value must be truncated");
         // Every cut is stated in the header, above the first element line: a tree
@@ -2981,6 +4236,432 @@ mod tests {
         assert_eq!(
             truncation.statements(0),
             ["[Tree truncated: 1 node at the 25-deep ceiling — its children were not read]"]
+        );
+    }
+
+    /// An observation recorded as a surface's look, for the views below.
+    fn look_of(obs: &Observation, target: TargetSpec) -> Look {
+        Look {
+            target,
+            counts: counts(&obs.root),
+            obs: obs.clone(),
+            taken_at: Instant::now(),
+        }
+    }
+
+    fn window_target(label: &str) -> TargetSpec {
+        TargetSpec::Window {
+            app_pid: Some(7),
+            app_name: "TestApp".to_string(),
+            key: WindowKey::new(label),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_narrow_look_by_kind_lists_matches_and_names_the_kinds_present() {
+        let obs = sample_observation();
+        let look = look_of(&obs, window_target("k"));
+
+        let buttons = Narrow {
+            kind: Some("button".to_string()),
+            ..Narrow::default()
+        };
+        let answer = render_narrow(&look, &buttons, true).expect("a kind always resolves");
+        assert!(
+            answer.contains("elements of kind \"button\" — 2 of 4 nodes"),
+            "{answer}"
+        );
+        assert!(answer.contains("[e2] Button \"OK\""), "{answer}");
+        assert!(answer.contains("[e4] Button \"Cancel\""), "{answer}");
+        assert!(answer.contains("— at path 1"), "{answer}");
+        assert!(answer.contains("— at path 2.1"), "{answer}");
+        assert!(
+            answer.contains("it covers part of the surface only"),
+            "{answer}"
+        );
+
+        // Narrowing composes: a kind inside a ref's subtree is only that subtree's.
+        let inside = Narrow {
+            at: Some(Locator {
+                path: vec![1],
+                role: "AXGroup".to_string(),
+                name: None,
+                frame: None,
+            }),
+            kind: Some("button".to_string()),
+            ..Narrow::default()
+        };
+        let answer = render_narrow(&look, &inside, true).expect("the ref is in this look");
+        assert!(answer.contains("— 1 of 2 nodes"), "{answer}");
+        assert!(answer.contains("Button \"Cancel\""), "{answer}");
+        assert!(
+            !answer.contains("Button \"OK\""),
+            "only the subtree's matches are listed: {answer}"
+        );
+
+        // A mistyped kind is a mistake to correct, not an empty surface.
+        let mistyped = Narrow {
+            kind: Some("buton".to_string()),
+            ..Narrow::default()
+        };
+        let answer = render_narrow(&look, &mistyped, true).expect("a kind always resolves");
+        assert!(answer.contains("no element of kind \"buton\""), "{answer}");
+        assert!(answer.contains("kinds present: Button (2)"), "{answer}");
+    }
+
+    #[test]
+    fn a_narrow_look_of_a_subtree_prints_no_refs_once_the_turn_ended() {
+        let obs = sample_observation();
+        let look = look_of(&obs, window_target("k"));
+        let subtree = Narrow {
+            at: Some(Locator {
+                path: vec![1],
+                role: "AXGroup".to_string(),
+                name: None,
+                frame: None,
+            }),
+            depth: Some(2),
+            kind: None,
+        };
+        let answer = render_narrow(&look, &subtree, true).expect("the ref is in this look");
+        assert!(answer.contains("[e3] Group"), "{answer}");
+        assert!(
+            answer.contains("  [e4] Button \"Cancel\" actions=[press]"),
+            "the subtree keeps its shape, printed as a full look prints it: {answer}"
+        );
+        assert!(answer.contains("2 levels beneath 2"), "{answer}");
+
+        // A later turn keeps the look but loses the refs: nothing is printed that would
+        // not resolve, and the answer says acting needs a fresh observation.
+        let answer = render_narrow(&look, &subtree, false).expect("the ref is in this look");
+        assert!(!answer.contains("[e3]"), "{answer}");
+        assert!(answer.contains("[No refs:"), "{answer}");
+
+        // A ref that no longer names that element is a mistake, not an empty look.
+        let stale = Narrow {
+            at: Some(Locator {
+                path: vec![1],
+                role: "AXButton".to_string(),
+                name: Some("Gone".to_string()),
+                frame: None,
+            }),
+            ..Narrow::default()
+        };
+        let err = render_narrow(&look, &stale, true).expect_err("the ref no longer matches");
+        assert!(err.to_string().starts_with(ERR_STALE_ELEMENT), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial(computer_looks)]
+    fn the_remembered_look_keeps_a_few_surfaces_and_drops_the_least_recently_looked_at() {
+        let obs = sample_observation();
+        let counts = counts(&obs.root);
+        let keys = (0..=MAX_LOOKS)
+            .map(|i| window_target(&format!("k{i}")))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            remember_look(key, obs.clone(), counts);
+        }
+        assert!(
+            with_look(&keys[0]).is_none(),
+            "the least recently looked at surface is dropped first"
+        );
+        for key in &keys[1..] {
+            assert!(with_look(key).is_some(), "{} is kept", key.describe());
+        }
+        // Reading a record — a narrow look, a change answer, an action's own statement — is
+        // not looking at the surface: only a full observation keeps it.
+        with_look(&keys[2]);
+        remember_look(&window_target("fresh"), obs.clone(), counts);
+        assert!(
+            with_look(&keys[1]).is_none(),
+            "a read did not keep the least recently observed surface"
+        );
+        assert!(with_look(&keys[2]).is_some());
+        // Observing one again is what keeps it when the next surface arrives.
+        remember_look(&keys[3], obs.clone(), counts);
+        remember_look(&window_target("fresh2"), obs.clone(), counts);
+        assert!(
+            with_look(&keys[3]).is_some(),
+            "the re-observed record survived"
+        );
+        assert!(with_look(&keys[2]).is_none(), "the older one went");
+        // A surface confirmed gone takes its record with it.
+        forget_look(&keys[3]);
+        assert!(with_look(&keys[3]).is_none(), "a gone surface is forgotten");
+        for key in &keys {
+            forget_look(key);
+        }
+        forget_look(&window_target("fresh"));
+        forget_look(&window_target("fresh2"));
+    }
+
+    #[test]
+    #[serial_test::serial(computer_looks)]
+    fn a_change_answer_pairs_by_kind_and_name_in_order() {
+        let before = framed_observation();
+        let mut after = framed_observation();
+        // The OK button moved and its value changed; the Cancel button was renamed, which
+        // reads as one element gone and another appeared; a new field appeared.
+        after.root.children[0].frame = Some((70.0, 10.0, 80.0, 24.0));
+        after.root.children[0].value = Some("typed".to_string());
+        after.root.children[1].children[0].name = Some("Cancelled".to_string());
+        after.root.children.push(leaf("AXTextField", "Search"));
+
+        let answer = render_changes(
+            &look_of(&before, window_target("k")),
+            &after,
+            counts(&after.root),
+        );
+        assert!(
+            answer.contains("2 appeared, 1 disappeared, 1 moved, 1 changed value"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("Button \"OK\" from (10, 10) to (70, 10)"),
+            "{answer}"
+        );
+        assert!(answer.contains("Button \"Cancel\""), "{answer}");
+        assert!(answer.contains("Button \"Cancelled\""), "{answer}");
+        assert!(answer.contains("TextField \"Search\""), "{answer}");
+        assert!(answer.contains("changed value:"), "{answer}");
+
+        // A control that lost its press action and one that took the focus are reported
+        // too: both are what the observation prints of the element.
+        let mut restated = framed_observation();
+        restated.root.children[0].actions.clear();
+        restated.root.children[1].children[0].focused = true;
+        let answer = render_changes(
+            &look_of(&before, window_target("k")),
+            &restated,
+            counts(&restated.root),
+        );
+        assert!(
+            answer.contains("1 changed actions, 1 changed focus"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("Button \"OK\" — actions [press] → []"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("Button \"Cancel\" is focused now"),
+            "{answer}"
+        );
+
+        // Nothing changed on an identical tree, and the answer says so.
+        let same = render_changes(
+            &look_of(&before, window_target("k")),
+            &before,
+            counts(&before.root),
+        );
+        assert!(
+            same.contains("nothing changed on this surface since the observation taken"),
+            "{same}"
+        );
+        assert!(
+            !same.contains("[e"),
+            "a change answer prints no refs: {same}"
+        );
+    }
+
+    #[test]
+    fn an_element_without_a_position_is_never_reported_as_moved() {
+        let before = framed_observation();
+        let mut after = sample_observation();
+        assert!(after.root.children[1].children[0].frame.is_none());
+        after.root.children[1].children[0].value = Some("other".to_string());
+        let answer = render_changes(
+            &look_of(&before, window_target("k")),
+            &after,
+            counts(&after.root),
+        );
+        assert!(!answer.contains("moved:"), "{answer}");
+        assert!(answer.contains("changed value:"), "{answer}");
+        // A side with no value says so, instead of a pair of quotes the observation never
+        // printed.
+        assert!(answer.contains("no value → \"other\""), "{answer}");
+    }
+
+    #[test]
+    fn a_ref_is_acted_on_only_while_it_still_names_what_was_seen() {
+        let obs = framed_observation();
+        let root = &obs.root;
+        let locator = Locator {
+            path: vec![0],
+            role: "AXButton".to_string(),
+            name: Some("OK".to_string()),
+            frame: None,
+        };
+        let (_, confirmed) =
+            resolve_locator_confirmed(root, &locator).expect("the button is there");
+        assert_eq!(confirmed, LocatorConfirmation::PositionUnconfirmed);
+        assert!(
+            confirmed
+                .note(&locator)
+                .contains("its place could not be confirmed"),
+            "{}",
+            confirmed.note(&locator)
+        );
+
+        let placed = Locator {
+            frame: Some((10.0, 10.0, 80.0, 24.0)),
+            ..locator.clone()
+        };
+        let (_, confirmed) = resolve_locator_confirmed(root, &placed).expect("the button is there");
+        assert_eq!(confirmed, LocatorConfirmation::SamePlace);
+        assert!(
+            confirmed
+                .note(&placed)
+                .contains("is still where the observation showed it"),
+            "{}",
+            confirmed.note(&placed)
+        );
+
+        // A reflow inside the surface moved it: nothing may be sent.
+        let reflowed = Locator {
+            frame: Some((300.0, 300.0, 80.0, 24.0)),
+            ..locator
+        };
+        let err = resolve_locator_confirmed(root, &reflowed).expect_err("it moved away");
+        assert!(err.to_string().starts_with(ERR_STALE_ELEMENT), "{err}");
+        assert!(err.to_string().contains("nothing was sent"), "{err}");
+    }
+
+    #[test]
+    fn a_surfaces_move_is_measured_against_one_record_with_a_tolerance() {
+        let before = surface(100.0, 100.0, 800.0, 600.0);
+        assert_eq!(geometry_change(&before, &before), None);
+        // Inside the tolerance is the same place: two reads of one window agree.
+        assert_eq!(
+            geometry_change(&before, &surface(101.0, 100.5, 800.0, 600.0)),
+            None
+        );
+        assert_eq!(
+            geometry_change(&before, &surface(100.0, 140.0, 800.0, 600.0)).as_deref(),
+            Some("moved by (0.0, 40.0)")
+        );
+        assert_eq!(
+            geometry_change(&before, &surface(100.0, 100.0, 900.0, 600.0)).as_deref(),
+            Some("resized from 800x600 to 900x600")
+        );
+    }
+
+    #[test]
+    fn a_click_is_blocked_only_by_another_applications_window() {
+        let geometry = surface(100.0, 100.0, 800.0, 600.0);
+        let other = WindowAtPoint {
+            app_pid: Some(1),
+            app_name: "Slack".to_string(),
+            title: "Team".to_string(),
+            frame: Some(surface(200.0, 200.0, 900.0, 700.0)),
+        };
+        let addressed = window_target("Inbox");
+        assert_eq!(
+            UnderPoint::classify(&addressed, Some(2), Some(&geometry), Some(&other)),
+            UnderPoint::Blocked(other.clone())
+        );
+        // Two maximized windows of two applications share a frame exactly: the process
+        // decides, so this is another application's window and nothing is sent.
+        let covering = WindowAtPoint {
+            frame: Some(geometry),
+            ..other.clone()
+        };
+        assert_eq!(
+            UnderPoint::classify(&addressed, Some(2), Some(&geometry), Some(&covering)),
+            UnderPoint::Blocked(covering.clone())
+        );
+        // The same application's own dialog is not an obstacle, and the answer names it.
+        let dialog = WindowAtPoint {
+            app_pid: Some(2),
+            app_name: "Mail".to_string(),
+            title: "Save".to_string(),
+            frame: Some(surface(300.0, 300.0, 400.0, 200.0)),
+        };
+        let verdict = UnderPoint::classify(&addressed, Some(2), Some(&geometry), Some(&dialog));
+        assert_eq!(verdict, UnderPoint::ThatWindow(dialog.clone()));
+        let check = ClickCheck {
+            surface: &addressed,
+            local: (10.0, 10.0),
+            geometry: &geometry,
+            addressed_pid: Some(2),
+            addressed_frame: Some(&geometry),
+            under: Some(&dialog),
+        };
+        let note = verdict.disclosure(&check).expect("a note, not a refusal");
+        assert!(note.is_some_and(|note| note.contains("another window of the same application")));
+        // The addressed window itself is recognised by its frame, however the two systems
+        // spell its title: the window the caller addressed is not another window of its
+        // application, so nothing is reported.
+        let itself = WindowAtPoint {
+            title: "Inbox - Mail".to_string(),
+            frame: Some(geometry),
+            ..dialog.clone()
+        };
+        assert_eq!(
+            UnderPoint::classify(&addressed, Some(2), Some(&geometry), Some(&itself)),
+            UnderPoint::Clear
+        );
+        // The same application, but the window's own frame unreadable — a menu-bar item, a
+        // Dock tile, an element whose window is not reported: the application is the same, so
+        // nothing of another application is in the way, and only which of its windows the
+        // point is on cannot be said.
+        let unframed = WindowAtPoint {
+            frame: None,
+            ..dialog.clone()
+        };
+        assert_eq!(
+            UnderPoint::classify(&addressed, Some(2), None, Some(&unframed)),
+            UnderPoint::Clear
+        );
+        // A window that cannot be attributed is the unknown case, never a silent clear — the
+        // addressed application unknown, or the window's own owner unread because it vanished
+        // before the query. The click goes and the answer says it was not checked.
+        let unattributed = WindowAtPoint {
+            app_pid: None,
+            ..other.clone()
+        };
+        for (addressed_pid, at) in [(None, &other), (Some(2), &unattributed)] {
+            assert_eq!(
+                UnderPoint::classify(&addressed, addressed_pid, Some(&geometry), Some(at)),
+                UnderPoint::Unknown
+            );
+        }
+        // Nothing to check: the screen, or a platform that cannot answer.
+        assert_eq!(
+            UnderPoint::classify(&TargetSpec::Screen, None, None, None),
+            UnderPoint::Screen
+        );
+        assert_eq!(
+            UnderPoint::classify(&addressed, Some(2), Some(&geometry), None),
+            UnderPoint::Unknown
+        );
+        let surface_target = window_target("Inbox");
+        let err = click_under_point(&ClickCheck {
+            surface: &surface_target,
+            local: (340.0, 220.0),
+            geometry: &geometry,
+            addressed_pid: Some(2),
+            addressed_frame: Some(&geometry),
+            under: Some(&other),
+        })
+        .expect_err("another application's window blocks the click");
+        assert!(err.to_string().starts_with(ERR_BLOCKED), "{err}");
+        assert!(err.to_string().contains("nothing was sent"), "{err}");
+        assert!(
+            err.to_string().contains("Slack"),
+            "the answer names the application in the way: {err}"
+        );
+        // The refusal states the surface and the position the point was resolved against,
+        // so a caller that named no surface learns what the point was placed on.
+        assert!(
+            err.to_string().contains("(340.0, 220.0) of 800x600"),
+            "the refusal states the position and the surface's size: {err}"
+        );
+        assert!(
+            err.to_string().contains("window \"Inbox\" of TestApp"),
+            "the refusal names the surface: {err}"
         );
     }
 
@@ -3142,14 +4823,13 @@ mod tests {
     fn store_and_resolve_ref_round_trip_then_stale() {
         let obs = sample_observation();
         let target = TargetSpec::Focused;
-        let count = store_observation(target.clone(), &obs);
+        store_observation(target.clone(), &obs);
 
         let (locator, resolved_target) = resolve_ref("e2").unwrap();
         assert_eq!(locator.role, "AXButton");
         assert_eq!(locator.name.as_deref(), Some("OK"));
         assert_eq!(locator.path, vec![0]);
         assert_eq!(resolved_target, TargetSpec::Focused);
-        assert_eq!(count, 4);
 
         // A fresh observe replaces the cache; the old ref goes stale.
         let obs2 = Observation {
@@ -3330,6 +5010,7 @@ mod tests {
                 path: vec![0],
                 role: "button".to_string(),
                 name: Some("OK".to_string()),
+                frame: None,
             },
         );
         assert!(matches!(hit, LocatorMatch::Path(_)));
@@ -3340,6 +5021,7 @@ mod tests {
                 path: vec![99],
                 role: "button".to_string(),
                 name: Some("OK".to_string()),
+                frame: None,
             },
         );
         assert!(matches!(fallback, LocatorMatch::Unique(_)));
@@ -3350,6 +5032,7 @@ mod tests {
                 path: vec![1],
                 role: "button".to_string(),
                 name: Some("OK".to_string()),
+                frame: None,
             },
         );
         assert!(matches!(mismatch, LocatorMatch::Unique(_)));
@@ -3360,6 +5043,7 @@ mod tests {
                 path: Vec::new(),
                 role: "AXSlider".to_string(),
                 name: None,
+                frame: None,
             },
         );
         assert!(matches!(none, LocatorMatch::NotFound));
@@ -3376,6 +5060,7 @@ mod tests {
                 path: Vec::new(),
                 role: "AXButton".to_string(),
                 name: None,
+                frame: None,
             },
         );
         assert!(matches!(all_buttons, LocatorMatch::Ambiguous));
@@ -3386,6 +5071,7 @@ mod tests {
                 path: vec![0],
                 role: "AXButton".to_string(),
                 name: None,
+                frame: None,
             },
         );
         assert!(matches!(pinned, LocatorMatch::Path(_)));

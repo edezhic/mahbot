@@ -188,8 +188,9 @@ mod window;
 use self::thread::Call;
 use self::window::SECURE_DESKTOP_REASON;
 use super::core::{
-    self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Observation,
-    RawInput, SurfaceGeometry, TargetSpec, WindowInfo, WindowListing,
+    self, Actuation, AppInfo, AppListing, Backend, Capture, CaptureBudget, ElementAct,
+    FocusedElement, Impact, Locator, Observation, RawInput, SurfaceGeometry, TargetSpec,
+    WindowInfo, WindowListing,
 };
 use async_trait::async_trait;
 use std::time::Duration;
@@ -207,7 +208,9 @@ use std::time::Duration;
 // deadline, and that error names the same surface (the call's own label, read before it
 // is submitted). For an actuating call the deadline answers applied-but-unconfirmed
 // (see [`thread::submit_act`]), because its input may still land; for a read it stays
-// an error, since nothing is left in flight.
+// an error, since nothing is left in flight. A deadline that expires before the thread
+// has even started the job is neither: nothing ran, so both shapes answer it as the
+// plain `degraded` failure it is.
 
 /// App/window enumeration and geometry: plain Win32, no provider involved.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -286,7 +289,7 @@ impl Backend for WindowsBackend {
         )
     }
 
-    async fn list_apps(&self) -> anyhow::Result<Vec<AppInfo>> {
+    async fn list_apps(&self) -> anyhow::Result<AppListing> {
         thread::submit(Call::ListApps, LIST_TIMEOUT).await
     }
 
@@ -301,8 +304,11 @@ impl Backend for WindowsBackend {
         app.pid.and_then(window::process_alive)
     }
 
-    async fn focused_window(&self) -> anyhow::Result<WindowInfo> {
-        thread::submit(Call::FocusedWindow, LIST_TIMEOUT).await
+    async fn surface_window(&self, target: &TargetSpec) -> anyhow::Result<WindowInfo> {
+        let call = Call::SurfaceWindow {
+            target: target.clone(),
+        };
+        thread::submit(call, LIST_TIMEOUT).await
     }
 
     async fn surface_geometry(&self, target: &TargetSpec) -> anyhow::Result<SurfaceGeometry> {
@@ -326,10 +332,12 @@ impl Backend for WindowsBackend {
             locator: locator.clone(),
             act,
         };
-        thread::submit_act(call, ACT_TIMEOUT).await
+        thread::submit_act(call, ACT_TIMEOUT)
+            .await
+            .map(|actuation| actuation.impact)
     }
 
-    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<Impact> {
+    async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> anyhow::Result<Actuation> {
         // Argument bounds first, before the call reaches the interface thread.
         core::check_raw_input(&input)?;
         let call = Call::RawInput {
@@ -341,6 +349,16 @@ impl Backend for WindowsBackend {
 
     async fn cursor_position(&self) -> anyhow::Result<(f64, f64)> {
         thread::submit(Call::CursorPosition, LIST_TIMEOUT).await
+    }
+
+    /// Read best-effort, as the contract requires: anything this cannot establish is
+    /// `None`, which the action's report states as unread. A probe that exceeds the list
+    /// bound is that same answer, never a failure of the action.
+    async fn focused_element(&self, target: Option<&TargetSpec>) -> Option<FocusedElement> {
+        let call = Call::FocusedElement {
+            target: target.cloned(),
+        };
+        thread::submit(call, LIST_TIMEOUT).await.ok().flatten()
     }
 
     async fn capture(

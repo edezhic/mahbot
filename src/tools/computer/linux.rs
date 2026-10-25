@@ -51,6 +51,19 @@
 //! chords and typing still reach it. Nothing here needs to know which process owns
 //! a window.
 //!
+//! That last fact is what this platform cannot answer, and the answers say so instead of
+//! implying otherwise: AT-SPI carries no application identity, so `apps` names a
+//! frontmost application only from the active state of the applications' windows (and
+//! names none when no window reports one), a listing gives no front-to-back order (the
+//! stack lives in the window manager, unreachable from these windows), and a coordinate
+//! click cannot be checked against the window under its point — it is sent, and its
+//! answer states that the point could not be checked.
+//!
+//! Focus is the exception: the toolkit publishes no "what has focus" call, so the element
+//! that holds it is found by a bounded search of the addressed window's subtree — a few
+//! hundred nodes at most, since this probe runs after every action — and an element that
+//! search cannot reach is reported as one the platform cannot name.
+//!
 //! A read never presents a ceiling as completeness: a tree that stopped at one
 //! records it in the observation's header, and an application whose windows cannot
 //! be read is named as unread instead of appearing to have none. A node whose own
@@ -84,9 +97,9 @@
 )]
 
 use super::core::{
-    self, AppInfo, Backend, Capture, CaptureBudget, ElementAct, Impact, Locator, Modifier,
-    MouseButton, Observation, RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, Truncation,
-    UiNode, UnreadWindows, WindowInfo, WindowKey, WindowListing,
+    self, AppInfo, AppListing, Backend, Capture, CaptureBudget, ElementAct, FocusedElement, Impact,
+    Locator, Modifier, MouseButton, Observation, RawInput, ScrollDirection, SurfaceGeometry,
+    TargetSpec, Truncation, UiNode, UnreadWindows, WindowInfo, WindowKey, WindowListing,
 };
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::Context as _;
@@ -120,7 +133,10 @@ pub(crate) struct LinuxBackend {
     connection: tokio::sync::Mutex<Option<zbus::Connection>>,
 }
 
-const MAX_DEPTH: usize = 25;
+/// Nodes one focus probe may visit: AT-SPI publishes no "what has focus" call, so the
+/// element is found by walking — and this probe runs after every action, so the search
+/// may cost a moment, not a walk of the whole window.
+const FOCUS_WALK_NODES: usize = 200;
 /// Cap on text read into a node's `value`: one character past what the renderer
 /// shows. The tree dump is a map of the surface, not a copy of its text, so one
 /// character more than the renderer displays is enough to know the value was cut —
@@ -592,14 +608,6 @@ struct WindowHandle {
     focused: bool,
 }
 
-struct ResolvedWindow {
-    object_ref: ObjectRefOwned,
-    key: WindowKey,
-    app_info: AppInfo,
-    title: String,
-    surface: SurfaceGeometry,
-}
-
 /// Root accessible's children = applications that expose accessibility. Apps
 /// that don't simply don't appear — an accepted AX-first limitation.
 async fn enumerate_apps(
@@ -797,6 +805,9 @@ async fn window_screen_extents(
 struct ResolvedSurface {
     /// The window object the reads were made against.
     object_ref: ObjectRefOwned,
+    /// The pid of the application resolution landed on, as far as this desktop tells it:
+    /// the target's own pid when it carried one, else whatever named the window.
+    app_pid: Option<u32>,
     app_name: String,
     title: Option<String>,
     surface: SurfaceGeometry,
@@ -825,6 +836,7 @@ async fn resolve_surface(
         .ok_or_else(|| core::unanswered(&label, "for its window geometry"))?;
     Ok(ResolvedSurface {
         object_ref,
+        app_pid: app_info.pid,
         app_name,
         title,
         surface,
@@ -924,7 +936,7 @@ async fn app_current_window(
 async fn resolve_focused_window(
     conn: &zbus::Connection,
     budget: &core::Budget,
-) -> Result<ResolvedWindow, anyhow::Error> {
+) -> Result<(ObjectRefOwned, AppInfo), anyhow::Error> {
     let apps = enumerate_apps(conn, budget).await?;
     let mut matches = Vec::new();
     let mut skipped = None;
@@ -936,13 +948,7 @@ async fn resolve_focused_window(
             Ok(handles) => {
                 for w in handles {
                     if w.active || w.focused {
-                        matches.push(ResolvedWindow {
-                            object_ref: w.object_ref,
-                            key: w.key,
-                            app_info: app_info.clone(),
-                            title: w.title,
-                            surface: w.surface,
-                        });
+                        matches.push((w.object_ref, app_info.clone()));
                     }
                 }
             }
@@ -994,10 +1000,7 @@ async fn resolve_window(
 ) -> Result<(ObjectRefOwned, AppInfo), anyhow::Error> {
     match target {
         TargetSpec::Screen => Err(core::screen_observe_error()),
-        TargetSpec::Focused => {
-            let w = resolve_focused_window(conn, budget).await?;
-            Ok((w.object_ref, w.app_info))
-        }
+        TargetSpec::Focused => resolve_focused_window(conn, budget).await,
         TargetSpec::App { app_pid, app_name } => {
             let app_ref = resolve_app_object(conn, app_name, *app_pid, budget).await?;
             let win_ref = app_current_window(conn, &app_ref, app_name, budget).await?;
@@ -1216,11 +1219,11 @@ async fn walk_node(
         .is_ok_and(|s| s.contains(AtspiState::Focused));
 
     let mut children = Vec::new();
-    if depth >= MAX_DEPTH {
+    if depth >= core::MAX_TREE_DEPTH {
         // The node's subtree is not read. Only a node that has one is a cut, so a leaf
         // at the ceiling is not reported as a truncation.
         if node_has_children(&accessible).await {
-            truncation.cut_depth(MAX_DEPTH);
+            truncation.cut_depth(core::MAX_TREE_DEPTH);
         }
     } else {
         budget.check()?;
@@ -1320,6 +1323,53 @@ async fn build_tree(
     // a thin window; say the read is incomplete instead.
     ensure_link(conn)?;
     Ok((node, handles, truncation))
+}
+
+/// The focused element in a window's subtree, by the one state AT-SPI publishes.
+///
+/// A depth-first walk over the same children the tree walk reads, bounded twice: at
+/// most [`FOCUS_WALK_NODES`] nodes and [`core::MAX_TREE_DEPTH`] levels, with the call's
+/// budget checked before each node. A cap or a spent budget answers `None` — this probe
+/// is an extra the answer can do without, so it never guesses instead — and so does a
+/// proxy that stops answering on the way down.
+async fn focused_node(
+    root: &ObjectRefOwned,
+    conn: &zbus::Connection,
+    budget: &core::Budget,
+) -> Option<FocusedElement> {
+    let mut stack = vec![(root.clone(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((object_ref, depth)) = stack.pop() {
+        if visited >= FOCUS_WALK_NODES || budget.check().is_err() {
+            return None;
+        }
+        visited += 1;
+        let accessible = object_ref.as_accessible_proxy(conn).await.ok()?;
+        let state = accessible.get_state().await.ok()?;
+        if state.contains(AtspiState::Focused) {
+            let kind = role_name(accessible.get_role().await.unwrap_or(Role::Unknown));
+            // The name is exactly what an observation prints for the same element, so
+            // the answer can be read against the tree it came from.
+            let name = accessible
+                .name()
+                .await
+                .ok()
+                .map(|name| crate::util::truncate(&name, core::MAX_NAME_CHARS));
+            return Some(FocusedElement {
+                kind,
+                name: name.filter(|name| !name.is_empty()),
+            });
+        }
+        if depth >= core::MAX_TREE_DEPTH {
+            continue;
+        }
+        let children = accessible.get_children().await.ok()?;
+        // Reverse push keeps the traversal in DFS pre-order.
+        for child in children.into_iter().rev() {
+            stack.push((child, depth + 1));
+        }
+    }
+    None
 }
 
 async fn tree_value(proxies: Option<&Proxies<'_>>, role: &str) -> Option<String> {
@@ -1712,13 +1762,16 @@ fn scroll_params(direction: ScrollDirection, amount: u32) -> (i32, Axis) {
     }
 }
 
+/// The geometry a point action is posted through. Only the shapes that place a point ask
+/// for one: a call that resolved none is refused before any event is sent.
+fn input_geometry(geo: Option<&SurfaceGeometry>) -> Result<SurfaceGeometry, anyhow::Error> {
+    geo.copied()
+        .ok_or_else(|| anyhow!("raw input needs surface geometry for this action"))
+}
+
 /// Normalized surface point → absolute X11 pixel point.
-fn pixel_point(
-    point: (f64, f64),
-    geo: Option<&SurfaceGeometry>,
-) -> Result<(i32, i32), anyhow::Error> {
-    let geo = geo.ok_or_else(|| anyhow!("raw input needs surface geometry for this action"))?;
-    let (x, y) = core::normalized_to_surface(point.0, point.1, geo)?;
+fn pixel_point(point: (f64, f64), geometry: &SurfaceGeometry) -> Result<(i32, i32), anyhow::Error> {
+    let (x, y) = core::normalized_to_surface(point.0, point.1, geometry)?;
     Ok((x.round() as i32, y.round() as i32))
 }
 
@@ -1800,10 +1853,10 @@ fn release_after_failed_press(session: &mut InputSession, button: Button) -> &'s
 
 /// A coordinate click: the pointer moves first, then the modifiers, then each
 /// press/release pair (twice for a double click). XTEST synthesizes into whatever is
-/// under the pointer — the model clicks first if focus is required (no
-/// activate-then-control) — and every step after the move is answered for: a failure
-/// names what may have landed or may still be held, because a second click is a
-/// second actuation.
+/// under the pointer, and this platform cannot attribute that window to an application,
+/// so the answer states that the point was not checked. Every step after the move is
+/// answered for: a failure names what may have landed or may still be held, because a
+/// second click is a second actuation.
 fn click(
     session: &mut InputSession,
     x: i32,
@@ -1915,10 +1968,13 @@ fn scroll(session: &mut InputSession, length: i32, axis: Axis) -> Impact {
     Impact::Done
 }
 
+/// Deliver one input, and answer with what it left behind together with the placement the
+/// delivery itself made: the point posted and the geometry that mapped it come from the
+/// same read here, so an answer can never quote a second, parallel mapping.
 fn raw_input_blocking(
     input: RawInput,
     geo: Option<&SurfaceGeometry>,
-) -> Result<Impact, anyhow::Error> {
+) -> Result<core::Actuation, anyhow::Error> {
     let mut session = InputSession::new()?;
     match input {
         RawInput::Click {
@@ -1927,29 +1983,58 @@ fn raw_input_blocking(
             double,
             modifiers,
         } => {
-            let (x, y) = pixel_point(point, geo)?;
-            click(&mut session, x, y, enigo_button(button), double, &modifiers)
+            let geometry = input_geometry(geo)?;
+            let (x, y) = pixel_point(point, &geometry)?;
+            let impact = click(&mut session, x, y, enigo_button(button), double, &modifiers)?;
+            Ok(core::Actuation::at(
+                impact,
+                core::Placement {
+                    geometry,
+                    from: core::surface_local((f64::from(x), f64::from(y)), &geometry),
+                    to: None,
+                },
+            ))
         }
-        RawInput::TypeText { text } => Ok(type_text(&mut session, &text)),
-        RawInput::KeyChord { chord } => key_chord(&mut session, &chord),
+        RawInput::TypeText { text } => Ok(core::Actuation::of(type_text(&mut session, &text))),
+        RawInput::KeyChord { chord } => key_chord(&mut session, &chord).map(core::Actuation::of),
         RawInput::Scroll {
             point,
             direction,
             amount,
         } => {
-            if let Some((nx, ny)) = point {
-                let (x, y) = pixel_point((nx, ny), geo)?;
-                session
-                    .enigo
-                    .move_mouse(x, y, Coordinate::Abs)
-                    .map_err(input_err)?;
-            }
+            let placed = match point {
+                Some((nx, ny)) => {
+                    let geometry = input_geometry(geo)?;
+                    let (x, y) = pixel_point((nx, ny), &geometry)?;
+                    session
+                        .enigo
+                        .move_mouse(x, y, Coordinate::Abs)
+                        .map_err(input_err)?;
+                    Some(core::Placement {
+                        geometry,
+                        from: core::surface_local((f64::from(x), f64::from(y)), &geometry),
+                        to: None,
+                    })
+                }
+                None => None,
+            };
             let (length, axis) = scroll_params(direction, amount);
-            Ok(scroll(&mut session, length, axis))
+            let impact = scroll(&mut session, length, axis);
+            Ok(core::Actuation::placed(impact, placed))
         }
         RawInput::Drag { from, to } => {
-            let (fx, fy) = pixel_point(from, geo)?;
-            let (tx, ty) = pixel_point(to, geo)?;
+            let geometry = input_geometry(geo)?;
+            let (fx, fy) = pixel_point(from, &geometry)?;
+            let (tx, ty) = pixel_point(to, &geometry)?;
+            // Both ends of the gesture as posted, from the pixels the drag actually uses.
+            let start = core::surface_local((f64::from(fx), f64::from(fy)), &geometry);
+            let end = core::surface_local((f64::from(tx), f64::from(ty)), &geometry);
+            let placement = core::Placement {
+                geometry,
+                from: start,
+                to: Some(end),
+            };
+            let placed = |impact: Impact| core::Actuation::at(impact, placement);
             // The button goes down where the gesture starts: pressing at the
             // pointer's previous position would grab whatever window that was.
             session
@@ -1960,10 +2045,10 @@ fn raw_input_blocking(
             // failed: the button can be down and the target may have seen a click.
             if let Err(e) = session.press_button(Button::Left) {
                 let state = release_after_failed_press(&mut session, Button::Left);
-                return Ok(Impact::Unconfirmed(format!(
+                return Ok(placed(Impact::Unconfirmed(format!(
                     "the drag's button press errored ({e}) at ({fx}, {fy}) — the button {state}, \
                      so the target may have taken it as a click"
-                )));
+                ))));
             }
             // Past the button-down the drag is under way: a failure must let the
             // button go again rather than leave the machine mid-gesture.
@@ -1973,19 +2058,19 @@ fn raw_input_blocking(
                 let y = (fy as f64 + (ty - fy) as f64 * t).round() as i32;
                 if session.enigo.move_mouse(x, y, Coordinate::Abs).is_err() {
                     let released = session.release_button(Button::Left).is_ok();
-                    return Ok(drag_incomplete(fx, fy, released));
+                    return Ok(placed(drag_incomplete(fx, fy, released)));
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
             if let Err(e) = session.release_button(Button::Left) {
                 // Every step ran and the pointer reached `to`: only the release
                 // failed, which is what must not read as an unfinished gesture.
-                return Ok(Impact::Unconfirmed(format!(
+                return Ok(placed(Impact::Unconfirmed(format!(
                     "the drag ran to its end but the button's release failed ({e}) — the button \
                      may still be held down"
-                )));
+                ))));
             }
-            Ok(Impact::Done)
+            Ok(placed(Impact::Done))
         }
     }
 }
@@ -2522,20 +2607,41 @@ impl Backend for LinuxBackend {
         }
     }
 
-    async fn list_apps(&self) -> Result<Vec<AppInfo>, anyhow::Error> {
+    /// Applications with their ids, and the one in front. AT-SPI gives an application no
+    /// "is active" state, so the frontmost is read from the active state of the
+    /// applications' windows, under the listing's budget; it is `None` only when that scan
+    /// found no active window, including when the budget ran out first.
+    async fn list_apps(&self) -> Result<AppListing, anyhow::Error> {
         let conn = self.conn().await?;
         let budget = core::Budget::new(
             core::LIST_BUDGET,
             "application list",
             "the running applications",
         );
-        let mut out: Vec<AppInfo> = enumerate_apps(&conn, &budget)
-            .await?
-            .into_iter()
-            .map(|(_, info)| info)
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        let found = enumerate_apps(&conn, &budget).await?;
+        let mut frontmost = None;
+        for (app_ref, app_info) in &found {
+            // A spent budget ends the scan with what it already found: the rest of the
+            // applications are the listing's answer, not the frontmost question's.
+            if budget.check().is_err() {
+                break;
+            }
+            // One unreadable application is not an answer either: the scan goes on.
+            let slice = budget.slice(core::APP_SLICE, core::windows_label(&app_info.name));
+            let Ok(handles) = app_window_handles(app_ref, &conn, &app_info.name, &slice).await
+            else {
+                continue;
+            };
+            // The active window names the application in front, exactly as a listing of
+            // windows reads it.
+            if handles.iter().any(|w| w.active) {
+                frontmost = Some(app_info.name.clone());
+                break;
+            }
+        }
+        let mut apps: Vec<AppInfo> = found.into_iter().map(|(_, info)| info).collect();
+        apps.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(AppListing { apps, frontmost })
     }
 
     async fn list_windows(&self, app: Option<&AppInfo>) -> Result<WindowListing, anyhow::Error> {
@@ -2575,12 +2681,25 @@ impl Backend for LinuxBackend {
             match app_window_handles(&app_ref, &conn, &app_info.name, &slice).await {
                 Ok(handles) => {
                     for w in handles {
+                        // The active window is the one in front, so its application is the
+                        // one the listing can name — AT-SPI has no application-level state
+                        // to ask instead. Neither carries a place in an order: the stack
+                        // lives in the window manager, unreachable from here.
+                        if w.active {
+                            listing.frontmost = Some(app_info.name.clone());
+                        }
                         listing.windows.push(WindowInfo {
                             app_pid: app_info.pid,
                             app_name: app_info.name.clone(),
                             title: w.title,
                             key: w.key,
                             surface: w.surface,
+                            // A background application's focused window is not the one
+                            // input reaches, so a general listing marks only the
+                            // frontmost application's; a listing of one application
+                            // marks its own.
+                            focused: w.focused && (app.is_some() || w.active),
+                            rank: None,
                         });
                     }
                 }
@@ -2594,20 +2713,18 @@ impl Backend for LinuxBackend {
         Ok(listing)
     }
 
-    async fn focused_window(&self) -> Result<WindowInfo, anyhow::Error> {
+    async fn surface_window(&self, target: &TargetSpec) -> Result<WindowInfo, anyhow::Error> {
         let conn = self.conn().await?;
-        let budget = core::Budget::new(
-            core::LIST_BUDGET,
-            "focused-window search",
-            "the running applications",
-        );
-        let w = resolve_focused_window(&conn, &budget).await?;
+        let mut budget = core::Budget::new(core::LIST_BUDGET, "surface lookup", target.describe());
+        let window = resolve_surface(&conn, target, &mut budget).await?;
         Ok(WindowInfo {
-            app_pid: w.app_info.pid,
-            app_name: w.app_info.name,
-            title: w.title,
-            key: w.key,
-            surface: w.surface,
+            app_pid: window.app_pid,
+            app_name: window.app_name,
+            title: window.title.unwrap_or_default(),
+            key: window_key(&window.object_ref),
+            surface: window.surface,
+            focused: false,
+            rank: None,
         })
     }
 
@@ -2663,7 +2780,9 @@ impl Backend for LinuxBackend {
         let (app_name, title) = surface_identity(target, &proxy, &app).await;
         core::name_surface(&mut budget, &app_name, title.as_deref());
         let (root, handles, _truncation) = build_tree(&window_ref, &conn, &budget).await?;
-        let matched = core::resolve_locator_checked(&root, locator)?;
+        // The ref is acted on only if it is still what the caller saw: same kind, same
+        // name, same place on the surface. Nothing is sent otherwise.
+        let (matched, confirmed) = core::resolve_locator_confirmed(&root, locator)?;
         if handles.is_empty() {
             return Err(core::taxonomy_error(
                 core::ERR_STALE_ELEMENT,
@@ -2680,17 +2799,18 @@ impl Backend for LinuxBackend {
             .await
             .map_err(|e| dbus_err(e, "enumerate element interfaces"))?;
         let role = role_name(element.get_role().await.unwrap_or(Role::Unknown));
-        match act {
+        let impact = match act {
             ElementAct::Press => press_element(&proxies).await,
             ElementAct::SetValue { text } => set_element_value(&proxies, &role, &text).await,
-        }
+        }?;
+        Ok(core::impact_note(impact, confirmed.note(locator)))
     }
 
     async fn raw_input(
         &self,
         target: &TargetSpec,
         input: RawInput,
-    ) -> Result<Impact, anyhow::Error> {
+    ) -> Result<core::Actuation, anyhow::Error> {
         // Argument bounds first, before the channel check or any window lookup.
         core::check_raw_input(&input)?;
         if wayland() {
@@ -2717,7 +2837,25 @@ impl Backend for LinuxBackend {
             | RawInput::Drag { .. } => Some(self.surface_geometry_with(target, &mut budget).await?),
             _ => None,
         };
-        with_block_in_place(|| raw_input_blocking(input, geo.as_ref()))
+        // This platform cannot attribute a window to an application, so a click's point
+        // is never checked against what lies under it: the answer says exactly that rather
+        // than implying a check that did not happen. A click that names the screen is its
+        // own case: the screen's points belong to no window at all. No other input carries
+        // either note.
+        let note = match &input {
+            RawInput::Click { .. } if matches!(target, TargetSpec::Screen) => {
+                Some(core::SCREEN_POINT_NOTE.to_string())
+            }
+            RawInput::Click { .. } => Some(core::UNCHECKED_POINT_NOTE.to_string()),
+            _ => None,
+        };
+        // The delivery path answers with the placement it made, from the same geometry it
+        // posted through, so nothing here maps a point a second time.
+        let mut actuation = with_block_in_place(|| raw_input_blocking(input, geo.as_ref()))?;
+        if let Some(note) = note {
+            actuation.impact = core::impact_note(actuation.impact, note);
+        }
+        Ok(actuation)
     }
 
     async fn cursor_position(&self) -> Result<(f64, f64), anyhow::Error> {
@@ -2733,6 +2871,26 @@ impl Backend for LinuxBackend {
             let (x, y) = enigo.location().map_err(input_err)?;
             Ok((f64::from(x), f64::from(y)))
         })
+    }
+
+    /// The element that holds the addressed window's focus, found by a bounded search:
+    /// AT-SPI has no "give me the focused element" call, so the one state it publishes
+    /// is what the search looks for. `None` when the window cannot be resolved or the
+    /// search cannot read the state — the answer then says the focus could not be read,
+    /// which is what a probe running after every action may report.
+    async fn focused_element(&self, target: Option<&TargetSpec>) -> Option<FocusedElement> {
+        // The screen has no focus of its own.
+        if matches!(target, Some(TargetSpec::Screen)) {
+            return None;
+        }
+        let conn = self.conn().await.ok()?;
+        let named = target.map_or_else(|| TargetSpec::Focused.describe(), TargetSpec::describe);
+        let budget = core::Budget::new(core::LIST_BUDGET, "focus probe", named);
+        let window = match target {
+            Some(spec) => resolve_window(&conn, spec, &budget).await.ok()?.0,
+            None => resolve_focused_window(&conn, &budget).await.ok()?.0,
+        };
+        focused_node(&window, &conn, &budget).await
     }
 
     /// Window stills show current visible pixels (occluders visible; use
