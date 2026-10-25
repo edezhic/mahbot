@@ -81,9 +81,12 @@
 //! writes `audio_transcription_use_local = "false"` into every install that
 //! never wrote the row, so an installation whose owner never chose a value is
 //! no longer treated as having local speech enabled (see
-//! [`seed_audio_transcription_disabled`]).
+//! [`seed_audio_transcription_disabled`]). `70` drops the retired
+//! `tickets.embedding` column of the deleted text-embedding search, logging
+//! how many stored vectors it held; a fresh install never creates the column,
+//! so it is a no-op there (see [`drop_ticket_embeddings`]).
 //!
-//! Future schema changes resume the chain at id `70` with monotonically
+//! Future schema changes resume the chain at id `71` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -166,7 +169,6 @@ CREATE TABLE IF NOT EXISTS tickets (
     lines_removed    INTEGER,
     reporter         TEXT NOT NULL DEFAULT '',
     is_archived      INTEGER NOT NULL DEFAULT 0,
-    embedding        BLOB,
     priority         INTEGER NOT NULL DEFAULT 1,
     reviewed_head    TEXT,
     reviewed_tree    TEXT,
@@ -1236,6 +1238,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(seed_audio_transcription_disabled),
     },
+    Migration {
+        id: "70",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_ticket_embeddings),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -2297,6 +2304,31 @@ async fn run_drop_personal_changes_column(conn: &Connection) -> anyhow::Result<(
     drop_column_if_missing(conn, "session_metadata", "personal_changes").await
 }
 
+fn drop_ticket_embeddings(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_drop_ticket_embeddings(conn))
+}
+
+/// Retire the vectors of the deleted text-embedding search: count the stored
+/// blobs, then drop `tickets.embedding` (the only place they lived). Fresh
+/// installs never create the column, so the probe makes this a no-op there.
+async fn run_drop_ticket_embeddings(conn: &Connection) -> anyhow::Result<()> {
+    if !column_exists(conn, "tickets", "embedding").await? {
+        return Ok(());
+    }
+    let vectors: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM tickets WHERE embedding IS NOT NULL",
+            (),
+        )
+        .await
+        .context("Failed to count the stored ticket embeddings")?[0]
+        .get::<i64>(0)
+        .context("Failed to read the stored ticket embedding count")?;
+    drop_column_if_missing(conn, "tickets", "embedding").await?;
+    tracing::info!(vectors, "dropped the retired tickets.embedding column");
+    Ok(())
+}
+
 /// Case-folded markers of a stored description of the retired two-stage
 /// review-then-QA arrangement, matched as substrings of the content after
 /// [`describes_retired_lifecycle`]'s normalization.
@@ -2898,7 +2930,6 @@ mod tests {
                 "lines_removed",
                 "reporter",
                 "is_archived",
-                "embedding",
                 "priority",
                 "reviewed_head",
                 "reviewed_tree",
@@ -3952,7 +3983,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63`/`65`–`69` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63`/`65`–`70` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -3980,10 +4011,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             [
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
-                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69"
+                "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
+                "70"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–69 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–70 tail exactly"
         );
     }
 
@@ -4059,6 +4091,71 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "core reopen with the retired delta-28 index",
         )
         .await;
+    }
+
+    /// Entry `70` retires the vectors of the deleted text-embedding search: a
+    /// database shaped with the column loses it, the ticket row survives, and
+    /// the title FTS index still answers — the drop rewrites the table, so the
+    /// index's survival is the part worth proving.
+    #[tokio::test]
+    async fn delta_70_drops_ticket_embeddings_and_keeps_the_fts_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_consolidated_store(tmp.path())
+            .await
+            .expect("fresh consolidated store");
+        // Rebuild the pre-70 shape: the column back, the entry unrecorded.
+        conn.execute("ALTER TABLE tickets ADD COLUMN embedding BLOB", ())
+            .await
+            .expect("restore the pre-70 embedding column");
+        conn.execute("DELETE FROM schema_migrations WHERE id = '70'", ())
+            .await
+            .expect("forget delta 70");
+        let now = crate::db::now();
+        let blob: Vec<u8> = vec![1, 2, 3];
+        conn.execute(
+            "INSERT INTO tickets \
+             (id, title, description, workspace_name, created_at, updated_at, embedding) \
+             VALUES ('t1', 'Migration embedding retirement', 'desc', 'ws', ?1, ?1, ?2)",
+            params![now, blob],
+        )
+        .await
+        .expect("insert a ticket carrying a stored vector");
+
+        run_migrations(&conn, TargetDb::Core).await.expect("reopen");
+
+        assert!(
+            !column_names(&conn, "tickets")
+                .await
+                .contains(&"embedding".to_string()),
+            "entry 70 must drop tickets.embedding"
+        );
+        assert!(
+            recorded_ids(&conn).await.contains(&"70".to_string()),
+            "the ledger must record entry 70"
+        );
+        let title: String = conn
+            .query("SELECT title FROM tickets WHERE id = 't1'", ())
+            .await
+            .expect("read the ticket")[0]
+            .get(0)
+            .expect("title");
+        assert_eq!(
+            title, "Migration embedding retirement",
+            "the ticket row must survive the drop"
+        );
+        let hits = conn
+            .query(
+                "SELECT id FROM tickets WHERE title MATCH ?1",
+                params!["migration"],
+            )
+            .await
+            .expect("the title FTS index must still answer");
+        assert_eq!(hits.len(), 1, "the surviving row must still be found");
+        assert_eq!(
+            hits[0].get::<String>(0).expect("id"),
+            "t1",
+            "the FTS hit must be the surviving row"
+        );
     }
 
     /// A database that applied the `telegram_intake` table in the shape delta `59` first
@@ -4569,7 +4666,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`57`/`59`–`63`/`65`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`57`/`59`–`63`/`65`–`70`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills, the delta-29 per-user model
@@ -4631,6 +4728,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
+            "70",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4639,7 +4737,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–69"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–70"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -4765,10 +4863,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
         let after_tickets_cols = column_sets(&conn, &["tickets"]).await;
         let mut expected_tickets_cols = before.cols["tickets"].clone();
+        expected_tickets_cols.retain(|column| column != "embedding");
         expected_tickets_cols.push("last_transition_actor".to_string());
         assert_eq!(
             after_tickets_cols["tickets"], expected_tickets_cols,
-            "reopen must append exactly last_transition_actor to tickets columns"
+            "reopen must append last_transition_actor and drop the retired embedding \
+             column from tickets columns"
         );
         let after_chronicle_cols = column_sets(&conn, &["ticket_chronicle"]).await;
         let mut expected_chronicle_cols = before.cols["ticket_chronicle"].clone();
@@ -5019,6 +5119,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
+            "70",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5027,7 +5128,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–69"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–70"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

@@ -2815,11 +2815,11 @@ mod tests {
         //
         //   • TEST-ONLY: created by this test's own setup, never by shared
         //     test infrastructure, so normal test runs never contain it and
-        //     other tests never observe it (test_embedder_graceful_degradation
-        //     expects an empty models/ dir in the test root);
+        //     other tests never observe it (they expect an empty models/ dir
+        //     in the test root);
         //   • the test stays #[ignore]d — a full --include-ignored run may
-        //     briefly overlap the symlink with parallel tests (e.g. an
-        //     embedder test creating <test_root>/models as a real directory).
+        //     briefly overlap the symlink with parallel tests (e.g. another
+        //     test creating <test_root>/models as a real directory).
         //     Accepted edge: a path that is already occupied skips the test.
 
         let Some(home_dir) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else {

@@ -63,6 +63,7 @@
 //! are rejected (re-enrollment required).
 
 use crate::audio::cue::{self, Cue};
+use crate::audio::util::cosine_similarity;
 use crate::audio::wake_word::{
     self, ENROLLMENT_CONSISTENCY_MIN_FRACTION, ENROLLMENT_CONSISTENCY_MIN_SIMILARITY,
     MIN_ENROLLMENT_UTTERANCES, WAKE_WORD_EMBEDDING_DIM, WINDOW_SAMPLES, WakeWordEnrollment,
@@ -3119,10 +3120,7 @@ fn enrollment_consistency_check(utterance_embeddings: &[Vec<f32>]) -> Result<Vec
         (utterance_embeddings.len() as f32 * ENROLLMENT_CONSISTENCY_MIN_FRACTION).ceil() as usize;
     let passed = utterance_embeddings
         .iter()
-        .filter(|emb| {
-            crate::vector::cosine_similarity(emb, &centroid)
-                >= ENROLLMENT_CONSISTENCY_MIN_SIMILARITY
-        })
+        .filter(|emb| cosine_similarity(emb, &centroid) >= ENROLLMENT_CONSISTENCY_MIN_SIMILARITY)
         .count();
     if passed < required {
         return Err(format!(

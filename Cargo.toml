@@ -172,17 +172,13 @@ grep-searcher = "0.1"
 grep-matcher = "0.1"
 ignore = "0.4"
 
-# SHA256: model-download checksum verification, and the Windows debug
+# SHA256 for downloaded-artifact checksum verification, and the Windows debug
 # endpoint's location-derived pipe name (see src/db/ipc.rs)
 sha2 = "0.10"
 paste = "1.0"
 
 # Enum derive helpers
 strum = { version = "0.27", features = ["derive"] }
-
-# Embeddings
-tokenizers = "0.22"
-candle-core = "0.11.0"
 
 # Image decode/re-encode for reference-image compression (already compiled via
 # iced's image-without-codecs feature; promoted to a direct dependency for the
@@ -325,8 +321,9 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Acceleration-carrying candle for the embedder and the TTS ONNX runtime.
+# Acceleration-carrying candle for the TTS ONNX runtime.
 candle-nn = { version = "0.11.0", features = ["accelerate"] }
+candle-core = "0.11.0"
 
 # ── Local audio subsystem (macOS only) ────────────────────────────────────
 # These exist only for `crate::audio`, which is itself macOS-only — the speech
@@ -388,12 +385,6 @@ zbus = "5"
 # Boxes the async AT-SPI tree walk (already a transitive zbus dependency — same
 # version, no new fork); the accessibility tree is inherently recursive.
 async-recursion = "1.1"
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-# Same candle, without the Apple-only `accelerate` backend. Needed by the
-# embedder (`src/embedder.rs`); the audio subsystem it also serves on macOS is
-# not built here at all.
-candle-nn = "0.11.0"
 
 [dev-dependencies]
 http = "1.5"

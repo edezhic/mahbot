@@ -858,9 +858,8 @@ async fn download_retry_loop() {
             warn!(
                 "Local transcriber: model files present but failed to load — deleting and re-downloading"
             );
-            // Delete corrupted files to force a fresh download with
-            // SHA256 verification, following the embedder pattern
-            // (embedder.rs Phase 1 logic).
+            // Delete the corrupt files so the next attempt re-downloads and
+            // re-verifies them.
             for f in &files {
                 let dest = dir.join(f.filename);
                 tokio::fs::remove_file(&dest).await.ok();

@@ -12,6 +12,7 @@ pub mod lock;
 pub(crate) mod macros;
 pub(crate) mod managed_bin;
 pub(crate) mod media_target;
+#[cfg(target_os = "macos")]
 pub(crate) mod model_state;
 pub(crate) mod owner_path;
 pub(crate) mod provenance;

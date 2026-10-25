@@ -441,7 +441,6 @@ mod tests {
                 phase: crate::pipeline::board::TicketPhase::Backlog,
                 prerequisites: Vec::new(),
                 reporter: "cli-test".to_string(),
-                embedding: None,
                 priority: 1,
             })
             .await

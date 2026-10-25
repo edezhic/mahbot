@@ -1,5 +1,7 @@
-//! Process start-up: the store bring-up sequence ([`open_stores`]) and the
-//! diagnostics emitted before the tracing layer exists. Diagnostics are written
+//! Process start-up: the store bring-up sequence ([`open_stores`]), the
+//! retirement of the removed text-embedding model files
+//! ([`remove_retired_embedding_model_files`]) and the diagnostics emitted before
+//! the tracing layer exists. Diagnostics are written
 //! to stderr immediately (carrying a local-time timestamp for update.log
 //! forensics) and buffered for replay into the logs store once tracing is live,
 //! so they appear in the GUI boot log.
@@ -292,6 +294,46 @@ pub fn startup_panic_error(message: &str) -> anyhow::Error {
     anyhow::anyhow!("Startup panicked: {message}")
 }
 
+/// Remove the retired text-embedding model files from the shared model cache.
+///
+/// A previous release downloaded these two files for the deleted embedder;
+/// they serve nothing now. The cache is shared with the audio models, so only
+/// these exact filenames are removed and nothing else in the directory is
+/// touched. A failure is logged, never fatal, and the next start retries.
+pub fn remove_retired_embedding_model_files() {
+    let Some(dir) = crate::util::models_dir() else {
+        return;
+    };
+    remove_retired_embedding_model_files_in(&dir);
+}
+
+/// The two files the deleted embedder downloaded — the weights and its
+/// tokenizer — and the only names this product ever removes from the cache.
+const RETIRED_EMBEDDING_MODEL_FILES: [&str; 2] =
+    ["v5-nano-retrieval-Q4_K_M.gguf", "embed_tokenizer.json"];
+
+fn remove_retired_embedding_model_files_in(dir: &Path) {
+    for name in RETIRED_EMBEDDING_MODEL_FILES {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    file = %path.display(),
+                    "Removed a retired text-embedding model file"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    "Could not remove a retired text-embedding model file; the next start retries"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +497,41 @@ mod tests {
             body.contains("step: bootstrap") && body.contains("reason: Startup panicked: boom"),
             "the record names the step and keeps the panic sentence as the reason: {body}"
         );
+    }
+
+    /// The retirement removes exactly the two files the deleted embedder
+    /// downloaded and leaves every other file in the shared cache — the
+    /// unrelated gguf and an audio model alike — in place. A second start on an
+    /// already-clean cache is a silent no-op. Driven on a private directory, so
+    /// the test can never reach the owner's real model cache (the ignored TTS
+    /// end-to-end test symlinks the test root's `models/` to it).
+    #[test]
+    fn only_the_retired_embedding_model_files_are_removed() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let dir = tmp.path();
+        for name in [
+            "v5-nano-retrieval-Q4_K_M.gguf",
+            "embed_tokenizer.json",
+            "embeddinggemma-2-Q8_0.gguf",
+            "audio-model.bin",
+        ] {
+            std::fs::write(dir.join(name), b"x").expect("seed a cache file");
+        }
+
+        remove_retired_embedding_model_files_in(dir);
+        remove_retired_embedding_model_files_in(dir);
+
+        for name in ["v5-nano-retrieval-Q4_K_M.gguf", "embed_tokenizer.json"] {
+            assert!(
+                !dir.join(name).exists(),
+                "the retired model file {name} must be gone"
+            );
+        }
+        for name in ["embeddinggemma-2-Q8_0.gguf", "audio-model.bin"] {
+            assert!(
+                dir.join(name).exists(),
+                "no other file in the shared cache may be touched, missing {name}"
+            );
+        }
     }
 }

@@ -264,7 +264,6 @@ pub(crate) struct TicketParams {
     pub phase: TicketPhase,
     pub prerequisites: Vec<String>,
     pub reporter: String,
-    pub embedding: Option<Vec<u8>>,
     pub priority: i64,
 }
 
@@ -740,11 +739,6 @@ impl BoardStore {
 
     /// Shared INSERT logic for [`BoardStore::create_ticket`] and [`BoardStore::supersede_and_create`].
     ///
-    /// The `embedding` column is write-once — stored at creation time and later
-    /// read by `list_archived_with_embeddings` for vector search. It is not
-    /// included in `TICKET_COLUMNS` (SELECT queries) because only the dedicated
-    /// `list_archived_with_embeddings` method reads it.
-    ///
     /// Computes the timestamp and serializes prerequisites internally. Does NOT
     /// commit the transaction — the caller is responsible for calling
     /// `tx.commit()` after any additional writes.
@@ -758,8 +752,8 @@ impl BoardStore {
         let prereqs_json = serde_json::to_string(&params.prerequisites)?;
         tx.execute(
             "INSERT INTO tickets (id, title, description, phase, workspace_name, \
-             created_at, updated_at, prerequisites, supersedes, reporter, embedding, priority) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             created_at, updated_at, prerequisites, supersedes, reporter, priority) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             db::params![
                 ticket_id,
                 params.title.as_str(),
@@ -771,7 +765,6 @@ impl BoardStore {
                 prereqs_json.as_str(),
                 supersedes,
                 params.reporter.as_str(),
-                params.embedding.as_deref(),
                 params.priority,
             ],
         )
@@ -2128,13 +2121,13 @@ impl BoardStore {
         ticket.done_at.as_deref().unwrap_or(&ticket.created_at)
     }
 
-    // ── Ticket FTS/embedding search methods ───────────────────────────────
+    // ── Ticket FTS search methods ─────────────────────────────────────────
     //
-    // The installation-wide archived-search methods contain the FTS and
-    // embedding SQL used by [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets);
-    // [`search_by_fts`] backs the GUI sidebar search. The board owns the schema
-    // (`ngram` tokenizer, FTS index name, blob format) and the tool layer owns
-    // the hybrid RRF merge logic.
+    // The installation-wide archived search used by
+    // [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets), and
+    // [`search_by_fts`], which backs the GUI sidebar search. The board owns the
+    // FTS schema (`ngram` tokenizer and index name); the tool layer owns only
+    // the presentation.
 
     /// Search archived tickets by FTS keyword match, installation-wide.
     ///
@@ -2142,32 +2135,35 @@ impl BoardStore {
     /// matching against the `ngram`-tokenized FTS index on `title`. Every
     /// workspace's archived tickets are candidates.
     ///
-    /// Returns up to `limit` `(id, fts_score)` pairs, highest score first.
+    /// Returns up to `limit` ticket ids, highest score first. The ranked FTS
+    /// scan is wrapped in a subquery and the archive predicate and `ORDER BY`
+    /// are applied outside it: the engine drops the sort when the archive
+    /// predicate sits inside, and the unbounded candidate set means live
+    /// (non-archived) tickets can neither crowd out archived hits nor break the
+    /// ordering.
+    ///
     /// On SQL error (e.g. corrupt FTS index), logs a warning and returns an
-    /// empty vec — the caller may fall through to vector search as a graceful
-    /// degradation strategy.
-    pub async fn search_archived_by_fts(
+    /// empty vec.
+    pub(crate) async fn search_archived_by_fts(
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<(String, f64)>> {
+    ) -> Result<Vec<String>> {
         let sanitized = crate::db::sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
 
         let sql = format!(
-            "SELECT t.id, fts_score(t.title, ?1) AS score \
-             FROM tickets t \
-             WHERE t.is_archived = 1 AND t.title MATCH ?1 \
-             ORDER BY score DESC LIMIT {limit}"
+            "SELECT id FROM (SELECT t.id AS id, t.is_archived AS archived, \
+             fts_score(t.title, ?1) AS score FROM tickets t WHERE t.title MATCH ?1) \
+             WHERE archived = 1 ORDER BY score DESC LIMIT {limit}"
         );
         match self
             .conn
             .query_map(&sql, db::params![sanitized.clone()], |row| {
                 let id: String = row.get(0)?;
-                let score: f64 = row.get(1)?;
-                Ok::<_, anyhow::Error>((id, score))
+                Ok::<_, anyhow::Error>(id)
             })
             .await
         {
@@ -2230,37 +2226,5 @@ impl BoardStore {
             );
         }
         Ok(tickets)
-    }
-
-    /// List archived tickets with non-NULL embeddings, deserialized,
-    /// installation-wide.
-    ///
-    /// Returns `(id, embedding)` pairs for all archived tickets that have
-    /// a stored embedding blob. Embeddings are deserialized from the
-    /// on-disk `[u8]` byte layout (4-byte little-endian `f32`) into
-    /// `Vec<f32>` via [`crate::vector::bytes_to_vec`].
-    ///
-    /// This returns ALL archived tickets with embeddings — there is no
-    /// LIMIT because the caller (the tool layer) needs all candidates for
-    /// cosine-similarity ranking, and the archive size is bounded in practice
-    /// by the total ticket volume of the installation.
-    pub async fn list_archived_with_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>> {
-        let rows = self
-            .conn
-            .query(
-                "SELECT id, embedding FROM tickets \
-                 WHERE is_archived = 1 AND embedding IS NOT NULL",
-                db::params![],
-            )
-            .await?;
-
-        let mut candidates: Vec<(String, Vec<f32>)> = Vec::new();
-        for row in &rows {
-            let id: String = row.get(0)?;
-            let stored: Vec<u8> = row.get(1)?;
-            let emb = crate::vector::bytes_to_vec(&stored);
-            candidates.push((id, emb));
-        }
-        Ok(candidates)
     }
 }

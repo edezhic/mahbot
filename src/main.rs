@@ -105,6 +105,10 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
     // cannot drift.
     let log_store = mahbot::boot::open_stores().await?;
 
+    // The model-cache files of the removed embedder are retired on every start
+    // until they are gone. After the stores, so the attempt is in the log.
+    mahbot::boot::remove_retired_embedding_model_files();
+
     // The platform exemption the start-up asked for, as an ordinary status line: an INFO
     // row, so it is not a problem in the Issues view, written once per start with nothing
     // de-duplicating it. A platform that made no request says nothing.

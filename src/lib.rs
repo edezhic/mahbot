@@ -83,8 +83,6 @@ pub mod ffmpeg;
 // ── Providers and model I/O ──────────────────────────────────────────────
 // A standalone benchmark for OpenRouter models, run outside the product.
 pub mod bench_openrouter;
-// The local Candle GGUF embedder behind archived-ticket semantic search.
-pub(crate) mod embedder;
 // Model providers: the OpenAI-compatible client, reasoning replay,
 // transcription and the error classification table.
 pub mod providers;
@@ -149,8 +147,8 @@ pub(crate) mod audio_cli;
 pub(crate) mod onnx;
 
 // ── Lifecycle and platform support ───────────────────────────────────────
-// How the process comes up: one ordering for every store open, plus the failure
-// line before tracing exists.
+// How the process comes up: one ordering for every store open, the sweep of the
+// retired model-cache files, plus the failure line before tracing exists.
 pub mod boot;
 // Defaults, persisted overrides, model routing and the process-global handle.
 pub mod config;
@@ -186,8 +184,6 @@ pub(crate) mod round_cancel;
 // Shared helpers: HTTP and TLS, locking, paths, managed binaries, media
 // markers, tree-sitter and test fixtures.
 pub mod util;
-// The maths and wire format behind hybrid archived-ticket search.
-pub(crate) mod vector;
 
 /// Hidden grep-engine subcommand entry (dispatched from `main()` before the
 /// instance lock; the shell tool's transparent grep interception rewrites

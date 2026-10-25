@@ -1,6 +1,6 @@
 //! Audio-subsystem utilities: PCM math and resampling, deterministic
-//! test-signal generation for the voice tests, and the streaming SHA-256
-//! verifier the audio model downloads share.
+//! test-signal generation for the voice tests, embedding cosine similarity, and
+//! the streaming SHA-256 verifier the audio model downloads share.
 //!
 //! These live here (not in `crate::util`) because the whole audio subsystem
 //! is macOS-only.
@@ -599,6 +599,95 @@ mod gaussian_sampler_tests {
             {
                 assert_eq!(z2, r * theta.sin(), "z2 for ({u1}, {u2})");
             }
+        }
+    }
+}
+
+// ── Embedding similarity ────────────────────────────────────────────────
+/// Cosine similarity between two embedding vectors. Returns 0.0–1.0.
+///
+/// The wake-word matcher compares a captured window embedding against its
+/// enrolment prototype, negatives and anti-prototypes with it, and enrolment
+/// checks each utterance against the running centroid with it.
+#[must_use]
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if !denom.is_finite() || denom < f32::EPSILON {
+        return 0.0;
+    }
+
+    let raw = dot / denom;
+    if !raw.is_finite() {
+        return 0.0;
+    }
+
+    // Clamp to [0, 1] — embeddings are typically positive
+    raw.clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod cosine_similarity_tests {
+    use super::cosine_similarity;
+
+    #[test]
+    fn cosine_similarity_all_cases() {
+        struct Case {
+            name: &'static str,
+            a: &'static [f32],
+            b: &'static [f32],
+            expected: f32,
+        }
+
+        let cases = [
+            Case {
+                name: "identical vectors",
+                a: &[1.0, 2.0, 3.0],
+                b: &[1.0, 2.0, 3.0],
+                expected: 1.0,
+            },
+            Case {
+                name: "orthogonal vectors",
+                a: &[1.0, 0.0, 0.0],
+                b: &[0.0, 1.0, 0.0],
+                expected: 0.0,
+            },
+            Case {
+                name: "empty first vector",
+                a: &[],
+                b: &[1.0, 2.0],
+                expected: 0.0,
+            },
+            Case {
+                name: "different lengths",
+                a: &[1.0, 2.0],
+                b: &[1.0, 2.0, 3.0],
+                expected: 0.0,
+            },
+        ];
+
+        for case in &cases {
+            let result = cosine_similarity(case.a, case.b);
+            assert!(
+                (result - case.expected).abs() < 1e-6,
+                "case: {} — expected {}, got {}",
+                case.name,
+                case.expected,
+                result,
+            );
         }
     }
 }

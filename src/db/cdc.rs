@@ -10,9 +10,8 @@
 //! This module writes no domain/timeline tables. The only write it performs is
 //! pruning `turso_cdc` (which the engine self-excludes from capture) — the
 //! "no domain writes" contract. Decoding is deliberately a Rust-side positional
-//! read over the `before`/`after` full-record blobs (NOT
-//! `bin_record_json_object`, which errors on tickets' embedding BLOB), using a
-//! cached `PRAGMA table_info` column/PK map.
+//! read over the `before`/`after` full-record blobs, using a cached
+//! `PRAGMA table_info` column/PK map.
 //!
 //! The drainer invokes any registered synchronous ticket materializer
 //! ([`register_ticket_materializer`]) before broadcasting to broadcast-channel

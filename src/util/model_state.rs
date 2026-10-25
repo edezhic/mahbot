@@ -1,19 +1,18 @@
-//! Shared model-loading state machine wrapper.
+//! Shared model-loading state machine wrapper for the macOS audio subsystem.
 //!
 //! Extracted from the duplicated `AtomicU8` lifecycle blocks (Uninit→Loading→
-//! Ready/Failed) in `audio::tts`, `audio::local_transcriber`, and `embedder`.
-//! The audio consumers are macOS-only; `embedder` is cross-platform.
+//! Ready/Failed) in `audio::tts` and `audio::local_transcriber`.
 //! `ModelState`/`AtomicModelState` provide the shared state representation;
 //! [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop guard
-//! used for panic safety in background download tasks (directly by `embedder`
-//! and `audio::local_transcriber`, and inside `audio`'s shared TTS
-//! download-retry loop that `audio::tts` runs through).
+//! used for panic safety in background download tasks (directly by
+//! `audio::local_transcriber`, and inside `audio`'s shared TTS download-retry
+//! loop that `audio::tts` runs through).
 //!
 //! Deliberate non-unifications (semantics-preserving scope):
-//! * The per-module singletons keep their own container/value types — `embedder`
-//!   uses `RwLock<Option<_>>`, `tts` `OnceLock<RwLock<Option<_>>>`, and
-//!   `local_transcriber` `Mutex<Option<_>>`.  Unifying these would change
-//!   synchronization semantics (poisoning, init-once, contention).
+//! * The per-module singletons keep their own container/value types — `tts`
+//!   `OnceLock<RwLock<Option<_>>>` and `local_transcriber` `Mutex<Option<_>>`.
+//!   Unifying these would change synchronization semantics (poisoning,
+//!   init-once, contention).
 //! * `local_transcriber` gained its guard when its init moved off the awaited
 //!   path: the background load/download must never leave its state stuck in
 //!   `Loading` — a panic in the spawned chain now flips it to `Failed` (the
@@ -23,8 +22,8 @@
 //! `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.
 //!
 //! All consumers (`audio` shared TTS helpers, `audio::tts`,
-//! `audio::local_transcriber`, `embedder`) use this shared copy; no
-//! module-local duplicates remain.
+//! `audio::local_transcriber`) use this shared copy; no module-local duplicates
+//! remain.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -68,11 +67,8 @@ impl AtomicModelState {
         self.0.store(state as u8, order);
     }
 
-    /// Returns `true` if the state is [`ModelState::Ready`]. Only the
-    /// macOS-only audio subsystem (TTS and local transcription) asks this way;
-    /// the cross-platform embedder keeps its own checks on the raw state.
+    /// Returns `true` if the state is [`ModelState::Ready`].
     #[must_use]
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     pub(crate) fn is_ready(&self) -> bool {
         self.load(Ordering::Acquire) == ModelState::Ready
     }

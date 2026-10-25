@@ -1953,9 +1953,9 @@ fn faph_sha256_file(path: &std::path::Path) -> std::io::Result<String> {
 ///
 /// Downloads `url` to `dest` (creating parent dirs), verifies the SHA-256
 /// against the manifest pin, and only then writes the file.  Uses its own
-/// local current-thread tokio runtime — deliberately NOT the embedder.rs
-/// download precedent (gated embedder/providers out of the bench
-/// surface), and no new runtime dependency for the standard bench run.
+/// local current-thread tokio runtime instead of pulling the daemon's async
+/// download path in, and adds no runtime dependency for the standard bench
+/// run.
 fn faph_download_file(
     url: &str,
     dest: &std::path::Path,

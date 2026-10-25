@@ -44,7 +44,7 @@ use anyhow::{Result, anyhow};
 use qwen_asr::context::QwenModel;
 use serde::{Deserialize, Serialize};
 
-use crate::vector::cosine_similarity;
+use super::util::cosine_similarity;
 
 // ── Constants ────────────────────────────────────────────────────────────
 

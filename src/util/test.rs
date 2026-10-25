@@ -615,9 +615,9 @@ pub(crate) fn tiny_png_data_uri() -> String {
 /// The single process-level test temp root.
 ///
 /// All test-owned process-global state that needs a temp directory — the
-/// CONFIG storage root (stores, user workspaces, models) and the embedder
-/// test config — resolves under this one root, so the whole process owns
-/// exactly one test temp directory that self-cleans on normal exit (unix).
+/// CONFIG storage root (stores, user workspaces, models) — resolves under this
+/// one root, so the whole process owns exactly one test temp directory that
+/// self-cleans on normal exit (unix).
 pub(crate) fn test_root() -> &'static PathBuf {
     TEST_ROOT.get_or_init(|| {
         let tmp = tempfile::TempDir::new().expect("failed to create test temp dir");
@@ -796,8 +796,8 @@ pub async fn expect_ticket_phase(store: &BoardStore, id: &str) -> TicketPhase {
 
 /// Builder for creating test tickets with common defaults.
 ///
-/// Defaults: `desc="desc"`, `phase=Backlog`, `prerequisites=[]`, `reporter="test"`,
-/// `embedding=None`. Title is required (no default) via `.title()`.
+/// Defaults: `desc="desc"`, `phase=Backlog`, `prerequisites=[]`, `reporter="test"`.
+/// Title is required (no default) via `.title()`.
 ///
 /// # Examples
 /// ```ignore
@@ -819,7 +819,6 @@ pub(crate) struct TicketBuilder<'a> {
     phase: TicketPhase,
     prereqs: Vec<String>,
     reporter: String,
-    embedding: Option<Vec<u8>>,
     priority: i64,
 }
 
@@ -834,7 +833,6 @@ impl<'a> TicketBuilder<'a> {
             phase: TicketPhase::Backlog,
             prereqs: Vec::new(),
             reporter: "test".into(),
-            embedding: None,
             priority: 1,
         }
     }
@@ -891,7 +889,6 @@ impl<'a> TicketBuilder<'a> {
                 phase: self.phase,
                 prerequisites: self.prereqs,
                 reporter: self.reporter,
-                embedding: self.embedding,
                 priority: self.priority,
             },
         )

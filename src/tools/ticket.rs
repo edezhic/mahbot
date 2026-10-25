@@ -97,7 +97,6 @@ impl CreateTicketTool {
         title: &str,
         description: &str,
         prerequisites: &[String],
-        embedding_bytes: Option<Vec<u8>>,
         priority: i64,
     ) -> TicketParams {
         TicketParams {
@@ -107,7 +106,6 @@ impl CreateTicketTool {
             phase: TicketPhase::Backlog,
             prerequisites: prerequisites.to_vec(),
             reporter: self.reporter.clone(),
-            embedding: embedding_bytes,
             priority,
         }
     }
@@ -190,8 +188,6 @@ impl Tool for CreateTicketTool {
         };
 
         let store = board_store();
-        let embedding_bytes: Option<Vec<u8>> =
-            crate::embedder::embed_document(title).map(|v| crate::vector::vec_to_bytes(&v));
 
         let prereq_note = if prerequisites.is_empty() {
             String::new()
@@ -223,13 +219,7 @@ impl Tool for CreateTicketTool {
             }
         };
 
-        let params = self.build_params(
-            title,
-            description,
-            &prerequisites,
-            embedding_bytes,
-            priority,
-        );
+        let params = self.build_params(title, description, &prerequisites, priority);
         if let Some(supersede_id) = supersede_id {
             guard_not_pipeline_occupied(store, &supersede_id).await?;
 
