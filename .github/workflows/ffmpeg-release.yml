@@ -30,7 +30,9 @@
 #                              the digests, each written by the machine that
 #                              ran that leg
 #   SHA256SUMS                 one `<sha256>  <file>` line per archive: the six
-#                              above and the source archive
+#                              above and the source archive. The product's
+#                              installer reads this platform's line out of it and
+#                              checks the archive it downloads against it.
 #
 # Windows on ARM is its own build and never the x64 one, and no leg may stand
 # in for another: a platform that cannot be built fails the release rather than
@@ -62,11 +64,12 @@
 # `<revision>` is this file's `BUILD_REVISION`. The version is read back out of
 # the binary that is published, so a tag, an archive name and the binary inside
 # it cannot disagree. Dispatching this workflow is the only way a build is
-# published, and a tag that exists is never re-published: the product compiles
-# in the digest of a release's `SHA256SUMS`, and assets changing under one tag
-# would hand an installed copy a different build at the same version. The
-# publish job prints that digest at the end of its log, and a follow-up commit
-# records it.
+# published, and a tag that exists is never re-published: a tag names one build,
+# and assets changing under it would hand an installed copy a different one at
+# the same version. A repaired build bumps `BUILD_REVISION` and so gets a tag of
+# its own. Nothing of a release has to be recorded in the product afterwards —
+# the installer verifies the archive against that release's own `SHA256SUMS`, so a
+# published release is installable as it stands.
 #
 # No code signing and no notarization: each leg builds on the platform's own
 # machine, the linker's ad-hoc signature is what lets an arm64 macOS file
@@ -901,10 +904,10 @@ jobs:
           tag="ffmpeg-v$VERSION-mahbot.$REVISION"
           notes="FFmpeg $VERSION for the product's probe, frame and audio jobs, built from upstream $FFMPEG_TAG ($SOURCE_COMMIT), mahbot build revision $REVISION"
 
-          # An existing release is left alone: the product carries the digest of
-          # its SHA256SUMS, so assets changing under one tag would hand an
-          # installed copy a different build at the same version. A repaired
-          # build bumps BUILD_REVISION and so gets a tag of its own.
+          # An existing release is left alone: a tag names one build, so assets
+          # changing under it would hand an installed copy a different one at the
+          # same version. A repaired build bumps BUILD_REVISION and so gets a tag
+          # of its own.
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::$tag already exists — bump BUILD_REVISION to publish a repaired build, or delete that release by hand if it should never have existed"
             exit 1
@@ -923,14 +926,3 @@ jobs:
             BUILD-RECIPE.txt \
             SHA256SUMS
 
-      # What the operator takes away from the run. The product compiles this
-      # value in (`src/ffmpeg/install.rs`), so a release host alone can never
-      # substitute an archive: every archive digest is checked against a list
-      # whose own digest is part of the product's binary.
-      - name: Print the integrity anchor
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/dist"
-          anchor="$(sha256sum SHA256SUMS | cut -d ' ' -f 1)"
-          echo "SHA-256 of SHA256SUMS: $anchor"
-          echo "Record that value in a follow-up commit as the product's integrity anchor for this release."

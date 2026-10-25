@@ -8,8 +8,12 @@
 //!
 //! Every install targets the one version this build of the product pins: nothing
 //! is discovered from a third party, so what runs is what was tested with the call
-//! sites in [`super`]. Integrity is anchored in the build as well, so a release host
-//! alone cannot substitute an archive.
+//! sites in [`super`]. Integrity comes from the release itself, the way it does for
+//! the product's other managed binaries: the release's `SHA256SUMS` is fetched, and
+//! the archive is checked against the line for that archive. No digest of a release
+//! artefact is carried by this build, so a published release installs as it stands —
+//! and a checksum file rewritten together with its archive is not detected, which is
+//! the price of that.
 //!
 //! All six archives are real builds — one per shipped target, Windows on ARM
 //! included and never the x64 one — so an archive missing from a release is a
@@ -38,42 +42,10 @@ use crate::util::managed_bin;
 /// The release this build of the product pins: upstream ffmpeg 7.1, mahbot build
 /// revision 1, published in the `ffmpeg-v` stream beside the product's own releases.
 ///
-/// A repair to the build — a patch, a rebuilt dependency — bumps the revision and
-/// publishes a new tag. A published tag is never re-published: its digest is what
-/// every copy in the field was installed against.
+/// One tag for every platform. A repair to the build — a patch, a rebuilt
+/// dependency — bumps the revision and publishes a new tag; a published tag is never
+/// re-published, because every copy in the field was installed against it.
 pub(super) const TAG: &str = "ffmpeg-v7.1-mahbot.1";
-
-/// The SHA-256 of the release's `SHA256SUMS` asset: the integrity anchor this
-/// build carries, through which all six archives and both binaries are pinned.
-///
-/// Empty until the release of [`TAG`] exists: the workflow prints the value to paste
-/// here, and a follow-up commit records it. Empty refuses to install — trust on first
-/// use would defeat the pin — so until then this module installs nothing and every
-/// operation answers that the copy is unavailable.
-const SUMS_SHA256: &str = "";
-
-/// One release of the pair: the tag its assets live under and the digest of its
-/// `SHA256SUMS`, which is what the product carries so a release host alone cannot
-/// substitute an archive.
-#[derive(Debug, Clone, Copy)]
-struct Pin {
-    tag: &'static str,
-    sums_sha256: &'static str,
-}
-
-/// The pin this build of the product carries.
-const PIN: Pin = Pin {
-    tag: TAG,
-    sums_sha256: SUMS_SHA256,
-};
-
-impl Pin {
-    /// Whether this build carries a pin at all: an unresolved one refuses to
-    /// install, and is not a failure worth a WARN on every start.
-    const fn is_resolved(self) -> bool {
-        !self.sums_sha256.is_empty()
-    }
-}
 
 /// Test hook: a releases base serving the layout the real one does
 /// (`{base}/{tag}/SHA256SUMS`, `{base}/{tag}/{asset}`).
@@ -231,7 +203,7 @@ pub(super) async fn ensure_installed() -> Result<Binaries, String> {
     }
     let reason = match attempt_failure() {
         Some(reason) => reason,
-        None => match install_pinned(&root, PIN).await {
+        None => match install(&root).await {
             Ok(binaries) => {
                 tracing::info!("ffmpeg {TAG} installed");
                 return Ok(binaries);
@@ -272,10 +244,11 @@ async fn verified(binaries: &Binaries) -> bool {
     verified
 }
 
-/// Why the pin's own attempt failed, when one did.
+/// Why this process's install attempt failed, when one did.
 static ATTEMPT_FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// The recorded reason the pin cannot be installed in this process, if it is known.
+/// The recorded reason the pinned release cannot be installed in this process, if it
+/// is known.
 fn attempt_failure() -> Option<String> {
     ATTEMPT_FAILURE.lock().unwrap_poison().clone()
 }
@@ -286,11 +259,9 @@ fn attempt_failure() -> Option<String> {
 fn fallback(root: &Path, reason: &str) -> Result<Binaries, String> {
     match chosen(root) {
         // A copy that runs is what the product works with: one revision behind, or even
-        // one that does not report the pinned build, beats having nothing to run. An
-        // unresolved pin is not a mismatch — whatever is installed is the only copy
-        // this build can run.
+        // one that does not report the pinned build, beats having nothing to run.
         Some((tag, binaries)) => {
-            if PIN.is_resolved() && first_time(&tag) {
+            if first_time(&tag) {
                 if tag == TAG {
                     tracing::warn!(
                         "the copy installed as {TAG} is not the pinned build and could not be \
@@ -324,19 +295,12 @@ fn first_time(state: &str) -> bool {
 /// The boot task: install the pin when this host does not have it, called once by the
 /// binary and never failing the boot.
 ///
-/// Nothing is looked up first — the pin is compile-time, so the only question is
+/// Nothing is looked up first — the version is compile-time, so the only question is
 /// whether this host has it — and there is no retry of its own: a failure is left to
-/// the next start, and every use in this process answers from the record. A build
-/// that carries no pin says so at debug, not at WARN on every start of every
-/// deployed instance.
+/// the next start, and every use in this process answers from the record.
 pub async fn install_on_start() {
-    let Err(reason) = ensure_installed().await else {
-        return;
-    };
-    if PIN.is_resolved() {
+    if let Err(reason) = ensure_installed().await {
         tracing::warn!("ffmpeg {TAG} could not be installed (retried on the next start): {reason}");
-    } else {
-        tracing::debug!("this build of the product carries no ffmpeg pin: {reason}");
     }
 }
 
@@ -346,29 +310,21 @@ pub async fn install_on_start() {
 /// directory and the staging beside it are this attempt's own — and returns the
 /// pair the placed directory now holds.
 ///
-/// The order is what makes a failure harmless: the anchor is checked before
-/// anything is downloaded, the archive's own line before the archive is, the
-/// archive is verified as it streams, and the pair is proven to run before the
-/// directory is renamed into place.
-async fn install_pinned(root: &Path, pin: Pin) -> Result<Binaries, String> {
+/// The order is what makes a failure harmless: this platform's line in the release's
+/// checksum file is read before anything is downloaded, the archive is verified as it
+/// streams, and the pair is proven to run before the directory is renamed into place.
+async fn install(root: &Path) -> Result<Binaries, String> {
     use crate::util::http::{DownloadSizeCheck, download_verified};
 
-    if !pin.is_resolved() {
-        return Err(
-            "no build of this version of ffmpeg has been pinned yet, so nothing is installed"
-                .to_string(),
-        );
-    }
     let (os, arch) = managed_bin::host_os_arch()?;
-    let asset = asset_name(pin.tag, os, arch);
+    let asset = asset_name(TAG, os, arch);
     let base = releases_url();
-    let tag = pin.tag;
-    let Some(pinned) = upstream_parts(tag) else {
-        return Err(format!("{tag} does not name an upstream version"));
+    let Some(pinned) = upstream_parts(TAG) else {
+        return Err(format!("{TAG} does not name an upstream version"));
     };
 
-    let sums = fetch_sums(&format!("{base}/{tag}/SHA256SUMS")).await?;
-    let digest = archive_digest(&sums, pin.sums_sha256, &asset)?;
+    let sums = fetch_sums(&format!("{base}/{TAG}/SHA256SUMS")).await?;
+    let digest = archive_digest(&sums, &asset)?;
 
     let downloads = root.join("downloads");
     let _ = fs::remove_dir_all(&downloads);
@@ -377,7 +333,7 @@ async fn install_pinned(root: &Path, pin: Pin) -> Result<Binaries, String> {
     let archive = downloads.join(&asset);
     download_verified(
         client()?,
-        &format!("{base}/{tag}/{asset}"),
+        &format!("{base}/{TAG}/{asset}"),
         &archive,
         &digest,
         None,
@@ -411,9 +367,9 @@ async fn install_pinned(root: &Path, pin: Pin) -> Result<Binaries, String> {
             ));
         }
     }
-    let installed = root.join(tag);
+    let installed = root.join(TAG);
     place(staging.path(), &installed)?;
-    prune(root, pin);
+    prune(root);
     // Both banners were just read: the pair in place is the pinned build.
     *PINNED_VERIFIED.lock().unwrap_poison() = Some(true);
     Ok(binaries_in(&installed))
@@ -473,28 +429,15 @@ async fn fetch_sums(url: &str) -> Result<String, String> {
     })
 }
 
-/// The digest `asset` must have, read out of a `SHA256SUMS` body whose own digest
-/// is `anchor`: the whole pin in one step, because the body is the one this build
-/// carries and this platform's archive is a line inside it. Both refusals leave
-/// the host untouched.
-fn archive_digest(body: &str, anchor: &str, asset: &str) -> Result<String, String> {
-    if !sha256_hex(body.as_bytes()).eq_ignore_ascii_case(anchor) {
-        return Err(
-            "the release's checksum file does not match the one this build of the product pins"
-                .to_string(),
-        );
-    }
+/// The digest `asset` must have, read out of the release's `SHA256SUMS` body: the
+/// line for this platform's archive. A body without one installs nothing, so no
+/// other platform's archive is ever substituted.
+fn archive_digest(body: &str, asset: &str) -> Result<String, String> {
     body.lines()
         .filter_map(managed_bin::parse_sha256_sidecar)
         .find(|(_, name)| name == asset)
         .map(|(digest, _)| digest)
         .ok_or_else(|| "the release carries no checksum for this platform's archive".to_string())
-}
-
-/// The lowercase hex SHA-256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    crate::util::hex_string(&sha2::Sha256::digest(bytes))
 }
 
 /// Unpack one release archive into `staging` in one pass: the two binaries under
@@ -581,8 +524,8 @@ fn place(staging: &Path, final_dir: &Path) -> Result<(), String> {
 ///
 /// Infallible in effect: each removal is best effort, so a file another process is
 /// using can never fail an install that already succeeded.
-fn prune(root: &Path, pin: Pin) {
-    let Some(pinned) = parse_tag(pin.tag) else {
+fn prune(root: &Path) {
+    let Some(pinned) = parse_tag(TAG) else {
         return;
     };
     let Ok(entries) = fs::read_dir(root) else {
@@ -738,7 +681,7 @@ mod tests {
         fs::create_dir_all(root.join(".staging-Kd7x2p")).expect("create staging");
         fs::create_dir_all(root.join("downloads")).expect("create downloads");
 
-        prune(root, PIN);
+        prune(root);
 
         assert!(root.join(TAG).exists(), "the pin stays");
         assert!(
@@ -756,24 +699,18 @@ mod tests {
     }
 
     #[test]
-    fn the_sums_body_must_be_the_pinned_one_and_carry_this_archive() {
+    fn the_sums_body_must_carry_this_archive() {
         let archive = "ffmpeg-7.1-mahbot.1-macos-aarch64.tar.gz";
-        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let digest = "0123456789abcdef".repeat(4);
         let body = format!("{digest}  {archive}\n{}  LICENCE.txt\n", "f".repeat(64));
-        let anchor = sha256_hex(body.as_bytes());
 
         assert_eq!(
-            archive_digest(&body, &anchor, archive).expect("the pinned body verifies"),
+            archive_digest(&body, archive).expect("this archive's line"),
             digest
         );
 
-        // A body this build does not pin installs nothing.
-        let reason = archive_digest(&body, &"0".repeat(64), archive)
-            .expect_err("a body that is not the pinned one is refused");
-        assert!(reason.contains("does not match"), "{reason}");
-
-        // The pinned body without this platform's line is refused as well.
-        let reason = archive_digest(&body, &anchor, "ffmpeg-7.1-mahbot.1-windows-aarch64.zip")
+        // The body without this platform's line is refused: no other archive stands in.
+        let reason = archive_digest(&body, "ffmpeg-7.1-mahbot.1-windows-aarch64.zip")
             .expect_err("a body without this archive is refused");
         assert!(reason.contains("no checksum for this platform"), "{reason}");
     }
@@ -989,15 +926,12 @@ mod tests {
         format!("{digest}  {name}\n")
     }
 
-    /// A pin for `tag` whose anchor is the digest of `sums`, the way the release
-    /// workflow prints the value that is then pasted into the source. Leaked into
-    /// `'static` because the product's anchor is a constant.
+    /// The lowercase hex SHA-256 of `bytes`: what a `SHA256SUMS` line for an archive
+    /// carries.
     #[cfg(unix)]
-    fn pin_of(tag: &'static str, sums: &str) -> Pin {
-        Pin {
-            tag,
-            sums_sha256: Box::leak(sha256_hex(sums.as_bytes()).into_boxed_str()),
-        }
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        crate::util::hex_string(&sha2::Sha256::digest(bytes))
     }
 
     /// The staging directories a finished or failed attempt may have left under
@@ -1190,39 +1124,30 @@ mod tests {
         Some(head.lines().next()?.split_whitespace().nth(1)?.to_string())
     }
 
-    /// A digest no `SHA256SUMS` body hashes to: the anchor a build that pins some
-    /// other release carries.
-    #[cfg(unix)]
-    const NOT_THE_PINNED_FILE: &str =
-        "0000000000000000000000000000000000000000000000000000000000000000";
-
     /// The whole install path against a host standing in for the release stream: a
-    /// release whose checksum file is the pinned one installs and becomes the copy
-    /// in use, and every way a release can lie — a checksum file this build does
-    /// not pin, no line for this platform's archive, bytes that are not the
-    /// declared ones — installs nothing and leaves the working copy in place.
+    /// release whose checksum file carries this platform's line installs and becomes
+    /// the copy in use, and every way a release can lie — no line for this platform's
+    /// archive, bytes that are not the declared ones — installs nothing and leaves the
+    /// working copy in place.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(ffmpeg_releases)] // points the release hook at a local host
-    async fn the_install_checks_the_release_against_the_pin() {
-        let install = tempfile::tempdir().expect("install root");
-        let root = install.path();
+    async fn the_install_checks_the_release_against_its_own_checksums() {
+        let dir = tempfile::tempdir().expect("install root");
+        let root = dir.path();
         let files = tempfile::tempdir().expect("stand-in release files");
         let asset = host_asset();
         let archive = archive_bytes(files.path());
         let sums = checksum_line(&sha256_hex(&archive), &asset);
 
-        // 1. The pinned checksum file, verified against the anchor this build
-        //    carries, names this platform's archive: the whole path runs, and the
-        //    copy it leaves is under the pinned tag with nothing of the attempt
-        //    beside it.
+        // 1. The release's checksum file names this platform's archive: the whole
+        //    path runs, and the copy it leaves is under the pinned tag with nothing
+        //    of the attempt beside it.
         let host = FakeRelease::start(TAG, &asset, &sums, &archive);
         // The hook is read on every attempt, so no real host is asked for the rest
         // of the check; the guard puts the variable back when it drops.
         let _hook = crate::util::test::set_env_var(RELEASES_URL_ENV, Some(host.base()));
-        install_pinned(root, pin_of(TAG, &sums))
-            .await
-            .expect("the pinned release installs");
+        install(root).await.expect("the release installs");
         assert_eq!(
             host.asked(),
             [format!("/{TAG}/SHA256SUMS"), format!("/{TAG}/{asset}")],
@@ -1251,32 +1176,14 @@ mod tests {
             "the whole install is one directory: no download and no staging left"
         );
 
-        // 2. A checksum file that is not the one this build pins: nothing is
-        //    downloaded, and the copy already in place keeps working.
-        let reason = install_pinned(
-            root,
-            Pin {
-                tag: TAG,
-                sums_sha256: NOT_THE_PINNED_FILE,
-            },
-        )
-        .await
-        .expect_err("a checksum file that is not the pinned one is refused");
-        assert!(reason.contains("does not match"), "{reason}");
-        assert_eq!(
-            chosen(root).expect("the installed copy survives").0,
-            TAG,
-            "the copy in use is untouched"
-        );
-
-        // 3. The pinned checksum file, without a line for this platform's archive:
-        //    no other platform's archive is ever substituted.
+        // 2. The checksum file without a line for this platform's archive: no other
+        //    platform's archive is ever substituted.
         let elsewhere = checksum_line(
             &sha256_hex(&archive),
             &asset_name(TAG, "windows", "aarch64"),
         );
         host.offer(&elsewhere, &archive);
-        let reason = install_pinned(root, pin_of(TAG, &elsewhere))
+        let reason = install(root)
             .await
             .expect_err("a release without this platform's archive is refused");
         assert!(reason.contains("no checksum for this platform"), "{reason}");
@@ -1294,12 +1201,12 @@ mod tests {
             "nothing was staged for a release without this archive"
         );
 
-        // 4. The declared digest, with an archive whose bytes are not the declared
+        // 3. The declared digest, with an archive whose bytes are not the declared
         //    ones: the download is refused and nothing of it is kept.
         let mut altered = archive.clone();
         *altered.last_mut().expect("the archive has bytes") ^= 0xff;
         host.offer(&sums, &altered);
-        let reason = install_pinned(root, pin_of(TAG, &sums))
+        let reason = install(root)
             .await
             .expect_err("an archive that does not match its digest is refused");
         assert!(reason.contains("does not match the checksum"), "{reason}");
@@ -1317,7 +1224,7 @@ mod tests {
             "nothing was staged for a rejected download"
         );
 
-        // 5. An unusable copy standing where the pin belongs — one of its binaries is
+        // 4. An unusable copy standing where the pin belongs — one of its binaries is
         //    gone — is replaced by the pinned one in a single swap, so the host is
         //    never left without a copy and no half-installed directory survives.
         host.offer(&sums, &archive);
@@ -1327,9 +1234,9 @@ mod tests {
             chosen(root).is_none(),
             "a copy that lost a binary is not a copy"
         );
-        install_pinned(root, pin_of(TAG, &sums))
+        install(root)
             .await
-            .expect("the pin replaces the broken copy");
+            .expect("the release replaces the broken copy");
         for tool in [ffmpeg_file(), ffprobe_file()] {
             assert!(
                 crate::util::is_executable(&root.join(TAG).join("bin").join(tool)),
