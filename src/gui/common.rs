@@ -14,7 +14,7 @@ pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
 /// Pagination state shared by dashboard pages that display paginated data.
 ///
 /// Groups `page`, `page_size`, and `total` into a single struct with helper
-/// methods for common operations (used by the Logs and Tool Failures pages).
+/// methods for common operations (used by the Logs page's two views).
 #[derive(Debug, Clone)]
 pub(crate) struct PaginationState {
     pub(crate) page: usize,
@@ -249,15 +249,15 @@ impl<T> PolledList<T> {
     }
 }
 
-/// Shared state for a paginated tab that fetches typed entries.
+/// Shared state for one paginated view of a dashboard page.
 ///
-/// Groups the per-tab fields (`entries`, `load_state`, `pagination`, `search`,
-/// `refresh_generation`) and the common refresh bookkeeping. Each tab unit
-/// still owns its own `refresh()` (query type, store path and message enum
-/// differ), so callers use [`begin_refresh`](Self::begin_refresh) to prepare a
-/// refresh and [`handle_refreshed`](Self::handle_refreshed)/
+/// Groups the per-view fields (`entries`, `load_state`, `pagination`, `search`,
+/// `refresh_generation`) and the common refresh bookkeeping. Each view still
+/// owns its own `refresh()` (query type, store path and message enum differ),
+/// so callers use [`begin_refresh`](Self::begin_refresh) to prepare a refresh
+/// and [`handle_refreshed`](Self::handle_refreshed)/
 /// [`handle_refresh_error`](Self::handle_refresh_error) to process responses.
-pub(crate) struct PaginatedTabState<T> {
+pub(crate) struct PaginatedViewState<T> {
     pub(crate) entries: Vec<T>,
     pub(crate) load_state: AsyncLoadState,
     pub(crate) pagination: PaginationState,
@@ -265,7 +265,7 @@ pub(crate) struct PaginatedTabState<T> {
     pub(crate) refresh_generation: u64,
 }
 
-impl<T> PaginatedTabState<T> {
+impl<T> PaginatedViewState<T> {
     pub(crate) fn new(page_size: usize) -> Self {
         Self {
             entries: Vec::new(),
@@ -319,7 +319,7 @@ impl<T> PaginatedTabState<T> {
     }
 
     /// Drop the loaded entries and return to the first page — the post-delete
-    /// state of a tab whose rows no longer exist.
+    /// state of a view whose rows no longer exist.
     pub(crate) fn clear_entries(&mut self) {
         self.entries.clear();
         self.pagination.reset();

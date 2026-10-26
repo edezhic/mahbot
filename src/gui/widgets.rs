@@ -1,7 +1,7 @@
 //! Shared dashboard widgets: page/scroll scaffolding, list bodies, and the
 //! reusable pieces (file tree, pick-list options, badges) used by GUI pages.
 
-use super::common::PaginatedTabState;
+use super::common::PaginatedViewState;
 use super::theme;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
@@ -322,19 +322,18 @@ pub fn empty_state_placeholder<'a, Message: 'a>(
     .into()
 }
 
-/// The body a paginated dashboard tab renders: the error banner, the first-read
-/// loading line, the tab's empty state, then its rows under one scroll — the
-/// shape the Logs and Tool Failures tabs share.
+/// The body a paginated dashboard view renders: the error banner, the first-read
+/// loading line, the view's empty state, then its rows under one scroll.
 ///
-/// The [`page`] wrapper belongs inside: both callers sit in a [`page_bare`]
-/// chrome, so leaving it out would silently lose [`theme::PAGE_PADDING`]. A
-/// failed first read leaves `loading` and `has_loaded` false, so the body falls
-/// through to the empty state with the banner as the only error signal — the
-/// deliberate opposite of the Alarms/Sessions lists, which suppress the
-/// placeholder on error.
+/// The [`page`] wrapper belongs inside: the Logs page body sits in a
+/// [`page_bare`] chrome, so leaving it out would silently lose
+/// [`theme::PAGE_PADDING`]. A failed first read leaves `loading` and
+/// `has_loaded` false, so the body falls through to the empty state with the
+/// banner as the only error signal — the deliberate opposite of the
+/// Alarms/Sessions lists, which suppress the placeholder on error.
 #[must_use]
-pub fn tab_body<'a, T, Message: 'a>(
-    state: &'a PaginatedTabState<T>,
+pub fn paginated_body<'a, T, Message: 'a>(
+    state: &'a PaginatedViewState<T>,
     empty_icon: iced::widget::Text<'a, iced::Theme, iced::Renderer>,
     empty_label: &'a str,
     row: impl Fn(&'a T) -> Element<'a, Message>,

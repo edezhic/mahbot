@@ -29,8 +29,9 @@ use tracing::{debug, warn};
 /// The window the accumulating telemetry is kept for.
 const TELEMETRY_HOURS: i64 = 8;
 
-/// Failed tool calls carry the history the Tool Failures page shows, so it is
-/// kept far longer than the rest of the telemetry.
+/// Failed tool calls are the record of why a tool call failed, read back through
+/// `mahbot debug` over the `tool_calls` table, so they are kept far longer than
+/// the rest of the telemetry.
 const FAILED_TOOL_CALL_HOURS: i64 = 24 * 7;
 
 /// Records removed per statement.
@@ -71,10 +72,9 @@ const RETENTION_RULES: &[RetentionRule] = &[
         expired: "success = 1 AND error_message IS NULL AND recorded_at < ?1",
         window_hours: TELEMETRY_HOURS,
     },
-    // Failed tool calls — everything the Tool Failures page lists (its own filter
-    // is `error_message IS NOT NULL`) and a call recorded as failed without error
-    // text of its own. The two rules on this table have to partition it: a call
-    // the failure rule takes must not also be a candidate for the 8 h one.
+    // Failed tool calls — a call recorded as failed, or one carrying error text
+    // of its own. The two rules on this table have to partition it: a call the
+    // failure rule takes must not also be a candidate for the 8 h one.
     RetentionRule {
         table: "tool_calls",
         expired: "(success = 0 OR error_message IS NOT NULL) AND recorded_at < ?1",

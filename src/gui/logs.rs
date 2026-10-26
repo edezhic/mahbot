@@ -1,11 +1,11 @@
-//! Logs dashboard page — live log viewing with per-tab pagination/search,
-//! plus a Tool Failures tab for browsing tool error entries.
+//! Logs dashboard page — live log viewing with a per-view pagination and
+//! search over the log store.
 //!
-//! Each tab (All Logs / Issues / Tool Failures) keeps its own entries,
-//! pagination state and search query, so switching tabs never reuses another
-//! tab's page index or search. The bottom bar holds pagination, this tab's
-//! clear button (deletes the tab's records from the store, behind the shared
-//! confirmation modal) and search; the top bar holds only the tabs.
+//! Each view (All Logs / Only Issues) keeps its own entries, pagination state
+//! and search query, so switching views never reuses another view's page index
+//! or search. The bottom bar holds pagination, the switch between the two views,
+//! this view's clear button (deletes the view's records from the store, behind
+//! the shared confirmation modal) and search.
 
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
@@ -18,43 +18,47 @@ use std::time::{Duration, Instant};
 
 use iced_fonts::lucide;
 
-use super::common::PaginatedTabState;
+use super::common::PaginatedViewState;
 use super::dialog;
 use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets;
 
-/// Tabs within the Logs page.
+/// The two listings the Logs page switches between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogsTab {
+pub enum LogsView {
     AllLogs,
     Issues,
-    ToolFailures,
 }
 
-impl LogsTab {
-    /// The level filter this tab's listing query uses — and therefore the exact
-    /// scope of its clear button, which always empties the whole tab and never
-    /// the searched subset. Only the log tabs have one (All Logs means every
-    /// level); the Tool Failures tab does not read the logs table at all, so
-    /// its `None` carries no scope.
+impl LogsView {
+    /// The level filter this view's listing query uses — and therefore the exact
+    /// scope of its clear button, which always empties the whole view and never
+    /// the searched subset. All Logs means every level.
     fn level_filter(self) -> Option<&'static str> {
         match self {
             Self::Issues => Some("ERROR,WARN"),
-            Self::AllLogs | Self::ToolFailures => None,
+            Self::AllLogs => None,
         }
     }
 
-    /// Label of this tab's clear button (also the title of its confirmation).
+    /// Label of this view's segment in the switch.
+    fn switch_label(self) -> &'static str {
+        match self {
+            Self::AllLogs => "All Logs",
+            Self::Issues => "Only Issues",
+        }
+    }
+
+    /// Label of this view's clear button (also the title of its confirmation).
     fn clear_label(self) -> &'static str {
         match self {
             Self::AllLogs => "Clear logs",
             Self::Issues => "Clear issues",
-            Self::ToolFailures => "Clear failures",
         }
     }
 
-    /// Consequence paragraphs for this tab's clear confirmation: the scope the
+    /// Consequence paragraphs for this view's clear confirmation: the scope the
     /// button names, including where the deleted records are shown elsewhere.
     fn clear_consequences(self) -> [&'static str; 3] {
         match self {
@@ -69,13 +73,6 @@ impl LogsTab {
                 "This permanently deletes every stored warning and error record, for \
                  every workspace and user.",
                 "Informational records are not touched and stay in the All Logs view.",
-                "Nothing can be recovered.",
-            ],
-            Self::ToolFailures => [
-                "This permanently deletes every recorded failed tool call, for every \
-                 workspace and user.",
-                "Successful tool calls are not touched — only the failed rows this tab \
-                 lists are deleted.",
                 "Nothing can be recovered.",
             ],
         }
@@ -101,11 +98,11 @@ fn log_stream_producer() -> impl futures_util::Stream<Item = LogMessage> {
 
 #[derive(Debug, Clone)]
 pub enum LogMessage {
-    // Data — tagged with the originating tab and refresh generation so stale
-    // async responses (issued before a newer refresh of the same tab) are
+    // Data — tagged with the originating view and refresh generation so stale
+    // async responses (issued before a newer refresh of the same view) are
     // dropped instead of overwriting newer data.
-    Refreshed(LogsTab, u64, Vec<LogEntry>, usize),
-    RefreshError(LogsTab, u64, String),
+    Refreshed(LogsView, u64, Vec<LogEntry>, usize),
+    RefreshError(LogsView, u64, String),
 
     // Live stream
     LiveEntry(LogEntry),
@@ -114,13 +111,13 @@ pub enum LogMessage {
     // Search
     SearchInput(super::editor_widget::EditorAction),
 
-    // Tab switching
-    TabSelected(LogsTab),
+    // View switching
+    ViewSelected(LogsView),
 
-    // Debounced refresh after text input (~300ms). Carries the tab whose
-    // query changed so the refresh still targets that tab if the user
-    // switches tabs within the debounce window.
-    DebouncedRefresh(u64, LogsTab),
+    // Debounced refresh after text input (~300ms). Carries the view whose
+    // query changed so the refresh still targets that view if the user
+    // switches views within the debounce window.
+    DebouncedRefresh(u64, LogsView),
 
     // Pagination
     PrevPage,
@@ -142,34 +139,29 @@ pub enum LogMessage {
 
     /// Clear button pressed — ask for confirmation before deleting anything.
     RequestClear,
-    /// The confirmation's danger action — delete the pending tab's records.
+    /// The confirmation's danger action — delete the pending view's records.
     ClearConfirmed,
     /// The confirmation was dismissed (Keep/backdrop/Escape) — nothing deleted.
     ClearDismissed,
     /// A clear finished. `Ok` = the delete committed; `Err` carries the failure
-    /// to surface in that tab's error banner. Records already buffered by the
+    /// to surface in that view's error banner. Records already buffered by the
     /// log writer may still land after it.
-    Cleared(LogsTab, Result<(), String>),
-
-    /// Bridged Tool Failures sub-messages.
-    ToolFailures(super::tool_failures::ToolFailuresMessage),
+    Cleared(LogsView, Result<(), String>),
 }
 
-/// Per-tab state shared by the All Logs and Issues tabs. Each tab keeps its
-/// own entries, load state, pagination and search query so switching tabs
-/// never reuses another tab's page index or query.
-type LogsTabData = PaginatedTabState<LogEntry>;
+/// Per-view state shared by the All Logs and Issues views. Each view keeps its
+/// own entries, load state, pagination and search query so switching views
+/// never reuses another view's page index or query.
+type LogsViewData = PaginatedViewState<LogEntry>;
 
 pub struct LogsState {
-    /// All Logs tab data (live-streamed).
-    all_logs: LogsTabData,
-    /// Issues tab data (ERROR/WARN only).
-    issues: LogsTabData,
-    /// Tool Failures tab data (delegated sub-state).
-    tool_failures_state: super::tool_failures::ToolFailuresState,
+    /// All Logs view data (live-streamed).
+    all_logs: LogsViewData,
+    /// Issues view data (ERROR/WARN only).
+    issues: LogsViewData,
 
-    // Tab state
-    active_tab: LogsTab,
+    /// The view on screen.
+    active_view: LogsView,
 
     /// Visual highlight for search input (Cmd+F).
     focus_search: bool,
@@ -180,22 +172,21 @@ pub struct LogsState {
     fade_anim: Animated<f32>,
     /// Debounce state for search-text input filtering.
     debounce: super::common::DebounceState,
-    /// Buffer for the shared search input (bound to the active tab's query).
+    /// Buffer for the shared search input (bound to the active view's query).
     search_buffer: super::common::SingleLineEditorState,
 
-    /// Tab whose clear button awaits confirmation. `Some` while the confirm
+    /// View whose clear button awaits confirmation. `Some` while the confirm
     /// modal is open — nothing is deleted without it.
-    pending_clear: Option<LogsTab>,
+    pending_clear: Option<LogsView>,
 }
 
 impl LogsState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            all_logs: PaginatedTabState::new(50),
-            issues: PaginatedTabState::new(50),
-            tool_failures_state: super::tool_failures::ToolFailuresState::new(),
-            active_tab: LogsTab::AllLogs,
+            all_logs: PaginatedViewState::new(50),
+            issues: PaginatedViewState::new(50),
+            active_view: LogsView::AllLogs,
             focus_search: false,
             newest_entry_timestamp: None,
             fade_anim: Animated::transition(
@@ -208,69 +199,50 @@ impl LogsState {
         }
     }
 
-    /// Immutable access to one log tab's data. Returns `None` for the Tool
-    /// Failures tab (handled via `tool_failures_state`).
-    fn tab_data(&self, tab: LogsTab) -> Option<&LogsTabData> {
-        match tab {
-            LogsTab::AllLogs => Some(&self.all_logs),
-            LogsTab::Issues => Some(&self.issues),
-            LogsTab::ToolFailures => None,
+    /// Immutable access to one view's data.
+    fn view_data(&self, view: LogsView) -> &LogsViewData {
+        match view {
+            LogsView::AllLogs => &self.all_logs,
+            LogsView::Issues => &self.issues,
         }
     }
 
-    /// Mutable access to one log tab's data. Returns `None` for the Tool
-    /// Failures tab (handled via `tool_failures_state`).
-    fn tab_data_mut(&mut self, tab: LogsTab) -> Option<&mut LogsTabData> {
-        match tab {
-            LogsTab::AllLogs => Some(&mut self.all_logs),
-            LogsTab::Issues => Some(&mut self.issues),
-            LogsTab::ToolFailures => None,
+    /// Mutable access to one view's data.
+    fn view_data_mut(&mut self, view: LogsView) -> &mut LogsViewData {
+        match view {
+            LogsView::AllLogs => &mut self.all_logs,
+            LogsView::Issues => &mut self.issues,
         }
     }
 
-    /// The active tab's search query (bound to the shared search input).
+    /// The active view's search query (bound to the shared search input).
     fn active_search(&self) -> &str {
-        match self.active_tab {
-            LogsTab::AllLogs => &self.all_logs.search,
-            LogsTab::Issues => &self.issues.search,
-            LogsTab::ToolFailures => self.tool_failures_state.search(),
-        }
+        &self.view_data(self.active_view).search
     }
 
-    /// Reset pagination for whichever tab is currently active.
-    fn reset_pagination_for_active_tab(&mut self) {
-        match self.tab_data_mut(self.active_tab) {
-            Some(data) => data.pagination.reset(),
-            None => self.tool_failures_state.reset_pagination(),
-        }
+    /// Reset pagination for whichever view is currently active.
+    fn reset_pagination_for_active_view(&mut self) {
+        self.view_data_mut(self.active_view).pagination.reset();
     }
 
-    /// Refresh whichever tab is currently active.
-    fn refresh_active_tab(&mut self, log_store: &LogStore) -> Task<LogMessage> {
-        self.refresh_tab(log_store, self.active_tab)
+    /// Refresh whichever view is currently active.
+    fn refresh_active_view(&mut self, log_store: &LogStore) -> Task<LogMessage> {
+        self.refresh_view(log_store, self.active_view)
     }
 
-    /// Public entry point: refresh the currently active tab (used at boot).
+    /// Public entry point: refresh the currently active view (used at boot).
     pub fn refresh(&mut self, log_store: &LogStore) -> Task<LogMessage> {
-        self.refresh_active_tab(log_store)
+        self.refresh_active_view(log_store)
     }
 
-    /// Issue a refresh for one specific tab, tagging the async response with
-    /// its origin tab and a generation counter so stale responses (issued
-    /// before a newer refresh of the same tab) are dropped by the handler.
-    /// Total over all three tabs: the Tool Failures tab refreshes through
-    /// its own state/store path instead.
-    fn refresh_tab(&mut self, log_store: &LogStore, tab: LogsTab) -> Task<LogMessage> {
-        // Tool Failures has its own state and store path.
-        let Some(data) = self.tab_data_mut(tab) else {
-            return self
-                .tool_failures_state
-                .refresh()
-                .map(LogMessage::ToolFailures);
-        };
+    /// Issue a refresh for one specific view, tagging the async response with
+    /// its origin view and a generation counter so stale responses (issued
+    /// before a newer refresh of the same view) are dropped by the handler.
+    fn refresh_view(&mut self, log_store: &LogStore, view: LogsView) -> Task<LogMessage> {
+        let data = self.view_data_mut(view);
         let generation = data.begin_refresh();
         let query = LogQuery {
-            level: tab.level_filter().map(str::to_owned),
+            level: view.level_filter().map(str::to_owned),
             target: None,
             search: crate::util::none_if_empty(&data.search),
             since: None,
@@ -288,19 +260,19 @@ impl LogsState {
             },
             move |res| match res {
                 Ok((generation, entries, total)) => {
-                    LogMessage::Refreshed(tab, generation, entries, total)
+                    LogMessage::Refreshed(view, generation, entries, total)
                 }
-                Err((generation, e)) => LogMessage::RefreshError(tab, generation, e),
+                Err((generation, e)) => LogMessage::RefreshError(view, generation, e),
             },
         )
     }
 
     pub fn subscription(&self) -> Subscription<LogMessage> {
-        // Live log stream only while the All Logs tab is active. Frame ticks are subscribed only while the fade animation is running —
+        // Live log stream only while the All Logs view is active. Frame ticks are subscribed only while the fade animation is running —
         // an always-on frames() subscription closes a self-sustaining redraw
         // loop (redraw → AnimTick → redraw).
         let mut subs: Vec<Subscription<LogMessage>> = Vec::new();
-        if self.active_tab == LogsTab::AllLogs {
+        if self.active_view == LogsView::AllLogs {
             subs.push(iced::Subscription::run(log_stream_producer));
         }
         if self.fade_anim.is_animating() {
@@ -312,26 +284,21 @@ impl LogsState {
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: LogMessage, log_store: &LogStore) -> Task<LogMessage> {
         match msg {
-            LogMessage::Refreshed(tab, generation, entries, total) => {
-                // A ToolFailures-tagged refresh cannot originate from
-                // `refresh_tab`; drop it defensively rather than panic.
-                let Some(data) = self.tab_data_mut(tab) else {
-                    return Task::none();
-                };
-                if data.handle_refreshed(generation, entries, total) {
-                    return self.refresh_tab(log_store, tab);
+            LogMessage::Refreshed(view, generation, entries, total) => {
+                if self
+                    .view_data_mut(view)
+                    .handle_refreshed(generation, entries, total)
+                {
+                    return self.refresh_view(log_store, view);
                 }
                 Task::none()
             }
-            LogMessage::RefreshError(tab, generation, e) => {
-                let Some(data) = self.tab_data_mut(tab) else {
-                    return Task::none();
-                };
-                data.handle_refresh_error(generation, e);
+            LogMessage::RefreshError(view, generation, e) => {
+                self.view_data_mut(view).handle_refresh_error(generation, e);
                 Task::none()
             }
             LogMessage::RequestClear => {
-                self.pending_clear = Some(self.active_tab);
+                self.pending_clear = Some(self.active_view);
                 Task::none()
             }
             LogMessage::ClearDismissed => {
@@ -339,64 +306,41 @@ impl LogsState {
                 Task::none()
             }
             LogMessage::ClearConfirmed => {
-                // The dialog names the tab it was opened for, not whichever tab
-                // is active now, so a tab switch behind the modal cannot retarget it.
-                let Some(tab) = self.pending_clear.take() else {
+                // The dialog names the view it was opened for, not whichever view
+                // is active now, so a view switch behind the modal cannot retarget it.
+                let Some(view) = self.pending_clear.take() else {
                     return Task::none();
                 };
                 let store = log_store.clone();
                 Task::perform(
-                    async move {
-                        // Explicit per tab: a catch-all would turn a future tab
-                        // into an unfiltered `DELETE FROM logs`.
-                        let result = match tab {
-                            LogsTab::AllLogs => store.clear_logs(None).await,
-                            LogsTab::Issues => {
-                                store.clear_logs(LogsTab::Issues.level_filter()).await
-                            }
-                            LogsTab::ToolFailures => store.clear_tool_errors().await,
-                        };
-                        result.map(|_| ()).map_err(|e| e.to_string())
-                    },
-                    move |result| LogMessage::Cleared(tab, result),
+                    // The clear scope is the view's own level filter: All Logs
+                    // carries none and empties the table.
+                    async move { store.clear_logs(view.level_filter()).await.map(|_| ()) },
+                    move |result| LogMessage::Cleared(view, result.map_err(|e| e.to_string())),
                 )
             }
-            LogMessage::Cleared(tab, result) => match result {
+            LogMessage::Cleared(view, result) => match result {
                 Ok(()) => {
-                    // Post-clear: the pressed tab returns to its first page and
+                    // Post-clear: the pressed view returns to its first page and
                     // keeps its typed search; its count is re-read by the
-                    // refresh below, never adjusted in place.
-                    match self.tab_data_mut(tab) {
-                        Some(data) => data.clear_entries(),
-                        None => self.tool_failures_state.clear_entries(),
-                    }
-                    let pressed = self.refresh_tab(log_store, tab);
-                    if tab == LogsTab::ToolFailures {
-                        return pressed;
-                    }
-                    // Both log tabs read the same table, so the other one holds
-                    // rows this clear just deleted — and it may be the tab on
-                    // screen. Drop that copy and re-read it too.
-                    let (sibling, sibling_tab) = if tab == LogsTab::AllLogs {
-                        (&mut self.issues, LogsTab::Issues)
-                    } else {
-                        (&mut self.all_logs, LogsTab::AllLogs)
-                    };
-                    sibling.entries.clear();
-                    Task::batch([pressed, self.refresh_tab(log_store, sibling_tab)])
+                    // refreshes below, never adjusted in place. Both views read
+                    // the same table, so the other one holds rows this clear just
+                    // deleted and is re-read too.
+                    self.view_data_mut(view).clear_entries();
+                    Task::batch(
+                        [LogsView::AllLogs, LogsView::Issues]
+                            .map(|view| self.refresh_view(log_store, view)),
+                    )
                 }
+                // This surface has no completion-notice plumbing; the view's
+                // error banner is the channel for a failed clear.
                 Err(e) => {
-                    // This surface has no completion-notice plumbing; its
-                    // per-tab error banner is the channel for a failed clear.
-                    match self.tab_data_mut(tab) {
-                        Some(data) => data.load_state.fail(e),
-                        None => self.tool_failures_state.fail(e),
-                    }
+                    self.view_data_mut(view).load_state.fail(e);
                     Task::none()
                 }
             },
             LogMessage::LiveEntry(entry) => {
-                // Live entries only arrive while the All Logs tab is active
+                // Live entries only arrive while the All Logs view is active
                 // (the subscription is gated in `subscription()`).
                 let data = &mut self.all_logs;
                 // Only prepend live entries when on page 0 (the live view).
@@ -405,8 +349,8 @@ impl LogsState {
                     return Task::none();
                 }
 
-                // Client-side search filter matching this tab's query (the
-                // level filter comes from the DB query for the Issues tab,
+                // Client-side search filter matching this view's query (the
+                // level filter comes from the DB query for the Issues view,
                 // which never receives live entries).
                 let passes = data.search.is_empty()
                     || entry
@@ -441,65 +385,50 @@ impl LogsState {
             }
             LogMessage::StreamLagged => {
                 // Only delivered while the All Logs stream is active.
-                self.refresh_active_tab(log_store)
+                self.refresh_active_view(log_store)
             }
             LogMessage::SearchInput(action) => {
                 // Single-line Tab moves focus rather than editing.
                 if let Some(task) = super::common::focus_navigation_task(&action) {
                     return task;
                 }
-                // The search input is bound to the active tab's own query.
+                // The search input is bound to the active view's own query.
                 let changes_text = action.changes_text();
                 self.search_buffer.apply_action(action);
                 let text = self.search_buffer.text();
-                match self.tab_data_mut(self.active_tab) {
-                    Some(data) => data.search = text,
-                    None => self.tool_failures_state.set_search(text),
-                }
+                self.view_data_mut(self.active_view).search = text;
                 // Only text changes re-trigger the debounced refresh; cursor
                 // movement emits actions too but shouldn't restart the timer.
                 if !changes_text {
                     return Task::none();
                 }
-                self.reset_pagination_for_active_tab();
-                // Tag the debounced refresh with the tab whose query changed
-                // so it still targets that tab if the user switches away
+                self.reset_pagination_for_active_view();
+                // Tag the debounced refresh with the view whose query changed
+                // so it still targets that view if the user switches away
                 // within the debounce window.
-                let tab = self.active_tab;
+                let view = self.active_view;
                 self.debounce
                     .trigger(300)
-                    .map(move |g| LogMessage::DebouncedRefresh(g, tab))
+                    .map(move |g| LogMessage::DebouncedRefresh(g, view))
             }
-            LogMessage::DebouncedRefresh(generation, tab) => {
+            LogMessage::DebouncedRefresh(generation, view) => {
                 if !self.debounce.should_process(generation) {
                     return Task::none();
                 }
-                self.refresh_tab(log_store, tab)
+                self.refresh_view(log_store, view)
             }
-            LogMessage::PrevPage => match self.tab_data_mut(self.active_tab) {
-                Some(data) => {
-                    if data.pagination.prev_page() {
-                        return self.refresh_active_tab(log_store);
-                    }
-                    Task::none()
+            LogMessage::PrevPage => {
+                if self.view_data_mut(self.active_view).pagination.prev_page() {
+                    return self.refresh_active_view(log_store);
                 }
-                None => self
-                    .tool_failures_state
-                    .prev_page()
-                    .map(LogMessage::ToolFailures),
-            },
-            LogMessage::NextPage => match self.tab_data_mut(self.active_tab) {
-                Some(data) => {
-                    if data.pagination.next_page() {
-                        return self.refresh_active_tab(log_store);
-                    }
-                    Task::none()
+                Task::none()
+            }
+            LogMessage::NextPage => {
+                if self.view_data_mut(self.active_view).pagination.next_page() {
+                    return self.refresh_active_view(log_store);
                 }
-                None => self
-                    .tool_failures_state
-                    .next_page()
-                    .map(LogMessage::ToolFailures),
-            },
+                Task::none()
+            }
             LogMessage::Escape => {
                 // Escape never confirms: while the confirm modal is open it only
                 // dismisses it.
@@ -518,74 +447,70 @@ impl LogsState {
                 // convention for context-menu actions (Home bubbles, editor).
                 iced::clipboard::write(format_log_entry(&entry))
             }
-            LogMessage::TabSelected(tab) => {
-                self.active_tab = tab;
-                // Sync the shared search buffer to the newly-active tab's query.
+            LogMessage::ViewSelected(view) => {
+                self.active_view = view;
+                // Sync the shared search buffer to the newly-active view's query.
                 let active_search = self.active_search().to_string();
                 self.search_buffer.set_text(&active_search);
-                self.refresh_active_tab(log_store)
+                self.refresh_active_view(log_store)
             }
-            LogMessage::ToolFailures(msg) => self
-                .tool_failures_state
-                .update(msg)
-                .map(LogMessage::ToolFailures),
         }
     }
 
-    /// Build a tab button element. Returns a highlighted container when the
-    /// tab is active, or a plain container when inactive.
-    fn tab_button(label: &str, tab: LogsTab, active_tab: LogsTab) -> Element<'_, LogMessage> {
-        let is_active = tab == active_tab;
+    /// One position of the bottom bar's view switch. Both labels always render;
+    /// the active one is accent-colored on an elevated fill, so the current
+    /// position is read off the control rather than inferred from a label.
+    fn view_switch_segment(view: LogsView, active: LogsView) -> Element<'static, LogMessage> {
+        let is_active = view == active;
         let color = if is_active {
             theme::ACCENT
         } else {
             theme::TEXT_FAINT
         };
-        let b = button(
-            container(text(label.to_string()).size(theme::TEXT_13).color(color))
-                .padding([theme::PAD_6, theme::PAD_14]),
+        let segment = button(text(view.switch_label()).size(theme::TEXT_11).color(color))
+            .style(theme::button_text)
+            .padding([theme::PAD_2, theme::PAD_8])
+            .on_press_maybe((!is_active).then_some(LogMessage::ViewSelected(view)));
+        container(segment)
+            .style(move |_| {
+                let background = if is_active {
+                    theme::BG_ELEVATED
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                theme::container_style(background, 4.0, 0.0, iced::Color::TRANSPARENT)
+            })
+            .into()
+    }
+
+    /// The view switch as one hairline-bordered pill sitting in the bottom bar.
+    /// Rendered unconditionally: it is the only view switcher on the page, so a
+    /// store with nothing to paginate or list must not hide it.
+    fn view_switch(active: LogsView) -> Element<'static, LogMessage> {
+        container(
+            row![
+                Self::view_switch_segment(LogsView::AllLogs, active),
+                Self::view_switch_segment(LogsView::Issues, active),
+            ]
+            .spacing(theme::SPACE_2),
         )
-        .style(theme::button_text)
-        .on_press(LogMessage::TabSelected(tab));
-        if is_active {
-            container(b).style(theme::container_bar).into()
-        } else {
-            container(b).into()
-        }
+        .padding(theme::PAD_1)
+        .style(|_| theme::container_style(iced::Color::TRANSPARENT, 5.0, 1.0, theme::BORDER))
+        .into()
     }
 
     pub fn view(&self) -> Element<'_, LogMessage> {
-        // ── Tab bar (top bar: tabs only) ──────────────────────────
-        let all_logs_btn = Self::tab_button("All Logs", LogsTab::AllLogs, self.active_tab);
-        let issues_btn = Self::tab_button("Issues", LogsTab::Issues, self.active_tab);
-        let tf_btn = Self::tab_button("Tool Failures", LogsTab::ToolFailures, self.active_tab);
-
-        let tab_bar = container(
-            row![all_logs_btn, issues_btn, tf_btn]
-                .spacing(theme::SPACE_2)
-                .align_y(Alignment::Center),
-        )
-        .width(Length::Fill)
-        .style(theme::surface_container_style);
-
-        // ── Tab content ────────────────────────────────────────────
-        let body: Element<'_, LogMessage> = match self.active_tab {
-            LogsTab::ToolFailures => self
-                .tool_failures_state
-                .view()
-                .map(LogMessage::ToolFailures),
-            LogsTab::AllLogs | LogsTab::Issues => self.logs_view(),
-        };
+        let body: Element<'_, LogMessage> = self.logs_view();
 
         // ── Log-writer persistence warning banner ──────────────────
         // Surfaces log-store insert failures (the writer task cannot use
         // tracing to report them without recursing into itself).
         let write_error_banner = Self::write_error_banner();
 
-        // ── Bottom bar: pagination + clear + search ────────────────
+        // ── Bottom bar: pagination + view switch + clear + search ──
         let bottom_bar = self.bottom_bar();
 
-        let content = column![tab_bar, write_error_banner, body, bottom_bar]
+        let content = column![write_error_banner, body, bottom_bar]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -595,23 +520,23 @@ impl LogsState {
         // page keeps its widget state as the modal opens/closes (same pattern
         // as the Running page).
         let confirm_layer: Element<'_, LogMessage> = match self.pending_clear {
-            Some(tab) => Self::clear_confirm_dialog(tab),
+            Some(view) => Self::clear_confirm_dialog(view),
             None => stack([widgets::empty_stack_placeholder()]).into(),
         };
         stack([page, confirm_layer]).into()
     }
 
-    /// The clear confirmation for `tab`: the shared confirm-dialog/backdrop
-    /// pair, with the tab's scope named in the title, the danger button and the
+    /// The clear confirmation for `view`: the shared confirm-dialog/backdrop
+    /// pair, with the view's scope named in the title, the danger button and the
     /// listed consequences. There is no undo, so nothing is deleted without it.
-    fn clear_confirm_dialog(tab: LogsTab) -> Element<'static, LogMessage> {
+    fn clear_confirm_dialog(view: LogsView) -> Element<'static, LogMessage> {
         widgets::modal_backdrop(
             dialog::confirm_dialog(
-                dialog::dialog_title(format!("{}?", tab.clear_label())),
-                dialog::dialog_body(tab.clear_consequences()),
+                dialog::dialog_title(format!("{}?", view.clear_label())),
+                dialog::dialog_body(view.clear_consequences()),
                 [
                     dialog::DialogAction::secondary("Keep records", LogMessage::ClearDismissed),
-                    dialog::DialogAction::danger(tab.clear_label(), LogMessage::ClearConfirmed),
+                    dialog::DialogAction::danger(view.clear_label(), LogMessage::ClearConfirmed),
                 ],
             ),
             LogMessage::ClearDismissed,
@@ -682,16 +607,11 @@ impl LogsState {
         .into()
     }
 
-    /// Render the bottom bar: pagination controls, the active tab's clear
-    /// button and the search input, all bound to the active tab.
+    /// Render the bottom bar: pagination controls, the view switch, the active
+    /// view's clear button and the search input, all bound to the active view.
     fn bottom_bar(&self) -> Element<'_, LogMessage> {
-        let (page, total_pages) = match self.tab_data(self.active_tab) {
-            Some(d) => (d.pagination.page, d.pagination.total_pages()),
-            None => (
-                self.tool_failures_state.page(),
-                self.tool_failures_state.total_pages(),
-            ),
-        };
+        let data = self.view_data(self.active_view);
+        let (page, total_pages) = (data.pagination.page, data.pagination.total_pages());
 
         // Pagination cluster — hidden entirely when there are no pages so the
         // "Page X of Y" indicator never shows an invalid page.
@@ -725,10 +645,10 @@ impl LogsState {
             .into()
         };
 
-        // Clear this tab — sits between the paging controls and the search box.
-        // Always rendered: a tab refilling from live activity right after a
-        // clear must stay clearable, so this is not tied to the paging state.
-        let clear_button = button(text(self.active_tab.clear_label()).size(theme::TEXT_12))
+        // This view's clear — always rendered: a view refilling from live
+        // activity right after a clear must stay clearable, so this is not tied
+        // to the paging state.
+        let clear_button = button(text(self.active_view.clear_label()).size(theme::TEXT_12))
             .style(theme::button_text_danger)
             .on_press(LogMessage::RequestClear);
 
@@ -767,6 +687,8 @@ impl LogsState {
         let bottom_row = row![
             pagination_cluster,
             Space::new().width(theme::SPACE_8),
+            Self::view_switch(self.active_view),
+            Space::new().width(theme::SPACE_8),
             clear_button,
             Space::new().width(Length::Fill),
             search_group,
@@ -781,21 +703,14 @@ impl LogsState {
             .into()
     }
 
-    /// Render the Logs/Issues tab content (entries list). Pagination lives in
-    /// the shared bottom bar.
+    /// Render the active view's content (entries list). Pagination lives in the
+    /// shared bottom bar.
     fn logs_view(&self) -> Element<'_, LogMessage> {
-        // The caller routes Tool Failures separately, so only the log tabs
-        // reach this view and `tab_data` answers for them.
-        let Some(data) = self.tab_data(self.active_tab) else {
-            return self
-                .tool_failures_state
-                .view()
-                .map(LogMessage::ToolFailures);
-        };
+        let data = self.view_data(self.active_view);
         // New live entries insert at position 0, so no scroll-to-newest logic
         // is needed. The fade and the newest-entry timestamp are read per row,
         // i.e. only when rows exist — never on the loading or empty paths.
-        widgets::tab_body(
+        widgets::paginated_body(
             data,
             lucide::activity::<iced::Theme, iced::Renderer>(),
             "No log entries",

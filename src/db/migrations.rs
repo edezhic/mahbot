@@ -539,17 +539,18 @@ const ADD_LLM_FAILURES: &str = "CREATE TABLE IF NOT EXISTS llm_failures (
 /// debug surface's `EXPLAIN QUERY PLAN`. The kept indexes are the ones a
 /// predicate or an ordering was planned onto:
 ///
-/// - `logs` — the Issues tab's count and list (`level IN (…)`) and the INFO
+/// - `logs` — the Issues view's count and list (`level IN (…)`) and the INFO
 ///   retention (`level = 'INFO' AND timestamp < ?`) all plan on
-///   `idx_logs_level`. The tab's `target`/`since` filters are never set, and
+///   `idx_logs_level`. The view's `target`/`since` filters are never set, and
 ///   `agent_id`/`agent_role`/`workspace` appear in no predicate; `timestamp`
 ///   loses to `idx_logs_level` for the retention range.
-/// - `tool_calls` — the Tool Failures count plans on
-///   `idx_tool_calls_error_message` (covering) and its list on
-///   `idx_tool_calls_recorded_at` (the `ORDER BY recorded_at DESC`); the two
-///   retention rules search exactly those (`error_message = ?`, then
-///   `recorded_at < ?`). `agent_id`/`role`/`tool_name`/`workspace` appear in no
-///   predicate or ordering.
+/// - `tool_calls` — the failure-listing query and its `ORDER BY recorded_at
+///   DESC` are gone: the only predicates left on this table are the two
+///   retention rules, both cutting on `recorded_at < ?`.
+///   `idx_tool_calls_recorded_at` and `idx_tool_calls_error_message` both
+///   stay — this entry drops indexes only, and ad-hoc `mahbot debug` SQL over
+///   `tool_calls` may use either. `agent_id`/`role`/`tool_name`/`workspace`
+///   appear in no predicate or ordering.
 /// - `llm_requests` — the retention delete's `recorded_at < ?` plans on
 ///   `idx_llm_requests_recorded_at`. `agent_id`/`model`/`purpose` are written
 ///   and never read.

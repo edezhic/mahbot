@@ -20,20 +20,7 @@
 //! schema. Consumers access the store through [`crate::logs::LOG_STORE`].
 
 use crate::db::{self};
-use anyhow::{Context, Result};
-
-// Column definitions for tool_error SELECT queries.
-crate::columns! {
-    TOOL_ERROR_COLUMNS [TE] {
-        TOOL_NAME      => "tool_name",
-        ROLE           => "role",
-        ERROR_MESSAGE  => "COALESCE(error_message, '') AS error_message",
-        ARGUMENTS      => "arguments",
-        DURATION_MS    => "duration_ms",
-        WORKSPACE      => "workspace",
-        RECORDED_AT    => "recorded_at",
-    }
-}
+use anyhow::Result;
 
 /// Which surface performed a recorded tool call: an agent's own run, or a
 /// command-line operation the product carried out for its owner.
@@ -78,125 +65,7 @@ pub(crate) fn recorded_arguments(args: &serde_json::Value, secrets: &[String]) -
     crate::util::truncate_bytes(&scrubbed, MAX_STATS_ARG_LENGTH).to_string()
 }
 
-/// A single tool error entry queried from the DB.
-#[derive(Debug, Clone)]
-pub struct ToolErrorEntry {
-    pub tool_name: String,
-    pub role: String,
-    pub error_message: String,
-    pub arguments: String,
-    pub duration_ms: i64,
-    pub workspace: String,
-    pub recorded_at: String,
-}
-
-/// Query filters for [`crate::logs::LogStore::query_tool_errors`].
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ToolErrorQuery {
-    /// Optional search text filter (substring match via `LIKE` on error text).
-    pub search: Option<String>,
-}
-
 impl crate::logs::LogStore {
-    /// Query tool call error entries with optional filters and pagination.
-    ///
-    /// Returns `(entries, total_count)` where each entry corresponds to a
-    /// single failed tool call (error_message IS NOT NULL).
-    pub(crate) async fn query_tool_errors(
-        &self,
-        query: &ToolErrorQuery,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<ToolErrorEntry>, usize)> {
-        let (where_clause, filter_params) = build_tool_error_filter(query);
-
-        let count_sql = format!("SELECT COUNT(*) FROM tool_calls WHERE {where_clause}");
-        let total = self
-            .conn
-            .query_row(&count_sql, filter_params.clone(), |row| row.get::<i64>(0))
-            .await
-            .map(|n: i64| {
-                usize::try_from(n)
-                    .expect("tool-error count returned a negative value; DB invariant violated")
-            })?;
-        if total == 0 {
-            return Ok((vec![], 0));
-        }
-
-        let limit_val = i64::try_from(limit)
-            .expect("query_tool_errors limit overflowed i64; limit must be <= i64::MAX");
-        let offset_val = i64::try_from(offset)
-            .expect("query_tool_errors offset overflowed i64; offset must be <= i64::MAX");
-
-        let sql = format!(
-            "SELECT {TOOL_ERROR_COLUMNS} \
-             FROM tool_calls \
-             WHERE {where_clause} \
-             ORDER BY recorded_at DESC \
-             LIMIT ? OFFSET ?",
-        );
-
-        let mut all_params = filter_params;
-        all_params.push(db::Value::Integer(limit_val));
-        all_params.push(db::Value::Integer(offset_val));
-
-        let rows = self.conn.query(&sql, all_params).await?;
-
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(ToolErrorEntry {
-                tool_name: row.get::<String>(COL_TE_TOOL_NAME)?,
-                role: row.get::<String>(COL_TE_ROLE)?,
-                error_message: row.get::<String>(COL_TE_ERROR_MESSAGE)?,
-                arguments: row.get::<String>(COL_TE_ARGUMENTS)?,
-                duration_ms: row.get::<i64>(COL_TE_DURATION_MS)?,
-                workspace: row.get::<String>(COL_TE_WORKSPACE)?,
-                recorded_at: row.get::<String>(COL_TE_RECORDED_AT)?,
-            });
-        }
-
-        Ok((entries, total))
-    }
-
-    /// Delete every failed tool call the Tool Failures tab lists, returning the
-    /// number of rows deleted.
-    ///
-    /// The predicate comes from the tab's own listing filter, built with no
-    /// search term, so the clear can never exceed the unfiltered tab: only rows
-    /// carrying an `error_message` go, and the other records in the store
-    /// (successful calls and the rest of the telemetry) are left untouched.
-    ///
-    /// Runs through [`crate::telemetry::wipe`], so a queued record the delete
-    /// covers cannot land behind it.
-    pub(crate) async fn clear_tool_errors(&self) -> Result<u64> {
-        let (where_clause, params) = build_tool_error_filter(&ToolErrorQuery::default());
-        crate::telemetry::wipe(
-            // The queued rows this delete covers are the failed calls; a batch
-            // that also holds successful ones keeps them, so the tab's promise
-            // that only the failed rows go holds for what is still queued too. A
-            // batch left with no call at all is dropped whole.
-            |record| {
-                let crate::telemetry::TelemetryRecord::ToolCalls(batch) = record else {
-                    return true;
-                };
-                batch
-                    .records
-                    .retain(|call| !covered_by_tool_error_clear(call));
-                !batch.records.is_empty()
-            },
-            async {
-                self.conn
-                    .execute(
-                        &format!("DELETE FROM tool_calls WHERE {where_clause}"),
-                        params,
-                    )
-                    .await
-                    .context("Failed to clear failed tool calls")
-            },
-        )
-        .await
-    }
-
     /// Write a batch of per-call tool records for a single flush.
     ///
     /// `recorded_at` is the instant the batch describes — stamped where the batch
@@ -653,38 +522,6 @@ pub(crate) fn record_llm_failure(
     );
 }
 
-/// Build a parameterized WHERE clause and params for tool error (failure) queries.
-///
-/// Returns `(where_clause, params)` where `where_clause` does NOT include
-/// the leading `WHERE` keyword — it is a set of `AND`-joined expressions
-/// suitable for embedding directly into SQL.  All placeholders use unnamed
-/// `?` — pass a `Vec<db::Value>` to bind params positionally (it
-/// implements [`IntoParams`](crate::db::IntoParams)).
-///
-/// Its first clause is the failed-rows rule the Tool Failures clear also applies
-/// to the calls still queued ([`covered_by_tool_error_clear`]): the two are one
-/// rule, stated here in SQL and there over a record.
-#[must_use]
-fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<db::Value>) {
-    let mut clauses = vec!["error_message IS NOT NULL".to_string()];
-    let mut params = Vec::new();
-
-    if let Some(ref search) = query.search {
-        params.push(db::Value::Text(format!("%{search}%")));
-        clauses.push("error_message LIKE ?".to_string());
-    }
-
-    (clauses.join(" AND "), params)
-}
-
-/// Whether a tool call is a row the Tool Failures clear covers — the failed-rows
-/// rule [`build_tool_error_filter`] states in SQL, applied to a call that is still
-/// queued rather than to one already in the store. The two must be changed
-/// together.
-fn covered_by_tool_error_clear(call: &crate::ToolCallRecord) -> bool {
-    call.error_message.is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,49 +549,11 @@ mod tests {
         );
     }
 
-    /// Both states of the sole remaining optional filter (`search`) in
-    /// [`ToolErrorQuery`].
-    ///
-    /// Each case verifies the exact SQL clause string and param values produced
-    /// by [`build_tool_error_filter`].
-    #[test]
-    fn build_tool_error_filter_with_and_without_search() {
-        struct Case {
-            name: &'static str,
-            query: ToolErrorQuery,
-            expected_clause: &'static str,
-            expected_params: Vec<db::Value>,
-        }
-
-        let cases = [
-            Case {
-                name: "no_filters",
-                query: ToolErrorQuery::default(),
-                expected_clause: "error_message IS NOT NULL",
-                expected_params: vec![],
-            },
-            Case {
-                name: "search_only",
-                query: ToolErrorQuery {
-                    search: Some("timeout".to_string()),
-                },
-                expected_clause: "error_message IS NOT NULL AND error_message LIKE ?",
-                expected_params: vec![db::Value::Text("%timeout%".to_string())],
-            },
-        ];
-
-        for case in &cases {
-            let (clause, params) = build_tool_error_filter(&case.query);
-            assert_eq!(clause, case.expected_clause, "case: {}", case.name);
-            assert_eq!(params, case.expected_params, "case: {}", case.name);
-        }
-    }
-
-    /// Integration test: write per-call records via flush_batch, then verify
-    /// they can be read back via query_tool_errors.
-    /// Uses the logs store (the consolidated home of the stats tables).
+    /// Round-trip through [`crate::logs::LogStore::flush_batch`]: the three
+    /// per-call records land as three rows, with the failed call's error text
+    /// stored alongside its success flag.
     #[tokio::test]
-    async fn flush_and_query_round_trip() {
+    async fn flush_batch_round_trip() {
         let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
 
         let records = vec![
@@ -781,7 +580,6 @@ mod tests {
             },
         ];
 
-        // Flush the batch
         store
             .flush_batch(
                 "test-agent",
@@ -794,101 +592,38 @@ mod tests {
             .await
             .expect("flush_batch");
 
-        // Verify query_tool_errors — only the 'write' call failed
-        let (errors, total) = store
-            .query_tool_errors(&ToolErrorQuery::default(), 100, 0)
-            .await
-            .expect("query_tool_errors");
-        assert_eq!(total, 1, "should have 1 error");
-        assert_eq!(errors.len(), 1, "should return 1 entry");
-        assert_eq!(errors[0].tool_name, "write");
-        assert!(errors[0].error_message.contains("permission denied"));
-        assert_eq!(errors[0].duration_ms, 0);
-        assert_eq!(errors[0].arguments, r#"{"path":"src/lib.rs"}"#);
-        assert_eq!(errors[0].role, "Engineer");
-        assert_eq!(errors[0].workspace, "my-workspace");
-
-        // Verify error filtering by search text
-        let query = ToolErrorQuery {
-            search: Some("permission".to_string()),
-        };
-        let (errors, total) = store
-            .query_tool_errors(&query, 100, 0)
-            .await
-            .expect("query_tool_errors with search");
-        assert_eq!(total, 1, "search 'permission' should find 1 error");
-        assert_eq!(errors[0].tool_name, "write");
-
-        let query = ToolErrorQuery {
-            search: Some("timeout".to_string()),
-        };
-        let (_errors, total) = store
-            .query_tool_errors(&query, 100, 0)
-            .await
-            .expect("query_tool_errors with search");
-        assert_eq!(total, 0, "search 'timeout' should find 0 errors");
-    }
-
-    /// The Tool Failures clear deletes exactly the failed rows the tab lists:
-    /// the successful calls — the rows the usage/cost figures are computed
-    /// from — must survive.
-    #[tokio::test]
-    // the clear drives a wipe, which purges the process-global telemetry queue
-    #[serial_test::serial(provider)]
-    async fn clear_tool_errors_keeps_successful_calls() {
-        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let records = vec![
-            crate::ToolCallRecord {
-                tool_name: "read".to_string(),
-                arguments: "{}".to_string(),
-                duration_ms: 1,
-                success: true,
-                error_message: None,
-            },
-            crate::ToolCallRecord {
-                tool_name: "write".to_string(),
-                arguments: "{}".to_string(),
-                duration_ms: 2,
-                success: false,
-                error_message: Some("permission denied".to_string()),
-            },
-            crate::ToolCallRecord {
-                tool_name: "edit".to_string(),
-                arguments: "{}".to_string(),
-                duration_ms: 3,
-                success: false,
-                error_message: Some("no match".to_string()),
-            },
-        ];
-        store
-            .flush_batch(
-                "test-agent",
-                "Engineer",
-                "my-workspace",
-                CallSource::Agent,
-                &crate::db::now(),
-                &records,
-            )
-            .await
-            .expect("flush_batch");
-
-        assert_eq!(store.clear_tool_errors().await.expect("clear"), 2);
-
-        let (errors, total) = store
-            .query_tool_errors(&ToolErrorQuery::default(), 10, 0)
-            .await
-            .expect("query_tool_errors");
-        assert!(errors.is_empty());
-        assert_eq!(total, 0);
-
-        let remaining = store
+        let rows = store
             .conn
-            .query_row("SELECT COUNT(*) FROM tool_calls", (), |row| {
-                row.get::<i64>(0)
-            })
+            .query(
+                "SELECT tool_name, success, error_message FROM tool_calls ORDER BY tool_name",
+                crate::db::params![],
+            )
             .await
-            .expect("count tool_calls");
-        assert_eq!(remaining, 1, "the successful call must survive the clear");
+            .expect("query tool_calls");
+        let rows: Vec<(String, i64, Option<String>)> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String>(0).expect("tool_name"),
+                    row.get::<i64>(1).expect("success"),
+                    row.get::<Option<String>>(2).expect("error_message"),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                ("create_ticket".to_string(), 1, None),
+                ("read".to_string(), 1, None),
+                (
+                    "write".to_string(),
+                    0,
+                    Some("Error executing write: permission denied".to_string())
+                ),
+            ],
+            "every record lands as its own row, the failed one carrying its error text"
+        );
     }
 
     /// `llm_requests` insert round-trip — verifies the schema (including

@@ -213,14 +213,14 @@ impl LogStore {
         Ok(())
     }
 
-    /// Delete stored log records in one Logs tab's scope, returning the number
+    /// Delete stored log records in one Logs view's scope, returning the number
     /// of rows deleted. `level_filter` uses [`LogQuery::level`] syntax; `None`
-    /// means every level (the All Logs tab).
+    /// means every level (the All Logs view).
     ///
-    /// The predicate comes from the same [`build_where_clause`] as the tab's
-    /// listing query and is built from the tab's level filter alone — the tab's
+    /// The predicate comes from the same [`build_where_clause`] as the view's
+    /// listing query and is built from the view's level filter alone — the view's
     /// search text is deliberately never part of it, because the button empties
-    /// the whole tab rather than the searched subset. A warning row the telemetry
+    /// the whole view rather than the searched subset. A warning row the telemetry
     /// queue still holds, at a level this scope covers, goes with it
     /// ([`crate::telemetry::wipe`]) instead of landing behind the wipe.
     ///
@@ -544,7 +544,7 @@ fn level_names(level_filter: &str) -> Vec<String> {
 
 /// Whether a row at `level` is inside a clear scope — the Rust side of the
 /// `level IN (…)` [`build_where_clause`] writes for the same filter, over the same
-/// [`level_names`] list. An empty scope is every level (the All Logs tab).
+/// [`level_names`] list. An empty scope is every level (the All Logs view).
 fn level_in_scope(levels: &[String], level: &str) -> bool {
     levels.is_empty() || levels.iter().any(|covered| covered == level)
 }
@@ -1452,13 +1452,13 @@ mod tests {
         store.insert_batch(entries).await.unwrap();
     }
 
-    /// The per-tab clear scopes: the Issues scope deletes warnings and errors
+    /// The per-view clear scopes: the Issues scope deletes warnings and errors
     /// only, the All Logs scope deletes every stored record (including the ones
     /// the Issues view shows).
     #[tokio::test]
     // the clear drives a wipe, which purges the process-global telemetry queue
     #[serial_test::serial(provider)]
-    async fn clear_logs_scopes_match_the_tabs() {
+    async fn clear_logs_scopes_match_the_views() {
         let (store, _dir) = test_store().await;
         seed_entries(
             &store,

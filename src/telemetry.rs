@@ -564,33 +564,7 @@ mod tests {
         TelemetryRecord::GrepTelemetry(telemetry_row(command))
     }
 
-    /// One session's tool-call batch, from `(tool name, error)` pairs.
-    fn batch_of(calls: &[(&str, Option<&str>)]) -> TelemetryRecord {
-        TelemetryRecord::ToolCalls(ToolCallBatch {
-            source: CallSource::Agent,
-            agent_id: MARKER.to_string(),
-            role: "Engineer".to_string(),
-            workspace: "/tmp/ws".to_string(),
-            recorded_at: crate::db::now(),
-            records: calls
-                .iter()
-                .map(|(name, error)| crate::ToolCallRecord {
-                    tool_name: (*name).to_string(),
-                    arguments: "{}".to_string(),
-                    duration_ms: 1,
-                    success: error.is_none(),
-                    error_message: error.map(str::to_string),
-                })
-                .collect(),
-        })
-    }
-
-    /// One failed call of one session's tool-call batch.
-    fn tool_call(name: &str, error: Option<&str>) -> TelemetryRecord {
-        batch_of(&[(name, error)])
-    }
-
-    /// A log row the Logs tabs can cover, at `level`, naming `message`.
+    /// A log row the Logs views' clear can cover, at `level`, naming `message`.
     fn log_row(level: &str, message: &str) -> TelemetryRecord {
         TelemetryRecord::StrayEvent(LogEntry {
             timestamp: crate::db::now(),
@@ -812,54 +786,7 @@ mod tests {
         );
     }
 
-    /// A wipe leaves nothing of its class behind: what the store held is deleted,
-    /// and what was still queued when the wipe ran is never written — while a
-    /// record the wipe only partly covers keeps the rows the delete leaves.
-    #[tokio::test]
-    #[serial_test::serial(provider)] // the telemetry store seam is process-global
-    async fn a_wipe_leaves_no_queued_record_of_its_class_behind() {
-        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let _seam = crate::util::test::install_test_log_store(store.clone());
-
-        // One failed call already written: the wipe must remove it.
-        enqueue(tool_call("read", Some("permission denied")));
-        drain_for_test().await;
-        // A successful call: the Tool Failures wipe does not cover it.
-        enqueue(tool_call("edit", None));
-        // One batch holding both a covered and an uncovered call: the wipe takes
-        // the failed call and leaves the successful one to land.
-        enqueue(batch_of(&[
-            ("write", Some("no space left")),
-            ("glob", None),
-        ]));
-        // Two more failed calls, still queued when the wipe runs.
-        enqueue(tool_call("bash", Some("timed out")));
-
-        let deleted = store.clear_tool_errors().await.expect("wipe failed calls");
-        assert!(deleted >= 1, "the written failed call is there to delete");
-
-        drain_for_test().await;
-        let rows = store
-            .conn
-            .query(
-                "SELECT tool_name FROM tool_calls WHERE agent_id = ?1 ORDER BY tool_name",
-                params![MARKER],
-            )
-            .await
-            .expect("read the remaining calls");
-        let names: Vec<String> = rows
-            .iter()
-            .map(|row| row.get::<String>(0).unwrap())
-            .collect();
-        assert_eq!(
-            names,
-            ["edit", "glob"],
-            "the queued failed calls must not land after the wipe, and the \
-             successful ones must still land"
-        );
-    }
-
-    /// The Logs tabs' clear covers the warning rows the same way: what its scope
+    /// The Logs views' clear covers the warning rows the same way: what its scope
     /// reaches never lands after it, and what the scope leaves still does — the
     /// queued-record side of the delete's own `level IN (…)`.
     #[tokio::test]

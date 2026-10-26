@@ -38,7 +38,6 @@ pub(crate) mod shortcut_keys;
 pub(crate) mod spinner;
 pub(crate) mod text_rendering;
 pub(crate) mod theme;
-pub(crate) mod tool_failures;
 pub(crate) mod users;
 pub(crate) mod widgets;
 pub(crate) mod workspaces;
