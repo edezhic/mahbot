@@ -1299,11 +1299,6 @@ impl Dashboard {
     /// Process a Settings message, optionally reloading the workspace map when
     /// workspaces are added or deleted.
     fn process_settings_message(&mut self, msg: settings::SettingsMessage) -> Task<Message> {
-        // Activation is the Dashboard's own write and feedback, never the
-        // Settings state's (see `activate_workspace`).
-        if let settings::SettingsMessage::ActivateWorkspace(name) = msg {
-            return self.activate_workspace(&name);
-        }
         // Adding activates the new workspace on every path (the `workspace`
         // tool's own `add` does the same). The row is seeded into the workspace map
         // so the picker renders it at once and the activation's own map-guard
@@ -2076,10 +2071,10 @@ impl Dashboard {
         self.propagate_workspace_selection(name)
     }
 
-    /// The one workspace-switch path, shared by the footer picker, the Settings
-    /// projects list and the Settings add form: apply `name` in memory — so a
-    /// completion landing after a newer pick can never revert it — and persist it
-    /// through a [`Self::selection_persistable`]-guarded write.
+    /// The one workspace-switch path, shared by the footer picker and the
+    /// Settings add form: apply `name` in memory — so a completion landing after
+    /// a newer pick can never revert it — and persist it through a
+    /// [`Self::selection_persistable`]-guarded write.
     fn switch_workspace(
         &mut self,
         name: &str,
@@ -2134,18 +2129,10 @@ impl Dashboard {
         self.switch_workspace(name, |_| Message::Nop)
     }
 
-    /// Make a workspace the active one from the Settings side — the projects
-    /// list's make-active action and the add form's automatic activation. Same
-    /// switch path as the picker, but the Settings section's own feedback: the
-    /// no-op of asking for the workspace that is already active, and a failed
-    /// write reported rather than only logged.
+    /// Make a just-added workspace the active one from the Settings add form —
+    /// the same switch path as the picker, with the Settings section's own
+    /// feedback so a failed write is reported rather than only logged.
     fn activate_workspace(&mut self, name: &str) -> Task<Message> {
-        if self.active_workspace_name_ref() == Some(name) {
-            // Reported through the same toast vocabulary as every other
-            // activation outcome (see `activation_toast`).
-            let already = ToastMessage::Warning(format!("Workspace '{name}' is already active."));
-            return self.push_toast_msg(&already);
-        }
         self.switch_workspace(name, Self::activation_feedback)
     }
 
@@ -2159,10 +2146,8 @@ impl Dashboard {
         ))
     }
 
-    /// What the Settings project list reports for a completed activation write:
-    /// the write's success, or its failure. The already-active no-op is not a
-    /// write and so is not one of these outcomes —
-    /// [`Self::activate_workspace`] reports it itself, as a warning.
+    /// What the Settings list reports for the add form's activation write: the
+    /// write's success, or its failure.
     fn activation_toast(outcome: Result<String, String>) -> ToastMessage {
         match outcome {
             Ok(name) => ToastMessage::SuccessMsg(format!("Active workspace: {name}")),
@@ -2437,12 +2422,10 @@ impl Dashboard {
                     unresolved_workspace_page(Page::Editor)
                 }
             }
-            Page::Settings => {
-                let active = self.active_workspace_name_ref();
-                self.settings_state
-                    .view(self.workspaces_error.as_deref(), active)
-                    .map(Message::Settings)
-            }
+            Page::Settings => self
+                .settings_state
+                .view(self.workspaces_error.as_deref())
+                .map(Message::Settings),
             Page::RunningAgents => running::view(
                 &self.workspaces,
                 self.pending_stop.as_ref(),
@@ -3309,13 +3292,11 @@ impl Dashboard {
     }
 
     /// Footer workspace picker: managed workspaces only, persists via
-    /// [`Self::select_workspace`]. With a single managed workspace the
-    /// dropdown degrades to a static label (that workspace's display name,
-    /// or the "Select workspace" placeholder when nothing is selected —
-    /// including a Personal/unset selection). When a failed workspace-map read
-    /// leaves nothing to pick, a static, non-selectable "Workspaces
-    /// unavailable" pill replaces it in the same footprint. Returns `None` for
-    /// the zero-managed-workspaces state.
+    /// [`Self::select_workspace`]. It is the only way a project becomes active,
+    /// so it is offered even when a single managed workspace exists. When a
+    /// failed workspace-map read leaves nothing to pick, a static,
+    /// non-selectable "Workspaces unavailable" pill replaces it in the same
+    /// footprint. Returns `None` for the zero-managed-workspaces state.
     fn render_workspace_picker(&self) -> Option<Element<'_, Message>> {
         // Nothing left to pick: the failed read renders a static, non-selectable
         // failure pill in the picker's footprint. The error text lives only in
@@ -3338,24 +3319,6 @@ impl Dashboard {
             // No managed workspaces exist — an inert placeholder dropdown would
             // suggest a choice that isn't there; hide the picker instead.
             return None;
-        }
-        if options.len() == 1 {
-            // A one-option dropdown offers no choice; render the sole
-            // workspace as a static label (140px, matching the dropdown's
-            // footprint so the footer chrome doesn't shift).
-            let sole = &options[0];
-            let label = if self.active_workspace_name_ref() == Some(sole.value.as_str()) {
-                sole.label.clone()
-            } else {
-                "Select workspace".to_string()
-            };
-            return Some(widgets::tooltip_hint(
-                container(text(label).size(theme::TEXT_14).color(theme::TEXT_PRIMARY))
-                    .width(Length::Fixed(140.0))
-                    .padding([theme::PAD_4, theme::PAD_8])
-                    .style(theme::pill_style(theme::BG_ELEVATED)),
-                "Active workspace",
-            ));
         }
         // Guard the displayed selection: a dangling persisted value (the
         // workspace vanished from the map) renders no highlight; a personal
@@ -4625,12 +4588,11 @@ mod tests {
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
     }
 
-    /// The Settings activation: asking for the workspace that is already active
-    /// changes nothing and says so, and any other pick applies in memory at once
-    /// — superseding any in-flight read-back — while a name the loaded map does
-    /// not carry still applies but is not persisted.
+    /// The add form's activation: a pick applies in memory at once — superseding
+    /// any in-flight read-back — while a name the loaded map does not carry still
+    /// applies but is not persisted.
     #[test]
-    fn activate_workspace_applies_at_once_and_no_ops_the_active_one() {
+    fn activate_workspace_applies_at_once_and_skips_a_name_the_map_lacks() {
         let mut dash = ready_dashboard();
         dash.workspaces = HashMap::from([
             ("ws1".to_string(), ws("ws1")),
@@ -4639,20 +4601,6 @@ mod tests {
         dash.selected_workspace_name = Some("ws1".to_string());
 
         let generation = dash.active_workspace_gen;
-        let _ = dash.activate_workspace("ws1");
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-        assert_eq!(
-            dash.active_workspace_gen, generation,
-            "the already-active no-op must not supersede anything"
-        );
-        assert!(
-            dash.toasts
-                .last()
-                .is_some_and(|t| t.message.contains("already active")),
-            "the no-op must say so: {:?}",
-            dash.toasts
-        );
-
         let _ = dash.activate_workspace("ws2");
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws2"));
         assert_eq!(dash.active_workspace_gen, generation + 1);

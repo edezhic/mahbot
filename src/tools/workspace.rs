@@ -3,8 +3,8 @@
 //! single ticket, and leave a clarification note on a ticket.
 //!
 //! It manages no board. Adding a managed workspace is the only write here that
-//! can change the desktop's active workspace; the desktop's own project list is
-//! the other surface that selects one.
+//! can change the desktop's active workspace; choosing a project in the
+//! desktop's footer workspace switcher is the other surface that selects one.
 use anyhow::anyhow;
 use async_trait::async_trait;
 use serde_json::json;
@@ -305,7 +305,8 @@ async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<ToolAnswer> {
         ))),
         Err(e) => Ok(ToolAnswer::partial(format!(
             "Added managed workspace '{name}' at {path}, but making it your active workspace \
-             failed: {e} — activate it from the desktop's own workspace list."
+             failed: {e} — make it active again by choosing it in the workspace switcher at the \
+             bottom of the desktop window."
         ))),
     }
 }
