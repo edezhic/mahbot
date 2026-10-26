@@ -364,6 +364,7 @@ impl MessageContext {
             update_date: self.update_date,
             forwarded: self.forwarded,
             update_ids: Vec::new(),
+            dictated: false,
         }
     }
 

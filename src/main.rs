@@ -922,6 +922,9 @@ fn main() -> Result<()> {
     // The runtime-change broadcast (agent registry / transcript / voice status)
     // must have a source before the iced app runs, same convention.
     mahbot::gui::init_runtime_event_tx();
+    // The voice-recording broadcast the Home composer subscribes to, so a
+    // recording's transcript has somewhere to land (same convention).
+    mahbot::gui::init_recording_tx();
 
     // The icon on the surfaces the window itself does not carry.
     mahbot::app_icon::install_desktop_integration();
@@ -1491,12 +1494,18 @@ async fn process_channel_message(msg: ChannelMessage) {
     // enrichment rewrites the content.
     let mut originals = Vec::with_capacity(parts.len());
     for part in &parts {
-        tracing::info!(
-            "💬 [{}] from {}: {}",
-            part.channel,
-            part.user_name,
-            mahbot::util::truncate(&part.content, 80)
-        );
+        // A dictated message is named without its content: the transcript is
+        // not written to the logs.
+        if part.dictated {
+            tracing::info!("💬 [{}] from {}: (dictated)", part.channel, part.user_name);
+        } else {
+            tracing::info!(
+                "💬 [{}] from {}: {}",
+                part.channel,
+                part.user_name,
+                mahbot::util::truncate(&part.content, 80)
+            );
+        }
         originals.push(part.content.clone());
     }
 

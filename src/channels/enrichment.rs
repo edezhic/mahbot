@@ -69,9 +69,9 @@ const AUDIO_ICON: &str = "🔊✍️";
 
 /// A transcribed message as it is presented: the audio icon combo, one space,
 /// then the text. The one definition of the marker's form — an inbound audio
-/// attachment and a locally recorded voice note (`audio::voice::route_to_agent`)
-/// both go through it, so a spoken message reads the same however it reached
-/// the product.
+/// attachment and a voice recording (`audio::voice`, whose transcript the Home
+/// composer sends as the leading part of its message) both go through it, so a
+/// spoken message reads the same however it reached the product.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn marked_transcript(text: &str) -> String {
@@ -1261,6 +1261,7 @@ mod tests {
             update_date: None,
             forwarded: false,
             update_ids: Vec::new(),
+            dictated: false,
         }
     }
 

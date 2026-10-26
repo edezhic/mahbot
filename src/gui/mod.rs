@@ -153,6 +153,15 @@ pub fn init_runtime_event_tx() {
     crate::runtime_events::init_runtime_event_tx();
 }
 
+/// Warm the voice-recording broadcast before the iced application runs (same
+/// convention as [`init_board_change_tx`]) so the Home composer's recording
+/// subscription always has a source. Called from `main`; nothing to warm on a
+/// platform with no voice stack.
+pub fn init_recording_tx() {
+    #[cfg(target_os = "macos")]
+    crate::audio::voice::init_recording_tx();
+}
+
 // ── Navigation pages ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3780,7 +3789,7 @@ impl Dashboard {
             VoiceStatus::LoadingModels => "🔊 Loading…".into(),
             VoiceStatus::ModelError => "🔊 ⚠ Model error".into(),
             VoiceStatus::Listening => "🔊 Listening".into(),
-            VoiceStatus::Recording | VoiceStatus::RecordingManual => "🔊 Recording…".into(),
+            VoiceStatus::RecordingWakeWord | VoiceStatus::RecordingButton => "🔊 Recording…".into(),
             VoiceStatus::Transcribing => "🔊 Transcribing…".into(),
             VoiceStatus::MicPermissionDenied => "🔊 No mic access".into(),
             VoiceStatus::MicDisconnected => "🔊 Mic disconnected".into(),

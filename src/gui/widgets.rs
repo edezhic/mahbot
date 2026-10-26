@@ -716,8 +716,9 @@ pub struct ChatComposerOptions<'a, M> {
     /// composer).
     pub controls: Vec<Element<'a, M>>,
     /// Grey the send button while the surface has nothing to send. Home passes
-    /// `attachments.is_empty()`, since an attachment sends on its own; Board
-    /// keeps its legacy always-active look.
+    /// whether the field is empty of attachments and idle — an attachment or a
+    /// running recording sends on its own; Board keeps its legacy always-active
+    /// look.
     pub grey_on_empty: bool,
     /// Tooltip text for the send button — surface-specific wording
     /// ("send text message" on Home, "send comment" on the Board ticket
@@ -779,7 +780,7 @@ pub fn chat_composer<'a, M: Clone + 'a>(
     let send_disabled =
         options.sending || (options.grey_on_empty && content.text().trim().is_empty());
     let send_btn = icon_tooltip_button(
-        lucide::send::<iced::Theme, iced::Renderer>()
+        lucide::send_horizontal::<iced::Theme, iced::Renderer>()
             .size(theme::TEXT_14)
             .color(if send_disabled {
                 theme::TEXT_MUTED

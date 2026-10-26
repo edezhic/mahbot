@@ -1254,7 +1254,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     // Guard: warm-up audio should not trigger a false detection.  If it does,
     // restore the pre-warm-up state so cooldown doesn't suppress all subsequent
     // benchmark measurements.  We must also
-    // reset `is_recording` because detection sets it to `true`, which would
+    // reset `recording` because detection starts one, which would
     // suppress scoring for the entire benchmark variant.
     if ctx.last_wake_word_detection != before_detection {
         warn!(
@@ -1262,7 +1262,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
              state to prevent cooldown corruption.",
         );
         ctx.last_wake_word_detection = before_detection;
-        ctx.is_recording = false;
+        ctx.recording = None;
     }
 
     // ── Clear warm-up residues before test utterance processing ──
@@ -2017,7 +2017,7 @@ fn faph_download_file(
 /// 3 s it represents, structurally
 /// under-counting.  The bench therefore observes the RAW event stream by
 /// re-arming after each event exactly like production's post-command reset
-/// (`reset_pipeline_state(Soft)` + `is_recording = false`) AND clearing the
+/// (`reset_pipeline_state(Soft)` + `recording = None`) AND clearing the
 /// cooldown timestamp (bench-side emulation — production's gate is NOT
 /// modified).  The caller applies production's 3 s cooldown as an
 /// audio-position merge ([`faph_merge_events`]) for the
@@ -2041,7 +2041,7 @@ fn faph_feed_file_continuous(
             // raw event stream; the 3 s cooldown is applied as an
             // audio-position merge by the caller.
             ctx.reset_pipeline_state(super::ResetLevel::Soft);
-            ctx.is_recording = false;
+            ctx.recording = None;
             ctx.last_wake_word_detection = None;
         }
         *audio_pos += chunk.len() as f64 / f64::from(super::SAMPLE_RATE);

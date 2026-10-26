@@ -722,16 +722,17 @@ impl SingleLineEditorState {
 /// Which page's send rules apply, beyond the shared length limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendRules {
-    /// The chat composer: an attachment alone is a message, and an in-flight
-    /// send is refused before the length limit is reported.
-    Chat { has_attachments: bool },
+    /// The chat composer: the field is content even with no text (an attachment,
+    /// or a recording that the send stops), and an in-flight send is refused
+    /// before the length limit is reported.
+    Chat { has_content: bool },
     /// The board comment box: text is required, and the length limit is
     /// reported before an in-flight send.
     Board,
 }
 
 /// Guard a chat send: a silent noop for empty text (unless the chat composer
-/// has something attached), then the page's own pair of checks. Returns the
+/// holds content of its own), then the page's own pair of checks. Returns the
 /// trimmed text when the send may proceed.
 pub(crate) fn send_guard<M: 'static>(
     text: &str,
@@ -740,12 +741,7 @@ pub(crate) fn send_guard<M: 'static>(
     over_limit: impl Fn(usize) -> Task<M>,
 ) -> Result<&str, Task<M>> {
     let trimmed = text.trim();
-    let allows_empty = matches!(
-        rules,
-        SendRules::Chat {
-            has_attachments: true
-        }
-    );
+    let allows_empty = matches!(rules, SendRules::Chat { has_content: true });
     if trimmed.is_empty() && !allows_empty {
         return Err(Task::none());
     }
@@ -877,13 +873,7 @@ mod tests {
         assert!(result.is_err() && !fired, "empty input is a silent noop");
         let (_, result) = run_guard("  hello  ", false, SendRules::Board);
         assert_eq!(result.unwrap(), "hello");
-        let (_, result) = run_guard(
-            "  ",
-            false,
-            SendRules::Chat {
-                has_attachments: true,
-            },
-        );
+        let (_, result) = run_guard("  ", false, SendRules::Chat { has_content: true });
         assert_eq!(
             result.expect("attachment-only send"),
             "",
@@ -904,13 +894,7 @@ mod tests {
     #[test]
     fn send_guard_combined_in_flight_and_over_limit() {
         let text = "a".repeat(MAX_INPUT_CHARS + 1);
-        let (fired, result) = run_guard(
-            &text,
-            true,
-            SendRules::Chat {
-                has_attachments: false,
-            },
-        );
+        let (fired, result) = run_guard(&text, true, SendRules::Chat { has_content: false });
         assert!(result.is_err() && !fired, "in-flight first: silent noop");
         let (fired, result) = run_guard(&text, true, SendRules::Board);
         assert!(result.is_err() && fired, "toast fires over-limit first");

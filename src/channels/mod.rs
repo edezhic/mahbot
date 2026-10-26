@@ -357,8 +357,9 @@ impl Channel for GuiChannel {
 /// used by [`GuiChannel`].
 ///
 /// The voice pipeline runs its own mic-capture loop independently;
-/// `listen()` is a no-op because incoming voice commands flow through
-/// `crate::audio::voice::route_to_agent`, not through a channel listener.
+/// `listen()` is a no-op because a recording's transcript never arrives through
+/// a channel listener: it joins the Home composer's message, which is delivered
+/// on the GUI channel like any typed one.
 #[cfg(target_os = "macos")]
 struct VoiceChannel;
 

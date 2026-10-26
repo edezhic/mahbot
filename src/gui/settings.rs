@@ -2275,7 +2275,7 @@ impl SettingsState {
                         // binding as `id <digits>`), then the unbind control.
                         let display = crate::users::settings_binding_label(&binding.identifier);
                         row![
-                            lucide::send::<iced::Theme, iced::Renderer>()
+                            lucide::send_horizontal::<iced::Theme, iced::Renderer>()
                                 .size(theme::TEXT_11)
                                 .color(theme::TEXT_MUTED),
                             Space::new().width(theme::SPACE_6),
@@ -3570,8 +3570,10 @@ impl SettingsState {
                 crate::audio::voice::VoiceStatus::Listening => {
                     status_label("Listening for wake word")
                 }
-                crate::audio::voice::VoiceStatus::Recording => status_label("Recording command"),
-                crate::audio::voice::VoiceStatus::RecordingManual => {
+                crate::audio::voice::VoiceStatus::RecordingWakeWord => {
+                    status_label("Recording command")
+                }
+                crate::audio::voice::VoiceStatus::RecordingButton => {
                     status_label("Recording voice message")
                 }
                 crate::audio::voice::VoiceStatus::Transcribing => status_label("Transcribing…"),

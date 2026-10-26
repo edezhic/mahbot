@@ -22,16 +22,18 @@
 //!    the phrase is still being spoken at the fire); an activation whose
 //!    retained audio holds no speech delivers nothing at all.  Two short cue
 //!    sounds (see [`crate::audio::cue`]) mark the start and the end of the
-//!    recording.
+//!    recording.  The composer's mic button starts a recording of its own
+//!    ([`RecordingOrigin::Button`]): same mechanism, same message — it just has
+//!    no silence end and no cues.
 //! 6. **Transcription** — via the shared Qwen3-ASR local transcriber
-//! 7. **Routing** — the transcribed text is marked with the audio-icon combo and
-//!    routed to the admin's Assistant via [`route_to_agent`] (the desktop GUI
-//!    has a single acting identity, the seeded admin account).
+//! 7. **Delivery** — the transcribed text is marked with the audio-icon combo
+//!    and published on [`RECORDING`]. The Home composer owns the message it
+//!    becomes, whichever way the recording started: it sends the transcript as
+//!    one message together with whatever the field holds, through the ordinary
+//!    desktop send path.
 //!
 //! The pipeline runs unconditionally as a boot background task. It does NOT
 //! use an LLM agent loop.
-//! Transcribed commands are routed to the admin's Assistant (resolved via
-//! [`route_to_agent`]) as if the admin typed them.
 //!
 //! # Model sharing
 //!
@@ -77,10 +79,9 @@ use crate::util::model_state::ModelState;
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 // ── E2E integration test (voice-tests feature) ──────────────────────────
@@ -553,12 +554,6 @@ const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
 /// Created once in [`init_global`].
 static VAD_DETECTOR: OnceLock<std::sync::Mutex<earshot::Detector>> = OnceLock::new();
 
-/// Mirrors [`PipelineCtx::manual_recording`] for GUI access — the flag stays
-/// set through the manual transcription window, letting the Home composer
-/// distinguish a mic-button ASR from a wake-word one (both share
-/// [`VoiceStatus::Transcribing`]).
-static MANUAL_RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
-
 /// Check whether wake word detection is ready for inference.
 ///
 /// Wake word detection shares the Qwen3-ASR transcriber model, so "models
@@ -571,11 +566,10 @@ fn models_ready() -> bool {
 /// Whether local audio transcription is disabled by config
 /// (`audio_transcription_use_local == "false"`).
 ///
-/// The voice pipeline (wake word AND mic-button recording) shares the local
-/// ASR transcriber, and with transcription disabled nothing loads it (the boot
-/// path no longer preloads it either), so the whole voice stack is unavailable
-/// — callers must surface the configuration rather than a loading state that
-/// can never complete.
+/// The voice pipeline shares the local ASR transcriber, and with transcription
+/// disabled nothing loads it (the boot path no longer preloads it either), so
+/// the whole voice stack is unavailable — callers must surface the configuration
+/// rather than a loading state that can never complete.
 #[must_use]
 pub fn is_transcription_disabled() -> bool {
     crate::config::CONFIG
@@ -616,7 +610,7 @@ fn current_model_status() -> VoiceStatus {
 }
 
 /// Demand the shared ASR model for work that needs it to listen — a wake-word
-/// start or a mic-button recording — and report the load it starts. Nothing
+/// start or a button recording — and report the load it starts. Nothing
 /// preloads the model at boot, so a voice-path demand is the first use; the
 /// resolved status is [`VoiceStatus::Disabled`] while nothing is in flight, so
 /// without this report the footer would show nothing at all during that first
@@ -637,10 +631,13 @@ pub enum VoiceStatus {
     LoadingModels,
     ModelError,
     Listening,
-    Recording,
-    /// Mic-button-initiated recording from the Home composer. Wake-word
-    /// listening is paused while this is active.
-    RecordingManual,
+    /// A recording the wake word started: it ends itself on silence, and the
+    /// composer's controls end it too.
+    RecordingWakeWord,
+    /// A recording started from the Home composer's mic button: the same
+    /// mechanism, without a silence end. Wake-word listening is paused while it
+    /// is active.
+    RecordingButton,
     Transcribing,
     MicPermissionDenied,
     /// The microphone became unavailable while voice was in use.  Voice stops
@@ -811,13 +808,14 @@ pub enum VoiceCommand {
     /// Retry loading the shared Qwen3-ASR transcriber model after a terminal
     /// failure (the wake-word pipeline has no model machinery of its own).
     RetryModelLoading,
-    /// Start a mic-button-initiated voice message recording (Home composer).
-    /// Pauses wake-word listening for the duration of the recording.
+    /// Start a voice recording from the Home composer's mic button. Pauses
+    /// wake-word listening for the duration of the recording.
     StartRecording,
-    /// Stop the mic-button recording, transcribe it, and route the
-    /// transcript to the admin's Assistant.
+    /// Stop the recording in progress — whichever way it started — and
+    /// transcribe it; the transcript is published on [`RECORDING`] for the
+    /// composer to send as one message with its own content.
     StopRecordingSend,
-    /// Stop the mic-button recording and discard the captured audio.
+    /// Stop the recording in progress and discard the captured audio.
     StopRecordingDiscard,
     /// Voice-relevant config changed externally (e.g. the Settings
     /// transcription toggle). Used to wake the pipeline loop when the periodic
@@ -858,34 +856,123 @@ pub fn get_status() -> VoiceStatus {
     voice_state().read().unwrap_poison().status.clone()
 }
 
-/// Whether a mic-button (manual) recording is active — including its
-/// transcription window, where the shared [`VoiceStatus::Transcribing`] is
-/// ambiguous between the manual and wake-word paths.
-#[must_use]
-pub fn is_manual_recording() -> bool {
-    MANUAL_RECORDING_ACTIVE.load(Ordering::Relaxed)
+/// How the recording in progress started. Both kinds share one mechanism — the
+/// same message-row controls, the same single message — and differ only in how
+/// they can end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingOrigin {
+    /// Started from the composer's mic button; only the composer's controls end
+    /// it.
+    Button,
+    /// Started by the wake word; it also ends itself on silence, and the
+    /// composer's controls end it like any other.
+    WakeWord,
+}
+
+/// Progress of a voice recording, delivered to the Home composer: whichever way
+/// a recording started, the composer owns the message it becomes, from the
+/// start until this resolves it.
+#[derive(Debug, Clone)]
+pub enum RecordingEvent {
+    /// A wake-word recording began: the field belongs to the message it will
+    /// become. A button recording needs no event — the press that starts it
+    /// opens the window itself. The composer drops a recording that starts while
+    /// an earlier message is still committed: the two never share one window.
+    Started,
+    /// Recording stopped and transcription is starting: the composer takes the
+    /// field's content now, and the message is in flight until the transcript
+    /// joins it.
+    Stopped,
+    /// The transcript, already carrying the spoken marker.
+    Transcript(String),
+    /// The recording held no speech.
+    NoSpeech,
+    /// The recording produced no message. The notice says why, and a composer
+    /// holding a committed message gives the field back.
+    Failed(&'static str),
+    /// Nothing was recorded — the microphone could not be opened, transcription
+    /// is unavailable: the composer's window closes, and a message a press
+    /// already committed goes out with the field's own content, the caller
+    /// having reported the reason.
+    NotStarted,
+}
+
+/// Broadcast of voice-recording progress. Warmed from `main` before the iced
+/// application runs (same convention as the other GUI broadcast senders): an
+/// uninitialized sender would end the composer's subscription on its first poll.
+pub(crate) static RECORDING: OnceLock<broadcast::Sender<RecordingEvent>> = OnceLock::new();
+
+/// Initialise the voice-recording broadcast (see [`RECORDING`]).
+pub(crate) fn init_recording_tx() {
+    RECORDING.get_or_init(|| broadcast::channel(16).0);
+}
+
+/// Publish recording progress to the composer. Best-effort: a no-op when the
+/// channel is not initialised (tests, headless runs).
+fn publish_recording(event: RecordingEvent) {
+    if let Some(tx) = RECORDING.get() {
+        let _ = tx.send(event);
+    }
+}
+
+/// Broadcast a composer-facing voice notice in the admin's conversation — the
+/// persisted agent-direction notice the pipeline's own failures use.
+pub(crate) async fn broadcast_notice(message: &str) {
+    let user_name = crate::users::ADMIN_USER_NAME;
+    let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
+    // Assistant conversations live in the admin's personal workspace.
+    let ws = crate::users::effective_workspace_for_role(crate::Role::Assistant, ws, user_name);
+    crate::channels::broadcast_and_persist_agent_response(
+        user_name,
+        "voice",
+        message,
+        "voice".to_string(),
+        &ws.name,
+        None,
+    )
+    .await;
 }
 
 /// Notice for the [`VoiceStatus::MicPermissionDenied`] state: the microphone
 /// cannot be used, and the fix is on the user's side.
 const MIC_PERMISSION_NOTICE: &str = "Microphone permission denied — enable mic access to record";
 
-/// Best-effort reason a mic-button recording cannot start right now
+/// Notice the composer reports when a recording held no speech and the field
+/// had nothing to send either.
+pub(crate) const NO_SPEECH_NOTICE: &str = "*Voice: no speech detected — recording discarded*";
+
+/// Notice the composer reports when a recording's transcript cannot be sent
+/// because the message it belonged to never went out: the words exist only in
+/// that one message, so they cannot be recovered.
+pub(crate) const VOICE_UNSENT_NOTICE: &str =
+    "*Voice: the voice part was not sent and cannot be restored*";
+
+/// Notice the composer reports when a recording's transcription fails.
+pub(crate) const TRANSCRIPTION_FAILED_NOTICE: &str =
+    "*Voice: transcription failed — the voice part was not sent and cannot be restored*";
+
+/// Window in which at most one voice notice of a class reaches the conversation.
+/// Each side keeps its own memory of the last one — the pipeline one, the
+/// composer one per class — and this is the interval they all use, so a rapid
+/// repeat cannot become a stream.
+pub(crate) const NOTICE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Best-effort reason a voice recording cannot start right now
 /// (None = allowed). Mirrors the field-based guards in
-/// [`PipelineCtx::handle_start_manual_recording`] for the GUI's pre-flight
+/// [`PipelineCtx::handle_start_button_recording`] for the GUI's pre-flight
 /// toast; the pipeline remains the authoritative check and this mapping can
 /// drift on transient transitions.  The transcription-disabled configuration
 /// is permanent rather than transient, so it is checked here directly.
 #[must_use]
-pub fn manual_recording_blocked_reason() -> Option<&'static str> {
+pub fn recording_blocked_reason() -> Option<&'static str> {
     // Local transcription disabled ⇒ the shared ASR model never loads, so a
-    // mic-button recording can never start.  Surface the configuration
-    // rather than a loading state that can never complete.
+    // recording can never start.  Surface the configuration rather than a
+    // loading state that can never complete.
     if is_transcription_disabled() {
         return Some("Voice recording unavailable — local transcription is disabled");
     }
     match get_status() {
-        VoiceStatus::Recording | VoiceStatus::Transcribing => {
+        VoiceStatus::RecordingWakeWord | VoiceStatus::Transcribing => {
             Some("A voice message is already being processed")
         }
         VoiceStatus::Enrolling { .. }
@@ -940,12 +1027,30 @@ fn set_enrollment(enrollment: WakeWordEnrollment) {
     state.enrollment = Some(enrollment);
 }
 
-pub fn send_command(cmd: VoiceCommand) {
-    if let Some(tx) = &voice_state().read().unwrap_poison().cmd_tx {
-        let _ = tx.send(cmd);
-    } else {
+/// Queue a command for the voice pipeline, returning whether one is running to
+/// take it. A no-op before the pipeline is initialised — the GUI's controls exist
+/// before it starts, and a press there must not panic.
+pub fn send_command(cmd: VoiceCommand) -> bool {
+    let Some(state) = VOICE_PIPELINE.get() else {
         warn!("Voice pipeline not initialized — dropping command {cmd:?}");
-    }
+        return false;
+    };
+    let Some(tx) = state.read().unwrap_poison().cmd_tx.clone() else {
+        warn!("Voice pipeline not running — dropping command {cmd:?}");
+        return false;
+    };
+    tx.send(cmd).is_ok()
+}
+
+/// Test seam: stand in for a running pipeline's command receiver, so
+/// [`send_command`] reports its commands taken. The receiver keeps them accepted
+/// for as long as the caller holds it.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn install_test_command_receiver() -> mpsc::UnboundedReceiver<VoiceCommand> {
+    let _ = init_global();
+    let (tx, rx) = mpsc::unbounded_channel();
+    voice_state().write().unwrap_poison().cmd_tx = Some(tx);
+    rx
 }
 
 // ── Voice VAD (Earshot) ─────────────────────────────────────────────────
@@ -1667,60 +1772,6 @@ fn segment_utterances_by_vad(
     utterances
 }
 
-// ── Voice command routing ────────────────────────────────────────────────
-
-async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace: &str) {
-    // Broadcast, persist, and mirror through the canonical incoming-message
-    // pipeline — exactly the GUI text path — so the transcription reaches
-    // Telegram with the same bindings and format. Voice is a strictly local
-    // source, so the mirror cannot echo (see `mirror_gui_message_to_telegram`).
-    // Callers always pass a non-empty user name — the "no empty user" invariant.
-    let msg = crate::ChannelMessage {
-        user_name: user_name.to_string(),
-        content: transcript.to_string(),
-        channel: "voice".to_string(),
-        workspace: workspace.to_string(),
-        ..Default::default()
-    };
-    crate::channels::broadcast_and_persist_incoming_message(&msg, transcript, transcript).await;
-}
-
-/// Route a transcribed voice command to the admin's Assistant, marking the
-/// transcript with the audio-icon combo before it is broadcast and routed, so
-/// the owner and the Assistant read the same text.
-///
-/// The desktop GUI has a single acting identity — the seeded admin — so the
-/// transcript goes to the admin's Assistant session and workspace, then through
-/// the agent-ID message router. Assistant pinning happens here, before the
-/// broadcast, so the transcript is announced in the workspace the agent
-/// actually runs in.
-async fn route_to_agent(transcript: String) {
-    let transcript = crate::channels::marked_transcript(&transcript);
-    let user_name = crate::users::ADMIN_USER_NAME;
-    let role = crate::Role::Assistant;
-    let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
-    let ws = crate::users::effective_workspace_for_role(role, ws, user_name);
-
-    info!(
-        "Voice command -> {role} (user: {user_name}, workspace: {})",
-        ws.name
-    );
-
-    // Broadcast before routing so the transcript appears immediately
-    // while the agent is still working.
-    broadcast_voice_transcript(&transcript, user_name, &ws.name).await;
-
-    crate::agent::message_router::route_user_message(
-        transcript,
-        ws.name,
-        user_name.to_string(),
-        "voice".to_string(),
-        role,
-        None,
-    )
-    .await;
-}
-
 // Voice pipeline background task
 
 // Adaptive threshold state
@@ -1929,6 +1980,17 @@ impl DetectionInstrumentation {
     }
 }
 
+/// What an attempt to start a recording did.
+enum StartAttempt {
+    /// The recording is running.
+    Started,
+    /// A recording was already running and owns the composer's field: nothing is
+    /// reported, so its message is not closed by this press.
+    AlreadyRecording,
+    /// Nothing is recording. The notice, when there is one, says why.
+    Refused(Option<&'static str>),
+}
+
 /// Runtime state for the voice pipeline main loop.
 #[expect(clippy::struct_excessive_bools)]
 struct PipelineCtx {
@@ -1937,15 +1999,15 @@ struct PipelineCtx {
     /// apart (see [`Microphone`]).
     mic: Option<Microphone>,
     is_listening: bool,
-    is_recording: bool,
-    /// Mic-button-initiated recording (Home composer). While active, wake-word
-    /// detection is paused and audio accumulates into [`command_buffer`].
-    manual_recording: bool,
-    /// Whether wake-word listening resumes when the current manual recording
-    /// ends: set when the wake-word mic was already running (or asked to start
-    /// while the recording was in progress), and when the user's switch is on
-    /// for a recording-only microphone — so a recording never leaves voice
-    /// stopped while the switch shows it on.
+    /// The recording in progress, if any: the mic button and the wake word share
+    /// one mechanism and differ only in how a recording can end (a wake-word
+    /// recording also ends itself on silence).
+    recording: Option<RecordingOrigin>,
+    /// Whether wake-word listening resumes when the current recording ends: set
+    /// when the wake-word mic was already running (or asked to start while the
+    /// recording was in progress), and when the user's switch is on for a
+    /// recording-only microphone — so a recording never leaves voice stopped
+    /// while the switch shows it on.
     resume_listening_after_recording: bool,
     command_buffer: Vec<f32>,
     /// Track silence duration by audio sample count rather than wall-clock
@@ -2126,8 +2188,6 @@ struct PipelineCtx {
     /// Timestamp until which the pipeline suppresses Error→Listening
     /// transitions (set after transcription failures).
     refractory_until: Option<Instant>,
-    /// Timestamp of the last rate-limited transcription-error message.
-    last_error_message_time: Option<Instant>,
     /// Timestamp of the last rate-limited voice notice.
     last_voice_notice_time: Option<Instant>,
     /// Remaining automatic model-retry cycles (see
@@ -2152,8 +2212,7 @@ impl PipelineCtx {
         Self {
             mic: None,
             is_listening: false,
-            is_recording: false,
-            manual_recording: false,
+            recording: None,
             resume_listening_after_recording: false,
             command_buffer: Vec::new(),
             silence_sample_count: 0,
@@ -2189,7 +2248,6 @@ impl PipelineCtx {
             injected_vad: None,
             negative_audio_buf: Vec::new(),
             refractory_until: None,
-            last_error_message_time: None,
             last_voice_notice_time: None,
             auto_model_retries_left: MAX_AUTO_MODEL_RETRY_CYCLES,
             adaptive_threshold: AdaptiveThresholdState::new(),
@@ -2202,13 +2260,6 @@ impl PipelineCtx {
         }
     }
 
-    /// Set the manual-recording flag on both the pipeline context and the
-    /// global mirror used by the GUI ([`is_manual_recording`]).
-    fn set_manual_recording(&mut self, active: bool) {
-        self.manual_recording = active;
-        MANUAL_RECORDING_ACTIVE.store(active, Ordering::Relaxed);
-    }
-
     /// Run a Full reset while preserving [`auto_start_pending`] (the reset
     /// clears it; a pending wake-word auto-start must survive the
     /// recording-only-mic lifecycle).
@@ -2218,23 +2269,28 @@ impl PipelineCtx {
         self.auto_start_pending = auto_start;
     }
 
-    /// End an in-flight wake-word recording, if there is one: clear its state and
-    /// play its end cue.
+    /// Take what a wake-word recording captured and end it: the audio, and
+    /// whether anything was said.
     ///
-    /// Every path that stops a recording for an operational reason goes through
-    /// here, so a new stop reason cannot forget the cue (process teardown that
-    /// simply closes the command channel is the one exception — nothing observes
-    /// a cue then).  Soft level drops the recording/detection buffers while
-    /// preserving VAD continuity, `vad_threshold` and the wake-word cooldown
-    /// timestamp, so the trigger cannot immediately re-fire.  The caller owns the
-    /// voice status (Listening after a normal end, Enrolling after an aborted
-    /// recording).
-    fn end_wake_recording(&mut self) {
-        if !self.is_recording {
-            return;
-        }
+    /// Every path that stops a wake-word recording goes through here, so the
+    /// order cannot be lost: the silence flag is read before the end clears it,
+    /// and the buffer is taken before the reset drops it. Soft level drops the
+    /// recording/detection buffers while preserving VAD continuity,
+    /// `vad_threshold` and the wake-word cooldown timestamp, so the trigger
+    /// cannot immediately re-fire.  The caller owns the voice status (Listening
+    /// after a normal end, Enrolling after an aborted recording).
+    fn take_wake_recording(&mut self) -> (Vec<f32>, bool) {
+        let had_speech = self.recording_had_speech;
+        let cmd_buf = std::mem::take(&mut self.command_buffer);
+        self.recording = None;
+        self.end_wake_state();
+        (cmd_buf, had_speech)
+    }
+
+    /// Drop a wake-word recording's buffers while keeping VAD continuity, and
+    /// play the end cue its stop owes.
+    fn end_wake_state(&mut self) {
         self.reset_pipeline_state(ResetLevel::Soft);
-        self.is_recording = false;
         cue::play(Cue::End);
     }
 
@@ -2253,6 +2309,10 @@ impl PipelineCtx {
 
     /// Parameterised pipeline state reset.
     ///
+    /// A reset only clears state: it never publishes an outcome, so a caller
+    /// ending a recording reports it itself ([`Self::abandon_recording`]) with
+    /// wording that matches what actually happened.
+    ///
     /// | Field | Full | Soft | Cancel |
     /// |---|---|---|---|
     /// | `audio_buffer`, `command_buffer`, `score_window`, `negative_audio_buf`, `frame_vad`, `frame_raw_audio` | cleared | cleared | cleared |
@@ -2264,12 +2324,11 @@ impl PipelineCtx {
     /// | `injected_vad` (voice-tests bench seam) | preserved | preserved | preserved |
     /// | `last_wake_word_detection` | `None` | preserved | `None` |
     /// | `auto_start_pending` | `false` | preserved | preserved |
-    /// | `is_recording` | `false` | preserved | preserved |
-    /// | `manual_recording` | `false` | preserved | preserved |
+    /// | `recording` | cleared | preserved | preserved |
     /// | `resume_listening_after_recording` | preserved | preserved | preserved |
     /// | VAD (`reset_vad()`) | called | NOT called | NOT called |
     /// | Global `enrollment_embeddings`, `negative_audio_chunks` | preserved | preserved | cleared |
-    /// | `refractory_until`, `last_error_message_time`, `last_voice_notice_time`, `last_model_retry`, `mic`, `is_listening`, `enrollment_mode` | NOT touched | NOT touched | NOT touched |
+    /// | `refractory_until`, `last_voice_notice_time`, `last_model_retry`, `mic`, `is_listening`, `enrollment_mode` | NOT touched | NOT touched | NOT touched |
     fn reset_pipeline_state(&mut self, level: ResetLevel) {
         // ── Audio accumulators (cleared by all levels) ──
         self.audio_buffer.clear();
@@ -2318,8 +2377,10 @@ impl PipelineCtx {
                 self.vad_threshold = VAD_THRESHOLD;
                 self.last_wake_word_detection = None;
                 self.auto_start_pending = false;
-                self.is_recording = false;
-                self.set_manual_recording(false);
+                // A reset clears state; it does not decide what the user is
+                // told. A caller ending a recording owns its event and wording
+                // (see [`Self::abandon_recording`]).
+                self.recording = None;
                 reset_vad();
                 self.adaptive_threshold.reset();
 
@@ -2329,8 +2390,8 @@ impl PipelineCtx {
             }
             ResetLevel::Soft => {
                 // Preserve VAD state, vad_threshold, last_wake_word_detection
-                // cooldown, auto_start_pending, is_recording, and global
-                // enrollment accumulators.
+                // cooldown, auto_start_pending, the running recording, and
+                // global enrollment accumulators.
                 // Clear rolling-window detection state so stale scores cannot
                 // carry cross-utterance contamination across Soft pipeline
                 // resets (which occur during the detection→recording handoff).
@@ -2365,7 +2426,7 @@ impl PipelineCtx {
     /// **Preserved**: `audio_buffer` (normal drain handles leftover overlap),
     /// VAD state (acoustic environment unchanged), `vad_threshold`,
     /// `last_wake_word_detection` (cooldown still active if within 3 s),
-    /// `is_recording`.
+    /// `recording`.
     fn reset_detection_segment(&mut self) {
         // ── Clear per-segment rolling scores (PRIMARY false-trigger fix) ──
         self.score_window.clear();
@@ -2407,7 +2468,7 @@ impl PipelineCtx {
             // Re-check the not-recording condition: a just-fired detection
             // must NOT be reset (the detection→recording handoff in
             // handle_wake_word_detection completes the transition).
-            if !self.is_recording {
+            if self.recording.is_none() {
                 self.reset_detection_segment();
             }
         } else {
@@ -2432,7 +2493,7 @@ impl PipelineCtx {
         {
             self.refractory_until = None;
             if self.is_listening
-                && !self.is_recording
+                && self.recording.is_none()
                 && matches!(get_status(), VoiceStatus::Error(_))
             {
                 set_status(VoiceStatus::Listening);
@@ -2440,70 +2501,34 @@ impl PipelineCtx {
         }
     }
 
-    /// Whether the 10-second rate limit has elapsed since `last` (true when
-    /// no prior message was sent).  The transcription-error and voice-notice
-    /// limiters stay independent — separate fields so a discard notice is not
-    /// suppressed by a recent error message (and vice versa).
+    /// Whether [`NOTICE_INTERVAL`] has elapsed since `last` (true when no prior
+    /// message was sent).
     fn should_send_rate_limited(last: Option<Instant>) -> bool {
-        let now = Instant::now();
-        last.is_none_or(|t| now.duration_since(t).as_secs() >= 10)
+        last.is_none_or(|t| t.elapsed() >= NOTICE_INTERVAL)
     }
 
-    /// 10-second transcription-error rate-limit guard.
-    fn should_send_error_message(&self) -> bool {
-        Self::should_send_rate_limited(self.last_error_message_time)
-    }
-
-    /// 10-second voice-notice rate-limit guard.
+    /// Voice-notice rate-limit guard.
     fn should_send_voice_notice(&self) -> bool {
         Self::should_send_rate_limited(self.last_voice_notice_time)
     }
 
-    /// Broadcast a chat message to the admin's voice workspace.
-    async fn broadcast_voice_message(&mut self, msg: &str) {
-        let user_name = crate::users::ADMIN_USER_NAME;
-        let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
-        // Assistant conversations live in the admin's personal workspace.
-        let ws = crate::users::effective_workspace_for_role(crate::Role::Assistant, ws, user_name);
-        crate::channels::broadcast_and_persist_agent_response(
-            user_name,
-            "voice",
-            msg,
-            "voice".to_string(),
-            &ws.name,
-            None,
-        )
-        .await;
-    }
-
-    /// Broadcast a rate-limited transcription-failure chat message (same as
-    /// the wake-word path) so the user sees a persistent indicator.
-    async fn broadcast_transcription_error(&mut self) {
-        if !self.should_send_error_message() {
-            return;
-        }
-        self.last_error_message_time = Some(Instant::now());
-        self.broadcast_voice_message("*Voice: transcription failed — try again*")
-            .await;
-    }
-
-    /// Broadcast a rate-limited voice notice chat message (discarded
-    /// recordings etc.). Shared by the wake-word and mic-button paths.
+    /// Broadcast a rate-limited voice notice chat message: the pipeline's own
+    /// report for a recording that could not start.
     async fn broadcast_voice_notice(&mut self, msg: &str) {
         if !self.should_send_voice_notice() {
             return;
         }
         self.last_voice_notice_time = Some(Instant::now());
-        self.broadcast_voice_message(msg).await;
+        broadcast_notice(msg).await;
     }
 
     fn handle_start_listening(&mut self) {
-        // While a mic-button recording is in progress, defer wake-word
+        // While the composer's own recording is in progress, defer wake-word
         // listening until the recording ends (mutual exclusion). The resume
-        // flag is set so `end_manual_recording` starts listening afterwards.
-        if self.manual_recording {
+        // flag is set so `end_button_recording` starts listening afterwards.
+        if self.recording == Some(RecordingOrigin::Button) {
             self.resume_listening_after_recording = true;
-            info!("Voice pipeline: start_listening deferred until manual recording ends");
+            info!("Voice pipeline: start_listening deferred until the recording ends");
             return;
         }
         // Wake word shares the ASR transcriber: with transcription disabled
@@ -2540,6 +2565,10 @@ impl PipelineCtx {
             return;
         }
         if !self.is_listening {
+            // A recording holding nothing but its own microphone cannot outlive
+            // this start: it is reported here, where the reason is known, rather
+            // than by the reset below.
+            self.abandon_recording("*Voice: recording discarded — wake-word listening started*");
             self.reset_pipeline_state(ResetLevel::Full);
             self.mic = None;
             match start_microphone() {
@@ -2570,15 +2599,13 @@ impl PipelineCtx {
     /// The caller owns the resulting voice status: [`VoiceStatus::Disabled`] on
     /// an explicit stop or a loss with the wake-word switch off,
     /// [`VoiceStatus::MicDisconnected`] when the device disappeared while voice
-    /// was on.  Returns `true` when an in-progress mic-button recording was
-    /// aborted (the caller broadcasts a discard notice so the loss is not
-    /// silent).
-    fn teardown_microphone(&mut self) -> bool {
-        let aborted_recording = self.manual_recording;
-        // A wake-word recording is abandoned here: the end cue and the state
-        // clear both belong to the helper, which is a no-op when nothing is
+    /// was on.  An in-progress recording is reported to the composer as lost,
+    /// with `notice` saying why.
+    fn teardown_microphone(&mut self, notice: &'static str) {
+        // The recording is abandoned here, wake-word one included: its end cue
+        // and state clear belong to the helper, which is a no-op when nothing is
         // recording.
-        self.end_wake_recording();
+        self.abandon_recording(notice);
         // Full reset: the mic stream is being torn down, so the old VAD state
         // is no longer representative of the next acoustic environment (Full
         // uses `reset_vad()`).  Global enrollment accumulators are deliberately
@@ -2589,29 +2616,27 @@ impl PipelineCtx {
         self.enrollment_mode = false;
         self.resume_listening_after_recording = false;
         self.mic = None;
-        aborted_recording
     }
 
     /// Stop the wake-word mic and tear down pipeline state.
-    fn handle_stop_listening(&mut self) -> bool {
-        let aborted_recording = self.teardown_microphone();
+    fn handle_stop_listening(&mut self) {
+        self.teardown_microphone("*Voice: recording discarded — voice assistant turned off*");
         set_status(VoiceStatus::Disabled);
         info!("Voice pipeline: stopped listening");
-        aborted_recording
     }
 
     /// Handle the microphone becoming unavailable (device unplugged, its host
     /// gone, the stream invalidated), reported by the stream itself.
     ///
     /// No audio can arrive any more, so everything the microphone was doing
-    /// ends here: a wake-word recording stops like any other stop (end cue
-    /// included), a mic-button recording is discarded, and an enrollment attempt
-    /// is abandoned with everything it collected dropped, so its gates cannot
-    /// complete it later with no microphone.  Nothing is re-armed: re-opening
-    /// the device is the user's own action ([`VoiceStatus::MicDisconnected`]).
-    fn handle_microphone_lost(&mut self) -> bool {
+    /// ends here: an in-progress recording — wake-word one included, end cue and
+    /// all — is discarded, and an enrollment attempt is abandoned with
+    /// everything it collected dropped, so its gates cannot complete it later
+    /// with no microphone.  Nothing is re-armed: re-opening the device is the
+    /// user's own action ([`VoiceStatus::MicDisconnected`]).
+    fn handle_microphone_lost(&mut self) {
         self.end_enrollment_attempt();
-        let aborted_recording = self.teardown_microphone();
+        self.teardown_microphone("*Voice: recording discarded — microphone disconnected*");
         // Read the switch and write the status under one lock: a user turning
         // voice off while this runs keeps the Disabled state their action
         // wrote, never a stale one from here.
@@ -2625,39 +2650,26 @@ impl PipelineCtx {
             set_status_and_notify(&mut state, status);
         }
         info!("Voice pipeline: microphone unavailable — voice input stopped");
-        aborted_recording
     }
 
-    /// Returns `true` when an in-progress mic-button recording was aborted for
-    /// enrollment (the caller broadcasts a discard notice).
-    fn handle_start_enrollment(&mut self, phrase: &str) -> bool {
+    /// Start an enrollment, aborting the recording it cannot coexist with (the
+    /// composer is told the recording was discarded).
+    fn handle_start_enrollment(&mut self, phrase: &str) {
         if !self.is_listening {
             warn!("Cannot start enrollment: microphone not running");
             set_status(VoiceStatus::Error(
                 "Microphone not running — enable Voice first".to_string(),
             ));
-            return false;
+            return;
         }
 
-        // A mic-button recording cannot coexist with enrollment: the audio
-        // router gives enrollment priority, so the manual buffer would starve
-        // (its auto-send cap never fires) and later resume as garbage.
-        // Abort the recording and discard its buffer.
-        let aborted_recording = self.manual_recording;
-        if aborted_recording {
-            warn!("Aborting manual recording — enrollment started");
-            self.set_manual_recording(false);
+        // No recording can coexist with enrollment: the audio router gives
+        // enrollment priority, so a recording's buffer would starve (its
+        // auto-send cap never fires) and later resume as garbage. Abandoning it
+        // also ends a wake-word recording's cue.
+        if self.abandon_recording("*Voice: recording discarded — enrollment started*") {
+            warn!("Aborting the recording — enrollment started");
             self.resume_listening_after_recording = false;
-            self.command_buffer.clear();
-            self.silence_sample_count = 0;
-        }
-
-        // A wake-word recording cannot survive enrollment either — the same
-        // router priority would starve it.  Abandon it (its end cue included) so
-        // no recording state outlives it.
-        if self.is_recording {
-            warn!("Aborting wake-word recording — enrollment started");
-            self.end_wake_recording();
         }
 
         // Resume existing enrollment progress if available (e.g., the user
@@ -2704,7 +2716,6 @@ impl PipelineCtx {
             "Voice pipeline: enrollment started (resuming from utterance \
              {existing_utterances}/{NUM_ENROLLMENT_SAMPLES})",
         );
-        aborted_recording
     }
 
     fn handle_cancel_enrollment(&mut self) {
@@ -2757,17 +2768,19 @@ impl PipelineCtx {
     }
 
     fn handle_shutdown(&mut self) {
-        self.set_manual_recording(false);
+        self.abandon_recording("*Voice: recording discarded — voice assistant stopped*");
         self.resume_listening_after_recording = false;
-        // A wake-word recording stops here like anywhere else.
-        self.end_wake_recording();
         self.mic = None;
     }
 
-    /// Start a mic-button-initiated voice message recording.
+    /// Start a voice recording from the composer's mic button.
+    ///
+    /// The composer opened its message window on the press; a start that does
+    /// not take closes it again, so the field is never held by a recording that
+    /// does not exist.
     ///
     /// Pauses wake-word detection for the duration of the recording
-    /// (mutual exclusion — audio routes to [`handle_manual_recording_audio`]
+    /// (mutual exclusion — audio routes to [`handle_button_recording_audio`]
     /// instead of [`handle_wake_word_detection`]).  Wake-word listening resumes
     /// when the recording ends, as `resume_listening_after_recording` decides.
     ///
@@ -2779,36 +2792,50 @@ impl PipelineCtx {
     /// started (the caller broadcasts it so the failure is user-visible);
     /// `None` otherwise (started, or silently rejected by a guard the GUI's
     /// pre-flight already surfaced).
-    fn handle_start_manual_recording(&mut self) -> Option<&'static str> {
-        if self.manual_recording {
-            warn!("Manual recording already in progress");
-            return None;
+    fn handle_start_button_recording(&mut self) -> Option<&'static str> {
+        match self.try_start_button_recording() {
+            StartAttempt::Started | StartAttempt::AlreadyRecording => None,
+            StartAttempt::Refused(notice) => {
+                // The composer opened its message window on the press; a start
+                // that did not take closes it, or the field waits for a message
+                // that will never come.
+                publish_recording(RecordingEvent::NotStarted);
+                notice
+            }
         }
-        if self.is_recording {
-            warn!("Cannot start manual recording — wake-word recording in progress");
-            return None;
+    }
+
+    /// [`Self::handle_start_button_recording`] without the composer hand-off.
+    fn try_start_button_recording(&mut self) -> StartAttempt {
+        if self.recording.is_some() {
+            // Whichever way it started, a running recording owns the composer's
+            // field: this press leaves that window alone.
+            warn!("Cannot start a recording — one is already running");
+            return StartAttempt::AlreadyRecording;
         }
         if self.enrollment_mode || self.collecting_negatives {
-            warn!("Cannot start manual recording during enrollment");
-            return None;
+            warn!("Cannot start a voice recording during enrollment");
+            return StartAttempt::Refused(None);
         }
         // With local transcription disabled the shared ASR model never loads
         // (or is unavailable after a restart) — surface the configuration,
         // not a loading state that can never complete.  Unconditional guard
-        // mirroring [`manual_recording_blocked_reason`], so a still-loaded
+        // mirroring [`recording_blocked_reason`], so a still-loaded
         // in-memory model cannot contradict the disabled configuration.
         if is_transcription_disabled() {
-            warn!("Cannot start manual recording — local transcription disabled");
-            return Some("Voice recording unavailable — local transcription is disabled");
+            warn!("Cannot start a voice recording — local transcription disabled");
+            return StartAttempt::Refused(Some(
+                "Voice recording unavailable — local transcription is disabled",
+            ));
         }
         // A model that failed to load is the one case a recording cannot end well:
         // say that, not the loading message it would otherwise be given.
         if crate::audio::local_transcriber::is_failed() {
-            warn!("Cannot start manual recording — the local speech model failed to load");
+            warn!("Cannot start a voice recording — the local speech model failed to load");
             set_status(VoiceStatus::ModelError);
-            return Some(
+            return StartAttempt::Refused(Some(
                 "Voice unavailable — the local speech model failed to load; retry it in Settings",
-            );
+            ));
         }
         // Recording does not need the recogniser — transcription loads it on use
         // and waits for it (see `local_transcriber::transcribe_file_async`), so
@@ -2833,7 +2860,7 @@ impl PipelineCtx {
                         "Could not start the microphone — check your input device"
                     };
                     set_status(status);
-                    return Some(notice);
+                    return StartAttempt::Refused(Some(notice));
                 }
             }
         }
@@ -2844,78 +2871,161 @@ impl PipelineCtx {
         // microphone loss), and a recording must not leave voice sitting
         // stopped while the switch shows it on.
         self.resume_listening_after_recording = self.is_listening || is_enabled();
-        self.set_manual_recording(true);
+        self.recording = Some(RecordingOrigin::Button);
         self.command_buffer.clear();
         self.silence_sample_count = 0;
-        set_status(VoiceStatus::RecordingManual);
-        info!("Voice pipeline: manual recording started");
-        None
+        set_status(VoiceStatus::RecordingButton);
+        info!("Voice pipeline: recording started from the mic button");
+        StartAttempt::Started
     }
 
-    /// Stop a mic-button recording (send or discard).
-    async fn handle_stop_manual_recording(&mut self, send: bool) {
-        if !self.manual_recording {
-            warn!("StopRecording called but no manual recording in progress");
-            return;
-        }
-        let cmd_buf = std::mem::take(&mut self.command_buffer);
-        self.silence_sample_count = 0;
-        if send && !cmd_buf.is_empty() {
-            self.finalize_manual_recording(cmd_buf).await;
-        } else {
-            // Discarded or empty — tear down and resume listening.
-            self.end_manual_recording();
-            if send {
-                self.broadcast_voice_notice("*Voice: no speech detected — recording discarded*")
-                    .await;
+    /// Stop the recording in progress — whichever way it started — and either
+    /// send what it holds or discard it.
+    async fn handle_stop_recording(&mut self, send: bool) {
+        match self.recording {
+            // Every way a recording ends publishes its outcome, so a stop with
+            // nothing to stop has nothing left to answer.
+            None => debug!("StopRecording with no recording in progress"),
+            Some(RecordingOrigin::Button) => {
+                let cmd_buf = std::mem::take(&mut self.command_buffer);
+                self.silence_sample_count = 0;
+                if send {
+                    self.finish_button_recording(cmd_buf).await;
+                } else {
+                    // The user's own discard: the composer closed its message
+                    // window on the same press, so nothing waits for an outcome.
+                    self.end_button_recording();
+                }
+            }
+            Some(RecordingOrigin::WakeWord) => {
+                let (cmd_buf, had_speech) = self.take_wake_recording();
+                if send {
+                    self.finish_wake_recording(cmd_buf, had_speech).await;
+                } else {
+                    // The user's own discard, exactly like the silence end that
+                    // found nothing to send: the composer closed its window on
+                    // the same press.
+                    set_status(VoiceStatus::Listening);
+                }
             }
         }
     }
 
-    /// Accumulate audio during a mic-button recording; auto-send at the
+    /// Accumulate audio during a button recording; auto-send at the
     /// 10-minute cap.
     #[expect(clippy::cast_precision_loss)]
-    async fn handle_manual_recording_audio(&mut self, samples: &[f32]) {
+    async fn handle_button_recording_audio(&mut self, samples: &[f32]) {
         self.command_buffer.extend_from_slice(samples);
         let duration_secs = self.command_buffer.len() as f64 / f64::from(SAMPLE_RATE);
         if duration_secs > MAX_RECORD_SECS as f64 {
-            debug!("Manual recording stopped: max duration ({duration_secs:.1}s)");
+            debug!("Button recording stopped: max duration ({duration_secs:.1}s)");
             let cmd_buf = std::mem::take(&mut self.command_buffer);
             self.silence_sample_count = 0;
-            self.finalize_manual_recording(cmd_buf).await;
+            self.finish_button_recording(cmd_buf).await;
         }
     }
 
-    /// Transcribe a completed manual-recording buffer and route it to the
-    /// admin's Assistant (same broadcast+routing path as wake-word
-    /// commands), then restore wake-word listening state.
-    async fn finalize_manual_recording(&mut self, cmd_buf: Vec<f32>) {
+    /// Transcribe a completed button recording and hand its outcome to the
+    /// composer, which owns the message the transcript joins; then restore
+    /// wake-word listening state.
+    async fn finish_button_recording(&mut self, cmd_buf: Vec<f32>) {
+        // The composer takes the field's content over now, so the message is in
+        // flight from the moment the recording stops — whether the user pressed
+        // send or the cap stopped it.
+        publish_recording(RecordingEvent::Stopped);
         set_status(VoiceStatus::Transcribing);
+        if cmd_buf.is_empty() {
+            warn!("Button recording stopped with no audio captured");
+            publish_recording(RecordingEvent::NoSpeech);
+        } else {
+            self.publish_transcript(cmd_buf).await;
+        }
+        self.end_button_recording();
+    }
+
+    /// Transcribe a finished recording and publish its outcome for the
+    /// composer. `false` when transcription failed: the failure is already
+    /// published, and the caller decides what the pipeline's own status does.
+    async fn publish_transcript(&mut self, cmd_buf: Vec<f32>) -> bool {
         match transcribe_audio(&cmd_buf).await {
             Ok(transcribed) if !transcribed.trim().is_empty() => {
-                route_to_agent(transcribed).await;
+                publish_recording(RecordingEvent::Transcript(
+                    crate::channels::marked_transcript(&transcribed),
+                ));
+                true
             }
             Ok(_) => {
-                warn!(
-                    "Empty transcription — dropping manual recording ({} samples)",
-                    cmd_buf.len()
-                );
-                self.broadcast_voice_notice("*Voice: no speech detected — recording discarded*")
-                    .await;
+                warn!("Empty transcription — dropping ({} samples)", cmd_buf.len());
+                publish_recording(RecordingEvent::NoSpeech);
+                true
             }
             Err(e) => {
-                warn!("Manual recording transcription failed: {e}");
-                self.broadcast_transcription_error().await;
+                warn!("Transcription failed: {e}");
+                publish_recording(RecordingEvent::Failed(TRANSCRIPTION_FAILED_NOTICE));
+                false
             }
         }
-        self.end_manual_recording();
     }
 
-    /// Finalize a manual recording session: resume wake-word listening when
+    /// Finish a wake-word recording that ended itself (silence, the cap) or was
+    /// ended from the composer: its transcript joins the field's content, which
+    /// the composer then sends as one message.
+    async fn finish_wake_recording(&mut self, cmd_buf: Vec<f32>, had_speech: bool) {
+        // Nothing was said, so there is nothing to join the field: publishing
+        // that leaves the composer's window — and its text and attachments —
+        // exactly as they were.
+        if !had_speech || cmd_buf.is_empty() {
+            debug!(
+                "No speech in wake-word recording — dropping {} samples",
+                cmd_buf.len()
+            );
+            publish_recording(RecordingEvent::NoSpeech);
+            set_status(VoiceStatus::Listening);
+            return;
+        }
+        // The words join the field: the composer takes its content over now, so
+        // the message is in flight until the transcript arrives.
+        publish_recording(RecordingEvent::Stopped);
+        set_status(VoiceStatus::Transcribing);
+        if self.publish_transcript(cmd_buf).await {
+            set_status(VoiceStatus::Listening);
+        } else {
+            set_status(VoiceStatus::Error("Transcription failed".to_string()));
+            // Enforce a 3-second refractory period before returning to
+            // Listening (replaces the old 2-second blocking sleep with a
+            // non-blocking alternative), handled by the main loop.
+            self.refractory_until = Some(Instant::now() + Duration::from_secs(3));
+        }
+    }
+
+    /// End the recording in progress without producing a message — a teardown, an
+    /// enrolment starting, wake-word listening starting on a recording-only
+    /// microphone, shutdown — and tell the composer, so a field it had committed
+    /// comes back instead of waiting for a message that will never arrive.
+    /// `notice` says why the recording was dropped, in the words the user sees.
+    /// Returns whether a recording was running.
+    fn abandon_recording(&mut self, notice: &'static str) -> bool {
+        let Some(origin) = self.recording.take() else {
+            return false;
+        };
+        // A wake-word recording ends like any other: its buffers go and its end
+        // cue plays. A button recording owes no cue — the press that ends it
+        // never got one either.
+        if origin == RecordingOrigin::WakeWord {
+            self.end_wake_state();
+        } else {
+            self.command_buffer.clear();
+            self.silence_sample_count = 0;
+        }
+        publish_recording(RecordingEvent::Failed(notice));
+        true
+    }
+
+    /// Finalize a button recording: resume wake-word listening when
     /// `resume_listening_after_recording` says so, otherwise tear down the
     /// recording-only mic.
-    fn end_manual_recording(&mut self) {
-        self.set_manual_recording(false);
+    fn end_button_recording(&mut self) {
+        self.recording = None;
         if self.resume_listening_after_recording {
             self.resume_listening_after_recording = false;
             if self.is_listening {
@@ -2924,8 +3034,8 @@ impl PipelineCtx {
                 self.reset_pipeline_state(ResetLevel::Soft);
                 set_status(VoiceStatus::Listening);
             } else {
-                // Voice was toggled ON during the manual recording. If the
-                // wake-word mic cannot start right now (models still loading),
+                // Voice was toggled ON during the recording. If the wake-word
+                // mic cannot start right now (models still loading),
                 // auto_start_pending is re-armed by handle_start_listening so
                 // check_auto_start retries once models are ready. Tear down
                 // the recording-only mic instead of leaving a zombie stream.
@@ -2952,7 +3062,7 @@ impl PipelineCtx {
             self.mic = None;
             set_status(VoiceStatus::Disabled);
         }
-        debug!("Voice pipeline: manual recording ended");
+        debug!("Voice pipeline: recording ended");
     }
 
     /// Attempt to retry loading the shared ASR transcriber, debounced to at
@@ -3361,26 +3471,11 @@ pub async fn run_voice_pipeline() {
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(VoiceCommand::StartListening) => ctx.handle_start_listening(),
-                    Some(VoiceCommand::StopListening) => {
-                        // Voice toggle-off mid-recording aborts the mic-button
-                        // recording — broadcast a notice so the loss is visible.
-                        if ctx.handle_stop_listening() {
-                            ctx.broadcast_voice_notice(
-                                "*Voice: recording discarded — voice assistant turned off*",
-                            )
-                            .await;
-                        }
-                    }
+                    // The recording a stop or an enrollment aborts is reported
+                    // to the composer, which carries the reason to the user.
+                    Some(VoiceCommand::StopListening) => ctx.handle_stop_listening(),
                     Some(VoiceCommand::StartEnrollment(phrase)) => {
-                        // Enrollment aborts any in-progress mic-button
-                        // recording — broadcast a notice so the loss is not
-                        // silent (mirrors the toggle-off / mic-disconnect paths).
-                        if ctx.handle_start_enrollment(&phrase) {
-                            ctx.broadcast_voice_notice(
-                                "*Voice: recording discarded — enrollment started*",
-                            )
-                            .await;
-                        }
+                        ctx.handle_start_enrollment(&phrase);
                     }
                     Some(VoiceCommand::CancelEnrollment) => ctx.handle_cancel_enrollment(),
                     Some(VoiceCommand::RetryModelLoading) => {
@@ -3393,16 +3488,16 @@ pub async fn run_voice_pipeline() {
                         }
                     }
                     Some(VoiceCommand::StartRecording) => {
-                        if let Some(msg) = ctx.handle_start_manual_recording() {
+                        if let Some(msg) = ctx.handle_start_button_recording() {
                             // On-demand mic failed — surface it to the user.
                             ctx.broadcast_voice_notice(msg).await;
                         }
                     }
                     Some(VoiceCommand::StopRecordingSend) => {
-                        ctx.handle_stop_manual_recording(true).await;
+                        ctx.handle_stop_recording(true).await;
                     }
                     Some(VoiceCommand::StopRecordingDiscard) => {
-                        ctx.handle_stop_manual_recording(false).await;
+                        ctx.handle_stop_recording(false).await;
                     }
                     Some(VoiceCommand::ConfigChanged) => {
                         // A runtime transcription re-enable must re-resolve the
@@ -3449,12 +3544,7 @@ pub async fn run_voice_pipeline() {
                     // microphone was doing (a recording is discarded, not sent),
                     // drops what an enrollment collected, and stops claiming to
                     // listen.
-                    if ctx.handle_microphone_lost() {
-                        ctx.broadcast_voice_notice(
-                            "*Voice: recording discarded — microphone disconnected*",
-                        )
-                        .await;
-                    }
+                    ctx.handle_microphone_lost();
                     continue;
                 };
 
@@ -3481,19 +3571,23 @@ pub async fn run_voice_pipeline() {
                         (state.enrolled_utterance_count, NUM_ENROLLMENT_SAMPLES)
                     };
                     handle_enrollment_audio(&samples, &mut ctx, sample, total);
-                } else if ctx.manual_recording {
-                    // Mic-button recording takes priority over wake-word
-                    // detection — the two are mutually exclusive.
-                    ctx.handle_manual_recording_audio(&samples).await;
-                } else if ctx.is_recording {
-                    handle_recording_audio(samples, &mut ctx).await;
+                } else if ctx.recording.is_some() {
+                    // A recording takes priority over detection — the two are
+                    // mutually exclusive. The origin decides how its audio is
+                    // handled: a button recording keeps everything it captures,
+                    // a wake-word one ends itself on silence.
+                    if ctx.recording == Some(RecordingOrigin::Button) {
+                        ctx.handle_button_recording_audio(&samples).await;
+                    } else {
+                        handle_recording_audio(samples, &mut ctx).await;
+                    }
                 } else {
                     handle_wake_word_detection(&samples, &mut ctx);
                     // A fire starts a recording: acknowledge it with the start
                     // cue.  Played from the loop rather than from the detector
                     // so the wake-word bench — which calls the detector
                     // directly — never plays it.
-                    if ctx.is_recording {
+                    if ctx.recording.is_some() {
                         cue::play(Cue::Start);
                     }
                 }
@@ -3706,11 +3800,11 @@ async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
 /// mid-phrase can survive).  The remainder accumulates into `command_buffer`,
 /// silence is tracked by sample count, and the recording stops after
 /// [`SILENCE_THRESHOLD_SAMPLES`] of silence or the [`MAX_RECORD_SECS`] cap, then
-/// transcribes and routes the command.
+/// transcribes what it holds and publishes the outcome for the composer.
 ///
 /// A recording whose retained audio contains no speech is dropped without
-/// delivering anything — no message, no notice.  The manual mic-button path
-/// (which keeps its own "no speech detected" notice) is unaffected.
+/// delivering anything — no message, no notice.  A button recording never
+/// reaches this gate: it has no silence end and keeps everything it captures.
 ///
 /// Silence duration is measured in audio samples (not wall-clock time) so that
 /// system load / processing delays don't affect recording cutoff consistency.
@@ -3759,61 +3853,9 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 
         // The recording has ended — acknowledge that regardless of what
         // follows (silence, the cap, a failed transcription) — and clear its
-        // state, so no outcome below owns a reset of its own.
-        let had_speech = ctx.recording_had_speech;
-        let cmd_buf = std::mem::take(&mut ctx.command_buffer);
-        ctx.end_wake_recording();
-
-        // A silent activation delivers nothing: no message, no notice.  The
-        // recording is dropped before transcription so silence cannot turn
-        // into junk either.
-        if !had_speech {
-            debug!(
-                "No speech in wake-word recording — dropping {} samples",
-                cmd_buf.len()
-            );
-            set_status(VoiceStatus::Listening);
-            return;
-        }
-
-        set_status(VoiceStatus::Transcribing);
-
-        match transcribe_audio(&cmd_buf).await {
-            Ok(transcribed) => {
-                // Guard: skip routing if ASR produced an empty or
-                // whitespace-only transcription (qwen-asr can return
-                // Ok("") when the model outputs zero text tokens).
-                if transcribed.trim().is_empty() {
-                    warn!(
-                        "Empty transcription — dropping ({} samples, {:.1}s)",
-                        cmd_buf.len(),
-                        duration_secs,
-                    );
-                } else {
-                    route_to_agent(transcribed).await;
-                }
-            }
-            Err(e) => {
-                warn!("Transcription failed: {e}");
-                set_status(VoiceStatus::Error("Transcription failed".to_string()));
-
-                // Broadcast an error chat message (rate-limited: at most one
-                // per 10 seconds) so the user sees a persistent indicator
-                // instead of a flash that disappears after 2s.
-                ctx.broadcast_transcription_error().await;
-
-                // Enforce a 3-second refractory period before returning to
-                // Listening (replaces the old 2-second blocking sleep with a
-                // non-blocking alternative).
-                ctx.refractory_until = Some(Instant::now() + Duration::from_secs(3));
-
-                // Do NOT set status to Listening here — the refractory delay
-                // is handled in the main loop's post-select section.
-                return;
-            }
-        }
-
-        set_status(VoiceStatus::Listening);
+        // state, so the outcome below owns no reset of its own.
+        let (cmd_buf, had_speech) = ctx.take_wake_recording();
+        ctx.finish_wake_recording(cmd_buf, had_speech).await;
     }
 }
 
@@ -4035,7 +4077,7 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // Score when SCORE_STRIDE_SAMPLES have been processed since the last
     // encode AND speech was seen in this call (or the rolling window is
     // non-empty — i.e., mid-utterance continuation after a VAD gap).
-    if !ctx.is_recording
+    if ctx.recording.is_none()
         && ctx.last_score_sample_count >= SCORE_STRIDE_SAMPLES
         && (speech_seen_this_call || !ctx.score_window.is_empty())
     {
@@ -4104,9 +4146,10 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
                 if detected && ctx.segment_score_steps <= WAKE_WORD_MAX_SEGMENT_STEPS {
                     // Detection fires immediately — the handoff below
                     // completes the transition to recording mode.
-                    ctx.is_recording = true;
+                    ctx.recording = Some(RecordingOrigin::WakeWord);
+                    publish_recording(RecordingEvent::Started);
                     ctx.last_wake_word_detection = Some(Instant::now());
-                    set_status(VoiceStatus::Recording);
+                    set_status(VoiceStatus::RecordingWakeWord);
                 }
             }
             Err(e) => {
@@ -4124,7 +4167,7 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // window, score window) while preserving VAD continuity, the adaptive
     // threshold and the cooldown timestamp; the recording then starts by
     // discarding its own opening.
-    if ctx.is_recording {
+    if ctx.recording.is_some() {
         ctx.reset_pipeline_state(ResetLevel::Soft);
         ctx.post_fire_discard_samples = POST_FIRE_DISCARD_SAMPLES;
     }
@@ -4747,7 +4790,7 @@ mod tests {
         {
             let mut ctx = PipelineCtx::new();
             ctx.is_listening = is_listening;
-            ctx.is_recording = is_recording;
+            ctx.recording = is_recording.then_some(RecordingOrigin::WakeWord);
             ctx.refractory_until = Some(if timer_elapsed {
                 Instant::now()
                     .checked_sub(Duration::from_secs(1))
@@ -4774,59 +4817,60 @@ mod tests {
         }
     }
 
-    // ── Mic-button (manual) recording state-machine tests ──────────────
-    // These test the StartRecording/StopRecording interactions that do not
-    // require a real microphone: reject guards and the resume/teardown
-    // transitions in [`PipelineCtx::end_manual_recording`].
+    // ── Recording state-machine tests ────────────────────────────────────
+    // The StartRecording/StopRecording interactions that need no real
+    // microphone: reject guards, the resume/teardown transitions in
+    // [`PipelineCtx::end_button_recording`], and the outcomes the composer sees.
 
     #[test]
     #[serial_test::serial(voice)]
-    fn manual_recording_rejects_while_wake_word_recording() {
+    fn button_recording_is_refused_while_one_runs() {
         let _ = init_global();
 
         let mut ctx = PipelineCtx::new();
-        ctx.is_recording = true; // wake-word recording in progress
-        set_status(VoiceStatus::Recording);
+        ctx.recording = Some(RecordingOrigin::WakeWord); // a recording is in progress
+        set_status(VoiceStatus::RecordingWakeWord);
 
-        ctx.handle_start_manual_recording();
+        ctx.handle_start_button_recording();
 
-        // Rejected: no manual recording, status unchanged, no resume flag.
-        assert!(!ctx.manual_recording);
+        // Refused, and the running recording is left exactly as it was: its
+        // message belongs to the composer's existing window.
+        assert_eq!(ctx.recording, Some(RecordingOrigin::WakeWord));
         assert!(!ctx.resume_listening_after_recording);
-        assert!(matches!(get_status(), VoiceStatus::Recording));
+        assert!(matches!(get_status(), VoiceStatus::RecordingWakeWord));
     }
 
     #[test]
     #[serial_test::serial(voice)]
-    fn manual_recording_rejects_during_enrollment() {
+    fn button_recording_is_refused_during_enrollment() {
         let _ = init_global();
 
         let mut ctx = PipelineCtx::new();
         ctx.enrollment_mode = true;
         set_status(VoiceStatus::Listening);
 
-        ctx.handle_start_manual_recording();
+        ctx.handle_start_button_recording();
 
-        assert!(!ctx.manual_recording);
+        assert!(ctx.recording.is_none());
         // Status untouched — the rejection does not mutate global state.
         assert!(matches!(get_status(), VoiceStatus::Listening));
     }
 
     #[test]
     #[serial_test::serial(voice)]
-    fn manual_recording_end_resumes_wake_word_listening() {
+    fn button_recording_end_resumes_wake_word_listening() {
         let _ = init_global();
 
         let mut ctx = PipelineCtx::new();
         ctx.is_listening = true; // wake-word assistant active
-        ctx.manual_recording = true;
+        ctx.recording = Some(RecordingOrigin::Button);
         ctx.resume_listening_after_recording = true;
-        set_status(VoiceStatus::RecordingManual);
+        set_status(VoiceStatus::RecordingButton);
 
-        ctx.end_manual_recording();
+        ctx.end_button_recording();
 
         // Wake-word listening resumes: status Listening, mic still running.
-        assert!(!ctx.manual_recording);
+        assert!(ctx.recording.is_none());
         assert!(!ctx.resume_listening_after_recording);
         assert!(ctx.is_listening);
         assert!(matches!(get_status(), VoiceStatus::Listening));
@@ -4834,17 +4878,17 @@ mod tests {
 
     #[test]
     #[serial_test::serial(voice)]
-    fn manual_recording_end_tears_down_recording_only_mic() {
+    fn button_recording_end_tears_down_recording_only_mic() {
         let _ = init_global();
 
         let mut ctx = PipelineCtx::new();
-        ctx.manual_recording = true; // recording with a recording-only mic
-        set_status(VoiceStatus::RecordingManual);
+        ctx.recording = Some(RecordingOrigin::Button); // recording with a recording-only mic
+        set_status(VoiceStatus::RecordingButton);
 
-        ctx.end_manual_recording();
+        ctx.end_button_recording();
 
         // No wake-word listening before → mic torn down, voice disabled.
-        assert!(!ctx.manual_recording);
+        assert!(ctx.recording.is_none());
         assert!(!ctx.is_listening);
         assert!(ctx.mic.is_none());
         assert!(matches!(get_status(), VoiceStatus::Disabled));
@@ -4882,9 +4926,8 @@ mod tests {
             quality: None,
         });
 
-        let aborted = ctx.handle_microphone_lost();
+        ctx.handle_microphone_lost();
 
-        assert!(!aborted, "no mic-button recording was in progress");
         // The attempt is gone, accumulators included: a later tick cannot
         // finish it, and a fresh Enroll starts from scratch.
         assert!(!ctx.enrollment_mode);
@@ -4908,9 +4951,9 @@ mod tests {
         // A genuinely fresh attempt: nothing of the failed start is left that
         // could block it — the GUI pre-flight included, so the record button
         // really tries again instead of refusing.
-        assert_eq!(manual_recording_blocked_reason(), None);
+        assert_eq!(recording_blocked_reason(), None);
         assert!(ctx.mic.is_none());
-        assert!(!ctx.manual_recording);
+        assert!(ctx.recording.is_none());
     }
 
     /// With voice switched off there is nothing claiming to listen, so the
@@ -4922,56 +4965,52 @@ mod tests {
         set_enabled(false);
         let mut ctx = PipelineCtx::new();
         ctx.is_listening = true;
-        ctx.manual_recording = true;
+        ctx.recording = Some(RecordingOrigin::Button);
         ctx.command_buffer = vec![0.5; 100];
-        set_status(VoiceStatus::RecordingManual);
+        set_status(VoiceStatus::RecordingButton);
 
-        let aborted = ctx.handle_microphone_lost();
+        ctx.handle_microphone_lost();
 
-        assert!(
-            aborted,
-            "the in-flight recording is reported for the notice"
-        );
-        assert!(!ctx.manual_recording);
+        assert!(ctx.recording.is_none());
         assert!(ctx.command_buffer.is_empty());
         assert!(matches!(get_status(), VoiceStatus::Disabled));
     }
 
     #[tokio::test]
     #[serial_test::serial(voice)]
-    async fn manual_recording_discard_clears_buffer_and_ends() {
+    async fn button_recording_discard_clears_buffer_and_ends() {
         let _ = init_global();
 
         let mut ctx = PipelineCtx::new();
-        ctx.manual_recording = true;
+        ctx.recording = Some(RecordingOrigin::Button);
         ctx.command_buffer.extend_from_slice(&[0.1, 0.2, 0.3]);
-        set_status(VoiceStatus::RecordingManual);
+        set_status(VoiceStatus::RecordingButton);
 
-        ctx.handle_stop_manual_recording(false).await;
+        ctx.handle_stop_recording(false).await;
 
-        assert!(!ctx.manual_recording);
+        assert!(ctx.recording.is_none());
         assert!(ctx.command_buffer.is_empty());
         assert!(matches!(get_status(), VoiceStatus::Disabled));
     }
 
     #[test]
     #[serial_test::serial(voice)]
-    fn manual_recording_teardown_preserves_auto_start_pending() {
+    fn button_recording_teardown_preserves_auto_start_pending() {
         let _ = init_global();
 
         let mut ctx = PipelineCtx::new();
         // Voice enabled in config but models still loading → auto-start is
-        // pending. A mic-button recording must not cancel it.
+        // pending. A button recording must not cancel it.
         ctx.auto_start_pending = true;
-        ctx.manual_recording = true; // recording-only mic
-        set_status(VoiceStatus::RecordingManual);
+        ctx.recording = Some(RecordingOrigin::Button); // recording-only mic
+        set_status(VoiceStatus::RecordingButton);
 
-        ctx.end_manual_recording();
+        ctx.end_button_recording();
 
-        // Teardown's Full reset would clear auto_start_pending; the manual
-        // recording lifecycle preserves it so check_auto_start still fires
+        // Teardown's Full reset would clear auto_start_pending; the button
+        // recording's lifecycle preserves it so check_auto_start still fires
         // once models become ready.
-        assert!(!ctx.manual_recording);
+        assert!(ctx.recording.is_none());
         assert!(ctx.auto_start_pending);
         assert!(!ctx.is_listening);
         assert!(matches!(get_status(), VoiceStatus::Disabled));
@@ -4979,25 +5018,96 @@ mod tests {
 
     #[test]
     #[serial_test::serial(voice)]
-    fn manual_recording_aborted_when_enrollment_starts() {
+    fn recording_aborted_when_enrollment_starts() {
         let _ = init_global();
 
         let mut ctx = PipelineCtx::new();
         ctx.is_listening = true; // wake-word mic running
-        ctx.manual_recording = true;
+        ctx.recording = Some(RecordingOrigin::Button);
         ctx.command_buffer.extend_from_slice(&[0.1, 0.2, 0.3]);
         ctx.resume_listening_after_recording = true;
-        set_status(VoiceStatus::RecordingManual);
+        set_status(VoiceStatus::RecordingButton);
 
-        // Enrollment owns the mic now: the manual recording is aborted and
-        // its buffer discarded so it cannot resume as garbage later. The
-        // return value tells the caller a recording was aborted (to surface
-        // a discard notice).
-        assert!(ctx.handle_start_enrollment("mahbot"));
-        assert!(!ctx.manual_recording);
+        // Enrollment owns the mic now: the recording is aborted and
+        // its buffer discarded so it cannot resume as garbage later.
+        ctx.handle_start_enrollment("mahbot");
+        assert!(ctx.recording.is_none());
         assert!(!ctx.resume_listening_after_recording);
         assert!(ctx.command_buffer.is_empty());
         assert!(ctx.enrollment_mode);
+    }
+
+    /// The composer's message is resolved by an event, never by silence: a start
+    /// that does not take closes it, and a recording a teardown drops is reported
+    /// lost with its reason.
+    #[test]
+    #[serial_test::serial(voice)]
+    fn recording_endings_always_reach_the_composer() {
+        let _ = init_global();
+        init_recording_tx();
+        let mut events = RECORDING.get().expect("warmed above").subscribe();
+
+        // A press while a recording runs belongs to that recording: it reports
+        // nothing, so the window the running recording owns is not closed.
+        let mut ctx = PipelineCtx::new();
+        ctx.recording = Some(RecordingOrigin::WakeWord);
+        assert!(ctx.handle_start_button_recording().is_none());
+        assert!(
+            events.try_recv().is_err(),
+            "the running recording reports nothing"
+        );
+        assert_eq!(ctx.recording, Some(RecordingOrigin::WakeWord));
+
+        // A recording a teardown drops is reported, whichever way it started.
+        ctx.handle_stop_listening();
+        match events.try_recv() {
+            Ok(RecordingEvent::Failed(notice)) => {
+                assert!(notice.contains("turned off"), "{notice}");
+            }
+            other => panic!("a dropped recording must be reported, got {other:?}"),
+        }
+    }
+
+    /// A wake-word recording that caught no speech resolves the composer's window
+    /// without taking the field: nothing was said, so nothing joins it.
+    #[tokio::test]
+    #[serial_test::serial(voice)]
+    async fn a_silent_wake_recording_leaves_the_field_alone() {
+        let _ = init_global();
+        init_recording_tx();
+        let mut events = RECORDING.get().expect("warmed above").subscribe();
+
+        let mut ctx = PipelineCtx::new();
+        ctx.recording = Some(RecordingOrigin::WakeWord);
+        set_status(VoiceStatus::RecordingWakeWord);
+
+        ctx.handle_stop_recording(true).await;
+
+        assert!(ctx.recording.is_none());
+        assert!(matches!(events.try_recv(), Ok(RecordingEvent::NoSpeech)));
+        assert!(matches!(get_status(), VoiceStatus::Listening));
+    }
+
+    /// The composer's cross: the recording is dropped and the composer reports
+    /// nothing on its own — it closed its window on the same press.
+    #[tokio::test]
+    #[serial_test::serial(voice)]
+    async fn a_discarded_wake_recording_reports_nothing() {
+        let _ = init_global();
+        init_recording_tx();
+        let mut events = RECORDING.get().expect("warmed above").subscribe();
+
+        let mut ctx = PipelineCtx::new();
+        ctx.recording = Some(RecordingOrigin::WakeWord);
+        ctx.command_buffer.extend_from_slice(&[0.1, 0.2, 0.3]);
+        set_status(VoiceStatus::RecordingWakeWord);
+
+        ctx.handle_stop_recording(false).await;
+
+        assert!(ctx.recording.is_none());
+        assert!(ctx.command_buffer.is_empty());
+        assert!(events.try_recv().is_err());
+        assert!(matches!(get_status(), VoiceStatus::Listening));
     }
 
     // ── Model-status resolution tests ────────────────────────────────────
@@ -5065,47 +5175,35 @@ mod tests {
     }
 
     // ── Rate-limiting debounce tests ─────────────────────────────────────
-    // These test the 10-second error-message rate limit via the canonical
-    // [`PipelineCtx::should_send_error_message`] method.  No serial marker
+    // These test the 10-second voice-notice rate limit via the canonical
+    // [`PipelineCtx::should_send_voice_notice`] method.  No serial marker
     // needed — these only read from [`PipelineCtx`] fields without touching
     // global voice state.
 
     #[test]
-    fn rate_limit_error_message_table() {
-        // (case, seconds since last error, expected send decision)
+    fn rate_limit_voice_notice_table() {
+        // (case, seconds since the last notice, expected send decision)
         let cases = [
-            ("no_prior_error", None, true),
-            ("recent_error", Some(0), false),
-            ("old_error_15s", Some(15), true),
+            ("no_prior_notice", None, true),
+            ("recent_notice", Some(0), false),
+            ("old_notice_15s", Some(15), true),
             ("exact_threshold_10s", Some(10), true),
             ("just_below_9s", Some(9), false),
         ];
 
         for (name, elapsed_secs, expected) in cases {
             let mut ctx = PipelineCtx::new();
-            ctx.last_error_message_time = elapsed_secs.map(|secs| {
+            ctx.last_voice_notice_time = elapsed_secs.map(|secs| {
                 Instant::now()
                     .checked_sub(Duration::from_secs(secs))
                     .expect("elapsed seconds in the past should not underflow")
             });
             assert_eq!(
-                ctx.should_send_error_message(),
+                ctx.should_send_voice_notice(),
                 expected,
-                "case {name}: 10s error-message rate limit",
+                "case {name}: 10s voice-notice rate limit",
             );
         }
-    }
-
-    #[test]
-    fn voice_notice_limiter_is_independent_of_error_limiter() {
-        let mut ctx = PipelineCtx::new();
-        // A recent transcription error must NOT suppress a discard notice
-        // (they use separate limiters so one can never starve the other).
-        ctx.last_error_message_time = Some(Instant::now());
-        assert!(ctx.should_send_voice_notice());
-
-        ctx.last_voice_notice_time = Some(Instant::now());
-        assert!(!ctx.should_send_voice_notice());
     }
 
     // ── AdaptiveThresholdState tests ──────────────────────────────────────
@@ -5869,7 +5967,7 @@ mod tests {
         ctx.last_wake_word_detection =
             Some(Instant::now().checked_sub(Duration::from_secs(5)).unwrap());
         ctx.auto_start_pending = true;
-        ctx.is_recording = true;
+        ctx.recording = Some(RecordingOrigin::WakeWord);
         ctx.segment_score_steps = 7;
         ctx
     }
@@ -5965,7 +6063,7 @@ mod tests {
         }
         assert!(ctx.last_wake_word_detection.is_none());
         assert!(!ctx.auto_start_pending);
-        assert!(!ctx.is_recording);
+        assert!(ctx.recording.is_none());
 
         // Global enrollment accumulators PRESERVED by Full — they survive
         // mic stop/start cycles so mid-enrollment progress is not lost on
@@ -6031,7 +6129,7 @@ mod tests {
         let saved_threshold = ctx.vad_threshold; // 0.75
         let saved_cooldown = ctx.last_wake_word_detection;
         let saved_auto_start = ctx.auto_start_pending;
-        let saved_recording = ctx.is_recording;
+        let saved_recording = ctx.recording;
 
         ctx.reset_pipeline_state(ResetLevel::Soft);
 
@@ -6044,7 +6142,7 @@ mod tests {
         }
         assert_eq!(ctx.last_wake_word_detection, saved_cooldown);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
-        assert_eq!(ctx.is_recording, saved_recording);
+        assert_eq!(ctx.recording, saved_recording);
 
         // Global enrollment accumulators preserved.
         let state = voice_state().read().unwrap_poison();
@@ -6066,7 +6164,7 @@ mod tests {
         }
 
         let saved_auto_start = ctx.auto_start_pending;
-        let saved_recording = ctx.is_recording;
+        let saved_recording = ctx.recording;
 
         ctx.reset_pipeline_state(ResetLevel::Cancel);
 
@@ -6081,7 +6179,7 @@ mod tests {
 
         // Cancel preserves handler-managed flags (unlike Full).
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
-        assert_eq!(ctx.is_recording, saved_recording);
+        assert_eq!(ctx.recording, saved_recording);
 
         // Global enrollment accumulators cleared (unlike Soft).
         let state = voice_state().read().unwrap_poison();
@@ -6098,7 +6196,6 @@ mod tests {
         for level in [ResetLevel::Soft, ResetLevel::Full, ResetLevel::Cancel] {
             let mut ctx = PipelineCtx::new();
             ctx.refractory_until = Some(Instant::now());
-            ctx.last_error_message_time = Some(Instant::now());
             ctx.last_voice_notice_time = Some(Instant::now());
 
             ctx.reset_pipeline_state(level);
@@ -6106,10 +6203,6 @@ mod tests {
             assert!(
                 ctx.refractory_until.is_some(),
                 "refractory_until lost at {level:?}"
-            );
-            assert!(
-                ctx.last_error_message_time.is_some(),
-                "last_error_message_time lost at {level:?}"
             );
             assert!(
                 ctx.last_voice_notice_time.is_some(),
@@ -6390,7 +6483,7 @@ mod tests {
         // boundary check — the detection→recording handoff completes the
         // transition and owns the state.
         let mut ctx = PipelineCtx::new();
-        ctx.is_recording = true;
+        ctx.recording = Some(RecordingOrigin::WakeWord);
         ctx.score_window = vec![0.5; 5];
         ctx.segment_silence_hops = 0;
 

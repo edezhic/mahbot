@@ -7,6 +7,8 @@
 
 use crate::ChatDirection;
 use crate::Role;
+#[cfg(target_os = "macos")]
+use crate::audio::voice::RecordingEvent;
 use crate::channels::ReplyReference;
 use crate::channels::chat_history::ChatHistoryEntry;
 use crate::channels::reply::{agent_author_label, normalize_reply_text};
@@ -309,25 +311,44 @@ fn attach_control(disabled: bool) -> Element<'static, HomeMessage> {
     )
 }
 
-/// Composer mic button: starts a voice message recording for the Assistant.
+/// The composer action toolbar beyond the send button: the voice controls, then
+/// the attach control.
 ///
-/// macOS-only, like the rest of the audio UI — the button lives in the composer
-/// action toolbar and is the entry point of the manual recording flow whose
-/// state (stop + send / stop + discard, transcribing) is rendered by
-/// [`recording_popup`].
+/// macOS-only, like the rest of the audio UI. `recording` is the caller's single
+/// derivation of "a recording the composer owns is running" — the same bool the
+/// send button's empty rule takes, so the controls and the button cannot
+/// disagree — and it covers both ways a recording starts.
+#[cfg(target_os = "macos")]
+fn composer_controls(
+    voice_status: &crate::audio::voice::VoiceStatus,
+    recording: bool,
+    draining: bool,
+) -> Vec<Element<'static, HomeMessage>> {
+    let mut controls = if recording {
+        // The recording replaces the mic; its cancel control discards it and
+        // leaves the field exactly as it is.
+        vec![recording_dot(), cancel_recording_control()]
+    } else {
+        vec![mic_control(voice_status)]
+    };
+    controls.push(attach_control(draining));
+    controls
+}
+
+/// Composer mic button: starts a voice recording for the Assistant.
 #[cfg(target_os = "macos")]
 fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'static, HomeMessage> {
-    // The mic is busy while the pipeline owns the mic for any recording
-    // or ASR (manual or wake-word) — the button must not look active
-    // when a new recording would be rejected.
+    // The mic is busy while the pipeline owns it for a recording or any ASR —
+    // the button must not look active when a new recording would be rejected.
+    // (A recording the composer owns renders the dot, not this button.)
     let mic_busy = matches!(
         voice_status,
-        crate::audio::voice::VoiceStatus::Recording
-            | crate::audio::voice::VoiceStatus::RecordingManual
+        crate::audio::voice::VoiceStatus::RecordingWakeWord
+            | crate::audio::voice::VoiceStatus::RecordingButton
             | crate::audio::voice::VoiceStatus::Transcribing
     );
     // With local transcription disabled the shared ASR model never loads,
-    // so a mic-button recording can never start — present the control as
+    // so a button recording can never start — present the control as
     // unavailable instead of a loading state that can never complete.
     let transcription_disabled = crate::audio::voice::is_transcription_disabled();
     let recording_unavailable = mic_busy || transcription_disabled;
@@ -353,67 +374,30 @@ fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'stat
     )
 }
 
-/// Composer recording popup: the stop + send / stop + discard controls for a
-/// mic-button recording, or a passive "Transcribing…" indicator while that
-/// recording is being transcribed (no stop controls — the ASR is finalizing).
-/// Collapses to zero height when neither state applies.
+/// The recording indicator: a red dot fading out and back in while a recording
+/// runs. Passive — it takes no press and shows no tooltip.
 #[cfg(target_os = "macos")]
-fn recording_popup(
-    voice_status: &crate::audio::voice::VoiceStatus,
-) -> Element<'static, HomeMessage> {
-    let recording = matches!(
-        voice_status,
-        crate::audio::voice::VoiceStatus::RecordingManual
-    );
-    // The Transcribing status is shared between the manual and wake-word
-    // paths; only a mic-button recording shows the composer popup.
-    let transcribing = matches!(voice_status, crate::audio::voice::VoiceStatus::Transcribing)
-        && crate::audio::voice::is_manual_recording();
+fn recording_dot() -> Element<'static, HomeMessage> {
+    // Padded so the dot sits at the height of the icon buttons beside it.
+    container(super::spinner::pulse_dot(theme::TEXT_10))
+        .padding(theme::PAD_5)
+        .into()
+}
 
-    if recording {
-        let status_label = text("Recording voice message…")
-            .size(theme::TEXT_13)
-            .color(theme::STATUS_ERROR);
-        let send_btn = button(text("Stop + Send").size(theme::TEXT_12))
-            .on_press(HomeMessage::StopVoiceRecordingSend)
-            .style(theme::button_secondary)
-            .padding(theme::PAD_5);
-        let discard_btn = button(text("Stop + Discard").size(theme::TEXT_12))
-            .on_press(HomeMessage::StopVoiceRecordingDiscard)
-            .style(theme::button_secondary)
-            .padding(theme::PAD_5);
-        container(
-            row![
-                status_label,
-                Space::new().width(Length::Fill),
-                send_btn,
-                discard_btn
-            ]
-            .spacing(theme::SPACE_8)
-            .align_y(Alignment::Center),
-        )
-        .padding(theme::PAD_8)
-        .style(theme::surface_container_style)
-        .width(Length::Fill)
-        .into()
-    } else if transcribing {
-        container(
-            row![
-                text("Transcribing voice message…")
-                    .size(theme::TEXT_13)
-                    .color(theme::TEXT_MUTED),
-                Space::new().width(Length::Fill),
-            ]
-            .spacing(theme::SPACE_8)
-            .align_y(Alignment::Center),
-        )
-        .padding(theme::PAD_8)
-        .style(theme::surface_container_style)
-        .width(Length::Fill)
-        .into()
-    } else {
-        Space::new().height(0).into()
-    }
+/// Cancel control for the running recording — whichever way it started: it is
+/// dropped, and the field keeps its text and attachments exactly as they are.
+#[cfg(target_os = "macos")]
+fn cancel_recording_control() -> Element<'static, HomeMessage> {
+    super::widgets::icon_tooltip_button(
+        lucide::circle_x::<iced::Theme, iced::Renderer>()
+            .size(theme::TEXT_14)
+            .color(theme::TEXT_SECONDARY),
+        "cancel recording",
+        Some(HomeMessage::StopVoiceRecordingDiscard),
+        theme::PAD_3,
+        theme::icon_button_style(false),
+        tooltip::Position::Top,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -444,9 +428,11 @@ pub enum HomeMessage {
     SendMessage,
     /// The composer's attachments are staged (or the copy failed) and the send
     /// continues here, off the update thread. `generation` names the send, so a
-    /// result for one that was cleared meanwhile delivers nothing.
+    /// result for one that was cleared meanwhile delivers nothing; `voice` is
+    /// the dictated part the message leads with, when it has one.
     Staged {
         generation: u64,
+        voice: Option<String>,
         text: String,
         attachments: Vec<super::attachment::Attachment>,
         result: Result<super::attachment::Staged, String>,
@@ -514,12 +500,15 @@ pub enum HomeMessage {
     /// Mic button clicked — start a voice message recording to the Assistant.
     #[cfg(target_os = "macos")]
     StartVoiceRecording,
-    /// Recording popup: stop recording, transcribe, and send the voice message.
-    #[cfg(target_os = "macos")]
-    StopVoiceRecordingSend,
-    /// Recording popup: stop recording and discard the voice message.
+    /// Cancel control clicked: stop the recording and discard it, leaving the
+    /// field exactly as it is.
     #[cfg(target_os = "macos")]
     StopVoiceRecordingDiscard,
+    /// Progress of a voice recording — whichever way it started: the field is
+    /// committed when it stops and the message goes out once the transcript
+    /// joins it.
+    #[cfg(target_os = "macos")]
+    VoiceRecording(RecordingEvent),
     /// The scripted onboarding exchange completed (provider configured) — re-run
     /// the onboarding check (now firing the Phase-2 kickoff).
     OnboardingScriptCompleted,
@@ -579,6 +568,62 @@ pub struct HomeState {
     /// the empty-chat hint so a failed read is never mistaken for a legitimately
     /// empty history; cleared on the next successful load.
     history_error: Option<String>,
+    /// The message a voice recording owns in the composer: a recording from its
+    /// start — the mic press or the wake word's — until the field is committed,
+    /// then the committed content until the transcript joins it (or the attempt
+    /// fails and it comes back). This is also what makes the recording the
+    /// composer's: the dot, the cancel control and the send press all read it, so
+    /// they can never disagree about whether a recording is running.
+    #[cfg(target_os = "macos")]
+    voice_message: Option<VoiceMessage>,
+    /// When the composer last posted a discarded-recording notice, for the
+    /// notice window.
+    #[cfg(target_os = "macos")]
+    voice_notice_at: Option<std::time::Instant>,
+    /// When the composer last posted a lost-message notice, for its own window:
+    /// a discard must not silence a failure.
+    #[cfg(target_os = "macos")]
+    voice_error_at: Option<std::time::Instant>,
+}
+
+/// The message a voice recording owns in the composer.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum VoiceMessage {
+    /// A recording owns the field: a press commits it, and the transcript that
+    /// follows completes the message.
+    Recording,
+    /// The press took the field's content; the message waits for the recording's
+    /// transcript (see [`HomeState::in_flight`] for what that lock means).
+    Committed {
+        /// The typed text, trimmed — the length limit applies to it alone.
+        text: String,
+        attachments: Vec<super::attachment::Attachment>,
+    },
+}
+
+/// A voice notice the composer posts, and the window it counts against — the
+/// same split the pipeline keeps between discards and failures.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum VoiceNotice {
+    /// A recording dropped for what it held (nothing said).
+    Discarded(&'static str),
+    /// A recording whose message was lost.
+    Failed(&'static str),
+}
+
+/// The content of a sent message: its dictated part first (already carrying the
+/// spoken marker), then the attachment markers, then the typed text — blank-line
+/// separated, so an ordinary send keeps its markers-then-caption shape and a
+/// voice message reads transcript → attachments → text.
+fn compose_content(voice: Option<&str>, markers: &str, text: &str) -> String {
+    voice
+        .into_iter()
+        .chain([markers, text])
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// The instant a stored timestamp names, or `None` when it is absent or not a
@@ -615,6 +660,12 @@ impl HomeState {
             drafts: crate::channels::chat_draft::DraftStore::global().clone(),
             draft_save: super::common::DebounceState::new(),
             history_error: None,
+            #[cfg(target_os = "macos")]
+            voice_message: None,
+            #[cfg(target_os = "macos")]
+            voice_notice_at: None,
+            #[cfg(target_os = "macos")]
+            voice_error_at: None,
         }
     }
 
@@ -1201,17 +1252,21 @@ impl HomeState {
             ))
         };
 
-        // One status snapshot per render, so the mic button in the composer
-        // toolbar below and the recording popup cannot disagree.
+        // The recording's own state decides the controls and the send button's
+        // empty rule — the pipeline status only says whether the mic is free.
         #[cfg(target_os = "macos")]
         let voice_status = crate::audio::voice::get_status();
+        #[cfg(target_os = "macos")]
+        let recording = matches!(self.voice_message, Some(VoiceMessage::Recording));
+        #[cfg(not(target_os = "macos"))]
+        let recording = false;
 
         // ── Input area ───────────────────────────────────────────
-        // Controls for the composer action toolbar: the mic on macOS, then the
-        // attach button — both inert while the composer is (a drain).
+        // Controls for the composer action toolbar — inert while the composer is
+        // (a drain).
         #[cfg(target_os = "macos")]
         let controls: Vec<Element<'_, HomeMessage>> =
-            vec![mic_control(&voice_status), attach_control(draining)];
+            composer_controls(&voice_status, recording, draining);
         #[cfg(not(target_os = "macos"))]
         let controls: Vec<Element<'_, HomeMessage>> = vec![attach_control(draining)];
 
@@ -1228,16 +1283,20 @@ impl HomeState {
             super::widgets::ChatComposerOptions {
                 // Input disabled during the graceful drain:
                 // sends are blocked while draining.
-                sending: self.sending || draining,
+                sending: self.in_flight() || draining,
                 // The action toolbar sits below the editor, so no reserved
                 // height is needed.
                 min_height: 44.0,
                 max_height: 330.0,
                 controls,
-                // An attachment-only message still sends: keep the button live
-                // when something is attached.
-                grey_on_empty: self.attachments.is_empty(),
-                send_tooltip: "send text message",
+                // An attachment-only message still sends, and so does a running
+                // recording (the voice is the content): keep the button live.
+                grey_on_empty: self.attachments.is_empty() && !recording,
+                send_tooltip: if recording {
+                    "stop recording and send"
+                } else {
+                    "send text message"
+                },
                 id: Some(CHAT_COMPOSER_ID),
                 attachments_on_paste: true,
             },
@@ -1269,12 +1328,6 @@ impl HomeState {
             .width(Length::Fill)
             .into();
 
-        // ── Recording popup (stop + send / stop + discard) ───────
-        #[cfg(target_os = "macos")]
-        let recording_popup = recording_popup(&voice_status);
-        #[cfg(not(target_os = "macos"))]
-        let recording_popup: Element<'_, HomeMessage> = Space::new().height(0).into();
-
         // ── Reply preview ────────────────────────────────────────
         // Shown between the message list and the composer while a reply target
         // is pending; the dismiss control cancels it.
@@ -1284,7 +1337,7 @@ impl HomeState {
         };
 
         // ── Full layout ──────────────────────────────────────────
-        column![chat_area, recording_popup, reply_preview, input_area,]
+        column![chat_area, reply_preview, input_area,]
             .align_x(Alignment::End)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1305,6 +1358,11 @@ impl HomeState {
         if self.pending_focus {
             subs.push(iced::time::every(FOCUS_TICK).map(|_| HomeMessage::FocusComposerOnce));
         }
+
+        // A running recording's progress — the dot pulses on its own clock, so
+        // no tick subscription is needed.
+        #[cfg(target_os = "macos")]
+        subs.push(iced::Subscription::run(voice_recording_stream));
 
         iced::Subscription::batch(subs)
     }
@@ -1375,13 +1433,16 @@ impl HomeState {
             HomeMessage::SendMessage => self.send_message(),
             HomeMessage::Staged {
                 generation,
+                voice,
                 text,
                 attachments,
                 result,
             } => {
                 if generation != self.sending_gen {
                     // A send cleared while its copy ran: nothing will deliver
-                    // it, so the staged copy goes back and the files with it.
+                    // it, so the staged copy goes back and the files with it. A
+                    // dictated part it carried goes with the conversation the
+                    // user cleared.
                     if let Ok(staged) = &result {
                         discard_staged(staged.dirs.clone());
                     }
@@ -1389,15 +1450,18 @@ impl HomeState {
                     return Task::none();
                 }
                 match result {
-                    Ok(staged) => self.deliver(&text, staged, attachments),
+                    Ok(staged) => self.deliver(voice.as_deref(), &text, staged, attachments),
                     Err(error) => {
                         // Nothing of this send reached the transcript, so no
-                        // bubble to remove.
-                        let restored = self.restore_send(&text, attachments, None);
-                        Task::batch([
-                            restored,
-                            Task::done(HomeMessage::Toast(ToastMessage::Warning(error))),
-                        ])
+                        // bubble to remove — and a dictated part it carried is
+                        // gone with it.
+                        self.send_failed(
+                            &text,
+                            attachments,
+                            None,
+                            voice.is_some(),
+                            HomeMessage::Toast(ToastMessage::Warning(error)),
+                        )
                     }
                 }
             }
@@ -1428,6 +1492,17 @@ impl HomeState {
                 self.messages.clear();
                 self.seen_ids.clear();
                 self.sending = false;
+                // A voice message the cleared conversation was waiting for goes
+                // with it: its transcript must not deliver into the fresh one. A
+                // recording still capturing ends here too — its cancel control
+                // went with the chat, so leaving it running would record into
+                // nothing that could stop it.
+                #[cfg(target_os = "macos")]
+                if let Some(VoiceMessage::Recording) = std::mem::take(&mut self.voice_message) {
+                    crate::audio::voice::send_command(
+                        crate::audio::voice::VoiceCommand::StopRecordingDiscard,
+                    );
+                }
                 // A copy staged for the conversation being cleared must not
                 // deliver into the fresh one; its generation no longer matches.
                 self.sending_gen = self.sending_gen.wrapping_add(1);
@@ -1677,32 +1752,49 @@ impl HomeState {
             }
             #[cfg(target_os = "macos")]
             HomeMessage::StartVoiceRecording => {
+                // A window the composer already owns belongs to a running
+                // recording — whichever way it started — so this press adds
+                // nothing to it.
+                if self.voice_message.is_some() {
+                    return Task::none();
+                }
                 // Best-effort pre-flight check surfaced by the pipeline itself
                 // (single source of truth for the blocked-state mapping). The
                 // pipeline remains the authoritative guard — this predicate can
                 // drift on transient transitions but covers the common cases.
-                if let Some(msg) = crate::audio::voice::manual_recording_blocked_reason() {
+                if let Some(msg) = crate::audio::voice::recording_blocked_reason() {
                     return Task::done(HomeMessage::Toast(ToastMessage::Warning(msg.to_string())));
                 }
-                crate::audio::voice::send_command(
+                // The recording's message owns the field from here: a press
+                // commits it, and the pipeline's outcome resolves it. With no
+                // pipeline to record, nothing owns anything.
+                if !crate::audio::voice::send_command(
                     crate::audio::voice::VoiceCommand::StartRecording,
-                );
-                Task::none()
-            }
-            #[cfg(target_os = "macos")]
-            HomeMessage::StopVoiceRecordingSend => {
-                crate::audio::voice::send_command(
-                    crate::audio::voice::VoiceCommand::StopRecordingSend,
-                );
+                ) {
+                    return Task::none();
+                }
+                self.voice_message = Some(VoiceMessage::Recording);
                 Task::none()
             }
             #[cfg(target_os = "macos")]
             HomeMessage::StopVoiceRecordingDiscard => {
+                // Only a still-capturing recording can be discarded: once the
+                // field is committed to its message, dropping the audio would
+                // strand that message.
+                if !matches!(self.voice_message, Some(VoiceMessage::Recording)) {
+                    return Task::none();
+                }
+                // The composer drops its own message window, so nothing waits
+                // for this recording's outcome — and with the window gone, so is
+                // this control: it can never be left dead over a live recording.
+                self.voice_message = None;
                 crate::audio::voice::send_command(
                     crate::audio::voice::VoiceCommand::StopRecordingDiscard,
                 );
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
+            HomeMessage::VoiceRecording(event) => self.voice_recording(event),
             HomeMessage::OnboardingScriptCompleted => {
                 self.sending = false;
                 self.onboarding_script_active = false;
@@ -1716,50 +1808,107 @@ impl HomeState {
         }
     }
 
-    /// Validate the composer and send it through the GUI channel. Staging the
-    /// attachments copies up to the product's file cap, so it runs as a task
-    /// and the send continues in [`HomeMessage::Staged`].
+    /// Send button or Enter in the editor. While a recording owns the field —
+    /// whichever way it started — the press belongs to its message (see
+    /// [`Self::send_voice_message`]).
     fn send_message(&mut self) -> Task<HomeMessage> {
+        #[cfg(target_os = "macos")]
+        if self.voice_message.is_some() {
+            return self.send_voice_message();
+        }
+        let (text, attachments) = match self.take_composer_content(false) {
+            Ok(taken) => taken,
+            Err(task) => return task,
+        };
+        self.send_taken(None, text, attachments)
+    }
+
+    /// A press while a recording owns the field: commit what it holds — the
+    /// message is on its way with the field's content from this moment — and stop
+    /// the recording, so its transcript joins that one message. A press after the
+    /// commit finds the message already in flight and does nothing.
+    #[cfg(target_os = "macos")]
+    fn send_voice_message(&mut self) -> Task<HomeMessage> {
+        if matches!(self.voice_message, Some(VoiceMessage::Committed { .. })) {
+            return Task::none();
+        }
+        if let Err(refusal) = self.commit_voice_content() {
+            // The field keeps its content, and a recording still capturing can
+            // carry it on a later press.
+            return refusal;
+        }
+        if crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::StopRecordingSend) {
+            return Task::none();
+        }
+        // Nothing took the stop, so no transcript will ever join the committed
+        // message: give the field back and say the voice part is gone.
+        if let Some(VoiceMessage::Committed { text, attachments }) = self.voice_message.take() {
+            return self.send_failed(&text, attachments, None, true, Self::send_refused_toast());
+        }
+        Task::none()
+    }
+
+    /// Commit the field to the recording's message: its content leaves the
+    /// composer and waits for the transcript. Idempotent — a window that is
+    /// already resolved is left alone, so the recording's own stop after a press
+    /// finds it done.
+    #[cfg(target_os = "macos")]
+    fn commit_voice_content(&mut self) -> Result<(), Task<HomeMessage>> {
+        if !matches!(self.voice_message, Some(VoiceMessage::Recording)) {
+            return Ok(());
+        }
+        let (text, attachments) = self.take_composer_content(true)?;
+        self.voice_message = Some(VoiceMessage::Committed { text, attachments });
+        Ok(())
+    }
+
+    /// Take the composer's content for a send: validate it and empty the field.
+    /// `has_voice` says the send carries a dictated part, which is content on its
+    /// own — a recording that captured nothing typed or attached still sends
+    /// itself.
+    fn take_composer_content(
+        &mut self,
+        has_voice: bool,
+    ) -> Result<(String, Vec<super::attachment::Attachment>), Task<HomeMessage>> {
         let text = self.editor_content.text();
-        let trimmed = match super::common::send_guard(
+        let trimmed = super::common::send_guard(
             &text,
-            self.sending,
-            // Attachments alone are a message; the length limit applies to the
-            // typed text only.
+            self.in_flight(),
+            // Attachments alone are a message, and so is a recording; the length
+            // limit applies to the typed text only.
             super::common::SendRules::Chat {
-                has_attachments: !self.attachments.is_empty(),
+                has_content: has_voice || !self.attachments.is_empty(),
             },
             |count| {
                 Task::done(HomeMessage::Toast(ToastMessage::Warning(format!(
                     "Message too long: {count} characters (maximum {MAX_INPUT_CHARS}). Please shorten your message and try again."
                 ))))
             },
-        ) {
-            Ok(t) => t,
-            Err(task) => return task,
-        };
+        )?;
 
         // Guard against sending without a selected workspace.
         if self.selected_workspace.is_none() {
             tracing::warn!("Home: attempted to send message without a workspace selected");
-            return Task::none();
+            return Err(Task::none());
         }
 
         // The scripted setup exchange reads the provider's settings and never
         // reaches the pipeline, so nothing attached could be delivered from it.
         if self.onboarding_script_active && !self.attachments.is_empty() {
-            return Task::done(HomeMessage::Toast(ToastMessage::Warning(
+            return Err(Task::done(HomeMessage::Toast(ToastMessage::Warning(
                 "Attachments cannot be sent during setup. Remove them to continue.".to_string(),
-            )));
+            ))));
         }
 
-        // A command is read from the message's first character, so an
-        // attachment's marker block must not be put in front of one.
-        if !self.attachments.is_empty() && trimmed.starts_with('/') {
-            return Task::done(HomeMessage::Toast(ToastMessage::Warning(
+        // A command is read from the message's first character, and a
+        // message's attachment markers lead its text. A dictated part needs no
+        // guard: the composed message opens with the spoken marker, so nothing
+        // reads it as a command.
+        if trimmed.starts_with('/') && !self.attachments.is_empty() {
+            return Err(Task::done(HomeMessage::Toast(ToastMessage::Warning(
                 "A command cannot carry attachments. Send them in a message of their own."
                     .to_string(),
-            )));
+            ))));
         }
 
         // The send owns its text and files from here on: clearing the composer
@@ -1768,12 +1917,29 @@ impl HomeState {
         self.editor_content.clear();
         self.undo_stack.clear();
         self.drop_draft();
-        self.sending = true;
-        let trimmed = trimmed.to_string();
-        let attachments = std::mem::take(&mut self.attachments);
+        Ok((trimmed.to_string(), std::mem::take(&mut self.attachments)))
+    }
 
+    /// Stage a taken send's attachments and hand the message to the pipeline.
+    /// Staging copies up to the product's file cap, so it runs as a task and the
+    /// send continues in [`HomeMessage::Staged`]; `voice` is the dictated part
+    /// the message leads with, when it has one.
+    fn send_taken(
+        &mut self,
+        voice: Option<String>,
+        text: String,
+        attachments: Vec<super::attachment::Attachment>,
+    ) -> Task<HomeMessage> {
+        // The send is in flight from here: the composer stays locked through the
+        // copy and until the message is acknowledged.
+        self.sending = true;
         if attachments.is_empty() {
-            return self.deliver(&trimmed, super::attachment::Staged::default(), attachments);
+            return self.deliver(
+                voice.as_deref(),
+                &text,
+                super::attachment::Staged::default(),
+                attachments,
+            );
         }
 
         // Up to the attachment size cap is copied here: stage it off the update
@@ -1789,12 +1955,31 @@ impl HomeState {
                 async move { super::attachment::stage(&staging).await },
                 move |result| HomeMessage::Staged {
                     generation,
-                    text: trimmed,
+                    voice,
+                    text,
                     attachments,
                     result,
                 },
             ),
         ])
+    }
+
+    /// Whether a send is in flight from the composer: an ordinary one, or a
+    /// voice message whose transcript has not arrived yet.
+    ///
+    /// A voice send puts nothing on the wire until its transcript joins it, so
+    /// `sending` — which the admin's own message echo clears — cannot stand for
+    /// that window; the committed message keeps the composer locked instead, with
+    /// no timeout, because transcribing may take as long as the recording did.
+    fn in_flight(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.sending || matches!(self.voice_message, Some(VoiceMessage::Committed { .. }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.sending
+        }
     }
 
     /// Put a send's attachments back in front of anything attached since.
@@ -1837,32 +2022,23 @@ impl HomeState {
         refused_toast(refused)
     }
 
-    /// Hand a validated message to the pipeline: markers plus text as the
-    /// content, an optimistic bubble, and the pending reply cleared once it is
-    /// queued. The composer was cleared when the send started, so every way out
-    /// of here that is not a queued send gives the text and the attachments back
-    /// ([`Self::restore_send`]).
+    /// Hand a validated message to the pipeline: its content (see
+    /// [`compose_content`]), an optimistic bubble, and the pending reply cleared
+    /// once it is queued. The composer was cleared when the send started, so
+    /// every way out of here that is not a queued send gives the text and the
+    /// attachments back ([`Self::restore_send`]) — the dictated part cannot come
+    /// back, and its loss is reported.
     fn deliver(
         &mut self,
+        voice: Option<&str>,
         trimmed: &str,
         staged: super::attachment::Staged,
         attachments: Vec<super::attachment::Attachment>,
     ) -> Task<HomeMessage> {
         let sender = crate::users::ADMIN_USER_NAME.to_string();
-        // The message is in flight from here, even if the copy outlived the
-        // send's own timeout.
-        self.sending = true;
 
-        // Telegram's own marker-then-caption shape: the markers first, then a
-        // blank line and the typed text.
         let super::attachment::Staged { dirs, markers } = staged;
-        let content = if markers.is_empty() {
-            trimmed.to_string()
-        } else if trimmed.is_empty() {
-            markers
-        } else {
-            format!("{markers}\n\n{trimmed}")
-        };
+        let content = compose_content(voice, &markers, trimmed);
 
         // Generate an optimistic ID for non-command messages so the Home page
         // can display the user's message immediately and replace it when the
@@ -1933,6 +2109,7 @@ impl HomeState {
             attachment_dirs: dirs,
             optimistic_id,
             reply_reference: reply,
+            dictated: voice.is_some(),
             ..Default::default()
         };
 
@@ -1942,22 +2119,24 @@ impl HomeState {
         let Some(tx) = crate::GUI_MESSAGE_TX.get() else {
             tracing::error!("Home: GUI_MESSAGE_TX not initialized");
             discard_staged(msg.attachment_dirs);
-            return Task::batch([
-                self.restore_send(trimmed, attachments, msg.optimistic_id.as_deref()),
-                Task::done(HomeMessage::Toast(ToastMessage::Error(
-                    "The message could not be sent. Try again.".to_string(),
-                ))),
-            ]);
+            return self.send_failed(
+                trimmed,
+                attachments,
+                msg.optimistic_id.as_deref(),
+                voice.is_some(),
+                Self::send_refused_toast(),
+            );
         };
         if let Err(error) = tx.send(msg) {
             tracing::error!("Home: failed to send message via GUI_MESSAGE_TX: {error}");
             discard_staged(error.0.attachment_dirs);
-            return Task::batch([
-                self.restore_send(trimmed, attachments, error.0.optimistic_id.as_deref()),
-                Task::done(HomeMessage::Toast(ToastMessage::Error(
-                    "The message could not be sent. Try again.".to_string(),
-                ))),
-            ]);
+            return self.send_failed(
+                trimmed,
+                attachments,
+                error.0.optimistic_id.as_deref(),
+                voice.is_some(),
+                Self::send_refused_toast(),
+            );
         }
 
         // The send was queued: drop the pending reply so the preview clears.
@@ -1965,6 +2144,146 @@ impl HomeState {
 
         // Snap to end on optimistic push if auto-scroll enabled.
         Task::batch([self.sending_timeout_task(), self.maybe_snap()])
+    }
+
+    /// Give a send that could not go out back to the composer, report `why`, and
+    /// — when it carried a dictated part, which no other message can carry —
+    /// report that loss too.
+    fn send_failed(
+        &mut self,
+        text: &str,
+        attachments: Vec<super::attachment::Attachment>,
+        optimistic_id: Option<&str>,
+        has_voice: bool,
+        why: HomeMessage,
+    ) -> Task<HomeMessage> {
+        let restored = self.restore_send(text, attachments, optimistic_id);
+        #[cfg(target_os = "macos")]
+        let lost = if has_voice {
+            self.voice_notice(VoiceNotice::Failed(
+                crate::audio::voice::VOICE_UNSENT_NOTICE,
+            ))
+        } else {
+            Task::none()
+        };
+        // Nothing dictated exists off macOS: `has_voice` is always false here.
+        #[cfg(not(target_os = "macos"))]
+        let lost = {
+            let _ = has_voice;
+            Task::none()
+        };
+        Task::batch([restored, Task::done(why), lost])
+    }
+
+    /// The toast for a send that could not reach the pipeline.
+    fn send_refused_toast() -> HomeMessage {
+        HomeMessage::Toast(ToastMessage::Error(
+            "The message could not be sent. Try again.".to_string(),
+        ))
+    }
+
+    /// Report a recording's outcome in the conversation, at most one of its
+    /// class per [`crate::audio::voice::NOTICE_INTERVAL`] — the windows the
+    /// pipeline's own notices keep, so a rapid repeat cannot become a stream and
+    /// a discard cannot silence a failure.
+    #[cfg(target_os = "macos")]
+    fn voice_notice(&mut self, notice: VoiceNotice) -> Task<HomeMessage> {
+        let (at, message) = match notice {
+            VoiceNotice::Discarded(message) => (&mut self.voice_notice_at, message),
+            VoiceNotice::Failed(message) => (&mut self.voice_error_at, message),
+        };
+        if at.is_some_and(|last| last.elapsed() < crate::audio::voice::NOTICE_INTERVAL) {
+            return Task::none();
+        }
+        *at = Some(std::time::Instant::now());
+        Task::future(crate::audio::voice::broadcast_notice(message)).discard()
+    }
+
+    /// Take in a voice recording's progress. Every outcome resolves the message
+    /// the recording owns: the transcript completes it, a silent recording leaves
+    /// only the field's own content to send, and a lost one gives the field back
+    /// and says why.
+    #[cfg(target_os = "macos")]
+    fn voice_recording(&mut self, event: RecordingEvent) -> Task<HomeMessage> {
+        match event {
+            // A recording began — the wake word's; a mic press opens the window
+            // itself. One message at a time: a window still committed to an
+            // earlier recording cannot take a second transcript, so this
+            // recording is dropped rather than poured into that message.
+            RecordingEvent::Started => {
+                if matches!(self.voice_message, Some(VoiceMessage::Committed { .. })) {
+                    crate::audio::voice::send_command(
+                        crate::audio::voice::VoiceCommand::StopRecordingDiscard,
+                    );
+                } else if self.voice_message.is_none() {
+                    self.voice_message = Some(VoiceMessage::Recording);
+                }
+                Task::none()
+            }
+            // A stopped recording: a press committed the field already, and both
+            // the ten-minute cap and the wake word's silence end stop one no press
+            // did. A refused commit keeps the field — the loss is reported when
+            // the transcript has nowhere to go.
+            RecordingEvent::Stopped => match self.commit_voice_content() {
+                Ok(()) => Task::none(),
+                Err(refusal) => refusal,
+            },
+            RecordingEvent::Transcript(transcript) => match self.voice_message.take() {
+                Some(VoiceMessage::Committed { text, attachments }) => {
+                    self.send_taken(Some(transcript), text, attachments)
+                }
+                // The press was refused (too long, no workspace): the words
+                // exist only in this recording.
+                Some(VoiceMessage::Recording) => self.voice_notice(VoiceNotice::Failed(
+                    crate::audio::voice::VOICE_UNSENT_NOTICE,
+                )),
+                None => Task::none(),
+            },
+            // The recording caught nothing to say: the field's own content, if
+            // it holds any, goes out as an ordinary message, and an empty one is
+            // told the recording was discarded.
+            RecordingEvent::NoSpeech => {
+                self.send_without_words(Some(crate::audio::voice::NO_SPEECH_NOTICE))
+            }
+            RecordingEvent::Failed(notice) => match self.voice_message.take() {
+                Some(VoiceMessage::Committed { text, attachments }) => {
+                    let restored = self.restore_send(&text, attachments, None);
+                    Task::batch([restored, self.voice_notice(VoiceNotice::Failed(notice))])
+                }
+                // The field was never committed: only the recording is lost, and
+                // the notice names why.
+                Some(VoiceMessage::Recording) => self.voice_notice(VoiceNotice::Failed(notice)),
+                // The message went with a cleared chat; the user cleared the
+                // conversation on purpose.
+                None => Task::none(),
+            },
+            // A start that did not take: the window it opened closes, and a
+            // message a press already committed can never get a transcript. The
+            // recording contributed nothing, so the field's own content goes out
+            // — and the pipeline's own notice already said why it never began.
+            RecordingEvent::NotStarted => self.send_without_words(None),
+        }
+    }
+
+    /// Resolve a recording that brought no words: what the press committed goes
+    /// out as an ordinary message, and a message with nothing in it is reported
+    /// as a discarded recording only when `discard` names the notice.
+    #[cfg(target_os = "macos")]
+    fn send_without_words(&mut self, discard: Option<&'static str>) -> Task<HomeMessage> {
+        match self.voice_message.take() {
+            Some(VoiceMessage::Committed { text, attachments })
+                if !text.is_empty() || !attachments.is_empty() =>
+            {
+                self.send_taken(None, text, attachments)
+            }
+            Some(VoiceMessage::Committed { .. }) => match discard {
+                Some(notice) => self.voice_notice(VoiceNotice::Discarded(notice)),
+                None => Task::none(),
+            },
+            // Nothing was committed: the field keeps its own content and lost
+            // nothing.
+            Some(VoiceMessage::Recording) | None => Task::none(),
+        }
     }
 
     /// Arm the 30-second SendingTimeout guard: if `sending` stays true for 30
@@ -2071,6 +2390,22 @@ fn chat_stream_producer() -> impl futures_util::Stream<Item = HomeMessage> {
     })
 }
 
+/// Stream producer for a voice recording's progress: the composer commits
+/// the field as the recording stops and completes the message once the
+/// transcript is known.
+#[cfg(target_os = "macos")]
+fn voice_recording_stream() -> impl futures_util::Stream<Item = HomeMessage> {
+    super::common::broadcast_stream_producer(16, &crate::audio::voice::RECORDING, |output, item| {
+        // A lagged stream loses no press: the events are one per recording
+        // and the channel is far larger than that.
+        Box::pin(async move {
+            if let Some(event) = item {
+                let _ = output.send(HomeMessage::VoiceRecording(event)).await;
+            }
+        })
+    })
+}
+
 /// Emit `TypingTick` every 500ms for the typing indicator animation.
 fn typing_tick() -> impl futures_util::Stream<Item = HomeMessage> {
     iced::stream::channel(
@@ -2091,6 +2426,21 @@ mod tests {
     use super::super::editor_widget::{EditorAction, EditorBuffer};
     use super::super::highlight::HighlightLanguage;
     use super::*;
+
+    /// A voice message leads with its dictated part, then the attachments, then
+    /// the typed text — and an ordinary send keeps its markers-then-text shape.
+    #[test]
+    fn a_sent_message_orders_its_dictated_part_first() {
+        assert_eq!(compose_content(Some("🔊✍️ spoken"), "", ""), "🔊✍️ spoken");
+        assert_eq!(
+            compose_content(Some("🔊✍️ spoken"), "[IMAGE:/a.png]", "typed"),
+            "🔊✍️ spoken\n\n[IMAGE:/a.png]\n\ntyped"
+        );
+        assert_eq!(
+            compose_content(None, "[IMAGE:/a.png]", "typed"),
+            "[IMAGE:/a.png]\n\ntyped"
+        );
+    }
 
     // ------------------------------------------------------------------
     // Helpers
@@ -3191,6 +3541,231 @@ mod tests {
         assert!(
             !state.messages.iter().any(|m| m.is_optimistic),
             "a send that never reached the pipeline leaves no optimistic bubble"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Voice recording outcomes
+    // ------------------------------------------------------------------
+
+    /// Put the composer where a mic press leaves it: a recording owns the field,
+    /// which holds `text`. The returned receiver stands in for the pipeline that
+    /// took the start, so a press's stop is taken too.
+    #[cfg(target_os = "macos")]
+    fn a_recording_owns_the_field(
+        state: &mut HomeState,
+        text: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::audio::voice::VoiceCommand> {
+        state.editor_content = EditorBuffer::with_text(text, Some(HighlightLanguage::Markdown));
+        state.voice_message = Some(VoiceMessage::Recording);
+        crate::audio::voice::install_test_command_receiver()
+    }
+
+    /// The text the recording's message holds, when the field was committed to it.
+    #[cfg(target_os = "macos")]
+    fn committed_text(state: &HomeState) -> Option<&str> {
+        match &state.voice_message {
+            Some(VoiceMessage::Committed { text, .. }) => Some(text),
+            _ => None,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_wake_word_recording_takes_the_field_and_its_controls() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = crate::audio::voice::install_test_command_receiver();
+        state.editor_content = EditorBuffer::with_text("hello", Some(HighlightLanguage::Markdown));
+
+        // The pipeline started the recording by voice: no press of ours did.
+        let _started = state.voice_recording(RecordingEvent::Started);
+
+        assert!(
+            matches!(state.voice_message, Some(VoiceMessage::Recording)),
+            "the field belongs to the recording"
+        );
+        assert!(!state.editor_content.text().is_empty(), "the field is kept");
+
+        // A press belongs to that recording's message, and the field joins it.
+        let _press = state.send_message();
+
+        assert!(state.editor_content.text().is_empty(), "the field is taken");
+        assert_eq!(committed_text(&state), Some("hello"));
+        assert!(state.in_flight(), "the message is on its way");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_press_commits_the_field_to_the_recording_message() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
+
+        let _task = state.send_message();
+
+        assert!(state.editor_content.text().is_empty(), "the field is taken");
+        assert_eq!(committed_text(&state), Some("hello"));
+        assert!(state.in_flight(), "the message is on its way");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_press_after_the_commit_does_nothing() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
+        let _first = state.send_message();
+
+        state.editor_content =
+            EditorBuffer::with_text("typed since", Some(HighlightLanguage::Markdown));
+        let _second = state.send_message();
+
+        assert_eq!(
+            committed_text(&state),
+            Some("hello"),
+            "the message is fixed"
+        );
+        assert_eq!(
+            state.editor_content.text(),
+            "typed since",
+            "the field keeps what was typed since"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_transcript_completes_the_committed_message() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
+        let _press = state.send_message();
+
+        let _task = state.voice_recording(RecordingEvent::Transcript("🔊✍️ spoken".to_string()));
+
+        assert!(state.voice_message.is_none(), "the message is resolved");
+        // No pipeline takes a send in a test, so the composed message — the
+        // transcript leading the field's content — comes back, and the voice part
+        // it carried is reported lost.
+        assert_eq!(state.editor_content.text(), "hello");
+        assert!(state.voice_error_at.is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_silent_recording_sends_only_what_the_field_held() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
+        let _press = state.send_message();
+
+        let _stopped = state.voice_recording(RecordingEvent::Stopped);
+        let _task = state.voice_recording(RecordingEvent::NoSpeech);
+
+        assert!(state.voice_message.is_none());
+        assert_eq!(
+            state.editor_content.text(),
+            "hello",
+            "the field's own content was the message"
+        );
+        assert!(
+            state.voice_notice_at.is_none(),
+            "content went out: no discard notice"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_silent_recording_of_an_empty_field_reports_the_discard() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = a_recording_owns_the_field(&mut state, "");
+
+        let _stopped = state.voice_recording(RecordingEvent::Stopped);
+        let _task = state.voice_recording(RecordingEvent::NoSpeech);
+
+        assert!(state.voice_message.is_none());
+        assert!(state.voice_notice_at.is_some(), "the discard is reported");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_lost_recording_gives_the_field_back() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
+        let _press = state.send_message();
+
+        let _task = state.voice_recording(RecordingEvent::Failed(
+            crate::audio::voice::VOICE_UNSENT_NOTICE,
+        ));
+
+        assert!(state.voice_message.is_none());
+        assert_eq!(state.editor_content.text(), "hello", "the field comes back");
+        assert!(!state.sending);
+        assert!(state.voice_error_at.is_some(), "the loss is reported");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_recording_that_never_started_closes_its_message() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
+
+        let _task = state.voice_recording(RecordingEvent::NotStarted);
+
+        assert!(state.voice_message.is_none());
+        assert_eq!(
+            state.editor_content.text(),
+            "hello",
+            "the field is untouched"
+        );
+        assert_eq!((state.voice_notice_at, state.voice_error_at), (None, None));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_press_whose_recording_never_began_sends_the_field_it_committed() {
+        let mut state = make_home_state("ws1");
+        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
+        let _press = state.send_message();
+        assert!(state.editor_content.text().is_empty(), "the press took it");
+
+        // The pipeline never started the recording, so no transcript can join
+        // the committed message: the field's own content goes out as any typed
+        // message does — and comes back whole, since no pipeline takes the send.
+        let _task = state.voice_recording(RecordingEvent::NotStarted);
+
+        assert!(state.voice_message.is_none(), "the window is resolved");
+        assert_eq!(state.editor_content.text(), "hello");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial(voice)]
+    fn a_recording_never_shares_a_committed_message() {
+        let mut state = make_home_state("ws1");
+        let mut pipeline = a_recording_owns_the_field(&mut state, "hello");
+        let _press = state.send_message();
+        while pipeline.try_recv().is_ok() {}
+
+        // A wake-word recording fires while the earlier message still waits for
+        // its own transcript: it is dropped rather than poured into that message.
+        let _started = state.voice_recording(RecordingEvent::Started);
+
+        assert_eq!(
+            committed_text(&state),
+            Some("hello"),
+            "the earlier message keeps its window"
+        );
+        assert!(
+            matches!(
+                pipeline.try_recv(),
+                Ok(crate::audio::voice::VoiceCommand::StopRecordingDiscard)
+            ),
+            "the second recording is dropped"
         );
     }
 }

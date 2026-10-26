@@ -3485,6 +3485,7 @@ fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -
         update_date: None,
         forwarded: false,
         update_ids: Vec::new(),
+        dictated: false,
     }
 }
 

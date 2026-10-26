@@ -639,6 +639,11 @@ pub struct ChannelMessage {
     /// to the pipeline, so an event it never handed on stays held for a later run
     /// to take up. Empty for every other channel. One level deep, like `parts`.
     pub update_ids: Vec<i64>,
+    /// True when `content` carries a dictated part (a voice recording's
+    /// transcript, which leads the message). Everything treats the message as
+    /// any typed one; the only difference is the dispatch log line, which names
+    /// such a message without its content — spoken words stay out of the logs.
+    pub dictated: bool,
 }
 
 /// An outbound message to deliver on a channel.
