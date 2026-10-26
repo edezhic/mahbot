@@ -3376,12 +3376,11 @@ impl Dashboard {
     }
 
     /// The rail's voice status, standing in for the footer bar's label while the
-    /// footer is hidden: an `ear` while the microphone side is active, a
-    /// `pen-line` while a transcription runs, and the bar's own wording as the
-    /// tooltip. The bar's resting label is the one state the rail leaves out — an
-    /// idle listener is the normal condition, not something to report from the
-    /// navigation — and an empty slot then keeps its place, so no status change
-    /// rebuilds the column below it.
+    /// footer is hidden: the status's glyph (see [`Self::voice_status_icon`]) with
+    /// the bar's own wording as its tooltip. The bar's resting label is the one
+    /// state the rail leaves out — an idle listener is the normal condition, not
+    /// something to report from the navigation — and an empty slot then keeps its
+    /// place, so no status change rebuilds the column below it.
     #[cfg(target_os = "macos")]
     fn render_sidebar_voice() -> Element<'static, Message> {
         let status = crate::audio::voice::get_status();
@@ -3391,12 +3390,14 @@ impl Dashboard {
         let Some(label) = Self::voice_status_label(&status) else {
             return Space::new().height(0).into();
         };
-        let icon = if matches!(status, VoiceStatus::Transcribing) {
-            lucide::pen_line::<iced::Theme, iced::Renderer>()
-        } else {
-            lucide::ear::<iced::Theme, iced::Renderer>()
-        };
-        Self::sidebar_rail_item(icon.size(28).color(theme::TEXT_MUTED).into(), label, None)
+        Self::sidebar_rail_item(
+            Self::voice_status_icon(&status)
+                .size(28)
+                .color(theme::TEXT_MUTED)
+                .into(),
+            label,
+            None,
+        )
     }
 
     /// No audio subsystem, so no voice status to report.
@@ -3957,11 +3958,12 @@ impl Dashboard {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (progress * 100.0).round() as u32;
         let label = format!("TTS: {file_name} {pct}%");
-        footer_status_label(label)
+        footer_status_label(label, None)
     }
 
-    /// The footer bar's wording for a [`VoiceStatus`], without the speaker glyph
-    /// the bar draws in front of it. `None` for voice off, which the bar hides.
+    /// The wording for a [`VoiceStatus`], shared by the footer bar's label and
+    /// the rail's tooltip, without the glyph [`Self::voice_status_icon`] draws in
+    /// front of it. `None` for voice off, which both surfaces hide.
     #[cfg(target_os = "macos")]
     fn voice_status_label(status: &VoiceStatus) -> Option<String> {
         Some(match status {
@@ -3990,17 +3992,32 @@ impl Dashboard {
         })
     }
 
-    /// Render a compact voice status indicator in the footer bar.
+    /// Render a compact voice status indicator in the footer bar: the status's
+    /// glyph in front of its wording (see [`Self::voice_status_icon`]).
     ///
     /// Shows a compact indicator for every [`VoiceStatus`] the shared label
     /// covers (see [`Self::voice_status_label`]); [`VoiceStatus::Error`]
     /// displays the actual error string rather than a hardcoded message.
     #[cfg(target_os = "macos")]
     fn render_voice_status() -> Element<'static, Message> {
-        let Some(label) = Self::voice_status_label(&crate::audio::voice::get_status()) else {
+        let status = crate::audio::voice::get_status();
+        let Some(label) = Self::voice_status_label(&status) else {
             return Space::new().width(0).into();
         };
-        footer_status_label(format!("🔊 {label}"))
+        footer_status_label(label, Some(Self::voice_status_icon(&status)))
+    }
+
+    /// The glyph drawn in front of a [`VoiceStatus`]: `ear` for the microphone
+    /// side, `pen-line` while a recording is being transcribed.
+    #[cfg(target_os = "macos")]
+    fn voice_status_icon(
+        status: &VoiceStatus,
+    ) -> iced::widget::text::Text<'static, iced::Theme, iced::Renderer> {
+        if matches!(status, VoiceStatus::Transcribing) {
+            lucide::pen_line::<iced::Theme, iced::Renderer>()
+        } else {
+            lucide::ear::<iced::Theme, iced::Renderer>()
+        }
     }
 
     /// 42px footer bar — update/picker/toggle chrome (left) and active
@@ -4061,16 +4078,29 @@ impl Dashboard {
     }
 }
 
-/// Muted 12px status label with side padding, shown in the centre of the footer bar.
+/// Muted 12px status label with side padding, shown in the centre of the footer
+/// bar, with an optional glyph in front of it.
 #[cfg(target_os = "macos")]
-fn footer_status_label(label: String) -> Element<'static, Message> {
-    container(
-        text(label)
-            .size(theme::TEXT_12)
-            .color(theme::TEXT_SECONDARY),
-    )
-    .padding([0.0, theme::PAD_12])
-    .into()
+fn footer_status_label(
+    label: String,
+    icon: Option<iced::widget::text::Text<'static, iced::Theme, iced::Renderer>>,
+) -> Element<'static, Message> {
+    let label = text(label)
+        .size(theme::TEXT_12)
+        .color(theme::TEXT_SECONDARY);
+    let content: Element<'static, Message> = match icon {
+        Some(icon) => Row::with_children(vec![
+            icon.size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+            label.into(),
+        ])
+        .spacing(theme::SPACE_3)
+        .align_y(Alignment::Center)
+        .into(),
+        None => label.into(),
+    };
+    container(content).padding([0.0, theme::PAD_12]).into()
 }
 
 /// Persisted window geometry: the last size and position the window reported.
