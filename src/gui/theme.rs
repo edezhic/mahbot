@@ -579,14 +579,16 @@ pub fn vertical_scrollbar() -> scrollable::Direction {
     scrollable::Direction::Vertical(thin_scrollbar())
 }
 
-/// Returns a horizontal [`scrollable::Direction`] with the thin scrollbar.
+/// Returns a horizontal [`scrollable::Direction`] with the thin scrollbar,
+/// embedded (zero spacing) so the rail occupies layout space at the bottom of
+/// the scrollable — iced reserves it only while the content overflows, so a
+/// strip that fits carries no rail band under it.
 ///
 /// Convenience wrapper around [`thin_scrollbar`] — prefer this over
-/// spelling out `scrollable::Direction::Horizontal(theme::thin_scrollbar())`
-/// at every call site.
+/// spelling out `scrollable::Direction::Horizontal(...)` at every call site.
 #[must_use]
 pub fn horizontal_scrollbar() -> scrollable::Direction {
-    scrollable::Direction::Horizontal(thin_scrollbar())
+    scrollable::Direction::Horizontal(thin_scrollbar().spacing(0.0))
 }
 
 /// Standard scrollbar style for the dark Flexoki theme.
@@ -680,6 +682,14 @@ pub fn icon_button_style(
     disabled: bool,
 ) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
     transparent_button_style(HOVER_STRONG, ACCENT_DIM, 6.0, disabled)
+}
+
+/// Label color for editor/shell tab bars: [`ACCENT`] on the active tab,
+/// [`TEXT_SECONDARY`] on the inactive ones — readable at a glance while the
+/// active tab still stands out by hue and by its [`BG_ELEVATED`] background.
+#[must_use]
+pub fn tab_label_color(is_active: bool) -> Color {
+    if is_active { ACCENT } else { TEXT_SECONDARY }
 }
 
 /// Tab-button style for editor/shell tab bars: active tabs use [`BG_ELEVATED`],

@@ -369,11 +369,7 @@ impl ShellState {
         for (i, tab) in ws_state.tabs.iter().enumerate() {
             let is_active = i == ws_state.active_idx;
 
-            let name_color = if is_active {
-                theme::ACCENT
-            } else {
-                theme::TEXT_FAINT
-            };
+            let name_color = theme::tab_label_color(is_active);
             let name_text = text(&tab.label).size(theme::TEXT_12).color(name_color);
 
             let tab_row = row![

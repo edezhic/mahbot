@@ -565,11 +565,9 @@ pub fn tab_close_button<'a, Message: Clone + 'a>(
 /// amount so the effective content inset does not double.
 pub const SCROLL_H_PAD: f32 = 8.0;
 
-/// Bottom inset the shared horizontal scrollable wrapper adds under its
-/// content — the scrollbar rail sits on the bottom edge.
-const SCROLL_BOTTOM_PAD: f32 = 6.0;
-
 /// Wrap a tab strip in the shared scrollable + surface-container chrome.
+/// The strip reserves no space under the tabs while they fit; the band with
+/// the scrollbar rail appears only once they overflow (see [`hscroll`]).
 /// `scroll_id` is optional — the editor passes one for scroll-to-active-tab.
 /// `on_scroll` is optional — the editor passes a closure tracking the
 /// [`scrollable::Viewport`] so its reveal logic can decide whether the
@@ -648,8 +646,8 @@ fn vscroll_base<'a, Message: 'a>(
 }
 
 /// Shared horizontal [`scrollable`]: thin 6px scrollbar (see
-/// [`theme::horizontal_scrollbar`]) plus an unconditional
-/// [`SCROLL_BOTTOM_PAD`] bottom content inset. Fill/Shrink sized. Consumed
+/// [`theme::horizontal_scrollbar`]) embedded, so the rail takes layout space
+/// under the content only while it overflows. Fill/Shrink sized. Consumed
 /// internally by [`tab_scrollable`]; make public when a standalone
 /// horizontal-scroll site appears.
 fn hscroll<'a, Message: 'a>(
@@ -657,18 +655,11 @@ fn hscroll<'a, Message: 'a>(
     id: Option<widget::Id>,
     on_scroll: Option<impl Fn(scrollable::Viewport) -> Message + 'a>,
 ) -> Element<'a, Message> {
-    let mut sc = scrollable(
-        container(content.into())
-            .width(Length::Fill)
-            .padding(Padding {
-                bottom: SCROLL_BOTTOM_PAD,
-                ..Padding::ZERO
-            }),
-    )
-    .width(Length::Fill)
-    .height(Length::Shrink)
-    .direction(theme::horizontal_scrollbar())
-    .style(theme::scrollbar_style);
+    let mut sc = scrollable(container(content.into()).width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .direction(theme::horizontal_scrollbar())
+        .style(theme::scrollbar_style);
     if let Some(id) = id {
         sc = sc.id(id);
     }

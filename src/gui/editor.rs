@@ -5174,11 +5174,7 @@ impl EditorState {
                 None
             };
 
-            let name_color = if is_active {
-                theme::ACCENT
-            } else {
-                theme::TEXT_FAINT
-            };
+            let name_color = theme::tab_label_color(is_active);
             let name_text = text(&tab.file_name).size(theme::TEXT_12).color(name_color);
 
             let mut tab_row = row![].spacing(theme::SPACE_2).align_y(Alignment::Center);
