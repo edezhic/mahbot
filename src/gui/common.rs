@@ -171,7 +171,7 @@ impl AsyncLoadState {
 /// Interval a polled list re-reads its source at, while it is shown.
 ///
 /// The tick is deliberately not gated on a read being in flight — the render
-/// that follows it is what moves the alarms countdown, so suppressing it would
+/// that follows it is what moves the automations countdown, so suppressing it would
 /// freeze the digits. Starting no second read while one is in flight is
 /// [`PolledList`]'s job.
 pub(crate) const POLLED_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -188,7 +188,7 @@ pub(crate) const POLLED_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(1)
 /// - a failure is recorded as data, once per read — nothing is logged here, so
 ///   a caller whose read keeps failing writes no log records.
 ///
-/// The asks may come from a timer (the Alarms page and the custom-tools area) or
+/// The asks may come from a timer (the Automations page and the custom-tools area) or
 /// from events (the Sessions page re-reads on every runtime tick, because a
 /// session is only ever created or grown by a running agent).
 pub(crate) struct PolledList<T> {

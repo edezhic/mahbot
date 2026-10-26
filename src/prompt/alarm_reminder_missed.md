@@ -1,1 +1,0 @@
-Your reminder "{{text}}" was MISSED — it was scheduled for {{fire_at}}, which had already passed when the reminder fired. Tell the user that this reminder was missed and when it had been scheduled for; a missed reminder is late, not void.

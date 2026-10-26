@@ -1,19 +1,19 @@
-//! Alarm/reminder persistence and fire routing for the Assistant session.
+//! Automation persistence and fire routing for the Assistant session.
 //!
-//! Backs the `add_alarm` / `list_alarms` / `remove_alarm` tools and the
-//! periodic background sweep that routes due reminders back into the
+//! Backs the `add_automation` / `list_automations` / `remove_automation` tools
+//! and the periodic background sweep that routes due automations back into the
 //! Assistant's own personal session as user-role messages.
 //!
-//! An alarm optionally carries a [`StoredTrigger`] — one custom tool plus its
+//! An automation optionally carries a [`StoredTrigger`] — one custom tool plus its
 //! arguments, stored in the `trigger` column. At fire time the tool runs as the
-//! alarm's owner in the owner's personal workspace, and only what the check
+//! automation's owner in the owner's personal workspace, and only what the check
 //! reported decides whether the Assistant is woken at all.
 //!
-//! A check stopped by its time limit is not a verdict about the alarm: nothing
+//! A check stopped by its time limit is not a verdict about the automation: nothing
 //! is delivered for that attempt, the occurrence stays pending and is retried
 //! after a short cool-down. Every other non-clean outcome — a non-zero exit, the
 //! memory ceiling, an output drain overrun, a check that could not run at all —
-//! is a broken check and takes the alarm with it. A stored check that cannot be
+//! is a broken check and takes the automation with it. A stored check that cannot be
 //! read is a check that cannot run, and is treated as one.
 
 use std::collections::HashSet;
@@ -32,14 +32,14 @@ use crate::tools::shell::ProgramOutcome;
 use crate::util::UnwrapPoison;
 
 crate::define_store! {
-    pub(crate) static ALARMS: AlarmStore,
-    expect = "ALARMS not initialized — call init_all_stores() first",
+    pub(crate) static AUTOMATIONS: AutomationStore,
+    expect = "AUTOMATIONS not initialized — call init_all_stores() first",
 }
 
 // ── Column index constants ────────────────────────────────────────────────
 
 crate::columns! {
-    ALARM_COLUMNS [ALARM] {
+    AUTOMATION_COLUMNS [AUTOMATION] {
         ID                  => "id",
         SESSION_ID          => "session_id",
         USER_NAME           => "user_name",
@@ -55,20 +55,20 @@ crate::columns! {
     }
 }
 
-/// A single alarm/reminder row.
+/// A single stored automation row.
 #[derive(Debug, Clone)]
-pub(crate) struct Alarm {
+pub(crate) struct Automation {
     pub id: String,
     pub session_id: String,
-    /// The raw (un-escaped) user the alarm belongs to.
+    /// The raw (un-escaped) user the automation belongs to.
     pub user_name: String,
     /// `"one-shot"` or `"periodic"`.
     pub kind: String,
-    /// The message the alarm fires or launches with — the card's description.
+    /// The message the automation fires or launches with — the card's description.
     pub text: String,
-    /// Optional custom-tool check to run at fire time (triggered alarm).
+    /// Optional custom-tool check to run at fire time (triggered automation).
     pub trigger: Option<StoredTrigger>,
-    /// The custom role this alarm wakes; `None` wakes the Assistant.
+    /// The custom role this automation wakes; `None` wakes the Assistant.
     pub role: Option<String>,
     /// The custom role branch identifier, when one was given.
     pub identifier: Option<String>,
@@ -87,10 +87,10 @@ pub(crate) struct Alarm {
     pub unfinished_attempts: i64,
 }
 
-impl Alarm {
-    /// The alarm's custom-role target as the listing surfaces show it —
+impl Automation {
+    /// The automation's custom-role target as the listing surfaces show it —
     /// `addressed to custom role "analyst" (branch "daily") in my-workspace`,
-    /// with the branch and folder only when recorded. `None` for an alarm that
+    /// with the branch and folder only when recorded. `None` for an automation that
     /// wakes the Assistant.
     pub(crate) fn role_target(&self) -> Option<String> {
         let role = self.role.as_deref()?;
@@ -105,18 +105,18 @@ impl Alarm {
     }
 }
 
-/// The custom role an alarm is addressed to (an alarm with no target wakes the
+/// The custom role an automation is addressed to (an automation with no target wakes the
 /// Assistant, as before).
-pub(crate) struct AlarmTarget {
+pub(crate) struct AutomationTarget {
     pub role: String,
     pub identifier: Option<String>,
     pub workspace: Option<String>,
 }
 
-/// An alarm's trigger: one custom tool, plus the arguments that tool receives.
+/// An automation's trigger: one custom tool, plus the arguments that tool receives.
 ///
 /// The tool is named exactly as a `custom` call names it and must be one the
-/// alarm's owner can call; one tool per alarm — no chains. Arguments are stored
+/// automation's owner can call; one tool per automation — no chains. Arguments are stored
 /// as the tool's declared parameters, already coerced to their declared types.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Trigger {
@@ -151,12 +151,12 @@ impl Trigger {
     }
 }
 
-/// The `trigger` column's content for one alarm: the check that was stored
+/// The `trigger` column's content for one automation: the check that was stored
 /// there, or a value that cannot be read as one.
 ///
 /// A stored check that cannot be read is a check that cannot run — it wakes the
-/// assistant with the reason and takes the alarm with it, rather than quietly
-/// becoming a plain reminder that keeps firing with its check dropped.
+/// assistant with the reason and takes the automation with it, rather than quietly
+/// becoming a plain automation that keeps firing with its check dropped.
 #[derive(Debug, Clone)]
 pub(crate) enum StoredTrigger {
     /// The decoded check: the tool to run and the arguments it receives.
@@ -165,7 +165,7 @@ pub(crate) enum StoredTrigger {
     Unreadable,
 }
 
-/// What the notice and the `<user-alarms>` summary show in place of a stored
+/// What the notice and the `<user-automations>` summary show in place of a stored
 /// check that cannot be read: there is no tool name to print.
 const UNREADABLE_TRIGGER: &str = "(unreadable stored check)";
 
@@ -183,13 +183,13 @@ impl StoredTrigger {
     }
 
     /// How a stored trigger is shown to the assistant — the confirmation when
-    /// it is armed, the `list_alarms` line and the `<user-alarms>` summary:
+    /// it is armed, the `list_automations` line and the `<user-automations>` summary:
     /// the tool's name followed by its arguments, nothing but the name when it
     /// has none, and a marker when there is nothing readable to show.
     ///
     /// The two tool-output surfaces are ordinary tool results, so the
-    /// agent-level pass scrubs them like any other; the `<user-alarms>` summary
-    /// and the fired notice carry the alarm's own wording and are not scrubbed.
+    /// agent-level pass scrubs them like any other; the `<user-automations>` summary
+    /// and the fired notice carry the automation's own wording and are not scrubbed.
     pub(crate) fn render(&self) -> String {
         match self {
             Self::Tool(trigger) => trigger.render(),
@@ -197,7 +197,7 @@ impl StoredTrigger {
         }
     }
 
-    /// The check's tool name alone — the alarm card's headline — or the marker
+    /// The check's tool name alone — the automation card's headline — or the marker
     /// when there is nothing readable to name.
     pub(crate) fn name(&self) -> &str {
         match self {
@@ -215,20 +215,20 @@ impl StoredTrigger {
     }
 }
 
-fn alarm_from_row(row: &db::Row) -> Result<Alarm, ::turso::Error> {
-    Ok(Alarm {
-        id: row.get(COL_ALARM_ID)?,
-        session_id: row.get(COL_ALARM_SESSION_ID)?,
-        user_name: row.get(COL_ALARM_USER_NAME)?,
-        kind: row.get(COL_ALARM_KIND)?,
-        text: row.get(COL_ALARM_TEXT)?,
+fn automation_from_row(row: &db::Row) -> Result<Automation, ::turso::Error> {
+    Ok(Automation {
+        id: row.get(COL_AUTOMATION_ID)?,
+        session_id: row.get(COL_AUTOMATION_SESSION_ID)?,
+        user_name: row.get(COL_AUTOMATION_USER_NAME)?,
+        kind: row.get(COL_AUTOMATION_KIND)?,
+        text: row.get(COL_AUTOMATION_TEXT)?,
         trigger: stored_trigger(row)?,
-        role: row.get(COL_ALARM_ROLE)?,
-        identifier: row.get(COL_ALARM_IDENTIFIER)?,
-        workspace: row.get(COL_ALARM_WORKSPACE)?,
-        interval_seconds: row.get(COL_ALARM_INTERVAL_SECONDS)?,
-        next_fire_at: row.get(COL_ALARM_NEXT_FIRE_AT)?,
-        unfinished_attempts: row.get(COL_ALARM_UNFINISHED_ATTEMPTS)?,
+        role: row.get(COL_AUTOMATION_ROLE)?,
+        identifier: row.get(COL_AUTOMATION_IDENTIFIER)?,
+        workspace: row.get(COL_AUTOMATION_WORKSPACE)?,
+        interval_seconds: row.get(COL_AUTOMATION_INTERVAL_SECONDS)?,
+        next_fire_at: row.get(COL_AUTOMATION_NEXT_FIRE_AT)?,
+        unfinished_attempts: row.get(COL_AUTOMATION_UNFINISHED_ATTEMPTS)?,
     })
 }
 
@@ -236,22 +236,22 @@ fn alarm_from_row(row: &db::Row) -> Result<Alarm, ::turso::Error> {
 /// check. Only text can be the stored check this product writes, so a row that
 /// holds anything else reads as [`StoredTrigger::Unreadable`] — a check that
 /// cannot be read is a check that cannot run either, and must not fail the
-/// sweep or leave the alarm firing with its check dropped.
+/// sweep or leave the automation firing with its check dropped.
 fn stored_trigger(row: &db::Row) -> Result<Option<StoredTrigger>, ::turso::Error> {
-    match row.get_value(COL_ALARM_TRIGGER)? {
+    match row.get_value(COL_AUTOMATION_TRIGGER)? {
         db::Value::Null => Ok(None),
         db::Value::Text(raw) => Ok(Some(StoredTrigger::decode(&raw))),
         _ => Ok(Some(StoredTrigger::Unreadable)),
     }
 }
 
-/// Maximum number of active alarms allowed per session.
-const MAX_ACTIVE_ALARMS: i64 = 50;
+/// Maximum number of active automations allowed per session.
+const MAX_ACTIVE_AUTOMATIONS: i64 = 50;
 
-/// Upper bound on an alarm's whole stored trigger — the tool's name together
+/// Upper bound on an automation's whole stored trigger — the tool's name together
 /// with its arguments — in characters. Keeps an over-eagerly-large trigger from
-/// bloating the notification envelope or the `<user-alarms>` prompt summary.
-const MAX_ALARM_TRIGGER_CHARS: usize = 2000;
+/// bloating the notification envelope or the `<user-automations>` prompt summary.
+const MAX_AUTOMATION_TRIGGER_CHARS: usize = 2000;
 
 /// Upper bound on a periodic interval (~292 years): keeps the total swept
 /// advance (interval × skipped whole periods) within a representable
@@ -259,13 +259,13 @@ const MAX_ALARM_TRIGGER_CHARS: usize = 2000;
 /// overflowing. Also rejects absurd intervals as caller errors at creation.
 const MAX_PERIOD_SECS: i64 = i64::MAX / 1_000_000_000;
 
-/// The alarm sweep's tick: how long the loop waits between passes over due
-/// alarms. The first tick after start is also the overdue scan.
+/// The automation sweep's tick: how long the loop waits between passes over due
+/// automations. The first tick after start is also the overdue scan.
 const SWEEP_TICK: Duration = Duration::from_secs(1);
 
 /// A firing later than its scheduled time by more than this is MISSED, and its
 /// notice says so: 30 sweep ticks. One tick can overrun — its due batch is fired
-/// one alarm at a time, each with a durable write — so a firing past the bound
+/// one automation at a time, each with a durable write — so a firing past the bound
 /// did not come from a routine tick.
 #[expect(clippy::cast_possible_wrap)] // 30 ticks fit i64 by many orders
 const MISSED_FIRING_TOLERANCE: ChronoDuration =
@@ -281,14 +281,14 @@ const RETRY_COOLDOWN_SECS: i64 = 60;
 /// the attempt ceiling and the cool-down.
 const UNFINISHED_NOTICE_ATTEMPTS: i64 = 3;
 
-/// Whether a firing at `now` was MISSED — the alarm's scheduled time had
+/// Whether a firing at `now` was MISSED — the automation's scheduled time had
 /// already passed by more than [`MISSED_FIRING_TOLERANCE`] when it fired.
 /// `scheduled` is the time the firing belongs to: the value as it stood before
-/// the state advance, never a periodic alarm's next occurrence.
+/// the state advance, never a periodic automation's next occurrence.
 ///
 /// Fail-soft: a scheduled time that cannot be read as a time is not a missed
 /// firing, and neither is one still in the future — a firing error would leave
-/// a due alarm re-firing on every tick.
+/// a due automation re-firing on every tick.
 fn is_missed_firing(now: &str, scheduled: &str) -> bool {
     let (Ok(now), Ok(scheduled)) = (
         db::parse_utc_timestamp(now),
@@ -303,30 +303,30 @@ fn is_missed_firing(now: &str, scheduled: &str) -> bool {
 enum Timing {
     /// On time: the occurrence fired when it was scheduled to.
     Due,
-    /// Fired long after the alarm was due — the product was not running then.
+    /// Fired long after the automation was due — the product was not running then.
     Missed,
     /// Earlier attempts at this occurrence did not finish and the report that
     /// finally arrived is late for it.
     Late,
 }
 
-/// The opening line of the notices that carry the reminder's own text — the
-/// plain reminder and the triggered check's: what the reminder is, and how the
+/// The opening line of the notices that carry the automation's own text — the
+/// plain automation's and the triggered check's: what the automation is, and how the
 /// firing it belongs to was timed. Exactly one timing statement, so a report
 /// that arrives after retries is announced as late instead of stacking a second
 /// lateness note on top of the missed-firing one. Every timing names the
 /// occurrence's own due moment, which no retry moves.
-fn reminder_line(alarm: &Alarm, timing: &Timing) -> String {
+fn automation_line(automation: &Automation, timing: &Timing) -> String {
     let asset = match timing {
-        Timing::Due => "alarm_reminder_due.md",
-        Timing::Missed => "alarm_reminder_missed.md",
-        Timing::Late => "alarm_reminder_late.md",
+        Timing::Due => "automation_due.md",
+        Timing::Missed => "automation_missed.md",
+        Timing::Late => "automation_late.md",
     };
     crate::prompt::substitute(
         &crate::prompt::load_prompt(asset),
         &[
-            ("{{text}}", &alarm.text),
-            ("{{fire_at}}", &alarm.next_fire_at),
+            ("{{text}}", &automation.text),
+            ("{{fire_at}}", &automation.next_fire_at),
         ],
     )
 }
@@ -334,8 +334,8 @@ fn reminder_line(alarm: &Alarm, timing: &Timing) -> String {
 /// The timing a notice states. Only a report can be late: a report that settles
 /// an occurrence whose earlier attempts did not finish says so instead of the
 /// missed-firing note, and a broken check's notice reads as it always has.
-fn trigger_timing(alarm: &Alarm, missed: bool, reported: bool) -> Timing {
-    if reported && alarm.unfinished_attempts > 0 {
+fn trigger_timing(automation: &Automation, missed: bool, reported: bool) -> Timing {
+    if reported && automation.unfinished_attempts > 0 {
         Timing::Late
     } else if missed {
         Timing::Missed
@@ -354,18 +354,18 @@ pub(crate) fn format_fire_time(timestamp: &str) -> Result<String> {
     Ok(format!("{local} local time ({utc} UTC)"))
 }
 
-// ── Alarm CRUD ──────────────────────────────────────────────────────────
+// ── Automation CRUD ──────────────────────────────────────────────────────────
 
-/// Validate an alarm's optional custom-role target before it is stored: only the
-/// administrator may address an alarm to a custom role, the role must exist, the
+/// Validate an automation's optional custom-role target before it is stored: only the
+/// administrator may address an automation to a custom role, the role must exist, the
 /// branch identifier and folder must resolve to what will be stored, and a role-
-/// addressed alarm's text is the launch message so it must not be empty and
+/// addressed automation's text is the launch message so it must not be empty and
 /// cannot also carry a check. Returns the role, branch identifier and folder
 /// address to store.
-async fn validate_alarm_target(
+async fn validate_automation_target(
     user_name: &str,
     text: &str,
-    target: Option<AlarmTarget>,
+    target: Option<AutomationTarget>,
     has_trigger: bool,
 ) -> Result<(Option<String>, Option<String>, Option<String>)> {
     let Some(target) = target else {
@@ -373,7 +373,7 @@ async fn validate_alarm_target(
     };
     anyhow::ensure!(
         crate::users::is_admin_name(user_name),
-        "usage: only the administrator may address an alarm to a custom role"
+        "usage: only the administrator may address an automation to a custom role"
     );
     anyhow::ensure!(
         crate::custom_role::get(&target.role).await?.is_some(),
@@ -403,25 +403,25 @@ async fn validate_alarm_target(
     };
     anyhow::ensure!(
         !has_trigger,
-        "usage: a role-addressed alarm's text IS the role's launch message, so its \
+        "usage: a role-addressed automation's text IS the role's launch message, so its \
          check cannot be combined with a role target"
     );
     anyhow::ensure!(
         !text.trim().is_empty(),
-        "usage: a role-addressed alarm's text is the role's launch message, so it must not be empty"
+        "usage: a role-addressed automation's text is the role's launch message, so it must not be empty"
     );
     Ok((Some(target.role), identifier, workspace))
 }
 
-/// The session an alarm call actually acts on: a custom-role caller's alarms
+/// The session an automation call actually acts on: a custom-role caller's automations
 /// live on the owner's Assistant session, the caller's own id otherwise.
 ///
-/// A custom role runs at the owner's strength, and a plain alarm it arms is
-/// still an owner reminder delivered to the assistant — so `add`/`list`/`remove`
+/// A custom role runs at the owner's strength, and a plain automation it arms is
+/// still an owner automation delivered to the assistant — so `add`/`list`/`remove`
 /// all resolve the owner's assistant session for such a caller, never the role's
-/// own branch (which would hold an alarm it could never see or cancel).
+/// own branch (which would hold an automation it could never see or cancel).
 #[must_use]
-pub(crate) fn owner_alarm_session(agent_id: &str, user_name: &str) -> String {
+pub(crate) fn owner_automation_session(agent_id: &str, user_name: &str) -> String {
     if crate::session::is_custom_role_agent_id(agent_id) {
         crate::session::assistant_agent_id(user_name)
     } else {
@@ -429,43 +429,43 @@ pub(crate) fn owner_alarm_session(agent_id: &str, user_name: &str) -> String {
     }
 }
 
-/// Create a new alarm for a session.
+/// Create a new automation for a session.
 ///
 /// Exactly one of `fire_at` (one-shot) or `interval_seconds` (periodic) must be
 /// provided. One-shot fire times are normalized to RFC3339 UTC and must be in
 /// the future; periodic intervals must be at least 5 seconds. At most
-/// [`MAX_ACTIVE_ALARMS`] active alarms may exist per session.
+/// [`MAX_ACTIVE_AUTOMATIONS`] active automations may exist per session.
 ///
-/// `target` addresses the alarm to a custom role instead of the Assistant: only
-/// the administrator may do that, the role must exist, and the alarm carries no
+/// `target` addresses the automation to a custom role instead of the Assistant: only
+/// the administrator may do that, the role must exist, and the automation carries no
 /// trigger — its text IS the role's launch message.
-pub(crate) async fn add_alarm(
+pub(crate) async fn add_automation(
     session_id: &str,
     user_name: &str,
     text: &str,
     fire_at: Option<&str>,
     interval_seconds: Option<u64>,
     trigger: Option<Trigger>,
-    target: Option<AlarmTarget>,
-) -> Result<Alarm> {
-    // A role-addressed alarm the owner's own Assistant never sees belongs on
-    // the assistant's session: a custom role may hold the alarm tools, but a
-    // plain alarm it arms is still an owner reminder.
-    let session_id = owner_alarm_session(session_id, user_name);
+    target: Option<AutomationTarget>,
+) -> Result<Automation> {
+    // A role-addressed automation the owner's own Assistant never sees belongs on
+    // the assistant's session: a custom role may hold the automation tools, but a
+    // plain automation it arms is still an owner automation.
+    let session_id = owner_automation_session(session_id, user_name);
 
     // Validate the target before touching the DB: a broken target must never be
-    // armed. A role-addressed alarm's text is the launch message, so a trigger
+    // armed. A role-addressed automation's text is the launch message, so a trigger
     // can never ride along and the text must be non-empty.
     let (role, identifier, workspace) =
-        validate_alarm_target(user_name, text, target, trigger.is_some()).await?;
+        validate_automation_target(user_name, text, target, trigger.is_some()).await?;
 
     // Validate an optional trigger before touching the DB: the whole stored
     // trigger — the tool's name together with its arguments — is bounded.
     let encoded_trigger = trigger.as_ref().map(Trigger::encode);
     if let Some(encoded) = &encoded_trigger {
         anyhow::ensure!(
-            encoded.chars().count() <= MAX_ALARM_TRIGGER_CHARS,
-            "Alarm trigger too long: the stored trigger — the tool name plus its arguments as JSON — is limited to {MAX_ALARM_TRIGGER_CHARS} characters; shorten the arguments"
+            encoded.chars().count() <= MAX_AUTOMATION_TRIGGER_CHARS,
+            "Automation trigger too long: the stored trigger — the tool name plus its arguments as JSON — is limited to {MAX_AUTOMATION_TRIGGER_CHARS} characters; shorten the arguments"
         );
     }
 
@@ -484,7 +484,7 @@ pub(crate) async fn add_alarm(
         (Some(fire), None) => {
             anyhow::ensure!(
                 db::parse_utc_timestamp(fire)? > db::parse_utc_timestamp(&db::now())?,
-                "Cannot set an alarm for a time in the past: pass a future RFC3339/ISO-8601 UTC time (convert the user's local time to UTC)"
+                "Cannot set an automation for a time in the past: pass a future RFC3339/ISO-8601 UTC time (convert the user's local time to UTC)"
             );
             ("one-shot", None, fire.clone())
         }
@@ -508,7 +508,7 @@ pub(crate) async fn add_alarm(
             ("periodic", Some(interval_secs), next.to_rfc3339())
         }
         _ => anyhow::bail!(
-            "Exactly one of fire_at or interval_seconds must be provided: pass `fire_at` for a one-shot reminder or `interval_seconds` for a periodic one, never both"
+            "Exactly one of fire_at or interval_seconds must be provided: pass `fire_at` for a one-shot automation or `interval_seconds` for a periodic one, never both"
         ),
     };
 
@@ -516,14 +516,14 @@ pub(crate) async fn add_alarm(
     let rows = store()
         .conn
         .query(
-            "SELECT COUNT(*) FROM alarms WHERE session_id = ?1 AND status = 'active'",
+            "SELECT COUNT(*) FROM automations WHERE session_id = ?1 AND status = 'active'",
             db::params![session_id.as_str()],
         )
         .await?;
     let count: i64 = rows.first().map(|r| r.get(0)).transpose()?.unwrap_or(0);
     anyhow::ensure!(
-        count < MAX_ACTIVE_ALARMS,
-        "Alarm limit reached (maximum {MAX_ACTIVE_ALARMS} active alarms): remove one with `remove_alarm` before adding another"
+        count < MAX_ACTIVE_AUTOMATIONS,
+        "Automation limit reached (maximum {MAX_ACTIVE_AUTOMATIONS} active automations): remove one with `remove_automation` before adding another"
     );
 
     let id = crate::generate_id();
@@ -531,7 +531,7 @@ pub(crate) async fn add_alarm(
     store()
         .conn
         .execute(
-            "INSERT INTO alarms \
+            "INSERT INTO automations \
              (id, session_id, user_name, kind, text, fire_at, interval_seconds, next_fire_at, status, created_at, trigger, role, identifier, workspace) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11, ?12, ?13)",
             db::params![
@@ -552,7 +552,7 @@ pub(crate) async fn add_alarm(
         )
         .await?;
 
-    Ok(Alarm {
+    Ok(Automation {
         id,
         session_id,
         user_name: user_name.to_string(),
@@ -568,49 +568,58 @@ pub(crate) async fn add_alarm(
     })
 }
 
-/// List the active alarms for a session, ordered by next fire time.
-pub(crate) async fn list_alarms(session_id: &str) -> Result<Vec<Alarm>> {
+/// List the active automations for a session, ordered by next fire time.
+pub(crate) async fn list_automations(session_id: &str) -> Result<Vec<Automation>> {
     let sql = format!(
-        "SELECT {ALARM_COLUMNS} FROM alarms \
+        "SELECT {AUTOMATION_COLUMNS} FROM automations \
          WHERE session_id = ?1 AND status = 'active' \
          ORDER BY next_fire_at ASC"
     );
     let rows = store().conn.query(&sql, db::params![session_id]).await?;
-    Ok(rows.iter().map(alarm_from_row).collect::<Result<_, _>>()?)
+    Ok(rows
+        .iter()
+        .map(automation_from_row)
+        .collect::<Result<_, _>>()?)
 }
 
-/// List the active alarms for a user across all their sessions, ordered by
-/// next fire time. Unlike [`list_alarms`] (session-scoped) this is the
-/// user-wide view backing the Assistant's system-prompt alarm snapshot.
-pub(crate) async fn list_user_alarms(user_name: &str) -> Result<Vec<Alarm>> {
+/// List the active automations for a user across all their sessions, ordered by
+/// next fire time. Unlike [`list_automations`] (session-scoped) this is the
+/// user-wide view backing the Assistant's system-prompt automation snapshot.
+pub(crate) async fn list_user_automations(user_name: &str) -> Result<Vec<Automation>> {
     let sql = format!(
-        "SELECT {ALARM_COLUMNS} FROM alarms \
+        "SELECT {AUTOMATION_COLUMNS} FROM automations \
          WHERE user_name = ?1 AND status = 'active' \
          ORDER BY next_fire_at ASC"
     );
     let rows = store().conn.query(&sql, db::params![user_name]).await?;
-    Ok(rows.iter().map(alarm_from_row).collect::<Result<_, _>>()?)
+    Ok(rows
+        .iter()
+        .map(automation_from_row)
+        .collect::<Result<_, _>>()?)
 }
 
-/// Every active alarm of every owner, ordered by owner name, then next fire
-/// time, then id — the read backing the alarms page. The id settles ties, so
+/// Every active automation of every owner, ordered by owner name, then next fire
+/// time, then id — the read backing the automations page. The id settles ties, so
 /// rows sharing an owner and a fire time keep the same order from read to read.
-/// The page groups by the name recorded on the alarm itself, so an alarm whose
+/// The page groups by the name recorded on the automation itself, so an automation whose
 /// account is gone is still listed under it.
-pub(crate) async fn list_all_active_alarms() -> Result<Vec<Alarm>> {
+pub(crate) async fn list_all_active_automations() -> Result<Vec<Automation>> {
     let sql = format!(
-        "SELECT {ALARM_COLUMNS} FROM alarms \
+        "SELECT {AUTOMATION_COLUMNS} FROM automations \
          WHERE status = 'active' \
          ORDER BY user_name ASC, next_fire_at ASC, id ASC"
     );
     let rows = store().conn.query(&sql, db::params![]).await?;
-    Ok(rows.iter().map(alarm_from_row).collect::<Result<_, _>>()?)
+    Ok(rows
+        .iter()
+        .map(automation_from_row)
+        .collect::<Result<_, _>>()?)
 }
 
-/// Mark an active alarm as removed; returns the removed alarm or `None`.
-pub(crate) async fn remove_alarm(session_id: &str, id: &str) -> Result<Option<Alarm>> {
+/// Mark an active automation as removed; returns the removed automation or `None`.
+pub(crate) async fn remove_automation(session_id: &str, id: &str) -> Result<Option<Automation>> {
     let sql = format!(
-        "SELECT {ALARM_COLUMNS} FROM alarms \
+        "SELECT {AUTOMATION_COLUMNS} FROM automations \
          WHERE id = ?1 AND session_id = ?2 AND status = 'active'"
     );
     let rows = store()
@@ -620,133 +629,137 @@ pub(crate) async fn remove_alarm(session_id: &str, id: &str) -> Result<Option<Al
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let alarm = alarm_from_row(row)?;
+    let automation = automation_from_row(row)?;
     // The SELECT and the UPDATE are separate statements, so a concurrent second
-    // removal of this alarm can pass the SELECT too and report it twice; the
+    // removal of this automation can pass the SELECT too and report it twice; the
     // UPDATE is idempotent (status stays 'removed'), so the duplicate report is
-    // not a wrong outcome, and the alarm is removed exactly once.
+    // not a wrong outcome, and the automation is removed exactly once.
     store()
         .conn
         .execute(
-            "UPDATE alarms SET status = 'removed' WHERE id = ?1 AND session_id = ?2",
+            "UPDATE automations SET status = 'removed' WHERE id = ?1 AND session_id = ?2",
             db::params![id, session_id],
         )
         .await?;
-    Ok(Some(alarm))
+    Ok(Some(automation))
 }
 
-/// Mark every ACTIVE alarm addressed to `role_name` as `'removed'` (soft
+/// Mark every ACTIVE automation addressed to `role_name` as `'removed'` (soft
 /// delete, consistent with the rest of the module); returns the number changed.
 #[expect(clippy::cast_possible_truncation)] // u64 row count fits usize on all supported targets
-pub(crate) async fn delete_alarms_for_role(role_name: &str) -> Result<usize> {
+pub(crate) async fn delete_automations_for_role(role_name: &str) -> Result<usize> {
     let changed = store()
         .conn
         .execute(
-            "UPDATE alarms SET status = 'removed' WHERE role = ?1 AND status = 'active'",
+            "UPDATE automations SET status = 'removed' WHERE role = ?1 AND status = 'active'",
             db::params![role_name],
         )
         .await?;
     Ok(changed as usize)
 }
 
-/// Soft-delete an alarm regardless of its current status (idempotent).
+/// Soft-delete an automation regardless of its current status (idempotent).
 ///
-/// Unlike [`remove_alarm`] this has no `status = 'active'` gate, so it also
+/// Unlike [`remove_automation`] this has no `status = 'active'` gate, so it also
 /// deletes an already-fired one-shot. Used whenever a check is broken — a run
 /// that failed and one that could not run alike, never one that merely ran past
-/// its time limit — so a broken alarm can never re-fire.
-async fn delete_alarm_after_run(alarm: &Alarm) -> Result<()> {
+/// its time limit — so a broken automation can never re-fire.
+async fn delete_automation_after_run(automation: &Automation) -> Result<()> {
     store()
         .conn
         .execute(
-            "UPDATE alarms SET status = 'removed' WHERE id = ?1 AND session_id = ?2",
-            db::params![alarm.id.as_str(), alarm.session_id.as_str()],
+            "UPDATE automations SET status = 'removed' WHERE id = ?1 AND session_id = ?2",
+            db::params![automation.id.as_str(), automation.session_id.as_str()],
         )
         .await?;
     Ok(())
 }
 
-/// The due alarms at `now` (RFC3339 UTC), ordered by next fire time: every
+/// The due automations at `now` (RFC3339 UTC), ordered by next fire time: every
 /// occurrence that is due and whose retry cool-down, if it is waiting for one,
-/// has passed. A waiting alarm is not due before its `retry_at` — and no other
-/// alarm's wait holds it back.
+/// has passed. A waiting automation is not due before its `retry_at` — and no other
+/// automation's wait holds it back.
 ///
-/// The read here and each alarm's later state advance are separate statements,
-/// so a second sweep overlapping this one can fire the same alarm twice; the
-/// sweep runs in one background loop, and a triggered alarm's attempt slot
+/// The read here and each automation's later state advance are separate statements,
+/// so a second sweep overlapping this one can fire the same automation twice; the
+/// sweep runs in one background loop, and a triggered automation's attempt slot
 /// ([`claim_attempt_slot`]) makes a repeated firing of the same occurrence a
 /// no-op.
-async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
+async fn due_automations(now: &str) -> Result<Vec<Automation>> {
     let sql = format!(
-        "SELECT {ALARM_COLUMNS} FROM alarms \
+        "SELECT {AUTOMATION_COLUMNS} FROM automations \
          WHERE status = 'active' AND next_fire_at <= ?1 \
          AND (retry_at IS NULL OR retry_at <= ?1) \
          ORDER BY next_fire_at ASC"
     );
     let rows = store().conn.query(&sql, db::params![now]).await?;
-    Ok(rows.iter().map(alarm_from_row).collect::<Result<_, _>>()?)
+    Ok(rows
+        .iter()
+        .map(automation_from_row)
+        .collect::<Result<_, _>>()?)
 }
 
 // ── Fire / sweep ────────────────────────────────────────────────────────
 
-/// Route a due alarm into the Assistant's own session and settle it.
+/// Route a due automation into the Assistant's own session and settle it.
 ///
-/// A role-addressed alarm (`role` set) wakes that custom role instead; the
-/// Assistant wakes otherwise — a triggered alarm (`trigger` set) takes its
-/// attempt slot and runs its custom tool (see [`fire_trigger_alarm`]); a plain
-/// alarm delivers the reminder text. The notification is delivered as a
+/// A role-addressed automation (`role` set) wakes that custom role instead; the
+/// Assistant wakes otherwise — a triggered automation (`trigger` set) takes its
+/// attempt slot and runs its custom tool (see [`fire_trigger_automation`]); a plain
+/// automation delivers its text as the notice. The notification is delivered as a
 /// user-role message into the calling assistant's own session
-/// (`alarm.session_id`, resolved directly — never re-derived from the id, which
+/// (`automation.session_id`, resolved directly — never re-derived from the id, which
 /// would double-escape colliding user names). A plain or role-addressed one-shot
 /// is terminalized (`status='fired'`) and a periodic one advances `next_fire_at`
 /// past every missed whole period; a triggered one settles the same way once its
 /// check completes. A firing later than its scheduled time by more than
-/// [`MISSED_FIRING_TOLERANCE`] says so in its notice (see [`reminder_line`]).
-async fn fire_alarm(alarm: &Alarm) -> Result<()> {
-    if alarm.role.is_some() {
-        return fire_custom_role_alarm(alarm).await;
+/// [`MISSED_FIRING_TOLERANCE`] says so in its notice (see [`automation_line`]).
+async fn fire_automation(automation: &Automation) -> Result<()> {
+    if automation.role.is_some() {
+        return fire_custom_role_automation(automation).await;
     }
     // Judged at the firing instant — the scheduled time as it stands before the
     // firing moves anything — never when the notice is composed: a slow check, or
     // a notice delivered late although the firing happened on time, is not a
     // missed firing.
-    let missed = is_missed_firing(&db::now(), &alarm.next_fire_at);
-    match &alarm.trigger {
+    let missed = is_missed_firing(&db::now(), &automation.next_fire_at);
+    match &automation.trigger {
         Some(trigger) => {
-            fire_trigger_alarm(alarm, trigger, missed);
+            fire_trigger_automation(automation, trigger, missed);
             Ok(())
         }
-        None => fire_plain_alarm(alarm, missed).await,
+        None => fire_plain_automation(automation, missed).await,
     }
 }
 
-/// Wake the custom role an alarm is addressed to, with the alarm's text as the
-/// launch message. A role that has since been deleted removes the alarm and
-/// tells the owner through his Assistant: a broken alarm must never keep
-/// firing. A store failure is not a verdict about the role — the alarm stays
+/// Wake the custom role an automation is addressed to, with the automation's text as the
+/// launch message. A role that has since been deleted removes the automation and
+/// tells the owner through his Assistant: a broken automation must never keep
+/// firing. A store failure is not a verdict about the role — the automation stays
 /// armed and the next sweep retries.
 ///
-/// Any other launch failure of a ONE-SHOT alarm is terminal: the alarm is
-/// removed and the owner is told the reason. A PERIODIC alarm instead advances
+/// Any other launch failure of a ONE-SHOT automation is terminal: the automation is
+/// removed and the owner is told the reason. A PERIODIC automation instead advances
 /// its state like a completed fire and stays armed, so a transient failure (e.g.
-/// a launch folder on a temporarily unavailable mount) loses no reminder and
+/// a launch folder on a temporarily unavailable mount) loses no automation and
 /// retries at its next scheduled time rather than every sweep tick. The notice
 /// names the reason and lets the owner re-arm once the cause is fixed.
-async fn fire_custom_role_alarm(alarm: &Alarm) -> Result<()> {
-    let role = alarm.role.as_deref().unwrap_or_default();
-    // `removed` = this failure disarms the alarm; a periodic launch failure
+async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
+    let role = automation.role.as_deref().unwrap_or_default();
+    // `removed` = this failure disarms the automation; a periodic launch failure
     // keeps it armed (see below).
     let (reason, removed) = if crate::custom_role::get(role).await?.is_none() {
         ("the custom role no longer exists".to_string(), true)
     } else {
-        // The launch runs in the folder the alarm was armed for; a folder that
+        // The launch runs in the folder the automation was armed for; a folder that
         // no longer resolves is a launch failure like any other.
         let launched = async {
-            let workspace = crate::launch::launch_workspace(alarm.workspace.as_deref()).await?;
+            let workspace =
+                crate::launch::launch_workspace(automation.workspace.as_deref()).await?;
             crate::launch::custom_role(
                 role,
-                &alarm.text,
-                alarm.identifier.as_deref(),
+                &automation.text,
+                automation.identifier.as_deref(),
                 &workspace,
                 crate::agent::message_router::AnsweredFor::Agent,
             )
@@ -758,176 +771,183 @@ async fn fire_custom_role_alarm(alarm: &Alarm) -> Result<()> {
                 // The launch is already persisted durably before it is routed
                 // (see `launch::custom_role`), so the state advance runs after,
                 // exactly as on the plain path.
-                advance_alarm_state(alarm, &db::now()).await?;
+                advance_automation_state(automation, &db::now()).await?;
                 return Ok(());
             }
             Err(e) if crate::db::is_store_error(&e) => {
-                // A store failure says nothing about the role: leave the alarm
+                // A store failure says nothing about the role: leave the automation
                 // armed and let the next sweep retry, instead of disarming a
-                // working reminder on a transient read/write error.
+                // working automation on a transient read/write error.
                 tracing::warn!(
-                    alarm = %alarm.id,
+                    automation = %automation.id,
                     role = %role,
                     error = %e,
-                    "Store failure launching a custom-role alarm — alarm left armed"
+                    "Store failure launching a custom-role automation — automation left armed"
                 );
                 return Err(e);
             }
             Err(e) => {
                 tracing::warn!(
-                    alarm = %alarm.id,
+                    automation = %automation.id,
                     role = %role,
                     error = %e,
-                    "Failed to launch a custom role alarm"
+                    "Failed to launch a custom role automation"
                 );
-                if alarm.kind == "one-shot" {
+                if automation.kind == "one-shot" {
                     (e.to_string(), true)
                 } else {
-                    // A periodic reminder must survive a transient launch
+                    // A periodic automation must survive a transient launch
                     // failure: advance its state like a completed fire so it
                     // retries at its next scheduled time instead of every sweep
-                    // tick (the sweep re-selects due alarms once a second).
-                    advance_alarm_state(alarm, &db::now()).await?;
+                    // tick (the sweep re-selects due automations once a second).
+                    advance_automation_state(automation, &db::now()).await?;
                     (e.to_string(), false)
                 }
             }
         }
     };
     if removed {
-        delete_alarm_after_run(alarm).await?;
+        delete_automation_after_run(automation).await?;
     }
     // The notice goes to the owner (the assistant), never to the role.
-    let workspace_line = match &alarm.workspace {
+    let workspace_line = match &automation.workspace {
         Some(workspace) => format!(" in {workspace}"),
         None => String::new(),
     };
     let outcome = if removed {
-        "The alarm was removed."
+        "The automation was removed."
     } else {
-        "The reminder stays armed and will fire again at its next scheduled time."
+        "The automation stays armed and will fire again at its next scheduled time."
     };
     let content = crate::prompt::substitute(
-        &crate::prompt::load_prompt("alarm_role_notification.md"),
+        &crate::prompt::load_prompt("automation_role_notification.md"),
         &[
-            ("{{text}}", &alarm.text),
+            ("{{text}}", &automation.text),
             ("{{role}}", role),
             ("{{workspace_line}}", &workspace_line),
             ("{{reason}}", &reason),
             ("{{outcome}}", outcome),
         ],
     );
-    deliver_alarm_notification(alarm, content).await;
+    deliver_automation_notification(automation, content).await;
     Ok(())
 }
 
-/// Deliver a plain (untriggered) alarm reminder and advance its state.
+/// Deliver a plain (untriggered) automation notice and advance its state.
 ///
 /// The durable envelope is persisted BEFORE advancing state (see
-/// [`deliver_alarm_notification`]): a crash after persisting but before the
-/// state advance replays the reminder at boot and leaves the alarm due, so the
-/// reminder is never lost.
-async fn fire_plain_alarm(alarm: &Alarm, missed: bool) -> Result<()> {
+/// [`deliver_automation_notification`]): a crash after persisting but before the
+/// state advance replays the notice at boot and leaves the automation due, so the
+/// automation is never lost.
+async fn fire_plain_automation(automation: &Automation, missed: bool) -> Result<()> {
     let now = db::now();
     let content = crate::prompt::substitute(
-        &crate::prompt::load_prompt("alarm_notification.md"),
+        &crate::prompt::load_prompt("automation_notification.md"),
         &[(
-            "{{reminder_line}}",
-            &reminder_line(alarm, &trigger_timing(alarm, missed, false)),
+            "{{automation_line}}",
+            &automation_line(automation, &trigger_timing(automation, missed, false)),
         )],
     );
-    deliver_alarm_notification(alarm, content).await;
-    advance_alarm_state(alarm, &now).await?;
+    deliver_automation_notification(automation, content).await;
+    advance_automation_state(automation, &now).await?;
     Ok(())
 }
 
-/// Deliver an alarm's notice into the calling assistant's session, logging a
-/// lost durable copy against the alarm it came from.
+/// Deliver an automation's notice into the calling assistant's session, logging a
+/// lost durable copy against the automation it came from.
 ///
 /// Delivery is sourced from the stored raw user and session id so the notice
 /// targets the right personal session regardless of agent-ID escaping — never
 /// re-derived from the id, which would double-escape colliding user names.
-async fn deliver_alarm_notification(alarm: &Alarm, content: String) {
+async fn deliver_automation_notification(automation: &Automation, content: String) {
     if let Err(e) = crate::agent::message_router::deliver_assistant_notice(
-        &alarm.session_id,
-        &alarm.user_name,
+        &automation.session_id,
+        &automation.user_name,
         content,
     )
     .await
     {
         tracing::warn!(
-            alarm = %alarm.id,
+            automation = %automation.id,
             error = %e,
-            "Failed to persist alarm delivery — routing best-effort"
+            "Failed to persist automation delivery — routing best-effort"
         );
     }
 }
 
-/// Advance an alarm's stored state past `now`: one-shot → `status='fired'`;
+/// Advance an automation's stored state past `now`: one-shot → `status='fired'`;
 /// periodic → `next_fire_at` past every missed whole period, so a schedule that
 /// waited out retries resumes on its own grid instead of replaying them. The
 /// retry state goes with it: the attempt that got here completed. Both writes
-/// take an active row only, so a reminder removed while its check ran stays
+/// take an active row only, so an automation removed while its check ran stays
 /// removed.
-async fn advance_alarm_state(alarm: &Alarm, now: &str) -> Result<()> {
-    if alarm.kind == "one-shot" {
+async fn advance_automation_state(automation: &Automation, now: &str) -> Result<()> {
+    if automation.kind == "one-shot" {
         store()
             .conn
             .execute(
-                "UPDATE alarms SET status = 'fired', retry_at = NULL, unfinished_attempts = 0 \
+                "UPDATE automations SET status = 'fired', retry_at = NULL, unfinished_attempts = 0 \
                  WHERE id = ?1 AND status = 'active'",
-                db::params![alarm.id.as_str()],
+                db::params![automation.id.as_str()],
             )
             .await?;
     } else {
-        let next = next_periodic_fire(now, &alarm.next_fire_at, periodic_interval(alarm)?)?;
+        let next = next_periodic_fire(
+            now,
+            &automation.next_fire_at,
+            periodic_interval(automation)?,
+        )?;
         store()
             .conn
             .execute(
-                "UPDATE alarms SET next_fire_at = ?1, retry_at = NULL, unfinished_attempts = 0 \
+                "UPDATE automations SET next_fire_at = ?1, retry_at = NULL, unfinished_attempts = 0 \
                  WHERE id = ?2 AND status = 'active'",
-                db::params![next, alarm.id.as_str()],
+                db::params![next, automation.id.as_str()],
             )
             .await?;
     }
     Ok(())
 }
 
-/// The interval a periodic alarm advances by, refusing a stored row that has no
+/// The interval a periodic automation advances by, refusing a stored row that has no
 /// valid one instead of looping on it forever.
-fn periodic_interval(alarm: &Alarm) -> Result<i64> {
-    let interval = alarm.interval_seconds.unwrap_or(0);
+fn periodic_interval(automation: &Automation) -> Result<i64> {
+    let interval = automation.interval_seconds.unwrap_or(0);
     anyhow::ensure!(
         interval > 0,
-        "Periodic alarm {} has no valid interval",
-        alarm.id
+        "Periodic automation {} has no valid interval",
+        automation.id
     );
     Ok(interval)
 }
 
-/// Alarms whose check is running in this process, keyed by alarm id — the guard
-/// that keeps an alarm to one attempt at a time.
+/// Automations whose check is running in this process, keyed by automation id — the guard
+/// that keeps an automation to one attempt at a time.
 static ATTEMPTS_IN_FLIGHT: LazyLock<std::sync::Mutex<HashSet<String>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
-/// Take the alarm's one in-process attempt slot. `None` while a previous attempt
-/// of the same alarm is still running; the returned slot frees it on drop —
+/// Take the automation's one in-process attempt slot. `None` while a previous attempt
+/// of the same automation is still running; the returned slot frees it on drop —
 /// including when a spawned task is dropped without ever having been polled,
 /// because the slot is taken before the spawn. Nothing about it is durable: a
-/// restarted process has no attempt in flight, so the alarm is simply due again.
-fn claim_attempt_slot(alarm_id: &str) -> Option<AttemptSlot> {
+/// restarted process has no attempt in flight, so the automation is simply due again.
+fn claim_attempt_slot(automation_id: &str) -> Option<AttemptSlot> {
     let inserted = ATTEMPTS_IN_FLIGHT
         .lock()
         .unwrap_poison()
-        .insert(alarm_id.to_string());
-    inserted.then(|| AttemptSlot(alarm_id.to_string()))
+        .insert(automation_id.to_string());
+    inserted.then(|| AttemptSlot(automation_id.to_string()))
 }
 
-/// Whether the alarm's check is running in this process.
-fn attempt_in_flight(alarm_id: &str) -> bool {
-    ATTEMPTS_IN_FLIGHT.lock().unwrap_poison().contains(alarm_id)
+/// Whether the automation's check is running in this process.
+fn attempt_in_flight(automation_id: &str) -> bool {
+    ATTEMPTS_IN_FLIGHT
+        .lock()
+        .unwrap_poison()
+        .contains(automation_id)
 }
 
-/// RAII guard for an alarm's in-process attempt slot.
+/// RAII guard for an automation's in-process attempt slot.
 struct AttemptSlot(String);
 
 impl Drop for AttemptSlot {
@@ -936,39 +956,39 @@ impl Drop for AttemptSlot {
     }
 }
 
-/// Fire a triggered alarm: take the alarm's attempt slot and spawn a detached
+/// Fire a triggered automation: take the automation's attempt slot and spawn a detached
 /// task that runs the stored check and settles the attempt.
 ///
 /// The slot is taken before the spawn, so however slow the check is — and
 /// whether or not the task ever gets polled — the sweep cannot start a second
-/// attempt for the same alarm. The rest of the sweep is unaffected: a waiting
-/// alarm holds back nothing but itself.
+/// attempt for the same automation. The rest of the sweep is unaffected: a waiting
+/// automation holds back nothing but itself.
 ///
 /// `missed` is the firing's lateness, decided before the check starts and
 /// carried into the notice the finished run produces: how long the check itself
 /// takes is not lateness.
-fn fire_trigger_alarm(alarm: &Alarm, trigger: &StoredTrigger, missed: bool) {
-    let Some(slot) = claim_attempt_slot(&alarm.id) else {
+fn fire_trigger_automation(automation: &Automation, trigger: &StoredTrigger, missed: bool) {
+    let Some(slot) = claim_attempt_slot(&automation.id) else {
         return;
     };
-    tokio::spawn(run_alarm_trigger_task(
+    tokio::spawn(run_automation_trigger_task(
         slot,
-        alarm.clone(),
+        automation.clone(),
         trigger.clone(),
         missed,
     ));
 }
 
-/// What one trigger evaluation produced, as the notification and the alarm's
+/// What one trigger evaluation produced, as the notification and the automation's
 /// state see it.
 enum TriggerOutcome {
-    /// The check ran and reported nothing at all — the alarm stays armed and
+    /// The check ran and reported nothing at all — the automation stays armed and
     /// nothing is delivered.
     Silent,
     /// The check ran and reported something: the run's own outcome.
     Ran(ProgramOutcome),
     /// The check could not run at all: the reason the assistant is shown. The
-    /// alarm goes either way.
+    /// automation goes either way.
     CouldNotRun(String),
     /// The check was still running when its own time limit stopped it. That is
     /// not a verdict about the check: nothing is delivered for the attempt, and
@@ -993,7 +1013,7 @@ impl TriggerOutcome {
     }
 }
 
-/// Run one trigger: resolve the named custom tool for the alarm's owner — the
+/// Run one trigger: resolve the named custom tool for the automation's owner — the
 /// same availability rule, catalogue lookup and argument contract a normal
 /// `custom` call applies, with the strict rule that arguments the tool does not
 /// declare are refused rather than ignored — then run it in the owner's
@@ -1042,74 +1062,74 @@ async fn run_trigger(ws: &Workspace, user: &str, trigger: &Trigger) -> TriggerOu
     )
 }
 
-/// Run a triggered alarm's stored check in the owner's personal workspace and
+/// Run a triggered automation's stored check in the owner's personal workspace and
 /// settle the attempt (see [`settle_trigger_attempt`]). The attempt's slot is
 /// held until this task finishes, however it finishes.
-async fn run_alarm_trigger_task(
+async fn run_automation_trigger_task(
     _slot: AttemptSlot,
-    alarm: Alarm,
+    automation: Automation,
     trigger: StoredTrigger,
     missed: bool,
 ) {
     let outcome = match &trigger {
         StoredTrigger::Tool(check) => {
-            let ws = crate::users::personal_workspace_struct(&alarm.user_name);
-            run_trigger(&ws, &alarm.user_name, check).await
+            let ws = crate::users::personal_workspace_struct(&automation.user_name);
+            run_trigger(&ws, &automation.user_name, check).await
         }
         // A stored check that cannot be read is a check that cannot run:
-        // nothing is run, and the reason goes to the assistant with the alarm.
+        // nothing is run, and the reason goes to the assistant with the automation.
         StoredTrigger::Unreadable => {
             TriggerOutcome::CouldNotRun("the stored check cannot be read".to_string())
         }
     };
 
-    if let Err(e) = settle_trigger_attempt(&alarm, &trigger, outcome, missed).await {
+    if let Err(e) = settle_trigger_attempt(&automation, &trigger, outcome, missed).await {
         // The occurrence is untouched: its due time still stands and no retry
         // cool-down was set, so the next sweep runs the check again.
-        tracing::warn!(alarm = %alarm.id, error = %e, "Failed to settle an alarm check");
+        tracing::warn!(automation = %automation.id, error = %e, "Failed to settle an automation check");
     }
 }
 
-/// Settle one finished attempt against its alarm.
+/// Settle one finished attempt against its automation.
 ///
 /// A check that reported — or ran cleanly and said nothing — delivers what it
-/// produced and lets the alarm resume its normal schedule. A broken check
-/// soft-deletes the alarm and delivers why. An attempt that did not finish in
+/// produced and lets the automation resume its normal schedule. A broken check
+/// soft-deletes the automation and delivers why. An attempt that did not finish in
 /// time delivers nothing and keeps the occurrence pending for a retry.
 async fn settle_trigger_attempt(
-    alarm: &Alarm,
+    automation: &Automation,
     trigger: &StoredTrigger,
     outcome: TriggerOutcome,
     missed: bool,
 ) -> Result<()> {
     match &outcome {
-        TriggerOutcome::Unfinished => return defer_trigger_attempt(alarm, trigger).await,
+        TriggerOutcome::Unfinished => return defer_trigger_attempt(automation, trigger).await,
         TriggerOutcome::Silent | TriggerOutcome::Ran(ProgramOutcome { success: true, .. }) => {}
         TriggerOutcome::Ran(_) | TriggerOutcome::CouldNotRun(_) => {
             // Track whether the delete actually committed — the notification
             // must not claim a deletion that didn't happen.
-            let deletion = delete_alarm_after_run(alarm).await;
+            let deletion = delete_automation_after_run(automation).await;
             if let Some(content) =
-                trigger_notification(alarm, trigger, &outcome, Some(&deletion), missed)
+                trigger_notification(automation, trigger, &outcome, Some(&deletion), missed)
             {
-                deliver_alarm_notification(alarm, content).await;
+                deliver_automation_notification(automation, content).await;
             }
-            // A deletion that did not commit leaves the alarm due: the broken
+            // A deletion that did not commit leaves the automation due: the broken
             // check would run and notify again on every sweep. Advancing bounds
             // it to one more firing per scheduled occurrence, as every fire was
             // bounded before.
             if deletion.is_err() {
-                advance_alarm_state(alarm, &db::now()).await?;
+                advance_automation_state(automation, &db::now()).await?;
             }
             return Ok(());
         }
     }
     // Delivered before the state advance, so a crash in between replays the
     // report rather than losing it.
-    if let Some(content) = trigger_notification(alarm, trigger, &outcome, None, missed) {
-        deliver_alarm_notification(alarm, content).await;
+    if let Some(content) = trigger_notification(automation, trigger, &outcome, None, missed) {
+        deliver_automation_notification(automation, content).await;
     }
-    advance_alarm_state(alarm, &db::now()).await
+    advance_automation_state(automation, &db::now()).await
 }
 
 /// Keep the occurrence pending after an attempt that did not finish in time:
@@ -1121,23 +1141,23 @@ async fn settle_trigger_attempt(
 /// late report is announced with — so the wait lives in the row's `retry_at`. The
 /// write is guarded on the occurrence the attempt ran for, so a concurrent
 /// reschedule is never overwritten; the count is written as this attempt's own
-/// value, which is the row's because an alarm has only one attempt in flight.
-async fn defer_trigger_attempt(alarm: &Alarm, trigger: &StoredTrigger) -> Result<()> {
-    let attempt = alarm.unfinished_attempts + 1;
+/// value, which is the row's because an automation has only one attempt in flight.
+async fn defer_trigger_attempt(automation: &Automation, trigger: &StoredTrigger) -> Result<()> {
+    let attempt = automation.unfinished_attempts + 1;
     let retry_at = (db::parse_utc_timestamp(&db::now())?
         + ChronoDuration::seconds(RETRY_COOLDOWN_SECS))
     .to_rfc3339();
     let changed = store()
         .conn
         .execute(
-            "UPDATE alarms SET retry_at = ?1, unfinished_attempts = ?2 \
+            "UPDATE automations SET retry_at = ?1, unfinished_attempts = ?2 \
              WHERE id = ?3 AND session_id = ?4 AND status = 'active' AND next_fire_at = ?5",
             db::params![
                 retry_at,
                 attempt,
-                alarm.id.as_str(),
-                alarm.session_id.as_str(),
-                alarm.next_fire_at.as_str(),
+                automation.id.as_str(),
+                automation.session_id.as_str(),
+                automation.next_fire_at.as_str(),
             ],
         )
         .await?;
@@ -1149,26 +1169,26 @@ async fn defer_trigger_attempt(alarm: &Alarm, trigger: &StoredTrigger) -> Result
     // it on every later unfinished attempt.
     if attempt == UNFINISHED_NOTICE_ATTEMPTS {
         let content = crate::prompt::substitute(
-            &crate::prompt::load_prompt("alarm_trigger_unfinished.md"),
+            &crate::prompt::load_prompt("automation_trigger_unfinished.md"),
             &[
-                ("{{text}}", &alarm.text),
+                ("{{text}}", &automation.text),
                 ("{{trigger}}", &trigger.render()),
             ],
         );
-        deliver_alarm_notification(alarm, content).await;
+        deliver_automation_notification(automation, content).await;
     }
     Ok(())
 }
 
 /// Decide the delivery for a finished trigger evaluation: `None` stays silent
 /// (the check reported nothing at all, or did not finish in time); `Some` is the
-/// rendered `<alarm-notification>` with the reminder, the trigger, the status
+/// rendered `<automation-notification>` with the automation's text, the trigger, the status
 /// line, the deletion note (on a broken check) and the check's output.
-/// `deletion` carries the result of [`delete_alarm_after_run`], `None` when no
+/// `deletion` carries the result of [`delete_automation_after_run`], `None` when no
 /// deletion was attempted; `missed` is the firing's lateness, decided when the
 /// firing happened.
 fn trigger_notification(
-    alarm: &Alarm,
+    automation: &Automation,
     trigger: &StoredTrigger,
     outcome: &TriggerOutcome,
     deletion: Option<&Result<()>>,
@@ -1204,17 +1224,17 @@ fn trigger_notification(
     };
     let deletion_line = match deletion {
         None => String::new(),
-        Some(Ok(())) => crate::prompt::load_prompt("alarm_trigger_deletion.md"),
-        Some(Err(_)) => crate::prompt::load_prompt("alarm_trigger_deletion_failed.md"),
+        Some(Ok(())) => crate::prompt::load_prompt("automation_trigger_deletion.md"),
+        Some(Err(_)) => crate::prompt::load_prompt("automation_trigger_deletion_failed.md"),
     };
     // Only a delivered result can be late for its occurrence — a broken check's
     // notice reads as it always has.
     let reported = matches!(outcome, TriggerOutcome::Ran(run) if run.success);
-    let timing = trigger_timing(alarm, missed, reported);
+    let timing = trigger_timing(automation, missed, reported);
     Some(crate::prompt::substitute(
-        &crate::prompt::load_prompt("alarm_trigger_notification.md"),
+        &crate::prompt::load_prompt("automation_trigger_notification.md"),
         &[
-            ("{{reminder_line}}", &reminder_line(alarm, &timing)),
+            ("{{automation_line}}", &automation_line(automation, &timing)),
             ("{{trigger}}", &trigger.render()),
             ("{{trigger_status}}", &status),
             ("{{trigger_deletion}}", &deletion_line),
@@ -1223,7 +1243,7 @@ fn trigger_notification(
     ))
 }
 
-/// Compute the next fire time for a periodic alarm: advance `next_fire` past
+/// Compute the next fire time for a periodic automation: advance `next_fire` past
 /// `now` by whole periods (O(1), saturating on overflow). Never loops over
 /// downtime and never panics on an absurd interval.
 fn next_periodic_fire(now: &str, next_fire: &str, interval_secs: i64) -> Result<String> {
@@ -1240,47 +1260,47 @@ fn next_periodic_fire(now: &str, next_fire: &str, interval_secs: i64) -> Result<
     Ok(next.to_rfc3339())
 }
 
-/// The alarms a sweep pass may start, up to `batch_limit`: those due and not
+/// The automations a sweep pass may start, up to `batch_limit`: those due and not
 /// already running here. A running check is skipped before the batch is cut, so
-/// a long check never takes a slot from a waiting alarm; the alarm's own slot
+/// a long check never takes a slot from a waiting automation; the automation's own slot
 /// ([`claim_attempt_slot`]) stays the authority on never starting twice.
-fn startable(due: Vec<Alarm>, batch_limit: usize) -> Vec<Alarm> {
+fn startable(due: Vec<Automation>, batch_limit: usize) -> Vec<Automation> {
     due.into_iter()
-        .filter(|alarm| !attempt_in_flight(&alarm.id))
+        .filter(|automation| !attempt_in_flight(&automation.id))
         .take(batch_limit)
         .collect()
 }
 
-/// Fire up to `batch_limit` due alarms, continuing past individual failures so
-/// one bad alarm cannot block the rest of the sweep.
-async fn run_alarm_sweep(batch_limit: usize) -> Result<()> {
-    let due = startable(due_alarms(&db::now()).await?, batch_limit);
+/// Fire up to `batch_limit` due automations, continuing past individual failures so
+/// one bad automation cannot block the rest of the sweep.
+async fn run_automation_sweep(batch_limit: usize) -> Result<()> {
+    let due = startable(due_automations(&db::now()).await?, batch_limit);
     let mut fired = 0usize;
     let mut failed = 0usize;
-    for alarm in due {
-        match fire_alarm(&alarm).await {
+    for automation in due {
+        match fire_automation(&automation).await {
             Ok(()) => fired += 1,
             Err(e) => {
                 failed += 1;
-                tracing::warn!(alarm = %alarm.id, error = %e, "Failed to fire alarm");
+                tracing::warn!(automation = %automation.id, error = %e, "Failed to fire automation");
             }
         }
     }
     if fired > 0 || failed > 0 {
-        tracing::debug!(fired, failed, "alarm sweep complete");
+        tracing::debug!(fired, failed, "automation sweep complete");
     }
     Ok(())
 }
 
-/// Cancellable alarm-sweep loop: sleep, then fire due alarms on each tick.
+/// Cancellable automation-sweep loop: sleep, then fire due automations on each tick.
 /// The first tick acts as the boot-time overdue scan.
-pub async fn run_alarm_sweep_loop() {
+pub async fn run_automation_sweep_loop() {
     loop {
         if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_TICK).await {
             break;
         }
-        if let Err(e) = run_alarm_sweep(50).await {
-            tracing::warn!(error = %e, "alarm sweep failed");
+        if let Err(e) = run_automation_sweep(50).await {
+            tracing::warn!(error = %e, "automation sweep failed");
         }
     }
 }
@@ -1307,7 +1327,7 @@ mod tests {
 
     /// A firing is MISSED only when it lands well past its scheduled time: a
     /// routine tick's own delay never counts, and a scheduled time that cannot
-    /// be read is not a miss either — that would fail the firing of an alarm
+    /// be read is not a miss either — that would fail the firing of an automation
     /// that stays due, re-firing it every tick.
     #[test]
     fn missed_firing_needs_a_firing_far_past_its_scheduled_time() {
@@ -1333,14 +1353,14 @@ mod tests {
     /// two, never both — naming the occurrence when a retried check finally
     /// reported.
     #[test]
-    fn reminder_line_states_exactly_one_timing() {
-        let alarm = trigger_alarm();
+    fn automation_line_states_exactly_one_timing() {
+        let automation = trigger_automation();
         assert_eq!(
-            reminder_line(&alarm, &Timing::Due),
-            "Your reminder \"check the thing\" is due now \
+            automation_line(&automation, &Timing::Due),
+            "Your automation \"check the thing\" is due now \
              (scheduled for 2026-09-04T12:00:00+00:00)."
         );
-        let missed = reminder_line(&alarm, &Timing::Missed);
+        let missed = automation_line(&automation, &Timing::Missed);
         assert!(missed.contains("was MISSED"), "got: {missed}");
         assert!(
             missed.contains("2026-09-04T12:00:00+00:00"),
@@ -1356,7 +1376,7 @@ mod tests {
         );
 
         let due_at = "2026-09-04T12:00:00+00:00";
-        let late = reminder_line(&alarm, &Timing::Late);
+        let late = automation_line(&automation, &Timing::Late);
         assert!(late.contains("LATE"), "got: {late}");
         assert!(
             late.contains(due_at),
@@ -1392,8 +1412,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_alarm_rejects_past_one_shot() {
-        let err = add_alarm(
+    async fn add_automation_rejects_past_one_shot() {
+        let err = add_automation(
             "session-a",
             "alice",
             "remind me",
@@ -1408,16 +1428,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_alarm_rejects_short_periodic_interval() {
-        let err = add_alarm("session-a", "alice", "remind me", None, Some(4), None, None)
+    async fn add_automation_rejects_short_periodic_interval() {
+        let err = add_automation("session-a", "alice", "remind me", None, Some(4), None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least 5 seconds"), "got: {err}");
     }
 
     #[tokio::test]
-    async fn add_alarm_rejects_absurd_periodic_interval() {
-        let err = add_alarm(
+    async fn add_automation_rejects_absurd_periodic_interval() {
+        let err = add_automation(
             "session-a",
             "alice",
             "remind me",
@@ -1432,15 +1452,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_alarm_requires_exactly_one_of_fire_at_or_interval() {
+    async fn add_automation_requires_exactly_one_of_fire_at_or_interval() {
         // Neither provided.
-        let err = add_alarm("session-a", "alice", "remind me", None, None, None, None)
+        let err = add_automation("session-a", "alice", "remind me", None, None, None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Exactly one"), "got: {err}");
 
         // Both provided.
-        let err = add_alarm(
+        let err = add_automation(
             "session-a",
             "alice",
             "remind me",
@@ -1455,15 +1475,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_alarm_enforces_active_cap() {
+    async fn add_automation_enforces_active_cap() {
         crate::util::test::init_test_stores().await;
         let session = "cap-session";
-        for i in 0..MAX_ACTIVE_ALARMS {
+        for i in 0..MAX_ACTIVE_AUTOMATIONS {
             let fire = format!("2099-01-01T00:00:{i:02}Z");
-            add_alarm(
+            add_automation(
                 session,
                 "alice",
-                &format!("reminder {i}"),
+                &format!("automation {i}"),
                 Some(&fire),
                 None,
                 None,
@@ -1472,7 +1492,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let err = add_alarm(
+        let err = add_automation(
             session,
             "alice",
             "one too many",
@@ -1485,7 +1505,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains(&format!("maximum {MAX_ACTIVE_ALARMS}")),
+                .contains(&format!("maximum {MAX_ACTIVE_AUTOMATIONS}")),
             "got: {err}"
         );
     }
@@ -1499,10 +1519,10 @@ mod tests {
     /// bounded as a whole, so a short-name/over-long-args trigger and a
     /// long-name/empty-args one are both refused.
     #[tokio::test]
-    async fn add_alarm_rejects_overlong_trigger() {
+    async fn add_automation_rejects_overlong_trigger() {
         crate::util::test::init_test_stores().await;
         let overlong = |trigger: Trigger| async move {
-            add_alarm(
+            add_automation(
                 "session-a",
                 "alice",
                 "remind me",
@@ -1518,14 +1538,16 @@ mod tests {
 
         let err = overlong(Trigger {
             tool: "weather".to_string(),
-            args: args_of(&serde_json::json!({ "city": "x".repeat(MAX_ALARM_TRIGGER_CHARS + 1) })),
+            args: args_of(
+                &serde_json::json!({ "city": "x".repeat(MAX_AUTOMATION_TRIGGER_CHARS + 1) }),
+            ),
         })
         .await;
         assert!(err.contains("too long"), "got: {err}");
 
         // The name counts too: these arguments alone are far inside the bound.
         let err = overlong(Trigger {
-            tool: "x".repeat(MAX_ALARM_TRIGGER_CHARS),
+            tool: "x".repeat(MAX_AUTOMATION_TRIGGER_CHARS),
             args: args_of(&serde_json::json!({ "city": "Minsk" })),
         })
         .await;
@@ -1533,10 +1555,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_alarm_stores_trigger() {
+    async fn add_automation_stores_trigger() {
         crate::util::test::init_test_stores().await;
         let session = "trigger-session";
-        let alarm = add_alarm(
+        let automation = add_automation(
             session,
             "alice",
             "remind me",
@@ -1547,10 +1569,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let trigger = alarm.trigger.as_ref().expect("stored trigger");
+        let trigger = automation.trigger.as_ref().expect("stored trigger");
         assert_eq!(trigger.render(), "weather {\"city\":\"Minsk\"}");
-        let listed = list_alarms(session).await.unwrap();
-        assert_eq!(listed.len(), 1, "one triggered alarm must be listed");
+        let listed = list_automations(session).await.unwrap();
+        assert_eq!(listed.len(), 1, "one triggered automation must be listed");
         let listed_trigger = listed[0].trigger.as_ref().expect("listed trigger");
         assert_eq!(listed_trigger.render(), "weather {\"city\":\"Minsk\"}");
     }
@@ -1564,9 +1586,9 @@ mod tests {
         }
     }
 
-    fn trigger_alarm() -> Alarm {
-        Alarm {
-            id: "alarm-trigger".to_string(),
+    fn trigger_automation() -> Automation {
+        Automation {
+            id: "automation-trigger".to_string(),
             session_id: "assistant:alice".to_string(),
             user_name: "alice".to_string(),
             kind: "periodic".to_string(),
@@ -1595,11 +1617,11 @@ mod tests {
 
     #[test]
     fn trigger_notification_stays_silent_when_check_reports_nothing() {
-        let alarm = trigger_alarm();
+        let automation = trigger_automation();
         let trigger = StoredTrigger::Tool(weather_trigger());
         for missed in [false, true] {
             assert!(
-                trigger_notification(&alarm, &trigger, &TriggerOutcome::Silent, None, missed)
+                trigger_notification(&automation, &trigger, &TriggerOutcome::Silent, None, missed)
                     .is_none(),
                 "a silent check must not wake the assistant, late or not"
             );
@@ -1646,11 +1668,11 @@ mod tests {
 
     #[test]
     fn trigger_notification_wakes_on_output() {
-        let alarm = trigger_alarm();
+        let automation = trigger_automation();
         let trigger = StoredTrigger::Tool(weather_trigger());
         let outcome = TriggerOutcome::Ran(ran(true, "exit status 0", "all good", true));
-        let content = trigger_notification(&alarm, &trigger, &outcome, None, false).unwrap();
-        assert!(content.contains("<alarm-notification>"));
+        let content = trigger_notification(&automation, &trigger, &outcome, None, false).unwrap();
+        assert!(content.contains("<automation-notification>"));
         assert!(content.contains("check the thing"));
         assert!(content.contains("weather {\"city\":\"Minsk\"}"));
         assert!(content.contains("exited successfully (exit status 0)"));
@@ -1669,14 +1691,15 @@ mod tests {
     /// for, on every notice a firing produces.
     #[test]
     fn trigger_notification_says_a_late_firing_was_missed() {
-        let alarm = trigger_alarm();
+        let automation = trigger_automation();
         let trigger = StoredTrigger::Tool(weather_trigger());
         for outcome in [
             TriggerOutcome::Ran(ran(true, "exit status 0", "all good", true)),
             TriggerOutcome::Ran(ran(false, "exit status 2", "boom", true)),
             TriggerOutcome::CouldNotRun("the managed bun runtime is unavailable".to_string()),
         ] {
-            let content = trigger_notification(&alarm, &trigger, &outcome, None, true).unwrap();
+            let content =
+                trigger_notification(&automation, &trigger, &outcome, None, true).unwrap();
             assert!(content.contains("was MISSED"), "got: {content}");
             assert!(
                 content.contains("2026-09-04T12:00:00+00:00"),
@@ -1690,10 +1713,10 @@ mod tests {
     /// not label it "no output".
     #[test]
     fn trigger_notification_does_not_call_escape_only_output_empty() {
-        let alarm = trigger_alarm();
+        let automation = trigger_automation();
         let trigger = StoredTrigger::Tool(weather_trigger());
         let outcome = TriggerOutcome::Ran(ran(true, "exit status 0", "", true));
-        let content = trigger_notification(&alarm, &trigger, &outcome, None, false).unwrap();
+        let content = trigger_notification(&automation, &trigger, &outcome, None, false).unwrap();
         assert!(content.contains("not printable"), "got: {content}");
         assert!(!content.contains("(no output)"), "got: {content}");
     }
@@ -1704,17 +1727,18 @@ mod tests {
     /// time, never the retry instant the notice is composed at.
     #[test]
     fn a_broken_check_after_retries_is_not_late_and_names_its_scheduled_time() {
-        let alarm = Alarm {
+        let automation = Automation {
             unfinished_attempts: 3,
-            ..trigger_alarm()
+            ..trigger_automation()
         };
         let trigger = StoredTrigger::Tool(weather_trigger());
         for outcome in [
             TriggerOutcome::Ran(ran(false, "exit status 2", "boom", true)),
             TriggerOutcome::CouldNotRun("the managed bun runtime is unavailable".to_string()),
         ] {
-            let content = trigger_notification(&alarm, &trigger, &outcome, Some(&Ok(())), true)
-                .expect("a broken check always notifies");
+            let content =
+                trigger_notification(&automation, &trigger, &outcome, Some(&Ok(())), true)
+                    .expect("a broken check always notifies");
             assert!(!content.contains("LATE"), "got: {content}");
             assert!(
                 content.contains("was MISSED — it was scheduled for 2026-09-04T12:00:00+00:00"),
@@ -1724,21 +1748,21 @@ mod tests {
     }
 
     /// A failed check always wakes, empty output included, and the notice
-    /// reports whether the alarm was actually removed.
+    /// reports whether the automation was actually removed.
     #[test]
     fn trigger_notification_wakes_on_failure_and_reports_the_deletion_outcome() {
-        let alarm = trigger_alarm();
+        let automation = trigger_automation();
         let trigger = StoredTrigger::Tool(weather_trigger());
         let outcome = TriggerOutcome::Ran(ran(false, "exit status 2", "", false));
 
         let deleted =
-            trigger_notification(&alarm, &trigger, &outcome, Some(&Ok(())), false).unwrap();
+            trigger_notification(&automation, &trigger, &outcome, Some(&Ok(())), false).unwrap();
         assert!(deleted.contains("FAILED (exit status 2)"), "got: {deleted}");
         assert!(deleted.contains("(no output)"), "got: {deleted}");
         assert!(deleted.contains("DELETED"), "got: {deleted}");
 
         let failed = trigger_notification(
-            &alarm,
+            &automation,
             &trigger,
             &outcome,
             Some(&Err(anyhow::anyhow!("db down"))),
@@ -1755,12 +1779,12 @@ mod tests {
 
     #[test]
     fn trigger_notification_reports_a_check_that_could_not_run() {
-        let alarm = trigger_alarm();
+        let automation = trigger_automation();
         let trigger = StoredTrigger::Tool(weather_trigger());
         let outcome =
             TriggerOutcome::CouldNotRun("the custom tool \"weather\" is no longer usable".into());
         let content =
-            trigger_notification(&alarm, &trigger, &outcome, Some(&Ok(())), false).unwrap();
+            trigger_notification(&automation, &trigger, &outcome, Some(&Ok(())), false).unwrap();
         assert!(
             content.contains("no longer usable"),
             "the reason must reach the assistant: {content}"
@@ -1773,27 +1797,33 @@ mod tests {
         );
     }
 
-    /// An alarms row's status, for the fire-time assertions that a non-clean
-    /// check took the alarm out of service.
-    async fn alarm_status(id: &str) -> String {
+    /// An automations row's status, for the fire-time assertions that a non-clean
+    /// check took the automation out of service.
+    async fn automation_status(id: &str) -> String {
         store()
             .conn
-            .query("SELECT status FROM alarms WHERE id = ?1", db::params![id])
+            .query(
+                "SELECT status FROM automations WHERE id = ?1",
+                db::params![id],
+            )
             .await
             .unwrap()
             .first()
             .map(|r| r.get(0))
             .transpose()
             .unwrap()
-            .expect("alarm row must exist")
+            .expect("automation row must exist")
     }
 
-    /// The moment the alarm's retried occurrence may run, `None` when nothing
+    /// The moment the automation's retried occurrence may run, `None` when nothing
     /// is waiting — read straight from the row, as the sweep's own filter is.
-    async fn alarm_retry_at(id: &str) -> Option<String> {
+    async fn automation_retry_at(id: &str) -> Option<String> {
         store()
             .conn
-            .query("SELECT retry_at FROM alarms WHERE id = ?1", db::params![id])
+            .query(
+                "SELECT retry_at FROM automations WHERE id = ?1",
+                db::params![id],
+            )
             .await
             .unwrap()
             .first()
@@ -1804,22 +1834,22 @@ mod tests {
     }
 
     /// The row as the next sweep would read it.
-    async fn active_alarm(session_id: &str, id: &str) -> Alarm {
-        list_alarms(session_id)
+    async fn active_automation(session_id: &str, id: &str) -> Automation {
+        list_automations(session_id)
             .await
             .unwrap()
             .into_iter()
-            .find(|alarm| alarm.id == id)
-            .expect("an active alarm row")
+            .find(|automation| automation.id == id)
+            .expect("an active automation row")
     }
 
-    /// Whether the sweep would pick the alarm up right now.
+    /// Whether the sweep would pick the automation up right now.
     async fn is_due(id: &str) -> bool {
-        due_alarms(&db::now())
+        due_automations(&db::now())
             .await
             .unwrap()
             .iter()
-            .any(|alarm| alarm.id == id)
+            .any(|automation| automation.id == id)
     }
 
     /// How far `timestamp` is from now, in seconds.
@@ -1830,35 +1860,35 @@ mod tests {
             .num_seconds()
     }
 
-    /// Make the alarm's occurrence overdue, as a sweep's read would find it.
+    /// Make the automation's occurrence overdue, as a sweep's read would find it.
     async fn make_overdue(id: &str) {
         store()
             .conn
             .execute(
-                "UPDATE alarms SET next_fire_at = ?1 WHERE id = ?2",
+                "UPDATE automations SET next_fire_at = ?1 WHERE id = ?2",
                 db::params!["2020-01-01T00:00:00+00:00", id],
             )
             .await
             .unwrap();
     }
 
-    /// One attempt at a time, and a waiting alarm holds back nothing but itself:
-    /// an alarm whose check is running has no second attempt, a deferred
-    /// occurrence is not due before its cool-down, and every other alarm keeps
+    /// One attempt at a time, and a waiting automation holds back nothing but itself:
+    /// an automation whose check is running has no second attempt, a deferred
+    /// occurrence is not due before its cool-down, and every other automation keeps
     /// firing at its own due time meanwhile.
     #[tokio::test]
-    async fn one_attempt_at_a_time_and_a_waiting_alarm_waits_only_for_itself() {
-        let session = "assistant:alarm-one-attempt-it";
-        let (waiting, _rx) = arm_trigger_alarm(
+    async fn one_attempt_at_a_time_and_a_waiting_automation_waits_only_for_itself() {
+        let session = "assistant:automation-one-attempt-it";
+        let (waiting, _rx) = arm_trigger_automation(
             session,
-            "alarm-waiting",
-            "no_such_alarm_tool",
+            "automation-waiting",
+            "no_such_automation_tool",
             serde_json::Map::new(),
         )
         .await;
-        let neighbour = add_alarm(
+        let neighbour = add_automation(
             session,
-            "alarm-neighbour",
+            "automation-neighbour",
             "the other check",
             None,
             Some(3600),
@@ -1866,7 +1896,7 @@ mod tests {
             None,
         )
         .await
-        .expect("arm a second triggered alarm");
+        .expect("arm a second triggered automation");
         make_overdue(&waiting.id).await;
         make_overdue(&neighbour.id).await;
         assert!(
@@ -1874,16 +1904,17 @@ mod tests {
             "both occurrences are due"
         );
 
-        // The attempt in flight holds the alarm's only slot: a second one never
+        // The attempt in flight holds the automation's only slot: a second one never
         // starts, however long the check runs.
-        let slot = claim_attempt_slot(&waiting.id).expect("the attempt takes the alarm's slot");
+        let slot =
+            claim_attempt_slot(&waiting.id).expect("the attempt takes the automation's slot");
         assert!(
             claim_attempt_slot(&waiting.id).is_none(),
-            "a second attempt of the same alarm must not start"
+            "a second attempt of the same automation must not start"
         );
         drop(slot);
 
-        let due = active_alarm(session, &waiting.id).await;
+        let due = active_automation(session, &waiting.id).await;
         settle_trigger_attempt(
             &due,
             &StoredTrigger::Tool(weather_trigger()),
@@ -1892,8 +1923,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let deferred = active_alarm(session, &waiting.id).await;
-        let retry_at = alarm_retry_at(&waiting.id)
+        let deferred = active_automation(session, &waiting.id).await;
+        let retry_at = automation_retry_at(&waiting.id)
             .await
             .expect("a wait is recorded");
         let retry_in = seconds_from_now(&retry_at);
@@ -1907,11 +1938,11 @@ mod tests {
         );
         assert!(
             !is_due(&waiting.id).await,
-            "a waiting alarm is not due before its retry"
+            "a waiting automation is not due before its retry"
         );
         assert!(
             is_due(&neighbour.id).await,
-            "a waiting alarm must not hold back the others"
+            "a waiting automation must not hold back the others"
         );
 
         // Once the cool-down has passed the occurrence is due again — with no
@@ -1919,7 +1950,7 @@ mod tests {
         store()
             .conn
             .execute(
-                "UPDATE alarms SET retry_at = ?1 WHERE id = ?2",
+                "UPDATE automations SET retry_at = ?1 WHERE id = ?2",
                 db::params!["2020-01-01T00:00:00+00:00", waiting.id.as_str()],
             )
             .await
@@ -1932,21 +1963,21 @@ mod tests {
     }
 
     /// The whole chain, from a program the ceiling really stops to the notice
-    /// the retry finally produces: the stop keeps the alarm (nothing delivered,
+    /// the retry finally produces: the stop keeps the automation (nothing delivered,
     /// a retry about a minute out, the occurrence's own due moment intact) and
     /// the report of the later attempt arrives late, naming that moment.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_check_stopped_by_its_ceiling_keeps_the_alarm_and_its_report_is_late() {
-        let session = "assistant:alarm-ceiling-it";
-        let (alarm, mut rx) = arm_trigger_alarm(
+    async fn a_check_stopped_by_its_ceiling_keeps_the_automation_and_its_report_is_late() {
+        let session = "assistant:automation-ceiling-it";
+        let (automation, mut rx) = arm_trigger_automation(
             session,
-            "alarm-ceiling",
-            "no_such_alarm_tool",
+            "automation-ceiling",
+            "no_such_automation_tool",
             serde_json::Map::new(),
         )
         .await;
-        let due_at = alarm.next_fire_at.clone();
+        let due_at = automation.next_fire_at.clone();
         let trigger = StoredTrigger::Tool(weather_trigger());
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let ws = crate::workspace::test_ws(tmp.path());
@@ -1962,9 +1993,14 @@ mod tests {
             stopped.timed_out,
             "the one-second ceiling must stop the run"
         );
-        settle_trigger_attempt(&alarm, &trigger, TriggerOutcome::from_run(stopped), false)
-            .await
-            .unwrap();
+        settle_trigger_attempt(
+            &automation,
+            &trigger,
+            TriggerOutcome::from_run(stopped),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert!(
             rx.try_recv().is_err(),
@@ -1974,19 +2010,23 @@ mod tests {
         // the wait lives in the row read back here, and a fresh process has no
         // attempt in flight.
         assert!(
-            !attempt_in_flight(&alarm.id),
+            !attempt_in_flight(&automation.id),
             "a restarted process has no attempt in flight"
         );
-        let waiting = active_alarm(session, &alarm.id).await;
+        let waiting = active_automation(session, &automation.id).await;
         assert_eq!(
-            alarm_status(&alarm.id).await,
+            automation_status(&automation.id).await,
             "active",
             "a one-shot whose check did not finish is not consumed"
         );
         assert_eq!(waiting.unfinished_attempts, 1);
         assert_eq!(waiting.next_fire_at, due_at);
         assert!(
-            seconds_from_now(&alarm_retry_at(&alarm.id).await.expect("a wait is recorded")) > 0,
+            seconds_from_now(
+                &automation_retry_at(&automation.id)
+                    .await
+                    .expect("a wait is recorded")
+            ) > 0,
             "the occurrence is kept and its retry is scheduled"
         );
 
@@ -2018,19 +2058,19 @@ mod tests {
     }
 
     /// A failed run is a broken check, not a check that did not finish: it
-    /// removes the alarm, says FAILED, and leaves nothing due to re-fire.
+    /// removes the automation, says FAILED, and leaves nothing due to re-fire.
     #[tokio::test]
-    async fn a_failed_check_removes_the_alarm_and_never_refires() {
-        let session = "assistant:alarm-failed-it";
-        let (alarm, mut rx) = arm_trigger_alarm(
+    async fn a_failed_check_removes_the_automation_and_never_refires() {
+        let session = "assistant:automation-failed-it";
+        let (automation, mut rx) = arm_trigger_automation(
             session,
-            "alarm-failed",
-            "no_such_alarm_tool",
+            "automation-failed",
+            "no_such_automation_tool",
             serde_json::Map::new(),
         )
         .await;
-        make_overdue(&alarm.id).await;
-        let due = active_alarm(session, &alarm.id).await;
+        make_overdue(&automation.id).await;
+        let due = active_automation(session, &automation.id).await;
 
         settle_trigger_attempt(
             &due,
@@ -2048,26 +2088,26 @@ mod tests {
             job.content
         );
         assert!(job.content.contains("DELETED"), "got: {}", job.content);
-        assert_eq!(alarm_status(&alarm.id).await, "removed");
+        assert_eq!(automation_status(&automation.id).await, "removed");
         assert!(
-            !is_due(&alarm.id).await,
+            !is_due(&automation.id).await,
             "a broken check must never re-fire"
         );
         crate::agent::message_router::unregister_agent(session);
     }
 
-    /// A sweep pass skips an alarm whose check is already running before it cuts
-    /// its batch, so a long check never takes a slot from a waiting alarm; the
-    /// alarm's own slot stays the authority on not starting twice.
+    /// A sweep pass skips an automation whose check is already running before it cuts
+    /// its batch, so a long check never takes a slot from a waiting automation; the
+    /// automation's own slot stays the authority on not starting twice.
     #[test]
     fn a_running_check_does_not_take_a_sweep_slot() {
-        let running = Alarm {
-            id: "alarm-slot-running".to_string(),
-            ..trigger_alarm()
+        let running = Automation {
+            id: "automation-slot-running".to_string(),
+            ..trigger_automation()
         };
-        let waiting = Alarm {
-            id: "alarm-slot-waiting".to_string(),
-            ..trigger_alarm()
+        let waiting = Automation {
+            id: "automation-slot-waiting".to_string(),
+            ..trigger_automation()
         };
         let slot = claim_attempt_slot(&running.id).expect("the running check holds its slot");
 
@@ -2079,28 +2119,29 @@ mod tests {
         );
         assert!(
             !attempt_in_flight(&waiting.id),
-            "picking an alarm takes no slot; its firing does"
+            "picking an automation takes no slot; its firing does"
         );
         drop(slot);
     }
 
     /// Three attempts in a row that did not finish wake the assistant once, with
-    /// a notice that says the check is not producing a result — and the alarm
+    /// a notice that says the check is not producing a result — and the automation
     /// keeps being retried without repeating the notice until an attempt
     /// completes, which starts the count over.
     #[tokio::test]
-    async fn three_unfinished_attempts_notify_once_and_the_alarm_keeps_retrying() {
-        let session = "assistant:alarm-stuck-it";
+    async fn three_unfinished_attempts_notify_once_and_the_automation_keeps_retrying() {
+        let session = "assistant:automation-stuck-it";
         let trigger = StoredTrigger::Tool(weather_trigger());
-        let mut alarm = arm_periodic_trigger_alarm(session, "alarm-stuck", 3600).await;
+        let mut automation =
+            arm_periodic_trigger_automation(session, "automation-stuck", 3600).await;
         let mut rx = crate::agent::message_router::register_agent(session);
 
         for attempt in 1..=4 {
-            settle_trigger_attempt(&alarm, &trigger, TriggerOutcome::Unfinished, false)
+            settle_trigger_attempt(&automation, &trigger, TriggerOutcome::Unfinished, false)
                 .await
                 .unwrap();
-            alarm = active_alarm(session, &alarm.id).await;
-            assert_eq!(alarm.unfinished_attempts, attempt);
+            automation = active_automation(session, &automation.id).await;
+            assert_eq!(automation.unfinished_attempts, attempt);
             if attempt == UNFINISHED_NOTICE_ATTEMPTS {
                 let job = rx
                     .try_recv()
@@ -2120,28 +2161,31 @@ mod tests {
             }
         }
         assert_eq!(
-            alarm_status(&alarm.id).await,
+            automation_status(&automation.id).await,
             "active",
-            "a check that never finishes never removes its alarm"
+            "a check that never finishes never removes its automation"
         );
 
         // A completing attempt clears the count, so the notice needs three more
         // unfinished attempts in a row and does not fire again before that.
-        settle_trigger_attempt(&alarm, &trigger, TriggerOutcome::Silent, false)
+        settle_trigger_attempt(&automation, &trigger, TriggerOutcome::Silent, false)
             .await
             .unwrap();
-        alarm = active_alarm(session, &alarm.id).await;
-        assert_eq!(alarm.unfinished_attempts, 0);
+        automation = active_automation(session, &automation.id).await;
+        assert_eq!(automation.unfinished_attempts, 0);
         assert!(
-            alarm_retry_at(&alarm.id).await.is_none(),
+            automation_retry_at(&automation.id).await.is_none(),
             "a completed check leaves no wait"
         );
         for attempt in 1..UNFINISHED_NOTICE_ATTEMPTS {
-            settle_trigger_attempt(&alarm, &trigger, TriggerOutcome::Unfinished, false)
+            settle_trigger_attempt(&automation, &trigger, TriggerOutcome::Unfinished, false)
                 .await
                 .unwrap();
-            alarm = active_alarm(session, &alarm.id).await;
-            assert_eq!(alarm.unfinished_attempts, attempt, "the count restarted");
+            automation = active_automation(session, &automation.id).await;
+            assert_eq!(
+                automation.unfinished_attempts, attempt,
+                "the count restarted"
+            );
             assert!(
                 rx.try_recv().is_err(),
                 "the count restarted, so no notice arrives yet"
@@ -2150,35 +2194,35 @@ mod tests {
         crate::agent::message_router::unregister_agent(session);
     }
 
-    /// A periodic alarm whose check completes resumes its normal schedule from
+    /// A periodic automation whose check completes resumes its normal schedule from
     /// the occurrence the retries settled: no burst of the occurrences missed
     /// while it waited, and no stale retry state left behind.
     #[tokio::test]
     async fn a_completed_check_resumes_the_periodic_schedule() {
-        let session = "assistant:alarm-resume-it";
-        let alarm = arm_periodic_trigger_alarm(session, "alarm-resume", 60).await;
+        let session = "assistant:automation-resume-it";
+        let automation = arm_periodic_trigger_automation(session, "automation-resume", 60).await;
         let mut rx = crate::agent::message_router::register_agent(session);
         let trigger = StoredTrigger::Tool(weather_trigger());
         // Long overdue, as an occurrence that waited out retries is: the resume
         // has to advance past every period missed meanwhile in one step.
-        make_overdue(&alarm.id).await;
-        let due = active_alarm(session, &alarm.id).await;
+        make_overdue(&automation.id).await;
+        let due = active_automation(session, &automation.id).await;
         let due_at = due.next_fire_at.clone();
 
         settle_trigger_attempt(&due, &trigger, TriggerOutcome::Unfinished, false)
             .await
             .unwrap();
-        let retry = active_alarm(session, &alarm.id).await;
+        let retry = active_automation(session, &automation.id).await;
         assert!(
-            alarm_retry_at(&alarm.id).await.is_some(),
-            "a waiting alarm records the retry it owes"
+            automation_retry_at(&automation.id).await.is_some(),
+            "a waiting automation records the retry it owes"
         );
         settle_trigger_attempt(&retry, &trigger, TriggerOutcome::Silent, false)
             .await
             .unwrap();
 
-        let resumed = active_alarm(session, &alarm.id).await;
-        assert!(alarm_retry_at(&alarm.id).await.is_none());
+        let resumed = active_automation(session, &automation.id).await;
+        assert!(automation_retry_at(&automation.id).await.is_none());
         assert_eq!(resumed.unfinished_attempts, 0);
         let next_in = seconds_from_now(&resumed.next_fire_at);
         assert!(
@@ -2200,11 +2244,15 @@ mod tests {
         crate::agent::message_router::unregister_agent(session);
     }
 
-    /// Arm a periodic trigger alarm for `owner`, firing every `period_secs`,
+    /// Arm a periodic trigger automation for `owner`, firing every `period_secs`,
     /// under the agent `session_id`.
-    async fn arm_periodic_trigger_alarm(session_id: &str, owner: &str, period_secs: u64) -> Alarm {
+    async fn arm_periodic_trigger_automation(
+        session_id: &str,
+        owner: &str,
+        period_secs: u64,
+    ) -> Automation {
         seed_owner(owner).await;
-        add_alarm(
+        add_automation(
             session_id,
             owner,
             "poll the thing",
@@ -2214,23 +2262,23 @@ mod tests {
             None,
         )
         .await
-        .expect("arm a periodic trigger alarm")
+        .expect("arm a periodic trigger automation")
     }
 
-    /// Arm one one-shot trigger alarm for `owner` under the agent `session_id`
+    /// Arm one one-shot trigger automation for `owner` under the agent `session_id`
     /// and return it with the receiver its notification will be routed to.
-    async fn arm_trigger_alarm(
+    async fn arm_trigger_automation(
         session_id: &str,
         owner: &str,
         tool: &str,
         args: serde_json::Map<String, serde_json::Value>,
     ) -> (
-        Alarm,
+        Automation,
         tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob>,
     ) {
         seed_owner(owner).await;
         let rx = crate::agent::message_router::register_agent(session_id);
-        let alarm = add_alarm(
+        let automation = add_automation(
             session_id,
             owner,
             "poll the thing",
@@ -2243,12 +2291,12 @@ mod tests {
             None,
         )
         .await
-        .expect("arm the trigger alarm");
-        (alarm, rx)
+        .expect("arm the trigger automation");
+        (automation, rx)
     }
 
     /// The initialized user store with a row for `name`: availability is settled
-    /// against it, so every alarm owner needs one.
+    /// against it, so every automation owner needs one.
     async fn seed_owner(name: &str) -> &'static crate::users::UserStore {
         crate::util::test::init_management_test_stores().await;
         let store = crate::users::USER_STORE
@@ -2269,14 +2317,14 @@ mod tests {
         probe
     }
 
-    /// Fire `alarm`, wait for the notification the assistant must receive, and
-    /// assert the alarm was taken out of service. Returns the notification.
+    /// Fire `automation`, wait for the notification the assistant must receive, and
+    /// assert the automation was taken out of service. Returns the notification.
     async fn fire_and_collect_notification(
-        alarm: &Alarm,
+        automation: &Automation,
         session_id: &str,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob>,
     ) -> String {
-        fire_alarm(alarm).await.unwrap();
+        fire_automation(automation).await.unwrap();
         let job = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await
             .expect("check resolution must finish in time")
@@ -2284,24 +2332,24 @@ mod tests {
         crate::agent::message_router::unregister_agent(session_id);
         assert!(job.content.contains("DELETED"), "got: {}", job.content);
         assert_eq!(
-            alarm_status(&alarm.id).await,
+            automation_status(&automation.id).await,
             "removed",
             "a check that cannot run must not re-fire"
         );
         job.content
     }
 
-    /// Fire-time integration: a plain alarm routes its reminder into the
+    /// Fire-time integration: a plain automation routes its notice into the
     /// assistant's session and terminalizes the one-shot.
     #[tokio::test]
-    async fn fire_plain_alarm_delivers_reminder_and_terminalizes_the_one_shot() {
+    async fn fire_plain_automation_delivers_its_text_and_terminalizes_the_one_shot() {
         crate::util::test::init_management_test_stores().await;
         // A registered receiver captures the routed job deterministically —
         // no consumer loop (and no agent run) is spawned.
-        let mut rx = crate::agent::message_router::register_agent("assistant:alarm-plain-it");
-        let alarm = add_alarm(
-            "assistant:alarm-plain-it",
-            "alarm-plain",
+        let mut rx = crate::agent::message_router::register_agent("assistant:automation-plain-it");
+        let automation = add_automation(
+            "assistant:automation-plain-it",
+            "automation-plain",
             "check the deploy",
             Some("2099-01-01T00:00:00Z"),
             None,
@@ -2311,37 +2359,37 @@ mod tests {
         .await
         .unwrap();
 
-        fire_alarm(&alarm).await.unwrap();
+        fire_automation(&automation).await.unwrap();
 
-        let job = rx.recv().await.expect("plain reminder must route");
-        assert!(job.content.contains("<alarm-notification>"));
+        let job = rx.recv().await.expect("plain automation notice must route");
+        assert!(job.content.contains("<automation-notification>"));
         assert!(job.content.contains("check the deploy"));
         assert!(
             !job.content.contains("MISSED"),
             "a firing on time must not claim it was missed: {}",
             job.content
         );
-        crate::agent::message_router::unregister_agent("assistant:alarm-plain-it");
+        crate::agent::message_router::unregister_agent("assistant:automation-plain-it");
 
         assert_eq!(
-            alarm_status(&alarm.id).await,
+            automation_status(&automation.id).await,
             "fired",
             "one-shot must be terminalized"
         );
     }
 
-    /// Fire-time integration: an alarm the sweep reaches long after its
+    /// Fire-time integration: an automation the sweep reaches long after its
     /// scheduled time — a start after the product was down, a machine that was
     /// suspended — reaches the user as missed, naming the occurrence that was
     /// due rather than the next one the state advance has already written.
     #[tokio::test]
-    async fn fire_late_alarm_says_the_firing_was_missed() {
+    async fn fire_late_automation_says_the_firing_was_missed() {
         crate::util::test::init_management_test_stores().await;
-        let session = "assistant:alarm-late-it";
+        let session = "assistant:automation-late-it";
         let mut rx = crate::agent::message_router::register_agent(session);
-        let alarm = add_alarm(
+        let automation = add_automation(
             session,
-            "alarm-late",
+            "automation-late",
             "check the deploy",
             None,
             Some(3600),
@@ -2355,20 +2403,20 @@ mod tests {
         store()
             .conn
             .execute(
-                "UPDATE alarms SET next_fire_at = ?1 WHERE id = ?2",
-                db::params!["2020-01-01T00:00:00Z", alarm.id.as_str()],
+                "UPDATE automations SET next_fire_at = ?1 WHERE id = ?2",
+                db::params!["2020-01-01T00:00:00Z", automation.id.as_str()],
             )
             .await
             .unwrap();
-        let due = due_alarms(&db::now()).await.unwrap();
+        let due = due_automations(&db::now()).await.unwrap();
         let stored = due
             .iter()
-            .find(|candidate| candidate.id == alarm.id)
-            .expect("the alarm must be due");
+            .find(|candidate| candidate.id == automation.id)
+            .expect("the automation must be due");
 
-        fire_alarm(stored).await.unwrap();
+        fire_automation(stored).await.unwrap();
 
-        let job = rx.recv().await.expect("late reminder must route");
+        let job = rx.recv().await.expect("late automation notice must route");
         crate::agent::message_router::unregister_agent(session);
         assert!(
             job.content
@@ -2377,24 +2425,24 @@ mod tests {
             job.content
         );
         assert_eq!(
-            alarm_status(&alarm.id).await,
+            automation_status(&automation.id).await,
             "active",
-            "a periodic alarm survives its firing"
+            "a periodic automation survives its firing"
         );
     }
 
     /// A role target with no branch and no workspace.
-    fn role_target(role: &str) -> AlarmTarget {
-        AlarmTarget {
+    fn role_target(role: &str) -> AutomationTarget {
+        AutomationTarget {
             role: role.to_string(),
             identifier: None,
             workspace: None,
         }
     }
 
-    /// The refusal from arming a role-addressed alarm under `user`.
+    /// The refusal from arming a role-addressed automation under `user`.
     async fn try_arm_role(user: &str, role: &str, trigger: Option<Trigger>) -> String {
-        add_alarm(
+        add_automation(
             "assistant:role-target-it",
             user,
             "run it",
@@ -2408,11 +2456,11 @@ mod tests {
         .to_string()
     }
 
-    /// Arming a role-addressed alarm fails closed: only the admin may address a
-    /// role, the role must exist, and the alarm's text (the role's launch
+    /// Arming a role-addressed automation fails closed: only the admin may address a
+    /// role, the role must exist, and the automation's text (the role's launch
     /// message) cannot also carry a trigger.
     #[tokio::test]
-    async fn add_alarm_validates_a_role_target_before_storing_it() {
+    async fn add_automation_validates_a_role_target_before_storing_it() {
         crate::util::test::init_test_stores().await;
 
         let err = try_arm_role("alice", "analyst", None).await;
@@ -2425,7 +2473,7 @@ mod tests {
         );
 
         crate::custom_role::create(
-            "alarm_role_probe",
+            "automation_role_probe",
             "do it",
             &[],
             crate::custom_role::CustomRoleBehavior::Continuous,
@@ -2434,7 +2482,7 @@ mod tests {
         .unwrap();
         let err = try_arm_role(
             crate::users::ADMIN_USER_NAME,
-            "alarm_role_probe",
+            "automation_role_probe",
             Some(weather_trigger()),
         )
         .await;
@@ -2444,35 +2492,35 @@ mod tests {
         );
     }
 
-    /// Fire-time integration: an alarm addressed to a custom role launches that
-    /// role's branch with the alarm's text as its launch message, then
+    /// Fire-time integration: an automation addressed to a custom role launches that
+    /// role's branch with the automation's text as its launch message, then
     /// terminalizes the one-shot.
     #[tokio::test]
-    async fn fire_role_alarm_launches_the_role_and_terminalizes_the_alarm() {
+    async fn fire_role_automation_launches_the_role_and_terminalizes_the_automation() {
         crate::util::test::init_management_test_stores().await;
         crate::custom_role::create(
-            "alarm_runner",
+            "automation_runner",
             "do the thing",
             &[],
             crate::custom_role::CustomRoleBehavior::Continuous,
         )
         .await
         .unwrap();
-        let alarm = add_alarm(
+        let automation = add_automation(
             &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
             crate::users::ADMIN_USER_NAME,
             "run the runner",
             Some("2099-01-01T00:00:00Z"),
             None,
             None,
-            Some(role_target("alarm_runner")),
+            Some(role_target("automation_runner")),
         )
         .await
         .unwrap();
 
-        let branch = crate::session::custom_role_agent_id("alarm_runner", None);
+        let branch = crate::session::custom_role_agent_id("automation_runner", None);
         let mut rx = crate::agent::message_router::register_agent(&branch);
-        fire_alarm(&alarm).await.unwrap();
+        fire_automation(&automation).await.unwrap();
         let job = rx
             .recv()
             .await
@@ -2480,55 +2528,55 @@ mod tests {
         crate::agent::message_router::unregister_agent(&branch);
         assert_eq!(job.content, "run the runner");
         assert_eq!(
-            alarm_status(&alarm.id).await,
+            automation_status(&automation.id).await,
             "fired",
             "one-shot must be terminalized"
         );
     }
 
-    /// Fire-time integration: a role deleted after arming takes its alarm with
-    /// it — the owner is told through his Assistant and the alarm is removed.
+    /// Fire-time integration: a role deleted after arming takes its automation with
+    /// it — the owner is told through his Assistant and the automation is removed.
     #[tokio::test]
-    async fn fire_role_alarm_reports_a_deleted_role_and_removes_the_alarm() {
+    async fn fire_role_automation_reports_a_deleted_role_and_removes_the_automation() {
         crate::util::test::init_management_test_stores().await;
         crate::custom_role::create(
-            "alarm_vanishing",
+            "automation_vanishing",
             "do the thing",
             &[],
             crate::custom_role::CustomRoleBehavior::Continuous,
         )
         .await
         .unwrap();
-        let alarm = add_alarm(
+        let automation = add_automation(
             &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
             crate::users::ADMIN_USER_NAME,
             "wake the role",
             Some("2099-01-01T00:00:00Z"),
             None,
             None,
-            Some(role_target("alarm_vanishing")),
+            Some(role_target("automation_vanishing")),
         )
         .await
         .unwrap();
-        // Remove the record out of band, leaving the armed alarm behind.
+        // Remove the record out of band, leaving the armed automation behind.
         crate::custom_role::CUSTOM_ROLES
             .get()
             .expect("custom role store")
             .conn
             .execute(
                 "DELETE FROM custom_roles WHERE name = ?1",
-                db::params!["alarm_vanishing"],
+                db::params!["automation_vanishing"],
             )
             .await
             .unwrap();
 
-        let mut rx = crate::agent::message_router::register_agent(&alarm.session_id);
-        fire_alarm(&alarm).await.unwrap();
+        let mut rx = crate::agent::message_router::register_agent(&automation.session_id);
+        fire_automation(&automation).await.unwrap();
         let job = rx.recv().await.expect("the owner must be told");
-        crate::agent::message_router::unregister_agent(&alarm.session_id);
-        assert!(job.content.contains("<alarm-notification>"));
+        crate::agent::message_router::unregister_agent(&automation.session_id);
+        assert!(job.content.contains("<automation-notification>"));
         assert!(
-            job.content.contains("alarm_vanishing"),
+            job.content.contains("automation_vanishing"),
             "got: {}",
             job.content
         );
@@ -2537,36 +2585,36 @@ mod tests {
             "got: {}",
             job.content
         );
-        assert_eq!(alarm_status(&alarm.id).await, "removed");
+        assert_eq!(automation_status(&automation.id).await, "removed");
     }
 
-    /// `delete_alarms_for_role` soft-deletes exactly the role's ACTIVE alarms.
+    /// `delete_automations_for_role` soft-deletes exactly the role's ACTIVE automations.
     #[tokio::test]
-    async fn delete_alarms_for_role_soft_deletes_only_its_active_alarms() {
+    async fn delete_automations_for_role_soft_deletes_only_its_active_automations() {
         crate::util::test::init_management_test_stores().await;
         crate::custom_role::create(
-            "alarm_cleanup",
+            "automation_cleanup",
             "done",
             &[],
             crate::custom_role::CustomRoleBehavior::Continuous,
         )
         .await
         .unwrap();
-        let alarm = add_alarm(
+        let automation = add_automation(
             &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
             crate::users::ADMIN_USER_NAME,
             "one",
             Some("2099-01-01T00:00:00Z"),
             None,
             None,
-            Some(role_target("alarm_cleanup")),
+            Some(role_target("automation_cleanup")),
         )
         .await
         .unwrap();
-        // A plain alarm of another owner must survive.
-        let plain = add_alarm(
-            "assistant:alarm-cleanup-it",
-            "alarm-cleanup-user",
+        // A plain automation of another owner must survive.
+        let plain = add_automation(
+            "assistant:automation-cleanup-it",
+            "automation-cleanup-user",
             "two",
             Some("2099-01-01T00:00:00Z"),
             None,
@@ -2576,56 +2624,74 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(delete_alarms_for_role("alarm_cleanup").await.unwrap(), 1);
-        assert_eq!(alarm_status(&alarm.id).await, "removed");
-        assert_eq!(alarm_status(&plain.id).await, "active");
+        assert_eq!(
+            delete_automations_for_role("automation_cleanup")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(automation_status(&automation.id).await, "removed");
+        assert_eq!(automation_status(&plain.id).await, "active");
         // Idempotent: nothing left to remove.
-        assert_eq!(delete_alarms_for_role("alarm_cleanup").await.unwrap(), 0);
+        assert_eq!(
+            delete_automations_for_role("automation_cleanup")
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     /// Fire-time integration: a trigger naming a tool the catalogue does not
-    /// have cannot run, so the assistant is told why and the alarm is removed.
+    /// have cannot run, so the assistant is told why and the automation is removed.
     #[tokio::test]
-    async fn fire_trigger_alarm_reports_a_tool_that_is_gone_and_removes_the_alarm() {
-        let (alarm, mut rx) = arm_trigger_alarm(
-            "assistant:alarm-gone-it",
+    async fn fire_trigger_automation_reports_a_tool_that_is_gone_and_removes_the_automation() {
+        let (automation, mut rx) = arm_trigger_automation(
+            "assistant:automation-gone-it",
             crate::users::ADMIN_USER_NAME,
-            "no_such_alarm_tool",
+            "no_such_automation_tool",
             serde_json::Map::new(),
         )
         .await;
 
         let content =
-            fire_and_collect_notification(&alarm, "assistant:alarm-gone-it", &mut rx).await;
-        assert!(content.contains("<alarm-notification>"));
+            fire_and_collect_notification(&automation, "assistant:automation-gone-it", &mut rx)
+                .await;
+        assert!(content.contains("<automation-notification>"));
         assert!(content.contains("poll the thing"));
-        assert!(content.contains("no_such_alarm_tool"), "got: {content}");
+        assert!(
+            content.contains("no_such_automation_tool"),
+            "got: {content}"
+        );
         assert!(content.contains("no longer usable"), "got: {content}");
     }
 
     /// Fire-time integration: a grant taken away between arming and firing is a
-    /// check that cannot run — its own wording, and the alarm goes with it.
+    /// check that cannot run — its own wording, and the automation goes with it.
     #[tokio::test]
-    async fn fire_trigger_alarm_reports_a_revoked_grant_and_removes_the_alarm() {
+    async fn fire_trigger_automation_reports_a_revoked_grant_and_removes_the_automation() {
         let owner = "revoked_grant_guest";
         let store = seed_owner(owner).await;
-        store.add_grant(owner, "alarm_grant_probe").await.unwrap();
-        let (alarm, mut rx) = arm_trigger_alarm(
-            "assistant:alarm-revoked-it",
+        store
+            .add_grant(owner, "automation_grant_probe")
+            .await
+            .unwrap();
+        let (automation, mut rx) = arm_trigger_automation(
+            "assistant:automation-revoked-it",
             owner,
-            "alarm_grant_probe",
+            "automation_grant_probe",
             serde_json::Map::new(),
         )
         .await;
         // The tool itself stays fine — it is only the grant that goes.
-        let _probe = catalogue_probe("alarm_grant_probe", "// @description Probe.\n");
+        let _probe = catalogue_probe("automation_grant_probe", "// @description Probe.\n");
         store
-            .remove_grant(owner, "alarm_grant_probe")
+            .remove_grant(owner, "automation_grant_probe")
             .await
             .unwrap();
 
         let content =
-            fire_and_collect_notification(&alarm, "assistant:alarm-revoked-it", &mut rx).await;
+            fire_and_collect_notification(&automation, "assistant:automation-revoked-it", &mut rx)
+                .await;
         assert!(
             content.contains("no longer available to you"),
             "got: {content}"
@@ -2634,21 +2700,22 @@ mod tests {
 
     /// Fire-time integration: a stored trigger whose arguments no longer fit
     /// the tool's rewritten header cannot run, so the assistant is told why and
-    /// the alarm is removed.
+    /// the automation is removed.
     #[tokio::test]
-    async fn fire_trigger_alarm_reports_arguments_that_no_longer_fit() {
-        let (alarm, mut rx) = arm_trigger_alarm(
-            "assistant:alarm-args-it",
+    async fn fire_trigger_automation_reports_arguments_that_no_longer_fit() {
+        let (automation, mut rx) = arm_trigger_automation(
+            "assistant:automation-args-it",
             crate::users::ADMIN_USER_NAME,
-            "alarm_args_probe",
+            "automation_args_probe",
             args_of(&serde_json::json!({ "city": "Minsk" })),
         )
         .await;
         // The tool's header no longer declares the parameter the trigger stored.
-        let _probe = catalogue_probe("alarm_args_probe", "// @description Probe.\n");
+        let _probe = catalogue_probe("automation_args_probe", "// @description Probe.\n");
 
         let content =
-            fire_and_collect_notification(&alarm, "assistant:alarm-args-it", &mut rx).await;
+            fire_and_collect_notification(&automation, "assistant:automation-args-it", &mut rx)
+                .await;
         assert!(content.contains("no longer fit"), "got: {content}");
         assert!(
             content.contains("[ignored arguments: city]"),
@@ -2657,36 +2724,36 @@ mod tests {
     }
 
     /// Fire-time integration: a stored check that cannot be read is a check that
-    /// cannot run — the assistant is told why and the alarm goes with it.
+    /// cannot run — the assistant is told why and the automation goes with it.
     #[tokio::test]
-    async fn fire_trigger_alarm_reports_a_stored_check_it_cannot_read() {
-        let session = "assistant:alarm-unreadable-it";
-        let (alarm, mut rx) = arm_trigger_alarm(
+    async fn fire_trigger_automation_reports_a_stored_check_it_cannot_read() {
+        let session = "assistant:automation-unreadable-it";
+        let (automation, mut rx) = arm_trigger_automation(
             session,
             crate::users::ADMIN_USER_NAME,
-            "alarm_unreadable_probe",
+            "automation_unreadable_probe",
             serde_json::Map::new(),
         )
         .await;
         // Replace the stored check with a value that is not one, and make the
-        // alarm due so the sweep's own read path is what fires it.
+        // automation due so the sweep's own read path is what fires it.
         store()
             .conn
             .execute(
-                "UPDATE alarms SET trigger = ?1, next_fire_at = ?2 WHERE id = ?3",
+                "UPDATE automations SET trigger = ?1, next_fire_at = ?2 WHERE id = ?3",
                 db::params![
                     "not a stored check",
                     "2020-01-01T00:00:00Z",
-                    alarm.id.as_str()
+                    automation.id.as_str()
                 ],
             )
             .await
             .unwrap();
-        let due = due_alarms(&db::now()).await.unwrap();
+        let due = due_automations(&db::now()).await.unwrap();
         let stored = due
             .iter()
-            .find(|candidate| candidate.id == alarm.id)
-            .expect("the alarm must be due");
+            .find(|candidate| candidate.id == automation.id)
+            .expect("the automation must be due");
 
         let content = fire_and_collect_notification(stored, session, &mut rx).await;
         assert!(content.contains("cannot be read"), "got: {content}");

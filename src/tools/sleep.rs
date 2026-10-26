@@ -2,7 +2,7 @@
 //!
 //! Called when there is nothing left to do right now and the agent is only
 //! waiting for new input (a user message, an async sub-agent result, or a
-//! fired alarm). The session is preserved and resumed by the next such event;
+//! fired automation). The session is preserved and resumed by the next such event;
 //! the tool never waits inside a turn.
 
 use anyhow::Result;

@@ -14,8 +14,8 @@
 // The execution engine for one agent: the work loop, tool rounds, role
 // metadata, the running-agent registry and the per-agent message router.
 pub mod agent;
-// Reminders that outlive the process, and who gets told when one fires.
-pub mod alarms;
+// Automations that outlive the process, and who gets told when one fires.
+pub mod automations;
 // Admin-defined custom roles: the record, its validation and its granted
 // tool subset.
 pub(crate) mod custom_role;
@@ -1001,7 +1001,7 @@ pub struct Launch {
     /// role's branch, whose folder is `workspace`, so the report returns into
     /// that branch instead of the admin's Assistant. It is PER-LAUNCH: each use
     /// names its asker, so a later use with a different asker overrides it.
-    /// `None` for a launch the owner or an alarm started. Boxed because the asker
+    /// `None` for a launch the owner or an automation started. Boxed because the asker
     /// itself holds a [`crate::Launch`] — the pair would otherwise be infinitely
     /// sized. `#[serde(default)]` keeps envelopes stored before the field existed
     /// decodable.

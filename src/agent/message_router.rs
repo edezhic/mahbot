@@ -410,7 +410,7 @@ async fn persist_and_stamp(job: &mut AgentJob) -> anyhow::Result<()> {
 pub(crate) enum AnsweredFor {
     /// A handover whose failure nobody is told about: an agent, whose own turn is
     /// durable already, or a background sweep with no answerable caller at all
-    /// (the alarm sweep). The failed write is logged and the envelope is routed
+    /// (the automation sweep). The failed write is logged and the envelope is routed
     /// best-effort instead (at-most-once): dropping the handover would be worse
     /// than delivering it unrecorded.
     Agent,
@@ -631,8 +631,8 @@ pub(crate) async fn deliver_command_line_message(content: String) -> anyhow::Res
 /// from the envelope by [`crate::jobs::pending_job_params`].
 /// Used by the durable producers: manager-bound messages routed here,
 /// analyze/research results via [`crate::jobs::complete_job_with_envelope`],
-/// and assistant notices ([`deliver_assistant_notice`]) from the alarm sweep
-/// (`alarms::fire_alarm`) and the custom-tool grant path.
+/// and assistant notices ([`deliver_assistant_notice`]) from the automation sweep
+/// (`automations::fire_automation`) and the custom-tool grant path.
 pub(crate) async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
     let now = db::now();
     crate::session::store()
@@ -650,9 +650,9 @@ pub(crate) async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Resul
 /// routing (a crash after persisting replays it at boot), then route it to
 /// `agent_id`.
 ///
-/// The reminder-parity delivery path — a fired alarm and a custom-tool grant
+/// The same delivery path for both kinds of notice — a fired automation and a custom-tool grant
 /// change both arrive through it. `agent_id` is the resolved Assistant session
-/// key; alarm delivery passes the id stored on the alarm rather than
+/// key; automation delivery passes the id stored on the automation rather than
 /// re-deriving it (re-derivation would double-escape colliding user names). The
 /// text is delivered as composed — notice text is not credential-scrubbed.
 ///

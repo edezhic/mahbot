@@ -294,7 +294,7 @@ pub(crate) struct SessionContext {
     /// The conversation that asked for this branch's launch, when one did — the
     /// asking custom role's branch and the folder its turn ran in, so a worker
     /// branch's report returns there (see [`crate::Launch::reply_to`]). `None`
-    /// for an owner- or alarm-started launch, and for every session recorded
+    /// for an owner- or automation-started launch, and for every session recorded
     /// before the `reply_to` column existed.
     pub reply_to: Option<crate::agent::message_router::Asker>,
 }
@@ -1847,7 +1847,7 @@ pub(crate) fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> St
 
 /// The agent address of `user_name`'s Assistant session.
 ///
-/// The single source of the owner's Assistant address — used by alarm arming
+/// The single source of the owner's Assistant address — used by automation arming
 /// and by notices addressed to the assistant, never re-derived ad hoc.
 #[must_use]
 pub(crate) fn assistant_agent_id(user_name: &str) -> String {

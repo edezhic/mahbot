@@ -1,7 +1,7 @@
-<alarm-notification>
-{{reminder_line}}
+<automation-notification>
+{{automation_line}}
 
 Trigger: `{{trigger}}`
 {{trigger_status}}
 {{trigger_deletion}}{{trigger_output}}
-</alarm-notification>
+</automation-notification>

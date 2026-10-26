@@ -330,7 +330,7 @@ pub fn empty_state_placeholder<'a, Message: 'a>(
 /// [`theme::PAGE_PADDING`]. A failed first read leaves `loading` and
 /// `has_loaded` false, so the body falls through to the empty state with the
 /// banner as the only error signal — the deliberate opposite of the
-/// Alarms/Sessions lists, which suppress the placeholder on error.
+/// Automations/Sessions lists, which suppress the placeholder on error.
 #[must_use]
 pub fn paginated_body<'a, T, Message: 'a>(
     state: &'a PaginatedViewState<T>,

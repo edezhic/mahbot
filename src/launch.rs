@@ -9,7 +9,7 @@
 use anyhow::Result;
 
 /// Build the durable launch envelope for a branch — the shape every launch path
-/// (a tool call, a user command, an alarm) shares.
+/// (a tool call, a user command, an automation) shares.
 fn launch_job(
     content: String,
     workspace_name: String,

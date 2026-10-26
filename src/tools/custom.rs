@@ -587,7 +587,7 @@ impl ResolvedCall {
 /// Why a custom-tool call could not be resolved.
 ///
 /// The call path renders these as its `forbidden:` / `not-found:` / `usage:`
-/// refusals; an alarm's arming and firing paths turn them into their own
+/// refusals; an automation's arming and firing paths turn them into their own
 /// wording, which is why the reason is a value rather than a formatted error.
 pub(crate) enum CallRefusal {
     /// The name is not a callable tool name at all (a path, a dot-file, empty).
@@ -1164,7 +1164,7 @@ mod tests {
         assert!(err.contains("[ignored arguments: extra]"), "got: {err}");
     }
 
-    /// The one difference a strict caller (an alarm) has: an argument the tool
+    /// The one difference a strict caller (an automation) has: an argument the tool
     /// does not declare is refused rather than ignored, and the availability
     /// gate is settled before anything is looked up either way.
     #[tokio::test]
@@ -1197,7 +1197,7 @@ mod tests {
         assert_eq!(resolved.args["city"], json!("Minsk"));
 
         // A guest without the grant is refused whatever the name resolves to —
-        // here to nothing at all — so no path that arms an alarm can probe the
+        // here to nothing at all — so no path that arms an automation can probe the
         // catalogue.
         let unavailable = resolve_tool_call("strict_probe_guest", "ghost", supplied, true).await;
         assert!(

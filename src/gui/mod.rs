@@ -9,8 +9,8 @@
     clippy::collapsible_if
 )]
 
-pub(crate) mod alarms;
 pub(crate) mod attachment;
+pub(crate) mod automations;
 pub(crate) mod board;
 pub(crate) mod common;
 pub(crate) mod custom_roles;
@@ -172,7 +172,7 @@ pub enum Page {
     Shell,
     Editor,
     Settings,
-    Alarms,
+    Automations,
     /// Live view of running agents and in-flight non-agent LLM work.
     RunningAgents,
 }
@@ -181,7 +181,7 @@ impl Page {
     /// Pages in the sidebar top nav. The top nav renders this list minus the
     /// pages [`Dashboard::page_available`] excludes.
     const fn sidebar_pages() -> &'static [Page] {
-        &[Page::Home, Page::Editor, Page::Shell, Page::Alarms]
+        &[Page::Home, Page::Editor, Page::Shell, Page::Automations]
     }
 
     /// Pages in the sidebar bottom nav.
@@ -197,7 +197,7 @@ impl Page {
             Page::Shell => "Shell",
             Page::Editor => "Editor",
             Page::Settings => "Settings",
-            Page::Alarms => "Alarms",
+            Page::Automations => "Automations",
             Page::RunningAgents => "Running Agents",
         }
     }
@@ -437,8 +437,8 @@ pub enum Message {
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
     Sessions(sessions::SessionsMessage),
-    /// Alarms page messages (refresh and card-menu deletion).
-    Alarms(alarms::AlarmsMessage),
+    /// Automations page messages (refresh and card-menu deletion).
+    Automations(automations::AutomationsMessage),
     /// Running Agents page messages (manual stop of a research run or a
     /// custom-role launch).
     RunningAgents(running::RunningMessage),
@@ -492,7 +492,7 @@ impl Message {
             | Message::Git(git::GitMessage::Toast(tm))
             | Message::Editor(editor::EditorMessage::Toast(tm))
             | Message::Sessions(sessions::SessionsMessage::Toast(tm))
-            | Message::Alarms(alarms::AlarmsMessage::Toast(tm))
+            | Message::Automations(automations::AutomationsMessage::Toast(tm))
             | Message::Settings(
                 settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(tm))
                 | settings::SettingsMessage::UserMsg(users::UsersMessage::Toast(tm)),
@@ -773,7 +773,7 @@ pub struct Dashboard {
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
-    alarms_state: alarms::AlarmsState,
+    automations_state: automations::AutomationsState,
     diff_state: diff::DiffState,
     home_state: home::HomeState,
     shell_state: shell::ShellState,
@@ -842,7 +842,7 @@ impl Dashboard {
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
-            alarms_state: alarms::AlarmsState::new(),
+            automations_state: automations::AutomationsState::new(),
             diff_state: diff::DiffState::new(),
             home_state: home::HomeState::new(),
             shell_state: shell::ShellState::new(),
@@ -1144,9 +1144,9 @@ impl Dashboard {
                 Task::batch([snap, board_refresh])
             }
             Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
-            // The Alarms page renders nothing but its polled list, so entering
+            // The Automations page renders nothing but its polled list, so entering
             // it starts a read rather than a render of stale entries.
-            Page::Alarms => self.alarms_state.refresh().map(Message::Alarms),
+            Page::Automations => self.automations_state.refresh().map(Message::Automations),
             Page::Settings => {
                 self.settings_state.refresh();
                 // Workspace list comes from the managed-workspace map; only the users
@@ -1292,14 +1292,14 @@ impl Dashboard {
                     .board_state
                     .update(board::BoardMessage::Escape)
                     .map(Message::Board),
-                // Shell and Alarms have no escape handling.
+                // Shell and Automations have no escape handling.
                 // Running Agents: Escape dismisses the pending stop
                 // confirmation (Keep) — never confirms it.
                 Page::RunningAgents => {
                     self.pending_stop = None;
                     Task::none()
                 }
-                Page::Shell | Page::Alarms => Task::none(),
+                Page::Shell | Page::Automations => Task::none(),
                 Page::Logs => self
                     .logs_state
                     .update(
@@ -1670,7 +1670,9 @@ impl Dashboard {
                 .sessions_state
                 .update(msg, &self.workspaces)
                 .map(Message::Sessions),
-            Message::Alarms(msg) => self.alarms_state.update(msg).map(Message::Alarms),
+            Message::Automations(msg) => {
+                self.automations_state.update(msg).map(Message::Automations)
+            }
             Message::RunningAgents(msg) => self.process_running_message(msg),
             // Intercept CloseModal from successful manual commit — auto-close
             // the diff modal while keeping the diff state in working-tree view.
@@ -2452,7 +2454,7 @@ impl Dashboard {
                 .sessions_state
                 .view(&self.workspaces)
                 .map(Message::Sessions),
-            Page::Alarms => self.alarms_state.view().map(Message::Alarms),
+            Page::Automations => self.automations_state.view().map(Message::Automations),
             Page::Shell => self.shell_state.view().map(Message::Shell),
             Page::Editor => self
                 .editor_state
@@ -2846,12 +2848,12 @@ impl Dashboard {
                 iced::Subscription::none()
             },
             self.home_state.subscription().map(Message::Home),
-            // The Alarms page and the Settings page's custom-tools area re-read
+            // The Automations page and the Settings page's custom-tools area re-read
             // their source while they are shown; the tick is page-gated so a
             // page nobody is looking at reads nothing.
             match self.page {
-                Page::Alarms => iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL)
-                    .map(|_| Message::Alarms(alarms::AlarmsMessage::Tick)),
+                Page::Automations => iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL)
+                    .map(|_| Message::Automations(automations::AutomationsMessage::Tick)),
                 Page::Settings => {
                     iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL).map(|_| {
                         Message::Settings(settings::SettingsMessage::CustomToolsMsg(
@@ -3170,7 +3172,7 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
         Page::Editor => lucide::pencil_line::<iced::Theme, iced::Renderer>(),
         Page::Shell => lucide::terminal::<iced::Theme, iced::Renderer>(),
         Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>(),
-        Page::Alarms => lucide::bell::<iced::Theme, iced::Renderer>(),
+        Page::Automations => lucide::workflow::<iced::Theme, iced::Renderer>(),
         Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>(),
         Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>(),
         Page::RunningAgents => lucide::radar::<iced::Theme, iced::Renderer>(),

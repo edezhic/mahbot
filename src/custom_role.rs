@@ -181,17 +181,17 @@ pub(crate) async fn update(
     Ok(())
 }
 
-/// Delete a custom role: confirm it exists, drop its record, remove the alarms
+/// Delete a custom role: confirm it exists, drop its record, remove the automations
 /// addressed to it, stop every branch of the role (so a running one is cancelled
 /// and never resumed), then tell the owner through his Assistant.
 ///
 /// The record goes FIRST: everything after it is best-effort, so a failure
 /// leaves the role fully deleted and reported rather than half-removed — and a
-/// record whose alarm removal failed still gets them removed when they fire
-/// ([`crate::alarms::fire_custom_role_alarm`] drops an alarm whose target role
+/// record whose automation removal failed still gets them removed when they fire
+/// ([`crate::automations::fire_custom_role_automation`] drops an automation whose target role
 /// is gone).
 pub(crate) async fn delete(name: &str) -> Result<()> {
-    // Check existence FIRST: a nonexistent role must never mutate its alarms.
+    // Check existence FIRST: a nonexistent role must never mutate its automations.
     anyhow::ensure!(get(name).await?.is_some(), "no custom role named '{name}'");
     let deleted = store()
         .conn
@@ -204,13 +204,13 @@ pub(crate) async fn delete(name: &str) -> Result<()> {
     // guarantees it): never claim success for a delete of nothing.
     anyhow::ensure!(deleted > 0, "no custom role named '{name}'");
     // Past the record: nothing below aborts, so the owner is always told.
-    let removed = match crate::alarms::delete_alarms_for_role(name).await {
+    let removed = match crate::automations::delete_automations_for_role(name).await {
         Ok(removed) => removed,
         Err(e) => {
             tracing::warn!(
                 role = %name,
                 error = %e,
-                "Failed to remove a deleted custom role's alarms — they are dropped when they fire"
+                "Failed to remove a deleted custom role's automations — they are dropped when they fire"
             );
             0
         }

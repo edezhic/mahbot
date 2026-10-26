@@ -26,7 +26,7 @@
 //! what the product provides while it RETAINS the channel; releasing it (past the
 //! retained-channel cap) ends the guarantee
 //! ([`crate::util::leftover_channels`]). A program this product
-//! runs for itself (a user's alarm, a custom tool's script, the document kit)
+//! runs for itself (a user's automation, a custom tool's script, the document kit)
 //! uses `End`: the run's tree is ended and the run is reported as a failure
 //! ([`ShellRunResult::EndedWithLeftovers`]).
 //!
@@ -668,7 +668,7 @@ fn program_command_with(
 /// leading its own process group; on Windows the runner's job is the platform's
 /// side of that containment ([`tree`]).
 ///
-/// These are the owner's own commands doing his own work — an alarm's program, a
+/// These are the owner's own commands doing his own work — an automation's program, a
 /// custom tool, a plan step — so his environment is handed over whole. The
 /// product's own work goes through [`build_internal_program_command`] instead.
 fn build_program_command(program: &Path, args: &[String], cwd: &Path) -> tokio::process::Command {
@@ -760,7 +760,7 @@ enum ShellRunResult {
 /// and the rewritten-line plan runner): the command's own exit status and output are
 /// the result, and the leftover is left running because it was started on purpose
 /// ([`ShellRunResult::ExitedWithLeftovers`]). `End` is the program paths' behaviour
-/// (`run_program_outcome` — a user's alarm — and the `run_program_with_timeout` /
+/// (`run_program_outcome` — a user's automation — and the `run_program_with_timeout` /
 /// `run_internal_program_with_timeout` pair — a custom tool's script, the document
 /// kit): the run's tree is ended and the run is reported as a failure
 /// ([`ShellRunResult::EndedWithLeftovers`]).
@@ -1756,7 +1756,7 @@ async fn run_command_with_timeout(
                             elapsed: start.elapsed(),
                         }
                     }
-                    // A program run (an alarm, a custom tool): end the tree the
+                    // A program run (an automation, a custom tool): end the tree the
                     // run is contained in — the process group on unix, the job on
                     // Windows — mirroring the timeout path, then cancel the readers
                     // and collect partial output so the caller gets a visible,
@@ -1871,7 +1871,7 @@ async fn stop_and_collect(
 }
 
 /// Outcome of a direct program run (argv — never a shell command string), used
-/// by trigger-armed alarms to decide whether a check reported anything.
+/// by trigger-armed automations to decide whether a check reported anything.
 ///
 /// `output` is the combined stdout+stderr AFTER ANSI stripping, but WITHOUT
 /// credential scrubbing and WITHOUT the shell pipeline's annotations (the
@@ -1911,7 +1911,7 @@ fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) 
 /// doing his own work. The bounds a direct run is held to live in [`run_bounded`].
 ///
 /// A direct run is never an agent's own command, so a leftover it leaves behind is
-/// ended rather than kept ([`LeftoverPolicy::End`]): an alarm or a custom tool must
+/// ended rather than kept ([`LeftoverPolicy::End`]): an automation or a custom tool must
 /// not be able to leave a process holding its output open.
 async fn run_program(
     cwd: &Path,
@@ -1983,7 +1983,7 @@ pub(crate) async fn run_program_outcome(
 
 /// [`run_program_outcome`] under an explicit wall-clock ceiling. A run stopped
 /// by it is marked [`ProgramOutcome::timed_out`], which is a stop rather than a
-/// verdict about the program — the alarm layer retries such a check instead of
+/// verdict about the program — the automation layer retries such a check instead of
 /// treating it as broken.
 pub(crate) async fn run_program_outcome_within(
     cwd: &Path,
@@ -2197,7 +2197,7 @@ fn program_error_tail(elapsed: Duration, stdout: &[u8], stderr: &[u8]) -> String
 /// Decode both raw streams ([`decode_and_strip_ansi`]'s reading + ANSI strip) and
 /// combine stderr onto its own line when non-blank (never a leading blank line
 /// when stdout is empty). Never credential-scrubbed here: the `custom` tool's
-/// output is scrubbed by the agent-level pass, while an alarm's trigger
+/// output is scrubbed by the agent-level pass, while an automation's trigger
 /// deliberately shows a check exactly as the check produced it.
 fn decode_raw_streams(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = decode_and_strip_ansi(stdout);
@@ -6149,7 +6149,7 @@ mod tests {
 
         // The literal is split so this source does not itself look like a
         // credential to output scrubbers; the control below proves the scrubber
-        // rewrites it, and that it therefore reaches the alarm verbatim.
+        // rewrites it, and that it therefore reaches the automation verbatim.
         let raw = concat!("API_KEY=", "abcd1234");
         assert!(
             scrub_credentials(raw).contains("*[REDACTED]"),
@@ -6165,11 +6165,11 @@ mod tests {
         assert_eq!(
             out.output.trim(),
             raw,
-            "the check's output must reach the alarm unredacted"
+            "the check's output must reach the automation unredacted"
         );
     }
 
-    /// A run stopped by its ceiling is marked as such — the alarm's verdict on
+    /// A run stopped by its ceiling is marked as such — the automation's verdict on
     /// an unfinished check, as opposed to every other way a run can fail. The
     /// ceiling is passed in, so the stop is reachable in milliseconds.
     #[cfg(unix)]
@@ -6185,7 +6185,7 @@ mod tests {
             Duration::from_secs(1),
         )
         .await;
-        assert!(out.timed_out, "the stop must be visible to the alarm");
+        assert!(out.timed_out, "the stop must be visible to the automation");
         assert!(!out.success);
         assert_eq!(out.detail, "timed out after 1s");
         assert!(

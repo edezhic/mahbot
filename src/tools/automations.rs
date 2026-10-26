@@ -1,10 +1,10 @@
-//! Alarm/reminder tools — add, list, and remove the Assistant's own reminders.
+//! Automation tools — add, list, and remove the Assistant's own automations.
 //!
-//! These tools let the Assistant create a reminder that fires a notification
-//! back into its conversation when due, list active reminders, and remove one.
+//! They let the Assistant create an automation that fires a notification back
+//! into its conversation when due, list the active ones, and remove one.
 //!
 //! What they return is a tool result like any other, so it keeps the
-//! product-wide agent-level credential scrub (see [`crate::alarms`]).
+//! product-wide agent-level credential scrub (see [`crate::automations`]).
 
 use std::fmt::Write as _;
 
@@ -13,11 +13,14 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::Workspace;
-use crate::alarms::{AlarmTarget, Trigger, add_alarm, format_fire_time, list_alarms, remove_alarm};
+use crate::automations::{
+    AutomationTarget, Trigger, add_automation, format_fire_time, list_automations,
+    remove_automation,
+};
 use crate::tools::Tool;
 
 /// The calling Assistant's personal-session identity: the agent id plus the
-/// raw user name (for storing the alarm owner and routing the fired reminder).
+/// raw user name (for storing the automation owner and routing the firing).
 struct AssistantIdentity {
     agent_id: String,
     user_name: String,
@@ -33,15 +36,15 @@ fn identity() -> Result<AssistantIdentity> {
     })
 }
 
-/// The `add_alarm` tool. An alarm may carry a `trigger`: one custom tool
+/// The `add_automation` tool. An automation may carry a `trigger`: one custom tool
 /// available to its owner plus that tool's arguments, run at fire time so the
 /// Assistant is woken only when the check reports something.
-pub struct AddAlarmTool;
+pub struct AddAutomationTool;
 
 #[async_trait]
-impl Tool for AddAlarmTool {
+impl Tool for AddAutomationTool {
     fn name(&self) -> &'static str {
-        "add_alarm"
+        "add_automation"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -50,7 +53,7 @@ impl Tool for AddAlarmTool {
             "text".to_string(),
             json!({
                 "type": "string",
-                "description": "The reminder text to store"
+                "description": "The automation text to store"
             }),
         );
         properties.insert(
@@ -71,7 +74,7 @@ impl Tool for AddAlarmTool {
             "trigger".to_string(),
             json!({
                 "type": "object",
-                "description": crate::prompt::load_prompt("tool/add_alarm_trigger.md").trim(),
+                "description": crate::prompt::load_prompt("tool/add_automation_trigger.md").trim(),
                 "properties": {
                     "tool": { "type": "string", "description": "Name of the custom tool, as listed in the <custom-tools> block" },
                     "args": { "type": "object", "description": "The tool's arguments, keyed by parameter name; only the parameters it declares are accepted" }
@@ -105,7 +108,7 @@ impl Tool for AddAlarmTool {
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         // The shell-command arm was removed: refuse the parameter rather than
-        // quietly arming a plain reminder. An explicit null counts as not passing
+        // quietly arming a plain automation. An explicit null counts as not passing
         // it, as elsewhere in the product; any other value is refused.
         if args.get("command").is_some_and(|v| !v.is_null()) {
             anyhow::bail!(
@@ -119,9 +122,9 @@ impl Tool for AddAlarmTool {
         let interval_seconds = super::get_opt_u64(&args, "interval_seconds")?;
         let trigger = read_trigger(&args, &ident.user_name).await?;
         let target = read_target(&args)?;
-        // `add_alarm` resolves the owner's assistant session itself for a
+        // `add_automation` resolves the owner's assistant session itself for a
         // custom-role caller — the raw agent id is passed through.
-        let alarm = add_alarm(
+        let automation = add_automation(
             &ident.agent_id,
             &ident.user_name,
             text,
@@ -131,18 +134,18 @@ impl Tool for AddAlarmTool {
             target,
         )
         .await?;
-        let display = format_fire_time(&alarm.next_fire_at)?;
-        let mut base = if let Some(interval) = alarm.interval_seconds {
+        let display = format_fire_time(&automation.next_fire_at)?;
+        let mut base = if let Some(interval) = automation.interval_seconds {
             format!(
-                "Alarm scheduled every {interval} seconds. Next fire at {display}.\nText: {text}"
+                "Automation scheduled every {interval} seconds. Next fire at {display}.\nText: {text}"
             )
         } else {
-            format!("Alarm set for {display}.\nText: {text}")
+            format!("Automation set for {display}.\nText: {text}")
         };
-        if let Some(trigger) = &alarm.trigger {
+        if let Some(trigger) = &automation.trigger {
             let _ = write!(base, "\nTrigger: {}", trigger.render());
         }
-        if let Some(target) = alarm.role_target() {
+        if let Some(target) = automation.role_target() {
             let _ = write!(base, "\n{target}");
         }
         Ok(base)
@@ -152,9 +155,9 @@ impl Tool for AddAlarmTool {
 /// Read the optional custom-role target from the call's `role`, `identifier`
 /// and `workspace` parameters. An empty/whitespace value counts as absent;
 /// `identifier`/`workspace` given without a `role` are a caller error. The
-/// authority check (only the admin may address a role) lives in [`add_alarm`],
+/// authority check (only the admin may address a role) lives in [`add_automation`],
 /// so the value is passed through as supplied.
-fn read_target(args: &serde_json::Value) -> Result<Option<AlarmTarget>> {
+fn read_target(args: &serde_json::Value) -> Result<Option<AutomationTarget>> {
     let normalized = |key: &str| {
         super::get_opt_str(args, key)
             .map(str::trim)
@@ -164,12 +167,12 @@ fn read_target(args: &serde_json::Value) -> Result<Option<AlarmTarget>> {
     let Some(role) = normalized("role") else {
         anyhow::ensure!(
             normalized("identifier").is_none() && normalized("workspace").is_none(),
-            "usage: `identifier` and `workspace` only apply to an alarm addressed to a custom \
+            "usage: `identifier` and `workspace` only apply to an automation addressed to a custom \
              role — pass `role` too"
         );
         return Ok(None);
     };
-    Ok(Some(AlarmTarget {
+    Ok(Some(AutomationTarget {
         role,
         identifier: normalized("identifier"),
         workspace: normalized("workspace"),
@@ -179,7 +182,7 @@ fn read_target(args: &serde_json::Value) -> Result<Option<AlarmTarget>> {
 /// Read and validate the optional `trigger` parameter for `caller`: the named
 /// custom tool must be one the caller can call and the stored arguments must
 /// fit its declared interface exactly — an argument the tool does not declare
-/// is refused here rather than stored, because an alarm that sits there passing
+/// is refused here rather than stored, because an automation that sits there passing
 /// arguments which do nothing is exactly the dead state this exists to avoid.
 async fn read_trigger(args: &serde_json::Value, caller: &str) -> Result<Option<Trigger>> {
     let trigger = match args.get("trigger") {
@@ -198,12 +201,12 @@ async fn read_trigger(args: &serde_json::Value, caller: &str) -> Result<Option<T
     }))
 }
 
-pub struct ListAlarmsTool;
+pub struct ListAutomationsTool;
 
 #[async_trait]
-impl Tool for ListAlarmsTool {
+impl Tool for ListAutomationsTool {
     fn name(&self) -> &'static str {
-        "list_alarms"
+        "list_automations"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -215,31 +218,32 @@ impl Tool for ListAlarmsTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // The Assistant asks to see its alarms, so the whole listing must reach
-        // it: sandwich-truncating would drop every alarm between the head and
+        // The Assistant asks to see its automations, so the whole listing must reach
+        // it: sandwich-truncating would drop every automation between the head and
         // the tail, invisibly to both the Assistant and the user.
         true
     }
 
     async fn execute(&self, _ws: &Workspace, _args: serde_json::Value) -> Result<String> {
         let ident = identity()?;
-        let session_id = crate::alarms::owner_alarm_session(&ident.agent_id, &ident.user_name);
-        let alarms = list_alarms(&session_id).await?;
-        if alarms.is_empty() {
-            return Ok("(no active alarms)".to_string());
+        let session_id =
+            crate::automations::owner_automation_session(&ident.agent_id, &ident.user_name);
+        let automations = list_automations(&session_id).await?;
+        if automations.is_empty() {
+            return Ok("(no active automations)".to_string());
         }
         let mut out = String::new();
-        for alarm in alarms {
-            let display = format_fire_time(&alarm.next_fire_at)?;
+        for automation in automations {
+            let display = format_fire_time(&automation.next_fire_at)?;
             let _ = write!(
                 out,
                 "- {}, {}, {}, next fire: {}",
-                alarm.id, alarm.kind, alarm.text, display
+                automation.id, automation.kind, automation.text, display
             );
-            if let Some(target) = alarm.role_target() {
+            if let Some(target) = automation.role_target() {
                 let _ = write!(out, ", {target}");
             }
-            if let Some(trigger) = &alarm.trigger {
+            if let Some(trigger) = &automation.trigger {
                 let _ = write!(out, ", trigger: {}", trigger.render());
             }
             out.push('\n');
@@ -248,12 +252,12 @@ impl Tool for ListAlarmsTool {
     }
 }
 
-pub struct RemoveAlarmTool;
+pub struct RemoveAutomationTool;
 
 #[async_trait]
-impl Tool for RemoveAlarmTool {
+impl Tool for RemoveAutomationTool {
     fn name(&self) -> &'static str {
-        "remove_alarm"
+        "remove_automation"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -261,7 +265,7 @@ impl Tool for RemoveAlarmTool {
             &json!({
                 "id": {
                     "type": "string",
-                    "description": "The alarm id to remove/stop"
+                    "description": "The automation id to remove/stop"
                 }
             }),
             &["id"],
@@ -270,14 +274,15 @@ impl Tool for RemoveAlarmTool {
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let ident = identity()?;
-        let session_id = crate::alarms::owner_alarm_session(&ident.agent_id, &ident.user_name);
+        let session_id =
+            crate::automations::owner_automation_session(&ident.agent_id, &ident.user_name);
         let id = super::get_str(&args, "id")?;
-        match remove_alarm(&session_id, id).await? {
-            Some(alarm) => {
-                let display = format_fire_time(&alarm.next_fire_at)?;
-                Ok(format!("Removed alarm {id} (was set for {display})."))
+        match remove_automation(&session_id, id).await? {
+            Some(automation) => {
+                let display = format_fire_time(&automation.next_fire_at)?;
+                Ok(format!("Removed automation {id} (was set for {display})."))
             }
-            None => Ok("No active alarm with that id.".to_string()),
+            None => Ok("No active automation with that id.".to_string()),
         }
     }
 }
@@ -287,13 +292,13 @@ mod tests {
     use super::*;
     use crate::util::test::ProbeFile;
 
-    /// Arm an alarm as `user`, under the agent identity a live call carries.
+    /// Arm an automation as `user`, under the agent identity a live call carries.
     async fn arm(user: &str, args: serde_json::Value) -> Result<String> {
         let ws = crate::workspace::test_ws("arming-probe");
         crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(format!("assistant:{user}")), async {
                 crate::agent::CURRENT_TOOL_USER_NAME
-                    .scope(user.to_string(), AddAlarmTool.execute(&ws, args))
+                    .scope(user.to_string(), AddAutomationTool.execute(&ws, args))
                     .await
             })
             .await
@@ -318,7 +323,7 @@ mod tests {
             .to_string();
             assert!(err.contains("was removed"), "got: {err}");
         }
-        // An explicit null is not passing it, so a plain reminder arms.
+        // An explicit null is not passing it, so a plain automation arms.
         arm(
             "admin",
             json!({ "text": text, "fire_at": fire, "command": null }),
@@ -387,7 +392,7 @@ mod tests {
             .expect("a guest granted the tool arms its trigger");
     }
 
-    /// The role-target parameters are passed through to `add_alarm`: a branch
+    /// The role-target parameters are passed through to `add_automation`: a branch
     /// without a role is a usage error, and an addressing call names the role
     /// in its confirmation.
     #[tokio::test]
@@ -422,7 +427,7 @@ mod tests {
             }),
         )
         .await
-        .expect("the admin arms a role-faced alarm");
+        .expect("the admin arms a role-faced automation");
         assert!(
             out.contains("addressed to custom role \"tool_role_probe\" (branch \"daily\")"),
             "got: {out}"

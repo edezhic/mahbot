@@ -452,7 +452,7 @@ impl MahbotConfigTool {
         let name = super::get_str(&args, "name")?;
         crate::custom_role::delete(name).await?;
         Ok(format!(
-            "Deleted custom role '{name}'. Alarms addressed to it can no longer wake anyone, and \
+            "Deleted custom role '{name}'. Automations addressed to it can no longer wake anyone, and \
              the owner was notified through the assistant."
         ))
     }

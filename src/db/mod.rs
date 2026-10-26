@@ -2,7 +2,7 @@
 //! single connection discipline every caller shares.
 //!
 //! The consolidated domain store (`core.db`: board, sessions, workspaces,
-//! users, config, chat history, alarms, custom roles, Telegram intake) and the
+//! users, config, chat history, automations, custom roles, Telegram intake) and the
 //! logs store (`logs.db`) are the only files. This module owns the connection
 //! surface (`Connection`, `TxGuard`, `ReaderPool`, `Maintenance`), the
 //! transaction helpers, the timestamp and column conventions, the store-facing
@@ -104,7 +104,7 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method"];
 
 /// Name (file stem) of the single consolidated domain database file that backs
-/// the board, sessions, workspaces, users, config, chat_history, alarms,
+/// the board, sessions, workspaces, users, config, chat_history, automations,
 /// custom_roles and telegram_intake stores.
 ///
 /// The domain stores were historically split across separate files; they
@@ -132,7 +132,7 @@ const DOMAIN_STORE_NAMES: &[&str] = &[
     "users",
     "config",
     "chat_history",
-    "alarms",
+    "automations",
     "custom_roles",
     "telegram_intake",
 ];
@@ -188,7 +188,7 @@ pub(crate) fn iter_checkpoint_stores()
 /// # Consolidated layout
 ///
 /// The domain stores (board, sessions, workspaces, users, config, chat_history,
-/// alarms, custom_roles, telegram_intake) are consolidated into ONE physical
+/// automations, custom_roles, telegram_intake) are consolidated into ONE physical
 /// file ([`CONSOLIDATED_DB_NAME`]); only the logs store is a separate file.
 /// This function returns the LOGICAL store names so `--db board`, `--db sessions`,
 /// etc. resolve to the single consolidated file via [`store_db_path`].
@@ -215,7 +215,7 @@ pub(crate) fn debug_db_names() -> Vec<&'static str> {
 /// Initialize all database stores concurrently.
 ///
 /// This is the canonical initialization path for the domain stores (board,
-/// session, workspace, users, chat_history, config, alarms, custom_roles,
+/// session, workspace, users, chat_history, config, automations, custom_roles,
 /// telegram_intake).
 /// The `logs` store
 /// is **not** included here because it must be initialized earlier via
@@ -256,7 +256,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     let chat_history = crate::channels::chat_history::ChatHistoryStore { conn: conn.clone() };
     let telegram_intake =
         crate::channels::telegram_intake::TelegramIntakeStore { conn: conn.clone() };
-    let alarms = crate::alarms::AlarmStore { conn: conn.clone() };
+    let automations = crate::automations::AutomationStore { conn: conn.clone() };
     let custom_roles = crate::custom_role::CustomRoleStore { conn: conn.clone() };
 
     // Record the shared connection before setting any cell so a concurrent
@@ -283,7 +283,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
         telegram_intake,
         "TELEGRAM_INTAKE",
     )?;
-    init_cell(&crate::alarms::ALARMS, alarms, "ALARMS")?;
+    init_cell(&crate::automations::AUTOMATIONS, automations, "AUTOMATIONS")?;
     init_cell(
         &crate::custom_role::CUSTOM_ROLES,
         custom_roles,

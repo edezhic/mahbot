@@ -1,6 +1,6 @@
 //! The `say` tool: one short phrase spoken aloud by the admin's Assistant.
 //!
-//! The product speaks nothing by itself — a reply, an alarm or a confirmation
+//! The product speaks nothing by itself — a reply, an automation or a confirmation
 //! reaches the engine only when the Assistant asks for it here. The phrase is
 //! handed to [`crate::audio::tts::say_phrase`], which renders and plays it in the
 //! background: the call returns at once, and a newer phrase replaces one still

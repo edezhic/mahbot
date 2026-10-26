@@ -9,7 +9,7 @@
 //! returns as soon as the phrase is handed to the engine, and playback happens
 //! in the background.
 //!
-//! Nothing is spoken by itself: an assistant reply, an alarm or a confirmation
+//! Nothing is spoken by itself: an assistant reply, an automation or a confirmation
 //! reaches the engine only through a `say` call. A phrase is then spoken when:
 //!
 //! 1. Speech output is enabled in config ([`is_config_enabled`]).

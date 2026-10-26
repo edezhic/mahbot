@@ -2813,7 +2813,7 @@ impl SettingsState {
         dialog::confirm_dialog(
             dialog::dialog_title(format!("Delete custom role {name}?")),
             dialog::dialog_body([
-                "This removes the role's record. Alarms addressed to it can no longer wake \
+                "This removes the role's record. Automations addressed to it can no longer wake \
                  anyone, and the role's continued branches can never be resumed.",
             ]),
             [

@@ -1,6 +1,6 @@
 //! Between-turns change report for a user's personal workspace: what was added,
 //! changed or removed there between turns, at the head of the message every
-//! Assistant turn answers ([`prepend_changes`]) — an alarm's, a notice's or a
+//! Assistant turn answers ([`prepend_changes`]) — an automation's, a notice's or a
 //! delegation's turn included — so it never answers from stale knowledge.
 //!
 //! The observed state lives in a row of its own — `session_personal_changes`, a
@@ -951,7 +951,7 @@ fn personal_account_of(workspace: &Workspace) -> Option<String> {
 /// skipped when nothing moved. A baseline that is missing or unreadable is the
 /// case whose walk is not paid here: it hands off to [`establish`].
 ///
-/// Two turns in the same folder (an alarm overlapping a user turn) can interleave
+/// Two turns in the same folder (an automation overlapping a user turn) can interleave
 /// their read-write here. Either write is a fresh observation of the same folder,
 /// so the loser costs a few milliseconds of staleness, not a wrong report.
 async fn refresh(user_name: &str) {

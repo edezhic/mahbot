@@ -1,1 +1,0 @@
-The alarm was DELETED — the check is broken: it failed (a non-zero exit, the memory ceiling, or output that could not be drained) or could not run at all, so the alarm is auto-deleted to avoid repeated failures. A check that merely ran past its time limit is retried instead and never deletes an alarm. Fix the underlying problem, then recreate the alarm.

@@ -27,7 +27,7 @@ use crate::runtime_events::RuntimeEvent;
 use crate::workspace::{WORKSPACES, truncate_workspace_notes};
 
 use crate::agent::skills;
-use crate::alarms::Alarm;
+use crate::automations::Automation;
 use crate::custom_role::{CUSTOM_ROLES, CustomRole};
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
 use crate::{ChatMessage, ChatRole, Role, Workspace};
@@ -324,7 +324,7 @@ impl Session {
     /// (`session_metadata.context_block_len`). This method measures the cached
     /// block by that recorded length — never by re-rendering the previous
     /// folder, whose length follows that folder's live state (skills on disk, the
-    /// workspace context, alarms) and could drift after the block was cached. A
+    /// workspace context, automations) and could drift after the block was cached. A
     /// session that predates the record (no released build can be in that state)
     /// is measured from the history itself, so no path needs the previous folder
     /// to resolve and no folder change can leave the model reading a stale one.
@@ -757,7 +757,7 @@ impl Session {
     ///                          `MEMORY.md` only for the account's own
     ///                          Assistant ([`carries_personal_memory`])
     /// skills                 — if any skills exist in the workspace
-    /// alarms                 — Assistant only, when the user has active alarms
+    /// automations            — Assistant only, when the user has active automations
     /// personal_files         — Assistant only, when the personal folder shows
     ///                          something of the user's
     /// workspaces             — the admin's Assistant only, when managed workspaces exist
@@ -779,7 +779,7 @@ impl Session {
     /// A custom role ([`Role::Custom`]) receives exactly two system parts and
     /// nothing else: the fixed [`custom_role_block`] first and the launch's
     /// authorial text (taken at session start) second. Everything the built-in
-    /// roles receive — workspace boilerplate, skills, notes, alarms/board/ticket
+    /// roles receive — workspace boilerplate, skills, notes, automations/board/ticket
     /// context, personal files, custom tools, custom-role listing, active models
     /// — is deliberately absent, because the administrator's own words are the
     /// whole definition.
@@ -899,20 +899,20 @@ impl Session {
         if !skills.is_empty() {
             msgs.push(ChatMessage::system(skills::skills_to_prompt(&skills, ws)));
         }
-        // Assistant sessions carry the user's alarm snapshot, the personal
+        // Assistant sessions carry the user's automation snapshot, the personal
         // folder's shape (its immediate child folders with their file counts —
         // never a path), the managed workspace list (the admin's Assistant
         // only), the custom-tool catalogue and the custom-role listing (the
         // admin's Assistant only) — the same snapshot-at-session-start contract
         // as the board block below.
         if matches!(role, Role::Assistant) {
-            let ((alarms, workspaces, personal_files, custom_roles), custom_tools) = tokio::join!(
+            let ((automations, workspaces, personal_files, custom_roles), custom_tools) = tokio::join!(
                 fetch_assistant_context(user_name, is_admin),
                 crate::tools::custom::context_block(user_name, is_admin),
             );
             for block in assistant_context_blocks(
                 is_admin,
-                &alarms,
+                &automations,
                 &workspaces,
                 personal_files.as_deref(),
                 &custom_roles,
@@ -933,7 +933,7 @@ impl Session {
     /// Build fresh system prompt + ticket context + user message for the
     /// current turn.
     /// Returns messages: [role_description, onboarding_guide?, active_models_opts?,
-    /// workspace_boilerplate, skills?, alarms?, personal_files?, workspaces?,
+    /// workspace_boilerplate, skills?, automations?, personal_files?, workspaces?,
     /// custom_tools, custom_roles?, board_context?, ticket_block?, user_msg]
     /// plus the rendered active-models snapshot (Assistant only; `Default` when
     /// no block injected).
@@ -1119,32 +1119,32 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     Some(output)
 }
 
-// ── Assistant context blocks (alarms + files + workspaces + tools + roles) ──
+// ── Assistant context blocks (automations + files + workspaces + tools + roles) ──
 
 /// Upper char bound for a workspace's collapsed discovery-summary line.
 const MAX_WORKSPACE_SUMMARY_CHARS: usize = 1000;
 
 /// Fetch the data for the Assistant's context blocks. Fail-open per store:
-/// an uninitialized store (`ALARMS.get()` / `WORKSPACES.get()` /
+/// an uninitialized store (`AUTOMATIONS.get()` / `WORKSPACES.get()` /
 /// `CUSTOM_ROLES.get()` returning `None`) or a read error yields empty data, so
 /// the corresponding block is omitted — same contract as `build_board_context`.
-/// The alarm fetch, the workspace fetch, the personal-folder picture walk and
+/// The automation fetch, the workspace fetch, the personal-folder picture walk and
 /// the custom-role listing (the admin's Assistant only) run concurrently, and the
 /// per-workspace general-context reads are batched via `join_all`.
 async fn fetch_assistant_context(
     user_name: &str,
     is_admin: bool,
 ) -> (
-    Vec<Alarm>,
+    Vec<Automation>,
     Vec<(Workspace, Option<String>)>,
     Option<String>,
     Vec<CustomRole>,
 ) {
-    let alarms = async {
-        if crate::alarms::ALARMS.get().is_none() {
+    let automations = async {
+        if crate::automations::AUTOMATIONS.get().is_none() {
             return Vec::new();
         }
-        crate::alarms::list_user_alarms(user_name)
+        crate::automations::list_user_automations(user_name)
             .await
             .unwrap_or_default()
     };
@@ -1187,7 +1187,7 @@ async fn fetch_assistant_context(
         crate::custom_role::list().await.unwrap_or_default()
     };
     tokio::join!(
-        alarms,
+        automations,
         workspaces,
         fetch_personal_files(user_name),
         custom_roles
@@ -1222,7 +1222,7 @@ fn workspace_frame_key(role: Role, is_admin: bool) -> &'static str {
 /// empty, the personal-folder picture is supplied pre-rendered (`None` when the
 /// folder shows nothing of the user's or cannot be walked), and the workspace
 /// list and the custom-role listing appear only for the admin's Assistant.
-/// Order: alarms → personal files → workspaces → custom tools → custom roles —
+/// Order: automations → personal files → workspaces → custom tools → custom roles —
 /// the custom-tool block being the one an Assistant always gets, because
 /// [`crate::tools::custom::context_block`] renders the brief "nothing
 /// available" form rather than nothing, while the custom-role block is omitted
@@ -1230,17 +1230,17 @@ fn workspace_frame_key(role: Role, is_admin: bool) -> &'static str {
 /// (before fetching).
 fn assistant_context_blocks(
     is_admin: bool,
-    alarms: &[Alarm],
+    automations: &[Automation],
     workspaces: &[(Workspace, Option<String>)],
     personal_files: Option<&str>,
     custom_roles: &[CustomRole],
     custom_tools: &str,
 ) -> Vec<String> {
     let mut blocks = Vec::new();
-    if let Some(lines) = render_alarm_lines(alarms) {
+    if let Some(lines) = render_automation_lines(automations) {
         blocks.push(substitute(
-            &load_prompt("context/alarms.md"),
-            &[("{{alarms}}", &lines)],
+            &load_prompt("context/automations.md"),
+            &[("{{automations}}", &lines)],
         ));
     }
     if let Some(lines) = personal_files {
@@ -1267,25 +1267,25 @@ fn assistant_context_blocks(
     blocks
 }
 
-/// Render one line per alarm — same shape as the `list_alarms` tool output,
-/// plus the interval for periodic alarms. `None` when there are no alarms.
-fn render_alarm_lines(alarms: &[Alarm]) -> Option<String> {
-    if alarms.is_empty() {
+/// Render one line per automation — same shape as the `list_automations` tool output,
+/// plus the interval for periodic automations. `None` when there are no automations.
+fn render_automation_lines(automations: &[Automation]) -> Option<String> {
+    if automations.is_empty() {
         return None;
     }
     let mut out = String::new();
-    for alarm in alarms {
-        let fire = crate::alarms::format_fire_time(&alarm.next_fire_at)
-            .unwrap_or_else(|_| alarm.next_fire_at.clone());
-        let _ = write!(out, "- {}, {}", alarm.id, alarm.kind);
-        if let Some(interval) = alarm.interval_seconds {
+    for automation in automations {
+        let fire = crate::automations::format_fire_time(&automation.next_fire_at)
+            .unwrap_or_else(|_| automation.next_fire_at.clone());
+        let _ = write!(out, "- {}, {}", automation.id, automation.kind);
+        if let Some(interval) = automation.interval_seconds {
             let _ = write!(out, " (every {interval} seconds)");
         }
-        let _ = write!(out, ", {}, next fire: {}", alarm.text, fire);
-        if let Some(trigger) = &alarm.trigger {
+        let _ = write!(out, ", {}, next fire: {}", automation.text, fire);
+        if let Some(trigger) = &automation.trigger {
             let _ = write!(out, ", trigger: {}", trigger.render());
         }
-        if let Some(target) = alarm.role_target() {
+        if let Some(target) = automation.role_target() {
             let _ = write!(out, ", {target}");
         }
         out.push('\n');
@@ -1997,16 +1997,16 @@ mod tests {
     }
 
     /// Pure gating of the Assistant context blocks: a guest's Assistant gets
-    /// the alarms, workspace-structure and custom-tool blocks (the workspace list and
+    /// the automations, workspace-structure and custom-tool blocks (the workspace list and
     /// the custom-role listing are the admin's only); the admin's Assistant gets
-    /// the first three in alarms → personal files → workspaces order plus the
+    /// the first three in automations → personal files → workspaces order plus the
     /// custom-tool block last; empty data omits the conditional blocks, while
     /// the custom-tool block is always present (its "nothing available" form is
     /// rendered upstream) and the custom-role block is omitted when no roles
     /// exist. (Role gating lives at the call site.)
     #[test]
     fn assistant_blocks_gating() {
-        let alarm = Alarm {
+        let automation = Automation {
             id: "a1".to_string(),
             session_id: "s1".to_string(),
             user_name: "u".to_string(),
@@ -2027,18 +2027,18 @@ mod tests {
         let files = Some("- album/ — 2 files\n2 files directly in the folder");
         let custom = "<custom-tools>\n- weather\n</custom-tools>";
 
-        // Guest's Assistant: alarms + personal files + custom tools, no
+        // Guest's Assistant: automations + personal files + custom tools, no
         // workspace list.
         let blocks = assistant_context_blocks(
             false,
-            std::slice::from_ref(&alarm),
+            std::slice::from_ref(&automation),
             &workspaces,
             files,
             &[],
             custom,
         );
         assert_eq!(blocks.len(), 3);
-        assert!(blocks[0].contains("<user-alarms>"));
+        assert!(blocks[0].contains("<user-automations>"));
         assert!(blocks[1].contains("<workspace-structure>"));
         assert!(!blocks[1].contains("<managed-workspaces>"));
         assert_eq!(blocks[2], custom);
@@ -2047,14 +2047,14 @@ mod tests {
         // custom-tool block stays last.
         let blocks = assistant_context_blocks(
             true,
-            std::slice::from_ref(&alarm),
+            std::slice::from_ref(&automation),
             &workspaces,
             files,
             &[],
             custom,
         );
         assert_eq!(blocks.len(), 4);
-        assert!(blocks[0].contains("<user-alarms>"));
+        assert!(blocks[0].contains("<user-automations>"));
         assert!(blocks[1].contains("<workspace-structure>"));
         assert!(blocks[2].contains("<managed-workspaces>"));
         assert_eq!(blocks[3], custom);
@@ -2154,12 +2154,12 @@ mod tests {
         assert!(fetch_personal_files("manager_picture_user").await.is_none());
     }
 
-    /// Alarm line rendering: a periodic interval is annotated, the trigger is
-    /// rendered verbatim (no scrubbing — alarm-born text is not redacted on the
-    /// alarm side), and an empty alarm set renders as `None`.
+    /// Automation line rendering: a periodic interval is annotated, the trigger is
+    /// rendered verbatim (no scrubbing — automation-born text is not redacted on the
+    /// automation side), and an empty automation set renders as `None`.
     #[test]
-    fn alarm_lines_show_trigger_and_interval() {
-        let one_shot = Alarm {
+    fn automation_lines_show_trigger_and_interval() {
+        let one_shot = Automation {
             id: "a1".to_string(),
             session_id: "s1".to_string(),
             user_name: "u".to_string(),
@@ -2173,22 +2173,24 @@ mod tests {
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
             unfinished_attempts: 0,
         };
-        let periodic = Alarm {
+        let periodic = Automation {
             id: "a2".to_string(),
             session_id: "s1".to_string(),
             user_name: "u".to_string(),
             kind: "periodic".to_string(),
             text: "check".to_string(),
-            trigger: Some(crate::alarms::StoredTrigger::Tool(crate::alarms::Trigger {
-                tool: "weather".to_string(),
-                args: serde_json::Map::from_iter([
-                    ("city".to_string(), serde_json::json!("Minsk")),
-                    (
-                        "api_key".to_string(),
-                        serde_json::json!("supersecretvalue123"),
-                    ),
-                ]),
-            })),
+            trigger: Some(crate::automations::StoredTrigger::Tool(
+                crate::automations::Trigger {
+                    tool: "weather".to_string(),
+                    args: serde_json::Map::from_iter([
+                        ("city".to_string(), serde_json::json!("Minsk")),
+                        (
+                            "api_key".to_string(),
+                            serde_json::json!("supersecretvalue123"),
+                        ),
+                    ]),
+                },
+            )),
             role: None,
             identifier: None,
             workspace: None,
@@ -2196,7 +2198,7 @@ mod tests {
             next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
             unfinished_attempts: 0,
         };
-        let role = Alarm {
+        let role = Automation {
             id: "a3".to_string(),
             session_id: "s1".to_string(),
             user_name: "u".to_string(),
@@ -2211,7 +2213,8 @@ mod tests {
             unfinished_attempts: 0,
         };
 
-        let lines = render_alarm_lines(&[one_shot, periodic, role]).expect("alarms render");
+        let lines =
+            render_automation_lines(&[one_shot, periodic, role]).expect("automations render");
         assert!(lines.contains("every 3600 seconds"));
         assert!(lines.contains("trigger: weather "));
         assert!(lines.contains("\"city\":\"Minsk\""));
@@ -2226,7 +2229,7 @@ mod tests {
             "got: {lines}"
         );
 
-        assert!(render_alarm_lines(&[]).is_none());
+        assert!(render_automation_lines(&[]).is_none());
     }
 
     /// Workspace list rendering: the discovery summary is collapsed to one

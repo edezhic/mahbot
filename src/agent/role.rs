@@ -296,10 +296,10 @@ use crate::config::CONFIG;
 use crate::tools::SayTool;
 use crate::tools::path::PathAccess;
 use crate::tools::{
-    AddAlarmTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ArchiveTool, ChromeTool,
-    ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool,
-    GetTicketTool, ImageGenTool, ListAlarmsTool, ListTicketsTool, MahbotConfigTool,
-    MahbotDebugTool, RasterizeTool, ReadTool, RemoveAlarmTool, SearchArchivedTicketsTool,
+    AddAutomationTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ArchiveTool,
+    ChromeTool, ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool,
+    GetTicketTool, ImageGenTool, ListAutomationsTool, ListTicketsTool, MahbotConfigTool,
+    MahbotDebugTool, RasterizeTool, ReadTool, RemoveAutomationTool, SearchArchivedTicketsTool,
     SearchTool, SendTool, ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoEditTool,
     VideoGenTool, WebSearchBackend, WebSearchTool, WorkspaceTool,
 };
@@ -386,9 +386,9 @@ impl Role {
         };
         let mut t: Vec<Box<dyn Tool>> = vec![
             Box::new(analyze),
-            Box::new(AddAlarmTool),
-            Box::new(ListAlarmsTool),
-            Box::new(RemoveAlarmTool),
+            Box::new(AddAutomationTool),
+            Box::new(ListAutomationsTool),
+            Box::new(RemoveAutomationTool),
             Box::new(EditTool::new(file_access)),
             Box::new(SearchTool),
             Box::new(SleepTool),
@@ -1410,7 +1410,7 @@ mod tests {
     fn assistant_role_descriptions_are_populated() {
         // Both Assistant descriptions (a guest's + the admin's) must be
         // non-empty, free of unsubstituted template keys, and carry the
-        // alarm-notification marker.
+        // automation-notification marker.
         for is_admin in [false, true] {
             let desc = crate::Role::Assistant.role_description_for(is_admin);
             assert!(
@@ -1422,8 +1422,8 @@ mod tests {
                 "Assistant role description must not contain unsubstituted template keys"
             );
             assert!(
-                desc.contains("<alarm-notification>"),
-                "Assistant role description must explain the <alarm-notification> marker"
+                desc.contains("<automation-notification>"),
+                "Assistant role description must explain the <automation-notification> marker"
             );
         }
     }

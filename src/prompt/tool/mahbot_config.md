@@ -16,4 +16,4 @@ Custom roles are the administrator's own agents: each has a name, an authorial p
 - `create_custom_role` — define a new role. The `prompt` is its whole definition — the only thing the role is told besides the folder it works in, so everything it must know and do has to be written there. An existing role is never silently overwritten.
 - `update_custom_role` — change an existing role by `name`; omitted fields keep their stored value. An empty `tools` array clears the role's tools.
 - `list_custom_roles` — show every defined role: name, behaviour, chosen tools and its authorial prompt. Reports when there are none.
-- `delete_custom_role` — remove a role by `name`. Alarms addressed to it can no longer wake anyone, and the owner is told through the assistant.
+- `delete_custom_role` — remove a role by `name`. Automations addressed to it can no longer wake anyone, and the owner is told through the assistant.

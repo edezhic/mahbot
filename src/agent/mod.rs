@@ -964,7 +964,7 @@ impl Agent {
         self.session.init(&self.agent_id).await?;
 
         // The session is re-engaging (any job kind: user message, async result,
-        // alarm, boot replay): clear a stale sleep-ended flag BEFORE this turn
+        // automation, boot replay): clear a stale sleep-ended flag BEFORE this turn
         // runs, so a genuine crash mid-round on this turn is still recovered
         // normally by the dead-session poller. Only the Assistant, the Manager
         // and a custom role (which is granted the sleep tool) can write the
@@ -4279,7 +4279,7 @@ mod tests {
     /// follow-up LLM call (the empty response is the intended silent end,
     /// never the failure path), and the durable sleep-ended flag is set. The
     /// next turn on the session (any wake-up: user message, async result,
-    /// alarm) clears the flag and runs normally.
+    /// automation) clears the flag and runs normally.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn sleep_call_ends_the_run_gracefully_and_flag_resets_on_reengage() {

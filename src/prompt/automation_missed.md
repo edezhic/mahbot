@@ -1,0 +1,1 @@
+Your automation "{{text}}" was MISSED — it was scheduled for {{fire_at}}, which had already passed when the automation fired. Tell the user that this automation was missed and when it had been scheduled for; a missed automation is late, not void.

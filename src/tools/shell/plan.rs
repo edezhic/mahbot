@@ -152,7 +152,7 @@
 //!   for the words a command can start at ([`own_image_in_text`]) and for the image's
 //!   path spelling anywhere in the text ([`spelling_in_text`]).
 //! - A script this product runs on its own behalf — a custom tool's payload, an
-//!   owner's alarm program, a diagnostics step — is not a command line this runner
+//!   owner's automation program, a diagnostics step — is not a command line this runner
 //!   sees: cmd.exe runs it, and a call of this service's own image inside it is left
 //!   to the shell, with whatever a shell gives a windowed image.
 //! - One class of bare-name call stays the shell's without being refused: a

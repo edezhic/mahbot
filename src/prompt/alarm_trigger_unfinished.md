@@ -1,3 +1,0 @@
-<alarm-notification>
-Your reminder "{{text}}" (check: `{{trigger}}`) has now run past its time limit three attempts in a row without producing a result. The alarm has NOT been removed: it stays armed and keeps being retried, and you will hear from it again as soon as a check reports a result or breaks. Tell the user that this check is not producing a result yet and that you are still waiting on it.
-</alarm-notification>

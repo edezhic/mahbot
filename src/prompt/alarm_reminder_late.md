@@ -1,1 +1,0 @@
-Your reminder "{{text}}" is LATE: it was due for {{fire_at}}, and the attempts since then did not finish in time — this report comes from a later attempt. Tell the user the result is late and name {{fire_at}} as the time it was due for, so they know it is older than now.

@@ -55,7 +55,7 @@
 //! run, and the document kit (the product's own work, through
 //! [`super::run_internal_program_with_timeout`], which gives it the reduced
 //! internal environment) — gets the job. [`RunOwner::Service`] — a
-//! user's alarm program — does not: it is not an agent's work and keeps exactly
+//! user's automation program — does not: it is not an agent's work and keeps exactly
 //! the treatment it had before job containment existed. Everything *else* the
 //! service launches for its own operation — the browser, the replacement
 //! instance a self-update starts, the browser-automation command-line tool and
@@ -114,7 +114,7 @@
 //! direct-program builders `tools::shell::build_program_command` and
 //! `tools::shell::build_internal_program_command`, and
 //! `tools::shell::build_shell_command` through the shared start above — the shell
-//! tool, the diagnostics runner, the `custom` tool's script, a user's alarm program,
+//! tool, the diagnostics runner, the `custom` tool's script, a user's automation program,
 //! and every step of a rewritten line's plan, [`super::plan`] included) with the grep
 //! engine's own probe (`tools::shell::grep_engine::probe_engine`); the
 //! self-hosted Telegram Bot API server (`channels::telegram_local::server::spawn`
@@ -212,7 +212,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(super) enum RunOwner {
     /// An agent's work: gets the job.
     Agent,
-    /// A user's alarm program — `alarms::run_program_outcome` is its only caller.
+    /// A user's automation program — `automations::run_program_outcome` is its only caller.
     /// Never given a job; unix contains it like any other run, because there the
     /// process group belongs to the spawn rather than to the owner.
     Service,
