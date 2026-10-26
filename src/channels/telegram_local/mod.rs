@@ -141,7 +141,8 @@ pub(crate) enum Health {
     /// The process answers and the bot answered recently.
     Running,
     /// The process answers, but Telegram is not confirmed — the server looks
-    /// healthy while it may be deaf, and the interface says exactly that.
+    /// healthy while it may be deaf, which is why the settings line offers the way
+    /// back to the cloud from this state.
     Unconfirmed,
     /// No working server: not installed, not running, or blocked.
     Down,
@@ -226,6 +227,10 @@ pub(crate) fn status() -> Status {
         // transport the owner is not using.
         snapshot.health = Health::Cloud;
         snapshot.port = None;
+    } else if snapshot.health == Health::Cloud {
+        // The idle value: a local mode whose server has not been observed yet is
+        // starting, never the cloud's.
+        snapshot.health = Health::Starting;
     }
     snapshot
 }
@@ -483,7 +488,7 @@ fn report_failure(reason: &str) {
     if !FAILURE_NOTIFIED.swap(true, Ordering::SeqCst) {
         let text = format!(
             "Telegram is unreachable: {reason}. MahBot keeps trying. \
-             If it does not come back, switch to the cloud Bot API in Settings."
+             If it does not come back, switch to the cloud Bot API in Settings → Integrations."
         );
         tokio::spawn(async move { send_owner_notice(&text).await });
     }
@@ -522,12 +527,17 @@ async fn send_owner_notice(text: &str) -> bool {
 ///
 /// The server answers in about a second with `Unauthorized: invalid
 /// api-id/api-hash`; retrying with the same values cannot succeed, and the owner
-/// has to correct them.
+/// has to correct them. The shape problems the switch blocks on before it starts
+/// name the pair the other way round (`api_id`, `api_hash`), and those are the
+/// same repair: nothing else can change either field.
 pub(crate) fn credentials_rejected(reason: &str) -> bool {
     // Only the pair's own words: a wrong bot token also answers `Unauthorized`,
     // and the remedy for that is the token field, not this dialog.
     let reason = reason.to_ascii_lowercase();
-    reason.contains("api-id") || reason.contains("api-hash")
+    reason.contains("api-id")
+        || reason.contains("api-hash")
+        || reason.contains("api_id")
+        || reason.contains("api_hash")
 }
 
 /// Ask for a switch to `target`: the decision is recorded durably before
@@ -751,9 +761,9 @@ async fn check_reachability() {
         });
         FAILURE_NOTIFIED.store(false, Ordering::SeqCst);
     } else {
-        // Nothing is failing here, so the state carries the whole message: the label
-        // for [`Health::Unconfirmed`] says the server answers and Telegram does not
-        // — the one honest reading, while a possibly-deaf server looks healthy.
+        // Nothing is failing here, so the state carries the whole message: the
+        // server answers and Telegram does not — the one honest reading while a
+        // possibly-deaf server looks healthy.
         set_status(|status| {
             status.health = Health::Unconfirmed;
             status.last_error = None;
@@ -954,6 +964,11 @@ mod tests {
     fn a_rejected_pair_is_recognised_by_what_the_server_says() {
         assert!(credentials_rejected(
             "Telegram rejected the bot token — Unauthorized: invalid api-id/api-hash"
+        ));
+        // The shape problems the switch blocks on before the server starts name
+        // the pair the other way round; the same dialog is the only repair.
+        assert!(credentials_rejected(
+            "api_hash must be 32 hexadecimal characters — the value pasted has 12"
         ));
         // A wrong bot token is a different remedy and must not open this dialog.
         assert!(!credentials_rejected(

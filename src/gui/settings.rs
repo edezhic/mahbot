@@ -186,22 +186,25 @@ fn model_picker_list<'a>(
 
 // ── Telegram Bot API mode helpers ────────────────────────────────
 
-/// The mode the owner asked for, in the words the Settings page shows it.
-fn mode_label(mode: Mode) -> &'static str {
+/// A mode in the words the one-line block shows it — short enough to sit beside
+/// its controls in a half-width settings column.
+fn mode_name(mode: Mode) -> &'static str {
     match mode {
-        Mode::Cloud => "Cloud Bot API",
-        Mode::Local => "Local Bot API server",
+        Mode::Cloud => "Cloud",
+        Mode::Local => "Local server",
     }
 }
 
 /// What the feature is doing right now, in words — never a claim beyond what
-/// the supervisor last observed.
+/// the supervisor last observed. These are the words of the one-line settings
+/// block, so each is short enough to sit beside the controls it allows;
+/// [`Health::Unconfirmed`] carries the nuance the label leaves out.
 fn health_label(health: Health) -> &'static str {
     match health {
-        Health::Cloud => "using Telegram's cloud API",
+        Health::Cloud => "served by Telegram",
         Health::Starting => "installing or starting…",
         Health::Running => "running",
-        Health::Unconfirmed => "server running; Telegram not confirmed",
+        Health::Unconfirmed => "not confirmed",
         Health::Down => "not running",
     }
 }
@@ -3516,7 +3519,8 @@ impl SettingsState {
     //
     // One 'Audio' section with exactly three rows — Transcription, Wake Word
     // Detection, Text to Speech — each with the toggle and an inline status in
-    // the same row. The wake-word enrollment UI (phrase input, Enroll button,
+    // the same row, and its explanation as a hover hint over the whole row. The
+    // wake-word enrollment UI (phrase input, Enroll button,
     // enrolled-phrase display, multi-line progress/Cancel) sits below the
     // three rows. The section does not exist off macOS, where there is no
     // audio subsystem at all.
@@ -3549,67 +3553,78 @@ impl SettingsState {
         } else {
             status_label("Loads on first use")
         };
-        let transcription_row = field_row(
-            "Transcription",
-            toggle_status_row(
-                toggler(transcription_enabled)
-                    .on_toggle(SettingsMessage::TranscriptionToggle)
-                    .style(theme::toggler_style),
-                transcription_status,
+        let transcription_row = row_hint(
+            field_row(
+                "Transcription",
+                toggle_status_row(
+                    toggler(transcription_enabled)
+                        .on_toggle(SettingsMessage::TranscriptionToggle)
+                        .style(theme::toggler_style),
+                    transcription_status,
+                ),
+                None,
             ),
-            Some("using local CPU-optimized Qwen3-ASR"),
+            "Voice message transcription",
         );
 
         // ── Row 2: Wake Word Detection (toggle gated on Transcription + live status) ──
         // Live status: voice status changes are broadcast as runtime-change
         // events, so the rendered pipeline state (listening / enrolling /
         // model error …) is current after each coalesced event.
-        let wake_status: Element<'_, SettingsMessage> = match status.clone() {
-            crate::audio::voice::VoiceStatus::Disabled => disabled_status(),
-            crate::audio::voice::VoiceStatus::LoadingModels => status_label("Loading models…"),
-            crate::audio::voice::VoiceStatus::ModelError => {
-                retry_status_row("Model error", SettingsMessage::RetryVoiceModels)
+        // Transcription and the wake word share the loaded ASR model, so with it
+        // off the status says why the toggle is dead: a hover hint alone cannot
+        // explain a disabled control.
+        let wake_status: Element<'_, SettingsMessage> = if !transcription_enabled {
+            status_label("Requires Transcription to be enabled")
+        } else {
+            match status.clone() {
+                crate::audio::voice::VoiceStatus::Disabled => disabled_status(),
+                crate::audio::voice::VoiceStatus::LoadingModels => status_label("Loading models…"),
+                crate::audio::voice::VoiceStatus::ModelError => {
+                    retry_status_row("Model error", SettingsMessage::RetryVoiceModels)
+                }
+                crate::audio::voice::VoiceStatus::Listening => {
+                    status_label("Listening for wake word")
+                }
+                crate::audio::voice::VoiceStatus::Recording => status_label("Recording command"),
+                crate::audio::voice::VoiceStatus::RecordingManual => {
+                    status_label("Recording voice message")
+                }
+                crate::audio::voice::VoiceStatus::Transcribing => status_label("Transcribing…"),
+                crate::audio::voice::VoiceStatus::MicPermissionDenied => {
+                    status_label("Microphone permission denied")
+                }
+                crate::audio::voice::VoiceStatus::MicDisconnected => {
+                    status_label("Microphone disconnected")
+                }
+                crate::audio::voice::VoiceStatus::Enrolling { .. }
+                | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
+                | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+                | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. } => {
+                    status_label("Enrolling…")
+                }
+                crate::audio::voice::VoiceStatus::Enrolled => status_label("Enrolled"),
+                crate::audio::voice::VoiceStatus::Error(msg) => status_label(msg),
             }
-            crate::audio::voice::VoiceStatus::Listening => status_label("Listening for wake word"),
-            crate::audio::voice::VoiceStatus::Recording => status_label("Recording command"),
-            crate::audio::voice::VoiceStatus::RecordingManual => {
-                status_label("Recording voice message")
-            }
-            crate::audio::voice::VoiceStatus::Transcribing => status_label("Transcribing…"),
-            crate::audio::voice::VoiceStatus::MicPermissionDenied => {
-                status_label("Microphone permission denied")
-            }
-            crate::audio::voice::VoiceStatus::MicDisconnected => {
-                status_label("Microphone disconnected")
-            }
-            crate::audio::voice::VoiceStatus::Enrolling { .. }
-            | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
-            | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
-            | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. } => {
-                status_label("Enrolling…")
-            }
-            crate::audio::voice::VoiceStatus::Enrolled => status_label("Enrolled"),
-            crate::audio::voice::VoiceStatus::Error(msg) => status_label(msg),
         };
         // Gated: wake word can only be enabled while Transcription is ON (they
         // share the loaded ASR model). Turning Transcription OFF cascades it off.
-        let wake_row = field_row(
-            "Wake Word Detection",
-            toggle_status_row(
-                toggler(voice_enabled)
-                    .on_toggle_maybe(if transcription_enabled {
-                        Some(SettingsMessage::VoiceToggle)
-                    } else {
-                        None
-                    })
-                    .style(theme::toggler_style),
-                wake_status,
+        let wake_row = row_hint(
+            field_row(
+                "Wake Word Detection",
+                toggle_status_row(
+                    toggler(voice_enabled)
+                        .on_toggle_maybe(if transcription_enabled {
+                            Some(SettingsMessage::VoiceToggle)
+                        } else {
+                            None
+                        })
+                        .style(theme::toggler_style),
+                    wake_status,
+                ),
+                None,
             ),
-            Some(if transcription_enabled {
-                "Hands-free voice commands with wake word detection"
-            } else {
-                "Requires Transcription to be enabled"
-            }),
+            "Listen for the command",
         );
 
         // ── Row 3: Text to Speech (toggle + inline status in one row) ──
@@ -3633,15 +3648,18 @@ impl SettingsState {
         } else {
             status_label("Downloading models…")
         };
-        let tts_row = field_row(
-            "Text to Speech",
-            toggle_status_row(
-                toggler(tts_enabled)
-                    .on_toggle(SettingsMessage::TtsToggle)
-                    .style(theme::toggler_style),
-                tts_status,
+        let tts_row = row_hint(
+            field_row(
+                "Text to Speech",
+                toggle_status_row(
+                    toggler(tts_enabled)
+                        .on_toggle(SettingsMessage::TtsToggle)
+                        .style(theme::toggler_style),
+                    tts_status,
+                ),
+                None,
             ),
-            Some("Lets the assistant speak short updates aloud"),
+            "Let assistant talk",
         );
 
         // ── Wake-word enrollment UI (below the three rows) ──
@@ -3868,8 +3886,9 @@ impl SettingsState {
         )
     }
 
-    /// The Telegram Bot API mode area of the Integrations section: the current
-    /// facts in words and the switch this state allows.
+    /// The Telegram Bot API mode area of the Integrations section: one line
+    /// carrying the mode serving the bot, what it is doing, the version of an
+    /// installed server, and the controls this state allows.
     ///
     /// The state is read at render time: every change of the feature publishes
     /// [`crate::runtime_events::RuntimeEvent::TelegramLocal`], which the
@@ -3877,149 +3896,146 @@ impl SettingsState {
     fn telegram_local_area(&self) -> Element<'_, SettingsMessage> {
         let status = telegram_local::status();
         // A switch actually in flight, or a request this page just started:
-        // every control is unavailable meanwhile. A switch waiting for the owner
+        // `busy` disables the controls that would start a second switch. The
+        // escape below is deliberately not one of them — it is the only control an
+        // owner needs while a switch stalls. A switch waiting for the owner
         // (blocked with a cause) is not busy by this definition.
         let busy = self.telegram_switch_busy || (status.migrating && status.blocked.is_none());
+        // The one bot fact this block rests on: everything a switch would start
+        // needs it, and the way in stays disabled without it.
+        let has_token = CONFIG.telegram_bot_token().is_some();
 
-        let mut facts = Column::new()
-            .spacing(theme::SPACE_4)
-            .push(field_row(
-                "Bot API Mode",
-                text(mode_label(status.serving)).size(theme::TEXT_13).into(),
-                None,
-            ))
-            .push(field_row(
-                "Bot API Status",
-                text(health_label(status.health))
-                    .size(theme::TEXT_13)
-                    .into(),
-                None,
-            ));
-        if status.target != status.serving {
-            // The switch has not reached its irreversible point: the mode above
-            // is what serves now, and this says where the owner is taking it.
-            facts = facts.push(
-                text(format!("switching to {}…", mode_label(status.target)))
-                    .size(theme::TEXT_11)
-                    .color(theme::TEXT_SECONDARY),
-            );
-        }
-        if let Some(version) = status.version.as_deref() {
-            facts = facts.push(field_row(
-                "Server Version",
-                text(version.to_owned()).size(theme::TEXT_13).into(),
-                None,
-            ));
+        // The one sentence the line carries: the mode serving the bot, then where
+        // a pending switch is taking it — that switch has not reached its
+        // irreversible point, so the mode just named is what serves now — or
+        // otherwise what that mode is doing.
+        let mode = mode_name(status.serving);
+        let mut state = if status.target != status.serving {
+            format!("{mode} · switching to {}…", mode_name(status.target))
+        } else if status.serving == Mode::Cloud && !has_token {
+            // Nothing can be served by a local server without a bot, so the cloud
+            // line says what is missing instead of a state that needs nothing.
+            format!("{mode} · add a bot token above")
+        } else {
+            format!("{mode} · {}", health_label(status.health))
+        };
+        // The version belongs to the local mode: it names the artifact serving the
+        // bot there. Only the number is added — the line already names the server,
+        // so the banner's own "Bot API " prefix is dropped.
+        if let Some(version) = status
+            .version
+            .as_deref()
+            .filter(|_| status.serving == Mode::Local)
+        {
+            state.push_str(" · ");
+            state.push_str(version.strip_prefix("Bot API ").unwrap_or(version));
         }
         if let Some(reason) = status.last_error.as_deref() {
-            // The reason lives in the status snapshot, not in the page state.
-            // When the switch is blocked this is the journal's cause, which
-            // survives restarts; it is printed here only.
-            let line: Element<'_, SettingsMessage> =
-                inline_error(reason.to_owned(), FIELD_ROW_INLINE_PAD);
-            facts = facts.push(line);
+            // The reason lives in the status snapshot, not in the page state. When
+            // the switch is blocked this is the journal's cause, which survives
+            // restarts.
+            state.push_str(" — ");
+            state.push_str(reason);
         }
 
-        let mut area = column![Space::new().height(theme::SPACE_2), facts].spacing(theme::SPACE_4);
+        let mut summary = text(state).size(theme::TEXT_13).width(Length::Fill);
+        if status.last_error.is_some() {
+            summary = summary.color(theme::STATUS_ERROR);
+        }
 
+        let mut line = Row::new()
+            .spacing(theme::SPACE_8)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .push(summary);
         if busy {
-            // The switch itself reports progress through the same status block;
-            // this only says the click was taken and no second one will be.
-            area = area.push(
-                row![
-                    super::spinner(theme::TEXT_14),
-                    text("working…")
-                        .size(theme::TEXT_12)
-                        .color(theme::TEXT_SECONDARY)
-                ]
-                .spacing(theme::SPACE_6)
-                .align_y(Alignment::Center),
-            );
+            // The switch reports progress through the same line, so a bare spinner
+            // is enough: the text beside it already says where the bot is going.
+            line = line.push(super::spinner(theme::TEXT_13));
         }
-        area.push(Self::telegram_mode_controls(&status, busy))
+        line.push(self.telegram_line_controls(&status, busy, has_token))
             .into()
     }
 
-    /// The controls this switch state allows. A switch that cannot finish must
-    /// leave the owner a way forward and a way out; which one that is follows the
-    /// switch that is pending, not the mode it is heading for — a blocked revert is
-    /// a switch to finish just as much as a blocked forward switch.
-    fn telegram_mode_controls(
+    /// The controls carried by the mode line. Every one of them stays on that
+    /// line, and each is rendered only in the states it resolves: the way into
+    /// the local mode, the repair a blocked switch needs, and the way back to the
+    /// cloud.
+    fn telegram_line_controls(
+        &self,
         status: &telegram_local::Status,
         busy: bool,
+        has_token: bool,
     ) -> Element<'static, SettingsMessage> {
-        // Telegram refused the pasted pair — the switch blocks on the same test, and
-        // only that outcome is fixed by entering the pair again.
-        let rejected = status
-            .last_error
-            .as_deref()
-            .is_some_and(telegram_local::credentials_rejected);
-        let credentials_button = || {
-            button(text("Enter api_id/api_hash again").size(theme::TEXT_12))
+        // Telegram refused the pasted pair — the switch blocks on the same test,
+        // and only that outcome is fixed by entering the pair again. Only a switch
+        // towards the local server can block on the pair: the dialog's submit is
+        // what asks for that mode, so it would reverse any other direction.
+        let rejected = status.target == Mode::Local
+            && status
+                .last_error
+                .as_deref()
+                .is_some_and(telegram_local::credentials_rejected);
+        let control = |label: &'static str, on_press| {
+            button(text(label).size(theme::TEXT_12))
                 .style(theme::button_secondary)
-                .on_press(SettingsMessage::OpenTelegramCredentials)
+                .on_press_maybe(on_press)
         };
-        let switch_back_button = || {
-            button(text("Switch back to the cloud").size(theme::TEXT_12))
-                .style(theme::button_secondary)
-                .on_press(SettingsMessage::RequestSwitchToCloud)
+        let credentials_again = || {
+            control(
+                "Enter api_id/api_hash again",
+                Some(SettingsMessage::OpenTelegramCredentials),
+            )
         };
 
-        let mut controls = Column::new().spacing(theme::SPACE_4);
-        if status.migrating {
-            if !busy {
-                controls = controls.push(if rejected {
-                    // The pair was refused, so entering it again is the way on:
-                    // the same dialog, whose submit resumes the switch.
-                    credentials_button()
-                } else {
-                    // The switch waits for something outside this page. Asking for
-                    // the same direction again re-runs it cleared of the cause that
-                    // blocked it.
-                    let retry = match status.target {
+        let mut controls = Row::new()
+            .spacing(theme::SPACE_8)
+            .align_y(Alignment::Center);
+
+        // The way in: nothing else in the product offers it, so it is never dropped
+        // from the cloud state — disabled, not removed, while it cannot start a
+        // switch. A switch already heading local carries its own retry instead of a
+        // second control that would ask for the same thing.
+        if status.serving == Mode::Cloud && !status.migrating {
+            controls = controls.push(control(
+                "Use a local Bot API server",
+                (!busy && has_token).then_some(SettingsMessage::OpenTelegramCredentials),
+            ));
+        }
+        // The repair: a refused pair is re-entered through the same dialog, whose
+        // submit resumes the switch; every other cause is re-run as the direction
+        // the journal already holds.
+        if !busy && status.migrating {
+            controls = controls.push(if rejected {
+                credentials_again()
+            } else {
+                control(
+                    match status.target {
                         Mode::Local => "Try switching again",
                         Mode::Cloud => "Try switching back again",
-                    };
-                    button(text(retry).size(theme::TEXT_12))
-                        .style(theme::button_secondary)
-                        .on_press(SettingsMessage::RetrySwitch)
-                });
-            }
-            if status.target == Mode::Local {
-                // The way out of the local mode is offered even while a switch is
-                // pending: it is the owner's escape from a server that will not
-                // recover, whatever step the switch stopped at.
-                controls = controls.push(switch_back_button());
-            }
-        } else if status.target == Mode::Cloud {
-            if !busy {
-                // The switch needs a working bot: without a token the local server
-                // has nothing to serve, so the control says so instead of starting
-                // a switch that would refuse immediately.
-                let configured = CONFIG.telegram_bot_token().is_some();
-                controls = controls.push(
-                    button(text("Use a local Bot API server").size(theme::TEXT_12))
-                        .style(theme::button_secondary)
-                        .on_press_maybe(
-                            configured.then_some(SettingsMessage::OpenTelegramCredentials),
-                        ),
-                );
-                if !configured {
-                    controls = controls.push(inline_label(
-                        "Add a Telegram bot token above first — the switch needs a working bot.",
-                        FIELD_ROW_INLINE_PAD,
-                        theme::TEXT_SECONDARY,
-                    ));
-                }
-            }
-        } else {
-            // Settled on the local server: the pair was rejected (or was never
-            // usable), so the way forward is entering it again — the same dialog,
-            // whose submit is what resumes a blocked switch.
-            if !busy && (rejected || !status.credentials_set) {
-                controls = controls.push(credentials_button());
-            }
-            controls = controls.push(switch_back_button());
+                    },
+                    Some(SettingsMessage::RetrySwitch),
+                )
+            });
+        } else if !busy && status.serving == Mode::Local && (rejected || !status.credentials_set) {
+            // Settled on the local server with a pair that cannot work: the same
+            // dialog is the way on.
+            controls = controls.push(credentials_again());
+        }
+        // The way out of a local server that is not confirmed running, and of any
+        // switch heading there: a stalled install, a drain waiting on a large file
+        // or a server that will not answer is exactly when there is no other way
+        // back, so only a request this page is already running makes the control
+        // unavailable — a switch running in the background does not, because
+        // asking for the cloud is what ends it. A switch back to the cloud is
+        // finished by its own retry, so the escape is not offered for it.
+        let escape =
+            status.target == Mode::Local && (status.migrating || status.health != Health::Running);
+        if escape {
+            controls = controls.push(control(
+                "Return to the cloud",
+                (!self.telegram_switch_busy).then_some(SettingsMessage::RequestSwitchToCloud),
+            ));
         }
         controls.into()
     }
@@ -4311,6 +4327,17 @@ fn disabled_status() -> Element<'static, SettingsMessage> {
         .size(theme::TEXT_13)
         .color(theme::TEXT_SECONDARY)
         .into()
+}
+
+/// A hover hint over the whole strip of a settings row: the row is stretched to
+/// the column so the hint answers the title, the toggle, the status and the empty
+/// tail alike, unlike a hint snug around the row's own content.
+#[cfg(target_os = "macos")]
+fn row_hint<'a>(
+    row: Element<'a, SettingsMessage>,
+    hint: &'static str,
+) -> Element<'a, SettingsMessage> {
+    widgets::tooltip_hint(container(row).width(Length::Fill), hint)
 }
 
 /// Toggle + inline status side by side — the shared frame of the three

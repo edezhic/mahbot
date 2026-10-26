@@ -404,9 +404,9 @@ fn blocked_notice(reason: &str) -> String {
     };
     format!(
         "⚠️ Telegram could not finish switching its Bot API: {reason}\n\
-         {reachability} It has not gone back to the cloud on its own. Settings → Telegram shows \
-         the state: correcting the entry there finishes the switch, and switching back to the \
-         cloud clears the local server."
+         {reachability} It has not gone back to the cloud on its own. Settings → Integrations \
+         shows the state: correcting the entry there finishes the switch, and switching back to \
+         the cloud clears the local server."
     )
 }
 
