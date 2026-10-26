@@ -4657,8 +4657,7 @@ impl EditorState {
     }
 
     /// Render the editor. The dashboard renders this page only for a resolved
-    /// workspace (it renders its own placeholder otherwise), so this is only
-    /// ever reached for one.
+    /// workspace, so this is only ever reached for one.
     #[must_use]
     pub fn view(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         // ── Split layout ─────────────────────────────────────────────

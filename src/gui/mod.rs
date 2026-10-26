@@ -169,15 +169,13 @@ pub enum Page {
 }
 
 impl Page {
-    /// Pages in the sidebar top nav — the Cmd+number keyboard map. Membership
-    /// is positional: the shortcut is the page's 1-based index here, and the top
-    /// nav renders this list minus the pages [`Dashboard::page_available`]
-    /// excludes, so the keyboard map stays fixed regardless of what is shown.
+    /// Pages in the sidebar top nav. The top nav renders this list minus the
+    /// pages [`Dashboard::page_available`] excludes.
     const fn sidebar_pages() -> &'static [Page] {
         &[Page::Home, Page::Editor, Page::Shell, Page::Alarms]
     }
 
-    /// Pages in the sidebar bottom nav — click-only, no keyboard shortcut.
+    /// Pages in the sidebar bottom nav.
     const fn sidebar_bottom_pages() -> &'static [Page] {
         &[Page::Sessions, Page::Logs, Page::Settings]
     }
@@ -617,21 +615,19 @@ pub(crate) fn parse_key_press(
     Some((key, modifiers, physical_key))
 }
 
-/// One of the dashboard's own shortcuts — the keys that still work while a page
-/// holds the keyboard.
+/// One of the dashboard's own shortcuts — the keys that still reach the
+/// dashboard while a page holds the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DashboardShortcut {
     /// Close the open overlay, or clear the page's own transient state.
     Escape,
     /// Focus the page's search.
     Search,
-    /// Navigate to the n-th sidebar page, 1-based.
-    Page(usize),
 }
 
-/// The dashboard shortcut a key press stands for, or `None`: Escape, Cmd+F
-/// (Ctrl+F elsewhere) and Cmd+digit, all matched on the physical key so any
-/// keyboard layout produces them.
+/// The dashboard shortcut a key press stands for, or `None` — Escape, or Cmd+F
+/// (Ctrl+F elsewhere, resolved through the physical key so a non-Latin layout
+/// still produces it).
 ///
 /// A focused input leaves exactly these uncaptured, because
 /// [`keyboard::listen`] only delivers events no widget captured — and the chat
@@ -651,9 +647,6 @@ pub(crate) fn dashboard_shortcut(
     }
     match key.to_latin(physical_key)? {
         'f' if !modifiers.shift() => Some(DashboardShortcut::Search),
-        digit if digit.is_ascii_digit() => {
-            Some(DashboardShortcut::Page(digit.to_digit(10)? as usize))
-        }
         _ => None,
     }
 }
@@ -1089,8 +1082,13 @@ impl Dashboard {
         self.propagate_workspace_selection(restored_name)
     }
 
-    /// Navigate to a page, refreshing page-specific state as needed.
+    /// Navigate to a page, refreshing page-specific state as needed. A page that
+    /// does not resolve ([`Self::page_available`]) is refused rather than opened
+    /// over no workspace.
     fn navigate_to(&mut self, page: Page) -> Task<Message> {
+        if !self.page_available(page) {
+            return Task::none();
+        }
         self.page = page;
         // Every navigation notifies the editor of its visibility AFTER
         // `self.page` is set, so the handler sees the new state. This is the
@@ -2176,8 +2174,9 @@ impl Dashboard {
 
     /// Push the resolved workspace to the four workspace-scoped surfaces — the
     /// editor, the shell, the footer git status and the change/diff view — and
-    /// to nothing else. No substitution of any kind happens here: an unresolved
-    /// selection is never shown the personal workspace.
+    /// leave a page that stops resolving (see [`Self::leave_unavailable_page`]).
+    /// No substitution of any kind happens here: an unresolved selection is
+    /// never shown the personal workspace.
     ///
     /// The editor and the shell own per-workspace tab state, so they are only
     /// ever pushed a real resolution; while nothing is resolved the Dashboard
@@ -2199,11 +2198,12 @@ impl Dashboard {
         if resolved.is_none() {
             self.show_diff_modal = false;
         }
+        let leave = self.leave_unavailable_page();
         if resolved == self.pushed_workspace {
-            return Task::none();
+            return leave;
         }
         self.pushed_workspace.clone_from(&resolved);
-        if let Some((name, path)) = resolved {
+        let surfaces = if let Some((name, path)) = resolved {
             Task::batch([
                 Task::done(editor::EditorMessage::WorkspaceSelected(
                     name.clone(),
@@ -2227,7 +2227,19 @@ impl Dashboard {
                     .map(Message::Git),
                 Task::done(diff::DiffMessage::WorkspaceUnresolved).map(Message::DiffModal),
             ])
+        };
+        Task::batch([leave, surfaces])
+    }
+
+    /// Return to Home when the current page is one the sidebar no longer offers
+    /// (a workspace-scoped page whose selection stopped resolving). The sidebar
+    /// entry is such a page's only way in, so leaving it open would mean showing
+    /// a page nothing can navigate to.
+    fn leave_unavailable_page(&mut self) -> Task<Message> {
+        if self.page_available(self.page) {
+            return Task::none();
         }
+        self.navigate_to(Page::Home)
     }
 
     /// Reload the full workspace map from storage (e.g. after add/delete on
@@ -2405,22 +2417,11 @@ impl Dashboard {
                 .view(&self.workspaces)
                 .map(Message::Sessions),
             Page::Alarms => self.alarms_state.view().map(Message::Alarms),
-            Page::Shell => {
-                if self.page_available(Page::Shell) {
-                    self.shell_state.view().map(Message::Shell)
-                } else {
-                    unresolved_workspace_page(Page::Shell)
-                }
-            }
-            Page::Editor => {
-                if self.page_available(Page::Editor) {
-                    self.editor_state
-                        .view(self.overlay_modal_open())
-                        .map(Message::Editor)
-                } else {
-                    unresolved_workspace_page(Page::Editor)
-                }
-            }
+            Page::Shell => self.shell_state.view().map(Message::Shell),
+            Page::Editor => self
+                .editor_state
+                .view(self.overlay_modal_open())
+                .map(Message::Editor),
             Page::Settings => self
                 .settings_state
                 .view(self.workspaces_error.as_deref())
@@ -2793,18 +2794,14 @@ impl Dashboard {
                 match dashboard_shortcut(&key, modifiers, physical_key)? {
                     DashboardShortcut::Escape => Some(Message::EscapePressed),
                     DashboardShortcut::Search => Some(Message::FocusSearch),
-                    DashboardShortcut::Page(index) => Page::sidebar_pages()
-                        .get(index.checked_sub(1)?)
-                        .copied()
-                        .map(Message::Navigation),
                 }
             }),
             self.shell_state.subscription().map(Message::Shell),
             self.logs_state.subscription().map(Message::Logs),
-            // The editor is a workspace-scoped page: while nothing is resolved
-            // its page is not shown, so it is given no subscription at all — no
-            // tick, no tree ping and no shortcut may act on the workspace it
-            // still holds in memory (its tabs are deliberately kept).
+            // The editor holds a workspace-scoped page: while nothing is
+            // resolved it is given no subscription at all — no tick and no tree
+            // ping may act on the workspace it still holds in memory (its tabs
+            // are deliberately kept).
             if self.page_available(Page::Editor) {
                 self.editor_state
                     .subscription(self.overlay_modal_open())
@@ -3144,17 +3141,6 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
     }
 }
 
-/// Stand-in for a workspace-scoped page while no workspace is resolved. Such a
-/// page is absent from the navigation then, so it is reachable only by a
-/// keyboard shortcut — and it must show no workspace content at all.
-fn unresolved_workspace_page(page: Page) -> Element<'static, Message> {
-    widgets::empty_state_placeholder(
-        page_icon(page),
-        "Select a workspace to open this page",
-        theme::TEXT_MUTED,
-    )
-}
-
 impl Dashboard {
     fn sidebar_view(&self) -> Element<'_, Message> {
         let col = column![
@@ -3218,8 +3204,7 @@ impl Dashboard {
         self.sidebar_nav_column(Page::sidebar_pages()).into()
     }
 
-    /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]) —
-    /// click-only, no keyboard shortcut.
+    /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]).
     fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
         self.sidebar_nav_column(Page::sidebar_bottom_pages()).into()
     }
@@ -4697,10 +4682,11 @@ mod tests {
     }
 
     /// The editor page, the shell page, the footer git status and the diff view
-    /// follow the resolution: hidden while nothing resolves, back by themselves
-    /// once it does. Every step goes through the real selection entry point
-    /// (the single push point for all four), so what the dashboard derives from
-    /// that push is asserted here.
+    /// follow the resolution: gone while nothing resolves, back by themselves
+    /// once it does — and a workspace-scoped page that stops resolving leaves
+    /// the desktop on Home. Every step goes through the real selection entry
+    /// point (the single push point for all of them), so what the dashboard
+    /// derives from that push is asserted here.
     #[test]
     fn unresolved_selection_hides_the_workspace_scoped_surfaces() {
         let mut dash = ready_dashboard();
@@ -4708,11 +4694,19 @@ mod tests {
 
         let _ = dash.apply_workspace_selection("ws1");
         assert!(dash.render_git_block().is_some());
+        let _ = dash.navigate_to(Page::Editor);
 
         // A personal selection never resolves.
         let _ = dash.apply_workspace_selection("personal:admin");
         assert!(!dash.page_available(Page::Editor));
         assert!(!dash.page_available(Page::Shell));
+        assert_eq!(
+            dash.page,
+            Page::Home,
+            "a page nothing can navigate to is left for Home"
+        );
+        let _ = dash.navigate_to(Page::Editor);
+        assert_eq!(dash.page, Page::Home, "and cannot be navigated back to");
         assert!(
             dash.page_available(Page::Home),
             "other pages stay available"

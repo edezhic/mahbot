@@ -251,9 +251,9 @@ impl ShellState {
     // ── View ─────────────────────────────────────────────────────────
 
     /// Render the shell. The dashboard renders this page only for a resolved
-    /// workspace (it renders its own placeholder otherwise), so this is only
-    /// ever reached for one; the fallback below is defensive — it covers a
-    /// missing tab-state entry and never points the view at another workspace.
+    /// workspace, so this is only ever reached for one; the fallback below is
+    /// defensive — it covers a missing tab-state entry and never points the
+    /// view at another workspace.
     pub fn view(&self) -> Element<'_, ShellMessage> {
         let Some(ws_state) = self
             .selected_workspace_name
