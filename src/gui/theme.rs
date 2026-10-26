@@ -1005,8 +1005,8 @@ pub fn surface_container_style(_theme: &iced::Theme) -> container::Style {
 }
 
 /// Style for badge pills: a rounded container with the given background and
-/// no border (canonical 4px radius). Used for log level tags, tool badges,
-/// workspace status pills, and notes panels.
+/// no border (canonical 4px radius). Used for log level tags, tool badges and
+/// workspace status pills.
 pub fn pill_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
     move |_theme: &iced::Theme| container_style(bg, 4.0, 0.0, Color::TRANSPARENT)
 }

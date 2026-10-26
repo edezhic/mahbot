@@ -1882,9 +1882,9 @@ impl SettingsState {
                 } else {
                     // The last tier, matching render_modal_overlay: the
                     // custom-tools details window, the custom-roles editor and
-                    // delete dialogs, and the delete-confirm and diagnostics
-                    // modals are all dismissed here (each only if it is the open
-                    // one).
+                    // delete dialogs, the workspace rules and contexts popups,
+                    // and the delete-confirm and diagnostics modals are all
+                    // dismissed here (each only if it is the open one).
                     self.custom_tools_state.close_details();
                     self.custom_roles_state.close_dialogs();
                     return Task::batch([
@@ -2023,8 +2023,8 @@ impl SettingsState {
             for ws_item in &ws.workspaces {
                 let ws_row = container(
                     column![
-                        // Line 1 — name, status pill, and truncated path on one
-                        // row. Maintainer/pause toggles live in the footer only.
+                        // Line 1 — name, status pill, and path on one row.
+                        // Maintainer/pause toggles live in the footer only.
                         row![
                             text(&ws_item.name)
                                 .size(theme::TEXT_14)
@@ -2037,27 +2037,27 @@ impl SettingsState {
                                 ),
                                 "Status",
                             ),
-                            // Path fills the remaining width and clips —
-                            // `Wrapping::None` keeps it on one line at any
-                            // column width (iced text has no ellipsis), and
-                            // the tooltip always reveals the full path.
-                            widgets::tooltip_hint(
-                                container(
-                                    text(&ws_item.path)
-                                        .size(theme::TEXT_12)
-                                        .color(theme::TEXT_SECONDARY)
-                                        .wrapping(text::Wrapping::None),
-                                )
-                                .width(Length::Fill)
-                                .clip(true)
-                                .align_y(Alignment::Center),
-                                ws_item.path.clone(),
-                            ),
+                            // The path hugs the row's right edge, clipped at the
+                            // left when it is too long for the column: the
+                            // paragraph's own right alignment keeps both cases
+                            // true (`Wrapping::None` keeps it on one line at any
+                            // width — iced text has no ellipsis).
+                            container(
+                                text(&ws_item.path)
+                                    .size(theme::TEXT_12)
+                                    .color(theme::TEXT_SECONDARY)
+                                    .wrapping(text::Wrapping::None)
+                                    .width(Length::Fill)
+                                    .align_x(text::Alignment::Right),
+                            )
+                            .width(Length::Fill)
+                            .clip(true)
+                            .align_y(Alignment::Center),
                         ]
                         .spacing(theme::SPACE_10)
                         .align_y(Alignment::Center),
                         // Line 2 — per-role context icons, general context,
-                        // Diag, Notes.
+                        // Diag, Rules.
                         {
                             let mut left = Row::new()
                                 .spacing(theme::SPACE_4)
@@ -2114,18 +2114,16 @@ impl SettingsState {
                                 theme::button_text,
                                 tooltip::Position::Top,
                             ));
-                            left = left.push(widgets::icon_tooltip_button(
-                                text("Notes").size(theme::TEXT_14).color(theme::TEXT_MUTED),
-                                "Custom context",
-                                Some(SettingsMessage::WorkspaceMsg(
-                                    workspaces::WorkspacesMessage::ToggleNotes(
-                                        ws_item.name.clone(),
-                                    ),
-                                )),
-                                button::DEFAULT_PADDING,
-                                theme::button_text,
-                                tooltip::Position::Top,
-                            ));
+                            left = left.push(
+                                button(text("Rules").size(theme::TEXT_14).color(theme::TEXT_MUTED))
+                                    .padding(button::DEFAULT_PADDING)
+                                    .style(theme::button_text)
+                                    .on_press(SettingsMessage::WorkspaceMsg(
+                                        workspaces::WorkspacesMessage::OpenRules(
+                                            ws_item.name.clone(),
+                                        ),
+                                    )),
+                            );
                             left
                         },
                     ]
@@ -2177,172 +2175,13 @@ impl SettingsState {
                             .style(theme::pill_style(theme::BG_ELEVATED)),
                     );
                 }
-
-                // ── Inline notes editor ──────────────────────────────────
-                if ws.notes_open.contains(&ws_item.name) {
-                    // Content is guaranteed to exist in the HashMap because
-                    // ToggleNotes always inserts before adding to notes_open.
-                    let content = ws
-                        .notes_editor_content
-                        .get(&ws_item.name)
-                        .expect("notes editor content must exist when notes_open contains name");
-                    let char_count = content.text().chars().count();
-                    let over_limit = char_count > MAX_WORKSPACE_NOTES_CHARS;
-
-                    let editor_widget = super::editor_widget::EditorWidget::new(content)
-                        .show_gutter(false)
-                        .code_mode(false)
-                        .enter(super::editor_widget::EnterBehavior::Newline)
-                        .id(iced::widget::Id::from(format!("workspace_notes:{}", ws_item.name)))
-                        .keyboard_passthrough(super::is_dashboard_shortcut)
-                        .placeholder(
-                            format!("Add manual context notes for all agents… (max {MAX_WORKSPACE_NOTES_CHARS} characters)"),
-                        )
-                        .min_height(100.0)
-                        .max_height(300.0)
-                        .padding(theme::PAD_5);
-                    let editor: Element<'_, SettingsMessage> =
-                        container(iced::Element::new(editor_widget).map(move |action| {
-                            SettingsMessage::WorkspaceMsg(
-                                workspaces::WorkspacesMessage::NotesEdited(
-                                    ws_item.name.clone(),
-                                    action,
-                                ),
-                            )
-                        }))
-                        .width(Length::Fill)
-                        .height(Length::Shrink)
-                        .style(theme::elevated_card_style)
-                        .into();
-
-                    let char_counter = text(if over_limit {
-                        format!("{char_count}/{MAX_WORKSPACE_NOTES_CHARS} — please trim")
-                    } else {
-                        format!("{char_count}/{MAX_WORKSPACE_NOTES_CHARS}")
-                    })
-                    .size(theme::TEXT_11)
-                    .color(if over_limit {
-                        theme::STATUS_ERROR
-                    } else {
-                        theme::TEXT_SECONDARY
-                    });
-
-                    let save_btn = button(text("Save Notes").size(theme::TEXT_12))
-                        .style(theme::button_secondary);
-                    // Only enable Save when under the character limit
-                    let save_btn = if over_limit {
-                        save_btn
-                    } else {
-                        save_btn.on_press(SettingsMessage::WorkspaceMsg(
-                            workspaces::WorkspacesMessage::SaveNotes(ws_item.name.clone()),
-                        ))
-                    };
-
-                    let cancel_btn = button(text("Cancel").size(theme::TEXT_12))
-                        .style(theme::button_secondary)
-                        .on_press(SettingsMessage::WorkspaceMsg(
-                            workspaces::WorkspacesMessage::NotesCancel(ws_item.name.clone()),
-                        ));
-
-                    let notes_section = container(
-                        column![
-                            editor,
-                            Space::new().height(4),
-                            row![
-                                char_counter,
-                                Space::new().width(Length::Fill),
-                                save_btn,
-                                Space::new().width(theme::SPACE_4),
-                                cancel_btn,
-                            ]
-                            .align_y(Alignment::Center),
-                        ]
-                        .spacing(theme::SPACE_4),
-                    )
-                    .padding([theme::PAD_4, theme::PAD_8])
-                    .style(theme::pill_style(theme::BG_ELEVATED));
-
-                    rows = rows.push(notes_section);
-                }
             }
         }
 
         let plus_btn =
             section_plus_button("Add workspace", SettingsMessage::ToggleAddWorkspaceModal);
 
-        let mut section_content = column![rows];
-
-        // Context view overlay — read-only markdown (inline in section)
-        if let Some((ref _ws_name, ref kind, ref md_items_opt)) = ws.context_view {
-            section_content = section_content.push(Space::new().height(16));
-
-            let title = match kind {
-                workspaces::ContextKind::Role(role) => format!("Context for {role}"),
-                workspaces::ContextKind::General => "General context".to_string(),
-            };
-
-            let body: Element<'_, SettingsMessage> = match md_items_opt {
-                None => container(widgets::loading_text())
-                    .width(Length::Fill)
-                    .into(),
-                Some(items) => {
-                    let mut view_col = column![];
-
-                    if let Some(ref err) = ws.context_view_error {
-                        view_col = view_col.push(widgets::error_banner(err));
-                        view_col = view_col.push(Space::new().height(8));
-                    }
-
-                    if items.is_empty() {
-                        view_col = view_col.push(
-                            text("Not yet discovered")
-                                .size(theme::TEXT_13)
-                                .color(theme::TEXT_MUTED),
-                        );
-                    } else {
-                        let md: Element<'_, SettingsMessage> =
-                            super::selectable::markdown::view(items, theme::markdown_settings())
-                                .map(|url| {
-                                    SettingsMessage::WorkspaceMsg(
-                                        workspaces::WorkspacesMessage::LinkClicked(url),
-                                    )
-                                });
-                        view_col = view_col.push(
-                            container(widgets::vscroll_sized(md, Length::Fill, Length::Shrink))
-                                .padding([theme::PAD_4, 0.0])
-                                .height(Length::Fixed(300.0))
-                                .style(|_| {
-                                    theme::container_style(theme::BG_BASE, 4.0, 1.0, theme::BORDER)
-                                }),
-                        );
-                    }
-
-                    view_col = view_col.push(Space::new().height(12));
-                    view_col = view_col.push(dialog::dialog_footer_row([button(
-                        text("Close").size(theme::TEXT_13),
-                    )
-                    .style(theme::button_secondary)
-                    .on_press(SettingsMessage::WorkspaceMsg(
-                        workspaces::WorkspacesMessage::Escape,
-                    ))
-                    .into()]));
-                    view_col.spacing(theme::SPACE_4).into()
-                }
-            };
-
-            let view_container = container(
-                column![
-                    text(title).size(theme::TEXT_16).color(theme::TEXT_PRIMARY),
-                    Space::new().height(8),
-                    body,
-                ]
-                .padding(theme::PAD_16),
-            )
-            .width(Length::Fill)
-            .style(theme::elevated_card_style);
-
-            section_content = section_content.push(view_container);
-        }
+        let section_content = column![rows];
 
         section_with_header_action("Workspaces", plus_btn, section_content)
     }
@@ -2495,8 +2334,9 @@ impl SettingsState {
 
                 let mut card_body = Column::new().spacing(theme::SPACE_2).push(segment);
                 // The admin holds the whole tool catalogue implicitly, so a
-                // grant line on the card would misstate what they can call.
-                if !is_admin {
+                // grant line on the card would misstate what they can call; a
+                // user granted nothing gets no line at all.
+                if !is_admin && !user.granted_tools.is_empty() {
                     card_body = card_body.push(
                         text(format!(
                             "Custom tools: {}",
@@ -2836,7 +2676,7 @@ impl SettingsState {
         let mut body = Column::new().spacing(theme::SPACE_8);
 
         // The prompt: the administrator's authorial text, the whole definition
-        // of the role (built like the workspace notes editor).
+        // of the role (the same multi-line editor frame the rules popup uses).
         let prompt_editor = super::editor_widget::EditorWidget::new(&editor.prompt)
             .show_gutter(false)
             .code_mode(false)
@@ -3017,10 +2857,161 @@ impl SettingsState {
         None
     }
 
+    /// The workspace rules popup: the editor, its counter, Save and Discard,
+    /// and a failed save reported in place. Its backdrop cannot dismiss it while
+    /// there is unsaved text — see `WorkspacesMessage::RulesDismiss`.
+    fn rules_dialog(rules: &workspaces::RulesEditor) -> Element<'_, SettingsMessage> {
+        let char_count = rules.buffer.text().chars().count();
+        let editor: Element<'_, SettingsMessage> = container(
+            iced::Element::new(
+                super::editor_widget::EditorWidget::new(&rules.buffer)
+                    .show_gutter(false)
+                    .code_mode(false)
+                    .enter(super::editor_widget::EnterBehavior::Newline)
+                    .id(Id::from(workspaces::RULES_EDITOR_ID))
+                    .keyboard_passthrough(super::is_dashboard_shortcut)
+                    .placeholder(format!(
+                        "Add rules for every agent in this workspace… (max \
+                         {MAX_WORKSPACE_NOTES_CHARS} characters)"
+                    ))
+                    .min_height(160.0)
+                    .max_height(320.0)
+                    .padding(theme::PAD_5),
+            )
+            .map(|action| {
+                SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::RulesEdited(action))
+            }),
+        )
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .style(theme::elevated_card_style)
+        .into();
+
+        let mut body = column![editor].spacing(theme::SPACE_4);
+        if let Some(err) = rules.error.as_deref() {
+            body = body.push(widgets::error_banner(err));
+        }
+        body = body.push(
+            row![
+                text(format!("{char_count}/{MAX_WORKSPACE_NOTES_CHARS}"))
+                    .size(theme::TEXT_11)
+                    .color(theme::TEXT_SECONDARY),
+                Space::new().width(Length::Fill),
+                button(text("Save Rules").size(theme::TEXT_12))
+                    .style(theme::button_secondary)
+                    .on_press(SettingsMessage::WorkspaceMsg(
+                        workspaces::WorkspacesMessage::SaveRules,
+                    )),
+                Space::new().width(theme::SPACE_4),
+                button(text("Discard").size(theme::TEXT_12))
+                    .style(theme::button_secondary)
+                    .on_press(SettingsMessage::WorkspaceMsg(
+                        workspaces::WorkspacesMessage::RulesDiscard,
+                    )),
+            ]
+            .align_y(Alignment::Center),
+        );
+
+        dialog::dialog_shell(
+            column![
+                dialog::dialog_title(format!("Rules: {}", rules.workspace)),
+                Space::new().height(16),
+                body,
+            ]
+            .spacing(theme::SPACE_4)
+            .width(Length::Fill),
+            620.0,
+            24.0,
+        )
+        .into()
+    }
+
+    /// The read-only workspace context popup: one role's discovered context or
+    /// the workspace's general context, as markdown.
+    fn contexts_dialog<'a>(
+        context: &'a (
+            String,
+            workspaces::ContextKind,
+            Option<Vec<iced::widget::markdown::Item>>,
+        ),
+        error: Option<&'a str>,
+    ) -> Element<'a, SettingsMessage> {
+        let (ws_name, kind, md_items) = context;
+
+        let scope = match kind {
+            workspaces::ContextKind::Role(role) => format!("{role} context"),
+            workspaces::ContextKind::General => "General context".to_string(),
+        };
+
+        let body: Element<'_, SettingsMessage> = match md_items {
+            None => container(widgets::loading_text())
+                .width(Length::Fill)
+                .into(),
+            Some(items) => {
+                let mut view_col = column![];
+
+                if let Some(err) = error {
+                    view_col = view_col.push(widgets::error_banner(err));
+                    view_col = view_col.push(Space::new().height(8));
+                }
+
+                if items.is_empty() {
+                    view_col = view_col.push(
+                        text("Not yet discovered")
+                            .size(theme::TEXT_13)
+                            .color(theme::TEXT_MUTED),
+                    );
+                } else {
+                    let md: Element<'_, SettingsMessage> =
+                        super::selectable::markdown::view(items, theme::markdown_settings()).map(
+                            |url| {
+                                SettingsMessage::WorkspaceMsg(
+                                    workspaces::WorkspacesMessage::LinkClicked(url),
+                                )
+                            },
+                        );
+                    view_col = view_col.push(
+                        container(widgets::vscroll_sized(md, Length::Fill, Length::Shrink))
+                            .padding([theme::PAD_4, 0.0])
+                            .height(Length::Fixed(300.0))
+                            .style(|_| {
+                                theme::container_style(theme::BG_BASE, 4.0, 1.0, theme::BORDER)
+                            }),
+                    );
+                }
+
+                view_col = view_col.push(Space::new().height(12));
+                view_col = view_col.push(dialog::dialog_footer_row([button(
+                    text("Close").size(theme::TEXT_13),
+                )
+                .style(theme::button_secondary)
+                .on_press(SettingsMessage::WorkspaceMsg(
+                    workspaces::WorkspacesMessage::ContextsClose,
+                ))
+                .into()]));
+                view_col.spacing(theme::SPACE_4).into()
+            }
+        };
+
+        dialog::dialog_shell(
+            column![
+                dialog::dialog_title(format!("{scope}: {ws_name}")),
+                Space::new().height(16),
+                body,
+            ]
+            .spacing(theme::SPACE_4)
+            .width(Length::Fill),
+            620.0,
+            24.0,
+        )
+        .into()
+    }
+
     /// Render the Settings modal overlay: whichever of the add-workspace,
-    /// add-user, user delete-confirm, workspace diagnostics, custom-tool
-    /// details and custom-role editor / delete-confirm windows is open, or a
-    /// type-stable placeholder when none is.
+    /// add-user, user delete-confirm, workspace diagnostics, workspace rules,
+    /// workspace contexts, custom-tool details and custom-role editor /
+    /// delete-confirm windows is open, or a type-stable placeholder when none
+    /// is.
     fn render_modal_overlay(&self) -> Element<'_, SettingsMessage> {
         if self.show_add_workspace_modal {
             let dialog = self.add_workspace_dialog();
@@ -3033,6 +3024,18 @@ impl SettingsState {
             widgets::modal_backdrop(
                 dialog,
                 SettingsMessage::UserMsg(users::UsersMessage::CancelDelete),
+                0.5,
+            )
+        } else if let Some(rules) = self.workspaces_state.rules_editor.as_ref() {
+            widgets::modal_backdrop(
+                Self::rules_dialog(rules),
+                SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::RulesDismiss),
+                0.5,
+            )
+        } else if let Some(context) = self.workspaces_state.context_view.as_ref() {
+            widgets::modal_backdrop(
+                Self::contexts_dialog(context, self.workspaces_state.context_view_error.as_deref()),
+                SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::ContextsClose),
                 0.5,
             )
         } else if let Some(ref diag_ws_name) = self.workspaces_state.diagnostics_modal {
@@ -3302,35 +3305,49 @@ impl SettingsState {
         let error = self.field_errors.get(&field).map(String::as_str);
         field_row_with_error(
             label,
-            widgets::single_line_editor(
-                &self.field_editor(&field).buffer,
-                placeholder,
-                true,
-                Length::Fill,
-                Some(Id::from(field.clone())),
-                move |action| SettingsMessage::ConfigFieldAction { key, action },
-            ),
+            self.config_text_editor(placeholder, key),
             None,
             error,
         )
     }
 
-    /// A model-slot config field: the field-name label stays left of the input,
-    /// while the group's role list is rendered as a small hint label ABOVE the
-    /// input (aligned with the input column via [`FIELD_ROW_INLINE_PAD`]).
+    /// The editor of a plain-text config field, without the label row — for a
+    /// field whose call site lays it out itself.
+    fn config_text_editor<'a>(
+        &'a self,
+        placeholder: &'static str,
+        key: &'static str,
+    ) -> Element<'a, SettingsMessage> {
+        let field = format!("config:{key}");
+        widgets::single_line_editor(
+            &self.field_editor(&field).buffer,
+            placeholder,
+            true,
+            Length::Fill,
+            Some(Id::from(field.clone())),
+            move |action| SettingsMessage::ConfigFieldAction { key, action },
+        )
+    }
+
+    /// A model-slot config field: the field takes the whole column width and
+    /// the group's role list is its hint ABOVE it, at the field's left edge.
     fn config_model_slot_field<'a>(
         &'a self,
-        label: &'static str,
         placeholder: &'static str,
         key: &'static str,
         role_hint: &'static str,
     ) -> Element<'a, SettingsMessage> {
-        column![
-            inline_label(role_hint, FIELD_ROW_INLINE_PAD, theme::TEXT_SECONDARY),
-            self.config_text_field(label, placeholder, key),
+        let field = format!("config:{key}");
+        let error = self.field_errors.get(&field).map(String::as_str);
+        let mut col = column![
+            inline_label(role_hint, 0.0, theme::TEXT_SECONDARY),
+            self.config_text_editor(placeholder, key),
         ]
-        .spacing(theme::SPACE_2)
-        .into()
+        .spacing(theme::SPACE_2);
+        if let Some(err) = error {
+            col = col.push(inline_error(err, 0.0));
+        }
+        col.into()
     }
 
     /// A single maskable password config field row (with password highlighting).
@@ -3439,13 +3456,11 @@ impl SettingsState {
 
     fn models_section(&self) -> Element<'_, SettingsMessage> {
         let manager_row = self.config_model_slot_field(
-            "Manager",
             crate::config::DEFAULT_MANAGER_MODEL,
             CONFIG_KEY_MANAGER_MODEL,
             "Manager, Assistant, Discovery, Engineer, Maintainer",
         );
         let worker_row = self.config_model_slot_field(
-            "Executor",
             crate::config::DEFAULT_WORKER_MODEL,
             CONFIG_KEY_WORKER_MODEL,
             "Analyst, Worker, QA, Reviewer, Sanitation",
@@ -4177,11 +4192,9 @@ impl SettingsState {
             );
 
             let row = column![
-                // Model name label (read-only)
-                text(display_name)
-                    .font(theme::JETBRAINS_MONO)
-                    .size(theme::TEXT_13)
-                    .color(theme::TEXT_SECONDARY),
+                // Model name label (read-only) — the same face as the image and
+                // video model rows.
+                text(display_name).size(theme::TEXT_12),
                 order_input,
             ]
             .spacing(theme::SPACE_2);

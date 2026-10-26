@@ -28,6 +28,12 @@ use crate::util::is_word_char;
 /// the same value so that page-up and page-down undo each other.
 const PAGE_SCROLL_LINES: usize = 40;
 
+/// Vertical overflow smaller than this is not scrollable. Layout arithmetic on
+/// an exactly fitting box (padding + line metrics) leaves a fraction of a pixel
+/// behind, and a box that cannot move by a visible amount must not take the
+/// wheel from the page behind it.
+const MIN_SCROLL_OVERFLOW: f32 = 0.5;
+
 // ── CursorState ──────────────────────────────────────────────────────
 
 /// Represents a cursor position (line and character-based column) together
@@ -452,6 +458,13 @@ impl EditorBuffer {
     pub fn move_to(&self, line: usize, col: usize) {
         self.set_cursor_pos(line, col);
         self.has_selection.set(false);
+    }
+
+    /// Move the cursor to the end of the buffer and clear any selection — where
+    /// a field opened over existing text starts, so the first keystroke appends.
+    pub fn move_to_end(&self) {
+        let last_line = self.line_count().saturating_sub(1);
+        self.move_to(last_line, self.line_char_len(last_line));
     }
 
     /// Set cursor position without affecting selection state.
@@ -2136,7 +2149,7 @@ struct EditorWidgetState {
     last_blink: std::time::Instant,
     /// Current vertical scroll offset in pixels.
     scroll_y: f32,
-    /// Maximum allowed vertical scroll offset.
+    /// Maximum allowed vertical scroll offset; 0 when the text fits the box.
     max_scroll_y: f32,
     /// Current horizontal scroll offset in pixels (single-line mode only).
     scroll_x: f32,
@@ -2895,7 +2908,12 @@ where
         // ── Compute max scroll range ───────────────────────────────────
         // `total_height` (computed above) is unchanged by the auto-size
         // clamp re-shape — wrapping depends only on the (fixed) text width.
-        state.max_scroll_y = (total_height - text_area_height).max(0.0);
+        let overflow = total_height - text_area_height;
+        state.max_scroll_y = if overflow > MIN_SCROLL_OVERFLOW {
+            overflow
+        } else {
+            0.0
+        };
         state.scroll_y = state.scroll_y.clamp(0.0, state.max_scroll_y);
 
         // Re-apply scroll if auto-scroll changed it
@@ -3040,8 +3058,11 @@ where
 
         match event {
             // ── Mouse wheel scrolling ───────────────────────────────
+            // Text taller than the box owns the wheel, so the page behind does
+            // not scroll too; a field that fits has nothing to scroll here and
+            // leaves the wheel to the page untouched.
             Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
-                if cursor.position_in(layout.bounds()).is_none() {
+                if state.max_scroll_y == 0.0 || cursor.position_in(layout.bounds()).is_none() {
                     return;
                 }
                 let line_height = font_metrics().line_height;
@@ -3053,6 +3074,7 @@ where
                 state.auto_scroll_enabled = false;
                 shell.invalidate_layout();
                 shell.request_redraw();
+                shell.capture_event();
             }
 
             // ── Mouse button press: move cursor to click point ───────

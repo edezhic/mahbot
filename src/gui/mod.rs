@@ -1356,7 +1356,7 @@ impl Dashboard {
             _ => {}
         }
         // Any successful Settings-side workspace mutation (add, delete,
-        // reanalyze, diagnostics/notes edits) refreshes the managed
+        // reanalyze, diagnostics/rules edits) refreshes the managed
         // workspace map from one full DB read — the map is the single source
         // of truth, and syncing the Settings workspace list from it (see
         // [`Self::sync_settings_workspaces_from_map`]) gives the page its immediate
@@ -1369,7 +1369,7 @@ impl Dashboard {
                     | workspaces::WorkspacesMessage::ReanalyzeResult(Ok(()))
                     | workspaces::WorkspacesMessage::DiagnosticsSaved(_, Ok(()))
                     | workspaces::WorkspacesMessage::RediscoverDiagnosticsResult(_, Ok(()))
-                    | workspaces::WorkspacesMessage::NotesSaved(_, Ok(()))
+                    | workspaces::WorkspacesMessage::RulesSaved(_, Ok(()))
             ) | settings::SettingsMessage::AddWorkspaceResult(Ok(_))
         );
 

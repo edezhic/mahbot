@@ -1731,6 +1731,11 @@ pub fn tree_row<'a, Message: 'a>(
 /// modal overlays. The backdrop is a full-screen [`mouse_area`] that emits
 /// `on_backdrop` when clicked.
 ///
+/// It reports [`iced::mouse::Interaction::Idle`] over its whole area, so the
+/// parent `Stack` levitates the cursor for the page below: nothing behind an
+/// open overlay reacts to the pointer — hover or wheel — while the overlay's
+/// own content is unaffected, levitation applying only to the layers under it.
+///
 /// Extracted from [`modal_backdrop`] so the 80%-width diff overlay can
 /// compose the same backdrop while claiming only its dialog rectangle.
 pub(super) fn modal_backdrop_layer<'a, Message: 'a + Clone>(
@@ -1748,6 +1753,7 @@ pub(super) fn modal_backdrop_layer<'a, Message: 'a + Clone>(
                 ..container::Style::default()
             }),
     )
+    .interaction(iced::mouse::Interaction::Idle)
     .on_press(on_backdrop)
     .into()
 }

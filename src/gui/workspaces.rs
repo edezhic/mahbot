@@ -6,7 +6,7 @@ use crate::workspace::truncate_workspace_notes;
 use iced::Task;
 use iced::widget::markdown;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::common::SingleLineEditorState;
 use super::editor_widget::EditorAction;
@@ -58,17 +58,23 @@ pub enum WorkspacesMessage {
     /// Request toast notification.
     Toast(super::ToastMessage),
 
-    // ── User notes editor ────────────────────────────────────────
-    /// Toggle the notes editor for a workspace.
-    ToggleNotes(String),
-    /// Notes editor content changed.
-    NotesEdited(String, super::editor_widget::EditorAction),
-    /// Save notes to DB.
-    SaveNotes(String),
-    /// Async result of saving notes.
-    NotesSaved(String, Result<(), String>),
-    /// Discard notes edits and close editor.
-    NotesCancel(String),
+    // ── Workspace rules popup ────────────────────────────────────
+    /// Open the rules popup for a workspace. The popup's backdrop covers the
+    /// page, so it is the only surface reachable until it closes.
+    OpenRules(String),
+    /// Rules editor content changed.
+    RulesEdited(super::editor_widget::EditorAction),
+    /// Save the rules buffer to the store.
+    SaveRules,
+    /// Async result of saving rules: (workspace, result).
+    RulesSaved(String, Result<(), String>),
+    /// Close the rules popup, throwing the buffer away — its explicit Discard.
+    RulesDiscard,
+    /// Escape or a click outside the popup: close it only when nothing is
+    /// unsaved.
+    RulesDismiss,
+    /// Close the read-only contexts popup.
+    ContextsClose,
 }
 
 /// Which context entry the read-only context panel is showing.
@@ -102,15 +108,50 @@ pub struct WorkspacesState {
     /// Last save error for diagnostics (resets on modal open).
     pub(crate) diagnostics_error: Option<String>,
 
-    // ── User notes editor ────────────────────────────────────────
-    /// Open notes editors per workspace (keyed by workspace name).
-    pub(crate) notes_editor_content: HashMap<String, super::editor_widget::EditorBuffer>,
-    /// Per-workspace undo stacks for the notes editors, kept in lockstep with
-    /// [`notes_editor_content`](Self::notes_editor_content). Each open editors
-    /// owns its own undo/redo, matching the per-field undo requirement.
-    pub(crate) notes_undo: HashMap<String, super::common::UndoStack>,
-    /// Which workspaces have their notes editor expanded.
-    pub(crate) notes_open: HashSet<String>,
+    // ── Rules popup ──────────────────────────────────────────────
+    /// The open rules popup, or nothing — one at a time, so its buffer and undo
+    /// stack live here rather than in a per-workspace map.
+    pub(crate) rules_editor: Option<RulesEditor>,
+}
+
+/// The focus id of the rules popup's editor — one popup at a time, so one id.
+pub(crate) const RULES_EDITOR_ID: &str = "workspace_rules";
+
+/// The open rules popup: the workspace it edits, the text as the store holds
+/// it, the unsaved buffer, and the last save failure shown in the popup.
+pub(crate) struct RulesEditor {
+    pub(crate) workspace: String,
+    /// What the store had when the popup opened — the yardstick for "unsaved".
+    saved: String,
+    pub(crate) buffer: super::editor_widget::EditorBuffer,
+    pub(crate) undo: super::common::UndoStack,
+    /// A failed save, reported inside the popup; the buffer stays as it was so
+    /// a retry needs no retyping.
+    pub(crate) error: Option<String>,
+}
+
+impl RulesEditor {
+    fn new(workspace: String, saved: String) -> Self {
+        let buffer = super::editor_widget::EditorBuffer::with_text(
+            &saved,
+            Some(super::highlight::HighlightLanguage::Markdown),
+        );
+        // Opened over existing rules to add to them: the caret goes to the end
+        // so the first keystroke appends instead of rewriting the first line.
+        buffer.move_to_end();
+        Self {
+            workspace,
+            saved,
+            buffer,
+            undo: super::common::UndoStack::new(),
+            error: None,
+        }
+    }
+
+    /// Whether the buffer holds anything the store does not.
+    fn is_dirty(&self) -> bool {
+        self.buffer.text() != self.saved
+    }
 }
 
 impl WorkspacesState {
@@ -126,9 +167,7 @@ impl WorkspacesState {
             diagnostics_edit_buffers: HashMap::new(),
             diagnostics_busy: false,
             diagnostics_error: None,
-            notes_editor_content: HashMap::new(),
-            notes_undo: HashMap::new(),
-            notes_open: HashSet::new(),
+            rules_editor: None,
         }
     }
 
@@ -236,21 +275,19 @@ impl WorkspacesState {
                     },
                 )
             }
-            WorkspacesMessage::ContextViewed(ws_name, kind, Ok(Some(content))) => {
-                let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
-                self.context_view = Some((ws_name, kind, Some(md_items)));
-                self.context_view_error = None;
-                Task::none()
-            }
-            WorkspacesMessage::ContextViewed(ws_name, kind, Ok(None)) => {
-                // No context set yet — show empty state with empty items
-                self.context_view = Some((ws_name, kind, Some(Vec::new())));
-                self.context_view_error = None;
-                Task::none()
-            }
-            WorkspacesMessage::ContextViewed(ws_name, kind, Err(e)) => {
-                self.context_view = Some((ws_name, kind, Some(Vec::new())));
-                self.context_view_error = Some(e);
+            WorkspacesMessage::ContextViewed(ws_name, kind, result) => {
+                // A fetch that lands after the popup was dismissed has nowhere
+                // to go: reopening it would undo the dismissal.
+                if self.context_view.is_none() {
+                    return Task::none();
+                }
+                // No context set yet — an empty item list is the empty state.
+                let items = match &result {
+                    Ok(Some(content)) => markdown::parse(content).collect(),
+                    Ok(None) | Err(_) => Vec::new(),
+                };
+                self.context_view_error = result.err();
+                self.context_view = Some((ws_name, kind, Some(items)));
                 Task::none()
             }
             WorkspacesMessage::LinkClicked(_url) => {
@@ -373,118 +410,120 @@ impl WorkspacesState {
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
 
-            // ── User notes editor ────────────────────────────────
-            WorkspacesMessage::ToggleNotes(name) => {
-                if self.notes_open.contains(&name) {
-                    // Close: discard editor state
-                    self.notes_open.remove(&name);
-                    self.notes_editor_content.remove(&name);
-                    self.notes_undo.remove(&name);
-                } else {
-                    // Open: initialize editor from current workspace's notes
-                    let notes = self
-                        .workspaces
-                        .iter()
-                        .find(|w| w.name == name)
-                        .map_or("", |w| w.notes.as_str());
-                    self.notes_open.insert(name.clone());
-                    self.notes_editor_content.insert(
-                        name.clone(),
-                        super::editor_widget::EditorBuffer::with_text(
-                            notes,
-                            Some(super::highlight::HighlightLanguage::Markdown),
-                        ),
-                    );
-                    self.notes_undo
-                        .insert(name, super::common::UndoStack::new());
-                }
-                Task::none()
+            // ── Rules popup ──────────────────────────────────────
+            WorkspacesMessage::OpenRules(workspace) => {
+                let saved = self
+                    .workspaces
+                    .iter()
+                    .find(|w| w.name == workspace)
+                    .map_or_else(String::new, |w| w.notes.clone());
+                self.rules_editor = Some(RulesEditor::new(workspace, saved));
+                // The popup is the thing that was just asked for: the keyboard
+                // goes there, so the first keystroke lands without a click.
+                iced::widget::operation::focus(iced::widget::Id::from(RULES_EDITOR_ID))
             }
-            WorkspacesMessage::NotesEdited(name, action) => {
-                let name_for_entry = name.clone();
-                let content = self
-                    .notes_editor_content
-                    .entry(name_for_entry)
-                    .or_insert_with(|| {
-                        self.workspaces.iter().find(|w| w.name == name).map_or_else(
-                            || {
-                                super::editor_widget::EditorBuffer::with_text(
-                                    "",
-                                    Some(super::highlight::HighlightLanguage::Markdown),
-                                )
-                            },
-                            |w| {
-                                super::editor_widget::EditorBuffer::with_text(
-                                    &w.notes,
-                                    Some(super::highlight::HighlightLanguage::Markdown),
-                                )
-                            },
-                        )
-                    });
-                // Route through the shared undo-aware path so Cmd+Z / Cmd+Shift+Z
-                // undo/redo in the notes editor instead of being a no-op.
-                let undo = self
-                    .notes_undo
-                    .entry(name.clone())
-                    .or_insert_with(super::common::UndoStack::new);
-                super::common::apply_editor_action(content, undo, action);
-                // Enforce cap at the UI level
-                let current = content.text().clone();
+            WorkspacesMessage::RulesEdited(action) => {
+                let Some(rules) = self.rules_editor.as_mut() else {
+                    return Task::none();
+                };
+                // The shared undo-aware path, so Cmd+Z / Cmd+Shift+Z work here
+                // like in every other editor.
+                super::common::apply_editor_action(&mut rules.buffer, &mut rules.undo, action);
+                // The store cuts at the cap; the buffer must not grow past it,
+                // or the counter would promise what a save throws away.
+                let current = rules.buffer.text();
                 let truncated = truncate_workspace_notes(&current);
                 if truncated.len() < current.len() {
-                    content.set_text(&truncated);
+                    rules.buffer.set_text(&truncated);
+                    rules.buffer.move_to_end();
                 }
                 Task::none()
             }
-            WorkspacesMessage::SaveNotes(name) => {
-                let notes = self
-                    .notes_editor_content
-                    .get(&name)
-                    .map(|c| c.text().clone())
-                    .unwrap_or_default();
+            WorkspacesMessage::SaveRules => {
+                let Some(rules) = self.rules_editor.as_mut() else {
+                    return Task::none();
+                };
+                rules.error = None;
+                let name = rules.workspace.clone();
+                let text = rules.buffer.text();
                 let name_clone = name.clone();
                 Task::perform(
                     async move {
                         crate::workspace::store()
-                            .set_notes(&name_clone, &notes)
+                            .set_notes(&name_clone, &text)
                             .await
                             .map_err(|e| e.to_string())
                     },
-                    move |result| WorkspacesMessage::NotesSaved(name, result),
+                    move |result| WorkspacesMessage::RulesSaved(name, result),
                 )
             }
-            WorkspacesMessage::NotesSaved(name, Ok(())) => {
-                self.notes_open.remove(&name);
-                self.notes_editor_content.remove(&name);
-                self.notes_undo.remove(&name);
+            WorkspacesMessage::RulesSaved(workspace, Ok(())) => {
+                if self
+                    .rules_editor
+                    .as_ref()
+                    .is_some_and(|rules| rules.workspace == workspace)
+                {
+                    self.rules_editor = None;
+                }
                 Task::none()
             }
-            WorkspacesMessage::NotesSaved(_name, Err(e)) => {
-                self.load_state.fail(e.clone());
-                // Keep editor open so user can retry
-                Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
+            WorkspacesMessage::RulesSaved(workspace, Err(e)) => {
+                if let Some(rules) = self.rules_editor.as_mut()
+                    && rules.workspace == workspace
+                {
+                    rules.error = Some(e);
+                }
+                Task::none()
             }
-            WorkspacesMessage::NotesCancel(name) => {
-                self.notes_open.remove(&name);
-                self.notes_editor_content.remove(&name);
-                self.notes_undo.remove(&name);
+            WorkspacesMessage::RulesDiscard => {
+                self.rules_editor = None;
+                Task::none()
+            }
+            // Escape and a click outside are not ways out of unsaved text: only
+            // Save and the explicit Discard are.
+            WorkspacesMessage::RulesDismiss => self.dismiss_rules(),
+            WorkspacesMessage::ContextsClose => {
+                self.context_view = None;
+                self.context_view_error = None;
                 Task::none()
             }
 
+            // One dismissal closes one surface — the topmost that is open — and
+            // leaves the others alone. Unsaved rules survive it.
             WorkspacesMessage::Escape => {
-                self.delete_target = None;
-                self.context_view = None;
-                self.context_view_error = None;
-                self.diagnostics_modal = None;
-                self.diagnostics_edit_buffers.clear();
-                self.diagnostics_busy = false;
-                self.diagnostics_error = None;
-                self.notes_open.clear();
-                self.notes_editor_content.clear();
-                self.notes_undo.clear();
-                Task::none()
+                if self.rules_editor.is_some() {
+                    self.dismiss_rules()
+                } else if self.context_view.is_some() {
+                    self.context_view = None;
+                    self.context_view_error = None;
+                    Task::none()
+                } else if self.diagnostics_modal.is_some() {
+                    self.diagnostics_modal = None;
+                    self.diagnostics_edit_buffers.clear();
+                    self.diagnostics_busy = false;
+                    self.diagnostics_error = None;
+                    Task::none()
+                } else {
+                    self.delete_target = None;
+                    Task::none()
+                }
             }
             WorkspacesMessage::Toast(_) => Task::none(),
+        }
+    }
+
+    /// Close the rules popup unless it holds unsaved text — the one place that
+    /// decides what "unsaved" means for a dismissal. A refused dismissal puts
+    /// the focus back in the editor: a click outside has just taken it away.
+    fn dismiss_rules(&mut self) -> Task<WorkspacesMessage> {
+        let Some(rules) = self.rules_editor.as_ref() else {
+            return Task::none();
+        };
+        if rules.is_dirty() {
+            iced::widget::operation::focus(iced::widget::Id::from(RULES_EDITOR_ID))
+        } else {
+            self.rules_editor = None;
+            Task::none()
         }
     }
 }
@@ -517,5 +556,36 @@ mod tests {
             let _ = state.update(WorkspacesMessage::ShowDiagnostics("ws".to_string()));
             assert!(state.diagnostics_error.is_none());
         }
+    }
+
+    #[test]
+    fn unsaved_rules_survive_escape_and_only_discard_drops_them() {
+        let mut state = state_with_diagnostics(None);
+        state.workspaces[0].notes = "stored rules".to_string();
+
+        let _ = state.update(WorkspacesMessage::OpenRules("ws".to_string()));
+        let _ = state.update(WorkspacesMessage::RulesEdited(EditorAction::Insert('!')));
+
+        let _ = state.update(WorkspacesMessage::Escape);
+        assert!(
+            state.rules_editor.is_some(),
+            "escape must not throw unsaved rules away"
+        );
+        let _ = state.update(WorkspacesMessage::RulesDismiss);
+        assert!(
+            state.rules_editor.is_some(),
+            "a click outside must not throw unsaved rules away"
+        );
+
+        let _ = state.update(WorkspacesMessage::RulesDiscard);
+        assert!(state.rules_editor.is_none(), "discard is the way out");
+
+        // A popup the user has not touched closes on the same dismissals.
+        let _ = state.update(WorkspacesMessage::OpenRules("ws".to_string()));
+        let _ = state.update(WorkspacesMessage::Escape);
+        assert!(
+            state.rules_editor.is_none(),
+            "a clean popup closes on escape"
+        );
     }
 }
