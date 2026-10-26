@@ -148,6 +148,10 @@ pub(crate) struct AgentTracking {
     pub generation: u64,
     pub role: String,
     pub workspace: String,
+    /// The ticket the run works on — empty when it has none. The log row's
+    /// ticket scope for a record that never travels through the agent's span
+    /// (see [`crate::logs::record_stray_event`]).
+    pub ticket: String,
 }
 
 struct AgentEntry {

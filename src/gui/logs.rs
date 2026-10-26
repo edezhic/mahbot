@@ -349,20 +349,12 @@ impl LogsState {
                     return Task::none();
                 }
 
-                // Client-side search filter matching this view's query (the
-                // level filter comes from the DB query for the Issues view,
-                // which never receives live entries).
-                let passes = data.search.is_empty()
-                    || entry
-                        .message
-                        .to_lowercase()
-                        .contains(&data.search.to_lowercase())
-                    || entry
-                        .target
-                        .to_lowercase()
-                        .contains(&data.search.to_lowercase());
-
-                if passes {
+                // Client-side search filter matching this view's query: the
+                // live filter and the stored-row query cover the same four
+                // parts — target, message, workspace and ticket. (The level
+                // filter comes from the DB query for the Issues view, which
+                // never receives live entries.)
+                if entry.matches_search(&data.search) {
                     data.entries.insert(0, entry);
                     data.pagination.total += 1;
                     // Auto-evict: keep exactly page_size entries visible.
@@ -775,10 +767,15 @@ impl LogsState {
                 .size(theme::TEXT_11)
                 .color(theme::TEXT_SECONDARY),
         );
-        if !entry.workspace.is_empty() {
+        // The row's remaining scope — the ticket it works on, then the
+        // workspace — shares one muted style under the module.
+        for scope in [&entry.ticket, &entry.workspace] {
+            if scope.is_empty() {
+                continue;
+            }
             spans.push(Span::new("  ").size(theme::TEXT_10));
             spans.push(
-                Span::new(&entry.workspace)
+                Span::new(scope)
                     .size(theme::TEXT_10)
                     .color(theme::TEXT_MUTED),
             );
@@ -867,16 +864,16 @@ fn field_value_str(value: &serde_json::Value) -> String {
 
 /// Format a [`LogEntry`] for clipboard copy ("Copy" context-menu action): the
 /// full raw RFC 3339 timestamp and level on the first line, a header line with
-/// the available role/agent/target/workspace parts, then the complete
+/// the available role/agent/target/ticket/workspace parts, then the complete
 /// untruncated message, then each remaining field as a `key: value` line.
 ///
 /// Concrete layout (only the parts present in the entry are emitted; the
-/// header line is omitted entirely when no role/agent/target/workspace part
-/// exists):
+/// header line is omitted entirely when no role/agent/target/ticket/workspace
+/// part exists):
 ///
 /// ```text
 /// 2026-08-17T20:15:44.581360Z  ERROR
-/// role: engineer  agent: ticket_42_engineer  target: run_agent  workspace: mahbot
+/// role: engineer  agent: ticket_42_engineer  target: run_agent  ticket: mahbot-42  workspace: mahbot
 ///
 /// The full untruncated message, possibly spanning multiple lines.
 /// error_chain: crate::foo at src/foo.rs:42
@@ -886,11 +883,12 @@ fn field_value_str(value: &serde_json::Value) -> String {
 /// Field lines iterate the stored fields JSON in **sorted key order** (the
 /// format function sorts explicitly, so the output is deterministic regardless
 /// of serde_json's `preserve_order` feature state) and skip only the `message`
-/// key, mirroring the row renderer. Keys that duplicate header parts (e.g.
-/// `agent_id`/`role` inside fields) are kept: the fields section is a faithful
-/// dump of the stored JSON, exactly as the row displays them. Non-string
-/// values render via [`field_value_str`] — numbers/bools as literals, nested
-/// JSON compact.
+/// key, mirroring the row renderer. The row's scope is promoted out of the
+/// record at write time, so the keys that duplicate header parts — `agent_id`,
+/// `role`/`agent_role`, `workspace`/`workspace_name`/`workspace_path`,
+/// `ticket`/`ticket_id` — are no longer fields: the fields section is only the
+/// record's remaining payload. Non-string values render via
+/// [`field_value_str`] — numbers/bools as literals, nested JSON compact.
 #[must_use]
 fn format_log_entry(entry: &LogEntry) -> String {
     let mut out = String::new();
@@ -908,6 +906,9 @@ fn format_log_entry(entry: &LogEntry) -> String {
     }
     if !entry.target.is_empty() {
         header.push(format!("target: {}", entry.target));
+    }
+    if !entry.ticket.is_empty() {
+        header.push(format!("ticket: {}", entry.ticket));
     }
     if !entry.workspace.is_empty() {
         header.push(format!("workspace: {}", entry.workspace));
@@ -957,12 +958,11 @@ mod tests {
                 "error_chain": "crate::foo at src/foo.rs:42",
                 "message": "not copied",
                 "attempt": 3,
-                "agent_id": "ticket_42_engineer",
-                "role": "engineer",
             }),
             agent_id: "ticket_42_engineer".to_string(),
             agent_role: "engineer".to_string(),
             workspace: "mahbot".to_string(),
+            ticket: "mahbot-42".to_string(),
         }
     }
 
@@ -972,13 +972,11 @@ mod tests {
         assert_eq!(
             out,
             "2026-08-17T20:15:44.581360Z  ERROR\n\
-             role: engineer  agent: ticket_42_engineer  target: run_agent  workspace: mahbot\n\
+             role: engineer  agent: ticket_42_engineer  target: run_agent  ticket: mahbot-42  workspace: mahbot\n\
              \n\
              Agent failed\n\
-             agent_id: ticket_42_engineer\n\
              attempt: 3\n\
-             error_chain: crate::foo at src/foo.rs:42\n\
-             role: engineer"
+             error_chain: crate::foo at src/foo.rs:42"
         );
     }
 

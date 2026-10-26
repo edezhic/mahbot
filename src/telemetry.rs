@@ -192,6 +192,7 @@ impl TelemetryRecord {
                     + entry.agent_id.len()
                     + entry.agent_role.len()
                     + entry.workspace.len()
+                    + entry.ticket.len()
                     + json_len(&entry.fields)
             }
         };

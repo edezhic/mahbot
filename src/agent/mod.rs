@@ -89,16 +89,31 @@ pub(crate) fn current_agent_id() -> Option<String> {
         .filter(|agent_id| !agent_id.is_empty())
 }
 
-/// The calling agent's identity for the warning row
-/// [`crate::logs::record_stray_event`] leaves: `(agent_id, role)`, empty outside
-/// an agent run (inbound enrichment, tests). The tracing writer takes this
-/// attribution from the current span; a row that travels to the telemetry queue
-/// must take it from the same task-local, read here — synchronously, while the
-/// calling task is still the one running, since no task-local is in scope where
-/// the row is written.
-pub(crate) fn tool_record_attribution() -> (String, String) {
+/// The scope a tool-call row states: the calling agent's identity and role, and
+/// the ticket the run works on (empty when it has none).
+#[derive(Default)]
+pub(crate) struct ToolRecordAttribution {
+    pub agent_id: String,
+    pub agent_role: String,
+    pub ticket: String,
+}
+
+/// The calling agent's attribution for the warning row
+/// [`crate::logs::record_stray_event`] leaves: empty outside an agent run
+/// (inbound enrichment, tests), and with the ticket empty whenever the run has no
+/// ticket of its own. The tracing writer takes this attribution from the current
+/// span; a row that travels to the telemetry queue must take it from the same
+/// task-local, read here — synchronously, while the calling task is still the one
+/// running, since no task-local is in scope where the row is written.
+pub(crate) fn tool_record_attribution() -> ToolRecordAttribution {
     CURRENT_TOOL_AGENT_TRACKING
-        .try_with(|t| t.as_ref().map(|t| (t.agent_id.clone(), t.role.clone())))
+        .try_with(|t| {
+            t.as_ref().map(|t| ToolRecordAttribution {
+                agent_id: t.agent_id.clone(),
+                agent_role: t.role.clone(),
+                ticket: t.ticket.clone(),
+            })
+        })
         .ok()
         .flatten()
         .unwrap_or_default()
@@ -919,7 +934,24 @@ impl Agent {
 
     /// Run a complete agent turn: initialize session, work loop (with shutdown
     /// cancellation), finalize session.
+    ///
+    /// The turn's log scope rides one span for the whole turn — the agent, its
+    /// role, the workspace's name (never its path) and the ticket when the run has
+    /// one — so every record the turn produces is scoped to the work it belongs to,
+    /// including the ones outside the LLM loop (see [`crate::logs`]).
     pub async fn work(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
+        let span = tracing::info_span!(
+            "agent",
+            agent_id = %self.agent_id,
+            role = %self.role,
+            workspace = %self.workspace.name,
+            ticket = self.ticket.as_ref().map(|ticket| ticket.id.as_str())
+        );
+        self.run_turn(msg, resume).instrument(span).await
+    }
+
+    /// [`Self::work`]'s body, running inside the turn's scope span.
+    async fn run_turn(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
         // Whether this turn's user message lands decides whether the turn may
         // advance a personal folder's change baseline at its end (the report
         // rides that message); see `session::personal_changes::refresh_after_turn`.
@@ -1316,176 +1348,174 @@ impl Agent {
     }
 
     /// Run the full agent loop: LLM calls → tool execution → loop until final answer.
+    ///
+    /// Runs inside [`Self::work`]'s turn span, which carries the run's log scope.
     async fn llm_loop(&mut self) -> anyhow::Result<String> {
-        let span = tracing::info_span!("agent", agent_id = %self.agent_id, role = %self.role, workspace = %self.workspace.path);
-        async {
-            let mut tool_rounds = 0usize;
-            let mut accumulated_media_paths: Vec<(&'static str, String)> = Vec::new();
-            loop {
-                if self.cancel_token.is_cancelled() {
-                    anyhow::bail!("Agent cancelled");
-                }
-                // Cooperative workspace-pause (strict freeze): the current LLM
-                // round ends at this boundary — no new LLM call starts. The
-                // pause does NOT fire the per-agent cancel token, so the round
-                // that was already in flight completes and commits first. The
-                // phase finalizer treats the frozen agent as a no-op (the job
-                // stays in place for the unpause re-drive).
-                if self.is_cancelled_by_pause() {
-                    // Record the freeze IMMUTABLY at the bail so a later
-                    // unpause (which clears the live pause_stop) cannot turn a
-                    // frozen run into a misclassified hard failure.
-                    self.paused_frozen
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    anyhow::bail!("Agent frozen by workspace pause — resumes at unpause");
-                }
-                // Shutdown/drain: checked at tool-round top (after the previous
-                // tool group's commit) so the CURRENT tool group completes —
-                // no new LLM call starts once the drain begins (or the token
-                // fires). The round is resumed at boot via the job row
-                // (status='launched').
-                Self::bail_on_shutdown()?;
-                if tool_rounds >= MAX_TOOL_ROUNDS {
-                    anyhow::bail!(
-                        "Agent exceeded maximum of {MAX_TOOL_ROUNDS} tool rounds \
-                         — model may be stuck in a tool-calling loop"
-                    );
-                }
-
-                // Messages arrive as user messages with a descriptive prefix so
-                // the model understands their source (ticket comments get the
-                // `format_comment_message` framing).
-                self.drain_incoming_messages().await;
-
-                // Leader-stagger signal: fire after the FIRST LLM call
-                // completes, success or failure — the wait is fail-open;
-                // Notify's stored permit covers a fire-before-wait race.
-                let llm_result = self.llm_call().await;
-                if tool_rounds == 0
-                    && let Some(notify) = &self.first_call_notify
-                {
-                    notify.notify_one();
-                }
-
-                // Provider input-image content-inspection rejection (e.g.
-                // OpenRouter HTTP 400 `data_inspection_failed`): the rejected
-                // image must not fail the run wholesale nor stay sticky in the
-                // session. Strip the image markers from the most recent user
-                // message (durable-first) and continue the loop — the next
-                // tool round re-runs `llm_call` with the corrected message as
-                // part of the NORMAL loop, not a dedicated retry step. No
-                // retry guard: a subsequent failure whose most recent user
-                // message no longer contains image markers takes the normal
-                // failure path (no repeated stripping).
-                //
-                // The leader-stagger signal above has already fired (first
-                // call completed, success or failure): a stripped leader's next
-                // request diverges from its followers' byte-stable prefix —
-                // fail-open by design, and moot for the direct-chat Assistant
-                // scenario that exercises this path (management rounds never
-                // send images). Note: the retried call re-runs the tool-round-0
-                // `notify_one` above, but the stagger has a single waiter (the
-                // `select!` in `spawn_staggered_round`, already consumed) — the
-                // second notification stores an unconsumed permit and is
-                // dropped with the Notify. No follower is released twice.
-                //
-                // The downcast is extracted to a local first: `anyhow::Chain`
-                // is not `Send`, so it must not be held across the await below
-                // (the agent runs inside a spawned, Send-bound task).
-                let image_rejection = llm_result.as_ref().err().and_then(|e| {
-                    e.chain()
-                        .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
-                });
-                if let Some(exhausted) = image_rejection
-                    && self.strip_rejected_input_image(exhausted).await
-                {
-                    tracing::info!(
-                        agent_id = %self.agent_id,
-                        role = %self.role,
-                        tool_rounds,
-                        "Stripped provider-rejected input image from the most recent user \
-                         message — continuing the normal loop"
-                    );
-                    continue;
-                }
-
-                let PreparedAssistantTurn {
-                    mut display_text,
-                    tool_calls,
-                    history_content,
-                    raw_text,
-                } = prepare_assistant_turn(
-                    llm_result.with_context(|| {
-                        llm_step_failure_context(&self.session, tool_rounds)
-                    })?,
-                );
-
-                if tool_calls.is_empty() {
-                    self.session.push_assistant(history_content);
-                    // Append any pending media markers the model may have omitted
-                    for (marker_prefix, path) in &accumulated_media_paths {
-                        let marker = format!("{marker_prefix}{path}]");
-                        if !display_text.contains(&marker) {
-                            let _ = write!(display_text, "\n{marker}");
-                        }
-                    }
-                    return Ok(display_text);
-                }
-
-                // EMISSION-TIME DURABILITY: the assistant frame with its tool
-                // calls is committed BEFORE the calls execute — a crash or drain
-                // mid-execution leaves the calls durably recorded with their
-                // results absent, and the universal resume-completion step (run
-                // before any LLM call on this session) re-runs or resumes them.
-                // The end-of-round commit below persists only the results.
-                self.session
-                    .persist_messages(
-                        &self.agent_id,
-                        &[ChatMessage::assistant(history_content.clone())],
-                    )
-                    .await?;                // Sleep-delivery guard: a sleep call in a round with
-                // accompanying raw text or bundled with other tool calls is
-                // rejected (see `execute_tool_round`) instead of silently
-                // swallowing the text or ending the run.
-                let has_sleep = tool_calls.iter().any(|c| c.name == "sleep");
-                let sleep_rejection = has_sleep
-                    .then(|| sleep_rejection_reason(!raw_text.trim().is_empty(), tool_calls.len() > 1))
-                    .flatten();
-                let all_outcomes = self.execute_tool_round(&tool_calls, sleep_rejection).await;
-
-                // Track media generation outcomes for marker fallback
-                accumulated_media_paths.extend(extract_media_from_outcomes(
-                    &self.tools,
-                    &tool_calls,
-                    &all_outcomes,
-                ));
-
-                // Read before the commit, which consumes the outcomes' payloads.
-                let sleep_ended = all_outcomes.iter().any(|o| o.success && o.ends_turn);
-
-                self.commit_tool_results(&tool_calls, all_outcomes).await?;
-
-                // Sleep stop: a successful `sleep` call ends the run gracefully AFTER
-                // this round — every tool result above is already committed, nothing
-                // is lost. Ordered before the loop-top MAX_TOOL_ROUNDS guard: the
-                // return happens before the next iteration is even evaluated.
-                if sleep_ended {
-                    self.sleep_ended = true;
-                    if let Err(e) = crate::session::store().set_sleep_ended(&self.agent_id, true).await {
-                        tracing::warn!(
-                            agent_id = %self.agent_id,
-                            error = %e,
-                            "Failed to persist sleep-ended flag — a stale tool-tail session may be re-recovered (accepted)"
-                        );
-                    }
-                    return Ok(String::new());
-                }
-
-                tool_rounds += 1;
+        let mut tool_rounds = 0usize;
+        let mut accumulated_media_paths: Vec<(&'static str, String)> = Vec::new();
+        loop {
+            if self.cancel_token.is_cancelled() {
+                anyhow::bail!("Agent cancelled");
             }
+            // Cooperative workspace-pause (strict freeze): the current LLM
+            // round ends at this boundary — no new LLM call starts. The
+            // pause does NOT fire the per-agent cancel token, so the round
+            // that was already in flight completes and commits first. The
+            // phase finalizer treats the frozen agent as a no-op (the job
+            // stays in place for the unpause re-drive).
+            if self.is_cancelled_by_pause() {
+                // Record the freeze IMMUTABLY at the bail so a later
+                // unpause (which clears the live pause_stop) cannot turn a
+                // frozen run into a misclassified hard failure.
+                self.paused_frozen
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("Agent frozen by workspace pause — resumes at unpause");
+            }
+            // Shutdown/drain: checked at tool-round top (after the previous
+            // tool group's commit) so the CURRENT tool group completes —
+            // no new LLM call starts once the drain begins (or the token
+            // fires). The round is resumed at boot via the job row
+            // (status='launched').
+            Self::bail_on_shutdown()?;
+            if tool_rounds >= MAX_TOOL_ROUNDS {
+                anyhow::bail!(
+                    "Agent exceeded maximum of {MAX_TOOL_ROUNDS} tool rounds \
+                         — model may be stuck in a tool-calling loop"
+                );
+            }
+
+            // Messages arrive as user messages with a descriptive prefix so
+            // the model understands their source (ticket comments get the
+            // `format_comment_message` framing).
+            self.drain_incoming_messages().await;
+
+            // Leader-stagger signal: fire after the FIRST LLM call
+            // completes, success or failure — the wait is fail-open;
+            // Notify's stored permit covers a fire-before-wait race.
+            let llm_result = self.llm_call().await;
+            if tool_rounds == 0
+                && let Some(notify) = &self.first_call_notify
+            {
+                notify.notify_one();
+            }
+
+            // Provider input-image content-inspection rejection (e.g.
+            // OpenRouter HTTP 400 `data_inspection_failed`): the rejected
+            // image must not fail the run wholesale nor stay sticky in the
+            // session. Strip the image markers from the most recent user
+            // message (durable-first) and continue the loop — the next
+            // tool round re-runs `llm_call` with the corrected message as
+            // part of the NORMAL loop, not a dedicated retry step. No
+            // retry guard: a subsequent failure whose most recent user
+            // message no longer contains image markers takes the normal
+            // failure path (no repeated stripping).
+            //
+            // The leader-stagger signal above has already fired (first
+            // call completed, success or failure): a stripped leader's next
+            // request diverges from its followers' byte-stable prefix —
+            // fail-open by design, and moot for the direct-chat Assistant
+            // scenario that exercises this path (management rounds never
+            // send images). Note: the retried call re-runs the tool-round-0
+            // `notify_one` above, but the stagger has a single waiter (the
+            // `select!` in `spawn_staggered_round`, already consumed) — the
+            // second notification stores an unconsumed permit and is
+            // dropped with the Notify. No follower is released twice.
+            //
+            // The downcast is extracted to a local first: `anyhow::Chain`
+            // is not `Send`, so it must not be held across the await below
+            // (the agent runs inside a spawned, Send-bound task).
+            let image_rejection = llm_result.as_ref().err().and_then(|e| {
+                e.chain()
+                    .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
+            });
+            if let Some(exhausted) = image_rejection
+                && self.strip_rejected_input_image(exhausted).await
+            {
+                tracing::info!(
+                    agent_id = %self.agent_id,
+                    role = %self.role,
+                    tool_rounds,
+                    "Stripped provider-rejected input image from the most recent user \
+                     message — continuing the normal loop"
+                );
+                continue;
+            }
+
+            let PreparedAssistantTurn {
+                mut display_text,
+                tool_calls,
+                history_content,
+                raw_text,
+            } = prepare_assistant_turn(
+                llm_result.with_context(|| llm_step_failure_context(&self.session, tool_rounds))?,
+            );
+
+            if tool_calls.is_empty() {
+                self.session.push_assistant(history_content);
+                // Append any pending media markers the model may have omitted
+                for (marker_prefix, path) in &accumulated_media_paths {
+                    let marker = format!("{marker_prefix}{path}]");
+                    if !display_text.contains(&marker) {
+                        let _ = write!(display_text, "\n{marker}");
+                    }
+                }
+                return Ok(display_text);
+            }
+
+            // EMISSION-TIME DURABILITY: the assistant frame with its tool
+            // calls is committed BEFORE the calls execute — a crash or drain
+            // mid-execution leaves the calls durably recorded with their
+            // results absent, and the universal resume-completion step (run
+            // before any LLM call on this session) re-runs or resumes them.
+            // The end-of-round commit below persists only the results.
+            self.session
+                .persist_messages(
+                    &self.agent_id,
+                    &[ChatMessage::assistant(history_content.clone())],
+                )
+                .await?; // Sleep-delivery guard: a sleep call in a round with
+            // accompanying raw text or bundled with other tool calls is
+            // rejected (see `execute_tool_round`) instead of silently
+            // swallowing the text or ending the run.
+            let has_sleep = tool_calls.iter().any(|c| c.name == "sleep");
+            let sleep_rejection = has_sleep
+                .then(|| sleep_rejection_reason(!raw_text.trim().is_empty(), tool_calls.len() > 1))
+                .flatten();
+            let all_outcomes = self.execute_tool_round(&tool_calls, sleep_rejection).await;
+
+            // Track media generation outcomes for marker fallback
+            accumulated_media_paths.extend(extract_media_from_outcomes(
+                &self.tools,
+                &tool_calls,
+                &all_outcomes,
+            ));
+
+            // Read before the commit, which consumes the outcomes' payloads.
+            let sleep_ended = all_outcomes.iter().any(|o| o.success && o.ends_turn);
+
+            self.commit_tool_results(&tool_calls, all_outcomes).await?;
+
+            // Sleep stop: a successful `sleep` call ends the run gracefully AFTER
+            // this round — every tool result above is already committed, nothing
+            // is lost. Ordered before the loop-top MAX_TOOL_ROUNDS guard: the
+            // return happens before the next iteration is even evaluated.
+            if sleep_ended {
+                self.sleep_ended = true;
+                if let Err(e) = crate::session::store()
+                    .set_sleep_ended(&self.agent_id, true)
+                    .await
+                {
+                    tracing::warn!(
+                        agent_id = %self.agent_id,
+                        error = %e,
+                        "Failed to persist sleep-ended flag — a stale tool-tail session may be re-recovered (accepted)"
+                    );
+                }
+                return Ok(String::new());
+            }
+
+            tool_rounds += 1;
         }
-        .instrument(span)
-        .await
     }
 
     /// Execute a batch of tool calls respecting side-effect ordering.
@@ -1613,6 +1643,11 @@ impl Agent {
             generation: self.generation,
             role: self.role.as_str().to_string(),
             workspace: self.workspace.name.clone(),
+            ticket: self
+                .ticket
+                .as_ref()
+                .map(|ticket| ticket.id.clone())
+                .unwrap_or_default(),
         });
         let launch = self.session.launch.clone();
         CURRENT_TOOL_USER_NAME

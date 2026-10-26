@@ -104,7 +104,8 @@ pub mod db;
 // How long each by-product class lives, and the paced sweep that removes it.
 pub mod log_retention;
 // The logs store: tracing installation, the batched writer, issue records and
-// the GUI's live log feed.
+// the GUI's live log feed. A row's scope — the agent, its role, the workspace and
+// the ticket — is promoted out of the record into the row itself (module docs).
 pub mod logs;
 // Two row families — one per tool call, one per LLM request — built for the
 // log store's writers.

@@ -42,7 +42,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures_util::future::join_all;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::agent::message_router;
 use crate::agent::role::SYSTEM_ROLE;
@@ -473,44 +473,51 @@ async fn ticket_with_comments(ticket: Arc<Ticket>) -> Arc<Ticket> {
 /// caller has already claimed the spawn slot in [`PHASE_BODIES_RUNNING`]; the
 /// RAII guard releases it on every exit path (completion, panic, cancellation).
 fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
+    // Everything the body does is that ticket's work in that workspace, so both
+    // ride the body's span: a record that never states them itself is still
+    // scoped to them (see `crate::logs`).
+    let span = tracing::info_span!("ticket", ticket = %ticket.id, workspace = %ws.name);
     let log_job_id = job_id.clone();
     let guard_job = job_id.clone();
-    tokio::spawn(async move {
-        let _guard = PhaseBodyGuard(guard_job);
-        // Refresh with comments inside the task so the body's work message and
-        // `<current-ticket>` block see the real comment thread (bounce feedback
-        // is a ticket comment). The panic clone comes from the refreshed ticket
-        // too, so crash-failure cleanup has the same freshest identity.
-        let ticket = ticket_with_comments(ticket).await;
-        let panic_ticket = Arc::clone(&ticket);
-        let run: futures_util::future::BoxFuture<'static, ()> = match phase {
-            TicketPhase::Analysis => Box::pin(analysis::run(ticket, ws, job_id)),
-            TicketPhase::InDevelopment => Box::pin(development::run(ticket, ws, job_id)),
-            TicketPhase::Verification => Box::pin(verification::run(ticket, ws, job_id)),
-            TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id)),
-            _ => {
-                error!(
-                    ticket = %ticket.id,
-                    phase = %phase,
-                    "spawn_phase_body called for a non-working phase",
-                );
+    tokio::spawn(
+        async move {
+            let _guard = PhaseBodyGuard(guard_job);
+            // Refresh with comments inside the task so the body's work message and
+            // `<current-ticket>` block see the real comment thread (bounce feedback
+            // is a ticket comment). The panic clone comes from the refreshed ticket
+            // too, so crash-failure cleanup has the same freshest identity.
+            let ticket = ticket_with_comments(ticket).await;
+            let panic_ticket = Arc::clone(&ticket);
+            let run: futures_util::future::BoxFuture<'static, ()> = match phase {
+                TicketPhase::Analysis => Box::pin(analysis::run(ticket, ws, job_id)),
+                TicketPhase::InDevelopment => Box::pin(development::run(ticket, ws, job_id)),
+                TicketPhase::Verification => Box::pin(verification::run(ticket, ws, job_id)),
+                TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id)),
+                _ => {
+                    error!(
+                        ticket = %ticket.id,
+                        phase = %phase,
+                        "spawn_phase_body called for a non-working phase",
+                    );
+                    return;
+                }
+            };
+            if futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run))
+                .await
+                .is_ok()
+            {
                 return;
             }
-        };
-        if futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run))
-            .await
-            .is_ok()
-        {
-            return;
+            error!(
+                ticket = %panic_ticket.id,
+                phase = %phase,
+                job = %log_job_id,
+                "Phase body panicked — resetting for a fresh attempt",
+            );
+            reset_phase_attempt(&panic_ticket, phase, &log_job_id, "pipeline phase panic").await;
         }
-        error!(
-            ticket = %panic_ticket.id,
-            phase = %phase,
-            job = %log_job_id,
-            "Phase body panicked — resetting for a fresh attempt",
-        );
-        reset_phase_attempt(&panic_ticket, phase, &log_job_id, "pipeline phase panic").await;
-    });
+        .instrument(span),
+    );
 }
 
 /// The single prompt-driven claim pipeline: Backlog→Analysis (5s grace) and

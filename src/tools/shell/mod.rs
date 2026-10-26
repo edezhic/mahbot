@@ -2920,7 +2920,6 @@ impl ShellTool {
                         // calling agent's own attribution (see
                         // [`crate::logs::record_stray_event`]).
                         let scope_text = scope.map_or_else(String::new, |pid| pid.to_string());
-                        let workspace = ws.as_path().to_string_lossy().into_owned();
                         crate::logs::record_stray_event(&crate::logs::StrayEvent {
                             source: crate::logs::STRAY_SOURCE_SHELL,
                             message: "the command exited while a process it left running still held \
@@ -2929,7 +2928,7 @@ impl ShellTool {
                             recipe: &leftover_stop_recipe(SHELL_PLATFORM, scope),
                             scope: &scope_text,
                             session: "",
-                            workspace: &workspace,
+                            workspace: &ws.name,
                             duration_ms: Some(crate::util::millis_i64(elapsed)),
                         });
                         Some(format_leftover_note(self.mode, SHELL_PLATFORM, scope))

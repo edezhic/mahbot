@@ -2,6 +2,24 @@
 //!
 //! Each log entry is inserted asynchronously via a background channel task.
 //! A broadcast channel feeds live log entries to the Iced native GUI dashboard.
+//!
+//! # Row scope
+//!
+//! A row's *scope* — the agent that produced it, that agent's role, the
+//! workspace the work belongs to and the ticket it works on — is a column of the
+//! row, never a field of the record: [`parse_tracing_json`] promotes every
+//! spelling of those values out of the record and its span chain and drops the
+//! record's own copy, so a value lives in the scope or in `fields`, never both.
+//! Promotion is what keeps the scope intact: a record that carries the value only
+//! as a field keeps it, now in the header; a record with no such context at all
+//! (a process-level line, a library message, a failure record written without a
+//! workspace on purpose) carries none, and nothing is invented for it.
+//!
+//! `workspace` is the workspace's own name — `personal:<user>` for an account's
+//! folder — never an absolute path: a path a span or field recorded is
+//! normalized to the name it stands for. This is write-time only. Rows written
+//! before the rule keep what they hold; they age out with retention, except the
+//! warnings, which are never pruned.
 
 use crate::db;
 use crate::util::UnwrapPoison;
@@ -36,6 +54,8 @@ pub struct LogEntry {
     pub agent_role: String,
     #[serde(default)]
     pub workspace: String,
+    #[serde(default)]
+    pub ticket: String,
 }
 
 // Column definitions for `logs` SELECT queries.
@@ -49,6 +69,21 @@ crate::columns! {
         AGENT_ID    => "agent_id",
         AGENT_ROLE  => "agent_role",
         WORKSPACE   => "workspace",
+        TICKET      => "ticket",
+    }
+}
+
+impl LogEntry {
+    /// Whether this row matches the Logs page's search text — the live stream's
+    /// half of the search, over the same parts as [`SEARCH_PARTS`]. An empty
+    /// query matches every row.
+    #[must_use]
+    pub fn matches_search(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        query.is_empty()
+            || SEARCH_PARTS
+                .iter()
+                .any(|(_, value)| value(self).to_lowercase().contains(&query))
     }
 }
 
@@ -145,7 +180,9 @@ pub(crate) struct StrayEvent<'a> {
     pub scope: &'a str,
     /// The physical chrome-use session driven; empty for the shell.
     pub session: &'a str,
-    /// The workspace the call ran in — empty only where the surface has none.
+    /// The workspace the call ran in — empty only where the surface has none. A
+    /// path is accepted: the row's scope is the workspace's name, so
+    /// [`record_stray_event`] normalizes it.
     pub workspace: &'a str,
     /// How long the recorded call took, when the surface measured it.
     pub duration_ms: Option<i64>,
@@ -191,7 +228,7 @@ impl LogStore {
             .context("Failed to begin log insert transaction")?;
         for entry in entries {
             tx.execute(
-                "INSERT INTO logs (timestamp, level, target, message, fields, agent_id, agent_role, workspace) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO logs (timestamp, level, target, message, fields, agent_id, agent_role, workspace, ticket) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     entry.timestamp.clone(),
                     entry.level.clone(),
@@ -202,6 +239,7 @@ impl LogStore {
                     entry.agent_id.clone(),
                     entry.agent_role.clone(),
                     entry.workspace.clone(),
+                    entry.ticket.clone(),
                 ],
             )
             .await
@@ -286,7 +324,9 @@ impl LogStore {
 
     /// Query log entries with optional filters.
     ///
-    /// Uses LIKE-based search on target and message columns.
+    /// Search is a plain substring match over the row's own readable parts — the
+    /// module, the message, the workspace and the ticket — see
+    /// [`build_where_clause`].
     ///
     /// Returns `(entries, total_count)` where `entries` respects pagination
     /// and `total_count` is the total number of entries matching the same filters.
@@ -382,7 +422,7 @@ pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
     if !crate::telemetry::recording() {
         return;
     }
-    let (agent_id, agent_role) = crate::agent::tool_record_attribution();
+    let attribution = crate::agent::tool_record_attribution();
     crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::StrayEvent(LogEntry {
         timestamp: crate::db::now(),
         level: "WARN".to_string(),
@@ -394,9 +434,10 @@ pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
             "session": event.session,
             "duration_ms": event.duration_ms,
         }),
-        workspace: event.workspace.to_string(),
-        agent_id,
-        agent_role,
+        workspace: workspace_name(event.workspace),
+        agent_id: attribution.agent_id,
+        agent_role: attribution.agent_role,
+        ticket: attribution.ticket,
     }));
 }
 
@@ -549,6 +590,36 @@ fn level_in_scope(levels: &[String], level: &str) -> bool {
     levels.is_empty() || levels.iter().any(|covered| covered == level)
 }
 
+/// One part of the Logs page's search: the `logs` column it is stored in, and
+/// where the entry holds it.
+type SearchPart = (&'static str, fn(&LogEntry) -> &str);
+
+/// The row's parts the Logs page's search covers: the module and the message,
+/// plus the two scope values a row is found by — its workspace and its ticket.
+/// Both halves of the search read this list, so neither can cover a different set.
+const SEARCH_PARTS: [SearchPart; 4] = [
+    ("target", |entry| &entry.target),
+    ("message", |entry| &entry.message),
+    ("workspace", |entry| &entry.workspace),
+    ("ticket", |entry| &entry.ticket),
+];
+
+/// A `LIKE` pattern matching `text` literally anywhere inside a column: `%`, `_`
+/// and the escape character itself are escaped, so a wildcard typed into the
+/// search box is just that character.
+fn like_contains(text: &str) -> String {
+    let mut pattern = String::with_capacity(text.len() + 2);
+    pattern.push('%');
+    for ch in text.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
 /// Build WHERE clause and bind values from `LogQuery` filters.
 /// Returns `(WHERE ...`, `[values]`) — an empty string when no filters are set.
 fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
@@ -579,10 +650,16 @@ fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
     if let Some(ref search) = filters.search
         && !search.is_empty()
     {
-        let val = Value::Text(format!("%{search}%"));
-        conditions.push("(target LIKE ? OR message LIKE ?)".into());
-        values.push(val.clone());
-        values.push(val);
+        let predicate = SEARCH_PARTS
+            .iter()
+            .map(|(column, _)| format!("{column} LIKE ? ESCAPE '\\'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        conditions.push(format!("({predicate})"));
+        values.extend(std::iter::repeat_n(
+            Value::Text(like_contains(search)),
+            SEARCH_PARTS.len(),
+        ));
     }
 
     if let Some(ref since) = filters.since {
@@ -609,6 +686,7 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
     let agent_id = row.get::<String>(COL_LOGS_AGENT_ID)?;
     let agent_role = row.get::<String>(COL_LOGS_AGENT_ROLE)?;
     let workspace = row.get::<String>(COL_LOGS_WORKSPACE)?;
+    let ticket = row.get::<String>(COL_LOGS_TICKET)?;
 
     Ok(LogEntry {
         timestamp,
@@ -619,6 +697,7 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
         agent_id,
         agent_role,
         workspace,
+        ticket,
     })
 }
 
@@ -1259,13 +1338,16 @@ fn get_str_or_empty(val: &serde_json::Value, key: &str) -> String {
     json::get_opt_str(val, key).unwrap_or("").to_string()
 }
 
-/// Parse a tracing-subscriber JSON line into a `LogEntry`.
+/// Parse a tracing-subscriber JSON line into a `LogEntry`, promoting the row's
+/// scope out of the record and its span chain.
 fn parse_tracing_json(line: &str) -> Option<LogEntry> {
     let val: serde_json::Value = serde_json::from_str(line).ok()?;
 
     let timestamp = get_str_or_empty(&val, "timestamp");
     let level = get_str_or_empty(&val, "level");
     let target = get_str_or_empty(&val, "target");
+
+    let scope = extract_scope(&val);
 
     let mut fields = val
         .get("fields")
@@ -1276,6 +1358,7 @@ fn parse_tracing_json(line: &str) -> Option<LogEntry> {
 
     if let Some(obj) = fields.as_object_mut() {
         obj.remove("message");
+        strip_scope_fields(obj);
     }
     let fields = if fields.as_object().is_some_and(serde_json::Map::is_empty) {
         serde_json::Value::Null
@@ -1283,74 +1366,120 @@ fn parse_tracing_json(line: &str) -> Option<LogEntry> {
         fields
     };
 
-    // Extract agent_id, agent_role and workspace from the innermost span
-    let (agent_id, agent_role, workspace) = extract_agent_from_span(&val);
-
     Some(LogEntry {
         timestamp,
         level,
         target,
         message,
         fields,
-        agent_id,
-        agent_role,
-        workspace,
+        agent_id: scope.agent_id,
+        agent_role: scope.agent_role,
+        workspace: scope.workspace,
+        ticket: scope.ticket,
     })
 }
 
-/// Extract the three agent-related fields from a span JSON object.
-fn extract_agent_fields(span: &serde_json::Value) -> (String, String, String) {
-    (
-        get_str_or_empty(span, "agent_id"),
-        get_str_or_empty(span, "role"),
-        get_str_or_empty(span, "workspace"),
-    )
+/// The field names each scope value may be carried under, most specific first: a
+/// record's own copy of any of them is the value the row's column carries.
+const AGENT_ID_KEYS: &[&str] = &["agent_id"];
+const AGENT_ROLE_KEYS: &[&str] = &["role", "agent_role"];
+const WORKSPACE_KEYS: &[&str] = &["workspace", "workspace_name", "workspace_path"];
+const TICKET_KEYS: &[&str] = &["ticket", "ticket_id"];
+
+/// A row's scope: the agent that produced it, that agent's role, the workspace
+/// the work belongs to and the ticket it works on — the values the row carries
+/// itself and the Logs page shows as its context.
+#[derive(Default)]
+struct LogScope {
+    agent_id: String,
+    agent_role: String,
+    workspace: String,
+    ticket: String,
 }
 
-/// Extract `agent_id`, `role`, and `workspace` from the current span data
-/// in tracing JSON.
-///
-/// `tracing-subscriber` JSON format puts the current span's fields under
-/// `span.agent_id`, `span.role`, and `span.workspace` (or `spans[last].*`).
-/// The three sources are merged per-component — the event's own fields win
-/// where present, the span fills the gaps — so every corner attributes
-/// correctly:
-///
-/// - full event fields (e.g. `run_agent`'s "Agent failed" entry, analyze-tool
-///   sub-agent failures) name the failing agent directly, beating the
-///   inherited caller span;
-/// - workspace-only events (e.g. "Search index capacity exhausted") keep the
-///   span's agent attribution;
-/// - agent_id-only events (e.g. session-persistence warnings) keep the span's
-///   role/workspace attribution.
-fn extract_agent_from_span(val: &serde_json::Value) -> (String, String, String) {
-    let mut agent_id = String::new();
-    let mut role = String::new();
-    let mut workspace = String::new();
-    for candidate in std::iter::once(val.get("fields"))
-        .chain(std::iter::once(val.get("span")))
-        .chain(std::iter::once(
-            val.get("spans")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.last()),
-        ))
-        .flatten()
-    {
-        let (id, r, ws) = extract_agent_fields(candidate);
-        if agent_id.is_empty() {
-            agent_id = id;
-        }
-        if role.is_empty() {
-            role = r;
-        }
-        if workspace.is_empty() {
-            workspace = ws;
-        }
-        if !agent_id.is_empty() && !role.is_empty() && !workspace.is_empty() {
-            break;
+impl LogScope {
+    /// Fill whatever this scope does not hold yet from one source, leaving the
+    /// values it already holds alone.
+    fn promote(&mut self, source: &serde_json::Value) {
+        fill(&mut self.agent_id, source, AGENT_ID_KEYS);
+        fill(&mut self.agent_role, source, AGENT_ROLE_KEYS);
+        fill(&mut self.ticket, source, TICKET_KEYS);
+        if self.workspace.is_empty()
+            && let Some(value) = first_value(source, WORKSPACE_KEYS)
+        {
+            self.workspace = workspace_name(value);
         }
     }
-    (agent_id, role, workspace)
+}
+
+/// Fill `slot` from the first non-empty value `source` holds under `keys`.
+fn fill(slot: &mut String, source: &serde_json::Value, keys: &[&str]) {
+    if slot.is_empty() {
+        *slot = first_value(source, keys).unwrap_or_default().to_string();
+    }
+}
+
+/// The first non-empty string `source` holds under `keys`.
+fn first_value<'a>(source: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| json::get_opt_str(source, key).filter(|value| !value.is_empty()))
+}
+
+/// Promote the row's scope out of the record's own fields and its span chain.
+///
+/// The record's own fields win where present, then the spans from the innermost
+/// outwards — the agent that is running wins over the context it runs in, so a
+/// per-ticket span on a phase body scopes every line inside it while an agent's
+/// own span still names that agent. Each value is taken from the first source
+/// that carries it, so a record that states only its workspace keeps the agent,
+/// role and ticket of the span around it. `tracing-subscriber`'s JSON formatter
+/// writes both `span` (the innermost) and `spans` (root to leaf).
+fn extract_scope(val: &serde_json::Value) -> LogScope {
+    let spans = val
+        .get("spans")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut scope = LogScope::default();
+    for source in std::iter::once(val.get("fields"))
+        .chain(spans.iter().rev().map(Some))
+        .chain(std::iter::once(val.get("span")))
+        .flatten()
+    {
+        scope.promote(source);
+    }
+    scope
+}
+
+/// Whether `key` is one of the names a scope value is carried under — such a key
+/// is never a field of the record: the value lives in the row's scope.
+fn is_scope_key(key: &str) -> bool {
+    [AGENT_ID_KEYS, AGENT_ROLE_KEYS, WORKSPACE_KEYS, TICKET_KEYS]
+        .iter()
+        .any(|keys| keys.contains(&key))
+}
+
+/// Drop the record's own copy of every scope value: the row carries the value
+/// itself now, and a scope value is never also a field of the same record.
+fn strip_scope_fields(fields: &mut serde_json::Map<String, serde_json::Value>) {
+    fields.retain(|key, _| !is_scope_key(key));
+}
+
+/// The row's `workspace` value: the workspace's name, never a path.
+///
+/// A raw value is normalized to the name it stands for: a folder in the
+/// userspaces directory ([`crate::users::userspaces_root`]) is an account's
+/// personal workspace, and any other path's last component is the folder it
+/// points at.
+fn workspace_name(value: &str) -> String {
+    let mut parts = value.rsplit(['/', '\\']).filter(|part| !part.is_empty());
+    let Some(last) = parts.next() else {
+        return String::new();
+    };
+    let userspaces = crate::users::userspaces_root();
+    if parts.next() == userspaces.file_name().and_then(std::ffi::OsStr::to_str) {
+        return crate::users::personal_workspace_name(last);
+    }
+    last.to_string()
 }
 
 #[cfg(test)]
@@ -1359,7 +1488,7 @@ mod tests {
 
     #[test]
     fn test_parse_tracing_json_full() {
-        let line = r#"{"timestamp":"2025-05-06T12:34:56.000000Z","level":"INFO","target":"mahbot::orchestrator","span":{"name":"agent","agent_id":"00000000-0000-0000-0000-000000000000","role":"lead","workspace":"/some/workspace"},"fields":{"message":"Hello world","key":"value"}}"#;
+        let line = r#"{"timestamp":"2025-05-06T12:34:56.000000Z","level":"INFO","target":"mahbot::orchestrator","span":{"name":"agent","agent_id":"00000000-0000-0000-0000-000000000000","role":"lead","workspace":"mahbot","ticket":"mahbot-42"},"fields":{"message":"Hello world","key":"value"}}"#;
         let entry = parse_tracing_json(line).unwrap();
         assert_eq!(entry.timestamp, "2025-05-06T12:34:56.000000Z");
         assert_eq!(entry.level, "INFO");
@@ -1368,7 +1497,8 @@ mod tests {
         assert_eq!(entry.fields, serde_json::json!({"key": "value"}));
         assert_eq!(entry.agent_id, "00000000-0000-0000-0000-000000000000");
         assert_eq!(entry.agent_role, "lead");
-        assert_eq!(entry.workspace, "/some/workspace");
+        assert_eq!(entry.workspace, "mahbot");
+        assert_eq!(entry.ticket, "mahbot-42");
     }
 
     #[test]
@@ -1380,6 +1510,7 @@ mod tests {
         assert_eq!(entry.agent_id, "");
         assert_eq!(entry.agent_role, "");
         assert_eq!(entry.workspace, "");
+        assert_eq!(entry.ticket, "");
     }
 
     #[test]
@@ -1393,12 +1524,64 @@ mod tests {
         assert_eq!(entry.agent_id, "");
         assert_eq!(entry.agent_role, "");
         assert_eq!(entry.workspace, "");
+        assert_eq!(entry.ticket, "");
     }
 
-    /// Agent-attribution corners for `parse_tracing_json`: the event's own
-    /// fields win where present, the span fills the gaps, and the `spans`
-    /// array is the last resort. Each case: (name, line, agent_id, role,
-    /// workspace).
+    /// The row's scope is the row's, not the record's: every spelling of a scope
+    /// value is promoted out of the record and its span chain, the record's own
+    /// copy disappears, and a workspace recorded as a path becomes the workspace
+    /// it names.
+    #[test]
+    fn test_parse_tracing_json_promotes_scope_out_of_the_record() {
+        let line = r#"{"timestamp":"...","level":"INFO","target":"test",
+            "spans":[
+                {"name":"ticket","ticket":"mahbot-42","workspace":"mahbot"},
+                {"name":"agent","agent_id":"ticket_mahbot-42_engineer","role":"engineer"}
+            ],
+            "fields":{"message":"writing code","agent_id":"ticket_mahbot-42_engineer",
+                "role":"engineer","workspace_name":"/Users/x/Desktop/mahbot/",
+                "ticket_id":"mahbot-42","path":"src/a.rs","attempt":2}}"#;
+        let entry = parse_tracing_json(line).unwrap();
+        assert_eq!(
+            entry.agent_id, "ticket_mahbot-42_engineer",
+            "agent identity"
+        );
+        assert_eq!(entry.agent_role, "engineer", "role");
+        assert_eq!(
+            entry.workspace, "mahbot",
+            "a path becomes the workspace it names"
+        );
+        assert_eq!(entry.ticket, "mahbot-42", "the ticket from the record");
+        assert_eq!(
+            entry.fields,
+            serde_json::json!({"path": "src/a.rs", "attempt": 2}),
+            "the promoted values are not fields of the same record"
+        );
+    }
+
+    /// The ticket also rides the context the work runs in: a record inside a
+    /// per-ticket span carries that ticket although the record itself never
+    /// states it, and an account's personal folder keeps its own spelling.
+    #[test]
+    fn test_parse_tracing_json_ticket_from_span_and_personal_workspace() {
+        let line = r#"{"timestamp":"...","level":"INFO","target":"mahbot::pipeline::verification",
+            "spans":[{"name":"ticket","ticket":"mahbot-7","workspace":"personal:lyuba"},
+                {"name":"agent","agent_id":"cli","role":"cli"}],
+            "fields":{"message":"project commands finished","passed":3}}"#;
+        let entry = parse_tracing_json(line).unwrap();
+        assert_eq!(entry.ticket, "mahbot-7", "inherited from the phase span");
+        assert_eq!(entry.agent_id, "cli", "the agent span still names its own");
+        assert_eq!(
+            entry.workspace, "personal:lyuba",
+            "an account's folder keeps its own spelling"
+        );
+        assert_eq!(entry.fields, serde_json::json!({"passed": 3}));
+    }
+
+    /// Attribution corners for `parse_tracing_json`: a value is taken from the
+    /// record's own fields where present, then from the span chain — leaving the
+    /// values the record does state alone. Each case: (name, line, agent_id,
+    /// role, workspace).
     #[test]
     fn test_parse_tracing_json_agent_attribution() {
         let cases = [
@@ -1411,10 +1594,10 @@ mod tests {
             ),
             (
                 "spans array",
-                r#"{"timestamp":"...","level":"INFO","target":"test","spans":[{"name":"parent"},{"name":"agent","agent_id":"xyz-456","role":"worker","workspace":"/ws"}],"fields":{"message":"writing code"}}"#,
+                r#"{"timestamp":"...","level":"INFO","target":"test","spans":[{"name":"parent"},{"name":"agent","agent_id":"xyz-456","role":"worker","workspace":"my-ws"}],"fields":{"message":"writing code"}}"#,
                 "xyz-456",
                 "worker",
-                "/ws",
+                "my-ws",
             ),
             (
                 "event fields without span",
@@ -1886,6 +2069,70 @@ mod tests {
         assert_eq!(total, 1, "only entry after timestamp matching 'process'");
     }
 
+    /// The search covers the row's scope: a workspace or a ticket typed into the
+    /// box finds the rows that belong to it, and a wildcard character is the
+    /// character — the stored-row query reads exactly like the live filter's
+    /// plain substring match.
+    #[tokio::test]
+    async fn test_search_finds_rows_by_workspace_and_ticket() {
+        let (store, _dir) = test_store().await;
+        seed_entries(
+            &store,
+            &[
+                LogEntry {
+                    target: "mahbot::pipeline".into(),
+                    message: "claimed".into(),
+                    workspace: "mahbot".into(),
+                    ticket: "mahbot-42".into(),
+                    ..Default::default()
+                },
+                LogEntry {
+                    target: "mahbot::pipeline".into(),
+                    message: "claimed".into(),
+                    workspace: "mahbot_rlx".into(),
+                    ticket: "mahbot-43".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+
+        for (search, total) in [
+            ("mahbot-42", 1),  // the ticket
+            ("mahbot_rlx", 1), // the workspace
+            ("mahbot-4", 2),   // a fragment of both tickets
+            ("mahbot_4", 0),   // `_` is a character, not a wildcard
+            ("%", 0),          // and so is `%`
+        ] {
+            let (_results, found) = store
+                .query(&LogQuery {
+                    search: Some(search.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(found, total, "search {search:?}");
+        }
+    }
+
+    /// The live filter matches the same four parts the stored-row query binds, so
+    /// a ticket or a workspace typed into the box finds a live row exactly as it
+    /// finds a stored one.
+    #[test]
+    fn matches_search_covers_the_row_scope() {
+        let entry = LogEntry {
+            target: "mahbot::pipeline".into(),
+            message: "Claimed ticket".into(),
+            workspace: "mahbot".into(),
+            ticket: "mahbot-42".into(),
+            ..Default::default()
+        };
+        for query in ["pipeline", "Claimed", "MAHBOT", "mahbot-4", "MAHBOT-42", ""] {
+            assert!(entry.matches_search(query), "{query}");
+        }
+        assert!(!entry.matches_search("mahbot_rlx"));
+    }
+
     #[tokio::test]
     async fn test_like_search_with_special_chars() {
         let (store, _dir) = test_store().await;
@@ -2075,6 +2322,79 @@ mod tests {
             module_path!(),
             "the record's real target must survive the bridge, not become the literal `log`",
         );
+    }
+
+    /// The line the layer really writes carries the row's scope: a record inside
+    /// the agent's span chain parses with the agent, its role, the workspace and
+    /// the ticket the spans carry, and the record's own copy of those values is
+    /// not repeated as a field. A record with no agent around it invents none of
+    /// them, and a workspace it states as a path becomes the name it stands for.
+    #[test]
+    fn a_record_inside_the_agent_span_carries_the_rows_scope() {
+        const WRITING: &str = "writing code";
+        const FINISHED: &str = "project commands finished";
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _guard = tracing::subscriber::set_default(log_layers(
+            make_log_writer(tx),
+            EnvFilter::new(DEFAULT_LOG_FILTER),
+        ));
+        // The phase body's span, then the agent's own — the same field spellings
+        // the production spans use, including the ticket the agent records as an
+        // `Option` (which tracing omits entirely when the run has none).
+        let phase = tracing::info_span!("ticket", ticket = %"mahbot-42", workspace = %"mahbot");
+        let agent = tracing::info_span!(
+            parent: &phase,
+            "agent",
+            agent_id = %"ticket_mahbot-42_engineer",
+            role = %"engineer",
+            workspace = %"mahbot",
+            ticket = Some("mahbot-42")
+        );
+        agent.in_scope(|| {
+            tracing::warn!(ticket = %"mahbot-42", path = "src/a.rs", "{}", WRITING);
+        });
+        phase.in_scope(|| {
+            tracing::info!(
+                workspace = %"/Users/x/.mahbot/userspaces/lyuba",
+                passed = 3,
+                "{}",
+                FINISHED
+            );
+        });
+
+        let mut written = String::new();
+        while let Ok(line) = rx.try_recv() {
+            written.push_str(&line);
+        }
+        let row = |message: &str| {
+            let line = written
+                .lines()
+                .find(|line| line.contains(message))
+                .unwrap_or_else(|| panic!("no written line carries {message:?}: {written}"));
+            parse_tracing_json(line).expect("the log store must parse the written line")
+        };
+
+        let scoped = row(WRITING);
+        assert_eq!(scoped.agent_id, "ticket_mahbot-42_engineer");
+        assert_eq!(scoped.agent_role, "engineer");
+        assert_eq!(scoped.workspace, "mahbot");
+        assert_eq!(scoped.ticket, "mahbot-42");
+        assert_eq!(
+            scoped.fields,
+            serde_json::json!({ "path": "src/a.rs" }),
+            "a promoted value is not repeated as a field of the same record"
+        );
+
+        let stage = row(FINISHED);
+        assert_eq!(stage.agent_id, "", "a stage line has no agent of its own");
+        assert_eq!(stage.agent_role, "");
+        assert_eq!(
+            stage.workspace, "personal:lyuba",
+            "an account's folder keeps its own spelling, never the path"
+        );
+        assert_eq!(stage.ticket, "mahbot-42");
+        assert_eq!(stage.fields, serde_json::json!({ "passed": 3 }));
     }
 
     /// The level cut [`DEFAULT_LOG_FILTER`] applies to the PDF text layer the read

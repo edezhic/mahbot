@@ -84,9 +84,12 @@
 //! [`seed_audio_transcription_disabled`]). `70` drops the retired
 //! `tickets.embedding` column of the deleted text-embedding search, logging
 //! how many stored vectors it held; a fresh install never creates the column,
-//! so it is a no-op there (see [`drop_ticket_embeddings`]).
+//! so it is a no-op there (see [`drop_ticket_embeddings`]). `71` adds the
+//! `logs.ticket` column — the row's ticket scope, so the ticket a logged line
+//! belongs to is a column of the row rather than a field of its record (see
+//! [`add_logs_ticket`]).
 //!
-//! Future schema changes resume the chain at id `71` with monotonically
+//! Future schema changes resume the chain at id `72` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -419,7 +422,8 @@ CREATE TABLE IF NOT EXISTS logs (
     fields      TEXT NOT NULL DEFAULT '{}',
     agent_id    TEXT NOT NULL DEFAULT '',
     agent_role  TEXT NOT NULL DEFAULT '',
-    workspace   TEXT NOT NULL DEFAULT ''
+    workspace   TEXT NOT NULL DEFAULT '',
+    ticket      TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -541,9 +545,12 @@ const ADD_LLM_FAILURES: &str = "CREATE TABLE IF NOT EXISTS llm_failures (
 ///
 /// - `logs` — the Issues view's count and list (`level IN (…)`) and the INFO
 ///   retention (`level = 'INFO' AND timestamp < ?`) all plan on
-///   `idx_logs_level`. The view's `target`/`since` filters are never set, and
-///   `agent_id`/`agent_role`/`workspace` appear in no predicate; `timestamp`
-///   loses to `idx_logs_level` for the retention range.
+///   `idx_logs_level`; `timestamp` loses to `idx_logs_level` for the retention
+///   range. The listing query's search predicate covers `target`, `message`,
+///   `workspace` and `ticket` as a substring with `LIKE '%…%' ESCAPE '\'`, and
+///   a leading wildcard is unplannable — no index can serve it, so the scope
+///   columns gain none. The view's `target`/`since` filters are never set, and
+///   `agent_id`/`agent_role` appear in no predicate.
 /// - `tool_calls` — the failure-listing query and its `ORDER BY recorded_at
 ///   DESC` are gone: the only predicates left on this table are the two
 ///   retention rules, both cutting on `recorded_at < ?`.
@@ -1243,6 +1250,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "70",
         target: TargetDb::Core,
         body: MigrationBody::Rust(drop_ticket_embeddings),
+    },
+    Migration {
+        id: "71",
+        target: TargetDb::Logs,
+        body: MigrationBody::Rust(add_logs_ticket),
     },
 ];
 
@@ -2330,6 +2342,21 @@ async fn run_drop_ticket_embeddings(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn add_logs_ticket(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_logs_ticket(conn))
+}
+
+/// Upfill `logs.ticket` for databases created before delta `71` — the row's
+/// ticket scope, the ticket the logged work belongs to. The tracing writer
+/// promotes it out of the record at write time, it is never a path, and it is
+/// empty when the record has no ticket context. Fresh installs get the column
+/// from entry `26`'s `CREATE TABLE`, so the probe makes this a no-op there.
+/// Guarded by [`add_column_if_missing`], so this body is idempotent
+/// (non-transactional like every Rust body, re-runnable until recorded).
+async fn run_add_logs_ticket(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "logs", "ticket", "TEXT NOT NULL DEFAULT ''").await
+}
+
 /// Case-folded markers of a stored description of the retired two-stage
 /// review-then-QA arrangement, matched as substrings of the content after
 /// [`describes_retired_lifecycle`]'s normalization.
@@ -3091,6 +3118,7 @@ mod tests {
                 "agent_id",
                 "agent_role",
                 "workspace",
+                "ticket",
             ],
         ),
         ("schema_migrations", &["id", "applied_at"]),
@@ -4321,10 +4349,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// A fresh logs store runs the baseline (`26`) plus the delta `35` and
-    /// delta `58` upfills and the delta `64` index drops, and converges to the
-    /// exact current logs shape (logs/tool_calls/llm_requests/llm_failures +
-    /// grep_telemetry, carrying only the indexes a product query's plan
-    /// reaches).
+    /// delta `58` upfills, the delta `64` index drops and the delta `71`
+    /// `ticket` upfill, and converges to the exact current logs shape
+    /// (logs/tool_calls/llm_requests/llm_failures + grep_telemetry, carrying
+    /// only the indexes a product query's plan reaches).
     #[tokio::test]
     async fn fresh_logs_install_converges_to_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4355,9 +4383,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "26".to_string(),
                 "35".to_string(),
                 "58".to_string(),
-                "64".to_string()
+                "64".to_string(),
+                "71".to_string()
             ],
-            "fresh logs applies baseline 26 + delta 35 + delta 58 + delta 64 exactly"
+            "fresh logs applies baseline 26 + delta 35 + delta 58 + delta 64 + delta 71 exactly"
         );
     }
 
@@ -4427,8 +4456,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// The common upgrade path: a database that already applied the logs
     /// baseline (`26`) — no `llm_failures` — gains the table through delta
     /// `35` on reopen (the `tool_calls.source` column through delta `58`, the
-    /// unused-index drops through delta `64`), converging to the current shape
-    /// with no index on the write-only `llm_failures` table.
+    /// unused-index drops through delta `64`, the `logs.ticket` column through
+    /// delta `71`), converging to the current shape with no index on the
+    /// write-only `llm_failures` table.
     #[tokio::test]
     async fn baseline_logs_db_gains_llm_failures_via_delta_35() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4461,9 +4491,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "26".to_string(),
                 "35".to_string(),
                 "58".to_string(),
-                "64".to_string()
+                "64".to_string(),
+                "71".to_string()
             ],
-            "reopen must record exactly 26 + 35 + 58 + 64"
+            "reopen must record exactly 26 + 35 + 58 + 64 + 71"
         );
         // The reopen converges to the current logs shape, which proves both the
         // delta-35 `llm_failures` upfill and delta 64's exact index set (none
@@ -4882,10 +4913,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The logs fleet-wide boot-safety pin: an old-catalog logs store (ids
     /// `8`/`9`/`14`) reopens through the logs baseline (`26`), the delta `35`
-    /// upfill, the delta `58` column upfill and the delta `64` index drops —
-    /// the table DDL is unchanged except the new `llm_failures` table and the
-    /// appended `tool_calls.source` column, and the index set converges to the
-    /// kept indexes (every write-only one the old shape carried is gone).
+    /// upfill, the delta `58` column upfill, the delta `64` index drops and the
+    /// delta `71` `logs.ticket` upfill — the table DDL is unchanged except the
+    /// new `llm_failures` table and the appended `tool_calls.source` and
+    /// `logs.ticket` columns, and the index set converges to the kept indexes
+    /// (every write-only one the old shape carried is gone).
     #[tokio::test]
     async fn old_catalog_logs_db_reopens_as_noop() {
         const NEW_TABLE: &str = "llm_failures";
@@ -4920,6 +4952,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let before_tables = table_defs(&conn).await;
         let before_indexes = index_defs(&conn).await;
         let before_tool_calls_cols = column_names(&conn, "tool_calls").await;
+        let before_logs_cols = column_names(&conn, "logs").await;
         let before_counts = table_row_counts(&conn, &counts_tables).await;
 
         run_migrations(&conn, TargetDb::Logs)
@@ -4931,18 +4964,19 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("35".to_string());
         expected_ids.push("58".to_string());
         expected_ids.push("64".to_string());
+        expected_ids.push("71".to_string());
         expected_ids.sort();
         let mut after_ids = recorded_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "logs reopen must record exactly old ids ∪ 26 ∪ 35 ∪ 58 ∪ 64"
+            "logs reopen must record exactly old ids ∪ 26 ∪ 35 ∪ 58 ∪ 64 ∪ 71"
         );
 
         assert_eq!(
-            without(&table_defs(&conn).await, &[NEW_TABLE, "tool_calls"]),
-            without(&before_tables, &[NEW_TABLE, "tool_calls"]),
-            "logs table DDL (except {NEW_TABLE} and the delta-58 tool_calls column) must be \
+            without(&table_defs(&conn).await, &[NEW_TABLE, "tool_calls", "logs"]),
+            without(&before_tables, &[NEW_TABLE, "tool_calls", "logs"]),
+            "logs table DDL (except {NEW_TABLE} and the delta-58/delta-71 columns) must be \
              unchanged on reopen"
         );
         assert_eq!(
@@ -4960,6 +4994,17 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             column_names(&conn, "tool_calls").await,
             expected_cols,
             "delta 58 must append source to tool_calls"
+        );
+
+        // Delta `71` must land the row's ticket scope on existing installs —
+        // appended by the `ALTER` (a fresh install's baseline declares it after
+        // `workspace` instead).
+        let mut expected_logs_cols = before_logs_cols;
+        expected_logs_cols.push("ticket".to_string());
+        assert_eq!(
+            column_names(&conn, "logs").await,
+            expected_logs_cols,
+            "delta 71 must append ticket to logs"
         );
 
         // Delta `35` must land the per-attempt failure trail on existing

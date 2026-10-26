@@ -104,6 +104,7 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
         generation: 0,
         role: "cli".to_string(),
         workspace: ws.name.clone(),
+        ticket: String::new(),
     });
 
     let args = call.args.clone();
@@ -190,7 +191,7 @@ async fn carry_out<T>(
         "agent",
         agent_id = %"cli",
         role = %"cli",
-        workspace = %ws.path
+        workspace = %ws.name
     );
     match AssertUnwindSafe(operation)
         .catch_unwind()
