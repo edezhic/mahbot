@@ -1625,7 +1625,7 @@ async fn attempt_pass(
             if disposition.retry.is_empty() {
                 if unclosable == 0 {
                     conclude_released_record(&entry.namespace);
-                    info!(
+                    tracing::debug!(
                         namespace = %entry.namespace,
                         run = %entry.run,
                         sessions = entry.names.len(),

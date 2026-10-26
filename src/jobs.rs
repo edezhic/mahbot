@@ -2165,7 +2165,12 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
         {
             Ok(_) => deleted += 1,
             Err(e) => {
-                warn!(agent = %agent_id, error = %e, "Failed to delete terminal session pin");
+                warn!(
+                    ticket = %ticket_id,
+                    agent = %agent_id,
+                    error = %e,
+                    "Failed to delete terminal session pin",
+                );
             }
         }
     }

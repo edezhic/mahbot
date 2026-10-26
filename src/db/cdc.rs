@@ -503,7 +503,13 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
                     && let Some(m) = TICKET_MATERIALIZER.get().cloned()
                     && let Err(e) = m(&event).await
                 {
-                    tracing::warn!(table = %event.table, change_id = event.change_id, error = %e, "ticket materializer failed");
+                    tracing::warn!(
+                        ticket = event.ticket_id().unwrap_or("?"),
+                        table = %event.table,
+                        change_id = event.change_id,
+                        error = %e,
+                        "ticket materializer failed",
+                    );
                     // Leave this row (and later ones) for the next drain so the
                     // transition is retried, not permanently dropped.
                     break;

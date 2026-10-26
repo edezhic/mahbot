@@ -655,8 +655,21 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
 /// caller's file rather than anything the product did or the owner must see. The
 /// quieter library levels are off entirely; a real refusal reaches the caller as
 /// that tool's own answer.
+///
+/// `iced` is the GUI library the dashboard is built with, reporting through `log`
+/// like the crates above. Its warning channel is the noise here: the event loop
+/// warns when more than three consecutive `RedrawRequested` events in one frame
+/// still made progress — a published message, an invalidated widget or layout. The
+/// product's own redraw handlers invalidate nothing (every layout invalidation in the
+/// GUI sits on an input event) and there is no repaint loop behind it: the frame is
+/// drawn normally afterwards, and the check stays upstream's to keep. What reaches it
+/// is the composer rebuilding when a picture is attached or cleared — a couple of
+/// frames now and then. The family is therefore held to ERROR, like the PDF layer: a
+/// genuine library error still reaches the store, its warnings and quieter levels do
+/// not. One directive covers every `iced_*` crate, because EnvFilter matches a target
+/// as a raw prefix.
 pub(crate) const DEFAULT_LOG_FILTER: &str =
-    "info,turso_core=warn,tantivy=warn,fff=off,pdf_extract=error,usvg=off,resvg=off";
+    "info,turso_core=warn,tantivy=warn,fff=off,pdf_extract=error,usvg=off,resvg=off,iced=error";
 
 /// The production layer stack: the JSON log layer, with the log filter applied
 /// PER LAYER, plus the engine-cause capture layer (see

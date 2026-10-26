@@ -2563,7 +2563,6 @@ impl Agent {
         tracing::info!(
             agent_id = %self.agent_id,
             role = %self.role,
-            trigger,
             token_length,
             image_count,
             "Session exceeded summarization trigger ({trigger})",

@@ -818,7 +818,12 @@ async fn finalize_analysis_round(
         return;
     }
     if let Err(e) = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await {
-        warn!(job = %job_id, error = %e, "Failed to terminalize analysis job");
+        warn!(
+            ticket = %ticket.id,
+            job = %job_id,
+            error = %e,
+            "Failed to terminalize analysis job",
+        );
     }
 }
 
@@ -861,7 +866,7 @@ async fn process_analyst_verdicts(
         reset_analysis_round(ticket, job_id).await;
         return;
     }
-    info!("{}", format_grade_summary(base_results));
+    info!(ticket = %ticket.id, "{}", format_grade_summary(base_results));
     let mut joint_comment = render_joint_comment(
         round,
         outcome,

@@ -489,7 +489,11 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
             TicketPhase::Verification => Box::pin(verification::run(ticket, ws, job_id)),
             TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id)),
             _ => {
-                error!(phase = %phase, "spawn_phase_body called for a non-working phase");
+                error!(
+                    ticket = %ticket.id,
+                    phase = %phase,
+                    "spawn_phase_body called for a non-working phase",
+                );
                 return;
             }
         };
@@ -623,7 +627,12 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 async fn guard_job_phase(ticket_id: &str, expected: TicketPhase, job_id: &str) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
         if let Err(e) = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await {
-            warn!(job = %job_id, error = %e, "Failed to complete job after phase-moved");
+            warn!(
+                ticket = %ticket_id,
+                job = %job_id,
+                error = %e,
+                "Failed to complete job after phase-moved",
+            );
         }
         return true;
     }
@@ -1058,7 +1067,11 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
     // triggered this notification is present in the <ticket-updates> block rather
     // than deferred to a later drain.
     if let Err(e) = crate::db::cdc::drain_once(&board().conn).await {
-        tracing::warn!(error = %e, "CDC flush before Manager notification failed");
+        tracing::warn!(
+            ticket = %ctx.ticket.id,
+            error = %e,
+            "CDC flush before Manager notification failed",
+        );
     }
 
     let drained = crate::pipeline::chronicle::drain(&ws.name).await;
@@ -1129,6 +1142,7 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
 /// Register an agent in the message router and write a job-bound launched
 /// roster row so mid-run comments route to it and the re-dispatch guard blocks.
 async fn register_running_agent(
+    ticket_id: &str,
     job_id: &str,
     agent_id: &str,
     kind: crate::jobs::AgentKind,
@@ -1146,6 +1160,7 @@ async fn register_running_agent(
     .await
     {
         warn!(
+            ticket = %ticket_id,
             agent = agent_id,
             job = job_id,
             error = ?e,
@@ -1295,6 +1310,7 @@ async fn rearm_resumed_slots(ticket_id: &str, job_id: &str, stage: &str, cohorts
 }
 
 async fn checkpoint_parallel_outcomes(
+    ticket_id: &str,
     job_id: &str,
     launched: &[&AgentSlot],
     run_results: &[ParallelVerdict],
@@ -1316,6 +1332,7 @@ async fn checkpoint_parallel_outcomes(
                 .await
         {
             warn!(
+                ticket = %ticket_id,
                 job = %job_id,
                 agent = %slot.agent_id,
                 error = %e,
@@ -1504,11 +1521,12 @@ async fn run_parallel_agents(
                     paused |= p;
                     run_results.push(v);
                 }
-                Err(e) => run_results.push(round_member_failed(e)),
+                Err(e) => run_results.push(round_member_failed(&ticket.id, e)),
             }
         }
 
-        let by_agent = checkpoint_parallel_outcomes(job_id, &launched, &run_results).await;
+        let by_agent =
+            checkpoint_parallel_outcomes(&ticket.id, job_id, &launched, &run_results).await;
         (assemble_parallel_results(slots, &by_agent), paused)
     }
 }
@@ -1650,6 +1668,7 @@ async fn run_stage_agent(
 
     let agent_id = crate::jobs::session_pin_id(&ticket.id, role);
     let incoming_rx = register_running_agent(
+        &ticket.id,
         job_id,
         &agent_id,
         kind.agent_kind(),
@@ -1698,9 +1717,19 @@ async fn run_stage_agent(
 /// Persist the phase job's dispatch task at dispatch time. Phase dispatch
 /// re-derives its prompt from live state, so this stored value is not read for
 /// re-dispatch. Best-effort.
-async fn sync_phase_job_task(conn: &crate::db::Connection, job_id: &str, task: &str) {
+async fn sync_phase_job_task(
+    conn: &crate::db::Connection,
+    ticket_id: &str,
+    job_id: &str,
+    task: &str,
+) {
     if let Err(e) = crate::jobs::update_phase_job_task(conn, job_id, task).await {
-        warn!(job = %job_id, error = %e, "Failed to sync phase job task");
+        warn!(
+            ticket = %ticket_id,
+            job = %job_id,
+            error = %e,
+            "Failed to sync phase job task",
+        );
     }
 }
 
@@ -1757,6 +1786,7 @@ async fn drain_queued_siblings(ticket: &Ticket) {
     {
         Ok(updated) if updated > 0 => {
             info!(
+                ticket = %ticket.id,
                 tickets = updated,
                 workspace = %ticket.workspace_name,
                 "Moved {updated} Queued ticket(s) to Planning after bounce breaker trip",
@@ -1764,6 +1794,7 @@ async fn drain_queued_siblings(ticket: &Ticket) {
         }
         Ok(_) => {
             debug!(
+                ticket = %ticket.id,
                 workspace = %ticket.workspace_name,
                 "No Queued siblings to drain after bounce breaker trip",
             );

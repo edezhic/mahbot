@@ -1,5 +1,7 @@
 ⚠️ Engineer failure — workspace paused
 
+Ticket: {{ticket_id}}
+
 {{failure_details}}
 
 ---

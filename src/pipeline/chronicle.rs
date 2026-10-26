@@ -154,6 +154,7 @@ async fn apply_change(
     if before == after {
         return Ok(false);
     }
+    let ticket_id = event.ticket_id().unwrap_or_default();
     // A phase string this binary cannot read is NOT a materialization failure:
     // it comes from an older arrangement — a stage name retired since, left in a
     // pending CDC image by the build that wrote it (nothing drains `turso_cdc`
@@ -165,13 +166,13 @@ async fn apply_change(
     let (Ok(source), Ok(target)) = (before.parse::<TicketPhase>(), after.parse::<TicketPhase>())
     else {
         tracing::warn!(
+            ticket = %ticket_id,
             before = %before,
             after = %after,
             "ticket chronicle: unreadable phase pair — skipping the hop",
         );
         return Ok(false);
     };
-    let ticket_id = event.ticket_id().unwrap_or_default();
     let workspace = event
         .after
         .as_ref()

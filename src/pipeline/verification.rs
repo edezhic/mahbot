@@ -240,7 +240,7 @@ impl RoundPlan {
         // The job's stored task records the round's primary work prompt (the
         // phase dispatch re-derives the prompts from live state).
         let task = reviewer_prompt.as_deref().unwrap_or(&tester_prompt);
-        sync_phase_job_task(&crate::session::store().conn, job_id, task).await;
+        sync_phase_job_task(&crate::session::store().conn, &ticket.id, job_id, task).await;
         let cohorts = [
             (REVIEWER.kind, reviewers.as_slice()),
             (TESTER.kind, testers.as_slice()),
@@ -426,9 +426,6 @@ async fn execute_round(
     });
     info!(
         ticket = %ticket.id,
-        reviewers = reviewer_count,
-        testers = tester_count,
-        commands = command_count,
         "Dispatching {reviewer_count} reviewer(s), {tester_count} tester(s) and {command_count} project command(s) in parallel",
     );
 
@@ -446,7 +443,11 @@ async fn execute_round(
         match crate::git::commands::run_git_worktree_identity(ws.as_path()).await {
             Ok((head, tree)) => Some(ReviewBase { head, tree }),
             Err(e) => {
-                debug!(error = %e, "Could not read the reviewed content identity");
+                debug!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Could not read the reviewed content identity",
+                );
                 None
             }
         }

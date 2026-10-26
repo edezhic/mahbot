@@ -2956,7 +2956,7 @@ impl ShellTool {
                 pid,
                 elapsed,
             } => {
-                tracing::info!(
+                tracing::debug!(
                     command = command_str,
                     elapsed_secs = elapsed.as_secs_f64(),
                     ?pid,

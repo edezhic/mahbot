@@ -536,7 +536,7 @@ impl GitState {
                 match result {
                     Ok(id) => {
                         self.watch_id = Some(id);
-                        tracing::info!(
+                        tracing::debug!(
                             ?id,
                             workspace = %self.workspace_name.as_deref().unwrap_or("<none>"),
                             "file-change watch registered",

@@ -464,8 +464,8 @@ struct Battery {
     /// or when a row that had to be compared could not be (see `unmeasured`): the
     /// run then establishes nothing and the caller records nothing.
     verdict: Option<Established>,
-    /// Rows attempted / compared / skipped / not measurable, as the INFO line
-    /// reports them.
+    /// Rows attempted / compared / skipped / not measurable, as the measured
+    /// record reports them.
     rows: usize,
     compared: usize,
     skipped: usize,
@@ -563,7 +563,7 @@ fn measure(env: &[(OsString, OsString)]) -> Option<Established> {
         return None;
     };
     let verdict = battery.verdict;
-    tracing::info!(
+    tracing::debug!(
         established = verdict.is_some(),
         plain = verdict.is_some_and(|v| v.plain),
         general = verdict.is_some_and(|v| v.general),

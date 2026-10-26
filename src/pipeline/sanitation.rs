@@ -342,7 +342,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     );
 
     let conn = &crate::session::store().conn;
-    sync_phase_job_task(conn, job_id, &prompt).await;
+    sync_phase_job_task(conn, &ticket.id, job_id, &prompt).await;
 
     run_stage_agent(&ticket, &ws, job_id, &prompt, StageRunKind::Sanitation).await;
 }

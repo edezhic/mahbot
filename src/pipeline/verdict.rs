@@ -420,9 +420,9 @@ pub(crate) struct AgentSlot {
 
 /// Map a panicked round member's [`tokio::task::JoinError`] to a contained
 /// [`ParallelVerdict::NoResponse`] (round continues fail-open).
-pub(crate) fn round_member_failed(e: tokio::task::JoinError) -> ParallelVerdict {
+pub(crate) fn round_member_failed(ticket_id: &str, e: tokio::task::JoinError) -> ParallelVerdict {
     let reason = scrub_credentials(&panic_message(&*e.into_panic()));
-    tracing::warn!(%reason, "round member task failed");
+    tracing::warn!(ticket = %ticket_id, %reason, "round member task failed");
     ParallelVerdict::NoResponse(reason)
 }
 

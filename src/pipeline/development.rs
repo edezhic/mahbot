@@ -57,7 +57,7 @@ fn engineer_work_message(ticket: &Ticket) -> String {
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     let message = engineer_work_message(&ticket);
     let conn = &crate::session::store().conn;
-    sync_phase_job_task(conn, job_id, &message).await;
+    sync_phase_job_task(conn, &ticket.id, job_id, &message).await;
     run_stage_agent(&ticket, &ws, job_id, &message, StageRunKind::Engineer).await;
 }
 
@@ -137,10 +137,11 @@ fn engineer_failure_notice(shutdown: bool, error: Option<&str>) -> String {
 
 /// Notify the Manager that a workspace was paused because of an engineer hard
 /// failure.
-fn notify_engineer_pause(ws: &Workspace, failure_details: &str, paused: bool) {
+fn notify_engineer_pause(ticket_id: &str, ws: &Workspace, failure_details: &str, paused: bool) {
     let content = substitute(
         &load_prompt("pipeline/engineer_pause_notification.md"),
         &[
+            ("{{ticket_id}}", ticket_id),
             ("{{failure_details}}", failure_details),
             ("{{workspace_status}}", &pause_status_sentence(paused)),
         ],
@@ -241,7 +242,7 @@ async fn handle_engineer_failure(
     // comment — ticket history carries stage conclusions only; the Manager
     // notice below reports the pause and the cause.
     let workspace_paused = ws.paused || pause_occurred;
-    notify_engineer_pause(ws, &failure_notice, workspace_paused);
+    notify_engineer_pause(&ticket.id, ws, &failure_notice, workspace_paused);
     info!(
         ticket = %ticket.id,
         "Engineer hard failure — workspace paused, ticket reset for a fresh development attempt"
