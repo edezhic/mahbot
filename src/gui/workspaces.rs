@@ -17,7 +17,10 @@ pub enum WorkspacesMessage {
     DeleteWorkspace(String),
     ConfirmDelete(String),
     CancelDelete,
-    DeleteResult(Result<(), String>),
+    /// A deletion finished: the project removed and the admin's active project
+    /// afterwards (`None` = the personal folder), as the deletion's own
+    /// transaction left it.
+    DeleteResult(Result<(String, Option<String>), String>),
     Reanalyze(String),
     ReanalyzeResult(Result<(), String>),
 
@@ -147,6 +150,7 @@ impl WorkspacesState {
                         crate::workspace::store()
                             .delete(&name)
                             .await
+                            .map(|moved_to| (name, moved_to))
                             .map_err(|e| e.to_string())
                     },
                     WorkspacesMessage::DeleteResult,
@@ -157,8 +161,9 @@ impl WorkspacesState {
                 Task::none()
             }
             // Successful mutations are refreshed by the Dashboard's shared-map
-            // reload (see process_settings_message) — no local store read.
-            WorkspacesMessage::DeleteResult(Ok(())) => {
+            // reload (see process_settings_message) — no local store read. The
+            // Dashboard also reports the deletion.
+            WorkspacesMessage::DeleteResult(Ok(_)) => {
                 self.load_state.clear_error();
                 Task::none()
             }

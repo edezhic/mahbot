@@ -1249,7 +1249,7 @@ async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<Stri
 /// warning — defense in depth against rogue re-attachment). A NULL
 /// `selected_workspace` and a missing account row both yield the canonical
 /// `personal:{user}` name; `None` is reserved for a failed read (warned) — the
-/// caller then applies its own personal default.
+/// caller then applies its own answer, without writing one back.
 pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<String> {
     let stored = match store().get_selected_workspace_name(user_name).await {
         Ok(stored) => stored,
@@ -1274,6 +1274,21 @@ pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<S
         );
     }
     Some(personal_workspace_name(user_name))
+}
+
+/// The project the desktop falls back to whenever the active selection names
+/// none that exists: the first managed name in the order the footer picker
+/// lists the projects (`workspaces.name`, ascending). Start-up and a deletion
+/// share this one rule, so a restart never changes which project is active. A
+/// personal workspace is never a candidate.
+#[must_use]
+pub(crate) fn fallback_workspace_name<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    names
+        .into_iter()
+        .filter(|name| !is_personal_workspace(name))
+        .min()
 }
 
 /// The managed workspaces — every `workspaces` row except a personal space,

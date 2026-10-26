@@ -325,8 +325,10 @@ pub enum Message {
     UsersCdcChanged,
     /// The admin's DB-stored active workspace read back after a users-table
     /// change — the desktop and the DB are one and the same choice, so a
-    /// switch made by another surface applies here without a restart. `generation`
-    /// is the `active_workspace_gen` guard value captured at dispatch, so a read a
+    /// switch made by another surface applies here without a restart. A personal
+    /// answer applies only while no project exists to show (see the handler: an
+    /// empty selection is not a steady state). `generation` is the
+    /// `active_workspace_gen` guard value captured at dispatch, so a read a
     /// newer pick or read superseded cannot apply.
     ActiveWorkspaceSynced {
         generation: u64,
@@ -390,12 +392,15 @@ pub enum Message {
     /// Workspace info and restored selection loaded during boot. The read
     /// result is carried as-is so a failed boot read surfaces in the picker
     /// and Settings list instead of silently rendering as "no workspaces".
-    /// The selection is the resolved name. The generation is the reload
-    /// generation the read was issued under, so a reload that answered while
-    /// it was in flight wins.
+    /// The selection is the resolved name. `remember` says whether that name has
+    /// to be written back as the admin's stored selection — it differs from a
+    /// successful stored read (see [`Dashboard::apply_boot_workspaces`]). The
+    /// generation is the reload generation the read was issued under, so a reload
+    /// that answered while it was in flight wins.
     BootWorkspaces {
         workspaces: Result<HashMap<String, Workspace>, String>,
         restored_name: String,
+        remember: bool,
         generation: u64,
     },
     /// The wait for a still-running boot expired ([`BOOT_EXIT_WAIT`], a start
@@ -403,10 +408,11 @@ pub enum Message {
     BootExitWaitExpired,
     /// Full workspace map reloaded from the store (CDC workspaces event,
     /// stream lag/baseline, toggle completion, or a settings add/delete). The
-    /// handler replaces the map and re-resolves the live selection against it,
-    /// but never substitutes one the fresh map does not carry: that is the DB
-    /// read-back's call (see `Message::ActiveWorkspaceSynced`). The generation
-    /// is the reload it answers, so a slow read cannot overwrite a newer one.
+    /// handler replaces the map and re-pushes the workspace-scoped surfaces; it
+    /// never re-resolves the live selection against it, because the map can lag
+    /// the stored choice — that is the DB read-back's call (see
+    /// `Message::ActiveWorkspaceSynced`). The generation is the reload it
+    /// answers, so a slow read cannot overwrite a newer one.
     WorkspacesReloaded {
         workspaces: HashMap<String, Workspace>,
         generation: u64,
@@ -713,13 +719,15 @@ pub struct Dashboard {
     /// Generation of the latest workspace-map reload, so a slow read cannot
     /// apply its (now stale) outcome over a newer one.
     workspaces_reload_gen: u64,
-    /// The read-back guard: bumped on every active-workspace pick this app
-    /// applies and on every read-back it dispatches. Each read carries the
-    /// generation it was dispatched with and applies only while it still matches,
-    /// so a read dispatched before a local pick — or before a newer read — can
-    /// never apply. A read dispatched *after* a pick can still observe that pick's
-    /// pre-commit row (the commit lands after the write is issued) and revert the
-    /// display until the pick's own CDC event re-reads it.
+    /// The read-back guard: bumped wherever this app makes the selection newer
+    /// than anything a read in flight can return — a pick, a deletion's relocation
+    /// (its transaction has committed) and a boot pick that is written back — and
+    /// on every read-back it dispatches. Each read carries the generation it was
+    /// dispatched with and applies only while it still matches, so a read
+    /// dispatched before a local pick — or before a newer read — can never apply. A
+    /// read dispatched *after* a pick can still observe that pick's pre-commit row
+    /// (the commit lands after the write is issued) and revert the display until
+    /// the pick's own CDC event re-reads it.
     active_workspace_gen: u64,
     /// The `(name, path)` pair last pushed to the workspace-scoped surfaces;
     /// `None` while none has been pushed. A workspace-map reload compares
@@ -1070,16 +1078,30 @@ impl Dashboard {
         &mut self,
         workspaces: Result<HashMap<String, Workspace>, String>,
         restored_name: &str,
+        remember: bool,
         read_generation: u64,
     ) -> Task<Message> {
         if read_generation == self.workspaces_reload_gen {
             self.apply_boot_workspace_map(workspaces);
         }
 
-        // The boot read always yields a name — a managed workspace or the
-        // admin's `personal:admin` fallback.
-        self.selected_workspace_name = Some(restored_name.to_owned());
-        self.propagate_workspace_selection(restored_name)
+        // The boot read always yields a name — a project or the admin's
+        // `personal:{user}` fallback, which is the answer only when no project
+        // exists. A pick produced by a failed read is written by nobody — a failed
+        // read is no evidence that nothing is selected — so an in-flight read-back
+        // may still correct it.
+        if !remember {
+            return self.apply_workspace_selection(restored_name);
+        }
+        // Written back unconditionally, unlike a pick: the name came from the same
+        // DB read as the stored selection, so the loaded map — which may not even
+        // have arrived — has no say in it. Reusing `switch_workspace` here would let
+        // a stale map skip the write, and the next read-back would drop the desktop
+        // back into the personal folder.
+        Task::batch([
+            self.apply_workspace_selection_superseding_read_back(restored_name),
+            Self::persist_active_workspace(restored_name.to_owned(), |_| Message::Nop),
+        ])
     }
 
     /// Navigate to a page, refreshing page-specific state as needed. A page that
@@ -1169,17 +1191,16 @@ impl Dashboard {
         self.settings_state.workspaces_state.workspaces = list;
     }
 
-    /// Toggle the selected workspace's pause or maintainer state.
+    /// Toggle the active project's pause or maintainer state. Only a resolved
+    /// project offers these (see [`Self::resolved_workspace`]), so the name written
+    /// is the resolved one — never a stored value that names no existing project.
     fn toggle_workspace_state(&mut self, kind: ToggleKind) -> Task<Message> {
+        let Some(ws_name) = self.resolved_workspace().map(|(name, _)| name.to_string()) else {
+            return Task::none();
+        };
         let current_state = match kind {
             ToggleKind::Pause => self.paused(),
             ToggleKind::Maintenance => self.maintenance_enabled(),
-        };
-        let Some(ws_name) = self.active_workspace_name() else {
-            return self.push_toast(
-                "No workspace selected — select a workspace first".to_string(),
-                ToastKind::Warning,
-            );
         };
         let new_state = !current_state;
         let ws_name_clone = ws_name.clone();
@@ -1296,17 +1317,44 @@ impl Dashboard {
     /// Process a Settings message, optionally reloading the workspace map when
     /// workspaces are added or deleted.
     fn process_settings_message(&mut self, msg: settings::SettingsMessage) -> Task<Message> {
-        // Adding activates the new workspace on every path (the `workspace`
-        // tool's own `add` does the same). The row is seeded into the workspace map
-        // so the picker renders it at once and the activation's own map-guard
-        // sees the workspace it just created; the reload this message already
-        // triggers below is what confirms it.
-        let activation = if let settings::SettingsMessage::AddWorkspaceResult(Ok(ws)) = &msg {
-            self.workspaces.insert(ws.name.clone(), ws.clone());
-            Some(self.activate_workspace(&ws.name))
-        } else {
-            None
-        };
+        // A Settings-side workspace mutation activates at most one project: an add
+        // activates the new workspace (the `workspace` tool's own `add` does the
+        // same), a delete moves the admin's selection in the store and the desktop
+        // follows it. Whatever moved the desktop is reported — changed tabs, git
+        // state and toggles are otherwise the only sign of it.
+        let mut activation = None;
+        match &msg {
+            settings::SettingsMessage::AddWorkspaceResult(Ok(ws)) => {
+                // Seeded into the map so the picker renders it at once and the
+                // activation's own map-guard sees the workspace it just created;
+                // the reload this message triggers below is what confirms it.
+                self.workspaces.insert(ws.name.clone(), ws.clone());
+                activation = Some(self.activate_workspace(&ws.name));
+            }
+            settings::SettingsMessage::WorkspaceMsg(
+                workspaces::WorkspacesMessage::DeleteResult(Ok((removed, active_now))),
+            ) => {
+                // The store has already resolved the admin's selection; aligning the
+                // desktop with that answer at once keeps it from passing through the
+                // no-project state while the map reload and the users read-back race
+                // each other.
+                let active_now = active_now.clone().unwrap_or_else(|| {
+                    crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME)
+                });
+                if self.selected_workspace_name.as_deref() != Some(active_now.as_str()) {
+                    let notice = if crate::users::is_personal_workspace(&active_now) {
+                        format!("Project {removed} removed — the personal folder is active")
+                    } else {
+                        format!("Project {removed} removed — {active_now} is active")
+                    };
+                    activation = Some(Task::batch([
+                        self.apply_workspace_selection_superseding_read_back(&active_now),
+                        self.push_toast(notice, ToastKind::Success),
+                    ]));
+                }
+            }
+            _ => {}
+        }
         // Any successful Settings-side workspace mutation (add, delete,
         // reanalyze, diagnostics/notes edits) refreshes the managed
         // workspace map from one full DB read — the map is the single source
@@ -1317,7 +1365,7 @@ impl Dashboard {
         let needs_global_reload = matches!(
             msg,
             settings::SettingsMessage::WorkspaceMsg(
-                workspaces::WorkspacesMessage::DeleteResult(Ok(()))
+                workspaces::WorkspacesMessage::DeleteResult(Ok(_))
                     | workspaces::WorkspacesMessage::ReanalyzeResult(Ok(()))
                     | workspaces::WorkspacesMessage::DiagnosticsSaved(_, Ok(()))
                     | workspaces::WorkspacesMessage::RediscoverDiagnosticsResult(_, Ok(()))
@@ -1331,10 +1379,7 @@ impl Dashboard {
         } else {
             settings_task
         };
-        match activation {
-            Some(activation) => Task::batch([tail, activation]),
-            None => tail,
-        }
+        Task::batch(std::iter::once(tail).chain(activation))
     }
 
     /// Process a Running Agents page message — the manual-stop flow for
@@ -1451,8 +1496,9 @@ impl Dashboard {
             Message::BootWorkspaces {
                 workspaces,
                 restored_name,
+                remember,
                 generation,
-            } => self.apply_boot_workspaces(workspaces, &restored_name, generation),
+            } => self.apply_boot_workspaces(workspaces, &restored_name, remember, generation),
             Message::CloseRequested(_) => self.request_exit(None),
             Message::QuitRequested => self.request_exit(Some(crate::shutdown::MACOS_QUIT_TRIGGER)),
             Message::Shutdown => self.save_and_exit(),
@@ -1809,8 +1855,8 @@ impl Dashboard {
                 self.finish_toggle(kind, result, &ws_name, intended_state)
             }
             // A workspaces-table row changed (or the stream lagged/baseline
-            // fired) — one full map reload; the handler below re-resolves the
-            // live selection against the fresh map.
+            // fired) — one full map reload; the handler below re-pushes the
+            // workspace-scoped surfaces from the fresh map.
             Message::WorkspacesCdcChanged => self.reload_workspace_map(),
             Message::WorkspacesReloaded {
                 workspaces,
@@ -1823,47 +1869,25 @@ impl Dashboard {
                 }
                 self.apply_workspace_reload(Ok(workspaces));
 
-                // A selection this map does not contain is NOT re-resolved to
-                // "Personal": the map can lag the stored choice (a workspace
-                // added and selected in one go is missing from a read that
-                // started before its insert), and resolving here would leave the
-                // desktop on the personal space while the DB keeps the project
-                // active. The DB owns the choice and its read-back applies it
-                // (see `active_workspace_gen`), so only the now-unresolved
-                // surfaces are re-pushed.
-                let unknown = self.selected_workspace_name.as_deref().is_some_and(|name| {
-                    !self.workspaces.contains_key(name)
-                        && !crate::users::is_personal_workspace(name)
-                });
-                if unknown {
+                // Nothing is picked from this map: it can lag the stored choice (a
+                // workspace added and selected in one go is missing from a read that
+                // started before its insert), and resolving against it would leave
+                // the desktop on the personal space while the DB keeps the project
+                // active. The DB owns the choice and its read-back applies it (see
+                // `active_workspace_gen`), so the applied map only re-pushes the
+                // workspace-scoped surfaces — whose resolvability this map may have
+                // changed (the boot race leaves the restored selection resolved
+                // against the map that was dropped as stale).
+                //
+                // The one case left to settle is a desktop that has applied no
+                // selection at all yet — the reload landed before the boot read —
+                // which takes the personal default the boot selection then replaces.
+                if self.selected_workspace_name.is_some() {
                     return self.sync_workspace_surfaces();
                 }
-
-                // Otherwise re-resolve the LIVE selection against the fresh map
-                // instead of a value captured when the reload was triggered, so a
-                // reload that lands before the boot selection is applied cannot
-                // clobber it. Only a resolution that differs from the live
-                // selection — the "Personal" default of nothing selected yet —
-                // propagates (propagate is heavy); otherwise only the
-                // workspace-scoped surfaces are re-pushed.
                 let personal_name =
                     crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
-                let resolved = resolve_workspace_selection(
-                    &self.workspaces,
-                    self.selected_workspace_name.as_deref(),
-                    &personal_name,
-                );
-                let current = self.selected_workspace_name.as_deref().unwrap_or_default();
-                if current != resolved.as_str() {
-                    self.selected_workspace_name = Some(resolved.clone());
-                    return self.propagate_workspace_selection(&resolved);
-                }
-                // The name is unchanged, but this map can still have changed
-                // whether it resolves to a workspace path: the boot race leaves
-                // the restored selection resolved against the map that was
-                // dropped as stale, so the workspace-scoped surfaces stayed
-                // empty. Re-push them, and only them.
-                self.sync_workspace_surfaces()
+                self.apply_workspace_selection(&personal_name)
             }
             // A users-table / user_channels-table row changed (or the stream
             // lagged) — the event does not say which column changed, so the
@@ -1889,14 +1913,26 @@ impl Dashboard {
                 if generation != self.active_workspace_gen
                     || self.selected_workspace_name.as_deref() == Some(name.as_str())
                 {
-                    Task::none()
-                } else {
-                    // Applied as stored, not resolved against the loaded map the
-                    // way a reload is: the map can be a reload behind while the DB
-                    // is authoritative about the choice. In memory only — writing
-                    // the value back would answer our own CDC event.
-                    self.apply_workspace_selection(&name)
+                    return Task::none();
                 }
+                // "No project selected" is not a steady state: start-up and a
+                // deletion both write the fallback back, so a personal answer while
+                // the loaded map carries a project is the residue of a failed
+                // start-up read (which wrote nothing, on purpose). Applying it would
+                // drop the desktop outside every project — the live pick stands.
+                if crate::users::is_personal_workspace(&name)
+                    && self
+                        .workspaces
+                        .keys()
+                        .any(|ws_name| !crate::users::is_personal_workspace(ws_name))
+                {
+                    return Task::none();
+                }
+                // Applied as stored, not resolved against the loaded map the way a
+                // reload is: the map can be a reload behind while the DB is
+                // authoritative about the choice. In memory only — writing the value
+                // back would answer our own CDC event.
+                self.apply_workspace_selection(&name)
             }
             // A failed read-back changes nothing: the live selection stands.
             Message::ActiveWorkspaceSynced { name: None, .. } => Task::none(),
@@ -2058,9 +2094,10 @@ impl Dashboard {
     }
 
     /// Apply a workspace selection in memory and broadcast it to all pages,
-    /// without writing the DB. Used where the DB write happened (or happens)
-    /// elsewhere — [`Self::switch_workspace`] and the read-back in the
-    /// `Message::ActiveWorkspaceSynced` arm.
+    /// without writing the DB. Used where nothing supersedes a read-back in flight:
+    /// the read-back itself (`Message::ActiveWorkspaceSynced`), the pre-boot
+    /// personal default, and a boot pick produced by a failed read. Every other
+    /// path goes through [`Self::apply_workspace_selection_superseding_read_back`].
     fn apply_workspace_selection(&mut self, name: &str) -> Task<Message> {
         // Git state is cleared and eagerly refreshed below via
         // propagate_workspace_selection → set_workspace_path.
@@ -2068,22 +2105,30 @@ impl Dashboard {
         self.propagate_workspace_selection(name)
     }
 
+    /// Make `name` the active project, superseding any read-back already in flight:
+    /// what sets the selection here — a pick, a deletion whose transaction has
+    /// committed, a boot pick that is written back — is newer than anything a read
+    /// dispatched earlier can return (see `active_workspace_gen`).
+    fn apply_workspace_selection_superseding_read_back(&mut self, name: &str) -> Task<Message> {
+        let propagate = self.apply_workspace_selection(name);
+        self.active_workspace_gen += 1;
+        propagate
+    }
+
     /// The one workspace-switch path, shared by the footer picker and the
-    /// Settings add form: apply `name` in memory — so a completion landing after
-    /// a newer pick can never revert it — and persist it through a
-    /// [`Self::selection_persistable`]-guarded write.
+    /// Settings add form: [`Self::apply_workspace_selection_superseding_read_back`]
+    /// plus the write, which is skipped when the loaded map has dropped the name
+    /// since the render (see [`Self::selection_persistable`]).
     fn switch_workspace(
         &mut self,
         name: &str,
         feedback: fn(Result<String, String>) -> Message,
     ) -> Task<Message> {
-        let propagate = self.apply_workspace_selection(name);
-        // Supersedes any in-flight read-back (see `active_workspace_gen`).
-        self.active_workspace_gen += 1;
+        let activate = self.apply_workspace_selection_superseding_read_back(name);
         let write = self
             .selection_persistable(name)
             .then(|| Self::persist_active_workspace(name.to_string(), feedback));
-        Task::batch(std::iter::once(propagate).chain(write))
+        Task::batch(std::iter::once(activate).chain(write))
     }
 
     /// Whether a pick may be written to the DB: a managed name only when the
@@ -2243,8 +2288,10 @@ impl Dashboard {
     }
 
     /// Reload the full workspace map from storage (e.g. after add/delete on
-    /// the Workspaces page or a post-toggle refresh). Resolution happens in
-    /// [`Message::WorkspacesReloaded`], from the live selection.
+    /// the Workspaces page or a post-toggle refresh). The applied map re-pushes
+    /// the workspace-scoped surfaces and fills in the pre-boot personal default;
+    /// it never picks the active project from itself (see
+    /// [`Message::WorkspacesReloaded`]).
     ///
     /// The reload carries the generation it was issued under: this read retries
     /// for a second on a transient failure, so without it a delayed failure
@@ -2285,25 +2332,6 @@ impl Dashboard {
             Err(e) => self.workspaces_error = Some(e),
         }
         self.sync_settings_workspaces_from_map();
-    }
-
-    /// Return the selected managed-workspace name, or `None` if the "Personal"
-    /// workspace is selected (no managed workspace).
-    fn active_workspace_name(&self) -> Option<String> {
-        self.active_workspace_name_ref().map(str::to_string)
-    }
-
-    /// Borrowed counterpart of [`Self::active_workspace_name`]: view code cannot
-    /// lend the borrowed page an owned `String`.
-    fn active_workspace_name_ref(&self) -> Option<&str> {
-        self.selected_workspace_name
-            .as_deref()
-            .filter(|n| !crate::users::is_personal_workspace(n))
-    }
-
-    /// Returns `true` when a managed (non-Personal) workspace is selected.
-    fn has_active_workspace(&self) -> bool {
-        self.active_workspace_name_ref().is_some()
     }
 
     /// Whether a dashboard-level overlay modal is open over the current page.
@@ -3276,9 +3304,10 @@ impl Dashboard {
     }
 
     /// Footer workspace picker: managed workspaces only, persists via
-    /// [`Self::select_workspace`]. It is the only way a project becomes active,
-    /// so it is offered even when a single managed workspace exists. When a
-    /// failed workspace-map read leaves nothing to pick, a static,
+    /// [`Self::select_workspace`]. A project also becomes active by being added
+    /// and when the active one is deleted, but this is the only place the admin
+    /// chooses one, so it is offered even when a single managed workspace
+    /// exists. When a failed workspace-map read leaves nothing to pick, a static,
     /// non-selectable "Workspaces unavailable" pill replaces it in the same
     /// footprint. Returns `None` for the zero-managed-workspaces state.
     fn render_workspace_picker(&self) -> Option<Element<'_, Message>> {
@@ -3306,9 +3335,10 @@ impl Dashboard {
         }
         // Guard the displayed selection: a dangling persisted value (the
         // workspace vanished from the map) renders no highlight; a personal
-        // selection (`active_workspace_name()` → None) renders the placeholder.
+        // selection renders the placeholder.
         let selected = self
-            .active_workspace_name()
+            .selected_workspace_name
+            .as_deref()
             .and_then(|name| options.iter().find(|o| o.value == name).cloned());
         Some(widgets::tooltip_hint(
             pick_list(options, selected, |opt| Message::WorkspacePick(opt.value))
@@ -3787,7 +3817,7 @@ impl Dashboard {
         if let Some(el) = self.render_workspace_picker() {
             left_elements.push(el);
         }
-        if self.has_active_workspace() {
+        if self.resolved_workspace().is_some() {
             left_elements.push(self.render_maintainer_toggle());
             left_elements.push(self.render_pause_toggle());
         }
@@ -3951,9 +3981,7 @@ fn save_window_state(pos: iced::Point, size: iced::Size) {
 }
 
 /// Reload the full workspace map from the store after boot (CDC workspaces
-/// event, stream lag, toggle completion, or a settings add/delete). The
-/// [`Message::WorkspacesReloaded`] handler re-resolves the live selection at
-/// apply time.
+/// event, stream lag, toggle completion, or a settings add/delete).
 ///
 /// On a transient read failure — the one scoped retry in this reload path — it
 /// retries once after a short delay; if the retry also fails, it returns
@@ -3992,58 +4020,69 @@ async fn read_workspace_map() -> anyhow::Result<HashMap<String, Workspace>> {
     Ok(list.into_iter().map(|ws| (ws.name.clone(), ws)).collect())
 }
 
-/// Resolve the restored workspace selection against a freshly loaded map:
-/// the previous selection is kept when it still exists (a `personal:{user}`
-/// name is never in the map, so it always falls through to the personal
-/// default); anything else falls back to the "Personal" default (the admin's
-/// `personal:{user}` name).
+/// Resolve the boot selection against a freshly loaded map: the stored name when
+/// it is an existing project, otherwise
+/// [`crate::users::fallback_workspace_name`]'s pick — the one a deletion makes
+/// too — otherwise the personal name, which is the answer only when the map
+/// carries no project at all.
+///
+/// `prev_selection` is [`crate::users::resolve_selected_workspace_name`]'s
+/// answer, so `None` is a failed read: it resolves like any other unusable value
+/// (the boot path must complete) and only decides whether the pick is stored.
 #[must_use]
 fn resolve_workspace_selection(
     map: &HashMap<String, Workspace>,
     prev_selection: Option<&str>,
     personal_name: &str,
 ) -> String {
-    match prev_selection {
-        Some(name) if map.contains_key(name) => name.to_string(),
-        _ => personal_name.to_string(),
-    }
+    prev_selection
+        .filter(|name| map.contains_key(*name) && !crate::users::is_personal_workspace(name))
+        .map(str::to_string)
+        .or_else(|| {
+            crate::users::fallback_workspace_name(map.keys().map(String::as_str))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| personal_name.to_string())
 }
 
-/// Load the full workspace map during boot and resolve the selected
-/// workspace from the DB (`users.selected_workspace` for the admin — the
-/// single source of truth) via the admin-aware
-/// [`crate::users::resolve_selected_workspace_name`] primitive. Degrades to
-/// the "Personal" default (`personal:admin`) when the stored value is
-/// NULL/personal, the read fails, or the stored workspace is missing from the
-/// map (the boot path must complete).
+/// Load the full workspace map during boot and resolve the active project from
+/// the DB (`users.selected_workspace` for the admin — the single source of truth)
+/// via the admin-aware [`crate::users::resolve_selected_workspace_name`]
+/// primitive, together with the projects that actually exist. An empty or
+/// dangling stored selection lands on a project whenever one exists; the personal
+/// name only when none does.
+///
+/// `remember` is set when a successful stored-selection read differs from the
+/// resolved pick (see [`Message::BootWorkspaces`]).
 ///
 /// The read result travels to [`Dashboard::apply_boot_workspaces`] as-is: a
-/// failed boot read still completes with an empty map, but the failure is
-/// rendered by the workspace picker / Settings list instead of being
-/// indistinguishable from an installation with no workspaces.
+/// failed boot read still completes with an empty map (nothing to land on), but
+/// the failure is rendered by the workspace picker / Settings list instead of
+/// being indistinguishable from an installation with no workspaces.
 ///
 /// `generation` is captured when the read is dispatched and travels back with
 /// it, so a reload that answered meanwhile supersedes this read.
 async fn load_workspace_options(generation: u64) -> Message {
     let user = crate::users::ADMIN_USER_NAME;
-    let prev = crate::users::resolve_selected_workspace_name(user).await;
-    // The personal default is the admin's `personal:{user}` name.
+    // `None` — the read failed.
+    let stored = crate::users::resolve_selected_workspace_name(user).await;
     let personal_name = crate::users::personal_workspace_name(user);
-    let (workspaces, restored) = match read_workspace_map().await {
+    let (workspaces, restored, remember) = match read_workspace_map().await {
         Ok(map) => {
-            let restored = resolve_workspace_selection(&map, prev.as_deref(), &personal_name);
-            (Ok(map), restored)
+            let restored = resolve_workspace_selection(&map, stored.as_deref(), &personal_name);
+            let remember = stored.as_deref().is_some_and(|stored| stored != restored);
+            (Ok(map), restored, remember)
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to load workspaces during boot");
-            // A failed read leaves no map to resolve against, i.e. the Personal
-            // default (nothing else can be selected from an unknown map).
-            (Err(e.to_string()), personal_name)
+            // A failed read leaves no project to land on.
+            (Err(e.to_string()), personal_name, false)
         }
     };
     Message::BootWorkspaces {
         workspaces,
         restored_name: restored,
+        remember,
         generation,
     }
 }
@@ -4486,10 +4525,10 @@ mod tests {
         assert!(dash.workspaces.contains_key("ws3"));
         assert!(!dash.workspaces.contains_key("ws2"));
 
-        // A reload whose map still contains the selection → unchanged. This is
-        // the live re-resolution: the selection is preserved regardless of what
-        // the trigger-time snapshot was — the boot-race regression where a
-        // reload triggered while the selection was still None must not reset it.
+        // A reload whose map still contains the selection → unchanged. The map is
+        // never consulted for the selection, so it survives whatever the
+        // trigger-time snapshot was — the boot-race regression where a reload
+        // triggered while the selection was still None must not reset it.
         dash.selected_workspace_name = Some("ws3".to_string());
         let new_map2 = HashMap::from([("ws3".to_string(), ws("ws3"))]);
         let _ = dash.update(reloaded(new_map2));
@@ -4500,7 +4539,8 @@ mod tests {
     /// dashboard: the read-back applies the stored choice in memory, an
     /// unchanged value is a no-op, and a read superseded by a local pick or by a
     /// newer read is dropped — the two surfaces are one choice, and the running
-    /// app follows it.
+    /// app follows it. A personal answer stands only when the map carries no
+    /// project to show.
     #[test]
     fn active_workspace_sync_follows_an_external_switch_and_drops_a_superseded_read() {
         let mut dash = ready_dashboard();
@@ -4570,6 +4610,26 @@ mod tests {
         // DB says otherwise.
         let _ = dash.update(reloaded(HashMap::from([("ws1".to_string(), ws("ws1"))])));
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
+
+        // A personal answer while the map carries a project is the residue of a
+        // failed start-up read, which writes nothing on purpose: adopting it would
+        // drop the desktop outside every project, so the live pick stands.
+        let _ = dash.update(Message::ActiveWorkspaceSynced {
+            generation: dash.active_workspace_gen,
+            name: Some("personal:admin".to_string()),
+        });
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
+
+        // With no project left to show, the personal answer is the right one.
+        dash.workspaces.clear();
+        let _ = dash.update(Message::ActiveWorkspaceSynced {
+            generation: dash.active_workspace_gen,
+            name: Some("personal:admin".to_string()),
+        });
+        assert_eq!(
+            dash.selected_workspace_name.as_deref(),
+            Some("personal:admin")
+        );
     }
 
     /// The add form's activation: a pick applies in memory at once — superseding
@@ -4604,16 +4664,41 @@ mod tests {
     }
 
     #[test]
-    fn workspaces_reloaded_preserves_boot_restored_selection() {
-        // Models the exact boot race: a CDC baseline reload was triggered while
-        // the selection was still None, but lands after `finish_boot` applied
-        // the DB-restored selection ("mahbot"). Re-resolving from the live
-        // selection keeps it instead of wiping it to Personal.
+    fn workspaces_reloaded_keeps_the_boot_restored_selection() {
+        // Models the boot race: a CDC baseline reload was triggered while the
+        // selection was still None, but lands after `finish_boot` applied the
+        // DB-restored selection ("mahbot"). The map is never consulted for the
+        // selection, so it stands instead of being wiped to Personal.
         let mut dash = ready_dashboard();
         dash.selected_workspace_name = Some("mahbot".to_string());
         let map = HashMap::from([("mahbot".to_string(), ws("mahbot"))]);
         let _ = dash.update(reloaded(map));
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("mahbot"));
+    }
+
+    /// A boot pick that is written back supersedes any read-back already in
+    /// flight, as a pick does. A pick produced by a failed read is written by
+    /// nobody, so it supersedes none — an in-flight read may still correct it.
+    #[test]
+    fn a_boot_pick_supersedes_a_read_back_in_flight() {
+        let mut dash = ready_dashboard();
+        let map = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+        let before = dash.active_workspace_gen;
+
+        let _ = dash.apply_boot_workspaces(Ok(map.clone()), "ws1", false, 0);
+        assert_eq!(
+            dash.active_workspace_gen, before,
+            "nothing was written, so a read-back may still correct the pick"
+        );
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
+
+        let _ = dash.apply_boot_workspaces(Ok(map), "ws1", true, 0);
+        assert_eq!(
+            dash.active_workspace_gen,
+            before + 1,
+            "the write must supersede a read-back in flight"
+        );
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
     }
 
     /// The boot race: the map read during boot is dropped as stale while the
@@ -4626,7 +4711,7 @@ mod tests {
     fn boot_without_the_workspace_map_pushes_nothing_then_recovers() {
         let mut dash = ready_dashboard();
 
-        let _ = dash.apply_boot_workspaces(Ok(HashMap::new()), "ws1", 0);
+        let _ = dash.apply_boot_workspaces(Ok(HashMap::new()), "ws1", false, 0);
 
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
         assert_eq!(dash.resolved_workspace(), None);
@@ -4693,11 +4778,13 @@ mod tests {
         dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
 
         let _ = dash.apply_workspace_selection("ws1");
+        assert!(dash.resolved_workspace().is_some());
         assert!(dash.render_git_block().is_some());
         let _ = dash.navigate_to(Page::Editor);
 
         // A personal selection never resolves.
         let _ = dash.apply_workspace_selection("personal:admin");
+        assert_eq!(dash.resolved_workspace(), None);
         assert!(!dash.page_available(Page::Editor));
         assert!(!dash.page_available(Page::Shell));
         assert_eq!(
@@ -4715,17 +4802,87 @@ mod tests {
         let _ = dash.open_diff_modal(None);
         assert!(!dash.show_diff_modal, "the diff view must not open");
 
-        // Neither does a selected name missing from the loaded map.
+        // Neither does a selected name missing from the loaded map — the toggles
+        // included: a stored selection naming a project that no longer exists
+        // counts as no project.
         let _ = dash.apply_workspace_selection("gone");
+        assert_eq!(dash.resolved_workspace(), None);
         assert!(!dash.page_available(Page::Editor));
         assert!(dash.render_git_block().is_none());
 
+        // Nothing is offered for it either: the toggle has no write to make and
+        // reports nothing.
+        let toasts = dash.toasts.len();
+        let _ = dash.update(Message::Toggle(ToggleKind::Pause));
+        assert_eq!(dash.toasts.len(), toasts);
+
         let _ = dash.apply_workspace_selection("ws1");
+        assert!(dash.resolved_workspace().is_some());
         assert!(dash.page_available(Page::Editor));
         assert!(dash.page_available(Page::Shell));
         assert!(dash.render_git_block().is_some());
         let _ = dash.open_diff_modal(None);
         assert!(dash.show_diff_modal);
+    }
+
+    /// Deleting a project reports where the desktop moved — or that it left every
+    /// project — whenever it moved at all, whichever project was deleted; changed
+    /// tabs, git state and toggles are otherwise the only sign of it.
+    #[test]
+    fn deleting_a_project_reports_where_the_desktop_moved() {
+        let mut dash = ready_dashboard();
+        dash.workspaces = HashMap::from([
+            ("ws1".to_string(), ws("ws1")),
+            ("ws2".to_string(), ws("ws2")),
+            ("ws3".to_string(), ws("ws3")),
+        ]);
+        let _ = dash.apply_workspace_selection("ws1");
+        let delete_result = |removed: &str, moved_to: Option<&str>| {
+            Message::Settings(settings::SettingsMessage::WorkspaceMsg(
+                workspaces::WorkspacesMessage::DeleteResult(Ok((
+                    removed.to_string(),
+                    moved_to.map(str::to_string),
+                ))),
+            ))
+        };
+
+        // The store left the selection where the desktop already is: silent.
+        let _ = dash.update(delete_result("ws2", Some("ws1")));
+        assert!(dash.toasts.is_empty(), "no move, nothing to report");
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
+
+        // The store moved it elsewhere: the desktop follows at once and says where,
+        // whichever project was deleted.
+        let _ = dash.update(delete_result("ws2", Some("ws3")));
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws3"));
+        assert_eq!(dash.resolved_workspace(), Some(("ws3", "/p/ws3")));
+        assert!(matches!(
+            dash.toasts.as_slice(),
+            [Toast { message, kind: ToastKind::Success, .. }]
+                if message == "Project ws2 removed — ws3 is active"
+        ));
+
+        // The same for the active project's own deletion, applied at once so the
+        // desktop never passes through the no-project state while the map reload
+        // and the read-back catch up.
+        let _ = dash.update(delete_result("ws3", Some("ws1")));
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
+        assert!(matches!(
+            dash.toasts.as_slice(),
+            [.., Toast { message, .. }] if message == "Project ws3 removed — ws1 is active"
+        ));
+
+        // The last project leaves the desktop outside any workspace.
+        let _ = dash.update(delete_result("ws1", None));
+        assert_eq!(
+            dash.selected_workspace_name.as_deref(),
+            Some("personal:admin")
+        );
+        assert_eq!(dash.resolved_workspace(), None);
+        assert!(matches!(
+            dash.toasts.as_slice(),
+            [.., Toast { message, .. }] if message == "Project ws1 removed — the personal folder is active"
+        ));
     }
 
     /// An open diff view is closed when the resolution is lost — from then on
@@ -4869,19 +5026,34 @@ mod tests {
         );
     }
 
+    /// The boot resolution: an existing stored project is kept, while a stored
+    /// value naming no existing project — including a failed read — lands on the
+    /// project the desktop falls back to. The personal name is the answer only
+    /// when the map carries no project at all.
     #[test]
-    fn resolve_workspace_selection_keeps_valid_falls_back_personal() {
-        let map = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+    fn resolve_workspace_selection_keeps_a_project_and_never_lands_on_personal_while_one_exists() {
+        let map = HashMap::from([
+            ("ws1".to_string(), ws("ws1")),
+            ("ws2".to_string(), ws("ws2")),
+            ("personal:alice".to_string(), ws("personal:alice")),
+        ]);
         let personal = "personal:alice";
         assert_eq!(
-            resolve_workspace_selection(&map, Some("ws1"), personal),
-            "ws1"
+            resolve_workspace_selection(&map, Some("ws2"), personal),
+            "ws2"
         );
+        // A dangling selection and a failed read both land on the first project
+        // in the footer switcher's order; a personal row is no candidate.
         assert_eq!(
             resolve_workspace_selection(&map, Some("gone"), personal),
-            personal
+            "ws1"
         );
-        assert_eq!(resolve_workspace_selection(&map, None, personal), personal);
+        assert_eq!(resolve_workspace_selection(&map, None, personal), "ws1");
+        assert_eq!(
+            resolve_workspace_selection(&HashMap::new(), Some("gone"), personal),
+            personal,
+            "with no project at all the desktop is outside any workspace"
+        );
     }
 
     /// A personal workspace is never a picker option — a lingering
@@ -4956,8 +5128,12 @@ mod tests {
     fn boot_workspace_read_failure_completes_with_error_state() {
         let mut dash = Dashboard::loading(&WindowState::default());
 
-        let _ =
-            dash.apply_boot_workspaces(Err("boot read failed".to_string()), "personal:admin", 0);
+        let _ = dash.apply_boot_workspaces(
+            Err("boot read failed".to_string()),
+            "personal:admin",
+            false,
+            0,
+        );
 
         assert_eq!(dash.workspaces_error.as_deref(), Some("boot read failed"));
         assert!(dash.workspaces.is_empty());
@@ -4981,6 +5157,7 @@ mod tests {
         let _ = dash.apply_boot_workspaces(
             Err("boot read failed".to_string()),
             "personal:admin",
+            false,
             read_generation,
         );
 
@@ -4995,8 +5172,10 @@ mod tests {
     }
 
     /// The DB-sourced boot resolution: the seeded admin with a managed stored
-    /// workspace present in the map restores it; a stored value missing from
-    /// the map falls back to the "Personal" default.
+    /// workspace present in the map restores it and writes nothing; a stored
+    /// value naming no existing project lands on the project the desktop falls
+    /// back to — the first in the footer switcher's order — and that pick is
+    /// remembered.
     #[tokio::test]
     #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
     async fn boot_workspace_options_resolve_from_db() {
@@ -5016,7 +5195,7 @@ mod tests {
         // The guard restores the shared seeded admin row even when an assertion
         // below panics.
         crate::users::test_util::with_admin_workspace_restored(async {
-            // A managed stored workspace present in the map → restored.
+            // A managed stored workspace present in the map → restored as it is.
             store
                 .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some("boot_ws_gui"))
                 .await
@@ -5024,6 +5203,7 @@ mod tests {
             let Message::BootWorkspaces {
                 workspaces: Ok(map),
                 restored_name,
+                remember,
                 ..
             } = load_workspace_options(0).await
             else {
@@ -5031,17 +5211,31 @@ mod tests {
             };
             assert!(map.contains_key("boot_ws_gui"));
             assert_eq!(restored_name, "boot_ws_gui");
+            assert!(!remember, "a stored project is restored, not picked");
 
-            // A stored value missing from the map → the Personal default.
+            // A stored value no project carries → the fallback project, and the
+            // pick is remembered so the next read cannot undo it.
             store
                 .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some("gone_ws_gui"))
                 .await
                 .expect("update admin selected_workspace");
-            let Message::BootWorkspaces { restored_name, .. } = load_workspace_options(0).await
+            let Message::BootWorkspaces {
+                workspaces: Ok(map),
+                restored_name,
+                remember,
+                ..
+            } = load_workspace_options(0).await
             else {
                 panic!("expected BootWorkspaces");
             };
-            assert_eq!(restored_name, "personal:admin");
+            assert_ne!(restored_name, "personal:admin");
+            assert!(map.contains_key(&restored_name));
+            assert_eq!(
+                Some(restored_name.as_str()),
+                crate::users::fallback_workspace_name(map.keys().map(String::as_str)),
+                "the pick is the first project in the footer switcher's order"
+            );
+            assert!(remember);
         })
         .await;
     }

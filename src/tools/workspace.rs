@@ -2,9 +2,11 @@
 //! (which activates it), freeze/unfreeze their pipelines, read a board and a
 //! single ticket, and leave a clarification note on a ticket.
 //!
-//! It manages no board. Adding a managed workspace is the only write here that
-//! can change the desktop's active workspace; choosing a project in the
-//! desktop's footer workspace switcher is the other surface that selects one.
+//! It manages no board. Adding a managed workspace activates it; the desktop
+//! itself moves the active project onto another one when the active one is
+//! deleted, and onto a project at start-up whenever the stored one no longer
+//! exists. Choosing a project in the desktop's footer switcher is its own way of
+//! selecting one.
 use anyhow::anyhow;
 use async_trait::async_trait;
 use serde_json::json;
@@ -231,12 +233,13 @@ async fn managed_ticket_id(raw: &str) -> anyhow::Result<String> {
 
 /// The managed workspaces, one line each, with the admin's active one marked.
 ///
-/// The active workspace resolves exactly as the desktop does and counts only
-/// when it is one of the managed names: a personal value, or a name no longer
-/// a managed workspace, means nothing is active — while the resolver's `None`
-/// is a failed read, which is reported as such rather than as nothing being
-/// active. A narrowed listing still uses the full managed set to decide all
-/// this.
+/// The active workspace is the stored selection and counts only when it is one
+/// of the managed names: a personal value, or a name no longer a managed
+/// workspace, means nothing is active — while the resolver's `None` is a failed
+/// read, which is reported as such rather than as nothing being active. The
+/// desktop repairs such a selection to a project of its own accord at start-up
+/// and after a deletion, so the two surfaces agree in the steady state. A
+/// narrowed listing still uses the full managed set to decide all this.
 async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
     let workspaces = crate::users::managed_workspaces().await?;
     if workspaces.is_empty() {

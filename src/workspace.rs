@@ -1114,15 +1114,25 @@ impl WorkspaceStore {
             .await
     }
 
-    /// Delete a workspace by name. Context rows are cascaded automatically, and
-    /// any `users.selected_workspace` referencing the deleted workspace is
-    /// cleared (NULL = personal workspace) in the same transaction so the DB
-    /// never holds a dangling selection. The workspace's research runs are
-    /// cancelled and swept first (releasing run folders + archives), and the
-    /// remaining job rows are deleted IN the workspace-row transaction so the
-    /// jobs/workspace deletion commits atomically. The associated search
-    /// engine is removed from the in-memory registry.
-    pub async fn delete(&self, name: &str) -> Result<()> {
+    /// Delete a workspace by name. Context rows are cascaded automatically. The
+    /// admin's `users.selected_workspace` is resolved against the surviving
+    /// projects: onto [`crate::users::fallback_workspace_name`]'s pick — the one
+    /// start-up makes too — or onto the personal workspace (NULL) when none
+    /// survives; an empty or dangling value is repaired the same way, since those
+    /// are not steady states either (start-up repairs both too). Guest selections
+    /// naming the deleted workspace are cleared: a guest always resolves to their
+    /// personal workspace.
+    ///
+    /// The workspace's research runs are cancelled and swept first (releasing run
+    /// folders + archives), and the remaining job rows are deleted IN the
+    /// workspace-row transaction so the jobs/workspace deletion commits
+    /// atomically. The associated search engine is removed from the in-memory
+    /// registry.
+    ///
+    /// Returns the admin's active project after the deletion (`None` = the
+    /// personal workspace) — read back through the same transaction, so the
+    /// caller reports where the desktop stands rather than a derivation of it.
+    pub async fn delete(&self, name: &str) -> Result<Option<String>> {
         // Fail-closed: boot SKIPS jobs whose workspace is unresolvable (their
         // only deletion path is this abandon), so a failed abandon followed by
         // a deleted workspace row would orphan the jobs permanently. The
@@ -1131,11 +1141,38 @@ impl WorkspaceStore {
         let tx = self.conn.begin_tx().await?;
         tx.execute("DELETE FROM workspaces WHERE name = ?1", db::params![name])
             .await?;
+        // Every selection naming the deleted workspace is cleared here; the
+        // admin's is resolved onto the fallback by the statement below.
         tx.execute(
             "UPDATE users SET selected_workspace = NULL WHERE selected_workspace = ?1",
             db::params![name],
         )
         .await?;
+        // The projects left — read through the transaction, so the deletion above
+        // is visible to it.
+        let surviving = tx
+            .query_map_strict("SELECT name FROM workspaces", db::params![], |row| {
+                row.get::<String>(0)
+            })
+            .await?;
+        let next = crate::users::fallback_workspace_name(surviving.iter().map(String::as_str));
+        tx.execute(
+            "UPDATE users SET selected_workspace = ?1 WHERE name = ?2 AND \
+             (selected_workspace IS NULL \
+              OR selected_workspace NOT IN (SELECT name FROM workspaces))",
+            db::params![next, crate::users::ADMIN_USER_NAME],
+        )
+        .await?;
+        let active_now = tx
+            .query_map_strict(
+                "SELECT selected_workspace FROM users WHERE name = ?1",
+                db::params![crate::users::ADMIN_USER_NAME],
+                |row| row.get::<Option<String>>(0),
+            )
+            .await?
+            .into_iter()
+            .next()
+            .flatten();
         // Remaining job rows (ticket phases, sync jobs, cancelled-run leftovers)
         // go with the workspace row in ONE atomic commit; CASCADE removes their
         // rosters.
@@ -1156,7 +1193,7 @@ impl WorkspaceStore {
         }
         crate::workspace_index::remove_engine(name);
         clear_pending_pickup_cooldown(name);
-        Ok(())
+        Ok(active_now)
     }
 
     /// Update the status of a workspace.
@@ -1218,31 +1255,35 @@ impl WorkspaceStore {
     }
 
     /// Set or clear the maintenance toggle for a workspace.
+    ///
+    /// A name with no row is an error rather than a silent no-op (see
+    /// [`Self::set_paused`]).
     pub async fn set_maintenance_enabled(&self, name: &str, enabled: bool) -> Result<()> {
         let val: i64 = i64::from(enabled);
-        if enabled {
-            // last_run_at = NULL lets the maintainer run on the very next
-            // 1-minute poll cycle; a kept interrupted session resumes
-            // regardless (resume bypasses the debounce gate).
-            self.exec_update_with_updated_at(
-                "maintenance = ?, maintainer_last_run_at = NULL",
-                vec![Value::from(val)],
-                name,
-            )
-            .await?;
+        // Enabling clears last_run_at so the maintainer runs on the very next
+        // 1-minute poll cycle; a kept interrupted session resumes regardless
+        // (resume bypasses the debounce gate).
+        let set_clause = if enabled {
+            "maintenance = ?, maintainer_last_run_at = NULL"
         } else {
-            self.exec_update_with_updated_at("maintenance = ?", vec![Value::from(val)], name)
-                .await?;
+            "maintenance = ?"
+        };
+        let affected = self
+            .exec_update_with_updated_at(set_clause, vec![Value::from(val)], name)
+            .await?;
+        anyhow::ensure!(
+            affected > 0,
+            "No managed workspace exists under the name '{name}'."
+        );
+        if enabled {
+            tracing::info!(workspace = name, "Maintainer enabled");
+        } else {
             // Cancel any running maintainer agent for this workspace so it
             // doesn't continue creating tickets after maintenance was disabled.
             if let Some(ws) = self.get_by_name(name).await? {
                 crate::agent::registry::AGENT_REGISTRY
                     .cancel_by_role_and_workspace_path(Role::Maintainer.as_str(), &ws.path);
             }
-        }
-        if enabled {
-            tracing::info!(workspace = name, "Maintainer enabled");
-        } else {
             tracing::info!(workspace = name, "Maintainer disabled");
         }
         Ok(())
@@ -2119,6 +2160,15 @@ mod tests {
         assert!(
             !fetched.maintenance_enabled,
             "Should have maintenance disabled after set_maintenance_enabled(false)"
+        );
+
+        // A name with no row is refused rather than reported as a write that
+        // happened — the footer toggle must not claim success for nothing.
+        assert!(
+            store
+                .set_maintenance_enabled("no_such_ws", true)
+                .await
+                .is_err()
         );
     }
 
@@ -3106,27 +3156,31 @@ mod tests {
     // ── delete — dangling user-selection cleanup ──────────────
 
     #[tokio::test]
-    async fn delete_clears_dangling_user_workspace_references() {
+    async fn delete_resolves_the_admin_selection_and_clears_guests() {
         // delete() now abandons the workspace's jobs via the jobs layer, which
         // reads the shared session store — initialize all stores first. NOTE:
         // the workspace store under test uses its own temp DB, so the abandon
         // inside delete() runs against the GLOBAL session store and is a no-op
-        // here (this test exercises the dangling-selection cleanup only; the
-        // abandon integration is covered by jobs::workspace_delete_abandons_all_jobs).
+        // here (this test exercises the selection cleanup only; the abandon
+        // integration is covered by jobs::workspace_delete_abandons_all_jobs).
         crate::util::test::init_test_stores().await;
         let (store, _tmp) = test_store().await;
         // delete() removes the workspace's search engine from the global
         // registry (init_global is idempotent).
         crate::workspace_index::init_global();
-        insert_direct(&store, "doomed_ws", "/tmp/doomed_ws", false, false, 0, 0).await;
+        for name in ["doomed_ws", "survivor_a", "survivor_b", "survivor_c"] {
+            insert_direct(&store, name, &format!("/tmp/{name}"), false, false, 0, 0).await;
+        }
 
-        // Seed users via raw SQL: two reference the workspace being deleted,
-        // one references an unrelated workspace, and one has no selection.
+        // Seed users via raw SQL: two guests reference the workspace being
+        // deleted, one references an unrelated workspace, one has no selection,
+        // and the admin's desktop is on the workspace being deleted.
         for (name, ws) in [
             ("alice", Some("doomed_ws")),
             ("bob", Some("doomed_ws")),
             ("carol", Some("other_ws")),
             ("dave", None),
+            (crate::users::ADMIN_USER_NAME, Some("doomed_ws")),
         ] {
             store
                 .conn
@@ -3138,7 +3192,12 @@ mod tests {
                 .expect("seed user");
         }
 
-        store.delete("doomed_ws").await.expect("delete workspace");
+        // The admin follows the desktop's fallback pick — the first project in
+        // the footer switcher's order — not the personal folder.
+        assert_eq!(
+            store.delete("doomed_ws").await.expect("delete workspace"),
+            Some("survivor_a".to_string())
+        );
 
         // The workspace row is gone.
         assert!(
@@ -3146,11 +3205,18 @@ mod tests {
             "the workspace row must be deleted"
         );
 
-        // Referencing users are cleared (NULL = personal workspace).
+        // Guest selections referencing it are cleared (NULL = personal
+        // workspace): they keep their own behaviour.
         for name in ["alice", "bob"] {
             let selected = selected_workspace(&store, name).await;
             assert_eq!(selected, None, "{name}'s selection must be cleared");
         }
+        assert_eq!(
+            selected_workspace(&store, crate::users::ADMIN_USER_NAME)
+                .await
+                .as_deref(),
+            Some("survivor_a")
+        );
 
         // Other users are untouched: an unrelated selection is kept and a
         // user with no selection stays NULL.
@@ -3159,6 +3225,43 @@ mod tests {
             Some("other_ws")
         );
         assert_eq!(selected_workspace(&store, "dave").await, None);
+
+        // Deleting a project the desktop is not on moves nothing.
+        assert_eq!(
+            store.delete("survivor_c").await.expect("delete workspace"),
+            Some("survivor_a".to_string())
+        );
+        assert_eq!(
+            selected_workspace(&store, crate::users::ADMIN_USER_NAME)
+                .await
+                .as_deref(),
+            Some("survivor_a")
+        );
+
+        // An empty admin selection is not a steady state: the deletion repairs it
+        // onto the fallback rather than leaving the desktop outside every project.
+        store
+            .conn
+            .execute(
+                "UPDATE users SET selected_workspace = NULL WHERE name = ?1",
+                crate::db::params![crate::users::ADMIN_USER_NAME],
+            )
+            .await
+            .expect("clear the admin selection");
+        assert_eq!(
+            store.delete("survivor_b").await.expect("delete workspace"),
+            Some("survivor_a".to_string())
+        );
+
+        // The last project leaves the admin on the personal folder.
+        assert_eq!(
+            store.delete("survivor_a").await.expect("delete workspace"),
+            None
+        );
+        assert_eq!(
+            selected_workspace(&store, crate::users::ADMIN_USER_NAME).await,
+            None
+        );
     }
 
     /// Read a user's `selected_workspace` column (NULL ↔ `None`).
