@@ -168,6 +168,8 @@ pub fn init_recording_tx() {
 pub enum Page {
     Home,
     Sessions,
+    /// The log store's viewer. It has no rail entry: [`DashboardShortcut::Logs`]
+    /// is its only way in.
     Logs,
     Shell,
     Editor,
@@ -184,9 +186,10 @@ impl Page {
         &[Page::Home, Page::Editor, Page::Shell, Page::Automations]
     }
 
-    /// Pages in the sidebar bottom nav.
+    /// Pages in the sidebar bottom nav — Logs is absent by design (see
+    /// [`Page::Logs`]).
     const fn sidebar_bottom_pages() -> &'static [Page] {
-        &[Page::Sessions, Page::Logs, Page::Settings]
+        &[Page::Sessions, Page::Settings]
     }
 
     const fn label(self) -> &'static str {
@@ -377,6 +380,8 @@ pub enum Message {
     WindowHandle(u64),
     /// Keyboard shortcut: Cmd+F — focus the primary search input on the current page.
     FocusSearch,
+    /// Keyboard shortcut: Cmd+L — open the Logs page, which has no rail item.
+    OpenLogs,
     /// Keyboard shortcut: Escape — dismiss modal/panel/confirmation on the current page.
     EscapePressed,
     /// Update button pressed — open the self-update confirmation modal.
@@ -638,11 +643,13 @@ pub(crate) enum DashboardShortcut {
     Escape,
     /// Focus the page's search.
     Search,
+    /// Open the Logs page — the shortcut that replaces its rail item.
+    Logs,
 }
 
-/// The dashboard shortcut a key press stands for, or `None` — Escape, or Cmd+F
-/// (Ctrl+F elsewhere, resolved through the physical key so a non-Latin layout
-/// still produces it).
+/// The dashboard shortcut a key press stands for, or `None` — Escape, Cmd+F or
+/// Cmd+L (Ctrl+F / Ctrl+L elsewhere, resolved through the physical key so a
+/// non-Latin layout still produces them).
 ///
 /// A focused input leaves exactly these uncaptured, because
 /// [`keyboard::listen`] only delivers events no widget captured — and the chat
@@ -662,6 +669,7 @@ pub(crate) fn dashboard_shortcut(
     }
     match key.to_latin(physical_key)? {
         'f' if !modifiers.shift() => Some(DashboardShortcut::Search),
+        'l' if !modifiers.shift() => Some(DashboardShortcut::Logs),
         _ => None,
     }
 }
@@ -1787,6 +1795,14 @@ impl Dashboard {
                     .map(Message::Logs),
                 _ => Task::none(),
             },
+            Message::OpenLogs => {
+                // A dashboard overlay covers the rail, so nothing navigates out
+                // from under one: Escape is what closes overlays.
+                if self.overlay_modal_open() {
+                    return Task::none();
+                }
+                self.navigate_to(Page::Logs)
+            }
             Message::EscapePressed => self.process_escape(),
             Message::UpdateBot => {
                 // Only opens the confirmation modal — the update
@@ -2287,10 +2303,10 @@ impl Dashboard {
         Task::batch([leave, surfaces])
     }
 
-    /// Return to Home when the current page is one the sidebar no longer offers
-    /// (a workspace-scoped page whose selection stopped resolving). The sidebar
-    /// entry is such a page's only way in, so leaving it open would mean showing
-    /// a page nothing can navigate to.
+    /// Return to Home when the current page is one the dashboard no longer
+    /// offers (a workspace-scoped page whose selection stopped resolving).
+    /// [`Self::navigate_to`] refuses such a page, so leaving it open would mean
+    /// showing a page nothing can navigate to.
     fn leave_unavailable_page(&mut self) -> Task<Message> {
         if self.page_available(self.page) {
             return Task::none();
@@ -2346,9 +2362,11 @@ impl Dashboard {
     }
 
     /// Whether a dashboard-level overlay modal is open over the current page.
-    /// Used to gate the editor page's keyboard ownership. The board ticket
-    /// modal is not included: it renders only inside the Home page content
-    /// (never the global overlay stack), so it cannot sit above the editor.
+    /// Gates the editor page's keyboard ownership and the Logs shortcut — the
+    /// overlay covers the rail, so the key that replaces a rail entry does
+    /// nothing from under one. The board ticket modal is not included: it
+    /// renders only inside the Home page content (never the global overlay
+    /// stack), so it cannot sit above the editor.
     ///
     /// `pending_stop` is likewise excluded: it is rendered inside
     /// the Running Agents page body, not as an overlay over other pages.
@@ -2832,6 +2850,7 @@ impl Dashboard {
                 match dashboard_shortcut(&key, modifiers, physical_key)? {
                     DashboardShortcut::Escape => Some(Message::EscapePressed),
                     DashboardShortcut::Search => Some(Message::FocusSearch),
+                    DashboardShortcut::Logs => Some(Message::OpenLogs),
                 }
             }),
             self.shell_state.subscription().map(Message::Shell),

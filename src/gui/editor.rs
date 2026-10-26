@@ -3378,7 +3378,14 @@ impl EditorState {
     }
 
     /// Handle go-to-line toggle — opens/closes the go-to-line input bar.
+    ///
+    /// Only the page on screen may be armed: the chord reaches this listener
+    /// from every page, and a bar armed behind another page would render the
+    /// moment the editor is next shown.
     fn go_to_line_toggle(&mut self) -> Task<EditorMessage> {
+        if !self.page_visible {
+            return Task::none();
+        }
         // Allow toggle-to-close when GotoLine is already open, but
         // block if any other modal is active.
         if let Some(modal) = &self.active_modal {
@@ -5718,18 +5725,15 @@ fn map_editor_shortcut(
     if !km.altgr_active && modifiers.control() && latin('w') {
         return Some(EditorMessage::CloseActiveTab);
     }
-    // Go-to-line: Cmd+L on macOS, Ctrl+G on other platforms.
-    #[cfg(target_os = "macos")]
-    {
-        if modifiers.command() && !modifiers.control() && latin('l') {
-            return Some(EditorMessage::GoToLineToggle);
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        if !km.altgr_active && modifiers.control() && latin('g') {
-            return Some(EditorMessage::GoToLineToggle);
-        }
+    // Go-to-line: Ctrl+G on every platform. Cmd+L is the dashboard's Logs
+    // shortcut now, and macOS keeps Cmd+G for find-next.
+    let go_to_line_mod = if cfg!(target_os = "macos") {
+        modifiers.control() && !modifiers.command()
+    } else {
+        !km.altgr_active && modifiers.control()
+    };
+    if go_to_line_mod && latin('g') {
+        return Some(EditorMessage::GoToLineToggle);
     }
     // Quick open: Cmd+P / Ctrl+P
     if km.is_shortcut_platform_mod() && latin('p') {
@@ -5739,9 +5743,9 @@ fn map_editor_shortcut(
     if km.is_shortcut_platform_mod() && latin('r') {
         return Some(EditorMessage::RefreshFileTree);
     }
-    // Find next/prev: Cmd+G / F3 → FindNext, Cmd+Shift+G / Shift+F3 → FindPrev
-    // macOS uses Cmd+G; non-macOS uses Ctrl+G for go-to-line (already mapped),
-    // so F3 and Shift+F3 serve as the cross-platform find shortcuts.
+    // Find next/prev: Cmd+G / F3 → FindNext, Cmd+Shift+G / Shift+F3 → FindPrev.
+    // Cmd+G is macOS's; go-to-line is Ctrl+G everywhere, so F3 and Shift+F3 are
+    // the other platform's find shortcuts.
     #[cfg(target_os = "macos")]
     if modifiers.command() && !modifiers.control() && latin('g') {
         return if modifiers.shift() {

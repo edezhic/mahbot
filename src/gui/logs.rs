@@ -1,6 +1,9 @@
 //! Logs dashboard page — live log viewing with a per-view pagination and
 //! search over the log store.
 //!
+//! The page has no rail entry: the dashboard's Cmd+L (Ctrl+L elsewhere)
+//! shortcut is its only way in.
+//!
 //! Each view (All Logs / Only Issues) keeps its own entries, pagination state
 //! and search query, so switching views never reuses another view's page index
 //! or search. The bottom bar holds pagination, the switch between the two views,

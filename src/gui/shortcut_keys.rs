@@ -1,13 +1,21 @@
-//! Layout-independent clipboard shortcuts for widgets we do not own.
+//! Key handling for widgets we do not own — the embedded terminal.
 //!
-//! A widget that matches `keyboard::Key::Character("c")` matches the character
-//! the active layout produces, so Ctrl/Cmd+C does nothing under a Cyrillic (or
-//! any other non-Latin) layout. iced's own widgets translate the key through
-//! `Key::to_latin(physical_key)`; this wrapper applies the same translation to
-//! the events a third-party widget receives while a command/control shortcut is
-//! held, so the terminal behaves exactly as it does under an English layout.
-//! Keys without that modifier are passed through untouched — typing is never
-//! affected.
+//! iced's keyboard contract is built around the widgets it ships; the terminal
+//! is a third-party one that captures what it handles, so two adaptations keep
+//! it consistent with the rest of the dashboard:
+//!
+//! - A widget that matches `keyboard::Key::Character("c")` matches the
+//!   character the active layout produces, so Ctrl/Cmd+C does nothing under a
+//!   Cyrillic (or any other non-Latin) layout. iced's own widgets translate the
+//!   key through `Key::to_latin(physical_key)`; this wrapper applies the same
+//!   translation to the events the terminal receives while a command/control
+//!   shortcut is held, so the terminal behaves as it does under an English
+//!   layout. Keys without that modifier are passed through untouched.
+//! - The terminal types any unbound printable key press into the session, so
+//!   the dashboard's Logs shortcut would become a literal character instead of
+//!   reaching [`keyboard::listen`]. Its `text` is dropped here, which leaves the
+//!   press uncaptured. Only macOS needs this: off macOS the chord is Ctrl+L,
+//!   which the terminal binds itself and therefore already captures.
 
 use std::borrow::Cow;
 
@@ -16,18 +24,19 @@ use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, renderer};
 use iced::keyboard;
 use iced::{Element, Event, Length, Rectangle, Size};
 
-/// Show `content` with clipboard shortcuts matched on the physical key.
-pub(crate) fn latin_shortcuts<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
-    Element::new(LatinShortcuts {
+/// Show `content` with the dashboard's keyboard contract applied.
+pub(crate) fn terminal_keys<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    Element::new(TerminalKeys {
         content: content.into(),
     })
 }
 
-struct LatinShortcuts<'a, M> {
+struct TerminalKeys<'a, M> {
     content: Element<'a, M>,
 }
 
-/// The same event with a shortcut key translated to its latin character.
+/// The same event, with a shortcut key translated to its latin character and
+/// the Logs shortcut left untyped.
 fn normalize(event: &Event) -> Cow<'_, Event> {
     let Event::Keyboard(keyboard::Event::KeyPressed {
         key,
@@ -41,17 +50,28 @@ fn normalize(event: &Event) -> Cow<'_, Event> {
     if !modifiers.command() {
         return Cow::Borrowed(event);
     }
-    let Some(latin) = key.to_latin(*physical_key) else {
+    // macOS only: off macOS Ctrl+L is the terminal's own clear-screen binding,
+    // matched before the text fallback, so the terminal keeps it.
+    let logs_shortcut = cfg!(target_os = "macos")
+        && super::dashboard_shortcut(key, *modifiers, *physical_key)
+            == Some(super::DashboardShortcut::Logs);
+    let latin = key.to_latin(*physical_key);
+    if latin.is_none() && !logs_shortcut {
         return Cow::Borrowed(event);
-    };
+    }
     let mut rewritten = event.clone();
-    if let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = &mut rewritten {
-        *key = keyboard::Key::Character(latin.to_string().into());
+    if let Event::Keyboard(keyboard::Event::KeyPressed { key, text, .. }) = &mut rewritten {
+        if let Some(latin) = latin {
+            *key = keyboard::Key::Character(latin.to_string().into());
+        }
+        if logs_shortcut {
+            *text = None;
+        }
     }
     Cow::Owned(rewritten)
 }
 
-impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LatinShortcuts<'_, Message> {
+impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalKeys<'_, Message> {
     fn tag(&self) -> tree::Tag {
         self.content.as_widget().tag()
     }
