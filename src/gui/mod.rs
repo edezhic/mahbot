@@ -50,7 +50,8 @@ use crate::pipeline::board::Ticket;
 
 use iced::keyboard;
 use iced::widget::{
-    Column, Row, Space, button, column, container, image, pick_list, row, rule, text, tooltip,
+    Column, Row, Space, button, column, container, image, pick_list, row, rule, scrollable, text,
+    tooltip,
 };
 use iced::window;
 use iced::{Alignment, Element, Length, Task};
@@ -83,6 +84,11 @@ const RUNTIME_REFRESH_COALESCE: Duration = Duration::from_millis(250);
 
 /// The left nav rail's fixed width, in px: the content area starts to its right.
 const SIDEBAR_RAIL_WIDTH: f32 = 56.0;
+
+/// The bottom footer bar's fixed height, in px. The toast stack clears it (see
+/// [`Dashboard::view`]), and there is no bar to clear while
+/// [`Dashboard::footer_hidden`].
+const FOOTER_HEIGHT: f32 = 42.0;
 
 /// The portions the Home page's chat and its ticket column split the content
 /// area by. The column's share also sizes a fresh window's opening width (see
@@ -175,7 +181,10 @@ pub enum Page {
     Editor,
     Settings,
     Automations,
-    /// Live view of running agents and in-flight non-agent LLM work.
+    /// Live view of running agents and in-flight non-agent LLM work. Its way in
+    /// is the activity indicators — the footer bar's, or the rail column's while
+    /// [`Dashboard::footer_hidden`] — so, like them, it has no entry while
+    /// nothing runs.
     RunningAgents,
 }
 
@@ -924,6 +933,30 @@ impl Dashboard {
         }
         let path = self.workspaces.get(name)?.path.as_str();
         (!path.is_empty()).then_some((name, path))
+    }
+
+    /// Whether the bottom footer bar is hidden: the workspace map holds no
+    /// managed workspace, and the personal folder is the active selection. Both
+    /// halves are load-bearing, because each one covers a transient the other
+    /// cannot: the selection stays unset until a read settles one, which carries
+    /// the bar through the boot window, and after the last project is deleted it
+    /// keeps naming that project while the map is already empty. The empty map
+    /// must in turn not be a failed read's placeholder, so a failed read leaves
+    /// the bar — and how it reports the failure — exactly where it is.
+    ///
+    /// With the bar hidden, what it carried moves into the rail: the voice
+    /// status under the nav icons and the running-agent indicators above
+    /// Sessions ([`Self::render_sidebar_mid`]).
+    fn footer_hidden(&self) -> bool {
+        self.workspaces_error.is_none()
+            && self
+                .workspaces
+                .keys()
+                .all(|name| crate::users::is_personal_workspace(name))
+            && self
+                .selected_workspace_name
+                .as_deref()
+                .is_some_and(crate::users::is_personal_workspace)
     }
 
     /// Whether `page` is offered in the navigation. Only the editor and the
@@ -2460,8 +2493,8 @@ impl Dashboard {
             .into();
         }
 
-        let sidebar = self.sidebar_view();
-        let footer = self.footer_view();
+        let footer_hidden = self.footer_hidden();
+        let sidebar = self.sidebar_view(footer_hidden);
         let content = match self.page {
             Page::Home => {
                 let modal = self.board_state.render_modal_overlay().map(Message::Board);
@@ -2489,14 +2522,16 @@ impl Dashboard {
             ),
         };
 
-        let body = column![
+        let mut body = column![
             row![sidebar, content]
                 .width(Length::Fill)
-                .height(Length::Fill),
-            footer,
+                .height(Length::Fill)
         ]
         .width(Length::Fill)
         .height(Length::Fill);
+        if !footer_hidden {
+            body = body.push(self.footer_view());
+        }
 
         // Keep Stack widget type stable to prevent state loss on toast
         // transitions. A type tag change (Column ↔ Stack) would cause Iced
@@ -2531,7 +2566,13 @@ impl Dashboard {
                 .width(Length::Fill)
                 .align_x(Alignment::Center)
                 .padding(iced::Padding {
-                    bottom: 44.0,
+                    // Clears the footer bar; with the bar hidden the stack keeps
+                    // only the window's own inset instead of a vacated strip.
+                    bottom: if footer_hidden {
+                        theme::PAD_16
+                    } else {
+                        FOOTER_HEIGHT + theme::SPACE_2
+                    },
                     ..Default::default()
                 })
                 .align_bottom(Length::Fill)
@@ -3178,6 +3219,38 @@ fn user_channels_cdc_subscription() -> impl futures_util::Stream<Item = Message>
     )
 }
 
+/// A running indicator — a role's agent count, or the in-flight non-agent call
+/// counter — ready for either place it is drawn: its content, and the wording its
+/// tooltip carries.
+struct RunningIndicator {
+    content: Element<'static, Message>,
+    label: String,
+}
+
+impl RunningIndicator {
+    /// The footer's presentation: in the right-hand indicator row, tooltip above.
+    fn footer(self) -> Element<'static, Message> {
+        widgets::icon_tooltip_button(
+            container(self.content).padding([0.0, theme::PAD_3]),
+            self.label,
+            Some(Message::Navigation(Page::RunningAgents)),
+            0,
+            theme::button_text,
+            tooltip::Position::Top,
+        )
+    }
+
+    /// The rail's presentation: a full-width rail entry, tooltip to the side
+    /// like every other entry.
+    fn rail(self) -> Element<'static, Message> {
+        Dashboard::sidebar_rail_item(
+            self.content,
+            self.label,
+            Some(Message::Navigation(Page::RunningAgents)),
+        )
+    }
+}
+
 // ── Navigation sidebar ──────────────────────────────────────────
 
 /// Map a [`Page`] variant to its corresponding Lucide icon element, unstyled so
@@ -3199,27 +3272,76 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
 }
 
 impl Dashboard {
-    fn sidebar_view(&self) -> Element<'_, Message> {
-        let col = column![
-            self.render_sidebar_nav(),
-            Space::new().height(Length::Fill),
-            self.render_sidebar_bottom_nav(),
-        ];
-        container(col.spacing(theme::SPACE_2))
-            .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
-            .height(Length::Fill)
-            .style(theme::surface_container_style)
-            .padding(theme::PAD_4)
-            .into()
+    /// The nav rail: the top nav icons, the voice status while the footer is
+    /// hidden, the stretch in between ([`Self::render_sidebar_mid`]) and the
+    /// bottom nav icons.
+    fn sidebar_view(&self, footer_hidden: bool) -> Element<'_, Message> {
+        let mut col = Column::new()
+            .spacing(theme::SPACE_2)
+            .push(self.render_sidebar_nav());
+        if footer_hidden {
+            col = col.push(Self::render_sidebar_voice());
+        }
+        container(
+            col.push(Self::render_sidebar_mid(footer_hidden))
+                .push(self.render_sidebar_bottom_nav()),
+        )
+        .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
+        .height(Length::Fill)
+        .style(theme::surface_container_style)
+        .padding(theme::PAD_4)
+        .into()
+    }
+
+    /// The rail's stretch between the nav icons and the bottom nav. With the
+    /// footer hidden it carries the running-agent indicators, bottom-aligned so
+    /// the column sits directly above Sessions; it fills the free height and
+    /// scrolls inside its own area, so the nav entries keep their size however
+    /// many roles run. Otherwise it is the plain spacer that keeps the two nav
+    /// groups apart.
+    fn render_sidebar_mid(footer_hidden: bool) -> Element<'static, Message> {
+        if footer_hidden && let Some(agents) = Self::render_sidebar_agents() {
+            return container(agents)
+                .width(Length::Fill)
+                .align_bottom(Length::Fill)
+                .into();
+        }
+        Space::new().height(Length::Fill).into()
+    }
+
+    /// A rail entry: its content centered in the rail's full width, tooltip to
+    /// the side — iced snaps Top tooltips into the viewport, overlapping the
+    /// topmost rail entry. `on_press: None` makes a static entry (the voice
+    /// status, which only reports).
+    fn sidebar_rail_item(
+        content: Element<'static, Message>,
+        label: impl Into<Cow<'static, str>>,
+        on_press: Option<Message>,
+    ) -> Element<'static, Message> {
+        tooltip(
+            button(
+                // The container's generous vertical padding gives the button a
+                // large hit area within the fixed 56px rail.
+                container(content)
+                    .width(Length::Fill)
+                    .center_x(Length::Fill)
+                    .padding([theme::PAD_10, 0.0]),
+            )
+            .width(Length::Fill)
+            .padding(0)
+            .style(theme::button_text)
+            .on_press_maybe(on_press),
+            text(label.into()).size(theme::TEXT_11),
+            tooltip::Position::Right,
+        )
+        .style(theme::tooltip_style)
+        .into()
     }
 
     /// Shared nav-icon column for the sidebar top and bottom navs. Each page is
     /// a 48px-tall full-width icon button (28px icon) with the active page
     /// accent-colored; a page that is not available ([`Self::page_available`]) is
     /// absent from the column entirely.
-    ///
-    /// Uses Position::Right — iced snaps Top tooltips into the viewport,
-    /// overlapping the topmost sidebar button.
     fn sidebar_nav_column(&self, pages: &[Page]) -> Column<'_, Message> {
         let mut col = Column::new().spacing(theme::SPACE_2);
         for page in pages {
@@ -3231,32 +3353,19 @@ impl Dashboard {
             } else {
                 theme::TEXT_MUTED
             };
-            // The container's generous vertical padding gives the button a large
-            // hit area within the fixed 56px rail.
-            col = col.push(
-                tooltip(
-                    button(
-                        container(page_icon(*page).size(28).color(color))
-                            .width(Length::Fill)
-                            .center_x(Length::Fill)
-                            .padding([theme::PAD_10, 0.0]),
-                    )
-                    .width(Length::Fill)
-                    .padding(0)
-                    .style(theme::button_text)
-                    .on_press(Message::Navigation(*page)),
-                    text(page.label()).size(theme::TEXT_11),
-                    tooltip::Position::Right,
-                )
-                .style(theme::tooltip_style),
-            );
+            col = col.push(Self::sidebar_rail_item(
+                page_icon(*page).size(28).color(color).into(),
+                page.label(),
+                Some(Message::Navigation(*page)),
+            ));
         }
         col
     }
 
-    /// Sidebar top nav icons (see [`Page::sidebar_pages`]). Running Agents
-    /// is not in the sidebar — it is reachable only via the footer activity
-    /// indicators.
+    /// Sidebar top nav icons (see [`Page::sidebar_pages`]). Running Agents is not
+    /// in the sidebar — it is reachable only via the running-agent indicators,
+    /// which live in the footer bar or, with the footer hidden, in the rail
+    /// ([`Self::render_sidebar_agents`]).
     fn render_sidebar_nav(&self) -> Element<'_, Message> {
         self.sidebar_nav_column(Page::sidebar_pages()).into()
     }
@@ -3264,6 +3373,62 @@ impl Dashboard {
     /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]).
     fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
         self.sidebar_nav_column(Page::sidebar_bottom_pages()).into()
+    }
+
+    /// The rail's voice status, standing in for the footer bar's label while the
+    /// footer is hidden: an `ear` while the microphone side is active, a
+    /// `pen-line` while a transcription runs, and the bar's own wording as the
+    /// tooltip. The bar's resting label is the one state the rail leaves out — an
+    /// idle listener is the normal condition, not something to report from the
+    /// navigation — and an empty slot then keeps its place, so no status change
+    /// rebuilds the column below it.
+    #[cfg(target_os = "macos")]
+    fn render_sidebar_voice() -> Element<'static, Message> {
+        let status = crate::audio::voice::get_status();
+        if matches!(status, VoiceStatus::Listening) {
+            return Space::new().height(0).into();
+        }
+        let Some(label) = Self::voice_status_label(&status) else {
+            return Space::new().height(0).into();
+        };
+        let icon = if matches!(status, VoiceStatus::Transcribing) {
+            lucide::pen_line::<iced::Theme, iced::Renderer>()
+        } else {
+            lucide::ear::<iced::Theme, iced::Renderer>()
+        };
+        Self::sidebar_rail_item(icon.size(28).color(theme::TEXT_MUTED).into(), label, None)
+    }
+
+    /// No audio subsystem, so no voice status to report.
+    #[cfg(not(target_os = "macos"))]
+    fn render_sidebar_voice() -> Element<'static, Message> {
+        Space::new().height(0).into()
+    }
+
+    /// The rail's running-agent indicators — one per role with agents running,
+    /// in the footer's order, then the in-flight non-agent call counter — as a
+    /// column that scrolls once the rail cannot show them all. `None` when
+    /// nothing is running: neither indicator renders, exactly as in the footer.
+    fn render_sidebar_agents() -> Option<Element<'static, Message>> {
+        let mut items: Vec<Element<'static, Message>> = Self::running_roles()
+            .into_iter()
+            .map(|(role, count)| Self::running_role_indicator(role, count, theme::TEXT_11).rail())
+            .collect();
+        if let Some(calls) = Self::non_agent_calls(theme::TEXT_11) {
+            items.push(calls.rail());
+        }
+        if items.is_empty() {
+            return None;
+        }
+        // A scrollbar would be painted over the right edge of these 48px
+        // entries; a half-visible row already shows there is more.
+        Some(
+            scrollable(Column::with_children(items).spacing(theme::SPACE_2))
+                .direction(theme::hidden_vertical_scrollbar())
+                .height(Length::Shrink)
+                .width(Length::Fill)
+                .into(),
+        )
     }
 
     /// Footer per-workspace Maintainer toggle icon button.
@@ -3686,81 +3851,62 @@ impl Dashboard {
         )
     }
 
-    /// Render the active agent icons in the right side of the footer.
-    /// Returns `None` when no agents are running.
-    ///
-    /// Each role-icon indicator is a clickable button navigating to the
-    /// Running Agents page; its tooltip carries the role name.
-    fn render_active_agents() -> Option<Element<'static, Message>> {
+    /// Roles with agents running and how many of each, in role order — the one
+    /// grouping every running-agent indicator is built from.
+    fn running_roles() -> Vec<(Role, usize)> {
         let handles = crate::agent::registry::AGENT_REGISTRY.list();
-        let mut role_counts: std::collections::BTreeMap<&str, usize> =
-            std::collections::BTreeMap::new();
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for h in &handles {
-            *role_counts.entry(h.role.as_str()).or_insert(0) += 1;
+            *counts.entry(h.role.as_str()).or_insert(0) += 1;
         }
-        if role_counts.is_empty() {
-            return None;
-        }
-        let mut icons: Vec<Element<'_, Message>> = Vec::new();
-        for (role_str, count) in &role_counts {
-            let role: crate::Role = role_str.parse().unwrap_or(crate::Role::Engineer);
-            let (color, _bg) = theme::role_badge_color_for(&role);
-            let icon = theme::role_icon(&role).size(theme::TEXT_24).color(color);
-            let content: Element<'_, Message> = if *count > 1 {
-                container(
-                    row![
-                        icon,
-                        text(format!("×{count}")).size(theme::TEXT_14).color(color)
-                    ]
-                    .spacing(theme::SPACE_3)
-                    .align_y(Alignment::Center),
-                )
-                .padding([0.0, theme::PAD_3])
-                .into()
-            } else {
-                container(icon).padding([0.0, theme::PAD_3]).into()
-            };
-            icons.push(widgets::icon_tooltip_button(
-                content,
-                role.display_label(),
-                Some(Message::Navigation(Page::RunningAgents)),
-                0,
-                theme::button_text,
-                tooltip::Position::Top,
-            ));
-        }
-        Some(
-            Row::with_children(icons)
-                .spacing(theme::SPACE_12)
-                .align_y(Alignment::Center)
-                .into(),
-        )
+        counts
+            .into_iter()
+            .map(|(role, count)| (role.parse().unwrap_or(Role::Engineer), count))
+            .collect()
     }
 
-    /// Render the in-flight non-agent LLM call counter next to the agent
-    /// icons. Distinct marker (zap glyph in accent color); a tooltip lists
-    /// the in-flight call kinds as human-readable labels. The whole indicator
-    /// is a clickable button navigating to the Running Agents page.
-    /// Returns `None` when none are in flight.
-    fn render_non_agent_calls() -> Option<Element<'static, Message>> {
+    /// One role's indicator: the role icon in its badge color, plus a `×N` count
+    /// once more than one agent of the role runs. `count_size` sizes that count —
+    /// the rail has less width for it than the footer.
+    fn running_role_indicator(role: Role, count: usize, count_size: f32) -> RunningIndicator {
+        let (color, _bg) = theme::role_badge_color_for(&role);
+        let icon = theme::role_icon(&role).size(theme::TEXT_24).color(color);
+        let content: Element<'static, Message> = if count > 1 {
+            row![
+                icon,
+                text(format!("×{count}")).size(count_size).color(color)
+            ]
+            .spacing(theme::SPACE_3)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            icon.into()
+        };
+        RunningIndicator {
+            content,
+            label: role.display_label().into(),
+        }
+    }
+
+    /// The in-flight non-agent LLM call counter, `count_size` as in
+    /// [`Self::running_role_indicator`]. `None` when none are in flight.
+    fn non_agent_calls(count_size: f32) -> Option<RunningIndicator> {
         let handles = crate::agent::registry::NON_AGENT_CALLS.list();
         if handles.is_empty() {
             return None;
         }
         let color = theme::ACCENT;
-        let content = container(
-            row![
-                lucide::zap::<iced::Theme, iced::Renderer>()
-                    .size(theme::TEXT_24)
-                    .color(color),
-                text(format!("×{}", handles.len()))
-                    .size(theme::TEXT_14)
-                    .color(color),
-            ]
-            .spacing(theme::SPACE_3)
-            .align_y(Alignment::Center),
-        )
-        .padding([0.0, theme::PAD_3]);
+        let content = row![
+            lucide::zap::<iced::Theme, iced::Renderer>()
+                .size(theme::TEXT_24)
+                .color(color),
+            text(format!("×{}", handles.len()))
+                .size(count_size)
+                .color(color),
+        ]
+        .spacing(theme::SPACE_3)
+        .align_y(Alignment::Center)
+        .into();
         // Tooltip lists the in-flight kinds as static human-readable labels —
         // raw snake_case kind names never surface. Map to labels FIRST, then
         // dedup: two unknown kinds share the generic fallback label, so
@@ -3771,15 +3917,34 @@ impl Dashboard {
             .collect();
         labels.sort_unstable();
         labels.dedup();
-        let tooltip_text = labels.join(", ");
-        Some(widgets::icon_tooltip_button(
+        Some(RunningIndicator {
             content,
-            tooltip_text,
-            Some(Message::Navigation(Page::RunningAgents)),
-            0,
-            theme::button_text,
-            tooltip::Position::Top,
-        ))
+            label: labels.join(", "),
+        })
+    }
+
+    /// The active agent icons in the right side of the footer. `None` when no
+    /// agents are running.
+    fn render_active_agents() -> Option<Element<'static, Message>> {
+        let icons: Vec<Element<'static, Message>> = Self::running_roles()
+            .into_iter()
+            .map(|(role, count)| Self::running_role_indicator(role, count, theme::TEXT_14).footer())
+            .collect();
+        if icons.is_empty() {
+            return None;
+        }
+        Some(
+            Row::with_children(icons)
+                .spacing(theme::SPACE_12)
+                .align_y(Alignment::Center)
+                .into(),
+        )
+    }
+
+    /// The in-flight non-agent call counter next to the agent icons in the
+    /// footer. `None` when none are in flight.
+    fn render_non_agent_calls() -> Option<Element<'static, Message>> {
+        Some(Self::non_agent_calls(theme::TEXT_14)?.footer())
     }
 
     /// Render the TTS download progress indicator in the centre of the footer bar.
@@ -3795,44 +3960,47 @@ impl Dashboard {
         footer_status_label(label)
     }
 
-    /// Render a compact voice status indicator in the footer bar.
-    ///
-    /// Shows a compact indicator for every [`VoiceStatus`] variant except
-    /// [`VoiceStatus::Disabled`] (which is hidden — voice is off).
-    /// [`VoiceStatus::Error`] displays the actual error string rather than
-    /// a hardcoded message.
+    /// The footer bar's wording for a [`VoiceStatus`], without the speaker glyph
+    /// the bar draws in front of it. `None` for voice off, which the bar hides.
     #[cfg(target_os = "macos")]
-    fn render_voice_status() -> Element<'static, Message> {
-        let label: String = match crate::audio::voice::get_status() {
-            // Hidden when voice is disabled.
-            VoiceStatus::Disabled => return Space::new().width(0).into(),
-            VoiceStatus::LoadingModels => "🔊 Loading…".into(),
-            VoiceStatus::ModelError => "🔊 ⚠ Model error".into(),
-            VoiceStatus::Listening => "🔊 Listening".into(),
-            VoiceStatus::RecordingWakeWord | VoiceStatus::RecordingButton => "🔊 Recording…".into(),
-            VoiceStatus::Transcribing => "🔊 Transcribing…".into(),
-            VoiceStatus::MicPermissionDenied => "🔊 No mic access".into(),
-            VoiceStatus::MicDisconnected => "🔊 Mic disconnected".into(),
-            VoiceStatus::Enrolling { sample, total, .. } => {
-                format!("🔊 Enrolling {sample}/{total}")
-            }
+    fn voice_status_label(status: &VoiceStatus) -> Option<String> {
+        Some(match status {
+            VoiceStatus::Disabled => return None,
+            VoiceStatus::Listening => "Listening".into(),
+            VoiceStatus::LoadingModels => "Loading…".into(),
+            VoiceStatus::ModelError => "⚠ Model error".into(),
+            VoiceStatus::RecordingWakeWord | VoiceStatus::RecordingButton => "Recording…".into(),
+            VoiceStatus::Transcribing => "Transcribing…".into(),
+            VoiceStatus::MicPermissionDenied => "No mic access".into(),
+            VoiceStatus::MicDisconnected => "Mic disconnected".into(),
+            VoiceStatus::Enrolling { sample, total, .. } => format!("Enrolling {sample}/{total}"),
             VoiceStatus::ListeningDuringEnrollment { sample, total } => {
-                format!("🔊 Listen… {sample}/{total}")
+                format!("Listen… {sample}/{total}")
             }
             VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total } => {
-                format!("🔊 Wait… {sample}/{total}")
+                format!("Wait… {sample}/{total}")
             }
             VoiceStatus::EnrollingNegatives {
                 accumulated_secs,
                 target_secs,
                 ..
-            } => {
-                format!("🔊 Collecting negatives {accumulated_secs}s/{target_secs}s")
-            }
-            VoiceStatus::Enrolled => "🔊 ✅ Enrolled".into(),
-            VoiceStatus::Error(msg) => format!("🔊 Error: {msg}"),
+            } => format!("Collecting negatives {accumulated_secs}s/{target_secs}s"),
+            VoiceStatus::Enrolled => "✅ Enrolled".into(),
+            VoiceStatus::Error(msg) => format!("Error: {msg}"),
+        })
+    }
+
+    /// Render a compact voice status indicator in the footer bar.
+    ///
+    /// Shows a compact indicator for every [`VoiceStatus`] the shared label
+    /// covers (see [`Self::voice_status_label`]); [`VoiceStatus::Error`]
+    /// displays the actual error string rather than a hardcoded message.
+    #[cfg(target_os = "macos")]
+    fn render_voice_status() -> Element<'static, Message> {
+        let Some(label) = Self::voice_status_label(&crate::audio::voice::get_status()) else {
+            return Space::new().width(0).into();
         };
-        footer_status_label(label)
+        footer_status_label(format!("🔊 {label}"))
     }
 
     /// 42px footer bar — update/picker/toggle chrome (left) and active
@@ -3886,7 +4054,7 @@ impl Dashboard {
 
         container(footer_row)
             .align_y(Alignment::Center)
-            .height(Length::Fixed(42.0))
+            .height(Length::Fixed(FOOTER_HEIGHT))
             .width(Length::Fill)
             .style(theme::surface_container_style)
             .into()

@@ -579,6 +579,14 @@ pub fn vertical_scrollbar() -> scrollable::Direction {
     scrollable::Direction::Vertical(thin_scrollbar())
 }
 
+/// Returns a vertical [`scrollable::Direction`] that scrolls without drawing a
+/// scrollbar — for a container too narrow to spend its edge on a rail, where the
+/// bar would be painted over the content itself.
+#[must_use]
+pub fn hidden_vertical_scrollbar() -> scrollable::Direction {
+    scrollable::Direction::Vertical(scrollable::Scrollbar::hidden())
+}
+
 /// Returns a horizontal [`scrollable::Direction`] with the thin scrollbar,
 /// embedded (zero spacing) so the rail occupies layout space at the bottom of
 /// the scrollable — iced reserves it only while the content overflows, so a
