@@ -164,7 +164,7 @@ pub fn role_badge_color(role: &str) -> (Color, Color) {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     match role {
-        crate::Role::Manager => lucide::bot(),
+        crate::Role::Manager => lucide::folder_kanban(),
         crate::Role::Engineer => lucide::code(),
         crate::Role::Analyst => lucide::scan_search(),
         crate::Role::Worker => lucide::hammer(),
@@ -173,7 +173,7 @@ pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme,
         crate::Role::Discovery => lucide::search(),
         crate::Role::Reviewer => lucide::file_check(),
         crate::Role::Sanitation => lucide::spray_can(),
-        crate::Role::Assistant => lucide::message_square(),
+        crate::Role::Assistant => lucide::bot(),
         crate::Role::Custom => lucide::puzzle(),
     }
 }
