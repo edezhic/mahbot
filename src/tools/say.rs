@@ -8,10 +8,15 @@
 //!
 //! A phrase is one short sentence, not a reading: anything over
 //! [`MAX_PHRASE_CHARS`] is refused rather than spoken. Every refusal — too long,
-//! speech output switched off, engine not up — is this tool's ordinary answer,
-//! not a failure: the Assistant did nothing wrong, and each one says what to do
-//! instead. The engine's own bring-up (download, device open) is kicked on the
-//! side and never waited for.
+//! speech output switched off, engine not up, nobody at the computer — is this
+//! tool's ordinary answer, not a failure: the Assistant did nothing wrong, and
+//! each one says what to do instead. The engine's own bring-up (download, device
+//! open) is kicked on the side and never waited for.
+//!
+//! The refusal for an absent user is the tool's one use of the machine-wide
+//! user-activity state ([`crate::user_activity`]), and it comes last in the
+//! engine's gates so the answers for speech that cannot be produced at all keep
+//! precedence.
 //!
 //! macOS only, where the speech engine lives — the module is `cfg`-gated in
 //! `tools/mod.rs`, and the admin's Assistant is its only holder.
@@ -70,16 +75,18 @@ impl Tool for SayTool {
                  phrase of at most {MAX_PHRASE_CHARS} characters — long text is not read aloud."
             ));
         }
-        match tts::say_phrase(text) {
-            SayOutcome::Speaking => Ok("Spoken: the phrase plays now.".into()),
+        Ok(match tts::say_phrase(text) {
+            SayOutcome::Speaking => "Spoken: the phrase plays now.".into(),
             SayOutcome::SpeechOff => {
-                Ok("Nothing was spoken: the user has speech output turned off right now.".into())
+                "Nothing was spoken: the user has speech output turned off right now.".into()
             }
-            SayOutcome::NotReady(reason) => Ok(format!(
-                "Nothing was spoken: {}.",
-                not_ready_reason(&reason)
-            )),
-        }
+            SayOutcome::Absent => {
+                "Nothing was spoken: the user is not at the computer right now.".into()
+            }
+            SayOutcome::NotReady(reason) => {
+                format!("Nothing was spoken: {}.", not_ready_reason(&reason))
+            }
+        })
     }
 }
 

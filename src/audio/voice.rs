@@ -1587,6 +1587,8 @@ fn run_enrollment_self_test(
             }
         }
         if detected_this {
+            // Enrollment recognises the phrase in utterances the user just spoke.
+            crate::user_activity::report_activity();
             passed += 1;
         }
     }
@@ -4136,6 +4138,12 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
                     if _rolling_sum > ctx.instrumentation.peak_score {
                         ctx.instrumentation.peak_score = _rolling_sum;
                     }
+                }
+
+                // A recognised phrase is a person at the computer, even when the
+                // position gate below refuses the fire.
+                if detected {
+                    crate::user_activity::report_activity();
                 }
 
                 // A fire is accepted only near the start of the segment it

@@ -15,6 +15,8 @@
 //! 1. Speech output is enabled in config ([`is_config_enabled`]).
 //! 2. The Supertonic 3 model files are cached and loaded.
 //! 3. An audio output device could be opened.
+//! 4. Someone is at the computer ([`crate::user_activity`]) — a phrase is not
+//!    spoken to an empty room.
 //!
 //! A newer phrase replaces the one still being spoken ([`cancel_playback`]).
 //!
@@ -440,6 +442,8 @@ pub(crate) enum SayOutcome {
     SpeechOff,
     /// The engine is not up, so nothing was spoken; its bring-up was kicked.
     NotReady(NotReady),
+    /// The user is not at the computer, so nothing was spoken.
+    Absent,
 }
 
 /// Why the engine could not speak a phrase right now.
@@ -480,6 +484,12 @@ pub(crate) fn say_phrase(text: &str) -> SayOutcome {
         // cannot be cancelled.
         drop(tokio::task::spawn_blocking(ensure_audio_output));
         return SayOutcome::NotReady(NotReady::NoAudioDevice);
+    }
+    // Last, so the answers above keep precedence: what cannot be produced at all
+    // is reported as such, and absence only stops speech that would otherwise be
+    // produced.
+    if crate::user_activity::is_absent() {
+        return SayOutcome::Absent;
     }
     speak(text);
     SayOutcome::Speaking

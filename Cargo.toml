@@ -318,6 +318,9 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_StationsAndDesktops",
+    # GetTickCount — the clock `GetLastInputInfo` reports its last input against
+    # (`user_activity::os_idle`).
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
@@ -387,7 +390,9 @@ dispatch2 = "0.3"
 # the Screenshot portal over zbus — all Rust-only, no system packages.
 atspi = { version = "0.30", default-features = false, features = ["proxies", "wrappers", "tokio"] }
 enigo = { version = "0.6", default-features = false, features = ["x11rb"] }
-x11rb = "0.13"
+# The `screensaver` feature adds the screen-saver extension's idle time — how long
+# since the X server last saw input, read by `user_activity::os_idle`.
+x11rb = { version = "0.13", features = ["screensaver"] }
 zbus = "5"
 # Boxes the async AT-SPI tree walk (already a transitive zbus dependency — same
 # version, no new fork); the accessibility tree is inherently recursive.

@@ -2,6 +2,8 @@
 
 pub(crate) mod catalog_cache;
 pub(crate) mod disk;
+#[cfg(target_os = "linux")]
+pub(crate) mod display_server;
 pub(crate) mod error;
 pub(crate) mod folder_name;
 pub(crate) mod html;

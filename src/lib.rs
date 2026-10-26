@@ -166,6 +166,13 @@ pub mod shell_env;
 pub mod shutdown;
 // Ownership of the daemon's private temp directory, from creation to cleanup.
 pub mod temp;
+// Who is at the computer right now: the machine-wide active/absent state, its
+// operating-system input reader and the wake word's activity report.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only the macOS speech tool reads it")
+)]
+pub(crate) mod user_activity;
 
 // ── Cancellation and cleanup ─────────────────────────────────────────────
 // The cancel action behind the `analyze` tool, confined to the caller's own

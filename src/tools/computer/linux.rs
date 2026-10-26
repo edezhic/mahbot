@@ -5,11 +5,10 @@
 //!
 //! # Which server this is
 //!
-//! Wayland is decided from the display server, not from an environment variable: an X
-//! connection that advertises `XWAYLAND` is XWayland, i.e. a Wayland session, and one
-//! without it is a real X server; `WAYLAND_DISPLAY` decides only a session with no X
-//! connection at all. A Wayland session therefore gets stills through the portal and no
-//! coordinate input, whether or not `WAYLAND_DISPLAY` is set.
+//! [`wayland`] (from [`crate::util::display_server`]) decides stills and coordinate input: a
+//! Wayland session gets stills through the portal and no coordinate input, whether or not
+//! `WAYLAND_DISPLAY` is set. XWayland counts as Wayland, since an X connection there is not
+//! the session's server.
 //!
 //! # Nothing left held, and nothing left behind
 //!
@@ -101,6 +100,7 @@ use super::core::{
     Locator, Modifier, MouseButton, Observation, RawInput, ScrollDirection, SurfaceGeometry,
     TargetSpec, Truncation, UiNode, UnreadWindows, WindowInfo, WindowKey, WindowListing,
 };
+use crate::util::display_server::wayland;
 use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::Context as _;
 use anyhow::anyhow;
@@ -329,17 +329,7 @@ async fn registry_root(conn: &zbus::Connection) -> anyhow::Result<AccessibleProx
         .map_err(|e| dbus_err(e, "access registry root"))
 }
 
-// ── Display server and session state ─────────────────────────────────────
-
-/// The display server this process is talking to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DisplayServer {
-    X11,
-    Wayland,
-}
-
-static DISPLAY_SERVER: std::sync::OnceLock<DisplayServer> = std::sync::OnceLock::new();
-
+// ── Session lock state ───────────────────────────────────────────────────
 /// systemd-logind, whose per-session `LockedHint` is the desktop-agnostic lock signal.
 const LOGIND_DEST: &str = "org.freedesktop.login1";
 const LOGIND_PATH: &str = "/org/freedesktop/login1";
@@ -365,40 +355,6 @@ async fn system_bus() -> Option<zbus::Connection> {
     let conn = zbus::Connection::system().await.ok()?;
     *held = Some(conn.clone());
     Some(conn)
-}
-
-/// Which server this session is, from the probe the module header describes. The answer is
-/// kept for the life of the process — a session does not change server under it — while a
-/// probe that could not reach the server is retried by the next caller.
-fn display_server() -> Option<DisplayServer> {
-    if let Some(known) = DISPLAY_SERVER.get() {
-        return Some(*known);
-    }
-    let probed = with_block_in_place(probe_display_server)?;
-    let _ = DISPLAY_SERVER.set(probed);
-    Some(probed)
-}
-
-fn probe_display_server() -> Option<DisplayServer> {
-    if std::env::var_os("DISPLAY").is_some()
-        && let Ok((conn, _screen)) = x11rb::connect(None)
-    {
-        let xwayland = xproto::query_extension(&conn, b"XWAYLAND")
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .is_some_and(|reply| reply.present);
-        return Some(if xwayland {
-            DisplayServer::Wayland
-        } else {
-            DisplayServer::X11
-        });
-    }
-    std::env::var_os("WAYLAND_DISPLAY").map(|_| DisplayServer::Wayland)
-}
-
-/// Whether this is a Wayland session — the branch every still and coordinate map takes.
-fn wayland() -> bool {
-    display_server() == Some(DisplayServer::Wayland)
 }
 
 /// `LockedHint` of this process's logind session, read under [`STATE_PROBE_TIMEOUT`]:
