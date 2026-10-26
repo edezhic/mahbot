@@ -2379,17 +2379,16 @@ impl Dashboard {
             row![container(home_view).width(Length::FillPortion(CHAT_COLUMN_PORTION))];
         if !self.board_state.has_nothing_to_show() {
             let sidebar = ticket_sidebar(&self.board_state);
-            // Sidebar right-click menu: the two bulk actions over the list the
-            // sidebar shows — each label carries that all-workspaces scope, so it
-            // is read before acting. Pausing is offered only when a queued ticket
-            // is listed.
+            // Sidebar right-click menu: the two bulk actions over the board —
+            // archiving done and cancelled tickets, pausing queued ones.
+            // Pausing is offered only when a queued ticket is listed.
             let mut menu_items = vec![menus::MenuItem::new(
-                "Archive done & cancelled (all workspaces)".into(),
+                "Archive done & cancelled".into(),
                 Message::Board(board::BoardMessage::ArchiveAllCompleted),
             )];
             if self.board_state.has_queued_tickets() {
                 menu_items.push(menus::MenuItem::new(
-                    "Pause all queued tickets (all workspaces)".into(),
+                    "Pause all queued tickets".into(),
                     Message::Board(board::BoardMessage::PauseAllQueued),
                 ));
             }
