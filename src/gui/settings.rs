@@ -723,20 +723,16 @@ fn sync_voice_state(enabled: bool) {
     }
 }
 
-/// Height of the custom-role tool picker's viewport — the catalogue overflows
-/// the window, so the list is bounded instead of stretching it to fit.
-const TOOL_PICKER_HEIGHT: f32 = 260.0;
+/// The custom-role prompt editor's own resizing range: it grows with its text up
+/// to the maximum, and gives that height back down to the minimum when the window
+/// runs out of room for the tools below it.
+const CUSTOM_ROLE_PROMPT_MIN_HEIGHT: f32 = 120.0;
+const CUSTOM_ROLE_PROMPT_MAX_HEIGHT: f32 = 280.0;
 
-/// Vertical space the custom-role window must leave to everything outside its
-/// scrolling body: the title, the name row, the spacers, the footer and the
-/// dialog's own padding. The body gets what the window has beyond this, so the
-/// Add/Save footer stays on screen at the 500px minimum window height.
-const CUSTOM_ROLE_DIALOG_CHROME: f32 = 240.0;
-
-/// Floor for the custom-role window's scrolling body, so the prompt editor and
-/// the tool picker stay usable in a window shorter than
-/// [`CUSTOM_ROLE_DIALOG_CHROME`] can account for.
-const CUSTOM_ROLE_BODY_MIN_HEIGHT: f32 = 200.0;
+/// Space the tools section keeps under the prompt editor: the branching field,
+/// the tool list's label and a few of its rows. The editor shrinks to its own
+/// minimum before this does.
+const CUSTOM_ROLE_TOOLS_MIN_HEIGHT: f32 = 146.0;
 
 /// The behaviours the custom-role window's picker offers, in the order it shows
 /// them. The labels it shows are [`CustomRoleBehavior`]'s `Display`; the stored
@@ -2629,7 +2625,7 @@ impl SettingsState {
     }
 
     /// The custom-role create/edit window: the name field, the prompt editor,
-    /// the behaviour picker, the tool picker and the window's own error line.
+    /// the branching picker, the tool picker and the window's own error line.
     fn custom_role_editor_window(
         editor: &custom_roles::RoleEditor,
     ) -> Element<'_, SettingsMessage> {
@@ -2646,21 +2642,13 @@ impl SettingsState {
             ));
         }
 
-        // The prompt + behaviour + tool picker body is taller than a small
-        // window can show (≈450px against the window's 500px minimum height),
-        // so it scrolls inside a viewport sized to the height this window can
-        // spare. The title, the name row and the footer stay outside it, so
-        // Add/Save is reachable at every window size.
-        middle = middle.push(responsive(move |size| {
-            let cap = (size.height - CUSTOM_ROLE_DIALOG_CHROME).max(CUSTOM_ROLE_BODY_MIN_HEIGHT);
-            container(widgets::vscroll_sized(
-                Self::custom_role_body(editor),
-                Length::Fill,
-                Length::Shrink,
-            ))
-            .max_height(cap)
-            .into()
-        }));
+        // The body gets the room between the fields and the footer, so the list runs
+        // down to the buttons; `Shrink` keeps the dialog at the body's own height
+        // instead of stretching it. The reported size still has the footer in it.
+        middle = middle.push(
+            responsive(move |size| Self::custom_role_body(editor, size.height))
+                .height(Length::Shrink),
+        );
 
         if let Some(err) = &editor.error {
             middle = middle.push(text(err).size(theme::TEXT_12).color(theme::STATUS_ERROR));
@@ -2696,35 +2684,50 @@ impl SettingsState {
         )
     }
 
-    /// The scrolling body of the custom-role window: the authorial prompt, the
-    /// behaviour without an identifier and the tool picker.
-    fn custom_role_body(editor: &custom_roles::RoleEditor) -> Column<'_, SettingsMessage> {
-        let mut body = Column::new().spacing(theme::SPACE_8);
+    /// One line of `size`px text as iced's `text` lays it out.
+    fn text_line_height(size: f32) -> f32 {
+        iced::advanced::text::LineHeight::default()
+            .to_absolute(iced::Pixels(size))
+            .0
+    }
 
-        // The prompt: the administrator's authorial text, the whole definition
-        // of the role (the same multi-line editor frame the rules popup uses).
-        let prompt_editor = super::editor_widget::EditorWidget::new(&editor.prompt)
-            .show_gutter(false)
-            .code_mode(false)
-            .enter(super::editor_widget::EnterBehavior::Newline)
-            .id(iced::widget::Id::from("custom_role_prompt"))
-            .keyboard_passthrough(super::is_dashboard_shortcut)
-            .placeholder("The authorial text that fully defines the role…")
-            .min_height(120.0)
-            .max_height(280.0)
-            .padding(theme::PAD_5);
-        let prompt_field: Element<'_, SettingsMessage> =
-            iced::Element::new(prompt_editor).map(|action| {
-                SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::Prompt(action))
-            });
-        body = body.push(
-            container(prompt_field)
-                .width(Length::Fill)
-                .height(Length::Shrink)
-                .style(theme::elevated_card_style),
-        );
+    /// What [`modal_dialog`] lays out under its middle slot: the 16px gap and the
+    /// footer's button row, a 13px label plus the button's own vertical padding.
+    fn dialog_footer_height() -> f32 {
+        theme::SPACE_16
+            + Self::text_line_height(theme::TEXT_13)
+            + 2.0 * iced::widget::button::DEFAULT_PADDING.y()
+    }
 
-        // What the role does when it is launched without a branch identifier.
+    /// The room the window's error line takes under the body when a failed save
+    /// shows one: the 8px gap and two lines of its 12px text, since save errors
+    /// are sentences that wrap at the dialog's width.
+    fn custom_role_error_height() -> f32 {
+        theme::SPACE_8 + 2.0 * Self::text_line_height(theme::TEXT_12)
+    }
+
+    /// The custom-role window's body, no taller than its content and never past
+    /// the room `reported` measures: the prompt editor, the branching picker and
+    /// the tool list, sized so the list runs down to the footer buttons and
+    /// scrolls inside itself when its rows do not fit.
+    fn custom_role_body(
+        editor: &custom_roles::RoleEditor,
+        reported: f32,
+    ) -> Element<'_, SettingsMessage> {
+        let error = if editor.error.is_some() {
+            Self::custom_role_error_height()
+        } else {
+            0.0
+        };
+        let available = (reported - Self::dialog_footer_height() - error).max(0.0);
+        let prompt_max = (available - CUSTOM_ROLE_TOOLS_MIN_HEIGHT)
+            .clamp(CUSTOM_ROLE_PROMPT_MIN_HEIGHT, CUSTOM_ROLE_PROMPT_MAX_HEIGHT);
+
+        let mut body = Column::new()
+            .spacing(theme::SPACE_8)
+            .push(Self::custom_role_prompt(editor, prompt_max));
+
+        // How the role branches when a launch names no branch.
         let behavior_pick = pick_list(BEHAVIORS, Some(editor.behavior), |behavior| {
             SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::SetBehavior(behavior))
         })
@@ -2732,18 +2735,44 @@ impl SettingsState {
         .style(theme::pick_list_style)
         .menu_style(theme::pick_list_menu_style)
         .width(Length::Fill);
-        body = body.push(field_row(
-            "Behaviour without an identifier",
-            behavior_pick.into(),
-            None,
-        ));
+        body = body.push(field_row("Default branching", behavior_pick.into(), None));
 
-        body.push(Self::custom_role_tool_picker(editor))
+        body = body.push(Self::custom_role_tool_picker(editor));
+
+        container(widgets::scroll_h_inset(body))
+            .max_height(available)
+            .into()
     }
 
-    /// The custom-role tool picker: the window's catalogue plus any stored name
-    /// this installation cannot serve right now, marked and labelled as
-    /// unavailable. A catalog tool that has a kind vocabulary
+    /// The prompt editor: the administrator's instructions, the whole definition
+    /// of the role (the same multi-line editor frame the rules popup uses),
+    /// grown to `max_height`.
+    fn custom_role_prompt(
+        editor: &custom_roles::RoleEditor,
+        max_height: f32,
+    ) -> Element<'_, SettingsMessage> {
+        let prompt_editor = super::editor_widget::EditorWidget::new(&editor.prompt)
+            .show_gutter(false)
+            .code_mode(false)
+            .enter(super::editor_widget::EnterBehavior::Newline)
+            .id(iced::widget::Id::from("custom_role_prompt"))
+            .keyboard_passthrough(super::is_dashboard_shortcut)
+            .placeholder("The instructions the agents of this role must always follow")
+            .min_height(CUSTOM_ROLE_PROMPT_MIN_HEIGHT)
+            .max_height(max_height)
+            .padding(theme::PAD_5);
+        container(iced::Element::new(prompt_editor).map(|action| {
+            SettingsMessage::CustomRolesMsg(custom_roles::CustomRolesMessage::Prompt(action))
+        }))
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .style(theme::elevated_card_style)
+        .into()
+    }
+
+    /// The custom-role tool list under its label: the window's catalogue plus any
+    /// stored name this installation cannot serve right now, marked and labelled
+    /// as unavailable. A catalog tool that has a kind vocabulary
     /// ([`crate::tools::grants::kinds_of`]) renders one checkbox per
     /// kind — the tool is granted iff at least one kind is checked — while a
     /// kindless tool keeps its single checkbox. The record's validators re-check
@@ -2753,6 +2782,7 @@ impl SettingsState {
     /// must be visible to be removable.
     fn custom_role_tool_picker(editor: &custom_roles::RoleEditor) -> Element<'_, SettingsMessage> {
         let mut tool_rows = Column::new().spacing(theme::SPACE_2);
+
         let unavailable = editor
             .tools
             .iter()
@@ -2827,7 +2857,7 @@ impl SettingsState {
             text("Tools")
                 .size(theme::TEXT_13)
                 .color(theme::TEXT_SECONDARY),
-            widgets::vscroll_sized(tool_rows, Length::Fill, Length::Fixed(TOOL_PICKER_HEIGHT)),
+            widgets::vscroll(tool_rows),
         ]
         .spacing(theme::SPACE_4)
         .into()

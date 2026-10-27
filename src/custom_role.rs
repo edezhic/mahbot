@@ -1,5 +1,5 @@
 //! Admin-defined custom roles: the record (name, authorial prompt, tool subset,
-//! behaviour without an identifier) plus its validation. The record carries no
+//! default branching) plus its validation. The record carries no
 //! owner column because there is exactly one owner — the admin — and two
 //! surfaces reach these functions: the admin's configuration tool (a role the
 //! admin granted `mahbot_config` runs at his strength and can call them) and
@@ -31,9 +31,9 @@ pub(crate) const MAX_ROLE_NAME_CHARS: usize = 32;
 /// Upper bound on a custom role branch identifier, in characters.
 pub(crate) const MAX_ROLE_IDENTIFIER_CHARS: usize = 32;
 
-/// What a custom role does when it is launched without a branch identifier:
-/// keep one continuable conversation ([`Self::Continuous`]) or run once and
-/// report back ([`Self::OneOff`]).
+/// How a custom role branches when a launch names no branch: keep one continuable
+/// conversation ([`Self::Continuous`]) or run once and report back
+/// ([`Self::OneOff`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CustomRoleBehavior {
     Continuous,

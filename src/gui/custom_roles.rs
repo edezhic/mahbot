@@ -27,7 +27,7 @@ pub(crate) enum CustomRolesMessage {
     Name(EditorAction),
     /// A shared-editor action on the prompt editor.
     Prompt(EditorAction),
-    /// Pick what the role does when it is launched without a branch identifier.
+    /// Pick how the role branches when a launch does not name one.
     SetBehavior(CustomRoleBehavior),
     /// Mark or unmark one tool of the catalogue.
     ToggleTool(String),
