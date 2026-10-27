@@ -60,9 +60,11 @@ fn artwork() -> &'static Artwork {
     &ARTWORK
 }
 
-/// The icon of the window itself, for [`iced::window::Settings::icon`] — the title
-/// bar on Windows and on X11. Wayland and macOS have no window icon at all and
-/// ignore it, which is what "degrade quietly" means here.
+/// The icon of the window itself, for [`iced::window::Settings::icon`] — the
+/// window's icon on X11; on Windows winit sets it as the *small* icon, and the
+/// Windows icon pass then replaces both with the executable's own. Wayland and macOS
+/// have no window icon at all and ignore it, which is what "degrade quietly" means
+/// here.
 #[must_use]
 pub fn window_icon() -> Option<iced::window::Icon> {
     let artwork = artwork();
@@ -317,10 +319,10 @@ fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<()> {
 /// Windows: attaches the executable's own icons to the window.
 ///
 /// winit registers the window's class with no icon at all and sets only the
-/// *small* one for the window, so the title bar gets the icon from
-/// [`iced::window::Settings::icon`] while the taskbar, Alt-Tab and the system menu
-/// have nothing of their own to show. The big icon is attached here — to the
-/// window and to its class, which every later window of that class inherits.
+/// *small* one, from [`iced::window::Settings::icon`], so the taskbar, Alt-Tab and
+/// the system menu — all of which read the big one — had nothing of their own to
+/// show. Both sizes are attached here, to the window and to its class, which every
+/// later window of that class inherits.
 ///
 /// `raw_handle` is the window's `HWND`: [`iced::window::raw_id`] answers with
 /// winit's own window id, and on Windows that conversion *is* the handle.
@@ -365,7 +367,7 @@ pub(crate) fn apply_window_icons(raw_handle: u64) {
         );
         for (icon, kind, class_index, surface) in [
             (big, ICON_BIG, GCLP_HICON, "the taskbar icon"),
-            (small, ICON_SMALL, GCLP_HICONSM, "the title-bar icon"),
+            (small, ICON_SMALL, GCLP_HICONSM, "the small icon"),
         ] {
             if icon == 0 {
                 // No such icon in this executable: `build.rs` has already said so at

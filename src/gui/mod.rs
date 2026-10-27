@@ -50,8 +50,8 @@ use crate::pipeline::board::Ticket;
 
 use iced::keyboard;
 use iced::widget::{
-    Column, Row, Space, button, column, container, image, pick_list, row, rule, scrollable, text,
-    tooltip,
+    Column, Row, Space, button, column, container, image, mouse_area, pick_list, row, rule,
+    scrollable, text, tooltip,
 };
 use iced::window;
 use iced::{Alignment, Element, Length, Task};
@@ -366,7 +366,7 @@ pub enum Message {
     /// self-update). Draining disables input; iced::exit is deferred until
     /// the drain completes (the token fires).
     DrainStarted,
-    /// The dashboard window's close button: an exit request, handled by
+    /// The dashboard window's close request: an exit request, handled by
     /// `request_exit` — the graceful drain once boot has finished, the exit path directly
     /// before it.
     CloseRequested(window::Id),
@@ -389,6 +389,8 @@ pub enum Message {
     /// Windows only — the value is the window's `HWND`.
     #[cfg(target_os = "windows")]
     WindowHandle(u64),
+    /// A window action the rail asks for ([`WindowAction`]).
+    WindowAction(WindowAction),
     /// Keyboard shortcut: Cmd+F — focus the primary search input on the current page.
     FocusSearch,
     /// Keyboard shortcut: Cmd+L — open the Logs page, which has no rail item.
@@ -1017,12 +1019,13 @@ impl Dashboard {
     /// Act on a request for the product to exit: name the route that asked, then start the wait
     /// the request calls for.
     ///
-    /// The two requests that reach it — the window's own close and an ordinary platform quit —
-    /// are handled identically, because full parity is the point of the interception; so are the
-    /// states with no drain to complete (a self-update finalizing, a boot that has not finished,
-    /// a boot that failed). `route` is the platform's wording for the ask
-    /// ([`crate::shutdown::MACOS_QUIT_TRIGGER`], beside the route that produces it), or `None`
-    /// for the window's own close, whose wording the exit line already falls back to.
+    /// The requests that reach it — the window's own close, the rail control's and an
+    /// ordinary platform quit — are handled identically, because full parity is the point
+    /// of the interception; so are the states with no drain to complete (a self-update
+    /// finalizing, a boot that has not finished, a boot that failed). `route` is the
+    /// platform's wording for the ask ([`crate::shutdown::MACOS_QUIT_TRIGGER`], beside the
+    /// route that produces it), or `None` for the window's own close, whose wording the
+    /// exit line already falls back to.
     /// It is recorded where this request is what drives the exit (or, in the self-update window,
     /// may yet drive it once the update is seen to fail); a request that finds the exit already
     /// pending leaves the record to the one that caused it.
@@ -1568,6 +1571,14 @@ impl Dashboard {
                 generation,
             } => self.apply_boot_workspaces(workspaces, &restored_name, remember, generation),
             Message::CloseRequested(_) => self.request_exit(None),
+            Message::WindowAction(action) => match action {
+                // The window follows the pointer for the rest of the gesture.
+                WindowAction::Drag => iced::window::latest().and_then(iced::window::drag),
+                WindowAction::Minimize => {
+                    iced::window::latest().and_then(|id| iced::window::minimize(id, true))
+                }
+                WindowAction::Close => self.request_exit(None),
+            },
             Message::QuitRequested => self.request_exit(Some(crate::shutdown::MACOS_QUIT_TRIGGER)),
             Message::Shutdown => self.save_and_exit(),
             Message::DrainStarted => {
@@ -2475,42 +2486,46 @@ impl Dashboard {
     #[expect(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, Message> {
         if let Some(err) = &self.boot_error {
-            return container(
-                column![
-                    text("MahBot failed to start")
-                        .size(20)
-                        .color(theme::STATUS_ERROR),
-                    text(err).size(theme::TEXT_14).color(theme::TEXT_SECONDARY),
-                ]
-                .spacing(theme::SPACE_12)
-                .padding(theme::PAGE_PADDING),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into();
+            return Self::window_chrome(
+                container(
+                    column![
+                        text("MahBot failed to start")
+                            .size(20)
+                            .color(theme::STATUS_ERROR),
+                        text(err).size(theme::TEXT_14).color(theme::TEXT_SECONDARY),
+                    ]
+                    .spacing(theme::SPACE_12)
+                    .padding(theme::PAGE_PADDING),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into(),
+            );
         }
 
         if !self.ready {
-            return container(
-                column![
-                    image(crate::app_icon::widget_image()).width(96).height(96),
-                    text("MahBot")
-                        .size(theme::TEXT_24)
-                        .color(theme::TEXT_PRIMARY),
-                    text("Starting…")
-                        .size(theme::TEXT_16)
-                        .color(theme::TEXT_MUTED),
-                ]
-                .spacing(theme::SPACE_16)
-                .align_x(Alignment::Center),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into();
+            return Self::window_chrome(
+                container(
+                    column![
+                        image(crate::app_icon::widget_image()).width(96).height(96),
+                        text("MahBot")
+                            .size(theme::TEXT_24)
+                            .color(theme::TEXT_PRIMARY),
+                        text("Starting…")
+                            .size(theme::TEXT_16)
+                            .color(theme::TEXT_MUTED),
+                    ]
+                    .spacing(theme::SPACE_16)
+                    .align_x(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into(),
+            );
         }
 
         let footer_hidden = self.footer_hidden();
@@ -3294,33 +3309,30 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
 }
 
 /// What a rail entry is, which decides how its button's highlight is painted. A
-/// navigation entry is full-bleed — its highlight spans the rail's whole width,
-/// and at the rail's top or bottom it reaches the layout's edge too ([`RailEnd`])
-/// — while every other item keeps [`theme::PAD_4`] at the rail's sides.
+/// navigation entry is full-bleed — its highlight spans the rail's whole width —
+/// and at the rail's bottom end it reaches the layout's edge too, while every
+/// other item keeps [`theme::PAD_4`] at the rail's sides.
 #[derive(Clone, Copy)]
 enum RailEntry {
-    /// A navigation entry away from both ends.
+    /// A navigation entry away from the rail's bottom end.
     Nav,
-    /// The navigation entry at the rail's top or bottom end.
-    NavAtEnd(RailEnd),
+    /// The navigation entry at the rail's bottom end.
+    NavAtBottom,
+    /// A window control: full-bleed and half-height, so the pair stays a narrow
+    /// strip at the rail's top.
+    WindowControl,
     /// Any other rail item: the voice status, the running-agent indicators.
     Item,
 }
 
-/// The rail's top or bottom end.
-#[derive(Clone, Copy)]
-enum RailEnd {
-    Top,
-    Bottom,
-}
-
 impl RailEntry {
-    /// The entry's vertical content padding, [`theme::PAD_14`] on the rail's
-    /// outer side at its end instead of [`theme::PAD_10`].
+    /// The entry's vertical content padding: [`theme::PAD_14`] on the rail's
+    /// outer side at its end instead of [`theme::PAD_10`], and [`theme::PAD_6`]
+    /// for a window control.
     fn content_padding(self) -> iced::Padding {
         let (top, bottom) = match self {
-            Self::NavAtEnd(RailEnd::Top) => (theme::PAD_14, theme::PAD_10),
-            Self::NavAtEnd(RailEnd::Bottom) => (theme::PAD_10, theme::PAD_14),
+            Self::NavAtBottom => (theme::PAD_10, theme::PAD_14),
+            Self::WindowControl => (theme::PAD_6, theme::PAD_6),
             Self::Nav | Self::Item => (theme::PAD_10, theme::PAD_10),
         };
         iced::Padding {
@@ -3330,12 +3342,12 @@ impl RailEntry {
         }
     }
 
-    /// The rail's [`theme::PAD_4`] inset around every button that is not a
-    /// navigation entry.
+    /// The rail's [`theme::PAD_4`] inset around every entry that is not
+    /// full-bleed.
     fn button_inset(self) -> iced::Padding {
         let inset = match self {
             Self::Item => theme::PAD_4,
-            Self::Nav | Self::NavAtEnd(_) => 0.0,
+            Self::Nav | Self::NavAtBottom | Self::WindowControl => 0.0,
         };
         iced::Padding {
             left: inset,
@@ -3345,24 +3357,54 @@ impl RailEntry {
     }
 }
 
+/// Which end of the rail a nav column sits at. Only the bottom one reaches the
+/// layout's edge, so only there does the last entry take [`RailEntry::NavAtBottom`].
+#[derive(Clone, Copy)]
+enum NavColumn {
+    Top,
+    Bottom,
+}
+
+/// A window action the app performs for itself, the platform's title bar having
+/// been removed: the controls the rail carries in its place and the drag its
+/// empty space starts ([`Dashboard::sidebar_view`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WindowAction {
+    /// The window follows the pointer: a press that is not claimed by a rail
+    /// button starts this.
+    Drag,
+    /// Minimize the window.
+    Minimize,
+    /// Close the window — the exit request the platform's own close makes
+    /// ([`Message::CloseRequested`]).
+    Close,
+}
+
 impl Dashboard {
-    /// The nav rail: the top nav icons, the voice status while the footer is
-    /// hidden, the stretch in between ([`Self::render_sidebar_mid`]) and the
-    /// bottom nav icons.
+    /// The rail: the window controls, the top nav icons, the voice status while the
+    /// footer is hidden, the stretch in between ([`Self::render_sidebar_mid`]) and
+    /// the bottom nav icons.
     fn sidebar_view(&self, footer_hidden: bool) -> Element<'_, Message> {
         let mut col = Column::new()
             .spacing(theme::SPACE_2)
+            .push(Self::render_window_controls())
             .push(self.render_sidebar_nav());
         if footer_hidden {
             col = col.push(Self::render_sidebar_voice());
         }
-        container(
-            col.push(Self::render_sidebar_mid(footer_hidden))
-                .push(self.render_sidebar_bottom_nav()),
+        // The rail drags the window: the mouse area passes a press to the entry under
+        // it first, so buttons keep their clicks, and holds no state, so a drag whose
+        // release the platform keeps leaves nothing stuck.
+        mouse_area(
+            container(
+                col.push(Self::render_sidebar_mid(footer_hidden))
+                    .push(self.render_sidebar_bottom_nav()),
+            )
+            .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
+            .height(Length::Fill)
+            .style(theme::surface_container_style),
         )
-        .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
-        .height(Length::Fill)
-        .style(theme::surface_container_style)
+        .on_press(Message::WindowAction(WindowAction::Drag))
         .into()
     }
 
@@ -3418,13 +3460,13 @@ impl Dashboard {
     /// Shared nav-icon column for the sidebar top and bottom navs. Each page is
     /// a full-width icon button (28px icon) with the active page accent-colored;
     /// a page that is not available ([`Self::page_available`]) is absent from the
-    /// column entirely. `end` is the rail's end the column sits at, which marks
-    /// the entry there as the rail's end entry ([`RailEntry`]).
-    fn sidebar_nav_column(&self, pages: &[Page], end: RailEnd) -> Column<'_, Message> {
-        // Only the column's own end can be the rail's end, so only it is searched.
-        let edge = match end {
-            RailEnd::Top => pages.iter().position(|page| self.page_available(*page)),
-            RailEnd::Bottom => pages.iter().rposition(|page| self.page_available(*page)),
+    /// column entirely.
+    fn sidebar_nav_column(&self, pages: &[Page], column: NavColumn) -> Column<'_, Message> {
+        // Only the column at the rail's bottom end reaches the layout's edge, so
+        // only there is an entry marked.
+        let edge = match column {
+            NavColumn::Bottom => pages.iter().rposition(|page| self.page_available(*page)),
+            NavColumn::Top => None,
         };
         let mut col = Column::new().spacing(theme::SPACE_2);
         for (index, page) in pages.iter().enumerate() {
@@ -3432,7 +3474,7 @@ impl Dashboard {
                 continue;
             }
             let entry = if Some(index) == edge {
-                RailEntry::NavAtEnd(end)
+                RailEntry::NavAtBottom
             } else {
                 RailEntry::Nav
             };
@@ -3451,18 +3493,55 @@ impl Dashboard {
         col
     }
 
+    /// A view that has no rail — the start-up splash, a failed boot — with the
+    /// window's own chrome above it: the rail's controls at the top, the whole
+    /// surface draggable.
+    fn window_chrome(view: Element<'_, Message>) -> Element<'_, Message> {
+        mouse_area(column![Self::render_window_controls(), view])
+            .on_press(Message::WindowAction(WindowAction::Drag))
+            .into()
+    }
+
+    /// The rail's window controls: one row at the rail's top, built like the
+    /// entries below it.
+    fn render_window_controls() -> Element<'static, Message> {
+        let glyph = |icon: iced::widget::Text<'static, iced::Theme, iced::Renderer>| {
+            icon.size(theme::TEXT_14).color(theme::TEXT_SECONDARY)
+        };
+        container(
+            row![
+                Self::sidebar_rail_item(
+                    glyph(lucide::minus()).into(),
+                    "minimize window",
+                    Some(Message::WindowAction(WindowAction::Minimize)),
+                    RailEntry::WindowControl,
+                ),
+                Self::sidebar_rail_item(
+                    glyph(lucide::x()).into(),
+                    "close window",
+                    Some(Message::WindowAction(WindowAction::Close)),
+                    RailEntry::WindowControl,
+                ),
+            ]
+            .spacing(theme::SPACE_2),
+        )
+        .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
+        .padding([theme::PAD_8, theme::PAD_2])
+        .into()
+    }
+
     /// Sidebar top nav icons (see [`Page::sidebar_pages`]). Running Agents is not
     /// in the sidebar — it is reachable only via the running-agent indicators,
     /// which live in the footer bar or, with the footer hidden, in the rail
     /// ([`Self::render_sidebar_agents`]).
     fn render_sidebar_nav(&self) -> Element<'_, Message> {
-        self.sidebar_nav_column(Page::sidebar_pages(), RailEnd::Top)
+        self.sidebar_nav_column(Page::sidebar_pages(), NavColumn::Top)
             .into()
     }
 
     /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]).
     fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
-        self.sidebar_nav_column(Page::sidebar_bottom_pages(), RailEnd::Bottom)
+        self.sidebar_nav_column(Page::sidebar_bottom_pages(), NavColumn::Bottom)
             .into()
     }
 

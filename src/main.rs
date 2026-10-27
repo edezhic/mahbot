@@ -984,8 +984,13 @@ fn dashboard_window_settings(state: &mahbot::gui::WindowState) -> iced::window::
             mahbot::gui::MIN_WINDOW_WIDTH,
             mahbot::gui::MIN_WINDOW_HEIGHT,
         )),
-        // The window's own icon where the platform has one (the title bar on
-        // Windows and X11); macOS and Wayland carry no window icon and ignore it.
+        // No system title bar or frame: the top of the window is the app's own, and
+        // the rail carries the window controls and the drag (`gui::WindowAction`).
+        // Corner rounding is then the platform's — square where it draws square.
+        decorations: false,
+        // The window's own icon where the platform has one (the window's icon on X11,
+        // and on Windows the small one, the big one attached separately); macOS and
+        // Wayland carry no window icon and ignore it.
         icon: mahbot::app_icon::window_icon(),
         // Linux: the name the window announces. A desktop environment matches it
         // against the launcher entry's file name to know which entry — and so which
