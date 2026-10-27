@@ -15,7 +15,7 @@ use iced::widget::{Column, column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 
-use crate::automations::Automation;
+use crate::automations::{Automation, StoredTrigger};
 
 use super::ToastMessage;
 use super::common::PolledList;
@@ -105,10 +105,7 @@ impl AutomationsState {
             let now = Local::now();
             let mut sections = Column::new().spacing(theme::SPACE_16);
             for (owner, automations) in group_by_owner(self.list.entries()) {
-                // Cards SPACE_4 apart — tighter than the SPACE_6 below a
-                // heading and the SPACE_16 between owners, so each owner's
-                // cards read as one group.
-                let mut cards = Column::new().spacing(theme::SPACE_4);
+                let mut cards = Column::new().spacing(theme::SPACE_8);
                 for automation in automations {
                     cards = cards.push(render_automation(automation, now));
                 }
@@ -147,6 +144,27 @@ fn group_by_owner(automations: &[Automation]) -> Vec<(&str, Vec<&Automation>)> {
     groups.into_iter().collect()
 }
 
+/// The check's arguments as `key: value` pairs in the order they are stored,
+/// `None` when it takes none. A string value is shown bare — the line is a label
+/// for a human, not machine output — and any other value keeps its compact JSON.
+fn render_args(trigger: &StoredTrigger) -> Option<String> {
+    let StoredTrigger::Tool(trigger) = trigger else {
+        return None;
+    };
+    (!trigger.args.is_empty()).then(|| {
+        trigger
+            .args
+            .iter()
+            .map(|(key, value)| match value {
+                // A string value is its own text; the JSON form would quote it.
+                serde_json::Value::String(raw) => format!("{key}: {raw}"),
+                value => format!("{key}: {value}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
 /// One automation as its own card — the log row's surface, padding and width — with
 /// a right-click menu whose single item deletes it.
 ///
@@ -177,11 +195,8 @@ fn render_automation(
             ]
             .spacing(theme::SPACE_6)
             .align_y(Alignment::Center);
-            // The arguments are shown exactly as stored: they are the same
-            // values that reach the assistant's prompt and the firing notice.
-            // Folded at any glyph so one long JSON token cannot run under the
-            // countdown.
-            if let Some(args) = trigger.args_json() {
+            // Folded at any glyph so one long token cannot run under the countdown.
+            if let Some(args) = render_args(trigger) {
                 check = check.push(
                     text(args)
                         .size(theme::TEXT_11)
@@ -209,7 +224,7 @@ fn render_automation(
                 text(format_next_fire(&automation.next_fire_at, now))
                     .size(theme::TEXT_12)
                     .font(super::JETBRAINS_MONO)
-                    .color(theme::TEXT_SECONDARY),
+                    .color(theme::TEXT_PRIMARY),
             )
             .spacing(theme::SPACE_12)
             .align_y(Alignment::Start),
@@ -345,6 +360,35 @@ mod tests {
             next_fire_at: String::new(),
             unfinished_attempts: 0,
         }
+    }
+
+    #[test]
+    fn render_args_formats_pairs_and_hides_none() {
+        let trigger = |args: serde_json::Value| {
+            let serde_json::Value::Object(args) = args else {
+                unreachable!("test arguments are an object")
+            };
+            StoredTrigger::Tool(crate::automations::Trigger {
+                tool: "wait".to_string(),
+                args,
+            })
+        };
+        assert_eq!(render_args(&StoredTrigger::Unreadable), None);
+        assert_eq!(render_args(&trigger(serde_json::json!({}))), None);
+        // The map's own (sorted) key order; string values are bare and anything
+        // else keeps its compact JSON.
+        assert_eq!(
+            render_args(&trigger(serde_json::json!({
+                "action": "night",
+                "dry_run": true,
+                "probe_seconds": 120,
+                "window": {"from": "09:00"},
+            }))),
+            Some(
+                "action: night, dry_run: true, probe_seconds: 120, window: {\"from\":\"09:00\"}"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
