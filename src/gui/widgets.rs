@@ -463,20 +463,24 @@ pub(crate) fn tooltip_hint<'a, Message: Clone + 'a>(
     .into()
 }
 
-/// Compact gray X removal/cancel control: a 12px [`lucide::x`] glyph in
-/// [`theme::TEXT_SECONDARY`] on a transparent button that highlights on
-/// hover (like [`theme::button_text`]). The glyph is the button's only
-/// content and the button shrink-wraps it, so the glyph is centered in its
-/// hit zone by construction — the hit zone is the glyph plus the caller's
-/// `padding`, which is how call sites preserve their existing hit areas
-/// (e.g. `button::DEFAULT_PADDING`, or larger uniform padding for a bigger
-/// zone).
+/// Compact X removal/cancel control: a 12px [`lucide::x`] glyph in `color` on a
+/// transparent button that highlights on hover (like [`theme::button_text`]).
+/// The glyph is the button's only content and the button shrink-wraps it, so the
+/// glyph is centered in its hit zone by construction — the hit zone is the glyph
+/// plus the caller's `padding`, which is how call sites preserve their existing
+/// hit areas (e.g. `button::DEFAULT_PADDING`, or larger uniform padding for a
+/// bigger zone).
+///
+/// `color` is [`theme::TEXT_SECONDARY`] wherever the control sits on a page, and
+/// brighter where it sits on a dark scrim over arbitrary content (the composer's
+/// picture tile).
 ///
 /// `on_press: None` disables the button and dims the glyph to
 /// [`theme::TEXT_MUTED`], matching the disabled-dim treatment of the
 /// surrounding icon-action buttons.
 #[must_use]
 pub fn compact_x_button<'a, Message: Clone + 'a>(
+    color: Color,
     padding: impl Into<Padding>,
     on_press: Option<Message>,
     tooltip_text: Option<&'a str>,
@@ -484,7 +488,7 @@ pub fn compact_x_button<'a, Message: Clone + 'a>(
     let glyph = lucide::x::<iced::Theme, iced::Renderer>()
         .size(theme::TEXT_12)
         .color(if on_press.is_some() {
-            theme::TEXT_SECONDARY
+            color
         } else {
             theme::TEXT_MUTED
         });

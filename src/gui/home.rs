@@ -1303,7 +1303,8 @@ impl HomeState {
         );
 
         // Attachment chips sit above the input bubble, in the same strip, and
-        // only while the message has something attached.
+        // only while the message has something attached. Picture tiles are
+        // taller than file chips, so the row centres on their shared middle.
         let composer: Element<'_, HomeMessage> = if self.attachments.is_empty() {
             composer
         } else {
@@ -1315,6 +1316,7 @@ impl HomeState {
                     super::attachment::chip(attachment, HomeMessage::RemoveAttachment(index))
                 }))
             .spacing(theme::SPACE_6)
+            .align_y(Alignment::Center)
             .wrap();
             column![chips, composer].spacing(theme::SPACE_6).into()
         };

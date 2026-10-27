@@ -733,6 +733,7 @@ impl BoardState {
                 // smaller 12px glyph so the hit zone stays the same 36x26 box the
                 // red 16px-glyph cancel renders (12 + 2*12 = 36 wide, ~12 + 2*7 = 26 tall).
                 icon_row = icon_row.push(widgets::compact_x_button(
+                    theme::TEXT_SECONDARY,
                     iced::Padding {
                         top: 7.0,
                         bottom: 7.0,

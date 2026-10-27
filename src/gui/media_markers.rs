@@ -628,7 +628,7 @@ fn decode_data_uri_image(uri: &str) -> Option<(u32, u32, Vec<u8>)> {
 /// entry survives eviction, `insert` evicts the oldest once the capacity cap is
 /// hit. Keys are looked up by [`Borrow`] so callers can use an unowned key (e.g.
 /// a `&str` media marker).
-struct BoundedLruCache<K, V> {
+pub(super) struct BoundedLruCache<K, V> {
     entries: HashMap<K, V>,
     /// LRU order of `entries` keys; back = most recently used.
     lru: VecDeque<K>,
@@ -639,7 +639,7 @@ impl<K, V> BoundedLruCache<K, V>
 where
     K: Hash + Eq + Clone,
 {
-    fn with_capacity(cap: usize) -> Self {
+    pub(super) fn with_capacity(cap: usize) -> Self {
         Self {
             entries: HashMap::new(),
             lru: VecDeque::new(),
@@ -647,7 +647,7 @@ where
         }
     }
 
-    fn get<Q>(&mut self, key: &Q) -> Option<&V>
+    pub(super) fn get<Q>(&mut self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -663,7 +663,7 @@ where
         hit
     }
 
-    fn insert(&mut self, key: K, value: V) {
+    pub(super) fn insert(&mut self, key: K, value: V) {
         // Remove any existing occurrence so a re-insert replaces the value and
         // moves the key to the most-recent position exactly once. Two concurrent
         // check→decode→insert passes for the same key must not duplicate it in
@@ -691,7 +691,7 @@ const MAX_CACHED_IMAGES: usize = 32;
 
 /// Outcome of one cached image decode attempt.
 #[derive(Debug)]
-enum CachedImage {
+pub(super) enum CachedImage {
     /// Successfully decoded; the stable handle is reused across frames, which
     /// keeps the wgpu texture Id stable too (re-building a handle in `view()`
     /// would decode every frame).
@@ -734,7 +734,7 @@ static DATA_URI_IMAGE_CACHE: LazyLock<Mutex<BoundedLruCache<String, CachedImage>
 /// raster decode never blocks a concurrent frame, and the owned key is cloned
 /// only when the outcome is inserted — a cache hit copies nothing.
 #[must_use]
-fn cached_image<K, Q>(
+pub(super) fn cached_image<K, Q>(
     cache: &Mutex<BoundedLruCache<K, CachedImage>>,
     key: &Q,
     decode: impl FnOnce() -> Option<(u32, u32, Vec<u8>)>,

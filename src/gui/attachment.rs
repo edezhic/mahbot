@@ -7,17 +7,41 @@
 //! with no channel-side special case.
 
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
+use ::image as image_crate;
+use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{container, image, row, text};
-use iced::{Alignment, Element, Length};
+use iced::{Alignment, ContentFit, Element, Length};
 
+use super::media_markers::{BoundedLruCache, CachedImage, cached_image};
 use super::theme;
 
-/// Side of the chip's image thumbnail or document glyph, in px.
+/// Side of the chip's document glyph, in px.
 const CHIP_THUMB: f32 = 28.0;
 
 /// Longest attachment name a chip shows, ellipsis included.
 const CHIP_NAME_MAX_CHARS: usize = 24;
+
+/// Height of a picture preview tile, in px.
+const PREVIEW_HEIGHT: f32 = 72.0;
+
+/// Width bounds of a preview at [`PREVIEW_HEIGHT`]: inside them the tile takes
+/// the picture's own proportions, outside them it shows the middle slice.
+const PREVIEW_MIN_WIDTH: f32 = 48.0;
+const PREVIEW_MAX_WIDTH: f32 = 160.0;
+
+/// Pixels a preview is decoded at per tile pixel: twice the tile keeps it sharp
+/// on a HiDPI display while the retained RGBA stays tiny.
+const PREVIEW_SCALE: f32 = 2.0;
+
+/// Corner rounding of a picture tile.
+const PREVIEW_RADIUS: f32 = 4.0;
+
+/// Tile previews each preview cache retains, least recently drawn first out.
+/// One is at most 320×144 px — 180 KiB — so a cache stays under 12 MiB, and a
+/// strip's live tiles stay cached however often the composer is redrawn.
+const MAX_CACHED_PREVIEWS: usize = 64;
 
 // ── Attachment ──────────────────────────────────────────────────────
 
@@ -51,7 +75,7 @@ pub enum Source {
     File(PathBuf),
     /// Encoded image bytes with no file behind them — a pasted image, which
     /// only the macOS pasteboard can hand over. Held as iced's own byte-backed
-    /// handle, so the chip's thumbnail decodes once instead of once per frame.
+    /// handle, so the paste keeps one stable identity for its preview.
     #[cfg(target_os = "macos")]
     Bytes(image::Handle),
 }
@@ -108,19 +132,6 @@ impl Attachment {
             name,
             source: Source::Bytes(image::Handle::from_bytes(bytes)),
             is_image: true,
-        })
-    }
-
-    /// A handle for the chip thumbnail of an image attachment. `None` for a
-    /// document, which the chip renders as a glyph.
-    pub(crate) fn preview_handle(&self) -> Option<image::Handle> {
-        if !self.is_image {
-            return None;
-        }
-        Some(match &self.source {
-            Source::File(path) => image::Handle::from_path(path.clone()),
-            #[cfg(target_os = "macos")]
-            Source::Bytes(handle) => handle.clone(),
         })
     }
 }
@@ -263,35 +274,154 @@ fn leaf_name(raw: &str) -> String {
     }
 }
 
+// ── Preview ─────────────────────────────────────────────────────────
+
+/// Tile-sized previews of pictures on disk, keyed by the file they were decoded
+/// from.
+static FILE_PREVIEWS: LazyLock<Mutex<BoundedLruCache<PathBuf, CachedImage>>> =
+    LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_PREVIEWS)));
+
+/// Tile-sized previews of pasted pictures, keyed by the paste's own handle.
+#[cfg(target_os = "macos")]
+static PASTED_PREVIEWS: LazyLock<Mutex<BoundedLruCache<iced::advanced::image::Id, CachedImage>>> =
+    LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_PREVIEWS)));
+
+/// The tile-sized preview of a picture attachment, decoded and cached the first
+/// time its tile is drawn: iced's handle, and the width the tile takes at
+/// [`PREVIEW_HEIGHT`]. `None` for a document — and for a picture that is gone or
+/// is not a raster this product decodes — which [`chip`] then draws as a file.
+/// Never touches [`Attachment::is_image`], so what is sent does not depend on
+/// whether the picture happens to decode.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a tile is a couple of hundred pixels wide"
+)]
+fn preview(attachment: &Attachment) -> Option<(image::Handle, f32)> {
+    if !attachment.is_image {
+        return None;
+    }
+    let handle = match &attachment.source {
+        Source::File(path) => {
+            // The file can move or grow between attaching and sending, so the
+            // cap is read from it again here.
+            let metadata = std::fs::metadata(path).ok()?;
+            if !metadata.is_file() || metadata.len() > crate::util::FILE_MAX_BYTES {
+                return None;
+            }
+            cached_image(&FILE_PREVIEWS, path.as_path(), || {
+                std::fs::read(path).ok().and_then(|bytes| decode(&bytes))
+            })
+        }
+        #[cfg(target_os = "macos")]
+        Source::Bytes(handle) => {
+            let image::Handle::Bytes(_, bytes) = handle else {
+                return None;
+            };
+            cached_image(&PASTED_PREVIEWS, &handle.id(), || decode(bytes))
+        }
+    }?;
+    let width = match &handle {
+        image::Handle::Rgba { width, .. } => *width,
+        _ => return None,
+    };
+    Some((handle, width as f32 / PREVIEW_SCALE))
+}
+
+/// Decode `bytes` into the pixels its tile draws: the picture upright (its own
+/// EXIF rotation applied, as iced applies it when it draws a path or byte
+/// handle), then cropped from the centre to the tile's proportions and scaled in
+/// one framework step — nothing is letterboxed or stretched afterwards.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "a preview is a few hundred pixels, so its pixel counts fit and its proportions are screen magnitudes"
+)]
+fn decode(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut picture = crate::util::media_target::decode_raster_image(
+        bytes,
+        crate::util::media_target::raster_decode_limits(),
+    )
+    .ok()?;
+    if let Some(orientation) = crate::util::exif_orientation(bytes) {
+        picture.apply_orientation(orientation);
+    }
+    let aspect = picture.width() as f32 / picture.height().max(1) as f32;
+    let logical_width = (PREVIEW_HEIGHT * aspect).clamp(PREVIEW_MIN_WIDTH, PREVIEW_MAX_WIDTH);
+    let width = (logical_width * PREVIEW_SCALE).round() as u32;
+    let height = (PREVIEW_HEIGHT * PREVIEW_SCALE) as u32;
+    let filled = picture.resize_to_fill(width, height, image_crate::imageops::FilterType::Triangle);
+    Some((width, height, filled.into_rgba8().into_raw()))
+}
+
 // ── Chip ────────────────────────────────────────────────────────────
 
-/// The composer chip for one attachment: thumbnail (images) or document glyph,
-/// the name, and a removal control that publishes `remove`.
+/// The composer chip for one attachment: a picture tile when it can be
+/// previewed, and the file chip (document glyph, shortened name, removal
+/// control) for a document or a picture that cannot. `remove` publishes the
+/// removal.
 pub(crate) fn chip<'a, M: Clone + 'a>(attachment: &'a Attachment, remove: M) -> Element<'a, M> {
-    let thumb: Element<'a, M> = match attachment.preview_handle() {
-        Some(handle) => image(handle)
-            .width(Length::Fixed(CHIP_THUMB))
-            .height(Length::Fixed(CHIP_THUMB))
-            .border_radius(4.0)
-            .into(),
-        None => container(
-            iced_fonts::lucide::file_text::<iced::Theme, iced::Renderer>()
-                .size(theme::TEXT_16)
-                .color(theme::TEXT_SECONDARY),
+    match preview(attachment) {
+        Some((handle, width)) => picture_tile(handle, width, &attachment.name, remove),
+        None => file_chip(&attachment.name, remove),
+    }
+}
+
+/// The tile of one picture: the picture itself at [`PREVIEW_HEIGHT`], its full
+/// name on hover, and the removal control over its top-right corner. The
+/// control sits in a layer above the picture, so hovering it closes the name
+/// tooltip and opens the control's own.
+fn picture_tile<'a, M: Clone + 'a>(
+    handle: image::Handle,
+    width: f32,
+    name: &'a str,
+    remove: M,
+) -> Element<'a, M> {
+    let picture = image(handle)
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(PREVIEW_HEIGHT))
+        .content_fit(ContentFit::Fill)
+        .border_radius(PREVIEW_RADIUS);
+    iced::widget::stack![
+        super::widgets::tooltip_hint(picture, name),
+        container(
+            container(super::widgets::compact_x_button(
+                theme::TEXT_PRIMARY,
+                [theme::PAD_1, theme::PAD_4],
+                Some(remove),
+                Some("remove attachment"),
+            ))
+            .padding(theme::PAD_1)
+            .style(theme::scrim_style),
         )
-        .width(Length::Fixed(CHIP_THUMB))
-        .height(Length::Fixed(CHIP_THUMB))
-        .center_x(Length::Fixed(CHIP_THUMB))
-        .center_y(Length::Fixed(CHIP_THUMB))
-        .into(),
-    };
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Horizontal::Right)
+        .align_y(Vertical::Top)
+        .padding(theme::PAD_2),
+    ]
+    .into()
+}
+
+/// The file chip of one attachment: the document glyph, the shortened name and
+/// the removal control after it.
+fn file_chip<'a, M: Clone + 'a>(name: &'a str, remove: M) -> Element<'a, M> {
     container(
         row![
-            thumb,
-            text(crate::util::truncate(&attachment.name, CHIP_NAME_MAX_CHARS))
+            container(
+                iced_fonts::lucide::file_text::<iced::Theme, iced::Renderer>()
+                    .size(theme::TEXT_16)
+                    .color(theme::TEXT_SECONDARY),
+            )
+            .width(Length::Fixed(CHIP_THUMB))
+            .height(Length::Fixed(CHIP_THUMB))
+            .center_x(Length::Fixed(CHIP_THUMB))
+            .center_y(Length::Fixed(CHIP_THUMB)),
+            text(crate::util::truncate(name, CHIP_NAME_MAX_CHARS))
                 .size(theme::TEXT_12)
                 .color(theme::TEXT_SECONDARY),
             super::widgets::compact_x_button(
+                theme::TEXT_SECONDARY,
                 [theme::PAD_1, theme::PAD_4],
                 Some(remove),
                 Some("remove attachment"),
@@ -303,4 +433,45 @@ pub(crate) fn chip<'a, M: Clone + 'a>(attachment: &'a Attachment, remove: M) -> 
     .padding([theme::PAD_2, theme::PAD_6])
     .style(theme::elevated_card_style)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image_crate::ImageEncoder as _;
+
+    /// A picture decodes to the tile its proportions ask for: 72 px tall, its
+    /// own width, clamped — the framework crops the rest from the centre.
+    #[test]
+    fn a_preview_decodes_at_its_tile_size() {
+        assert_eq!(
+            decode(&png(300, 300)).map(|(w, h, _)| (w, h)),
+            Some((144, 144))
+        );
+        // A 3:1 picture hits the 160 px width clamp.
+        assert_eq!(
+            decode(&png(300, 100)).map(|(w, h, _)| (w, h)),
+            Some((320, 144))
+        );
+        // A 1:3 picture hits the 48 px one.
+        assert_eq!(
+            decode(&png(100, 300)).map(|(w, h, _)| (w, h)),
+            Some((96, 144))
+        );
+    }
+
+    /// A flat RGBA PNG of `width`×`height`.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let pixels = vec![0x40; usize::try_from(width * height * 4).unwrap_or(0)];
+        let mut png = Vec::new();
+        image_crate::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &pixels,
+                width,
+                height,
+                image_crate::ExtendedColorType::Rgba8,
+            )
+            .expect("an in-memory PNG encodes");
+        png
+    }
 }

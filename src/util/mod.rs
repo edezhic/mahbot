@@ -1225,7 +1225,7 @@ fn compress_reference_step(bytes: &[u8], step: usize) -> anyhow::Result<Vec<u8>>
 
 /// Read the EXIF orientation tag from a raw image without decoding pixels
 /// (header-only parse via the decoder's `orientation()`).
-fn exif_orientation(bytes: &[u8]) -> Option<image::metadata::Orientation> {
+pub(crate) fn exif_orientation(bytes: &[u8]) -> Option<image::metadata::Orientation> {
     use image::ImageDecoder;
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()

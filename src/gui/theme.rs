@@ -957,6 +957,20 @@ pub fn tooltip_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_ELEVATED, 6.0, 1.0, BORDER_STRONG)
 }
 
+/// Style for a control drawn over arbitrary content (the composer's
+/// picture-tile remove cross): a dark translucent scrim under the glyph, dark
+/// enough to keep a light glyph legible on a bright picture and still distinct
+/// on a dark one.
+#[must_use]
+pub fn scrim_style(_theme: &iced::Theme) -> container::Style {
+    container_style(
+        Color::from_rgba(0.0, 0.0, 0.0, 0.6),
+        4.0,
+        0.0,
+        Color::TRANSPARENT,
+    )
+}
+
 /// Style for chat message bubbles and the typing indicator.
 ///
 /// Shared padding/radius/border across all bubbles.  Background is
