@@ -3527,12 +3527,6 @@ impl TelegramChannel {
                 None,
             );
         }
-        // An update the poll loop received is proof that the local server reaches
-        // Telegram — nothing else produces one — and that is the only such proof
-        // available in local mode, where `getMe` is answered from the server's cache.
-        if self.local {
-            crate::channels::telegram_local::note_telegram_contact();
-        }
         let plan = poll_plan(&updates);
         let mut fresh = HashSet::new();
         // The unit the record could not be written for — an unwritable store, or an

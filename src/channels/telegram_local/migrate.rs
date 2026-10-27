@@ -519,7 +519,7 @@ async fn to_local(journal: &mut Journal) -> Result<(), Step> {
     // local listener must never exist before the bot has left the cloud. Publishing
     // it earlier would also survive a failed switch as a base for a bot that never
     // arrived there.
-    super::publish_endpoint(instance.port, instance.version.clone());
+    super::publish_endpoint(instance.port);
 
     // The two servers number updates independently, so nothing recorded against
     // one may stand in for the other's events. Cleared after the listener
@@ -540,28 +540,32 @@ async fn to_local(journal: &mut Journal) -> Result<(), Step> {
     if let Err(e) = crate::channels::telegram::start_telegram_listener().await {
         let reason = e.to_string();
         if super::credentials_rejected(&reason) {
-            // Nothing local is serving the bot until the pair is corrected, and
-            // saying "starting…" while it waits for the owner would be a lie.
-            set_status(|status| status.health = Health::Down);
+            // Nothing local is serving the bot until the pair is corrected, so
+            // "starting…" would be a lie, and the cause is named now rather than
+            // after the server is stopped: the owner must not see a reason-less
+            // failure meanwhile. The server's own words are the cause
+            // ("Unauthorized: invalid api-id/api-hash").
+            let cause = api_cause(&reason).to_string();
+            set_status(|status| {
+                status.health = Health::Down;
+                status.last_error = Some(cause.clone());
+            });
             // The server caches a failed login for half an hour, so it goes away
             // with the wrong pair: the next attempt starts it with the new one. Its
             // endpoint goes with it, so no boot or supervisor tick builds a listener
             // against a port that no longer serves anything.
             super::server::stop().await;
-            // The server's own words are the cause ("Unauthorized: invalid
-            // api-id/api-hash"); the transport's wrapper around them adds nothing.
-            return Err(Step::Blocked(api_cause(&reason).to_string()));
+            return Err(Step::Blocked(cause));
         }
         return Err(Step::Retry(format!(
             "the local server did not accept the bot: {reason}"
         )));
     }
 
-    // The listener is up, but "asked the server for the bot" is not "Telegram
-    // answered": in local mode only an update that actually arrives proves the
-    // route, so the state says unconfirmed until one does ([`super::Health`]).
+    // The listener is up and the server accepts the bot: the healthy state, which
+    // the settings line does not report at all.
     set_status(|status| {
-        status.health = Health::Unconfirmed;
+        status.health = Health::Running;
         status.last_error = None;
     });
     // Kept in the journal until it reaches the owner: this is the last step, so a
@@ -582,8 +586,7 @@ async fn to_local(journal: &mut Journal) -> Result<(), Step> {
 ///
 /// The local server's state is what ends its session, so the `logOut` against it
 /// is best-effort: a server that cannot reach Telegram, holds the wrong token or
-/// has already been left must not keep the owner from the one mode that works —
-/// this is his escape from a local server that looks healthy but is deaf.
+/// has already been left must not keep the owner from the one mode that works.
 async fn to_cloud(journal: &mut Journal) -> Result<(), Step> {
     crate::channels::telegram::stop_telegram_listener()
         .await

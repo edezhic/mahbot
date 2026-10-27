@@ -572,8 +572,7 @@ pub(super) async fn adopt_or_reap() {
 pub(super) async fn stop() {
     stop_process().await;
     // The endpoint names a port nothing serves any more: a status that kept it
-    // would report a version for a server that is not installed, and a listener
-    // could be built against it.
+    // would offer a listener a base for a server that is not installed.
     super::clear_endpoint();
 }
 

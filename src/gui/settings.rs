@@ -196,18 +196,66 @@ fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
-/// What the feature is doing right now, in words — never a claim beyond what
-/// the supervisor last observed. These are the words of the one-line settings
-/// block, so each is short enough to sit beside the controls it allows;
-/// [`Health::Unconfirmed`] carries the nuance the label leaves out.
-fn health_label(health: Health) -> &'static str {
-    match health {
-        Health::Cloud => "served by Telegram",
-        Health::Starting => "installing or starting…",
-        Health::Running => "running",
-        Health::Unconfirmed => "not confirmed",
-        Health::Down => "not running",
+/// The one line the mode block carries, or `None` when it must not be drawn at
+/// all: a local server that is installed and answering has nothing to report, so a
+/// quiet bot and a busy one look exactly alike. Installing, starting, a switch in
+/// flight and every failure do have something to say, the last one through its
+/// reason.
+fn telegram_line(status: &telegram_local::Status, has_token: bool) -> Option<String> {
+    let mode = mode_name(status.serving);
+    let switching = status.target != status.serving;
+    // Healthy is silence: installed, answering, nothing under way. A switch in
+    // flight is not healthy, even once it reached the side it is heading to.
+    if status.serving == Mode::Local
+        && !switching
+        && !status.migrating
+        && status.health == Health::Running
+        && status.last_error.is_none()
+    {
+        return None;
     }
+    let state = if switching {
+        // Where a pending switch is taking the bot is the new information; the
+        // mode just named is what serves until it gets there.
+        Some(format!("switching to {}…", mode_name(status.target)))
+    } else if status.last_error.is_some() {
+        // A failure is the whole message: no state word beside it, which would
+        // misdescribe a server that answers but refuses the bot — or one whose
+        // listener never came back.
+        None
+    } else if status.serving == Mode::Cloud {
+        Some(if has_token {
+            "served by Telegram".to_string()
+        } else {
+            // Nothing can be served by a local server without a bot, so the cloud
+            // line says what is missing instead of a state that needs nothing.
+            "add a bot token above".to_string()
+        })
+    } else if status.health == Health::Down {
+        Some("not running".to_string())
+    } else {
+        // Installing or starting, or a switch that already cut over and has not
+        // finished bringing the bot up on this side.
+        Some("installing or starting…".to_string())
+    };
+    let mut line = match state {
+        Some(state) => format!("{mode} · {state}"),
+        None => mode.to_string(),
+    };
+    if let Some(reason) = status.last_error.as_deref() {
+        // The reason lives in the status snapshot, not in the page state. When
+        // the switch is blocked this is the journal's cause, which survives
+        // restarts.
+        line.push_str(" — ");
+        line.push_str(reason);
+    }
+    Some(line)
+}
+
+/// Whether the way back to the cloud is offered: only a failure of the local
+/// server earns it, never a bot that has merely been quiet.
+fn telegram_escape(status: &telegram_local::Status) -> bool {
+    status.target == Mode::Local && status.last_error.is_some()
 }
 
 // ── Messages ─────────────────────────────────────────────────────
@@ -3841,90 +3889,62 @@ impl SettingsState {
                 .map(String::as_str),
         );
 
-        section(
-            "Integrations",
-            column![
-                provider_row,
-                self.config_password_field(
-                    "Firecrawl API Key",
-                    PasswordTarget::FirecrawlKey,
-                    "fc-...",
-                    CONFIG_KEY_FIRECRAWL_KEY,
-                    None,
-                    false,
-                ),
-                self.config_password_field(
-                    "Exa API Key",
-                    PasswordTarget::ExaKey,
-                    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-                    CONFIG_KEY_EXA_KEY,
-                    None,
-                    false,
-                ),
-                self.config_password_field(
-                    "Telegram Bot Token",
-                    PasswordTarget::TelegramToken,
-                    "123:abc",
-                    CONFIG_KEY_TELEGRAM_BOT_TOKEN,
-                    None,
-                    false,
-                ),
-                self.telegram_local_area(),
-            ],
-        )
+        let mut integrations = column![
+            provider_row,
+            self.config_password_field(
+                "Firecrawl API Key",
+                PasswordTarget::FirecrawlKey,
+                "fc-...",
+                CONFIG_KEY_FIRECRAWL_KEY,
+                None,
+                false,
+            ),
+            self.config_password_field(
+                "Exa API Key",
+                PasswordTarget::ExaKey,
+                "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+                CONFIG_KEY_EXA_KEY,
+                None,
+                false,
+            ),
+            self.config_password_field(
+                "Telegram Bot Token",
+                PasswordTarget::TelegramToken,
+                "123:abc",
+                CONFIG_KEY_TELEGRAM_BOT_TOKEN,
+                None,
+                false,
+            ),
+        ];
+        // Absent while the local server is installed and healthy: the working
+        // setup says nothing, so there is no empty line to leave a gap.
+        if let Some(area) = self.telegram_local_area() {
+            integrations = integrations.push(area);
+        }
+        section("Integrations", integrations)
     }
 
     /// The Telegram Bot API mode area of the Integrations section: one line
-    /// carrying the mode serving the bot, what it is doing, the version of an
-    /// installed server, and the controls this state allows.
+    /// carrying the mode serving the bot, what it is doing, and the controls this
+    /// state allows — or no element at all, which is the healthy local state.
     ///
     /// The state is read at render time: every change of the feature publishes
     /// [`crate::runtime_events::RuntimeEvent::TelegramLocal`], which the
     /// dashboard turns into a repaint, so there is no poll loop here.
-    fn telegram_local_area(&self) -> Element<'_, SettingsMessage> {
+    fn telegram_local_area(&self) -> Option<Element<'_, SettingsMessage>> {
         let status = telegram_local::status();
         // A switch actually in flight, or a request this page just started:
-        // `busy` disables the controls that would start a second switch. The
-        // escape below is deliberately not one of them — it is the only control an
-        // owner needs while a switch stalls. A switch waiting for the owner
-        // (blocked with a cause) is not busy by this definition.
+        // `busy` disables the controls that would start a second switch. A switch
+        // waiting for the owner (blocked with a cause) is not busy by this
+        // definition.
         let busy = self.telegram_switch_busy || (status.migrating && status.blocked.is_none());
         // The one bot fact this block rests on: everything a switch would start
         // needs it, and the way in stays disabled without it.
         let has_token = CONFIG.telegram_bot_token().is_some();
 
-        // The one sentence the line carries: the mode serving the bot, then where
-        // a pending switch is taking it — that switch has not reached its
-        // irreversible point, so the mode just named is what serves now — or
-        // otherwise what that mode is doing.
-        let mode = mode_name(status.serving);
-        let mut state = if status.target != status.serving {
-            format!("{mode} · switching to {}…", mode_name(status.target))
-        } else if status.serving == Mode::Cloud && !has_token {
-            // Nothing can be served by a local server without a bot, so the cloud
-            // line says what is missing instead of a state that needs nothing.
-            format!("{mode} · add a bot token above")
-        } else {
-            format!("{mode} · {}", health_label(status.health))
-        };
-        // The version belongs to the local mode: it names the artifact serving the
-        // bot there. Only the number is added — the line already names the server,
-        // so the banner's own "Bot API " prefix is dropped.
-        if let Some(version) = status
-            .version
-            .as_deref()
-            .filter(|_| status.serving == Mode::Local)
-        {
-            state.push_str(" · ");
-            state.push_str(version.strip_prefix("Bot API ").unwrap_or(version));
-        }
-        if let Some(reason) = status.last_error.as_deref() {
-            // The reason lives in the status snapshot, not in the page state. When
-            // the switch is blocked this is the journal's cause, which survives
-            // restarts.
-            state.push_str(" — ");
-            state.push_str(reason);
-        }
+        // Silence is the whole report of a working local setup: not even an empty
+        // row, which would leave a gap in the section.
+        let state = telegram_line(&status, has_token)?;
 
         let mut summary = text(state).size(theme::TEXT_13).width(Length::Fill);
         if status.last_error.is_some() {
@@ -3941,8 +3961,10 @@ impl SettingsState {
             // is enough: the text beside it already says where the bot is going.
             line = line.push(super::spinner(theme::TEXT_13));
         }
-        line.push(self.telegram_line_controls(&status, busy, has_token))
-            .into()
+        Some(
+            line.push(self.telegram_line_controls(&status, busy, has_token))
+                .into(),
+        )
     }
 
     /// The controls carried by the mode line. Every one of them stays on that
@@ -4010,16 +4032,10 @@ impl SettingsState {
             // dialog is the way on.
             controls = controls.push(credentials_again());
         }
-        // The way out of a local server that is not confirmed running, and of any
-        // switch heading there: a stalled install, a drain waiting on a large file
-        // or a server that will not answer is exactly when there is no other way
-        // back, so only a request this page is already running makes the control
-        // unavailable — a switch running in the background does not, because
-        // asking for the cloud is what ends it. A switch back to the cloud is
-        // finished by its own retry, so the escape is not offered for it.
-        let escape =
-            status.target == Mode::Local && (status.migrating || status.health != Health::Running);
-        if escape {
+        // The way out is offered for a failure of the local server and nothing
+        // else: a working setup needs no way back, and neither does a switch that
+        // has not failed, however long it runs.
+        if telegram_escape(status) {
             controls = controls.push(control(
                 "Return to the cloud",
                 (!self.telegram_switch_busy).then_some(SettingsMessage::RequestSwitchToCloud),
@@ -5659,5 +5675,134 @@ mod tests {
             !state.custom_endpoint_active_ui(),
             "back on OpenRouter: routing section visible"
         );
+    }
+
+    /// A status for the mode-line tests: every field the line reads, and nothing
+    /// that would need a running supervisor.
+    fn telegram_status(
+        serving: Mode,
+        target: Mode,
+        health: Health,
+        migrating: bool,
+        error: Option<&str>,
+    ) -> telegram_local::Status {
+        telegram_local::Status {
+            target,
+            serving,
+            health,
+            last_error: error.map(str::to_string),
+            port: None,
+            migrating,
+            blocked: None,
+            credentials_set: true,
+        }
+    }
+
+    /// The mode line: silence for a working local server, progress while it is not
+    /// yet serving, the reason on a failure, and the cloud's own words.
+    #[test]
+    fn telegram_line_speaks_only_when_there_is_something_to_say() {
+        let (l, c) = (Mode::Local, Mode::Cloud);
+        let line = |status: &telegram_local::Status| telegram_line(status, true);
+
+        // Installed and answering: nothing at all. Quietness is not an input here,
+        // so no amount of it can produce a word.
+        assert_eq!(
+            line(&telegram_status(l, l, Health::Running, false, None)),
+            None
+        );
+        // A switch that already cut over is still progress, not silence.
+        let starting = Some("Local server · installing or starting…".to_string());
+        assert_eq!(
+            line(&telegram_status(l, l, Health::Running, true, None)),
+            starting
+        );
+        assert_eq!(
+            line(&telegram_status(l, l, Health::Starting, false, None)),
+            starting
+        );
+        assert_eq!(
+            line(&telegram_status(l, l, Health::Down, false, None)),
+            Some("Local server · not running".to_string())
+        );
+        // A failure is the reason, with no state word beside it — a server that
+        // answers but refuses the bot is not "not running".
+        assert_eq!(
+            line(&telegram_status(
+                l,
+                l,
+                Health::Down,
+                false,
+                Some("the local server refused the bot: Unauthorized")
+            )),
+            Some("Local server — the local server refused the bot: Unauthorized".to_string())
+        );
+        // A switch in flight keeps reporting where it is going, and a failure that
+        // stops it keeps its reason.
+        assert_eq!(
+            line(&telegram_status(c, l, Health::Starting, true, None)),
+            Some("Cloud · switching to Local server…".to_string())
+        );
+        assert_eq!(
+            line(&telegram_status(l, c, Health::Running, true, None)),
+            Some("Local server · switching to Cloud…".to_string())
+        );
+        assert_eq!(
+            line(&telegram_status(
+                c,
+                l,
+                Health::Starting,
+                true,
+                Some("the install failed")
+            )),
+            Some("Cloud · switching to Local server… — the install failed".to_string())
+        );
+        // The cloud keeps its own line and its way in; a failure there is its
+        // reason alone, because nothing is served while its listener is missing.
+        assert_eq!(
+            line(&telegram_status(c, c, Health::Cloud, false, None)),
+            Some("Cloud · served by Telegram".to_string())
+        );
+        assert_eq!(
+            telegram_line(&telegram_status(c, c, Health::Cloud, false, None), false),
+            Some("Cloud · add a bot token above".to_string())
+        );
+        assert_eq!(
+            line(&telegram_status(
+                c,
+                c,
+                Health::Cloud,
+                true,
+                Some("the cloud Bot API has not taken the bot back yet")
+            )),
+            Some("Cloud — the cloud Bot API has not taken the bot back yet".to_string())
+        );
+    }
+
+    /// The way back to the cloud: a failure of the local server earns it, a quiet
+    /// bot and a switch back never do.
+    #[test]
+    fn the_way_back_to_the_cloud_needs_a_failure() {
+        assert!(!telegram_escape(&telegram_status(
+            Mode::Local,
+            Mode::Local,
+            Health::Running,
+            false,
+            None
+        )));
+        assert!(telegram_escape(&telegram_status(
+            Mode::Local,
+            Mode::Local,
+            Health::Down,
+            false,
+            Some("the install failed")
+        )));
+        assert!(!telegram_escape(&telegram_status(
+            Mode::Cloud,
+            Mode::Cloud,
+            Health::Cloud,
+            true,
+            Some("the cloud Bot API has not taken the bot back yet")
+        )));
     }
 }

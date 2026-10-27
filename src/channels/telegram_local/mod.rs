@@ -40,11 +40,12 @@
 //!
 //! ## What the interface is told
 //!
-//! [`Health`] keeps "the process answers" and "Telegram is reachable" apart. The
-//! second cannot be probed in local mode — the server answers from its own cache —
-//! so it is only reported as confirmed when an update actually arrived, and as
-//! unconfirmed otherwise. A switch waiting for the owner keeps its own cause in the
-//! journal, so it survives a restart and is not overwritten by a later probe.
+//! [`Health`] reports installing, starting and failures, and nothing else: a
+//! local server that is installed and answering has no state word, because "the
+//! process answers" says nothing about Telegram and a bot nobody writes to is not
+//! a fault. A failure carries its reason. A switch waiting for the owner keeps its
+//! own cause in the journal, so it survives a restart and is not overwritten by a
+//! later probe.
 
 mod install;
 mod migrate;
@@ -136,15 +137,12 @@ fn serving_from(configured: Mode, switch: Option<&migrate::Journal>) -> Mode {
 pub(crate) enum Health {
     /// Cloud mode: nothing local is involved.
     Cloud,
-    /// Installing, starting, or waiting for the first answer.
+    /// Installing or starting the server, before it answers.
     Starting,
-    /// The process answers and the bot answered recently.
+    /// The process answers: nothing to report.
     Running,
-    /// The process answers, but Telegram is not confirmed — the server looks
-    /// healthy while it may be deaf, which is why the settings line offers the way
-    /// back to the cloud from this state.
-    Unconfirmed,
-    /// No working server: not installed, not running, or blocked.
+    /// The local server is not serving the bot; [`Status::last_error`] names the
+    /// cause once a step has named it.
     Down,
 }
 
@@ -161,8 +159,6 @@ pub(crate) struct Status {
     /// The mode the transport uses right now.
     pub(crate) serving: Mode,
     pub(crate) health: Health,
-    /// The Bot API version the running artifact reports.
-    pub(crate) version: Option<String>,
     /// The last failure, in words the owner can act on.
     pub(crate) last_error: Option<String>,
     pub(crate) port: Option<u16>,
@@ -180,7 +176,6 @@ impl Status {
             target: Mode::Cloud,
             serving: Mode::Cloud,
             health: Health::Cloud,
-            version: None,
             last_error: None,
             port: None,
             migrating: false,
@@ -198,7 +193,7 @@ fn status_cell() -> &'static std::sync::Mutex<Status> {
 
 /// The current state.
 ///
-/// The stored fields (health, version, port, last error) come from the running
+/// The stored fields (health, port, last error) come from the running
 /// supervisor; the switch's facts are derived here, once per call, from the one
 /// journal read. A pending switch stays `migrating` while it is blocked too: it is
 /// waiting for the owner, not finished. A journal whose only remaining work is the
@@ -346,8 +341,8 @@ pub(crate) enum Boot {
 /// every minute.
 const LIVENESS_INTERVAL: Duration = Duration::from_mins(1);
 
-/// How often the bot itself is asked whether Telegram answers: this is what
-/// tells "the process runs" apart from "the bot works".
+/// How often the local server is asked whether it takes the bot: `getMe` is the
+/// one question a refusal or a rejected pair answers.
 const REACHABILITY_INTERVAL: Duration = Duration::from_mins(5);
 
 /// How often the release stream is asked for a newer server.
@@ -372,31 +367,6 @@ const SETTLED_RETRY: Duration = Duration::from_hours(1);
 /// clears by itself, rarely enough that a cause which is not gone costs nothing.
 const BLOCKED_RETRY: Duration = Duration::from_hours(1);
 
-/// How long a delivery from Telegram keeps the bot "confirmed reachable". A bot
-/// nobody writes to cannot be confirmed at all — the server answers from its own
-/// cache and its `getUpdates` is empty either way — and saying so is the honest
-/// state ([`Health::Unconfirmed`]).
-const CONTACT_FRESHNESS: Duration = Duration::from_mins(15);
-
-/// When the bot last received something through the local server: the one proof
-/// that the server reaches Telegram rather than merely answering.
-static LAST_CONTACT: OnceLock<std::sync::Mutex<Option<tokio::time::Instant>>> = OnceLock::new();
-
-/// Record that Telegram reached the bot: an update arrived through the local
-/// server, which nothing but a working route to Telegram produces.
-pub(crate) fn note_telegram_contact() {
-    let cell = LAST_CONTACT.get_or_init(|| std::sync::Mutex::new(None));
-    *cell.lock().unwrap_poison() = Some(tokio::time::Instant::now());
-}
-
-/// Whether Telegram has been heard from recently enough to call the bot working.
-fn contacted_recently() -> bool {
-    LAST_CONTACT
-        .get()
-        .and_then(|cell| *cell.lock().unwrap_poison())
-        .is_some_and(|at| at.elapsed() < CONTACT_FRESHNESS)
-}
-
 /// Whether the owner has already been told about the current failure episode.
 static FAILURE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
@@ -418,7 +388,7 @@ pub(crate) async fn prepare_for_boot() -> Boot {
     if let Some(instance) = server::read_record()
         && server::alive(&instance).await
     {
-        publish_endpoint(instance.port, instance.version.clone());
+        publish_endpoint(instance.port);
     }
 
     if migrate::pending() {
@@ -454,16 +424,16 @@ async fn ensure_local() -> Result<(), String> {
     set_status(|status| status.health = Health::Starting);
     let fingerprint = server::credentials_fingerprint(&api_id, &api_hash);
     let instance = server::ensure(&fingerprint).await?;
-    publish_endpoint(instance.port, instance.version.clone());
+    publish_endpoint(instance.port);
     Ok(())
 }
 
-/// Record the endpoint the transport may use.
-pub(super) fn publish_endpoint(port: u16, version: Option<String>) {
+/// Record the endpoint the transport may use: the server answers, so the state
+/// is healthy and the current failure episode, if any, is over.
+pub(super) fn publish_endpoint(port: u16) {
     set_status(|status| {
         status.port = Some(port);
-        status.version = version;
-        status.health = Health::Unconfirmed;
+        status.health = Health::Running;
         status.last_error = None;
     });
     FAILURE_NOTIFIED.store(false, Ordering::SeqCst);
@@ -472,10 +442,7 @@ pub(super) fn publish_endpoint(port: u16, version: Option<String>) {
 /// Forget the endpoint: the server it named is gone, and nothing may be built
 /// against it. In local mode that means no listener at all until one exists.
 pub(super) fn clear_endpoint() {
-    set_status(|status| {
-        status.port = None;
-        status.version = None;
-    });
+    set_status(|status| status.port = None);
 }
 
 /// Record a failure and tell the owner once per episode.
@@ -568,8 +535,8 @@ pub(crate) async fn request_switch(target: Mode) -> anyhow::Result<()> {
 /// switch a crash interrupted.
 ///
 /// Its whole cost when everything is fine is one tokenless request a minute, and
-/// a `getMe` every five minutes to tell a working bot from a merely running
-/// server.
+/// a `getMe` every five minutes to catch a server that answers but refuses the
+/// bot.
 pub(crate) async fn run_supervisor() {
     let mut backoff = 0usize;
     // `None` means nothing is scheduled: the steady state wakes on the liveness
@@ -705,21 +672,19 @@ fn start_listener_after_recovery() {
     });
 }
 
-/// Probe the local server and report what is known about the bot behind it.
+/// Probe the local server and report a failure the settings line can name.
 ///
-/// Two different facts hide behind "the server works": the process answering on
-/// its port, and the bot being reachable through it. The first is probed
-/// tokenlessly. The second cannot be probed at all in local mode — the server
-/// answers `getMe` from its own cache and its `getUpdates` is empty whether or not
-/// Telegram is reachable — so it is only ever reported as confirmed when
-/// something actually arrived from Telegram recently
-/// ([`note_telegram_contact`]), and as [`Health::Unconfirmed`] otherwise.
+/// Two facts hide behind "the server works": the process answering on its port,
+/// and the server accepting the bot against it. The first is probed tokenlessly,
+/// the second with `getMe`. Either failure is an error with its reason; both
+/// answering is the healthy state, which has nothing to say — a bot nobody writes
+/// to looks exactly like a busy one from here.
 async fn check_reachability() {
     // The probe is about the local server, so it runs only while that is what serves
     // — and not while a switch is in flight, which owns the diagnosis: it knows
     // which side the bot is on, and a probe of the wrong side would overwrite its
     // cause. A switch waiting for the owner does not own it: the local server is
-    // what carries the bot then, and its deafness is exactly what the owner must
+    // what carries the bot then, and a failure of it is exactly what the owner must
     // see.
     if serving_mode() != Mode::Local
         || (migrate::pending() && !migrate::is_blocked() && !migrate::finishing())
@@ -741,34 +706,24 @@ async fn check_reachability() {
         });
         return;
     }
-    // Whether the server knows the token is a fact it can answer; whether Telegram
-    // is behind it is not, which is what the state below says.
+    // Whether the server knows the token is a fact it can answer, and a refusal is
+    // a failure like any other: the reason the owner needs is the server's own.
     if let (Some(base), Some(token)) = (local_endpoint(), CONFIG.telegram_bot_token())
         && let Err(e) = crate::channels::telegram::TelegramChannel::probe_bot(&base, &token).await
     {
         let failure = e.to_string();
         let reason = api_cause(&failure);
         set_status(|status| {
-            status.health = Health::Unconfirmed;
+            status.health = Health::Down;
             status.last_error = Some(format!("the local server refused the bot: {reason}"));
         });
         return;
     }
-    if contacted_recently() {
-        set_status(|status| {
-            status.health = Health::Running;
-            status.last_error = None;
-        });
-        FAILURE_NOTIFIED.store(false, Ordering::SeqCst);
-    } else {
-        // Nothing is failing here, so the state carries the whole message: the
-        // server answers and Telegram does not — the one honest reading while a
-        // possibly-deaf server looks healthy.
-        set_status(|status| {
-            status.health = Health::Unconfirmed;
-            status.last_error = None;
-        });
-    }
+    set_status(|status| {
+        status.health = Health::Running;
+        status.last_error = None;
+    });
+    FAILURE_NOTIFIED.store(false, Ordering::SeqCst);
 }
 
 /// Check the release stream and install a newer build, beside the loop.
@@ -827,7 +782,6 @@ async fn apply_server_update() {
     server::stop().await;
     match ensure_local().await {
         Ok(()) => {
-            set_status(|status| status.health = Health::Unconfirmed);
             // The new process listens on a fresh port, so the listener is rebuilt now
             // rather than at the next tick: the bot is only away for the restart.
             start_listener_after_recovery();
