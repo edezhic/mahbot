@@ -46,8 +46,7 @@
 //!
 //! Every run tests the fixed bench phrase **"hey mahbot"** — never resolved
 //! from the live config store, never overridable via env.  This keeps
-//! benchmark numbers comparable across runs and guarantees the live personal
-//! enrollment phrase can never drive benchmark runs.
+//! benchmark numbers comparable across runs.
 //!
 //! # TTS caveat
 //!
@@ -118,9 +117,7 @@ static WARMUP_TTS_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::ne
 
 /// The fixed wake phrase every benchmark run synthesizes and tests.
 ///
-/// Pinned so benchmark numbers stay comparable across runs and the live
-/// personal enrollment phrase can never drive benchmark runs (the bench
-/// never reads the deployed config-store phrase).
+/// Pinned so benchmark numbers stay comparable across runs.
 const BENCH_WAKE_PHRASE: &str = "hey mahbot";
 
 /// Number of enrollment variants to generate.
@@ -2658,9 +2655,7 @@ pub(crate) fn run_wake_word_benchmark() {
                     crate::audio::wake_word::calibrate_negatives(&proto, &negative_embeddings);
                 let created_at = crate::db::now();
                 let trained_at = crate::db::now();
-                let phrase = super::normalize_phrase(BENCH_WAKE_PHRASE);
                 crate::audio::wake_word::WakeWordEnrollment::build(
-                    phrase,
                     &utterance_embeddings,
                     calibration,
                     &negative_embeddings,
@@ -2683,9 +2678,8 @@ pub(crate) fn run_wake_word_benchmark() {
     #[expect(clippy::cast_precision_loss)] // ROLLING_WINDOW_N small — exact in f32
     let static_match_threshold = (super::ROLLING_WINDOW_N as f32) * calibration.fire_soft();
     info!(
-        "Enrollment built: phrase='{}', {} utterances, calibration neg_mean={:.4} (p99={:.4}, n={}), \
+        "Enrollment built: {} utterances, calibration neg_mean={:.4} (p99={:.4}, n={}), \
          derived_floor={:.4}, fire_factor={:.4}, static_threshold={:.4}",
-        enrollment.phrase,
         enrollment.utterance_count,
         calibration.neg_mean,
         calibration.neg_p99,

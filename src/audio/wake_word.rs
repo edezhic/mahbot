@@ -29,9 +29,9 @@
 //!
 //! # Persistence
 //!
-//! Schema version 2 (`wake_word_templates` config key): phrase, 1024-dim
-//! prototype, calibration stats, anti-prototypes, timestamps.  Old v1
-//! enrollment records are rejected outright — no migration, no compat.
+//! Schema version 2 (`wake_word_templates` config key): 1024-dim prototype,
+//! calibration stats, anti-prototypes, timestamps.  Old v1 enrollment records
+//! are rejected outright — no migration, no compat.
 //!
 //! # Mel-normalization consistency
 //!
@@ -329,12 +329,13 @@ impl Calibration {
 /// The prototype is the L2-normalized mean of the accepted per-utterance
 /// window embeddings.  Scoring is cosine similarity against the prototype,
 /// mapped through [`Calibration::soft_score`].
+///
+/// Records written before the phrase field was dropped still load: serde
+/// ignores the extra key, so no existing enrollment has to be redone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WakeWordEnrollment {
     #[serde(default)]
     pub(crate) schema_version: u32,
-    /// Normalized wake word phrase (lowercased, trimmed).
-    pub(crate) phrase: String,
     /// Expected embedding dimension (runtime: [`WAKE_WORD_EMBEDDING_DIM`]).
     pub(crate) embedding_dim: usize,
     /// L2-normalized prototype embedding (1024-dim).
@@ -378,7 +379,6 @@ impl WakeWordEnrollment {
     /// Returns `None` when fewer than [`MIN_ENROLLMENT_UTTERANCES`] are given.
     #[must_use]
     pub(crate) fn build(
-        phrase: String,
         utterance_embeddings: &[Vec<f32>],
         calibration: Calibration,
         negative_embeddings: &[Vec<f32>],
@@ -392,7 +392,6 @@ impl WakeWordEnrollment {
         let prototype = normalized_centroid(utterance_embeddings).ok()?;
         Some(Self {
             schema_version: ENROLLMENT_SCHEMA_VERSION,
-            phrase,
             embedding_dim: dim,
             prototype,
             utterance_count: utterance_embeddings.len(),
@@ -768,7 +767,6 @@ mod tests {
 
         let five: Vec<Vec<f32>> = vec![proto.clone(); MIN_ENROLLMENT_UTTERANCES];
         let enr = WakeWordEnrollment::build(
-            "mahbot".into(),
             &five,
             cal.clone(),
             std::slice::from_ref(&confusable),
@@ -788,15 +786,9 @@ mod tests {
         assert!(enr.soft_score(&proto) > 0.5);
         // Without anti-prototypes the same confusable is NOT rejected — the
         // gate (not the floor) is what suppressed it.
-        let no_neg = WakeWordEnrollment::build(
-            "mahbot".into(),
-            &five,
-            cal.clone(),
-            &[],
-            String::new(),
-            String::new(),
-        )
-        .expect("enrollment");
+        let no_neg =
+            WakeWordEnrollment::build(&five, cal.clone(), &[], String::new(), String::new())
+                .expect("enrollment");
         assert!(no_neg.soft_score(&confusable) > 0.5);
     }
 
@@ -881,7 +873,6 @@ mod tests {
         let enough: Vec<Vec<f32>> = vec![emb.clone(); MIN_ENROLLMENT_UTTERANCES];
         assert!(
             WakeWordEnrollment::build(
-                "mahbot".into(),
                 &enough,
                 Calibration::default(),
                 &[],
@@ -893,7 +884,6 @@ mod tests {
         let too_few: Vec<Vec<f32>> = vec![emb; MIN_ENROLLMENT_UTTERANCES - 1];
         assert!(
             WakeWordEnrollment::build(
-                "mahbot".into(),
                 &too_few,
                 Calibration::default(),
                 &[],
@@ -914,7 +904,6 @@ mod tests {
         );
         let five: Vec<Vec<f32>> = vec![emb; MIN_ENROLLMENT_UTTERANCES];
         let enr = WakeWordEnrollment::build(
-            "mahbot".into(),
             &five,
             Calibration::default(),
             &[],
@@ -937,7 +926,6 @@ mod tests {
         );
         let eight: Vec<Vec<f32>> = vec![emb; 8];
         let enr = WakeWordEnrollment::build(
-            "mahbot".into(),
             &eight,
             Calibration::default(),
             &[],
@@ -950,13 +938,34 @@ mod tests {
         assert_eq!(back.schema_version, ENROLLMENT_SCHEMA_VERSION);
         assert_eq!(back.embedding_dim, WAKE_WORD_EMBEDDING_DIM);
         assert_eq!(back.prototype.len(), WAKE_WORD_EMBEDDING_DIM);
-        assert_eq!(back.phrase, "mahbot");
+    }
+
+    /// A record stored before the phrase field was dropped carries an extra
+    /// `phrase` key: it must still load, or every existing enrollment would
+    /// have to be redone.
+    #[test]
+    fn record_with_legacy_phrase_still_loads() {
+        let emb = l2_normalize(&vec![1.0; WAKE_WORD_EMBEDDING_DIM]);
+        let enr = WakeWordEnrollment::build(
+            &vec![emb; 8],
+            Calibration::default(),
+            &[],
+            "created".into(),
+            "trained".into(),
+        )
+        .expect("enrollment");
+        let mut json = serde_json::to_value(&enr).expect("serialize");
+        json["phrase"] = "mahbot".into();
+        let back: WakeWordEnrollment =
+            serde_json::from_value(json).expect("a legacy record with a phrase must load");
+        assert_eq!(back.schema_version, ENROLLMENT_SCHEMA_VERSION);
+        assert_eq!(back.prototype, enr.prototype);
     }
 
     #[test]
     fn v1_schema_rejected() {
         // A v1 record (classifier-based) must not deserialize as v2.
-        let v1 = r#"{"schema_version":1,"phrase":"mahbot","embedding_dim":96,
+        let v1 = r#"{"schema_version":1,"embedding_dim":96,
                      "window_size":3,"classifier":[]}"#;
         let parsed: serde_json::Result<WakeWordEnrollment> = serde_json::from_str(v1);
         // v1 has no prototype → deserialization fails (missing field).

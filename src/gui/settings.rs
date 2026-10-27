@@ -500,9 +500,6 @@ pub enum SettingsMessage {
     /// Retry loading voice models after a [`VoiceStatus::ModelError`].
     #[cfg(target_os = "macos")]
     RetryVoiceModels,
-    /// User typed in the wake word phrase text input.
-    #[cfg(target_os = "macos")]
-    WakeWordPhraseInput(EditorAction),
     // ── TTS messages ─────────────────────────────────────
     /// Toggle TTS on/off (persisted to config DB).
     #[cfg(target_os = "macos")]
@@ -709,10 +706,6 @@ pub struct SettingsState {
     /// earlier toggles are detected and ignored.
     #[cfg(target_os = "macos")]
     transcription_toggle_gen: u64,
-    /// Transient text input for the wake word phrase.
-    /// Not persisted — passed to [`VoiceCommand::StartEnrollment`] on click.
-    #[cfg(target_os = "macos")]
-    wake_word_phrase_input: SingleLineEditorState,
 
     // ── TTS state ─────────────────────────────────────────
     /// Generation counter for TTS toggle operations.
@@ -799,8 +792,6 @@ impl SettingsState {
             voice_toggle_gen: 0,
             #[cfg(target_os = "macos")]
             transcription_toggle_gen: 0,
-            #[cfg(target_os = "macos")]
-            wake_word_phrase_input: SingleLineEditorState::new(""),
             #[cfg(target_os = "macos")]
             tts_toggle_gen: 0,
         };
@@ -1680,15 +1671,10 @@ impl SettingsState {
             }
             #[cfg(target_os = "macos")]
             SettingsMessage::StartVoiceEnrollment => {
-                let phrase = self.wake_word_phrase_input.text();
                 crate::audio::voice::send_command(
-                    crate::audio::voice::VoiceCommand::StartEnrollment(phrase),
+                    crate::audio::voice::VoiceCommand::StartEnrollment,
                 );
                 Task::none()
-            }
-            #[cfg(target_os = "macos")]
-            SettingsMessage::WakeWordPhraseInput(action) => {
-                apply_simple_editor_action(&mut self.wake_word_phrase_input, action)
             }
             #[cfg(target_os = "macos")]
             SettingsMessage::CancelVoiceEnrollment => {
@@ -3554,10 +3540,9 @@ impl SettingsState {
     // One 'Audio' section with exactly three rows — Transcription, Wake Word
     // Detection, Text to Speech — each with the toggle and an inline status in
     // the same row, and its explanation as a hover hint over the whole row. The
-    // wake-word enrollment UI (phrase input, Enroll button,
-    // enrolled-phrase display, multi-line progress/Cancel) sits below the
-    // three rows. The section does not exist off macOS, where there is no
-    // audio subsystem at all.
+    // wake-word enrollment UI (Enroll button, multi-line progress/Cancel) sits
+    // below the three rows. The section does not exist off macOS, where there
+    // is no audio subsystem at all.
 
     #[cfg(target_os = "macos")]
     #[expect(clippy::too_many_lines)]
@@ -3566,14 +3551,6 @@ impl SettingsState {
             self.config.audio_transcription_use_local.as_deref() != Some("false");
         let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
         let status = crate::audio::voice::get_status();
-        let has_enrollment = crate::audio::voice::get_enrollment().is_some();
-        let is_enrolling = matches!(
-            status,
-            crate::audio::voice::VoiceStatus::Enrolling { .. }
-                | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
-                | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
-                | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. }
-        );
 
         // ── Row 1: Transcription (toggle + inline status + Retry) ──
         let transcription_status: Element<'_, SettingsMessage> = if !transcription_enabled {
@@ -3698,36 +3675,7 @@ impl SettingsState {
             "Let assistant talk",
         );
 
-        // ── Wake-word enrollment UI (below the three rows) ──
-        // Enrolled-phrase display / phrase input / Enroll button (when voice
-        // is on and transcription allows it — the push site below applies the
-        // same guard, so the row collapses to nothing when either is off).
-        let wake_word_value: String = match crate::audio::voice::get_enrolled_phrase() {
-            Some(phrase) => phrase,
-            None if has_enrollment => "Enrollment found — re-enroll to replace it".into(),
-            None => "Enroll a wake word to get started".into(),
-        };
-        let wake_word_row = field_row(
-            "Wake Word",
-            text(wake_word_value).size(theme::TEXT_13).into(),
-            None,
-        );
-
-        // Text input for the wake word phrase (before enrollment).
-        let phrase_input = if voice_enabled && transcription_enabled && !is_enrolling {
-            let input = widgets::single_line_editor(
-                &self.wake_word_phrase_input.buffer,
-                "mahbot",
-                false,
-                Length::Fill,
-                Some(Id::new("wake_word_phrase")),
-                SettingsMessage::WakeWordPhraseInput,
-            );
-            field_row("Wake Word Phrase", input, None)
-        } else {
-            Space::new().height(0).into()
-        };
-
+        // ── Wake-word enrollment controls (below the three rows) ──
         let enroll_btn: Element<'_, SettingsMessage> = if voice_enabled && transcription_enabled {
             container(
                 button(Text::new("Enroll Wake Word").size(theme::TEXT_13))
@@ -3844,8 +3792,6 @@ impl SettingsState {
             .push(tts_row);
         if voice_enabled && transcription_enabled {
             column = column.push(Space::new().height(8));
-            column = column.push(wake_word_row);
-            column = column.push(phrase_input);
             column = column.push(enroll_btn);
         }
         if let Some(ui) = enrollment_ui {

@@ -175,9 +175,6 @@ const ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES: usize =
     (ENROLLMENT_NO_SPEECH_DURATION.as_millis() as usize * SAMPLE_RATE as usize)
         / (HOP_LENGTH * 1000);
 
-/// Default wake word phrase used when no phrase has been specified.
-const DEFAULT_WAKE_WORD_PHRASE: &str = "mahbot";
-
 /// Consecutive VAD-negative hops before a detection segment boundary fires
 /// (~300 ms at 16 ms/hop).  The rolling score window and adaptive threshold
 /// are reset at the boundary so scores cannot accumulate across separate
@@ -768,13 +765,6 @@ struct VoicePipelineState {
     /// accepted `handle_enrollment_sample` call.  The UI counter and
     /// finalization trigger use this field.
     enrolled_utterance_count: usize,
-    /// Cached wake word phrase from the last loaded / persisted enrollment.
-    /// Never cleared on cancel.  Read by [`get_enrolled_phrase()`].
-    model_phrase: Option<String>,
-    /// Transient wake word phrase for an enrollment in progress.
-    /// Set at enrollment start via [`normalize_phrase`], consumed by
-    /// [`finalize_enrollment_pipeline`]. Never read by [`get_enrolled_phrase()`].
-    enrolling_phrase: Option<String>,
     cmd_tx: Option<mpsc::UnboundedSender<VoiceCommand>>,
 }
 
@@ -783,16 +773,12 @@ impl VoicePipelineState {
     ///
     /// Called by [`PipelineCtx::reset_pipeline_state`] on [`ResetLevel::Cancel`]
     /// and by tests to verify data model invariants.
-    ///
-    /// Clears the transient [`enrolling_phrase`] but preserves [`model_phrase`]
-    /// (the cached phrase from the last loaded / persisted enrollment).
     fn reset_enrollment(&mut self) {
         self.enrollment_embeddings.clear();
         self.negative_audio_chunks.clear();
         self.owner_negative_chunks.clear();
         self.enrolled_utterance_count = 0;
         self.utterances_collected = false;
-        self.enrolling_phrase = None;
     }
 }
 
@@ -800,10 +786,8 @@ impl VoicePipelineState {
 pub enum VoiceCommand {
     StartListening,
     StopListening,
-    /// Start wake word enrollment using the specified wake word phrase.
-    /// The phrase is normalized (trimmed, lowercased, whitespace-collapsed)
-    /// before being stored in the enrollment record.
-    StartEnrollment(String),
+    /// Start wake word enrollment.
+    StartEnrollment,
     CancelEnrollment,
     /// Retry loading the shared Qwen3-ASR transcriber model after a terminal
     /// failure (the wake-word pipeline has no model machinery of its own).
@@ -842,8 +826,6 @@ pub fn init_global() -> Result<()> {
             owner_negative_chunks: Vec::new(),
             enrolled_utterance_count: 0,
             utterances_collected: false,
-            model_phrase: None,
-            enrolling_phrase: None,
             cmd_tx: None,
         }))
         .map_err(|_| anyhow!("VoicePipeline already initialized"))?;
@@ -2656,7 +2638,7 @@ impl PipelineCtx {
 
     /// Start an enrollment, aborting the recording it cannot coexist with (the
     /// composer is told the recording was discarded).
-    fn handle_start_enrollment(&mut self, phrase: &str) {
+    fn handle_start_enrollment(&mut self) {
         if !self.is_listening {
             warn!("Cannot start enrollment: microphone not running");
             set_status(VoiceStatus::Error(
@@ -2693,13 +2675,6 @@ impl PipelineCtx {
                  {existing_utterances}/{NUM_ENROLLMENT_SAMPLES}",
             );
         }
-
-        // Store the normalized wake word phrase in the global enrollment
-        // state AFTER reset, so reset_enrollment does not clear it.
-        // This phrase is consumed by finalize_enrollment_pipeline() on
-        // completion.
-        let normalized = normalize_phrase(phrase);
-        voice_state().write().unwrap_poison().enrolling_phrase = Some(normalized);
 
         self.enrollment_mode = true;
         // Initialize a separate VAD detector for this enrollment session
@@ -3252,7 +3227,6 @@ fn enrollment_consistency_check(utterance_embeddings: &[Vec<f32>]) -> Result<Vec
 /// Returns `true` on success.  On failure the cause is logged, `false` is
 /// returned, and the caller ends the attempt via
 /// [`PipelineCtx::end_enrollment_attempt`] so the user can start a new one.
-#[expect(clippy::too_many_lines)]
 async fn finalize_enrollment_pipeline() -> bool {
     if !models_ready() {
         warn!("finalize_enrollment_pipeline: models not ready");
@@ -3268,12 +3242,6 @@ async fn finalize_enrollment_pipeline() -> bool {
             state.owner_negative_chunks.clone(),
         )
     };
-    let enrolled_phrase = voice_state()
-        .read()
-        .unwrap_poison()
-        .enrolling_phrase
-        .clone()
-        .unwrap_or_else(|| DEFAULT_WAKE_WORD_PHRASE.to_string());
 
     // ── Consistency gate ──
     // Returns the L2-normalized prototype (centroid) used for calibration.
@@ -3336,7 +3304,6 @@ async fn finalize_enrollment_pipeline() -> bool {
     let trained_at = db::now();
 
     let Some(enrollment) = WakeWordEnrollment::build(
-        enrolled_phrase.clone(),
         &utterance_embeddings,
         calibration,
         &negative_embeddings,
@@ -3373,7 +3340,6 @@ async fn finalize_enrollment_pipeline() -> bool {
 
     // ── Store + persist ──
     set_enrollment(enrollment.clone());
-    voice_state().write().unwrap_poison().model_phrase = Some(enrolled_phrase.clone());
 
     if !persist_enrollment(&enrollment).await {
         warn!("Enrollment persisted to memory but failed to save to config DB");
@@ -3417,10 +3383,8 @@ pub async fn run_voice_pipeline() {
                     && enr.embedding_dim == WAKE_WORD_EMBEDDING_DIM
                     && enr.prototype.len() == WAKE_WORD_EMBEDDING_DIM =>
             {
-                let phrase = enr.phrase.clone();
                 set_enrollment(enr);
-                voice_state().write().unwrap_poison().model_phrase = Some(phrase.clone());
-                info!("Loaded wake word enrollment (v2, phrase={phrase})");
+                info!("Loaded wake word enrollment (v2)");
             }
             Ok(_) | Err(_) => {
                 // Legacy (v1 classifier) records and unparseable JSON are
@@ -3476,9 +3440,7 @@ pub async fn run_voice_pipeline() {
                     // The recording a stop or an enrollment aborts is reported
                     // to the composer, which carries the reason to the user.
                     Some(VoiceCommand::StopListening) => ctx.handle_stop_listening(),
-                    Some(VoiceCommand::StartEnrollment(phrase)) => {
-                        ctx.handle_start_enrollment(&phrase);
-                    }
+                    Some(VoiceCommand::StartEnrollment) => ctx.handle_start_enrollment(),
                     Some(VoiceCommand::CancelEnrollment) => ctx.handle_cancel_enrollment(),
                     Some(VoiceCommand::RetryModelLoading) => {
                         // Explicit retry from GUI — bypass debounce.
@@ -3738,29 +3700,6 @@ pub async fn run_voice_pipeline() {
     }
 
     info!("Voice pipeline exited");
-}
-
-/// Normalize a wake word phrase (trim, lowercase, collapse whitespace).
-/// Empty input falls back to [`DEFAULT_WAKE_WORD_PHRASE`].
-#[must_use]
-fn normalize_phrase(s: &str) -> String {
-    let normalized = s
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    if normalized.is_empty() {
-        DEFAULT_WAKE_WORD_PHRASE.to_string()
-    } else {
-        normalized
-    }
-}
-
-/// The currently enrolled wake word phrase (from the loaded/persisted
-/// enrollment), if any.
-#[must_use]
-pub fn get_enrolled_phrase() -> Option<String> {
-    voice_state().read().unwrap_poison().model_phrase.clone()
 }
 
 /// Persist a wake word enrollment to the config DB and update the in-memory
@@ -4925,7 +4864,6 @@ mod tests {
             state.owner_negative_chunks.push(vec![0.5; 100]);
             state.enrolled_utterance_count = NUM_ENROLLMENT_SAMPLES;
             state.utterances_collected = true;
-            state.enrolling_phrase = Some("hey mahbot".to_string());
         }
         set_status(VoiceStatus::Enrolling {
             sample: NUM_ENROLLMENT_SAMPLES,
@@ -4946,7 +4884,6 @@ mod tests {
         assert!(state.owner_negative_chunks.is_empty());
         assert_eq!(state.enrolled_utterance_count, 0);
         assert!(!state.utterances_collected);
-        assert!(state.enrolling_phrase.is_none());
         drop(state);
 
         // Voice stopped with the honest status, and the user's switch is
@@ -5038,7 +4975,7 @@ mod tests {
 
         // Enrollment owns the mic now: the recording is aborted and
         // its buffer discarded so it cannot resume as garbage later.
-        ctx.handle_start_enrollment("mahbot");
+        ctx.handle_start_enrollment();
         assert!(ctx.recording.is_none());
         assert!(!ctx.resume_listening_after_recording);
         assert!(ctx.command_buffer.is_empty());
@@ -5516,7 +5453,6 @@ mod tests {
     fn synthetic_enrollment(n_utterances: usize) -> WakeWordEnrollment {
         let emb = basis_embedding(0);
         WakeWordEnrollment::build(
-            "mahbot".to_string(),
             &vec![emb; n_utterances],
             crate::audio::wake_word::Calibration::default(),
             &[],
@@ -5638,7 +5574,6 @@ mod tests {
             n_negatives: 200,
         };
         let enrollment = WakeWordEnrollment::build(
-            "mahbot".to_string(),
             &vec![basis_embedding(0); MIN_ENROLLMENT_UTTERANCES],
             hot_cal,
             &[],
@@ -5862,80 +5797,6 @@ mod tests {
         assert_eq!(q.duration_ms, 100);
         assert!((q.score - 0.25).abs() < 1e-6, "score {}", q.score);
         assert_eq!(q.level, QualityLevel::Poor);
-    }
-
-    // ── normalize_phrase / wake word phrase state machine tests ──────────
-
-    #[test]
-    fn normalize_phrase_trims_lowercases_collapses() {
-        assert_eq!(normalize_phrase("  HeY  MahBot  "), "hey mahbot");
-        assert_eq!(normalize_phrase("OK   Computer"), "ok computer");
-        assert_eq!(normalize_phrase("  hello  WORLD  "), "hello world");
-        assert_eq!(normalize_phrase("singleword"), "singleword");
-        assert_eq!(normalize_phrase("  already  fine  "), "already fine");
-    }
-
-    #[test]
-    fn normalize_phrase_empty_returns_default() {
-        assert_eq!(normalize_phrase(""), DEFAULT_WAKE_WORD_PHRASE);
-        assert_eq!(normalize_phrase("   "), DEFAULT_WAKE_WORD_PHRASE);
-        assert_eq!(normalize_phrase("\t\n"), DEFAULT_WAKE_WORD_PHRASE);
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn get_enrolled_phrase_returns_none_initially() {
-        let _ = init_global();
-        // Ensure clean state (another serial test may have set model_phrase)
-        voice_state().write().unwrap_poison().model_phrase = None;
-        assert!(get_enrolled_phrase().is_none());
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn get_enrolled_phrase_returns_phrase_after_set() {
-        let _ = init_global();
-        {
-            let mut state = voice_state().write().unwrap_poison();
-            state.model_phrase = Some("hey mahbot".to_string());
-        }
-        assert_eq!(get_enrolled_phrase(), Some("hey mahbot".to_string()));
-        // Verify idempotent read
-        assert_eq!(get_enrolled_phrase(), Some("hey mahbot".to_string()));
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn model_phrase_survives_enrollment_cancel() {
-        let _ = init_global();
-
-        // Set model_phrase (enrolled model) and enrolling_phrase (in-progress)
-        {
-            let mut state = voice_state().write().unwrap_poison();
-            state.model_phrase = Some("hey computer".to_string());
-            state.enrolling_phrase = Some("new phrase".to_string());
-        }
-
-        // Cancel enrollment — calls VoicePipelineState::reset_enrollment()
-        {
-            let mut state = voice_state().write().unwrap_poison();
-            state.reset_enrollment();
-        }
-
-        // model_phrase must be preserved, enrolling_phrase cleared
-        let state = voice_state().read().unwrap_poison();
-        assert_eq!(
-            state.model_phrase,
-            Some("hey computer".to_string()),
-            "model_phrase must survive enrollment cancel"
-        );
-        assert!(
-            state.enrolling_phrase.is_none(),
-            "enrolling_phrase must be cleared on enrollment cancel"
-        );
-
-        // get_enrolled_phrase() must still return the cached phrase
-        assert_eq!(get_enrolled_phrase(), Some("hey computer".to_string()),);
     }
 
     // ── reset_pipeline_state level tests ──────────────────────────────────
