@@ -2275,7 +2275,7 @@ impl SettingsState {
                         // binding as `id <digits>`), then the unbind control.
                         let display = crate::users::settings_binding_label(&binding.identifier);
                         row![
-                            lucide::send_horizontal::<iced::Theme, iced::Renderer>()
+                            lucide::send::<iced::Theme, iced::Renderer>()
                                 .size(theme::TEXT_11)
                                 .color(theme::TEXT_MUTED),
                             Space::new().width(theme::SPACE_6),
