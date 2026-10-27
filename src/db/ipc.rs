@@ -65,9 +65,7 @@
 //! The operation surface is the command line's own: a tool is served by name
 //! only when one of [`crate::cli`]'s families fronts it, so the channel can
 //! never reach the rest of the owner's toolset (see
-//! [`crate::cli::fronts_tool`]). The one operation that is no tool is the
-//! Issues-view note ([`ISSUE_OPERATION`]), served by the listener itself for a
-//! command line that runs before any store exists.
+//! [`crate::cli::fronts_tool`]).
 //!
 //! Write enforcement for the read-only query channel is the store's own, and it
 //! is the same per store. The statement forms a read-only connection refuses
@@ -262,20 +260,6 @@ pub(crate) const CALL_STORE_BASE: &str = "cli";
 /// Every protocol value this build serves — one per generation of the command
 /// line's surface.
 pub(crate) const CALL_STORES: &[&str] = &[CALL_STORE, CALL_STORE_BASE];
-
-/// The operation a caller with no store of its own files an Issues-view note with, in the
-/// operation frame's own `tool` slot: `mahbot chrome` dispatches before any store exists, so the
-/// one durable fact its tab-group tail produces travels to the instance rather than being printed
-/// on every command. Served by the listener itself ([`file_issue_note`]) and not by a tool — it is
-/// no operation on the owner's workspace — and behind the same owner-only socket gate as every
-/// other operation, because it writes. The client wrapper is [`ipc_file_issue`], the only writer of
-/// this frame.
-const ISSUE_OPERATION: &str = "__issue";
-
-/// How long a client waits for its note's answer: one attempt on a short bound, never the operation
-/// channel's boot window, so filing a note delays the command by at most this and never rides out a
-/// restart.
-const ISSUE_BOUND: Duration = Duration::from_secs(2);
 
 /// One command-line operation: the tool the frontend addressed and the
 /// arguments it passed, plus the values the caller handed over as secrets.
@@ -500,12 +484,10 @@ async fn handle_connection(
         // accepted operation unfinished or with its answer unwritten — the
         // caller is owed that answer.
         let _flight = serve_calls.then(crate::cli::instance::hold_flight);
-        let reply = if !serve_calls {
-            CallReply::unavailable(UNRESTRICTED_SOCKET_ANSWER)
-        } else if call.tool == ISSUE_OPERATION {
-            file_issue_note(&log_store, &call.args).await
-        } else {
+        let reply = if serve_calls {
             crate::cli::instance::execute(call).await
+        } else {
+            CallReply::unavailable(UNRESTRICTED_SOCKET_ANSWER)
         };
         write_json_frame(&mut stream, &reply).await?;
         return Ok(());
@@ -536,62 +518,6 @@ async fn handle_connection(
 
     write_json_frame(&mut stream, &resp).await?;
     Ok(())
-}
-
-/// Serve one Issues-view note ([`crate::logs::record_issue_once`]) for a caller that has no store of
-/// its own: the row is deduped exactly like the product's own, so a host that cannot fold a group
-/// reports once however many commands meet it. A frame missing any of the three values is refused,
-/// never panicked on.
-async fn file_issue_note(log_store: &crate::logs::LogStore, args: &serde_json::Value) -> CallReply {
-    let (Some(message), Some(reason), Some(target)) = (
-        args.get("message").and_then(serde_json::Value::as_str),
-        args.get("reason").and_then(serde_json::Value::as_str),
-        args.get("target").and_then(serde_json::Value::as_str),
-    ) else {
-        return CallReply::refused("an issue note carries `message`, `reason` and `target`");
-    };
-    let fields = args
-        .get("fields")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    match crate::logs::record_issue_once_in(log_store, message, reason, target, fields).await {
-        crate::logs::IssueWrite::NotRecorded => {
-            CallReply::unavailable("the instance could not record this issue")
-        }
-        _ => CallReply::done("the issue is in the Issues view"),
-    }
-}
-
-/// Client: file one Issues-view note with the instance at `storage_root` ([`ISSUE_OPERATION`]), for
-/// a caller with no store of its own. Answers whether the note landed.
-///
-/// ONE attempt on [`ISSUE_BOUND`] and no retry window: a note is cosmetic, so it never rides out a
-/// boot or a hand-off, and a caller that awaits it is delayed by at most that bound — never by a
-/// restart. Every way it can fail — no instance, one that predates the operation, a refused or
-/// severed exchange — answers `false`, and the caller decides what to do with the fact (the command
-/// line prints it, having no Issues view to file it in).
-pub(crate) async fn ipc_file_issue(
-    storage_root: &Path,
-    message: &str,
-    reason: &str,
-    target: &str,
-    fields: serde_json::Value,
-) -> bool {
-    let call = CallRequest {
-        tool: ISSUE_OPERATION.to_string(),
-        args: serde_json::json!({
-            "message": message,
-            "reason": reason,
-            "target": target,
-            "fields": fields,
-        }),
-        secrets: Vec::new(),
-        output_dir: None,
-    };
-    matches!(
-        tokio::time::timeout(ISSUE_BOUND, ipc_call_once(storage_root, &call, CALL_STORE)).await,
-        Ok(CallAttempt::Answered(reply)) if reply.outcome == CallOutcome::Done
-    )
 }
 
 /// Spawn the instance-side IPC listener. Call after `DOMAIN_CONN` / `LOG_STORE`
@@ -1763,71 +1689,6 @@ mod tests {
             }
             _ => panic!("the operation frame must be served as an operation"),
         }
-
-        listener.abort();
-        let _ = listener.await;
-    }
-
-    /// End-to-end: a frame naming [`ISSUE_OPERATION`] is served as the note it is, never as a tool
-    /// — a client that runs before any store exists gets its one durable fact into the Issues
-    /// view over the same owner-only socket as an operation. The row is deduped by the store
-    /// itself, so the same fact filed twice is one row.
-    #[tokio::test]
-    async fn ipc_call_files_a_storeless_clients_issue_once() {
-        const MESSAGE: &str = "a command-line browser step left its tab group wrong";
-        const REASON: &str = "chrome-tabs:test-note";
-        let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let root = dir.path().to_path_buf();
-        let probe = store.clone();
-        let listener_root = root.clone();
-        let listener = tokio::spawn(async move {
-            crate::db::ipc::run_ipc_listener(&listener_root, std::sync::Arc::new(store)).await;
-        });
-        // A note takes ONE attempt (it is cosmetic), so the bind is awaited rather than retried.
-        for _ in 0..500 {
-            if socket_path(&root).exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            socket_path(&root).exists(),
-            "the listener never bound its socket"
-        );
-
-        for _ in 0..2 {
-            assert!(
-                crate::db::ipc::ipc_file_issue(
-                    &root,
-                    MESSAGE,
-                    REASON,
-                    "chrome-tabs",
-                    serde_json::json!({ "detail": "group 7's live state could not be read" }),
-                )
-                .await,
-                "the instance must take the note"
-            );
-        }
-        assert!(
-            probe
-                .has_reason(MESSAGE, REASON)
-                .await
-                .expect("the filed row must be readable"),
-            "the fact must reach the Issues view"
-        );
-        let rows = probe
-            .conn
-            .query(
-                "SELECT fields FROM logs WHERE message = ?1",
-                crate::db::params![MESSAGE],
-            )
-            .await
-            .expect("the filed rows must be readable");
-        assert_eq!(
-            rows.len(),
-            1,
-            "one fact is one row, however often it is filed"
-        );
 
         listener.abort();
         let _ = listener.await;

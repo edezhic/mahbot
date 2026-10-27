@@ -15,10 +15,14 @@
 //! - [`collapse_own_groups`], after any other command-line step in a named session: the groups its
 //!   tabs sit in are collapsed, as this command always has after its envelope.
 //!
+//! The command line's tails report nothing: whatever a leg did not manage is silent, because the
+//! condition has no effect on the next step (a tab left in the group is closed with the group's
+//! sessions later). Only [`settle`] answers a [`Note`], and its caller is the agent's own tool.
+//!
 //! The verbs covered are the ones whose opened tab can be established: `open`, whose reply names no
 //! tab, by the caller reading the session's tabs before the step ([`created_tabs`]), and `click`,
 //! whose reply names it. A tab another verb opens (`eval`'s `window.open`, a `press` on a targeted
-//! link) is not reported, so it is not moved.
+//! link) is not named by its reply, so it is not moved.
 
 use super::chrome_daemon::{NoVerdict, run_cli_json_at};
 use serde_json::{Value, json};
@@ -42,13 +46,9 @@ const TAIL_BUDGET: Duration = Duration::from_secs(5);
 /// Bound on one call within a stage.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The Issues row the command line files a tail's trouble under — a named sentence, because the
-/// Issues view dedupes on `(message, reason)` and a reworded one would file the same fact twice.
-pub(crate) const STEP_ISSUE_MESSAGE: &str = "a command-line browser step left its tab group wrong";
-
 /// A tail's trouble as the Issues view keys it: the failing leg's own reason — a distinct cause is a
-/// distinct row — and the line the owner reads. The command line files it with the running
-/// instance, which holds the store; the agent's tool files it in its own process.
+/// distinct row — and the line the owner reads. Only [`settle`] answers one, and its caller is the
+/// agent's tool, which files it in its own process.
 pub(crate) struct Note {
     pub(crate) reason: &'static str,
     pub(crate) detail: String,
@@ -56,11 +56,10 @@ pub(crate) struct Note {
 
 /// The legs a tail's note names, one reason each.
 const TABS_UNREAD_REASON: &str = "chrome-tabs:tabs-unread";
-const TAB_NOT_MOVED_REASON: &str = "chrome-tabs:tab-not-moved";
 const GROUP_NOT_COLLAPSED_REASON: &str = "chrome-tabs:group-not-collapsed";
 const GROUP_NOT_NAMED_REASON: &str = "chrome-tabs:agent-group-not-named";
 
-/// What a command-line step reports about the tab it created, as its tail needs it.
+/// What a command-line step hands its tail about the tab it created.
 pub(crate) enum Opened<'a> {
     /// `open` names no tab in its reply: the tabs the step created are the session's created tabs
     /// that were not there when the step started, which the caller read first ([`created_tabs`]).
@@ -75,7 +74,7 @@ pub(crate) enum Opened<'a> {
 pub(crate) async fn settle(cli: &Path, session: &str) -> Option<Note> {
     let tabs = match own_rows(cli, session).await {
         Ok(tabs) => tabs,
-        Err(note) => return note,
+        Err(reason) => return answered(cli, session, Some(unread(&reason))).await,
     };
     // The collapse comes first and on its own budget: it is what the owner sees, so a naming stage
     // that is slow or refused can never cost it. The naming decision reads the placement group's
@@ -96,30 +95,20 @@ pub(crate) async fn settle(cli: &Path, session: &str) -> Option<Note> {
 
 /// Leave a command-line step's own tab as an ordinary tab: taken out of the group chrome-use put it
 /// in, before the caller sees the result, with the groups this session's tabs sit in collapsed again.
-pub(crate) async fn leave_command_line_tabs(
-    cli: &Path,
-    session: &str,
-    opened: Opened<'_>,
-) -> Option<Note> {
-    let tabs = match own_rows(cli, session).await {
-        Ok(tabs) => tabs,
-        Err(note) => return note,
+/// Silent by design: a leg that did not manage is not reported anywhere (see the module docs).
+pub(crate) async fn leave_command_line_tabs(cli: &Path, session: &str, opened: Opened<'_>) {
+    let Ok(tabs) = own_rows(cli, session).await else {
+        return;
     };
     // The collapse only needs the listing; the move needs the created-row decision too, so an answer
     // that refuses that decision costs the move and never the collapse.
     let groups = groups_of(&tabs);
-    let mut trouble = None;
     let targets: Vec<OwnTab> = match opened {
-        Opened::Baseline(before) => match created_of(tabs) {
-            Ok(created) => created
-                .into_iter()
-                .filter(|tab| tab.group.is_some() && !before.contains(&tab.tab))
-                .collect(),
-            Err(reason) => {
-                trouble = Some(unread(&reason));
-                Vec::new()
-            }
-        },
+        Opened::Baseline(before) => created_of(tabs)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tab| tab.group.is_some() && !before.contains(&tab.tab))
+            .collect(),
         // The reply names the tab, so this leg needs no ownership answer: a row that does not say
         // how the session came by the tab is still the one the reply just named, and only the
         // relay's own word that it was adopted (the owner's) keeps it where it is.
@@ -129,55 +118,40 @@ pub(crate) async fn leave_command_line_tabs(
             .filter(|tab| tab.created != Some(false))
             .collect(),
     };
-    if !targets.is_empty()
-        && let Some(detail) = ungroup(cli, session, &targets, Instant::now() + TAIL_BUDGET).await
-    {
-        trouble.get_or_insert(Note {
-            reason: TAB_NOT_MOVED_REASON,
-            detail,
-        });
+    if !targets.is_empty() {
+        ungroup(cli, session, &targets, Instant::now() + TAIL_BUDGET).await;
     }
-    let (collapse_trouble, _) = collapse_each(cli, session, groups).await;
-    if let Some(note) = collapse_trouble {
-        trouble.get_or_insert(note);
-    }
-    answered(cli, session, trouble).await
+    collapse_each(cli, session, groups).await;
 }
 
 /// Leave the groups of a named-session command-line step collapsed, as the command always has: every
 /// group this session's own tabs sit in. Runs after the envelope, so its reads cost the caller
 /// nothing.
-pub(crate) async fn collapse_own_groups(cli: &Path, session: &str) -> Option<Note> {
-    let tabs = match own_rows(cli, session).await {
-        Ok(tabs) => tabs,
-        Err(note) => return note,
+pub(crate) async fn collapse_own_groups(cli: &Path, session: &str) {
+    let Ok(tabs) = own_rows(cli, session).await else {
+        return;
     };
-    let (trouble, _) = collapse_each(cli, session, groups_of(&tabs)).await;
-    answered(cli, session, trouble).await
+    collapse_each(cli, session, groups_of(&tabs)).await;
 }
 
-/// The tabs a session has created itself, for an `open` step's baseline: `Err` is the tail's own
-/// note for an answer it could not read, which costs the moving. A tab the session adopted is not
-/// its own, so it is no part of the answer.
-pub(crate) async fn created_tabs(cli: &Path, session: &str) -> Result<BTreeSet<i64>, Option<Note>> {
-    let created = match own_rows(cli, session).await {
-        Ok(tabs) => created_of(tabs),
-        Err(note) => return Err(note),
-    };
-    match created {
-        Ok(created) => Ok(created.into_iter().map(|tab| tab.tab).collect()),
-        Err(reason) => Err(answered(cli, session, Some(unread(&reason))).await),
-    }
+/// The tabs a session has created itself, for an `open` step's baseline: `None` when the answer
+/// could not be read or named no ownership decision, which costs the moving. A tab the session
+/// adopted is not its own, so it is no part of the answer.
+pub(crate) async fn created_tabs(cli: &Path, session: &str) -> Option<BTreeSet<i64>> {
+    let tabs = own_rows(cli, session).await.ok()?;
+    Some(
+        created_of(tabs)
+            .ok()?
+            .into_iter()
+            .map(|tab| tab.tab)
+            .collect(),
+    )
 }
 
-/// This session's own tabs, or the tail's note for an answer it could not read — the prologue every
-/// tail starts with. `Err(None)` is the one case with nothing to say: the host has no
-/// `extension call` door at all, so the tail stops without a note.
-async fn own_rows(cli: &Path, session: &str) -> Result<Vec<OwnTab>, Option<Note>> {
-    match list(cli, session, Instant::now() + TAIL_BUDGET).await {
-        Ok(tabs) => Ok(tabs),
-        Err(reason) => Err(answered(cli, session, Some(unread(&reason))).await),
-    }
+/// This session's own tabs by `tab list --all`, or the answer the tail could not read — the prologue
+/// every tail starts with.
+async fn own_rows(cli: &Path, session: &str) -> Result<Vec<OwnTab>, NoVerdict> {
+    list(cli, session, Instant::now() + TAIL_BUDGET).await
 }
 
 /// The tail's own note for a `tab list --all` answer it could not read.
@@ -188,7 +162,7 @@ fn unread(reason: &NoVerdict) -> Note {
     }
 }
 
-/// A tail's answer to its caller: the trouble it met, unless the browser side has no
+/// [`settle`]'s answer to its caller: the trouble it met, unless the browser side has no
 /// `extension call` door at all — an extension absent, disabled or older than that door. That is a
 /// fact about the host, and the product's once-only issue for it is the release sweep's
 /// ([`crate::tools::chrome_release`]), so no step repeats it. The check is one chrome-use call on
@@ -207,7 +181,8 @@ async fn answered(cli: &Path, session: &str, trouble: Option<Note>) -> Option<No
 /// Collapse every group in `groups` that is not collapsed, reading each one first so a group the
 /// browser no longer has is nothing to do. Its own stage budget, so the collapse the owner sees
 /// always gets a slot of its own. Answers the first trouble and the live state read for every group
-/// still there, so a caller that has to decide something about one of them does not ask again.
+/// still there, so [`settle`] — the one caller that reports — does not ask again; the command line's
+/// tails discard both.
 async fn collapse_each(
     cli: &Path,
     session: &str,
@@ -339,29 +314,18 @@ async fn write_collapsed(
     }
 }
 
-/// Take the tabs a step created out of their groups through the extension's own door.
-async fn ungroup(
-    cli: &Path,
-    session: &str,
-    opened: &[OwnTab],
-    deadline: Instant,
-) -> Option<String> {
+/// Take the tabs a step created out of their groups through the extension's own door. Best-effort
+/// and silent: a refusal leaves the tab in its group until the session is closed.
+async fn ungroup(cli: &Path, session: &str, opened: &[OwnTab], deadline: Instant) {
     let ids: Vec<i64> = opened.iter().map(|tab| tab.tab).collect();
     let args = json!([ids]).to_string();
-    match call(
+    let _ = call(
         cli,
         session,
         &["extension", "call", "tabs.ungroup", &args],
         deadline,
     )
-    .await
-    {
-        Ok(_) => None,
-        Err(reason) => Some(format!(
-            "the tabs this call opened were left in their group: {}",
-            reason.text()
-        )),
-    }
+    .await;
 }
 
 /// One `tab list --all` row this session owns: the Chrome tab id the extension's door takes, the

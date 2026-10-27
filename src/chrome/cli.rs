@@ -19,12 +19,9 @@
 //! step creates in a NAMED session is left as an ordinary tab, outside chrome-use's group, before
 //! the envelope is out; the whole rule, including which verbs report their tab, is
 //! [`crate::tools::chrome_groups`]'. That move needs the session's own tabs, and when the browser
-//! will not answer for them the tab stays inside chrome-use's group: the step still succeeds and
-//! only its note records the miss. The note is filed as the product's once-only issue on the
-//! instance side, so no command repeats it (with no instance to take it, the one line goes to
-//! stderr instead); a browser side with no `extension call` door is not filed at all: that host
-//! fact is the release sweep's. An ephemeral session is closed right after its command and its tab
-//! closes with it.
+//! will not answer for them the tab stays inside chrome-use's group: the step still succeeds, and
+//! the miss is silent — the command line's tail reports nothing ([`crate::tools::chrome_groups`]
+//! says why). An ephemeral session is closed right after its command and its tab closes with it.
 //!
 //! ## Session lifetime
 //!
@@ -72,7 +69,7 @@ use crate::tools::chrome_daemon::{
     CliStatus, SessionRecovery, cli_path, cli_probe, cli_version, ensure_ready_for_actions,
     readiness, recover_unresponsive_session, run_cli_bounded_at,
 };
-use crate::tools::chrome_groups::{self, Note, Opened};
+use crate::tools::chrome_groups::{self, Opened};
 use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, truncate_sandwich};
 use serde_json::{Value, json};
 
@@ -722,10 +719,9 @@ pub async fn run_cli(args: &[String]) -> i32 {
             // to leave collapsed — unless the step failed on its environment, where the tail cannot
             // reach the browser either ([`tail_cli`]). A step whose tab tail ran did this before
             // the envelope ([`run_action`], [`chrome_groups`]); the rest do it here, including an
-            // `open` whose baseline the browser would not answer. Cosmetic and best-effort: its
-            // trouble is filed as the product's once-only issue, not printed per command.
-            let note = chrome_groups::collapse_own_groups(&cli, &s.name);
-            file_tail_trouble(note.await).await;
+            // `open` whose baseline the browser would not answer. Cosmetic and best-effort: it
+            // reports nothing.
+            chrome_groups::collapse_own_groups(&cli, &s.name).await;
         }
     }
     // The call is over: its in-flight mark goes, so the session is idle from here — and a
@@ -1762,8 +1758,8 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     // `open` names no tab in its reply, so the tabs the session already had are read before the
     // step to tell the one it creates apart later; every other verb's own tab comes from its
     // reply ([`chrome_groups`]). An unreadable answer only costs the moving — the tab then stays in
-    // chrome-use's group — and the note is filed as the product's once-only issue. The pre-flight
-    // has already refused a step its own arguments reject, so no listing is spent on one.
+    // chrome-use's group. The pre-flight has already refused a step its own arguments reject, so no
+    // listing is spent on one.
     let tabs_before = match action {
         Action::Open { .. } if !session.ephemeral => tabs_before_open(&session.name).await,
         _ => None,
@@ -1793,8 +1789,8 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     recover_session_wedge(&mut env, &session.name, !session.ephemeral, killed_by_clock).await;
     // The tab this step created is taken out of chrome-use's group here, before the caller sees
     // the result, and the groups this session's tabs sit in are collapsed — see [`chrome_groups`]
-    // for the whole rule. Best-effort: its trouble is filed as the product's once-only issue and
-    // never becomes the step's own failure. A step whose tab the tail has no way to establish — no
+    // for the whole rule. Best-effort and silent: its trouble never becomes the step's own failure
+    // and is reported nowhere. A step whose tab the tail has no way to establish — no
     // tab created, or an `open` baseline the browser would not answer — leaves the collapse to the
     // post-envelope tail ([`run_cli`]), so its answer is not held back by browser work it does not
     // depend on.
@@ -1806,8 +1802,7 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     let mut tail_ran = false;
     if let (Some(opened), Some(cli)) = (opened, tail_cli(&env, session).as_deref()) {
         tail_ran = true;
-        let note = chrome_groups::leave_command_line_tabs(cli, &session.name, opened);
-        file_tail_trouble(note.await).await;
+        chrome_groups::leave_command_line_tabs(cli, &session.name, opened).await;
     }
     DispatchOutcome {
         envelope: env,
@@ -1818,43 +1813,11 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
 }
 
 /// The tabs the session has created before an `open` step — the baseline its reply cannot give.
-/// `None` when there is nothing to compare against: the browser would not answer (its note is
-/// filed, and the step's tab then stays in chrome-use's group) or the helper cannot be resolved at
-/// all.
+/// `None` when there is nothing to compare against: the browser would not answer (the step's tab
+/// then stays in chrome-use's group) or the helper cannot be resolved at all.
 async fn tabs_before_open(session: &str) -> Option<std::collections::BTreeSet<i64>> {
     let cli = cli_path()?;
-    match chrome_groups::created_tabs(&cli, session).await {
-        Ok(tabs) => Some(tabs),
-        Err(note) => {
-            file_tail_trouble(note).await;
-            None
-        }
-    }
-}
-
-/// File a tail's note as the product's once-only issue. The command line dispatches before any store
-/// exists, so the fact travels to the running instance ([`crate::db::ipc::ipc_file_issue`]) on one
-/// short-bounded attempt. The Issues view dedupes on the note's own reason, so one cause is one row
-/// however many commands meet it; with no instance to take it there is no view to dedupe in, and the
-/// line goes to stderr — the one place a standalone caller can see it.
-async fn file_tail_trouble(note: Option<Note>) {
-    let Some(note) = note else { return };
-    let filed = match crate::config::default_config_dir() {
-        Ok(root) => {
-            crate::db::ipc::ipc_file_issue(
-                &root,
-                chrome_groups::STEP_ISSUE_MESSAGE,
-                note.reason,
-                crate::tools::chrome_release::ISSUE_TARGET,
-                json!({ "detail": note.detail }),
-            )
-            .await
-        }
-        Err(_) => false,
-    };
-    if !filed {
-        eprintln!("mahbot chrome: {}", note.detail);
-    }
+    chrome_groups::created_tabs(&cli, session).await
 }
 
 /// The chrome-use binary a step's group tail drives, when the step's session can be reached at all:
