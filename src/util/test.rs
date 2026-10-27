@@ -599,6 +599,21 @@ pub fn make_executable(path: &Path) {
     std::fs::set_permissions(path, PermissionsExt::from_mode(0o755)).unwrap();
 }
 
+/// Wait — briefly — for a pid to stop existing. `kill(pid, 0)` is the existence
+/// probe: it sends no signal. Unix only, like the stops it checks.
+#[cfg(unix)]
+pub async fn wait_for_death(pid: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        // SAFETY: signal 0 performs the permission/existence check only.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("pid {pid} is still alive");
+}
+
 /// 1×1 red PNG as a native data-URI — a payload that survives the media
 /// gate's base64 + bounded raster decode; used wherever tests need a marker
 /// the provider promotes to a vision part.

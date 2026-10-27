@@ -1,27 +1,31 @@
 //! Whole-tree containment for a command run.
 //!
 //! Ending a run must end everything the run started. A stop — its timeout, the
-//! point where the *program* paths give up on its output collection
-//! ([`super::LeftoverPolicy::End`]'s drain overrun, reported as
-//! [`super::ShellRunResult::EndedWithLeftovers`]) or the run being torn down (its
-//! tool call dropped, its agent destroyed) — takes the whole tree on both
+//! point where its output collection hit the drain bound because a leftover held a
+//! pipe (an agent's command then goes through [`super::stop_leftover`], which ends
+//! the tree and judges the stop by the channels closing; a program run ends the tree
+//! and reports [`super::ShellRunResult::EndedWithLeftovers`]) or the run being torn
+//! down (its tool call dropped, its agent destroyed) — takes the whole tree on both
 //! platforms. An abrupt death of the service takes it too, but only where something
 //! holds the tree on the run's behalf: a background session's watcher or job handle
-//! (`bg`) and, on Windows, every run. Three cases are not a stop:
+//! (`bg`) and, on Windows, every run. Three cases are not a plain stop:
 //!
-//! - a *foreground* run that finished on its own is left alone; its stragglers
-//!   outlive both the command and, on unix, the service, exactly as they always
-//!   did. Windows keeps the containment in force instead, so nothing it left
-//!   behind can outlive the service ([`Tree::retain_after_completion`]).
-//! - an *agent's* run whose output collection hit the drain bound because a
-//!   leftover held a pipe is left alone too ([`super::LeftoverPolicy::Keep`]): the
-//!   leftover was started on purpose, so it keeps running and the containment is
-//!   retained rather than ended ([`Tree::retain_after_completion`] — a closed job
-//!   handle would kill exactly the process the run must leave running).
+//! - a *foreground* run that finished on its own, with nothing left holding a
+//!   capture pipe, is left alone; its stragglers (a process that redirected its own
+//!   output, or none at all) outlive both the command and, on unix, the service,
+//!   exactly as they always did. Windows keeps the containment in force instead, so
+//!   nothing it left behind can outlive the service
+//!   ([`Tree::retain_after_completion`]).
+//! - a *foreground* run whose stop attempt did not take (the residual case — see
+//!   [`super::stop_leftover`]): the tree was ended and the leftover survived it, so
+//!   it is the containment that is retained rather than closed
+//!   ([`Tree::retain_after_completion`] — a closed job handle would kill exactly the
+//!   process the run must report).
 //! - a *background session* belongs to the agent rather than to a tool call, so
 //!   its leftovers go when its command does, on both platforms (`bg`: the unix
 //!   watcher's group kill when the lifeline closes, this module's `terminate` on
-//!   Windows).
+//!   Windows). A background session never runs through the shell tool's capture, so
+//!   no stop of a tool call can reach it.
 //!
 //! The two platforms reach all of that with their own primitive, and the split
 //! between them is deliberate — a shared seam over the two would put the unix
@@ -257,14 +261,17 @@ impl Tree {
     /// which is why a caller that got `true` only has to reap them. `true` means
     /// the groups were signalled, not that every member died: a signal to a group
     /// with no live member left is not an error here
-    /// ([`super::kill_process_group`] logs its own failure).
+    /// ([`super::kill_process_group`] logs its own failures and stays quiet for a
+    /// group already gone, which is why [`super::stop_leftover`] judges the stop by
+    /// the capture pipes closing instead of by this return value).
     ///
     /// A member that has already been reaped stays in the list: its process group is
     /// where anything it left running lives, which is what a stop after the reap is
     /// for. A group that is fully gone leaves its pgid free for reuse, so a signal
     /// meant for it can land elsewhere — an accepted window, not the purpose of the
-    /// retention, and the alternative (forgetting the pid) is what loses the
-    /// leftover kill the [`super::LeftoverPolicy::End`] drain path relies on.
+    /// retention, and the alternative (forgetting the pid) is what loses the leftover
+    /// kill both drain paths rely on ([`super::stop_leftover`] for an agent's
+    /// command, [`super::LeftoverPolicy::Program`]'s own).
     pub(super) fn terminate(&self) -> bool {
         for pid in self.pids.lock().unwrap_poison().iter() {
             super::kill_process_group(*pid, libc::SIGKILL);
@@ -354,8 +361,8 @@ impl Tree {
     /// closed instead — there is nothing for the handle to keep in.
     ///
     /// The handle is therefore leaked on purpose, one per completed command that
-    /// left a live descendant — the clean-completion path and the agent's
-    /// leftover-holding one ([`super::LeftoverPolicy::Keep`]) alike. Dropping it
+    /// left a live descendant — the clean-completion path and the agent's residual
+    /// one (a leftover that survived [`super::stop_leftover`]) alike. Dropping it
     /// would give up the only thing standing between those processes and outliving
     /// the service, so the leak is the feature — do not "fix" it.
     pub(super) fn retain_after_completion(self) {

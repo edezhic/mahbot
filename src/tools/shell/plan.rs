@@ -195,11 +195,11 @@
 //!   the single-child runner's two pipes had.
 //! - A member's leftover descendants can hold a capture pipe open after the
 //!   member exited: the post-run drain bound is the same one the single-child run
-//!   gives, and it is resolved the same way an agent's own command is — the last
-//!   member's own status is reported with
-//!   [`super::ShellRunResult::ExitedWithLeftovers`] and the leftover is left
-//!   running. No program path builds a plan, so there is no
-//!   [`super::LeftoverPolicy`] to pick here: the plan runner never ends a tree.
+//!   gives, and it is resolved the same way an agent's own command is — the run's
+//!   whole tree is ended ([`super::stop_leftover`]) and the last member's own status
+//!   is the answer. Only a stop that did not take reports the leftover, with
+//!   [`super::ShellRunResult::ExitedWithLeftovers`]. No program path builds a plan,
+//!   so a plan always takes [`super::LeftoverPolicy::Command`].
 //! - A stop ends the whole run's tree, not one member's: every member's process
 //!   group on unix — the groups of members already reaped included, which is what
 //!   reaches a descendant they left behind — and the run's own job on Windows
@@ -1741,10 +1741,11 @@ impl CaptureBudgets {
 /// `ExitedWithLeftovers`, `MemoryExceeded`, `SpawnFailed`. The status of a completed
 /// run is the last executed group's last member's (see the module docs).
 ///
-/// A leftover descendant still holding a capture pipe is left running: the last
-/// member's own status is the answer. A plan is only ever built for an agent's
-/// rewritten line, so nothing here ends a tree the way the program paths do
-/// ([`super::LeftoverPolicy::End`]).
+/// A leftover descendant still holding a capture pipe is stopped with the run's tree
+/// ([`super::stop_leftover`]): the last member's own status is the answer, and only a
+/// stop that did not take reports it. A plan is only ever built for an agent's
+/// rewritten line, so nothing here reports a run as a failure for a leftover the way
+/// the program paths do ([`super::LeftoverPolicy::Program`]).
 pub(super) async fn run(
     plan: &Plan,
     timeout: Duration,
@@ -1853,24 +1854,22 @@ pub(super) async fn run(
             elapsed: start.elapsed(),
         };
     }
-    // The drain bound was exceeded: a leftover process still holds a capture
-    // pipe. A plan run is an agent's rewritten line, so the leftover is left
-    // running — the readers are detached rather than cancelled so its channel
-    // stays open, and the containment is kept (on Windows the job's handle must
-    // not be closed, because that would kill the very process this path must
-    // leave running). No containment is named: the leftover is not in one group
-    // the run can point at (on unix each member is its own process group, while
-    // the Windows containment is the whole run's job), and the note renders the
-    // unnamed case honestly.
-    tree.retain_after_completion();
-    let (stdout, stderr) = readers.snapshot_and_detach();
-    ShellRunResult::ExitedWithLeftovers {
-        stdout,
-        stderr,
+    // The drain bound was exceeded: a leftover process still holds a capture pipe.
+    // A plan run is an agent's rewritten line, so it takes the agent's shaping
+    // ([`super::leftover_result`] with [`super::LeftoverPolicy::Command`]): the whole
+    // tree is stopped and a stop that took is a plain completed run. No containment
+    // is named in the residual case — the members are one process group each on unix
+    // and one job on Windows, no single one the note could point at.
+    super::leftover_result(
+        super::LeftoverPolicy::Command,
+        tree,
+        &mut readers,
+        &cancel,
         status,
-        scope: None,
-        elapsed: start.elapsed(),
-    }
+        None,
+        start,
+    )
+    .await
 }
 
 /// Spawn one group's members, left to right, connecting consecutive members with
@@ -2223,11 +2222,9 @@ async fn end_group_members(tree: &Tree, members: &mut [MemberRun]) {
 }
 
 /// Collect a run that is being stopped: cancel the capture readers and take what
-/// they hold, so every stop path — the deadline, the memory ceiling, the output
-/// drain — reports its partial output instead of a hang. The kill itself is the
-/// caller's, because what has to be ended differs: a group's members are reaped
-/// through [`end_group`], while the drain path's were all reaped already and only
-/// the run's tree can still hold a leftover process.
+/// they hold, so every stop path — the deadline, the memory ceiling — reports its
+/// partial output instead of a hang. The kill itself is the caller's, because what
+/// has to be ended differs: a group's members are reaped through [`end_group`].
 async fn collect_stopped(
     cancel: &tokio_util::sync::CancellationToken,
     readers: &mut Readers,
@@ -3624,41 +3621,40 @@ mod tests {
         );
     }
 
-    /// A member that leaves a descendant holding the capture pipe open past the
-    /// drain bound is not a failure: the last member's own status and the output
-    /// collected up to the bound are the run's result, the same split the
-    /// single-child runner gives — and the note names no containment, because the
-    /// leftover is not in one group this run can point at.
+    /// A member that leaves a descendant holding the capture pipe open past the drain
+    /// bound is stopped with the run's tree: the last member's own status and the
+    /// output collected up to the detection are the run's result, the same split the
+    /// single-child runner gives — and the descendant does not survive it.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_leftover_holder_past_the_drain_bound_keeps_its_status() {
+    async fn a_leftover_holder_past_the_drain_bound_is_stopped() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let pid_path = tmp.path().join("leftover.pid");
+        let command = format!("echo out; sleep 999 & echo $! > {}", pid_path.display());
         let result = run(
-            &shell_plan(&[("echo out; sleep 5 &", Join::First)]),
+            &shell_plan(&[(command.as_str(), Join::First)]),
             Duration::from_secs(20),
             Duration::from_millis(300),
             None,
             RunOwner::Agent,
         )
         .await;
-        let ShellRunResult::ExitedWithLeftovers {
-            stdout,
-            status,
-            scope,
-            ..
-        } = result
-        else {
-            panic!("expected ExitedWithLeftovers, got {result:?}");
+        let ShellRunResult::Completed { stdout, status, .. } = result else {
+            panic!("expected Completed, got {result:?}");
         };
         assert_eq!(status.code(), Some(0), "the member's own status");
-        assert!(
-            scope.is_none(),
-            "the leftover is not in one group the run can name"
-        );
         assert!(
             String::from_utf8_lossy(&stdout).contains("out"),
             "what the member wrote before the bound is collected: {}",
             String::from_utf8_lossy(&stdout)
         );
+        // The descendant that held the pipe is gone with the rest of the tree.
+        let pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("the member wrote the descendant's pid")
+            .trim()
+            .parse()
+            .expect("valid pid file");
+        crate::util::test::wait_for_death(pid).await;
     }
 
     /// A member that cannot be spawned fails the run as `SpawnFailed` — the same

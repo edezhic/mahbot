@@ -2,11 +2,12 @@
 //! still holds.
 //!
 //! A command that exits while a process it started still holds the command's
-//! output channel is reported as FINISHED with that leftover named and left
-//! RUNNING (it was started on purpose) — so the product keeps the read end open:
-//! closing it would fault the leftover on its next write (SIGPIPE on unix, a
-//! broken pipe on Windows) and kill the very process the report says is still
-//! running.
+//! output channel can leave that channel alive: the chrome-use CLI's helper is
+//! deliberately left running, and the shell tool's leftover survives only when the
+//! stop it makes at the moment of detection did not take (see [`crate::tools::shell`]).
+//! Closing such a read end would fault the leftover on its next write (SIGPIPE on
+//! unix, a broken pipe on Windows) and kill the very process the caller was told
+//! about, so the channel is kept open.
 //!
 //! A reader is retained only when the call that started it ENDS, so the set holds
 //! only channels that outlived their call — the cap can never abort the reader of

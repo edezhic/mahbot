@@ -404,9 +404,7 @@ impl BackgroundSessions {
             // about to close the lifeline — the watcher (whose PID is the
             // PGID) will then exit and its PID could be recycled before the
             // SIGKILL lands. `finished == false` here implies the watcher is
-            // still alive, so the PGID is still valid. Skipping the SIGKILL
-            // also avoids a misleading kill(-pgid) failure warning when the
-            // group is already gone.
+            // still alive, so the PGID is still valid.
             if !finished.load(Ordering::SeqCst) {
                 super::kill_process_group(pgid, libc::SIGKILL);
             }
