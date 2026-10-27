@@ -4,6 +4,7 @@
 //! ([`transcript`]) that the Running Agents GUI reads to show a running
 //! agent's in-memory conversation including the unpersisted tail.
 
+mod activity;
 mod compaction_dump;
 pub mod dead_session;
 pub(crate) mod image_strip;
@@ -663,6 +664,7 @@ fn session_message_from_row(row: &Row) -> Result<ChatMessage> {
 /// enum makes the `format!` interpolation compile-time safe.
 enum MetadataColumn {
     ActiveModels,
+    UserActivity,
     TokenLength,
     SleepEnded,
     CustomRole,
@@ -677,6 +679,7 @@ impl MetadataColumn {
     fn as_str(&self) -> &'static str {
         match self {
             Self::ActiveModels => "active_models",
+            Self::UserActivity => "user_activity",
             Self::TokenLength => "token_length",
             Self::SleepEnded => "sleep_ended",
             Self::CustomRole => "custom_role",
@@ -1340,6 +1343,27 @@ impl SessionStore {
             agent_id,
             MetadataColumn::ActiveModels,
             "Failed to read active-models snapshot",
+            |row| row.get::<Option<String>>(0),
+        )
+        .await
+    }
+
+    /// Record the user-activity state the admin Assistant was last shown, so the
+    /// next message reports a change against what was actually seen. Upserts, like
+    /// the snapshot above.
+    pub(crate) async fn set_user_activity(&self, agent_id: &str, location: &str) -> Result<()> {
+        self.set_metadata_value(agent_id, MetadataColumn::UserActivity, location.into())
+            .await
+    }
+
+    /// The user-activity state the admin Assistant was last shown; `None` when the
+    /// session has none recorded yet (nothing shown, a read error, or no session
+    /// row) — the next known state is then set silently instead of being reported.
+    pub(crate) async fn user_activity(&self, agent_id: &str) -> Option<String> {
+        self.get_metadata_value(
+            agent_id,
+            MetadataColumn::UserActivity,
+            "Failed to read the user-activity reference",
             |row| row.get::<Option<String>>(0),
         )
         .await

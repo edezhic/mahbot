@@ -185,14 +185,15 @@ impl Session {
         if !msg.is_empty() {
             let is_new = self.history.is_empty();
 
-            // The one composition point for both branches below: a later Assistant
-            // turn's machine change-info (a first turn's system prompt holds the
-            // models instead, so the snapshot write below stays on its first-turn
-            // path), then the personal-workspace report at the very head, ahead of it.
-            // The session-start `<workspace-structure>` block cannot stand in for the
-            // report: it is a shape — folder names with counts, never a path — so it
-            // cannot say what the user just touched, and a session truncated from
-            // the Sessions page takes this path with its baseline intact.
+            // The one composition point for both branches below: the activity line
+            // at the very head, then the personal-workspace report, then a later
+            // Assistant turn's machine change-info (a first turn's system prompt
+            // holds the models instead, so the snapshot write below stays on its
+            // first-turn path). The session-start `<workspace-structure>` block
+            // cannot stand in for the report: it is a shape — folder names with
+            // counts, never a path — so it cannot say what the user just touched,
+            // and a session truncated from the Sessions page takes this path with
+            // its baseline intact.
             let (content, new_snapshot) = if !is_new && matches!(role, Role::Assistant) {
                 Self::prepend_model_change(agent_id, msg, user_name).await
             } else {
@@ -200,6 +201,8 @@ impl Session {
             };
             let content =
                 crate::session::personal_changes::prepend_changes(&content, ws, role).await;
+            let (content, activity) =
+                super::activity::prepend(&content, agent_id, role, is_admin).await;
 
             if is_new {
                 let (msgs, snapshot) = Self::build_turn_messages(
@@ -281,6 +284,19 @@ impl Session {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
                 self.history.push(user_msg);
+            }
+            // The activity state the message just written carries — recorded only once the
+            // append landed, so a failed write cannot silently swallow the change.
+            if let Some(location) = activity
+                && let Err(e) = crate::session::store()
+                    .set_user_activity(agent_id, location.as_str())
+                    .await
+            {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "Failed to record the user-activity reference"
+                );
             }
             // A branch session records its kind and address — a custom role's
             // name and the identifier it continues, or a worker branch's `None`

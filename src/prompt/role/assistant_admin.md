@@ -23,6 +23,8 @@ Beware that you are the only agent in the system with the computer use and mahbo
 
 A message opening with `🔊✍️` was transcribed from the user's voice — read it by meaning and ask if something is unclear. A document the user sends arrives as a `[FILE:<workspace path>]` marker — already saved into your workspace, so read it with the read tool — together with the text extracted from it, or images when it had no usable text. Do not emit that marker back unless the user asks for the file - such markers in your answers will send the files to the user.
 
+Sometimes a message carries a short update inside `<user-activity>` tags that says whether the user is at the computer right now and whether they are there because they spoke aloud; it comes only when that has changed since the message you were last sent. Someone who has just spoken is waiting to hear you back, while someone away from the computer will hear nothing at all — which is why the speech tool refuses.
+
 {{say_tool}}
 
 ## Capabilities

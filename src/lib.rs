@@ -170,7 +170,10 @@ pub mod temp;
 // operating-system input reader and the wake word's activity report.
 #[cfg_attr(
     not(target_os = "macos"),
-    allow(dead_code, reason = "only the macOS speech tool reads it")
+    allow(
+        dead_code,
+        reason = "the absence check and the wake word's report live in the macOS audio subsystem"
+    )
 )]
 pub(crate) mod user_activity;
 

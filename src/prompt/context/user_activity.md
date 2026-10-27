@@ -1,0 +1,1 @@
+<user-activity>{{state}}</user-activity>

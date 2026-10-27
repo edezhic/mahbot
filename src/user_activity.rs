@@ -2,21 +2,22 @@
 //!
 //! Active while activity is reported, absent after [`ABSENCE_THRESHOLD`] without any, and
 //! *cannot tell* where the machine cannot report input — which behaves exactly like active,
-//! because the product must never claim the user is away when it cannot see them. Nothing
-//! else is kept: no history (nothing is logged when the state changes), no per-application
-//! detail. The state is the machine's, not one account's.
+//! because the product must never claim the user is away when it cannot see them. The state
+//! is the machine's, not one account's, and it is what [`crate::session::activity`] puts in
+//! front of the admin Assistant's message. Nothing else is kept: no history (nothing is
+//! logged when the state changes), no per-application detail.
 //!
 //! Activity is what the operating system reports as real input — mouse and keyboard — plus a
 //! recognised wake phrase, reported through [`report_activity`] the moment the phrase is
 //! recognised, whatever the voice pipeline then does with the capture. An open microphone is
 //! not activity.
 //!
-//! Sources report and the rule in [`activity`] combines them; there is no registry, and a
+//! Sources report and the rule in [`state`] combines them; there is no registry, and a
 //! platform without a source simply has none, which is the *cannot tell* case. Absence is
 //! concluded only from the operating system's continuous reading: a wake phrase is a point
 //! event, so no amount of silence from it adds up to evidence that someone left.
 //!
-//! The reading is taken when asked ([`is_absent`]), never sampled, so it always reflects the
+//! The reading is taken when asked ([`read`]), never sampled, so it always reflects the
 //! machine's own last five minutes — a restart into an untouched machine reports absent at
 //! once instead of manufacturing fresh presence.
 
@@ -32,42 +33,78 @@ const ABSENCE_THRESHOLD: Duration = Duration::from_mins(5);
 /// recognised wake phrase, in practice.
 static LAST_REPORT: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Whether the user is absent right now. Never true on a machine that cannot tell.
-pub(crate) fn is_absent() -> bool {
-    activity(
-        os_idle(),
-        LAST_REPORT.lock().unwrap_poison().map(|at| at.elapsed()),
-    ) == Activity::Absent
-}
-
 /// A source saw the user: last activity is now. Called by the wake word at the moment it
 /// recognises the spoken phrase.
 pub(crate) fn report_activity() {
     *LAST_REPORT.lock().unwrap_poison() = Some(Instant::now());
 }
 
-/// What the machine says about the person in front of it.
+/// Where the user is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Activity {
-    Active,
-    Absent,
-    /// The machine cannot say; behaves exactly like [`Activity::Active`].
-    Unknown,
+pub(crate) enum Location {
+    AtComputer,
+    Away,
 }
 
-/// The rule, over how long since the operating system saw real input (`None` where it cannot
-/// say) and how long since the last report: the freshest of the two decides, and absence
-/// needs the operating system's reading to exist at all.
-fn activity(os_idle: Option<Duration>, since_report: Option<Duration>) -> Activity {
-    let Some(os_idle) = os_idle else {
-        return Activity::Unknown;
-    };
-    let since = since_report.map_or(os_idle, |report| os_idle.min(report));
-    if since >= ABSENCE_THRESHOLD {
-        Activity::Absent
-    } else {
-        Activity::Active
+impl Location {
+    /// The value stored as the reference, and the plain line label.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AtComputer => "active",
+            Self::Away => "absent",
+        }
     }
+}
+
+/// Where the user is, and whether speaking aloud is what put them there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct State {
+    pub(crate) location: Location,
+    pub(crate) by_voice: bool,
+}
+
+impl State {
+    /// The value the line carries.
+    pub(crate) fn label(self) -> &'static str {
+        if self.by_voice {
+            "active, by voice"
+        } else {
+            self.location.as_str()
+        }
+    }
+}
+
+/// Where the user is right now; `None` where the machine cannot tell.
+pub(crate) fn read() -> Option<State> {
+    state(
+        os_idle(),
+        LAST_REPORT.lock().unwrap_poison().map(|at| at.elapsed()),
+    )
+}
+
+/// The rule, over how long since the operating system saw real input (`None`
+/// where it cannot say) and how long since the last report: the freshest of the
+/// two decides, and absence needs the operating system's reading to exist at
+/// all. A report places the user at the computer *by voice* only where the
+/// operating system's own reading already says they left.
+fn state(os_idle: Option<Duration>, since_report: Option<Duration>) -> Option<State> {
+    let os_idle = os_idle?;
+    let freshest = since_report.map_or(os_idle, |report| os_idle.min(report));
+    let location = if freshest >= ABSENCE_THRESHOLD {
+        Location::Away
+    } else {
+        Location::AtComputer
+    };
+    Some(State {
+        location,
+        by_voice: os_idle >= ABSENCE_THRESHOLD
+            && since_report.is_some_and(|report| report < ABSENCE_THRESHOLD),
+    })
+}
+
+/// Whether the user is absent right now. Never true on a machine that cannot tell.
+pub(crate) fn is_absent() -> bool {
+    read().is_some_and(|state| state.location == Location::Away)
 }
 
 // ── The operating system's input reading ────────────────────────────────
@@ -164,10 +201,14 @@ mod tests {
 
     #[test]
     fn activity_stops_counting_at_the_threshold() {
-        assert_eq!(activity(Some(Duration::ZERO), None), Activity::Active);
-        assert_eq!(activity(Some(RECENT), None), Activity::Active);
-        assert_eq!(activity(Some(ABSENCE_THRESHOLD), None), Activity::Absent);
-        assert_eq!(activity(Some(STALE), None), Activity::Absent);
+        for (idle, expected) in [
+            (Duration::ZERO, Location::AtComputer),
+            (RECENT, Location::AtComputer),
+            (ABSENCE_THRESHOLD, Location::Away),
+            (STALE, Location::Away),
+        ] {
+            assert_eq!(state(Some(idle), None).map(|s| s.location), Some(expected));
+        }
     }
 
     /// A report is a point event, so it cannot stand in for the machine's own reading: where
@@ -175,7 +216,7 @@ mod tests {
     #[test]
     fn a_machine_that_cannot_tell_is_never_absent() {
         for report in [None, Some(RECENT), Some(STALE)] {
-            assert_eq!(activity(None, report), Activity::Unknown);
+            assert_eq!(state(None, report), None);
         }
     }
 
@@ -183,9 +224,37 @@ mod tests {
     /// stopped seeing input.
     #[test]
     fn the_freshest_source_decides() {
-        assert_eq!(activity(Some(STALE), Some(RECENT)), Activity::Active);
-        assert_eq!(activity(Some(RECENT), Some(STALE)), Activity::Active);
-        assert_eq!(activity(Some(STALE), Some(STALE)), Activity::Absent);
-        assert_eq!(activity(Some(STALE), None), Activity::Absent);
+        for (idle, report, expected) in [
+            (STALE, Some(RECENT), Location::AtComputer),
+            (RECENT, Some(STALE), Location::AtComputer),
+            (STALE, Some(STALE), Location::Away),
+            (STALE, None, Location::Away),
+        ] {
+            assert_eq!(
+                state(Some(idle), report).map(|s| s.location),
+                Some(expected)
+            );
+        }
+    }
+
+    /// Speaking aloud is what tells "active because they spoke" from "active because they
+    /// are typing", and only where the operating system's own reading already says they left.
+    #[test]
+    fn speaking_aloud_marks_the_change() {
+        let spoken = state(Some(STALE), Some(RECENT));
+        assert_eq!(spoken.map(|s| s.location), Some(Location::AtComputer));
+        assert!(spoken.is_some_and(|s| s.by_voice));
+
+        let typed = state(Some(RECENT), Some(RECENT));
+        assert_eq!(typed.map(|s| s.location), Some(Location::AtComputer));
+        assert!(typed.is_some_and(|s| !s.by_voice));
+
+        assert_eq!(
+            state(Some(STALE), None),
+            Some(State {
+                location: Location::Away,
+                by_voice: false,
+            })
+        );
     }
 }
