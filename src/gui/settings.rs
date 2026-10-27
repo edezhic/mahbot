@@ -34,7 +34,7 @@ use iced::widget::Text;
 use iced::widget::text::IntoFragment;
 use iced::widget::{
     Column, Id, Row, Space, button, checkbox, column, container, image, pick_list, responsive, row,
-    stack, text, toggler, tooltip,
+    text, toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -2015,14 +2015,10 @@ impl SettingsState {
 
         let scroll = widgets::vscroll(content);
 
-        // Modal overlay (rendered above everything else)
-        let modal = self.render_modal_overlay();
-
-        // Stack order: [scroll content, modal overlay] — every change on the
-        // page persists automatically, so there is no floating Save button.
-        let body = stack([scroll, modal]);
-
-        widgets::page(body)
+        // The dialog layer sits above the padded page, so its backdrop dims the
+        // whole page area. Every change here persists automatically — hence no
+        // floating Save button.
+        widgets::page_with_dialog(scroll, self.render_modal_overlay())
     }
 
     // ── Workspace management section ──────────────────────────
@@ -3098,7 +3094,7 @@ impl SettingsState {
             widgets::modal_backdrop(dialog, SettingsMessage::DismissSwitchToCloud, 0.5)
         } else {
             // Keep Stack widget type stable
-            iced::widget::stack([widgets::empty_stack_placeholder()]).into()
+            widgets::no_dialog()
         }
     }
 

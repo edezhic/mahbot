@@ -73,9 +73,7 @@ use crate::gui::theme;
 use crate::gui::widgets;
 use chrono::{DateTime, Utc};
 
-use iced::widget::{
-    Column, Row, Space, button, column, container, mouse_area, row, stack, text, tooltip,
-};
+use iced::widget::{Column, Row, Space, button, column, container, mouse_area, row, text, tooltip};
 use iced::{Alignment, Element, Length};
 
 use iced_fonts::lucide;
@@ -170,17 +168,14 @@ pub(crate) fn view(
         widgets::vscroll(content)
     };
 
-    let page = widgets::page(body);
-    // Confirm-dialog overlay: the page content is stack child 0, the dialog
-    // (or a type-stable placeholder) child 1 — the widget shapes never
-    // change, so no page state is lost when the dialog opens/closes.
+    // Confirm-dialog overlay: a type-stable placeholder while closed, so the
+    // page keeps its widget state when the dialog opens and closes.
     let confirm_layer: Element<'_, RunningMessage> = if let Some(target) = pending_stop {
         stop_confirm_dialog(target)
     } else {
-        stack([widgets::empty_stack_placeholder()]).into()
+        widgets::no_dialog()
     };
-    let stacked: Element<'_, RunningMessage> = stack([page, confirm_layer]).into();
-    stacked.map(Message::RunningAgents)
+    widgets::page_with_dialog(body, confirm_layer).map(Message::RunningAgents)
 }
 
 // ── Display model ─────────────────────────────────────────────────────────

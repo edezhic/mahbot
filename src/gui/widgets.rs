@@ -78,6 +78,27 @@ pub fn page_bare<'a, Message: 'a>(
         .into()
 }
 
+/// [`page`] with a page-level dialog layer above it.
+///
+/// The dialog sits outside the page padding, so its backdrop dims the whole
+/// page area instead of stopping at the inset, while the padding stays around
+/// the content and nothing else moves.
+#[must_use]
+pub fn page_with_dialog<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    dialog: Element<'a, Message>,
+) -> Element<'a, Message> {
+    stack([page(content), dialog]).into()
+}
+
+/// Closed [`page_with_dialog`] layer: zero-size and `Stack`-rooted like
+/// [`modal_backdrop`], so swapping in a real dialog keeps the page's widget
+/// state (scroll positions, caret).
+#[must_use]
+pub fn no_dialog<'a, Message: 'a>() -> Element<'a, Message> {
+    stack([empty_stack_placeholder()]).into()
+}
+
 // ── Shared single-line editor field ──────────────────────────────────
 
 /// A single shared-editor field frame matching the app's `text_input` visual

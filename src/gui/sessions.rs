@@ -1123,7 +1123,10 @@ impl SessionsState {
             ));
         }
 
-        widgets::page(content)
+        // The page-level dialog slot is stacked above the padded page, as on
+        // Settings, so a dialog added here dims the whole page area too. Closed
+        // is the type-stable placeholder, keeping the page's widget state.
+        widgets::page_with_dialog(content, widgets::no_dialog())
     }
 }
 
