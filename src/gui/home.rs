@@ -240,18 +240,14 @@ fn reply_reference_for(
     }
 }
 
-/// Shared lead row of both reply renderings: reply glyph, author (caller-chosen
-/// color), and muted snippet, already spaced and center-aligned. Callers may
-/// `push` extra trailing elements (e.g. the dismiss button).
-fn reply_lead_row(
-    reply: &ReplyReference,
-    author_color: iced::Color,
-) -> iced::widget::Row<'_, HomeMessage> {
+/// Shared lead row of both reply renderings: reply glyph and muted snippet,
+/// already spaced and center-aligned. Callers may `push` extra trailing
+/// elements (e.g. the dismiss button).
+fn reply_lead_row(reply: &ReplyReference) -> iced::widget::Row<'_, HomeMessage> {
     row![
         lucide::reply::<iced::Theme, iced::Renderer>()
             .size(theme::TEXT_12)
             .color(theme::ACCENT),
-        text(&reply.author).size(theme::TEXT_11).color(author_color),
         text(&reply.snippet)
             .size(theme::TEXT_11)
             .color(theme::TEXT_MUTED),
@@ -260,16 +256,9 @@ fn reply_lead_row(
     .align_y(Alignment::Center)
 }
 
-/// Render the compact reply quote header shown above a bubble that carries a
-/// [`ReplyReference`]: a muted "_author_: snippet" line with a small reply
-/// glyph, aligned to the row the bubble occupies.
-fn reply_quote_header(reply: &ReplyReference) -> Element<'_, HomeMessage> {
-    reply_lead_row(reply, theme::TEXT_SECONDARY).into()
-}
-
 /// Render the reply preview bar shown between the message list and the
-/// composer when a reply reference is pending: author + snippet on one line
-/// (the snippet's own cap produces the ellipsis) with a dismiss control.
+/// composer when a reply reference is pending: the shared reply row (the
+/// snippet's own cap produces the ellipsis) with a dismiss control.
 fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     let dismiss = button(
         lucide::x::<iced::Theme, iced::Renderer>()
@@ -280,7 +269,7 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     .style(theme::icon_button_style(false))
     .padding(theme::PAD_2);
     container(
-        reply_lead_row(reply, theme::TEXT_PRIMARY)
+        reply_lead_row(reply)
             .push(Space::new().width(Length::Fill))
             .push(dismiss),
     )
@@ -1164,12 +1153,13 @@ impl HomeState {
 
                     // Quote header for a replied-to message: rendered above the
                     // bubble (inside the same context-menu region) so a reply
-                    // stays visually tied to its target. Direction-agnostic —
-                    // agent messages never carry references today, but the
-                    // header renders whenever one is present.
+                    // stays visually tied to its target. Just the reply glyph and
+                    // the snippet — the quoted author is not named. Direction-
+                    // agnostic: agent messages never carry references today, but
+                    // the header renders whenever one is present.
                     let bubble_region: Element<'_, HomeMessage> =
                         if let Some(reply) = &msg.reply_reference {
-                            column![reply_quote_header(reply), bubble.width(Length::Fill),]
+                            column![reply_lead_row(reply), bubble.width(Length::Fill),]
                                 .spacing(theme::SPACE_4)
                                 .width(Length::FillPortion(3))
                                 .into()
