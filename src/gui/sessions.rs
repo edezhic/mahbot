@@ -1,5 +1,8 @@
 //! Sessions dashboard page — view and manage conversation sessions.
 //!
+//! The page has no rail entry: the dashboard's Cmd+K (Ctrl+K elsewhere)
+//! shortcut is its only way in.
+//!
 //! The list is a live projection of the registry, not a snapshot: a session
 //! whose agent is running is pinned to the top of the list for as long as it
 //! runs — including an agent that has not stored its first message yet — and the

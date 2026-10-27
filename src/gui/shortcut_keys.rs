@@ -1,8 +1,8 @@
 //! Key handling for widgets we do not own — the embedded terminal.
 //!
 //! iced's keyboard contract is built around the widgets it ships; the terminal
-//! is a third-party one that captures what it handles, so two adaptations keep
-//! it consistent with the rest of the dashboard:
+//! is a third-party one that captures what it handles, so the adaptations below
+//! keep it consistent with the rest of the dashboard:
 //!
 //! - A widget that matches `keyboard::Key::Character("c")` matches the
 //!   character the active layout produces, so Ctrl/Cmd+C does nothing under a
@@ -16,6 +16,10 @@
 //!   reaching [`keyboard::listen`]. Its `text` is dropped here, which leaves the
 //!   press uncaptured. Only macOS needs this: off macOS the chord is Ctrl+L,
 //!   which the terminal binds itself and therefore already captures.
+//! - The Sessions shortcut is dropped whole (see [`is_sessions_shortcut`]): off
+//!   macOS the terminal binds Ctrl+K itself and would swallow the press, so
+//!   dropping only the `text` would not be enough — and unlike Logs, its page
+//!   has to open from the terminal on every platform.
 
 use std::borrow::Cow;
 
@@ -33,6 +37,19 @@ pub(crate) fn terminal_keys<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> El
 
 struct TerminalKeys<'a, M> {
     content: Element<'a, M>,
+}
+
+/// Whether the press opens the Sessions page. The terminal must not see it at
+/// all — typing the `k` on macOS would capture the press, and off macOS the
+/// terminal's own Ctrl+K binding would — so it is dropped, which leaves the
+/// press for [`keyboard::listen`].
+fn is_sessions_shortcut(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    physical_key: keyboard::key::Physical,
+) -> bool {
+    super::dashboard_shortcut(key, modifiers, physical_key)
+        == Some(super::DashboardShortcut::Sessions)
 }
 
 /// The same event, with a shortcut key translated to its latin character and
@@ -128,6 +145,16 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalKeys<'_, 
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            physical_key,
+            ..
+        }) = event
+            && is_sessions_shortcut(key, *modifiers, *physical_key)
+        {
+            return;
+        }
         self.content.as_widget_mut().update(
             tree,
             &normalize(event),

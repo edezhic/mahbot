@@ -173,6 +173,8 @@ pub fn init_recording_tx() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Home,
+    /// The session list's viewer. It has no rail entry:
+    /// [`DashboardShortcut::Sessions`] is its only way in.
     Sessions,
     /// The log store's viewer. It has no rail entry: [`DashboardShortcut::Logs`]
     /// is its only way in.
@@ -195,10 +197,10 @@ impl Page {
         &[Page::Home, Page::Editor, Page::Shell, Page::Automations]
     }
 
-    /// Pages in the sidebar bottom nav — Logs is absent by design (see
-    /// [`Page::Logs`]).
+    /// Pages in the sidebar bottom nav — Sessions and Logs are absent by design
+    /// (see [`Page::Sessions`] and [`Page::Logs`]).
     const fn sidebar_bottom_pages() -> &'static [Page] {
-        &[Page::Sessions, Page::Settings]
+        &[Page::Settings]
     }
 
     const fn label(self) -> &'static str {
@@ -391,6 +393,9 @@ pub enum Message {
     FocusSearch,
     /// Keyboard shortcut: Cmd+L — open the Logs page, which has no rail item.
     OpenLogs,
+    /// Keyboard shortcut: Cmd+K — open the Sessions page, which has no rail
+    /// item.
+    OpenSessions,
     /// Keyboard shortcut: Escape — dismiss modal/panel/confirmation on the current page.
     EscapePressed,
     /// Update button pressed — open the self-update confirmation modal.
@@ -654,11 +659,13 @@ pub(crate) enum DashboardShortcut {
     Search,
     /// Open the Logs page — the shortcut that replaces its rail item.
     Logs,
+    /// Open the Sessions page — the shortcut that replaces its rail item.
+    Sessions,
 }
 
-/// The dashboard shortcut a key press stands for, or `None` — Escape, Cmd+F or
-/// Cmd+L (Ctrl+F / Ctrl+L elsewhere, resolved through the physical key so a
-/// non-Latin layout still produces them).
+/// The dashboard shortcut a key press stands for, or `None` — Escape, Cmd+F,
+/// Cmd+L or Cmd+K (Ctrl+F / Ctrl+L / Ctrl+K elsewhere, resolved through the
+/// physical key so a non-Latin layout still produces them).
 ///
 /// A focused input leaves exactly these uncaptured, because
 /// [`keyboard::listen`] only delivers events no widget captured — and the chat
@@ -678,6 +685,7 @@ pub(crate) fn dashboard_shortcut(
     }
     match key.to_latin(physical_key)? {
         'f' if !modifiers.shift() => Some(DashboardShortcut::Search),
+        'k' if !modifiers.shift() => Some(DashboardShortcut::Sessions),
         'l' if !modifiers.shift() => Some(DashboardShortcut::Logs),
         _ => None,
     }
@@ -945,8 +953,8 @@ impl Dashboard {
     /// the bar — and how it reports the failure — exactly where it is.
     ///
     /// With the bar hidden, what it carried moves into the rail: the voice
-    /// status under the nav icons and the running-agent indicators above
-    /// Sessions ([`Self::render_sidebar_mid`]).
+    /// status under the nav icons and the running-agent indicators above the
+    /// bottom nav ([`Self::render_sidebar_mid`]).
     fn footer_hidden(&self) -> bool {
         self.workspaces_error.is_none()
             && self
@@ -1202,6 +1210,16 @@ impl Dashboard {
             }
         };
         Task::batch([visibility, refresh])
+    }
+
+    /// Enter `page` from the shortcut that replaces its rail item. A dashboard
+    /// overlay covers the rail, so nothing navigates out from under one — Escape
+    /// is what closes overlays.
+    fn open_from_shortcut(&mut self, page: Page) -> Task<Message> {
+        if self.overlay_modal_open() {
+            return Task::none();
+        }
+        self.navigate_to(page)
     }
 
     /// Refresh the Settings users list. The workspace list is not read here —
@@ -1828,13 +1846,15 @@ impl Dashboard {
                     .map(Message::Logs),
                 _ => Task::none(),
             },
-            Message::OpenLogs => {
-                // A dashboard overlay covers the rail, so nothing navigates out
-                // from under one: Escape is what closes overlays.
-                if self.overlay_modal_open() {
+            Message::OpenLogs => self.open_from_shortcut(Page::Logs),
+            Message::OpenSessions => {
+                // A repeat press on the page it opens changes nothing:
+                // re-entering it would re-run the read `navigate_to` starts on
+                // entry.
+                if self.page == Page::Sessions {
                     return Task::none();
                 }
-                self.navigate_to(Page::Logs)
+                self.open_from_shortcut(Page::Sessions)
             }
             Message::EscapePressed => self.process_escape(),
             Message::UpdateBot => {
@@ -2395,11 +2415,11 @@ impl Dashboard {
     }
 
     /// Whether a dashboard-level overlay modal is open over the current page.
-    /// Gates the editor page's keyboard ownership and the Logs shortcut — the
-    /// overlay covers the rail, so the key that replaces a rail entry does
-    /// nothing from under one. The board ticket modal is not included: it
-    /// renders only inside the Home page content (never the global overlay
-    /// stack), so it cannot sit above the editor.
+    /// Gates the editor page's keyboard ownership and the rail-replacing
+    /// shortcuts — the overlay covers the rail, so the keys that replace rail
+    /// entries do nothing from under one. The board ticket modal is not
+    /// included: it renders only inside the Home page content (never the global
+    /// overlay stack), so it cannot sit above the editor.
     ///
     /// `pending_stop` is likewise excluded: it is rendered inside
     /// the Running Agents page body, not as an overlay over other pages.
@@ -2892,6 +2912,7 @@ impl Dashboard {
                     DashboardShortcut::Escape => Some(Message::EscapePressed),
                     DashboardShortcut::Search => Some(Message::FocusSearch),
                     DashboardShortcut::Logs => Some(Message::OpenLogs),
+                    DashboardShortcut::Sessions => Some(Message::OpenSessions),
                 }
             }),
             self.shell_state.subscription().map(Message::Shell),
@@ -3295,10 +3316,10 @@ impl Dashboard {
 
     /// The rail's stretch between the nav icons and the bottom nav. With the
     /// footer hidden it carries the running-agent indicators, bottom-aligned so
-    /// the column sits directly above Sessions; it fills the free height and
-    /// scrolls inside its own area, so the nav entries keep their size however
-    /// many roles run. Otherwise it is the plain spacer that keeps the two nav
-    /// groups apart.
+    /// the column sits directly above the bottom nav; it fills the free height
+    /// and scrolls inside its own area, so the nav entries keep their size
+    /// however many roles run. Otherwise it is the plain spacer that keeps the
+    /// two nav groups apart.
     fn render_sidebar_mid(footer_hidden: bool) -> Element<'static, Message> {
         if footer_hidden && let Some(agents) = Self::render_sidebar_agents() {
             return container(agents)
