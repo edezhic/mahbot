@@ -201,7 +201,7 @@ fn mode_name(mode: Mode) -> &'static str {
 /// quiet bot and a busy one look exactly alike. Installing, starting, a switch in
 /// flight and every failure do have something to say, the last one through its
 /// reason.
-fn telegram_line(status: &telegram_local::Status, has_token: bool) -> Option<String> {
+fn telegram_line(status: &telegram_local::Status) -> Option<String> {
     let mode = mode_name(status.serving);
     let switching = status.target != status.serving;
     // Healthy is silence: installed, answering, nothing under way. A switch in
@@ -224,13 +224,7 @@ fn telegram_line(status: &telegram_local::Status, has_token: bool) -> Option<Str
         // listener never came back.
         None
     } else if status.serving == Mode::Cloud {
-        Some(if has_token {
-            "served by Telegram".to_string()
-        } else {
-            // Nothing can be served by a local server without a bot, so the cloud
-            // line says what is missing instead of a state that needs nothing.
-            "add a bot token above".to_string()
-        })
+        Some("served by Telegram".to_string())
     } else if status.health == Health::Down {
         Some("not running".to_string())
     } else {
@@ -3858,8 +3852,6 @@ impl SettingsState {
                 false,
             ),
         ];
-        // Absent while the local server is installed and healthy: the working
-        // setup says nothing, so there is no empty line to leave a gap.
         if let Some(area) = self.telegram_local_area() {
             integrations = integrations.push(area);
         }
@@ -3868,25 +3860,24 @@ impl SettingsState {
 
     /// The Telegram Bot API mode area of the Integrations section: one line
     /// carrying the mode serving the bot, what it is doing, and the controls this
-    /// state allows — or no element at all, which is the healthy local state.
+    /// state allows — or nothing at all: a healthy local server has nothing to
+    /// report, and without a bot token there is no bot to serve.
     ///
     /// The state is read at render time: every change of the feature publishes
     /// [`crate::runtime_events::RuntimeEvent::TelegramLocal`], which the
     /// dashboard turns into a repaint, so there is no poll loop here.
     fn telegram_local_area(&self) -> Option<Element<'_, SettingsMessage>> {
+        CONFIG.telegram_bot_token()?;
         let status = telegram_local::status();
         // A switch actually in flight, or a request this page just started:
         // `busy` disables the controls that would start a second switch. A switch
         // waiting for the owner (blocked with a cause) is not busy by this
         // definition.
         let busy = self.telegram_switch_busy || (status.migrating && status.blocked.is_none());
-        // The one bot fact this block rests on: everything a switch would start
-        // needs it, and the way in stays disabled without it.
-        let has_token = CONFIG.telegram_bot_token().is_some();
 
         // Silence is the whole report of a working local setup: not even an empty
         // row, which would leave a gap in the section.
-        let state = telegram_line(&status, has_token)?;
+        let state = telegram_line(&status)?;
 
         let mut summary = text(state).size(theme::TEXT_13).width(Length::Fill);
         if status.last_error.is_some() {
@@ -3903,10 +3894,7 @@ impl SettingsState {
             // is enough: the text beside it already says where the bot is going.
             line = line.push(super::spinner(theme::TEXT_13));
         }
-        Some(
-            line.push(self.telegram_line_controls(&status, busy, has_token))
-                .into(),
-        )
+        Some(line.push(self.telegram_line_controls(&status, busy)).into())
     }
 
     /// The controls carried by the mode line. Every one of them stays on that
@@ -3917,7 +3905,6 @@ impl SettingsState {
         &self,
         status: &telegram_local::Status,
         busy: bool,
-        has_token: bool,
     ) -> Element<'static, SettingsMessage> {
         // Telegram refused the pasted pair — the switch blocks on the same test,
         // and only that outcome is fixed by entering the pair again. Only a switch
@@ -3944,14 +3931,14 @@ impl SettingsState {
             .spacing(theme::SPACE_8)
             .align_y(Alignment::Center);
 
-        // The way in: nothing else in the product offers it, so it is never dropped
-        // from the cloud state — disabled, not removed, while it cannot start a
-        // switch. A switch already heading local carries its own retry instead of a
-        // second control that would ask for the same thing.
+        // The way in: nothing else in the product offers it, so it is always on
+        // the cloud line — disabled rather than removed while a switch is under
+        // way. A switch heading local carries its own retry instead of a second
+        // control that would ask for the same thing.
         if status.serving == Mode::Cloud && !status.migrating {
             controls = controls.push(control(
                 "Use a local Bot API server",
-                (!busy && has_token).then_some(SettingsMessage::OpenTelegramCredentials),
+                (!busy).then_some(SettingsMessage::OpenTelegramCredentials),
             ));
         }
         // The repair: a refused pair is re-entered through the same dialog, whose
@@ -5645,32 +5632,31 @@ mod tests {
     #[test]
     fn telegram_line_speaks_only_when_there_is_something_to_say() {
         let (l, c) = (Mode::Local, Mode::Cloud);
-        let line = |status: &telegram_local::Status| telegram_line(status, true);
 
         // Installed and answering: nothing at all. Quietness is not an input here,
         // so no amount of it can produce a word.
         assert_eq!(
-            line(&telegram_status(l, l, Health::Running, false, None)),
+            telegram_line(&telegram_status(l, l, Health::Running, false, None)),
             None
         );
         // A switch that already cut over is still progress, not silence.
         let starting = Some("Local server · installing or starting…".to_string());
         assert_eq!(
-            line(&telegram_status(l, l, Health::Running, true, None)),
+            telegram_line(&telegram_status(l, l, Health::Running, true, None)),
             starting
         );
         assert_eq!(
-            line(&telegram_status(l, l, Health::Starting, false, None)),
+            telegram_line(&telegram_status(l, l, Health::Starting, false, None)),
             starting
         );
         assert_eq!(
-            line(&telegram_status(l, l, Health::Down, false, None)),
+            telegram_line(&telegram_status(l, l, Health::Down, false, None)),
             Some("Local server · not running".to_string())
         );
         // A failure is the reason, with no state word beside it — a server that
         // answers but refuses the bot is not "not running".
         assert_eq!(
-            line(&telegram_status(
+            telegram_line(&telegram_status(
                 l,
                 l,
                 Health::Down,
@@ -5682,15 +5668,15 @@ mod tests {
         // A switch in flight keeps reporting where it is going, and a failure that
         // stops it keeps its reason.
         assert_eq!(
-            line(&telegram_status(c, l, Health::Starting, true, None)),
+            telegram_line(&telegram_status(c, l, Health::Starting, true, None)),
             Some("Cloud · switching to Local server…".to_string())
         );
         assert_eq!(
-            line(&telegram_status(l, c, Health::Running, true, None)),
+            telegram_line(&telegram_status(l, c, Health::Running, true, None)),
             Some("Local server · switching to Cloud…".to_string())
         );
         assert_eq!(
-            line(&telegram_status(
+            telegram_line(&telegram_status(
                 c,
                 l,
                 Health::Starting,
@@ -5702,15 +5688,11 @@ mod tests {
         // The cloud keeps its own line and its way in; a failure there is its
         // reason alone, because nothing is served while its listener is missing.
         assert_eq!(
-            line(&telegram_status(c, c, Health::Cloud, false, None)),
+            telegram_line(&telegram_status(c, c, Health::Cloud, false, None)),
             Some("Cloud · served by Telegram".to_string())
         );
         assert_eq!(
-            telegram_line(&telegram_status(c, c, Health::Cloud, false, None), false),
-            Some("Cloud · add a bot token above".to_string())
-        );
-        assert_eq!(
-            line(&telegram_status(
+            telegram_line(&telegram_status(
                 c,
                 c,
                 Health::Cloud,

@@ -3261,13 +3261,14 @@ impl RunningIndicator {
         )
     }
 
-    /// The rail's presentation: a full-width rail entry, tooltip to the side
-    /// like every other entry.
+    /// The rail's presentation: an inset rail entry, tooltip to the side like
+    /// every other item in the rail.
     fn rail(self) -> Element<'static, Message> {
         Dashboard::sidebar_rail_item(
             self.content,
             self.label,
             Some(Message::Navigation(Page::RunningAgents)),
+            RailEntry::Item,
         )
     }
 }
@@ -3292,6 +3293,58 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
     }
 }
 
+/// What a rail entry is, which decides how its button's highlight is painted. A
+/// navigation entry is full-bleed — its highlight spans the rail's whole width,
+/// and at the rail's top or bottom it reaches the layout's edge too ([`RailEnd`])
+/// — while every other item keeps [`theme::PAD_4`] at the rail's sides.
+#[derive(Clone, Copy)]
+enum RailEntry {
+    /// A navigation entry away from both ends.
+    Nav,
+    /// The navigation entry at the rail's top or bottom end.
+    NavAtEnd(RailEnd),
+    /// Any other rail item: the voice status, the running-agent indicators.
+    Item,
+}
+
+/// The rail's top or bottom end.
+#[derive(Clone, Copy)]
+enum RailEnd {
+    Top,
+    Bottom,
+}
+
+impl RailEntry {
+    /// The entry's vertical content padding, [`theme::PAD_14`] on the rail's
+    /// outer side at its end instead of [`theme::PAD_10`].
+    fn content_padding(self) -> iced::Padding {
+        let (top, bottom) = match self {
+            Self::NavAtEnd(RailEnd::Top) => (theme::PAD_14, theme::PAD_10),
+            Self::NavAtEnd(RailEnd::Bottom) => (theme::PAD_10, theme::PAD_14),
+            Self::Nav | Self::Item => (theme::PAD_10, theme::PAD_10),
+        };
+        iced::Padding {
+            top,
+            bottom,
+            ..iced::Padding::default()
+        }
+    }
+
+    /// The rail's [`theme::PAD_4`] inset around every button that is not a
+    /// navigation entry.
+    fn button_inset(self) -> iced::Padding {
+        let inset = match self {
+            Self::Item => theme::PAD_4,
+            Self::Nav | Self::NavAtEnd(_) => 0.0,
+        };
+        iced::Padding {
+            left: inset,
+            right: inset,
+            ..iced::Padding::default()
+        }
+    }
+}
+
 impl Dashboard {
     /// The nav rail: the top nav icons, the voice status while the footer is
     /// hidden, the stretch in between ([`Self::render_sidebar_mid`]) and the
@@ -3310,7 +3363,6 @@ impl Dashboard {
         .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
         .height(Length::Fill)
         .style(theme::surface_container_style)
-        .padding(theme::PAD_4)
         .into()
     }
 
@@ -3330,23 +3382,24 @@ impl Dashboard {
         Space::new().height(Length::Fill).into()
     }
 
-    /// A rail entry: its content centered in the rail's full width, tooltip to
-    /// the side — iced snaps Top tooltips into the viewport, overlapping the
-    /// topmost rail entry. `on_press: None` makes a static entry (the voice
-    /// status, which only reports).
+    /// A rail entry: its content centered in the entry's width, tooltip to the
+    /// side — iced snaps Top tooltips into the viewport, overlapping the topmost
+    /// rail entry. `on_press: None` makes a static entry (the voice status, which
+    /// only reports).
     fn sidebar_rail_item(
         content: Element<'static, Message>,
         label: impl Into<Cow<'static, str>>,
         on_press: Option<Message>,
+        entry: RailEntry,
     ) -> Element<'static, Message> {
-        tooltip(
+        let tip = tooltip(
             button(
-                // The container's generous vertical padding gives the button a
-                // large hit area within the fixed 56px rail.
+                // The container's vertical padding gives the button a large hit
+                // area and keeps the icon's place.
                 container(content)
                     .width(Length::Fill)
                     .center_x(Length::Fill)
-                    .padding([theme::PAD_10, 0.0]),
+                    .padding(entry.content_padding()),
             )
             .width(Length::Fill)
             .padding(0)
@@ -3355,20 +3408,34 @@ impl Dashboard {
             text(label.into()).size(theme::TEXT_11),
             tooltip::Position::Right,
         )
-        .style(theme::tooltip_style)
-        .into()
+        .style(theme::tooltip_style);
+        container(tip)
+            .width(Length::Fill)
+            .padding(entry.button_inset())
+            .into()
     }
 
     /// Shared nav-icon column for the sidebar top and bottom navs. Each page is
-    /// a 48px-tall full-width icon button (28px icon) with the active page
-    /// accent-colored; a page that is not available ([`Self::page_available`]) is
-    /// absent from the column entirely.
-    fn sidebar_nav_column(&self, pages: &[Page]) -> Column<'_, Message> {
+    /// a full-width icon button (28px icon) with the active page accent-colored;
+    /// a page that is not available ([`Self::page_available`]) is absent from the
+    /// column entirely. `end` is the rail's end the column sits at, which marks
+    /// the entry there as the rail's end entry ([`RailEntry`]).
+    fn sidebar_nav_column(&self, pages: &[Page], end: RailEnd) -> Column<'_, Message> {
+        // Only the column's own end can be the rail's end, so only it is searched.
+        let edge = match end {
+            RailEnd::Top => pages.iter().position(|page| self.page_available(*page)),
+            RailEnd::Bottom => pages.iter().rposition(|page| self.page_available(*page)),
+        };
         let mut col = Column::new().spacing(theme::SPACE_2);
-        for page in pages {
+        for (index, page) in pages.iter().enumerate() {
             if !self.page_available(*page) {
                 continue;
             }
+            let entry = if Some(index) == edge {
+                RailEntry::NavAtEnd(end)
+            } else {
+                RailEntry::Nav
+            };
             let color = if self.page == *page {
                 theme::ACCENT
             } else {
@@ -3378,6 +3445,7 @@ impl Dashboard {
                 page_icon(*page).size(28).color(color).into(),
                 page.label(),
                 Some(Message::Navigation(*page)),
+                entry,
             ));
         }
         col
@@ -3388,12 +3456,14 @@ impl Dashboard {
     /// which live in the footer bar or, with the footer hidden, in the rail
     /// ([`Self::render_sidebar_agents`]).
     fn render_sidebar_nav(&self) -> Element<'_, Message> {
-        self.sidebar_nav_column(Page::sidebar_pages()).into()
+        self.sidebar_nav_column(Page::sidebar_pages(), RailEnd::Top)
+            .into()
     }
 
     /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]).
     fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
-        self.sidebar_nav_column(Page::sidebar_bottom_pages()).into()
+        self.sidebar_nav_column(Page::sidebar_bottom_pages(), RailEnd::Bottom)
+            .into()
     }
 
     /// The rail's voice status, standing in for the footer bar's label while the
@@ -3418,6 +3488,7 @@ impl Dashboard {
                 .into(),
             label,
             None,
+            RailEntry::Item,
         )
     }
 
@@ -3442,8 +3513,8 @@ impl Dashboard {
         if items.is_empty() {
             return None;
         }
-        // A scrollbar would be painted over the right edge of these 48px
-        // entries; a half-visible row already shows there is more.
+        // A scrollbar would be painted beside these entries; a half-visible row
+        // already shows there is more.
         Some(
             scrollable(Column::with_children(items).spacing(theme::SPACE_2))
                 .direction(theme::hidden_vertical_scrollbar())

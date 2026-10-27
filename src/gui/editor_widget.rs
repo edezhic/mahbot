@@ -3826,7 +3826,9 @@ where
     let metrics = font_metrics();
     let placeholder_text = iced::advanced::text::Text {
         content: text.to_string(),
-        bounds: Size::new(geo.clip.width, geo.clip.height),
+        // A hint is one line, and the width it is shaped at is the width it
+        // wraps at: only the clip decides how much of it shows.
+        bounds: Size::new(f32::MAX, metrics.line_height),
         size: iced::Pixels(metrics.font_size),
         line_height: iced::advanced::text::LineHeight::Relative(1.3),
         font: renderer.default_font(),
