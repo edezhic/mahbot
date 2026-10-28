@@ -130,6 +130,10 @@ pub(crate) mod runtime_events;
 // notification area, with the click that brings the window up and the menu that quits.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod tray;
+// The ways into that window from outside it — the tray, a second launch, the Dock — and
+// the product's one in-app quit. Linux's window is never hidden, so it has none of them.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod window_requests;
 
 // ── CLI and prompts ──────────────────────────────────────────────────────
 // The operation channel a `mahbot` command line carries into the live instance,

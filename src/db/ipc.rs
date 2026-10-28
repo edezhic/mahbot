@@ -8,17 +8,22 @@
 //! read-only SQL queries and returns the rows. The debug CLI connects to it
 //! instead of opening the database directly.
 //!
-//! The same socket carries two request shapes:
-//! - the read-only diagnostic query it always did, and
-//! - a command-line operation (any family [`crate::cli`] publishes — `mahbot
-//!   config …`, `mahbot send …`), carried in the SAME frame with an extra `call`
-//!   field.
+//! Where the window can be hidden (macOS and Windows, see `crate::window_requests`),
+//! the same socket carries a third request shape next to the two it always did — the
+//! read-only diagnostic query and the command-line operation (any family [`crate::cli`]
+//! publishes — `mahbot config …`, `mahbot send …`) that rides the query's SAME frame with
+//! an extra `call` field:
+//!
+//! - an operation names its family's protocol value in `store` and carries its `call`;
+//! - a second launch of the product names the window store to bring the window up, and is
+//!   answered when the interface took it.
 //!
 //! Protocol (length-prefixed JSON over a local socket stream):
 //! - request  → `[u32 LE payload_len][payload]`, payload is JSON `IpcRequest`
-//!   (`call` present on the operation shape, absent on a diagnostic query).
+//!   (`call` present on the operation shape, absent on a diagnostic query and on the
+//!   window raise).
 //! - response → `[u32 LE payload_len][payload]`, payload is JSON `QueryResponse`
-//!   for a diagnostic query and `CallReply` for an operation.
+//!   for a diagnostic query and a window raise, `CallReply` for an operation.
 //!
 //! The compatibility rule is why the operation rides the old frame instead of a
 //! new one: an operation frame carries a magic `store` value — the value of the
@@ -261,6 +266,24 @@ pub(crate) const CALL_STORE_BASE: &str = "cli";
 /// line's surface.
 pub(crate) const CALL_STORES: &[&str] = &[CALL_STORE, CALL_STORE_BASE];
 
+/// The store value a second launch's frame names: not a store, and nothing is
+/// queried — the frame asks the interface to bring its window up (see
+/// [`crate::window_requests`]) and is answered when the interface took it. A
+/// product that does not know the value refuses the frame as an unknown store,
+/// and so does one that cannot show a window, which the caller reads as "no
+/// window came up".
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const SHOW_WINDOW_STORE: &str = "window";
+
+/// The answer a window raise gets when the socket could not be restricted to the
+/// instance's own user: the fail-closed rule the operations follow (see the module
+/// doc), stated for this request.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const SHOW_WINDOW_UNRESTRICTED_ANSWER: &str = concat!(
+    "the command-line channel could not be restricted to this machine's own user, so a window ",
+    "is not brought up through it"
+);
+
 /// One command-line operation: the tool the frontend addressed and the
 /// arguments it passed, plus the values the caller handed over as secrets.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -420,6 +443,17 @@ fn response_error(msg: &str) -> QueryResponse {
     }
 }
 
+/// The answer to a request that was taken on, with nothing to report.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn response_ok() -> QueryResponse {
+    QueryResponse {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        error: None,
+        truncated: false,
+    }
+}
+
 /// Serialize one response — a `QueryResponse` or a `CallReply` — into an IPC
 /// frame and write it. (serde_json emits `null` — not an error — for non-finite
 /// floats, which `de_real` maps back to NaN, so serialization never fails for
@@ -464,6 +498,26 @@ async fn handle_connection(
             return Ok(());
         }
     };
+
+    // A second launch of the product: its one frame asks the interface to bring the window up.
+    // Served only on a channel restricted to the instance's own user, and taken only while the
+    // product can still show a window — a launch that finds a drain or an exit under way is
+    // refused the way every second launch was, since no window will come up. The answer says
+    // the request was taken, not that the window is up.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if req.store == SHOW_WINDOW_STORE {
+        let resp = if !serve_calls {
+            response_error(SHOW_WINDOW_UNRESTRICTED_ANSWER)
+        } else if crate::shutdown::aborting() {
+            response_error("the product is shutting down, so no window came up")
+        } else if !crate::window_requests::show() {
+            response_error("the interface is not running, so no window came up")
+        } else {
+            response_ok()
+        };
+        write_json_frame(&mut stream, &resp).await?;
+        return Ok(());
+    }
 
     // The operation shape: the magic store plus its `call`. A frame that names
     // one of the protocol values this build serves and carries nothing to run is
@@ -855,18 +909,9 @@ fn ipc_query_sync_once(
     req: &IpcRequest,
     read: crate::db::read_limit::Read<'_>,
 ) -> Attempt {
-    let socket = socket_path(storage_root);
-    let name = match socket.as_path().to_fs_name::<GenericFilePath>() {
-        Ok(name) => name,
-        Err(e) => return Attempt::NotDelivered(e.to_string()),
-    };
-    // `Stream::connect` is an associated function on the sync `Stream` trait,
-    // not the enum — call it fully-qualified so `Self` resolves to the enum.
-    let mut stream = match <interprocess::local_socket::Stream as interprocess::local_socket::traits::Stream>::connect(
-        name,
-    ) {
+    let mut stream = match connect_sync(storage_root) {
         Ok(stream) => stream,
-        Err(e) => return Attempt::NotDelivered(e.to_string()),
+        Err(e) => return Attempt::NotDelivered(e),
     };
     // Read AFTER the connect, like the async client's wait, so an attempt cannot
     // run past the budget by the connect's own duration; and a budget spent here
@@ -883,28 +928,43 @@ fn ipc_query_sync_once(
     // way the read-limit watchdog the caller armed is what ends a wedged read.
     let _ = stream.set_recv_timeout(Some(wait));
     let _ = stream.set_send_timeout(Some(wait));
-    let payload = match serde_json::to_vec(req) {
-        Ok(payload) => payload,
-        Err(e) => return Attempt::Broken(e.to_string()),
-    };
-    if let Err(e) = write_frame_sync(&mut stream, &payload) {
-        // A send that ran out of time is the same event the async client's
-        // timeout wrapper sees, and gets the same answer: the limit, not a
-        // channel that could not be reached.
-        return if timed_out(&e) {
-            Attempt::NoAnswer
-        } else {
-            Attempt::Broken(e.to_string())
-        };
-    }
-    match read_frame_sync(&mut stream) {
+    match exchange_sync(&mut stream, req) {
+        // A send or a read that ran out of time is the same event the async
+        // client's timeout wrapper sees, and gets the same answer: the limit, not
+        // a channel that could not be reached.
+        Err(e) if timed_out(&e) => Attempt::NoAnswer,
+        Err(e) => Attempt::Broken(e.to_string()),
         Ok(payload) => match serde_json::from_slice(&payload) {
             Ok(resp) => Attempt::Answered(resp),
             Err(e) => Attempt::Broken(e.to_string()),
         },
-        Err(e) if timed_out(&e) => Attempt::NoAnswer,
-        Err(e) => Attempt::Broken(e.to_string()),
     }
+}
+
+/// Connect to the running instance's endpoint.
+fn connect_sync(storage_root: &Path) -> Result<interprocess::local_socket::Stream, String> {
+    let socket = socket_path(storage_root);
+    let name = socket
+        .as_path()
+        .to_fs_name::<GenericFilePath>()
+        .map_err(|e| e.to_string())?;
+    // `Stream::connect` is an associated function on the sync `Stream` trait,
+    // not the enum — call it fully-qualified so `Self` resolves to the enum.
+    <interprocess::local_socket::Stream as interprocess::local_socket::traits::Stream>::connect(
+        name,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// One request frame out, one answer frame in — the whole of the sync channel's
+/// exchange, shared by the query client and the second-launch request.
+fn exchange_sync(
+    stream: &mut interprocess::local_socket::Stream,
+    req: &IpcRequest,
+) -> std::io::Result<Vec<u8>> {
+    let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;
+    write_frame_sync(stream, &payload)?;
+    read_frame_sync(stream)
 }
 
 /// True for the error a socket timeout surfaces as on this platform (both kinds:
@@ -936,6 +996,56 @@ fn read_frame_sync(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> 
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload)?;
     Ok(payload)
+}
+
+// ── Second-launch request ────────────────────────────────────────
+
+/// Ask the running instance to bring its window up — the one request a second launch of the
+/// product makes (see `main`).
+///
+/// A single short attempt with no retry: this runs at startup, before any interface exists in
+/// this process, and `false` means the instance has not bound the endpoint yet (a boot or an
+/// update hand-off under way), stopped answering, is shutting down, or does not serve the
+/// request at all. The caller then answers the launch the way a second launch always was.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[must_use]
+pub fn request_window_show(storage_root: &Path) -> bool {
+    /// Bound on the whole exchange: the instance either answers at once or is not there to,
+    /// and a launch must not wait on one that never will — it has no window to show either way.
+    const WAIT: Duration = Duration::from_secs(2);
+
+    // The exchange runs on a thread of its own so the wait has a bound everywhere: a Windows
+    // named pipe carries no I/O timeout at all (see `ipc_query_sync_once`), and an instance
+    // that took the frame but stopped answering must not hang the launch.
+    let (sent, answer) = std::sync::mpsc::channel();
+    let root = storage_root.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("window-show".to_string())
+        .spawn(move || {
+            let _ = sent.send(ask_window_show(&root));
+        });
+    if spawned.is_err() {
+        return false;
+    }
+    answer.recv_timeout(WAIT).unwrap_or(false)
+}
+
+/// One exchange with the running instance: the request frame out, the answer in.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn ask_window_show(storage_root: &Path) -> bool {
+    let Ok(mut stream) = connect_sync(storage_root) else {
+        return false;
+    };
+    let request = IpcRequest {
+        store: SHOW_WINDOW_STORE.to_string(),
+        sql: String::new(),
+        params: Vec::new(),
+        call: None,
+    };
+    let Ok(payload) = exchange_sync(&mut stream, &request) else {
+        return false;
+    };
+    serde_json::from_slice::<QueryResponse>(&payload).is_ok_and(|response| response.error.is_none())
 }
 
 // ── Command-line operation client ───────────────────────────────

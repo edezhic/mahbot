@@ -93,7 +93,13 @@ fn next_step_in(elapsed_ms: u64, step_ms: u64) -> u64 {
 
 /// Self-arm the next redraw at the next `step_ms` boundary: this is what keeps a
 /// clock-driven widget animating with no subscription and no messages.
+///
+/// A hidden window draws nothing, so nothing is armed for one: the animation resumes with
+/// the next frame the window does draw, when it comes back.
 fn arm_redraw<Message>(event: &Event, shell: &mut Shell<'_, Message>, step_ms: u64) {
+    if super::app_window::hidden() {
+        return;
+    }
     if let Event::Window(window::Event::RedrawRequested(_)) = event {
         shell.request_redraw_at(window::RedrawRequest::At(
             Instant::now() + Duration::from_millis(next_step_in(phase_ms(), step_ms) + 1),

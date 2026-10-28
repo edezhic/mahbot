@@ -62,7 +62,7 @@ fn global_shutdown() -> &'static CancellationToken {
 }
 
 /// Global graceful-drain state: a `watch` channel of `bool` set by the first
-/// shutdown signal (SIGINT / window-close / quit / self-update). Distinct from the
+/// shutdown signal (SIGINT / a close that could not hide / a quit / self-update). Distinct from the
 /// cancellation token — during the drain the token is NOT fired, so in-flight
 /// LLM calls (which race the token around the HTTP send) survive to complete
 /// their current round. Background loops fold this flag into their
@@ -276,8 +276,8 @@ fn stage_budget(deadline: Instant, now: Instant) -> Duration {
 
 /// The bound on the exit path's stage before the store checkpoint, for a stop that
 /// runs under the platform's own kill deadline (a Windows console close or session
-/// end): `None` for every other stop, which no platform deadline bounds (a dashboard
-/// window close, a first Ctrl+C, a macOS quit).
+/// end): `None` for every other stop, which no platform deadline bounds (the tray's
+/// quit, a close that could not hide, a first Ctrl+C, a macOS quit).
 ///
 /// Sampled once, when that stage starts, from the deadline the platform's stops recorded
 /// (`record_stop_deadline` keeps the earliest — the kill the process must beat);
@@ -299,8 +299,8 @@ pub fn urgent_release_budget() -> Option<Duration> {
 /// deliveries (the console protocol loop and the session-end listener), a macOS quit and the tray
 /// menu's quit write one — the macOS and tray routes only where that request is what drives the
 /// exit, so a repeat gesture leaves the record to the request that caused it. `None` when
-/// nothing was recorded: a dashboard window close and a Unix signal record nothing, and the exit
-/// line then keeps the wording it always had. A `Mutex`, not a `OnceLock`: a later request takes
+/// nothing was recorded: a close that could not hide and a Unix signal record nothing, and the
+/// exit line then keeps the wording it always had. A `Mutex`, not a `OnceLock`: a later request takes
 /// the record over from the one before it.
 ///
 /// The exit line itself is dropped outright — it runs after the iced runtime whose log writer
@@ -388,8 +388,8 @@ fn stop_for_session_end(label: &'static str) {
 /// all — it is force-cancel class on its own terms, in `install_session_end_listener`.
 ///
 /// The "second request" is read off the global drain flag rather than a per-source
-/// count, so a first Ctrl+C that follows a drain begun elsewhere — the dashboard
-/// window close, a platform quit, a self-update's finalizing drain — force-cancels,
+/// count, so a first Ctrl+C that follows a drain begun elsewhere — a quit, a close that
+/// could not hide, a self-update's finalizing drain — force-cancels,
 /// where on Unix a first SIGINT after those is a no-op. The dashboard's own exit
 /// requests read the same flag (see `gui::Dashboard::request_exit`), so this is
 /// deliberate and not a defect.
@@ -552,8 +552,8 @@ fn install_session_end_listener() {
 ///   Ctrl+Break, so those would be inert if that loop died while the process lived. Unix
 ///   is no better: tokio keeps its handler installed for the whole process even once the
 ///   signal streams are dropped, so a died-out signal task there swallows the signal the
-///   same way. No machinery is warranted: the console close and the dashboard window
-///   close remain as escapes.
+///   same way. No machinery is warranted: the console close and the tray menu's quit
+///   remain as escapes.
 /// - A kill mid-exit, when a close's grace expires first: what the bound cuts is
 ///   covered by the durability note on [`urgent_release_budget`], and a kill that lands
 ///   mid-checkpoint cuts only hygiene — committed work is durable on disk. Whatever
@@ -568,11 +568,13 @@ fn install_session_end_listener() {
 /// console event has no consumer while that loop does not exist, and none is added for
 /// it. Both of those are console events, so both need a launch that has a console to
 /// arise at all; there, and only there, Ctrl+C still reaches tokio's own handler, whose
-/// `ctrl_c()` is itself a `SetConsoleCtrlHandler` registration. The dashboard's own window close
-/// is not among them: the dashboard consumes it in every state, whether or not boot
-/// finished. A session end is not among them: it reaches the process through its own window
-/// whether or not this handler is registered — the instance a self-update leaves behind owns
-/// no console at all, so no console close can reach it, but it owns a window just the same.
+/// `ctrl_c()` is itself a `SetConsoleCtrlHandler` registration. The dashboard's own close is not
+/// among them: the dashboard consumes it in every state, whether or not boot finished — and on
+/// this platform it hides the window rather than ending the process, unless there is nothing
+/// left to keep running or no tray to come back from. A session end is not among them: it
+/// reaches the process through its own window whether or not this handler is registered — the
+/// instance a self-update leaves behind owns no console at all, so no console close can reach
+/// it, but it owns a window just the same.
 #[cfg(windows)]
 mod console {
     use super::{DEFAULT_STOP_GRACE, StopRequest, record_stop_deadline};
@@ -785,8 +787,8 @@ mod console {
 ///
 /// - A session end before the dashboard is ready: the dashboard subscribes to shutdown only
 ///   once boot has succeeded and nothing else consumes the forced stop, so the platform ends
-///   the process as today — unless the owner closes the window during the grace, which the
-///   dashboard consumes in every state and which runs the same exit path. A boot that
+///   the process as today — and with nothing hidden before boot finished, a close during the
+///   grace runs the exit path the dashboard consumes in every state. A boot that
 ///   finishes inside the platform's grace does exit properly (the token stays fired for the
 ///   subscription that then appears); one that fails never does.
 /// - A session end while a self-update is finalizing: the update's exit path wins, spawn
@@ -957,7 +959,7 @@ mod session_end {
 pub(crate) const MACOS_QUIT_TRIGGER: &str = "macOS quit";
 
 /// The wording the tray menu's one item records for itself in [`EXIT_TRIGGER`]: its own ask, on
-/// either platform that has a tray, is neither a window close nor the platform's quit.
+/// either platform that has a tray, is neither the platform's quit nor a close.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) const TRAY_QUIT_TRIGGER: &str = "tray quit";
 
@@ -993,8 +995,9 @@ pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceive
     QUIT_REQUESTS.lock().unwrap_poison().take()
 }
 
-/// The macOS quit interception: the platform's own ordinary quit asks, brought into the
-/// product's closing path.
+/// The macOS quit interception, and the Dock's reopen hook, on winit's application delegate: the
+/// platform's own ordinary quit asks, brought into the product's closing path, and the Dock
+/// click that brings a hidden window back.
 ///
 /// # Why it exists
 ///
@@ -1017,6 +1020,16 @@ pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceive
 /// `run`, after `main`'s install call), so a thread of its own waits for it and gives up after
 /// `INSTALL_WAIT` — the fallback named under "Accepted" below.
 ///
+/// # The Dock's reopen
+///
+/// The same class carries one method more: `applicationShouldHandleReopen:hasVisibleWindows:`.
+/// A click on the Dock icon is one of the ways back to a window a close hid — and to one the
+/// application hid itself with ⌘H — so the method hands a show request to the dashboard (see
+/// [`crate::window_requests`]) and answers `YES`, which leaves the platform's own reopen
+/// (unhiding the application) to run. The same waiter installs it, and before boot finishes
+/// rather than after, so the Dock works from the moment the window exists — the launch the
+/// updater restarted hidden included.
+///
 /// # Which ask it is
 ///
 /// `kAEQuitReason` on the Quit AppleEvent names why the quit was sent; an ordinary quit carries no
@@ -1024,11 +1037,11 @@ pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceive
 /// for every AppleEvent-driven route, the Dock's Quit included. The two are answered differently:
 ///
 /// - An ordinary quit is answered `NSTerminateCancel`: the platform's termination is refused and
-///   the closing path takes over, exactly as a window close does (winit answers
-///   `windowShouldClose:` with "no" for the same reason). Nothing stays pending on the platform's
-///   side, so a **second** quit during the graceful drain reaches this hook again and does what a
-///   second window close does — forces that drain, except while a self-update's own drain owns
-///   the exit, which neither gesture forces.
+///   the closing path takes over, exactly as the tray menu's quit does (winit answers
+///   `windowShouldClose:` with "no" for the same reason, so a close is the app's to answer).
+///   Nothing stays pending on the platform's side, so a **second** quit during
+///   the graceful drain reaches this hook again and forces that drain, except while a
+///   self-update's own drain owns the exit.
 /// - A session end — a log-out, restart or shut-down — is not the product's to handle: the ask is
 ///   answered `NSTerminateNow`, the answer an application that does not implement this method at
 ///   all gets, and the platform ends the process at once. That exit and its accepted losses are on
@@ -1053,9 +1066,11 @@ pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceive
 ///   because the interface is already past its exit: it is handed back (`NSTerminateNow`), which
 ///   keeps a quit from being a dead key and the platform from waiting on an answer nothing can
 ///   give.
-/// - A failure to install (the delegate class never appears, a future winit renames it, the class
-///   already implements the method, the thread cannot be spawned): an ordinary quit keeps today's
-///   behaviour — the platform ends the process — reported, never fatal.
+/// - A failure to install (the delegate class never appears, a future winit renames it, the
+///   class already implements the method, the thread cannot be spawned): an ordinary quit keeps
+///   today's behaviour — the platform ends the process — reported, never fatal. The same failure
+///   leaves the Dock's reopen uninstalled, which costs that way back and nothing else: the tray
+///   and a second launch still bring the window up.
 /// - The exit bound firing: a hard end with no closing steps, the same class as a force quit. A
 ///   quit arriving while a self-update is finalizing is armed like any other, so the bound can cut
 ///   that hand-off where the exit path would otherwise wait for it: a tail outrunning the
@@ -1086,13 +1101,18 @@ mod macos_quit {
         QUIT_TX.get().is_some_and(|tx| tx.send(()).is_ok())
     }
 
-    /// The delegate class winit registers for its event loop, and the only one AppKit asks about
-    /// termination; a rename in a future winit costs the interception and nothing else.
+    /// The delegate class winit registers for its event loop, and the one AppKit asks about a
+    /// termination and a Dock reopen; a rename in a future winit costs the interception and the
+    /// Dock's way back, and nothing else.
     const DELEGATE_CLASS: &CStr = c"WinitApplicationDelegate";
 
     /// `applicationShouldTerminate:`'s type encoding: the reply (`NSUInteger`), the receiver,
     /// the selector, the sender.
     const SHOULD_TERMINATE_TYPES: &CStr = c"Q@:@";
+
+    /// `applicationShouldHandleReopen:hasVisibleWindows:`'s type encoding: the answer (`BOOL`),
+    /// the receiver, the selector, the application and the visible-windows flag.
+    const SHOULD_REOPEN_TYPES: &CStr = c"c@:@c";
 
     /// How long the installer waits for winit's delegate class to be registered.
     const INSTALL_WAIT: Duration = Duration::from_secs(60);
@@ -1103,8 +1123,8 @@ mod macos_quit {
     /// steps that follow it (see the module's bound note).
     const EXIT_BOUND: Duration = Duration::from_secs(crate::jobs::DRAIN_CAP_SECS + 300);
 
-    /// Bring the interception up on a thread of its own, never joined: a failure is reported and
-    /// never fatal — an ordinary quit keeps today's behaviour.
+    /// Bring the interception and the Dock's reopen up on a thread of its own, never joined: a
+    /// failure is reported and never fatal — an ordinary quit keeps today's behaviour.
     pub(super) fn install(tx: tokio::sync::mpsc::UnboundedSender<()>) {
         let _ = QUIT_TX.set(tx);
         if let Err(e) = std::thread::Builder::new()
@@ -1115,7 +1135,7 @@ mod macos_quit {
         }
     }
 
-    /// Wait for winit's delegate class, then add the delegate method to it.
+    /// Wait for winit's delegate class, then add the delegate methods to it.
     fn install_when_registered() {
         let give_up = Instant::now() + INSTALL_WAIT;
         loop {
@@ -1144,6 +1164,31 @@ mod macos_quit {
                     report(
                         "winit's delegate already implements applicationShouldTerminate: — \
                          the platform's own termination stands",
+                    );
+                }
+                // SAFETY: as above — the IMP is the method's own signature (`self`, `_cmd`,
+                // the application and the flag, answering a `BOOL`), the encoding spells it out,
+                // and the class outlives the process.
+                let reopened = unsafe {
+                    class_addMethod(
+                        std::ptr::from_ref(class).cast_mut(),
+                        sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+                        std::mem::transmute::<
+                            unsafe extern "C-unwind" fn(
+                                *mut AnyObject,
+                                Sel,
+                                *mut AnyObject,
+                                i8,
+                            ) -> i8,
+                            Imp,
+                        >(should_reopen),
+                        SHOULD_REOPEN_TYPES.as_ptr(),
+                    )
+                };
+                if !reopened.as_bool() {
+                    report(
+                        "winit's delegate already answers a Dock reopen — the tray and a second \
+                         launch still bring the window up",
                     );
                 }
                 // Success is silent, as the Windows installers are: the class appears inside
@@ -1186,6 +1231,26 @@ mod macos_quit {
         info!("macOS quit — the platform asked the product to quit");
         arm_exit_bound();
         NSApplicationTerminateReply::TerminateCancel
+    }
+
+    /// The delegate method AppKit asks about a reopen — the Dock icon clicked while the
+    /// application runs: the dashboard brings the window up, and answering `YES` leaves the
+    /// platform's own reopen (unhiding the application after ⌘H) to run.
+    ///
+    /// # Safety
+    ///
+    /// AppKit calls this as `-[WinitApplicationDelegate
+    /// applicationShouldHandleReopen:hasVisibleWindows:]` on the main thread: `_this` is the
+    /// delegate, `_sender` the application object and `_has_visible_windows` the flag, none of
+    /// which this needs.
+    unsafe extern "C-unwind" fn should_reopen(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        _sender: *mut AnyObject,
+        _has_visible_windows: i8,
+    ) -> i8 {
+        let _ = crate::window_requests::show();
+        1
     }
 
     /// Whether the platform is ending the session rather than asking the product to quit: its
@@ -1233,12 +1298,12 @@ mod macos_quit {
         }
     }
 
-    /// Report a failure of the interception, or the exit bound firing, through the boot diagnostic,
-    /// as the session-end listener's `report` does: its stderr leg is the one that carries it (an
-    /// install failure can run before the logs store exists, and the exit-bound report is followed
-    /// at once by the `_exit`).
+    /// Report a failure of the delegate hooks, or the exit bound firing, through the boot
+    /// diagnostic, as the session-end listener's `report` does: its stderr leg is the one that
+    /// carries it (an install failure can run before the logs store exists, and the exit-bound
+    /// report is followed at once by the `_exit`).
     fn report(what: &str) {
-        crate::boot::boot_diagnostic(format!("quit interception: {what}"));
+        crate::boot::boot_diagnostic(format!("macOS delegate hooks: {what}"));
     }
 }
 

@@ -9,6 +9,8 @@
     clippy::collapsible_if
 )]
 
+/// The dashboard's window on the platforms whose window is the app's own (see its docs).
+pub mod app_window;
 pub(crate) mod attachment;
 pub(crate) mod automations;
 pub(crate) mod board;
@@ -50,9 +52,12 @@ use crate::pipeline::board::Ticket;
 
 use iced::keyboard;
 use iced::widget::{
-    Column, Row, Space, button, column, container, image, mouse_area, pick_list, row, rule,
-    scrollable, text, tooltip,
+    Column, Row, Space, button, column, container, image, pick_list, row, rule, scrollable, text,
+    tooltip,
 };
+// The window-dragging area: only a frameless window is dragged by the rail.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use iced::widget::mouse_area;
 use iced::window;
 use iced::{Alignment, Element, Length, Task};
 
@@ -360,24 +365,24 @@ pub enum Message {
     /// Shutdown signaled — leave the iced runtime for the product's exit path
     /// (`save_and_exit`), which `main` continues after `run()` returns.
     /// Triggered by the shutdown token: a self-update restart, SIGTERM/SIGINT, and the
-    /// end of a drain a window close or a macOS quit began.
+    /// end of a drain a quit began.
     Shutdown,
-    /// The graceful-drain window began (first signal / window-close / quit /
+    /// The graceful-drain window began (first signal / a close that could not hide / a quit /
     /// self-update). Draining disables input; iced::exit is deferred until
     /// the drain completes (the token fires).
     DrainStarted,
-    /// The dashboard window's close request: an exit request, handled by
-    /// `request_exit` — the graceful drain once boot has finished, the exit path directly
-    /// before it.
+    /// The dashboard window's close request — the system's own close, Alt+F4, a shortcut:
+    /// [`Dashboard::close_window`], which HIDES the window on macOS and Windows and runs the
+    /// exit path on Linux and wherever a hide is not the right answer.
     CloseRequested(window::Id),
     /// One of the platform's own ordinary quit asks — macOS's ⌘Q, the application menu's Quit
     /// item or the Dock's Quit — delivered by `quit_requests_subscription`, subscribed from the
-    /// first frame. Runs the same exit handling as a window close, the second-quit escape
-    /// included; the system's asks during a log-out, restart or shut-down are not delivered here
+    /// first frame. Runs the exit path (`request_exit`), the second-quit escape included; the
+    /// system's asks during a log-out, restart or shut-down are not delivered here
     /// (see `shutdown`).
     QuitRequested,
     /// A window event delivered to the dashboard: geometry (move/resize), which
-    /// is tracked for persist-on-close, and file drops, which attach to the
+    /// is tracked for persist-on-exit, and file drops, which attach to the
     /// chat composer while the Home page is showing.
     WindowEvent(window::Id, window::Event),
     /// The dashboard window was created, carrying the id of the new window.
@@ -390,15 +395,13 @@ pub enum Message {
     #[cfg(target_os = "windows")]
     WindowHandle(u64),
     /// A window action the rail asks for ([`WindowAction`]).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     WindowAction(WindowAction),
-    /// The tray icon was clicked: [`Dashboard::bring_window_up`]. A click before boot or
-    /// during a drain does nothing.
+    /// A gesture from outside the window — the tray icon's click, a second launch of the
+    /// product, a click on the macOS Dock icon ([`crate::window_requests`]): the window comes
+    /// up, or the product quits. A show during a drain does nothing.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    TrayClicked,
-    /// The tray menu's one item: the same exit a window close runs, the second-ask escape
-    /// included.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    TrayQuit,
+    WindowRequested(crate::window_requests::WindowRequest),
     /// Keyboard shortcut: Cmd+F — focus the primary search input on the current page.
     FocusSearch,
     /// Keyboard shortcut: Cmd+L — open the Logs page, which has no rail item.
@@ -721,7 +724,7 @@ pub(crate) fn is_dashboard_shortcut(
 /// changes the layout, never the window.
 #[derive(Clone, Copy)]
 enum StartupWidth {
-    /// Nothing to decide: a saved geometry opened at the size it was closed
+    /// Nothing to decide: a saved geometry opened at the size it was saved
     /// with, or the decision is already made.
     Settled,
     /// Owed, waiting for the window's own report of the size it opened at. The
@@ -743,7 +746,7 @@ pub struct Dashboard {
     page: Page,
     log_store: Option<LogStore>,
 
-    /// Tracked window geometry for persist-on-close.
+    /// Tracked window geometry: what the exit path persists.
     last_size: iced::Size,
     last_position: iced::Point,
     /// Where the one start-up width decision stands (see [`StartupWidth`]).
@@ -782,8 +785,8 @@ pub struct Dashboard {
     /// admin's "Personal" workspace; `Some("ws")` = a managed workspace;
     /// `None` = nothing selected.
     selected_workspace_name: Option<String>,
-    /// True when a genuine exit request — the window's close or a platform quit — arrived
-    /// while the update was in its finalizing window (daemon shut down; checkpoint + spawn +
+    /// True when a genuine exit request — a close that could not hide, or a platform quit —
+    /// arrived while the update was in its finalizing window (daemon shut down; checkpoint + spawn +
     /// exit pending). Only a real request sets this: the update's own shutdown step also fires
     /// `Message::Shutdown` via the subscription, which must not be mistaken for one. If the
     /// update fails, this flag makes the GUI run its own checkpoint + exit.
@@ -893,7 +896,7 @@ impl Dashboard {
     }
 
     fn finish_boot(&mut self, result: Result<LogStore, String>) -> Task<Message> {
-        match result {
+        let tasks = match result {
             Ok(log_store) => {
                 self.ready = true;
                 self.boot_error = None;
@@ -931,7 +934,15 @@ impl Dashboard {
                 self.boot_error = Some(e);
                 Task::none()
             }
+        };
+        // A boot that failed has nothing left to keep running hidden, and a launch the updater
+        // restarted hidden has no way back without a tray icon: either way the window comes up
+        // rather than staying unreachable.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if self::app_window::hidden() && (!self.ready || !crate::tray::available()) {
+            return tasks.chain(self::app_window::show());
         }
+        tasks
     }
 
     /// Returns the [`Workspace`] for the currently selected workspace, if any.
@@ -1024,33 +1035,38 @@ impl Dashboard {
         iced::window::latest().and_then(move |id| iced::window::resize(id, size))
     }
 
-    /// Bring the window up: restore it if it is minimized, then raise and focus it,
-    /// including while another application is in front.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn bring_window_up() -> Task<Message> {
-        #[cfg(target_os = "macos")]
+    /// The window's close — the platform's own close request (Alt+F4 on Windows, the system
+    /// menu, whatever a shortcut asks for) and the rail's one control: a hide where a hidden
+    /// window is still reachable, the exit path otherwise.
+    ///
+    /// A hide would be wrong while there is nothing to keep working (before the boot finished,
+    /// a boot that failed), while the product is already on its way out
+    /// ([`crate::shutdown::aborting`], or the drain and hand-off a self-update owns), and with
+    /// no tray icon — a hidden window would then leave no in-app way to quit the product. A
+    /// platform with no hidden window ([`self::app_window`]) never takes it.
+    fn close_window(&mut self) -> Task<Message> {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if self.ready
+            && crate::tray::available()
+            && !crate::shutdown::aborting()
+            && !(crate::self_update::update_in_progress()
+                && crate::self_update::update_is_finalizing())
         {
-            bring_window_forward();
-            Task::none()
+            return self::app_window::hide();
         }
-        // A minimized window ignores a focus request, so the restore is chained ahead of it.
-        #[cfg(target_os = "windows")]
-        {
-            iced::window::latest()
-                .and_then(|id| window::minimize(id, false).chain(window::gain_focus(id)))
-        }
+        self.request_exit(None)
     }
 
     /// Act on a request for the product to exit: name the route that asked, then start the wait
     /// the request calls for.
     ///
-    /// The requests that reach it — the window's own close, the rail control's, an
+    /// The requests that reach it — a close that cannot hide ([`Self::close_window`]), an
     /// ordinary platform quit and the tray menu's Quit — are handled identically, because
     /// full parity is the point of the interception; so are the states with no drain to
     /// complete (a self-update finalizing, a boot that has not finished, a boot that
     /// failed). `route` is the platform's wording for the ask, one of the route constants
-    /// beside the routes that produce them, or `None` for the window's own close, whose
-    /// wording the exit line already falls back to.
+    /// beside the routes that produce them, or `None` for a close, whose wording the exit line
+    /// already falls back to.
     /// It is recorded where this request is what drives the exit (or, in the self-update window,
     /// may yet drive it once the update is seen to fail); a request that finds the exit already
     /// pending leaves the record to the one that caused it.
@@ -1095,7 +1111,7 @@ impl Dashboard {
         } else if crate::shutdown::is_draining() {
             // An exit request during a drain = second request: force-cancel (fires the token →
             // Message::Shutdown → exit path). The rule is the drain flag's, not the gesture's:
-            // a first ⌘Q after a window close's drain forces that drain too. A drain whose token
+            // a first ⌘Q after a close's drain forces that drain too. A drain whose token
             // has already fired is an exit under way, though — this request changes nothing about
             // it and must not take the record over.
             if !crate::shutdown::shutdown_token().is_cancelled() {
@@ -1116,8 +1132,8 @@ impl Dashboard {
     /// Leave the iced runtime for the product's exit path: flush the draft, record the window
     /// geometry, fire the shutdown token, then exit the runtime.
     ///
-    /// The ordinary exit for everything the interface handles — a window close, a platform
-    /// quit, SIGINT/SIGTERM, the clean end of a drain — and the entry to the teardown in
+    /// The ordinary exit for everything the interface handles — a quit, a close that could not
+    /// hide, SIGINT/SIGTERM, the clean end of a drain — and the entry to the teardown in
     /// `main` that the token's cancellation is checked against. It is not the only way this
     /// process ends: [`crate::shutdown`]'s module docs name the exits that never reach it.
     fn save_and_exit(&self) -> Task<Message> {
@@ -1595,22 +1611,38 @@ impl Dashboard {
                 remember,
                 generation,
             } => self.apply_boot_workspaces(workspaces, &restored_name, remember, generation),
-            Message::CloseRequested(_) => self.request_exit(None),
+            Message::CloseRequested(_) => self.close_window(),
+            // An exit a gesture outside the window asks for — the tray menu's one item — ends
+            // the process in every state, the way a platform quit does.
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            Message::TrayQuit => self.request_exit(Some(crate::shutdown::TRAY_QUIT_TRIGGER)),
+            Message::WindowRequested(crate::window_requests::WindowRequest::Quit) => {
+                self.request_exit(Some(crate::shutdown::TRAY_QUIT_TRIGGER))
+            }
+            // The same for the way back: a window a restart left hidden comes up before boot
+            // finishes too — the start-up view is all there is to show then. A product on its
+            // way out has no window to bring up, and the frame a second launch sends asks the
+            // same question before it gets here (see `db::ipc`).
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Message::WindowRequested(crate::window_requests::WindowRequest::Show) => {
+                if crate::shutdown::aborting() {
+                    Task::none()
+                } else {
+                    self::app_window::show()
+                }
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Message::WindowAction(action) => match action {
                 // The window follows the pointer for the rest of the gesture.
                 WindowAction::Drag => iced::window::latest().and_then(iced::window::drag),
-                WindowAction::Minimize => {
-                    iced::window::latest().and_then(|id| iced::window::minimize(id, true))
-                }
-                WindowAction::Close => self.request_exit(None),
+                // The rail's one control is the window's close: on these platforms that is a
+                // hide (`close_window`).
+                WindowAction::Close => self.close_window(),
             },
             Message::QuitRequested => self.request_exit(Some(crate::shutdown::MACOS_QUIT_TRIGGER)),
             Message::Shutdown => self.save_and_exit(),
             Message::DrainStarted => {
                 // Restart toast: only when the update has finished and finalize
-                // is shutting the service down — a plain window close, quit or
+                // is shutting the service down — a plain quit, close or
                 // signal during an update still in flight (not yet finalizing)
                 // must not show a false "restarting" toast. `!self.draining` is
                 // defensive single-emission protection.
@@ -1708,14 +1740,6 @@ impl Dashboard {
             _ if !self.ready => Task::none(),
 
             // ── Post-ready handlers (no per-arm guards needed) ──
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            Message::TrayClicked => {
-                if crate::shutdown::is_draining() {
-                    Task::none()
-                } else {
-                    Self::bring_window_up()
-                }
-            }
             Message::WorkspacePick(name) => self.select_workspace(&name),
             Message::ToastExpired(id) => {
                 // Dismissing an already-expired/unknown id is a safe no-op.
@@ -1966,7 +1990,7 @@ impl Dashboard {
                 if let Err(err) = result {
                     let toast = self.push_toast_msg(&ToastMessage::Error(err));
                     if self.exit_requested_during_update {
-                        // A window close or a platform quit arrived while the
+                        // A close or a platform quit arrived while the
                         // update owned the exit; it failed, so run the normal
                         // exit checkpoint.
                         self.exit_requested_during_update = false;
@@ -2926,9 +2950,9 @@ impl Dashboard {
     pub fn subscription(&self) -> iced::Subscription<Message> {
         // Window events are subscribed from the start, before boot completes —
         // a close request included: it must reach the dashboard in every state
-        // (see `request_exit`). Resized also carries the start-up width decision
+        // (see `close_window`). Resized also carries the start-up width decision
         // (see `StartupWidth`), and both it and Moved keep last_size and
-        // last_position at the geometry the window really has, which a close
+        // last_position at the geometry the window really has, which the exit path
         // persists (iced does not replay missed window events).
         //
         // The platform's quit requests are subscribed from the start for the
@@ -2950,12 +2974,12 @@ impl Dashboard {
             }),
             window::close_requests().map(Message::CloseRequested),
             iced::Subscription::run(quit_requests_subscription),
-            // The tray's own gestures, subscribed from the start like the platform's quit
-            // asks: a tray quit before boot is done ends the process the way a close does,
-            // while a click falls to the not-ready no-op arm in `update`. A platform
-            // without a tray has no such gestures.
+            // The ways into the window from outside it, subscribed from the start like the
+            // platform's quit asks: both are handled in every state — the tray menu's quit
+            // ends the process the way a platform quit does, and the way back brings up even
+            // a window that is still booting. A platform without them has no such gestures.
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            iced::Subscription::run(tray_subscription),
+            iced::Subscription::run(window_requests_subscription),
         ]);
         if !self.ready {
             return always_on;
@@ -3050,7 +3074,7 @@ impl Dashboard {
 /// Subscription that emits [`Message::Shutdown`] when the global shutdown
 /// token fires (self-update restart, SIGTERM/SIGINT, the end of a drain), and
 /// [`Message::DrainStarted`] when the graceful-drain window begins (first
-/// signal / window-close / quit / self-update) — the token does NOT fire on the
+/// signal / a close that could not hide / a quit / self-update) — the token does NOT fire on the
 /// first signal, so the GUI needs a separate drain signal to disable input
 /// while the drain runs.
 fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
@@ -3072,7 +3096,7 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
 }
 
 /// Record `route` as the exit route, where the ask has wording of its own — a platform quit passes
-/// its label, a window close passes `None`, and this is the one home of the rule that `None` leaves
+/// its label, a close passes `None`, and this is the one home of the rule that `None` leaves
 /// the record alone. Nothing is shown for it (the exit path's line is dropped with the iced
 /// runtime — see `shutdown::EXIT_TRIGGER`), so it is set for accuracy, not for reporting.
 fn record_exit_route(route: Option<&'static str>) {
@@ -3103,62 +3127,29 @@ fn quit_requests_subscription() -> impl futures_util::Stream<Item = Message> {
     })
 }
 
-/// macOS: activates the application and brings its window to the front, out of the
-/// minimized state as well, in one step — iced's `gain_focus` cannot lift it, because the
-/// platform refuses to activate an application whose windows are all minimized and a
-/// window brought back while the application is still behind stays behind.
+/// Subscription that turns the ways into the window from outside it into their messages: a
+/// click on the tray icon or the Dock brings the window up, the tray menu's single item is an
+/// ordinary exit request ([`crate::window_requests`]).
 ///
-/// The dashboard's window is the only one this process can minimize — the status item's
-/// own window and AppKit's tooltip windows cannot be — which is what finds it.
-#[cfg(target_os = "macos")]
-fn bring_window_forward() {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSApplication;
-
-    // The dashboard's update runs on the main thread, which is where AppKit is used; a
-    // call from anywhere else is simply skipped.
-    let Some(marker) = MainThreadMarker::new() else {
-        return;
-    };
-    let app = NSApplication::sharedApplication(marker);
-    let window = app
-        .windows()
-        .iter()
-        .find(|window| window.isMiniaturizable());
-    // Deprecated in favour of `activate()`, which the platform grants only to an
-    // application it considers driven by the user right now — not to one whose windows are
-    // all minimized, which is exactly the state this lifts.
-    #[expect(deprecated)]
-    app.activateIgnoringOtherApps(true);
-    let Some(window) = window else {
-        return;
-    };
-    window.deminiaturize(None);
-    window.makeKeyAndOrderFront(None);
-}
-
-/// Subscription that turns the tray icon's gestures into their messages: a click on the
-/// icon brings the window up, and the menu's single item is an ordinary exit request.
-///
-/// The source is the process-lifetime channel [`crate::tray::install`] fills before the
-/// iced application runs. Neither gesture ever waits on the platform: the handlers only
+/// The source is the process-lifetime channel [`crate::window_requests::init`] fills before
+/// the iced application runs. Neither gesture ever waits on the platform: the handlers only
 /// enqueue, and the platform's own menu tracking is never held up by the interface.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn tray_subscription() -> impl futures_util::Stream<Item = Message> {
+fn window_requests_subscription() -> impl futures_util::Stream<Item = Message> {
     use futures_util::SinkExt;
     use iced::futures::channel::mpsc;
     iced::stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
-        let Some(mut actions) = crate::tray::take_actions() else {
+        let Some(mut requests) = crate::window_requests::take() else {
             return;
         };
-        while let Some(action) = actions.recv().await {
+        while let Some(request) = requests.recv().await {
             // Backpressure, not a dropped gesture: the next quit during a drain is what
             // forces the exit, so it must not be lost to a full channel.
-            let message = match action {
-                crate::tray::TrayAction::Clicked => Message::TrayClicked,
-                crate::tray::TrayAction::Quit => Message::TrayQuit,
-            };
-            if output.send(message).await.is_err() {
+            if output
+                .send(Message::WindowRequested(request))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -3421,8 +3412,9 @@ enum RailEntry {
     Nav,
     /// The navigation entry at the rail's bottom end.
     NavAtBottom,
-    /// A window control: full-bleed and half-height, so the pair stays a narrow
-    /// strip at the rail's top.
+    /// The window's own control: full-bleed and half-height, so it stays a narrow strip at
+    /// the rail's top.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     WindowControl,
     /// Any other rail item: the voice status, the running-agent indicators.
     Item,
@@ -3435,6 +3427,7 @@ impl RailEntry {
     fn content_padding(self) -> iced::Padding {
         let (top, bottom) = match self {
             Self::NavAtBottom => (theme::PAD_10, theme::PAD_14),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Self::WindowControl => (theme::PAD_6, theme::PAD_6),
             Self::Nav | Self::Item => (theme::PAD_10, theme::PAD_10),
         };
@@ -3445,12 +3438,11 @@ impl RailEntry {
         }
     }
 
-    /// The rail's [`theme::PAD_4`] inset around every entry that is not
-    /// full-bleed.
+    /// The rail's [`theme::PAD_4`] inset around every entry that is not full-bleed.
     fn button_inset(self) -> iced::Padding {
         let inset = match self {
             Self::Item => theme::PAD_4,
-            Self::Nav | Self::NavAtBottom | Self::WindowControl => 0.0,
+            _ => 0.0,
         };
         iced::Padding {
             left: inset,
@@ -3468,47 +3460,52 @@ enum NavColumn {
     Bottom,
 }
 
-/// A window action the app performs for itself, the platform's title bar having
-/// been removed: the controls the rail carries in its place and the drag its
-/// empty space starts ([`Dashboard::sidebar_view`]).
+/// A window action the app performs for itself, the platform's title bar having been removed
+/// on macOS and Windows: the one control the rail carries in its place and the drag its empty
+/// space starts ([`Dashboard::sidebar_view`]).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WindowAction {
     /// The window follows the pointer: a press that is not claimed by a rail
     /// button starts this.
     Drag,
-    /// Minimize the window.
-    Minimize,
-    /// Close the window — the exit request the platform's own close makes
-    /// ([`Message::CloseRequested`]).
+    /// Close the window — the platform's own close, which on these platforms hides it
+    /// ([`Dashboard::close_window`]).
     Close,
 }
 
 impl Dashboard {
-    /// The rail: the window controls, the top nav icons, the voice status while the
-    /// footer is hidden, the stretch in between ([`Self::render_sidebar_mid`]) and
-    /// the bottom nav icons.
+    /// The rail: the window's own chrome on a frameless platform, the top nav icons, the
+    /// voice status while the footer is hidden, the stretch in between
+    /// ([`Self::render_sidebar_mid`]) and the bottom nav icons — all of it draggable there,
+    /// where the platform's title bar is gone.
     fn sidebar_view(&self, footer_hidden: bool) -> Element<'_, Message> {
-        let mut col = Column::new()
-            .spacing(theme::SPACE_2)
-            .push(Self::render_window_controls())
-            .push(self.render_sidebar_nav());
+        let mut col = Column::new().spacing(theme::SPACE_2);
+        // The window's own chrome, where the platform's frame is gone.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            col = col.push(Self::render_window_control());
+        }
+        col = col.push(self.render_sidebar_nav());
         if footer_hidden {
             col = col.push(Self::render_sidebar_voice());
         }
+        let rail = container(
+            col.push(Self::render_sidebar_mid(footer_hidden))
+                .push(self.render_sidebar_bottom_nav()),
+        )
+        .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
+        .height(Length::Fill)
+        .style(theme::surface_container_style);
         // The rail drags the window: the mouse area passes a press to the entry under
         // it first, so buttons keep their clicks, and holds no state, so a drag whose
         // release the platform keeps leaves nothing stuck.
-        mouse_area(
-            container(
-                col.push(Self::render_sidebar_mid(footer_hidden))
-                    .push(self.render_sidebar_bottom_nav()),
-            )
-            .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
-            .height(Length::Fill)
-            .style(theme::surface_container_style),
-        )
-        .on_press(Message::WindowAction(WindowAction::Drag))
-        .into()
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        return mouse_area(rail)
+            .on_press(Message::WindowAction(WindowAction::Drag))
+            .into();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        rail.into()
     }
 
     /// The rail's stretch between the nav icons and the bottom nav. With the
@@ -3597,37 +3594,32 @@ impl Dashboard {
     }
 
     /// A view that has no rail — the start-up splash, a failed boot — with the
-    /// window's own chrome above it: the rail's controls at the top, the whole
+    /// window's own chrome above it: the rail's control at the top, the whole
     /// surface draggable.
     fn window_chrome(view: Element<'_, Message>) -> Element<'_, Message> {
-        mouse_area(column![Self::render_window_controls(), view])
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        return view;
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        mouse_area(column![Self::render_window_control(), view])
             .on_press(Message::WindowAction(WindowAction::Drag))
             .into()
     }
 
-    /// The rail's window controls: one row at the rail's top, built like the
-    /// entries below it.
-    fn render_window_controls() -> Element<'static, Message> {
+    /// The rail's one window control, at the rail's top and built like the entries below it:
+    /// the close glyph, which hides the window ([`Self::close_window`]). Minimizing is the
+    /// platform's own — the taskbar's menu on Windows — and the tray brings a minimized window
+    /// back like a hidden one.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn render_window_control() -> Element<'static, Message> {
         let glyph = |icon: iced::widget::Text<'static, iced::Theme, iced::Renderer>| {
             icon.size(theme::TEXT_14).color(theme::TEXT_SECONDARY)
         };
-        container(
-            row![
-                Self::sidebar_rail_item(
-                    glyph(lucide::minus()).into(),
-                    "minimize window",
-                    Some(Message::WindowAction(WindowAction::Minimize)),
-                    RailEntry::WindowControl,
-                ),
-                Self::sidebar_rail_item(
-                    glyph(lucide::x()).into(),
-                    "close window",
-                    Some(Message::WindowAction(WindowAction::Close)),
-                    RailEntry::WindowControl,
-                ),
-            ]
-            .spacing(theme::SPACE_2),
-        )
+        container(Self::sidebar_rail_item(
+            glyph(lucide::x()).into(),
+            "close window",
+            Some(Message::WindowAction(WindowAction::Close)),
+            RailEntry::WindowControl,
+        ))
         .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
         .padding([theme::PAD_8, theme::PAD_2])
         .into()

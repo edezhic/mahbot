@@ -3689,7 +3689,12 @@ where
                 // draw() evaluates the blink state (computed from wall-clock
                 // time in draw_cursor). Adding `request_redraw()` here would
                 // cancel this At schedule and re-arm a per-frame redraw loop.
-                shell.request_redraw_at(window::RedrawRequest::At(next));
+                // A hidden window draws nothing (see `gui::app_window`), so the blink
+                // is not armed for one: the first frame it draws after coming
+                // back re-arms it.
+                if !super::app_window::hidden() {
+                    shell.request_redraw_at(window::RedrawRequest::At(next));
+                }
                 // Clear stale composition state when this widget is no longer
                 // the active surface (focus moved away, a find bar / modal
                 // opened over the code editor). Otherwise `is_composing`

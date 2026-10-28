@@ -3168,8 +3168,9 @@ fn is_cooperative_stop(classification: &str) -> bool {
 /// Stable failure classification for the agent-failure log.
 ///
 /// Order matters: the global shutdown token fires on any stop request — SIGTERM/SIGINT, the
-/// dashboard's window close or a macOS quit, a Windows console or session-end request, a
-/// self-update — and when a graceful drain completes; the per-agent token on a deliberate stop —
+/// dashboard's quit (macOS's own or the tray menu's), a close that could not hide, a Windows
+/// console or session-end request, a self-update — and when a graceful drain completes;
+/// the per-agent token on a deliberate stop —
 /// check the global token first so shutdown isn't mislabeled as an internal cancel. The global
 /// token also cancels every per-agent token via
 /// [`crate::agent::registry::AgentRegistry::shutdown_all`]. `error` is the raw

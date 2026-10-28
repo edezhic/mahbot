@@ -1,19 +1,21 @@
 //! The tray icon: the product's own icon in the platform's status area — the macOS
 //! menu bar and the Windows notification area — with a click that brings the window
-//! up and a native one-item menu whose item quits.
+//! up and a native one-item menu whose item quits. It is the way back to a window a
+//! close hid, and the product's only in-app quit (see [`crate::window_requests`]).
 //!
 //! Linux has no tray, and nothing here is compiled there. Nothing about the tray runs
-//! periodically: each platform hands a gesture to [`install`]'s handlers when one arrives,
-//! and they only enqueue it — the dashboard decides what it means (see `gui::Dashboard`).
+//! periodically: each platform hands a gesture to the handlers [`install`] sets when one
+//! arrives, and they only enqueue it — the dashboard decides what it means (see
+//! `gui::Dashboard`).
 //!
 //! A tray that cannot be created is not fatal: it is reported the way other boot
-//! problems are, and the daemon runs without it.
-use std::sync::Mutex;
-use tokio::sync::mpsc::UnboundedReceiver;
+//! problems are, and the daemon runs without it. A window then never hides, because a
+//! hidden window with no tray to bring it back would leave no way to quit (see `gui`).
+use std::sync::atomic::{AtomicBool, Ordering};
 use tray_icon::TrayIconBuilder;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 
-use crate::util::UnwrapPoison;
+use crate::window_requests;
 
 /// The menu's single item: the id its event is matched against, and its wording.
 const QUIT_ITEM: &str = "quit";
@@ -26,45 +28,32 @@ const TOOLTIP: &str = "mahbot";
 /// icon on Windows, never a hang.
 const REMOVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// A gesture on the tray, for the dashboard to act on.
-pub(crate) enum TrayAction {
-    /// The icon itself was clicked: bring the window up.
-    Clicked,
-    /// The menu's quit item: an ordinary exit request.
-    Quit,
-}
+/// Whether the icon exists, which is whether the product has a way back to a hidden window.
+/// Set by the platform that built it, and false for one that reported a failure.
+static AVAILABLE: AtomicBool = AtomicBool::new(false);
 
-/// The gestures the dashboard's subscription reads. Filled by [`install`] before the
-/// iced application runs, so the subscription always has a source.
-static ACTIONS: Mutex<Option<UnboundedReceiver<TrayAction>>> = Mutex::new(None);
+/// Whether the tray icon is there: a window may only be hidden while it is (see `gui`).
+pub(crate) fn available() -> bool {
+    AVAILABLE.load(Ordering::Relaxed)
+}
 
 /// Install the icon, once per process, before the iced application runs.
 ///
-/// The channel comes first, so a gesture that arrives before anything is subscribed
-/// waits instead of being lost. The menu is the same on both platforms; each one supplies
-/// its own click, because each hears about it in its own way.
+/// The menu is the same on both platforms; each one supplies its own click, because each
+/// hears about it in its own way. The gestures go to [`crate::window_requests`], whose
+/// channel [`crate::window_requests::init`] fills before this runs — a gesture that arrives
+/// before the dashboard subscribes waits there instead of being lost.
 pub fn install() {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    *ACTIONS.lock().unwrap_poison() = Some(receiver);
-
-    let items = sender.clone();
-    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+    MenuEvent::set_event_handler(Some(|event: MenuEvent| {
         if event.id.as_ref() == QUIT_ITEM {
-            let _ = items.send(TrayAction::Quit);
+            window_requests::quit();
         }
     }));
 
     #[cfg(target_os = "macos")]
-    macos::install(sender);
+    macos::install();
     #[cfg(target_os = "windows")]
-    windows::install(sender);
-}
-
-/// Take the gestures channel, for the dashboard's subscription. `None` before [`install`]
-/// ran, or once it has been taken: iced spawns a `Subscription::run` recipe identified by
-/// its function pointer once per process.
-pub(crate) fn take_actions() -> Option<UnboundedReceiver<TrayAction>> {
-    ACTIONS.lock().unwrap_poison().take()
+    windows::install();
 }
 
 // Each platform's own `remove` is documented there: the re-export is what the two ends of
@@ -96,7 +85,8 @@ fn report(reason: &str) {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{REMOVAL_WAIT, TrayAction, builder, report};
+    use super::{AVAILABLE, REMOVAL_WAIT, builder, report};
+    use crate::window_requests;
     use block2::RcBlock;
     use dispatch2::DispatchQueue;
     use objc2::MainThreadMarker;
@@ -105,7 +95,7 @@ mod macos {
     use objc2_app_kit::{NSEvent, NSEventMask, NSStatusItem};
     use std::cell::RefCell;
     use std::ptr::NonNull;
-    use tokio::sync::mpsc::UnboundedSender;
+    use std::sync::atomic::Ordering;
     use tray_icon::TrayIcon;
 
     /// What the main thread keeps for as long as the icon is in the menu bar.
@@ -128,14 +118,17 @@ mod macos {
     /// call behind them are that thread's work. [`install`](super::install) runs before
     /// iced's loop starts, so the creation is queued onto the main thread — the run loop
     /// drains that queue once it runs.
-    pub(super) fn install(actions: UnboundedSender<TrayAction>) {
-        DispatchQueue::main().exec_async(move || match create(&actions) {
-            Ok(installed) => ICON.with(|icon| *icon.borrow_mut() = Some(installed)),
+    pub(super) fn install() {
+        DispatchQueue::main().exec_async(|| match create() {
+            Ok(installed) => {
+                AVAILABLE.store(true, Ordering::Relaxed);
+                ICON.with(|icon| *icon.borrow_mut() = Some(installed));
+            }
             Err(reason) => report(&reason),
         });
     }
 
-    fn create(actions: &UnboundedSender<TrayAction>) -> Result<Installed, String> {
+    fn create() -> Result<Installed, String> {
         let icon = crate::app_icon::tray_icon_image().ok_or("its image could not be built")?;
         let tray = builder()?
             .with_icon_templated(icon)
@@ -159,11 +152,10 @@ mod macos {
         // view, which opens the menu — so the press is read from the event stream instead,
         // before it is dispatched to a view.
         let watched = item.clone();
-        let clicked = actions.clone();
         let handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
             // SAFETY: the monitor hands over a live event for the duration of the call.
             if on_icon(&watched, unsafe { event.as_ref() }) {
-                let _ = clicked.send(TrayAction::Clicked);
+                window_requests::show();
             }
             // Handed back untouched: the icon's own handling still needs it.
             event.as_ptr()
@@ -225,11 +217,12 @@ mod macos {
 
 #[cfg(target_os = "windows")]
 mod windows {
-    use super::{REMOVAL_WAIT, TrayAction, builder, report};
+    use super::{AVAILABLE, REMOVAL_WAIT, builder, report};
     use crate::util::UnwrapPoison;
+    use crate::window_requests;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc::Receiver;
-    use tokio::sync::mpsc::UnboundedSender;
     use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -254,8 +247,8 @@ mod windows {
     /// needs a message loop on it, so the tray gets a thread of its own. Nothing of ours
     /// runs on that loop beyond the dispatch below, and a menu that is open never blocks
     /// the iced event loop.
-    pub(super) fn install(actions: UnboundedSender<TrayAction>) {
-        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+    pub(super) fn install() {
+        TrayIconEvent::set_event_handler(Some(|event: TrayIconEvent| {
             // The release, not the press: that is the gesture one click reports once, and
             // the press of a secondary click belongs to the menu.
             if let TrayIconEvent::Click {
@@ -264,7 +257,7 @@ mod windows {
                 ..
             } = event
             {
-                let _ = actions.send(TrayAction::Clicked);
+                window_requests::show();
             }
         }));
 
@@ -321,6 +314,9 @@ mod windows {
             }
         };
         if registered {
+            // The icon is in the notification area and will be pumped from here: this is
+            // the way back to a hidden window that `gui` checks for before it hides one.
+            AVAILABLE.store(true, Ordering::Relaxed);
             pump();
         }
         drop(tray);

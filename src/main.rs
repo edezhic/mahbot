@@ -659,13 +659,13 @@ fn init_message_pipeline(
 }
 
 async fn shutdown_after_dashboard() {
-    // The stop trace: names the last stop request the platform recorded, and keeps "the
-    // window closed" wording when nothing was recorded. This line is dropped outright and
-    // reaches no one — `shutdown::EXIT_TRIGGER` documents why, and what that leaves of a
-    // stop's reason.
+    // The stop trace: names the last stop request the platform recorded, and keeps the
+    // "window close" wording when nothing was recorded — a stop that named no route (a Unix
+    // signal, a close that could not hide). This line is dropped outright and reaches no one
+    // — `shutdown::EXIT_TRIGGER` documents why, and what that leaves of a stop's reason.
     info!(
         "{} — shutting down",
-        mahbot::shutdown::exit_trigger().unwrap_or("Dashboard window closed")
+        mahbot::shutdown::exit_trigger().unwrap_or("window close")
     );
     // No shutdown() here — the token is already cancelled whenever this function
     // runs: the ordinary exit path (`save_and_exit`) fires it before leaving the
@@ -896,18 +896,32 @@ fn main() -> Result<()> {
     })?;
 
     // Acquire the instance lock before Iced runtime starts.
-    // Stored in a global so the update flow can release/re-acquire it. The
-    // refusal is also filed in the durable failure record under the root resolved
-    // above: this is a pre-boot step, so the process-global root is not set
-    // yet. Its text is passed through unchanged — the shell tool's stale-binary
-    // detection matches on it. On a product launch on Windows that the platform gave
-    // no console and no standard streams (the double-click case) the text reaches
-    // nowhere and the launch is silent: no window, no text, exit code 1 — the filed
-    // block is what a second launch leaves behind, and the runner's own-image step
-    // reads that same text off the pipe it wired.
-    mahbot::self_update::acquire_lock(&storage_root).map_err(|e| {
-        mahbot::boot::record_launch_failure(&storage_root, "self_update::acquire_lock", e)
-    })?;
+    // Stored in a global so the update flow can release/re-acquire it.
+    //
+    // A second launch of the product while one is running takes the other way out: the
+    // running copy's window comes up — it is the only way back to one a close hid — and this
+    // process exits 0. That only counts where the copy can be reached: an instance still
+    // booting has not bound its endpoint yet, and an update hand-off is not a second launch at
+    // all (it exists to take the location over). Everywhere else the launch is refused, and the
+    // refusal is filed in the durable failure record under the root resolved above (this is a
+    // pre-boot step, so the process-global root is not set yet), with its text passed through
+    // unchanged — the shell tool recognises a stale self-update binary by it
+    // (`self_update::second_instance_refusal`). A refusal leaves a Windows launch the platform
+    // gave no console and no standard streams (the double-click case) silent: no window, no
+    // text, exit code 1 — the filed block is what such a launch leaves behind, and the runner's
+    // own-image step reads that same text off the pipe it wired.
+    if let Err(refusal) = mahbot::self_update::acquire_lock(&storage_root) {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if !mahbot::self_update::is_handoff() && mahbot::db::ipc::request_window_show(&storage_root)
+        {
+            return Ok(());
+        }
+        return Err(mahbot::boot::record_launch_failure(
+            &storage_root,
+            "self_update::acquire_lock",
+            refusal,
+        ));
+    }
 
     // Read persisted window state (sync, before Iced runtime starts).
     let window_state = mahbot::gui::read_window_state();
@@ -939,16 +953,29 @@ fn main() -> Result<()> {
     // The icon on the surfaces the window itself does not carry.
     mahbot::app_icon::install_desktop_integration();
 
+    // The ways into the window from outside it — the tray icon, a second launch, the Dock —
+    // and the product's only in-app quit. The channel first, so a gesture that arrives
+    // before the dashboard subscribes waits for it.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    mahbot::window_requests::init();
+
     // The tray icon, where the platform has one: the click that brings the window up and
     // the menu that quits. macOS creates the status item on its main thread once iced's
     // own loop is running; Windows on a thread of its own. Never fatal (see `tray`).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     mahbot::tray::install();
 
-    // The geometry the window opens at, and the dashboard's own copy of it: a
-    // close persists the last size the window reported, and a fresh window's
+    // A restart the updater made for a hidden window comes back hidden: the window is
+    // created invisible and nothing draws until the tray brings it up. An ordinary cold start
+    // always shows it.
+    let start_hidden = cfg!(any(target_os = "macos", target_os = "windows"))
+        && mahbot::self_update::starts_hidden();
+    mahbot::gui::app_window::set_hidden(start_hidden);
+
+    // The geometry the window opens at, and the dashboard's own copy of it: the exit path
+    // persists the last size and position the window reported, and a fresh window's
     // start-up width is settled by the board's first read (see `StartupWidth`).
-    let window_settings = dashboard_window_settings(&window_state);
+    let window_settings = dashboard_window_settings(&window_state, start_hidden);
     let run = iced::application(
         move || {
             (
@@ -997,20 +1024,28 @@ fn main() -> Result<()> {
 
 /// The dashboard window's own settings: the geometry it opens with
 /// ([`mahbot::gui::WindowState::opening_size`], a saved one or the narrower
-/// default a fresh window starts with), and the icon and announced name the
-/// platform's identity surfaces need.
-fn dashboard_window_settings(state: &mahbot::gui::WindowState) -> iced::window::Settings {
+/// default a fresh window starts with), whether it opens hidden, and the icon and announced
+/// name the platform's identity surfaces need.
+fn dashboard_window_settings(
+    state: &mahbot::gui::WindowState,
+    start_hidden: bool,
+) -> iced::window::Settings {
     iced::window::Settings {
         size: state.opening_size(),
         position: state.position(),
+        // A restart the updater made for a hidden window comes back hidden (see
+        // `self_update::starts_hidden`): the window is created without ever being shown, so
+        // nothing is drawn for it until the tray brings it up.
+        visible: !start_hidden,
         min_size: Some(iced::Size::new(
             mahbot::gui::MIN_WINDOW_WIDTH,
             mahbot::gui::MIN_WINDOW_HEIGHT,
         )),
-        // No system title bar or frame: the top of the window is the app's own, and
-        // the rail carries the window controls and the drag (`gui::WindowAction`).
-        // Corner rounding is then the platform's — square where it draws square.
-        decorations: false,
+        // No system title bar or frame on macOS and Windows: the top of the window is the
+        // app's own, and the rail carries the one window control and the drag
+        // (`gui::WindowAction`). Corner rounding is then the platform's — square where it
+        // draws square. Every other platform keeps the frame `gui::app_window` describes.
+        decorations: cfg!(not(any(target_os = "macos", target_os = "windows"))),
         // The window's own icon where the platform has one (the window's icon on X11,
         // and on Windows the small one, the big one attached separately); macOS and
         // Wayland carry no window icon and ignore it.

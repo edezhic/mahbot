@@ -141,6 +141,25 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// hand-off wait once before the ordinary refusal.
 const HANDOFF_ENV: &str = "MAHBOT_UPDATE_HANDOFF";
 
+/// Environment marker the updating parent sets on the replacement instance it spawns — `"1"`
+/// when the window it replaces was hidden, `"0"` otherwise — so that instance opens its window
+/// the way the old one was left, instead of a window popping up over whatever the owner is
+/// doing (see `gui::app_window`). Written on every spawn rather than only for a hidden window:
+/// the parent may itself have come back hidden, and what it inherited must never decide.
+///
+/// Every launch the updater makes carries it, and a `mahbot` launched from the replacement
+/// instance's own shell inherits it — where it can decide nothing: that launch never gets past
+/// the instance lock (see `main`), while a cold start from the shell or Finder has no marker at
+/// all.
+const START_HIDDEN_ENV: &str = "MAHBOT_START_HIDDEN";
+
+/// Whether this launch is the updater's replacement of a window that was hidden (see
+/// [`START_HIDDEN_ENV`]): the one launch whose window opens hidden.
+#[must_use]
+pub fn starts_hidden() -> bool {
+    std::env::var(START_HIDDEN_ENV).is_ok_and(|value| value == "1")
+}
+
 /// How long a hand-off-marked instance waits for the previous instance to
 /// release the location before refusing ([`acquire_lock`]).
 const HANDOFF_LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -182,7 +201,7 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
 
     let file = match try_acquire_lock(&lock_path)? {
         Some(file) => file,
-        None if std::env::var(HANDOFF_ENV).is_ok_and(|v| v == "1") => {
+        None if is_handoff() => {
             crate::boot::boot_diagnostic(format!(
                 "update hand-off: the instance lock is still held — waiting up to {}s for the \
                  previous instance to release it",
@@ -219,6 +238,13 @@ fn wait_for_handoff(lock_path: &Path) -> Result<File> {
         }
     }
     Err(second_instance_refusal(lock_path))
+}
+
+/// Whether this launch is the updater's replacement of a previous instance ([`HANDOFF_ENV`]),
+/// which takes the location over rather than being a second launch of the product.
+#[must_use]
+pub fn is_handoff() -> bool {
+    std::env::var(HANDOFF_ENV).is_ok_and(|value| value == "1")
 }
 
 /// The error a launch gets when another instance holds the location.
@@ -1610,7 +1636,7 @@ async fn record_update_unfinished(admin_target: Option<&str>, step: UnfinishedSt
 /// Set while [`execute_update`] runs its finalizing window (drain through
 /// `exit(0)`). During this window the update path owns the process:
 /// the GUI exit path waits ([`update_is_finalizing`]) instead of exiting, so a
-/// window close, a platform quit or SIGINT cannot abort the update's checkpoint
+/// platform quit, a close or SIGINT cannot abort the update's checkpoint
 /// on the iced runtime and leave the instance down without a replacement.
 static UPDATE_FINALIZING: AtomicBool = AtomicBool::new(false);
 
@@ -2098,13 +2124,14 @@ async fn finalize_source_tree_update(
 /// replacement instance runs from. The ordering is load-bearing and MUST NOT be
 /// rearranged:
 ///
-/// 1. Graceful drain (the FULL drain, same as window close — NOT fast-cancel).
-///    In-flight agents complete their current round; the drain-watch task fires
-///    the global token when no in-flight agents or orchestrator calls remain
-///    (or force-cancels at the 10-min cap). The GUI stays open with input
-///    disabled; the GUI exit path waits ([`update_is_finalizing`]) instead of
-///    exiting, so this sequence cannot be aborted by a window close, a platform
-///    quit or SIGINT racing the checkpoint. No failure transitions with 'service
+/// 1. Graceful drain (the FULL drain, same as the tray's quit or ⌘Q — NOT
+///    fast-cancel). In-flight agents complete their current round; the
+///    drain-watch task fires the global token when no in-flight agents or
+///    orchestrator calls remain (or force-cancels at the 10-min cap). The GUI
+///    stays up with input disabled; the GUI exit path waits
+///    ([`update_is_finalizing`]) instead of exiting, so this sequence cannot be
+///    aborted by an exit request — a close, a platform quit or SIGINT — racing
+///    the checkpoint. No failure transitions with 'service
 ///    shutting down' comments fire — agents that cannot finish stay
 ///    status='launched' and boot-resume. The drain semantics are unchanged; then
 ///    `crate::tools::chrome_release::flush_ended_run_chrome_releases` releases
@@ -2186,9 +2213,9 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
     // 6. Spawn the new instance from the determined spawn path, marked as the
     //    update hand-off.
     if let Err(e) = spawn_new_instance_from(spawn_path) {
-        // Spawn failed — the process stays alive (unless a window close or a
-        // platform quit arrived during the finalizing window, in which case the
-        // GUI honors it with its own checkpoint + exit via UpdateResult).
+        // Spawn failed — the process stays alive (unless an exit request — a
+        // close, a platform quit — arrived during the finalizing window, in which
+        // case the GUI honors it with its own checkpoint + exit via UpdateResult).
         // Clear the finalizing flag and re-acquire the lock.
         UPDATE_FINALIZING.store(false, Ordering::SeqCst);
         // Re-acquire the lock since the process stays alive.
@@ -2538,7 +2565,8 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// [`finalize_update_and_restart`]).
 ///
 /// The child is marked as the update hand-off ([`HANDOFF_ENV`] — see
-/// [`acquire_lock`]).
+/// [`acquire_lock`]), and as the replacement of a hidden window when the one it
+/// replaces was hidden ([`START_HIDDEN_ENV`]).
 ///
 /// The replacement inherits the daemon's launch mode — `paused` when the old
 /// process was started paused, nothing otherwise — and never the old process's own
@@ -2596,6 +2624,17 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     cmd.args(&args);
     // The update hand-off mark — see `acquire_lock`.
     cmd.env(HANDOFF_ENV, "1");
+    // The window comes back as it was left: hidden when it was hidden. Written on every
+    // spawn, never left to inheritance — the parent may itself have come back hidden from an
+    // earlier restart, and the marker must describe THIS window (see `START_HIDDEN_ENV`).
+    cmd.env(
+        START_HIDDEN_ENV,
+        if crate::gui::app_window::hidden() {
+            "1"
+        } else {
+            "0"
+        },
+    );
 
     let update_log = OpenOptions::new()
         .create(true)

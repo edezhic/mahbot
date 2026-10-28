@@ -273,12 +273,14 @@ impl LogsState {
     pub fn subscription(&self) -> Subscription<LogMessage> {
         // Live log stream only while the All Logs view is active. Frame ticks are subscribed only while the fade animation is running —
         // an always-on frames() subscription closes a self-sustaining redraw
-        // loop (redraw → AnimTick → redraw).
+        // loop (redraw → AnimTick → redraw). A hidden window draws nothing, so
+        // the fade waits for the window to come back rather than ticking for a
+        // frame nobody sees.
         let mut subs: Vec<Subscription<LogMessage>> = Vec::new();
         if self.active_view == LogsView::AllLogs {
             subs.push(iced::Subscription::run(log_stream_producer));
         }
-        if self.fade_anim.is_animating() {
+        if self.fade_anim.is_animating() && !super::app_window::hidden() {
             subs.push(window::frames().map(LogMessage::AnimTick));
         }
         Subscription::batch(subs)
