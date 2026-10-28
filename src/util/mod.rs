@@ -1,6 +1,7 @@
 //! Utility modules for shared helper functions.
 
 pub(crate) mod catalog_cache;
+pub(crate) mod desktop_entry;
 pub(crate) mod disk;
 #[cfg(target_os = "linux")]
 pub(crate) mod display_server;
@@ -18,6 +19,8 @@ pub(crate) mod media_target;
 pub(crate) mod model_state;
 pub(crate) mod owner_path;
 pub(crate) mod provenance;
+#[cfg(windows)]
+pub(crate) mod registry;
 #[cfg(test)]
 pub(crate) mod test;
 pub(crate) mod tree_sitter;

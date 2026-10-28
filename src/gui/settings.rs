@@ -14,10 +14,11 @@ use crate::Role;
 use crate::Workspace;
 use crate::channels::telegram_local::{self, Health, Mode};
 use crate::config::{
-    CONFIG, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_MANAGER_MODEL,
-    CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY, CONFIG_KEY_PROVIDER_KEY,
-    CONFIG_KEY_TELEGRAM_API_HASH, CONFIG_KEY_TELEGRAM_API_ID, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
-    CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL, ConfigData, ModelRouting,
+    CONFIG, CONFIG_KEY_AUTOUPDATE, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY,
+    CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
+    CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_API_HASH, CONFIG_KEY_TELEGRAM_API_ID,
+    CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL,
+    ConfigData, ModelRouting,
 };
 #[cfg(target_os = "macos")]
 use crate::config::{
@@ -382,6 +383,20 @@ pub enum SettingsMessage {
     },
     /// Toggle password visibility for a specific field.
     TogglePasswordVisibility(PasswordTarget),
+    // ── Application ─────────────────────────────────────────
+    /// The Autolaunch switch: apply the decision to the system's own
+    /// registration.
+    AutolaunchToggle(bool),
+    /// The system's answer to a read of its login registration, tagged with the
+    /// click count it was taken under (`None` when the read itself failed, which
+    /// is unknown rather than off).
+    AutolaunchRead {
+        epoch: u64,
+        state: Option<bool>,
+    },
+    /// One apply's result: the state the system reports afterwards (`None` when it
+    /// could not tell), or the failure.
+    AutolaunchApplied(Result<Option<bool>, String>),
     // ── Telegram Bot API mode messages ──────────────────────────
     /// Open the api_id/api_hash dialog, re-seeded from CONFIG.
     OpenTelegramCredentials,
@@ -533,7 +548,7 @@ const TEXT_INPUT_KEYS: &[&str] = &[
 /// generic ConfigField key — it is a dedicated
 /// [`SettingsMessage::TranscriptionToggle`] toggle with its own transactional
 /// persist path (macOS only, like the rest of the audio settings).
-const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER];
+const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_AUTOUPDATE];
 
 /// Field id of the custom chat-endpoint URL (the `config:`-prefixed form of
 /// [`CONFIG_KEY_PROVIDER_ENDPOINT`]).
@@ -547,6 +562,8 @@ const CONFIG_FIELD_WEB_SEARCH_PROVIDER: &str = "config:web_search_provider";
 const CONFIG_FIELD_IMAGE_GEN_MODELS: &str = "config:image_gen_models";
 /// Field id of the video-generation model picker list.
 const CONFIG_FIELD_VIDEO_MODELS: &str = "config:video_models";
+/// Field id of the Autoupdate switch.
+const CONFIG_FIELD_AUTOUPDATE: &str = "config:autoupdate";
 
 /// The two routable model slots (manager + worker), resolved to their
 /// trimmed/default model names. This is the set of models represented by
@@ -607,7 +624,8 @@ pub struct SettingsState {
     /// suffices — a keyed map here would be single-key dead state.
     endpoint_warning: Option<String>,
     /// Last error message rendered in the bottom banner — failed custom-endpoint
-    /// saves, plus voice/TTS toggle failures on macOS.
+    /// saves, failed Autolaunch registration changes, plus voice/TTS toggle
+    /// failures on macOS.
     error: Option<String>,
     /// Per-field presentation/undo state for stateless config fields rendered
     /// through the shared single-line editor. Keyed by the canonical field id
@@ -632,6 +650,21 @@ pub struct SettingsState {
     /// A failed endpoint save closes the section (the runtime stayed on
     /// OpenRouter), so the toggle never shows ON while nothing is configured.
     custom_revealed: bool,
+
+    // ── Application state ───────────────────────────────────────
+    /// What the system reports about starting the product at login — the
+    /// Autolaunch switch's shown state, not the config decision. `None` while it
+    /// is not known: before the first answer, from the start of every read, and
+    /// again after a failed apply.
+    autolaunch: Option<bool>,
+    /// Whether an apply is running. One at a time, and the switch is inert
+    /// meanwhile: a click made then is lost, which is intended — it keeps one
+    /// apply from overtaking another.
+    autolaunch_applying: bool,
+    /// Bumped by every Autolaunch click. A read carries the count it was taken
+    /// under, so an answer that was already on its way when the owner clicked is
+    /// discarded instead of painting the state the click replaced.
+    autolaunch_epoch: u64,
 
     // ── Telegram Bot API mode state ─────────────────────────────
     /// Whether the api_id/api_hash dialog is open.
@@ -760,6 +793,9 @@ impl SettingsState {
             error: None,
             password_visible: HashSet::new(),
             custom_revealed: false,
+            autolaunch: None,
+            autolaunch_applying: false,
+            autolaunch_epoch: 0,
             telegram_credentials_open: false,
             telegram_api_id_input: SingleLineEditorState::new(""),
             telegram_api_hash_input: SingleLineEditorState::new(""),
@@ -789,17 +825,42 @@ impl SettingsState {
         state
     }
 
-    /// Reload the editable snapshot from the current CONFIG.
+    /// Reload the editable snapshot from the current CONFIG and read what the
+    /// system reports about Autolaunch.
     ///
     /// Inline errors are cleared (the page is being shown fresh). Pending
     /// debounced settles are NOT invalidated — a value typed before
     /// navigating away must still be persisted when its settle fires.
-    pub fn refresh(&mut self) {
+    ///
+    /// Re-entered on every page entry, so the switch reports the system as it
+    /// is now — including a disable the owner made in the system's own
+    /// settings. The read runs off the update thread, so it is started rather
+    /// than awaited.
+    pub fn refresh(&mut self) -> Task<SettingsMessage> {
         self.config = CONFIG.snapshot();
         self.error = None;
         self.field_errors.clear();
         self.endpoint_warning = None;
         self.resync_field_editors();
+        // A copy built from sources never registers, so there is nothing to
+        // read and no subprocess to pay for. A running apply answers for
+        // itself, so a read now could only report a stale state.
+        if crate::self_update::is_published_copy() && !self.autolaunch_applying {
+            return self.read_system_autolaunch();
+        }
+        Task::none()
+    }
+
+    /// Start a read of the system's registration, tagged with the click count it
+    /// was taken under so a click made while it was in flight supersedes it. What
+    /// the system last said is not what it says now, so the state is unknown again
+    /// until the answer is in.
+    fn read_system_autolaunch(&mut self) -> Task<SettingsMessage> {
+        self.autolaunch = None;
+        let epoch = self.autolaunch_epoch;
+        Task::perform(read_autolaunch(), move |state| {
+            SettingsMessage::AutolaunchRead { epoch, state }
+        })
     }
 
     /// Re-sync the config text editors from the current config snapshot.
@@ -1177,6 +1238,7 @@ impl SettingsState {
                 | CONFIG_FIELD_IMAGE_GEN_MODELS
                 | CONFIG_FIELD_VIDEO_MODELS
                 | CONFIG_FIELD_PROVIDER_ENDPOINT
+                | CONFIG_FIELD_AUTOUPDATE
         )
     }
 
@@ -1282,6 +1344,15 @@ impl SettingsState {
                     Ok(outcome) => {
                         self.field_errors.remove(&field);
                         self.sync_persisted(&field, Some(&outcome.value));
+                        // Switching Autoupdate back on must restore today's
+                        // behaviour now, not up to ten minutes from now: wake
+                        // the availability loop for a tick. The stored spelling is
+                        // free, so it is read by the same rule as everywhere else.
+                        if field == CONFIG_FIELD_AUTOUPDATE
+                            && crate::config::flag_on(Some(outcome.value.as_str()))
+                        {
+                            crate::self_update::nudge_update_tick();
+                        }
                         // The endpoint arm's warning has a slot of its own, and it
                         // is the only arm that carries one: a post-write failure
                         // that leaves the save standing is logged by the persist
@@ -1392,6 +1463,50 @@ impl SettingsState {
                     self.password_visible.insert(target);
                 }
                 Task::none()
+            }
+
+            // ── Application ────────────────────────────────────
+            SettingsMessage::AutolaunchToggle(enabled) => {
+                // The switch is inert while an apply runs, so a click that still
+                // reaches here is lost — intended: applies cannot overtake each
+                // other.
+                if self.autolaunch_applying {
+                    return Task::none();
+                }
+                // Optimistic: the switch follows the click until the system
+                // answers, and this click supersedes any read already on its way.
+                self.autolaunch_epoch += 1;
+                self.autolaunch_applying = true;
+                self.autolaunch = Some(enabled);
+                Task::perform(
+                    save_and_apply_autolaunch(enabled),
+                    SettingsMessage::AutolaunchApplied,
+                )
+            }
+            SettingsMessage::AutolaunchRead { epoch, state } => {
+                // Only the answer to the newest read counts: one taken before the
+                // owner's last click would paint the state that click already
+                // replaced. A read that could not run leaves the state unknown,
+                // which is not "off".
+                if epoch == self.autolaunch_epoch {
+                    self.autolaunch = state;
+                }
+                Task::none()
+            }
+            SettingsMessage::AutolaunchApplied(result) => {
+                self.autolaunch_applying = false;
+                match result {
+                    Ok(state) => {
+                        self.autolaunch = state;
+                        Task::none()
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        // The failed write leaves the system's state unknown; read
+                        // it rather than asserting the state it may not have.
+                        self.read_system_autolaunch()
+                    }
+                }
             }
 
             // ── Telegram Bot API mode ──────────────────────────
@@ -1944,8 +2059,15 @@ impl SettingsState {
         // Custom roles area (right column, below the custom tools)
         let roles_section = self.custom_roles_section();
 
-        // Existing config sections (left column)
-        let config_sections = Column::new()
+        // Existing config sections (left column). The Application section leads
+        // when this copy offers either of its switches.
+        let mut config_sections = Column::new();
+        if let Some(application) = self.application_section() {
+            config_sections = config_sections
+                .push(application)
+                .push(Space::new().height(16));
+        }
+        let config_sections = config_sections
             .push(self.provider_section())
             .push(Space::new().height(16))
             .push(self.integrations_section())
@@ -3437,6 +3559,59 @@ impl SettingsState {
 
     // ── Section helpers ──────────────────────────────────────────
 
+    /// The Application section: what the product does for itself — start with the
+    /// login, and update by itself. Each row is offered only where it can do
+    /// something: only a published copy is the login target, and only a copy that
+    /// downloads its own releases has an update policy to switch. No row at all
+    /// means no section.
+    fn application_section(&self) -> Option<Element<'_, SettingsMessage>> {
+        let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
+        if crate::self_update::is_published_copy() {
+            // The switch reports the system and nothing else, so a state that is
+            // not known yet (or again, after a failed apply or read) says so
+            // instead of asserting "off".
+            let control: Element<'_, SettingsMessage> = match self.autolaunch {
+                Some(state) => {
+                    let switch = toggler(state).style(theme::toggler_style);
+                    // Inert while an apply runs: a click now would be lost.
+                    let switch = if self.autolaunch_applying {
+                        switch
+                    } else {
+                        switch.on_toggle(SettingsMessage::AutolaunchToggle)
+                    };
+                    switch.into()
+                }
+                None => text("Checking…")
+                    .size(theme::TEXT_13)
+                    .color(theme::TEXT_FAINT)
+                    .into(),
+            };
+            rows.push(field_row(
+                "Autolaunch",
+                control,
+                Some("Starts MahBot when you log in"),
+            ));
+        }
+        if crate::self_update::update_mode() == crate::self_update::UpdateMode::Downloaded {
+            let autoupdate = crate::config::flag_on(self.config.autoupdate.as_deref());
+            rows.push(field_row(
+                "Autoupdate",
+                toggler(autoupdate)
+                    .on_toggle(|on| SettingsMessage::ConfigField {
+                        key: CONFIG_KEY_AUTOUPDATE,
+                        value: if on { "true" } else { "false" }.to_string(),
+                    })
+                    .style(theme::toggler_style)
+                    .into(),
+                Some("Installs newer versions by itself"),
+            ));
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        Some(section("Application", Column::from_iter(rows)))
+    }
+
     fn provider_section(&self) -> Element<'_, SettingsMessage> {
         // The API key field is highlighted until a valid (trimmed non-empty)
         // key is present. Computed per-render from the editable snapshot, so
@@ -4109,8 +4284,7 @@ impl SettingsState {
 
     /// About block — version and how this copy of it was obtained, on one line.
     fn about_section() -> Element<'static, SettingsMessage> {
-        // Bind the classification once per render — `update_mode()` performs
-        // filesystem probes and must not run twice per frame.
+        // Bound once, so the classification is asked for one value per render.
         let mode = crate::self_update::update_mode();
         let origin = match mode {
             crate::self_update::UpdateMode::Downloaded => "Downloaded copy",
@@ -4447,6 +4621,29 @@ fn delete_confirm_button<'a>(
             .on_press(on_cancel),
     ]
     .into()
+}
+
+/// Read the system's registration off the update thread. `None` when the read
+/// itself failed — unknown, which is not the same as "off".
+async fn read_autolaunch() -> Option<bool> {
+    tokio::task::spawn_blocking(crate::autostart::registered)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Persist the owner's Autolaunch decision and apply it to the system's own
+/// registration in one go: the decision first, so a registration failure never
+/// loses the choice. Returns what the system reports afterwards.
+async fn save_and_apply_autolaunch(enabled: bool) -> Result<Option<bool>, String> {
+    let value = if enabled { "true" } else { "false" };
+    crate::config::persist_settled_string_field(crate::config::CONFIG_KEY_AUTOLAUNCH, value)
+        .await
+        .map_err(|e| format!("The Autolaunch setting could not be saved: {e}"))?;
+    tokio::task::spawn_blocking(move || crate::autostart::set_enabled(enabled))
+        .await
+        .map_err(|e| format!("The login registration could not be changed: {e}"))?
+        .map_err(|e| format!("The login registration could not be changed: {e:#}"))
 }
 
 /// Dispatch a settled field value to its per-field persistence function.
@@ -4937,6 +5134,58 @@ mod tests {
                 crate::audio::tts::test_set_state(2); // ModelState::Ready
             },
         );
+    }
+
+    // ── Application: the Autolaunch switch's shown state ─────────────
+    //
+    // The switch reports the system's answer and nothing else: it never asserts a
+    // state it does not know, and an answer to a read the owner has already
+    // clicked past is dropped instead of painting the state the click replaced.
+    // State transitions only — the spawned tasks are dropped, never awaited, so no
+    // store or launchctl is touched.
+
+    #[test]
+    fn the_autolaunch_switch_only_ever_shows_what_the_system_answered() {
+        let mut state = SettingsState::new();
+        assert_eq!(state.autolaunch, None, "nothing is known before the answer");
+
+        let _ = state.update(SettingsMessage::AutolaunchRead {
+            epoch: 0,
+            state: Some(true),
+        });
+        assert_eq!(state.autolaunch, Some(true));
+
+        // A click supersedes a read already on its way: that answer is the state
+        // the click replaced, so it must not paint over it. The switch is inert
+        // while the apply runs.
+        let _ = state.update(SettingsMessage::AutolaunchToggle(false));
+        assert_eq!(state.autolaunch, Some(false));
+        assert!(state.autolaunch_applying);
+        let _ = state.update(SettingsMessage::AutolaunchRead {
+            epoch: 0,
+            state: Some(true),
+        });
+        assert_eq!(
+            state.autolaunch,
+            Some(false),
+            "a superseded read is dropped"
+        );
+
+        let _ = state.update(SettingsMessage::AutolaunchApplied(Ok(Some(false))));
+        assert_eq!(state.autolaunch, Some(false));
+        assert!(!state.autolaunch_applying);
+
+        // A read that could not run is unknown, never "off".
+        let epoch = state.autolaunch_epoch;
+        let _ = state.update(SettingsMessage::AutolaunchRead { epoch, state: None });
+        assert_eq!(state.autolaunch, None);
+        assert!(state.error.is_none(), "a failed read is not an error");
+
+        // A failed apply is unknown too, not the state it was asked for.
+        let _ = state.update(SettingsMessage::AutolaunchToggle(true));
+        let _ = state.update(SettingsMessage::AutolaunchApplied(Err("denied".into())));
+        assert_eq!(state.autolaunch, None);
+        assert_eq!(state.error.as_deref(), Some("denied"));
     }
 
     // ── Per-field autosave: settle generations ──────────────────────

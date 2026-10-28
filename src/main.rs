@@ -130,6 +130,12 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
         .await
         .map_err(|e| mahbot::boot::record_startup_failure("config::reload_from_db", e))?;
 
+    // The login registration is kept true at every start: the installed copy owns
+    // the system's startup entry, so an install registers it, an update re-points
+    // it at the file that now runs, and the owner's decision is never overridden
+    // (see `mahbot::autostart`).
+    mahbot::autostart::reconcile();
+
     // The macOS local Qwen3-ASR recogniser is deliberately NOT loaded here: the
     // model loads on the first use of the voice stack (a voice message, or the
     // voice stack's own demand to listen) — see
@@ -769,9 +775,9 @@ fn main() -> Result<()> {
 
     // Every entry point that is a command line runs its own frontend and exits,
     // before the daemon's pre-boot steps: each has to work while an instance holds
-    // the lock taken below. What is left for the daemon is a bare launch and
-    // `paused`, a launch mode rather than a command line.
-    let start_paused = match entry {
+    // the lock taken below. What is left for the daemon is a bare launch, `paused`
+    // and `__login-start`, launch modes rather than command lines.
+    let (start_paused, login_start) = match entry {
         // Read-only SQL directly, with no GUI or instance setup. The surface that
         // must work WHILE an instance holds the lock, hence before lock
         // acquisition. No tracing init, no Iced.
@@ -858,9 +864,12 @@ fn main() -> Result<()> {
         // A startup mode, not a command line: the launch continues into the normal
         // GUI startup with the flag that pauses every managed workspace before
         // any background task starts (see `bootstrap_mahbot`).
-        EntryPoint::Paused => true,
+        EntryPoint::Paused => (true, false),
+        // A login start is an ordinary daemon launch: it differs only in the window
+        // rule and in the second-launch rule below, where it is not a second launch.
+        EntryPoint::LoginStart => (false, true),
         // A bare `mahbot`: the daemon.
-        EntryPoint::Daemon => false,
+        EntryPoint::Daemon => (false, false),
     };
 
     // The platform's own exemption from slowing this process down because its window is
@@ -912,6 +921,13 @@ fn main() -> Result<()> {
     // text, exit code 1 — the filed block is what such a launch leaves behind, and the runner's
     // own-image step reads that same text off the pipe it wired.
     if let Err(refusal) = mahbot::self_update::acquire_lock(&storage_root) {
+        // A login start is not a second launch: the system asked for the product
+        // and one is already up, so this exits quietly — no window raised, no
+        // failure filed, exit 0. A location that could not be taken for any other
+        // reason is a real failure of the launch and is filed like one.
+        if login_start && mahbot::self_update::is_instance_refusal(&refusal) {
+            return Ok(());
+        }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if !mahbot::self_update::is_handoff() && mahbot::db::ipc::request_window_show(&storage_root)
         {
@@ -967,11 +983,14 @@ fn main() -> Result<()> {
     mahbot::tray::install();
 
     // A restart the updater made for a hidden window comes back hidden: the window is
-    // created invisible and nothing draws until the tray brings it up. An ordinary cold start
-    // always shows it.
+    // created invisible and nothing draws until the tray brings it up. A login start is
+    // hidden the same way; Linux has no windowless mode and opens its window as a hand
+    // launch does. An ordinary cold start always shows it.
     let start_hidden = cfg!(any(target_os = "macos", target_os = "windows"))
-        && mahbot::self_update::starts_hidden();
+        && (mahbot::self_update::starts_hidden() || login_start);
     mahbot::gui::app_window::set_hidden(start_hidden);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    mahbot::gui::app_window::set_login_start(login_start);
 
     // The geometry the window opens at, and the dashboard's own copy of it: the exit path
     // persists the last size and position the window reported, and a fresh window's

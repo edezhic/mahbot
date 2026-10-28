@@ -420,31 +420,8 @@ fn launcher_entry_text(executable: &Path) -> String {
          Categories=Development;\n\
          StartupWMClass={LINUX_APP_ID}\n",
         description = env!("CARGO_PKG_DESCRIPTION"),
-        exec = exec_argument(executable),
+        exec = crate::util::desktop_entry::exec_argument(executable),
     )
-}
-
-/// A path as an `Exec` argument: quoted, with the characters the desktop entry
-/// specification reserves inside a quoted argument escaped and `%` doubled — it
-/// introduces a field code there, and a literal one is written `%%`. The running
-/// file can sit anywhere, spaces and percentages included.
-#[cfg(target_os = "linux")]
-fn exec_argument(executable: &Path) -> String {
-    let path = executable.to_string_lossy();
-    let mut argument = String::with_capacity(path.len() + 2);
-    argument.push('"');
-    for character in path.chars() {
-        match character {
-            '"' | '\\' | '$' | '`' => {
-                argument.push('\\');
-                argument.push(character);
-            }
-            '%' => argument.push_str("%%"),
-            _ => argument.push(character),
-        }
-    }
-    argument.push('"');
-    argument
 }
 
 /// A copy of the artwork for one of the icon theme's size directories, scaled and

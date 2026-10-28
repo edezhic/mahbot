@@ -1625,6 +1625,10 @@ fn family(word: &str) -> Option<Cli> {
     FAMILIES.iter().find(|family| family.word == word).map(Cli)
 }
 
+/// The word the login registration passes, so a start the system made at login can
+/// tell itself apart from a hand launch. Hidden like `__grep-engine`.
+pub(crate) const LOGIN_START_ARG: &str = "__login-start";
+
 /// One entry point a launch's first word can name: the binary's whole command
 /// table, the families beside the fixed words below. The ladder dispatches on this
 /// answer alone, so a word it serves and a word it knows are one fact, and a word
@@ -1635,6 +1639,10 @@ pub enum EntryPoint {
     /// `mahbot paused`: the daemon, with every managed workspace paused before
     /// the poll loop starts.
     Paused,
+    /// `mahbot __login-start`: the daemon, as the system's login registration
+    /// starts it. A launch mode, not a command line: the only difference is that
+    /// a login start is not a second launch and comes up with the tray only.
+    LoginStart,
     /// `-h`/`--help`.
     Help,
     /// `-V`/`--version`.
@@ -1665,6 +1673,7 @@ pub fn entry_point(word: Option<&str>) -> Option<EntryPoint> {
     Some(match word {
         None => EntryPoint::Daemon,
         Some("paused") => EntryPoint::Paused,
+        Some(LOGIN_START_ARG) => EntryPoint::LoginStart,
         Some("-h" | "--help") => EntryPoint::Help,
         Some("-V" | "--version") => EntryPoint::Version,
         Some("debug") => EntryPoint::Debug,
@@ -2836,6 +2845,10 @@ mod tests {
         assert!(matches!(
             entry_point(Some("__env-dump")),
             Some(EntryPoint::EnvDump)
+        ));
+        assert!(matches!(
+            entry_point(Some(LOGIN_START_ARG)),
+            Some(EntryPoint::LoginStart)
         ));
         assert!(matches!(
             entry_point(Some("bench-openrouter")),

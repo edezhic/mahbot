@@ -329,6 +329,15 @@ pub struct ConfigData {
     /// installs keep the `finished` value seeded by the retired catalog's
     /// one-time migration. A legacy `"welcomed"` value reads as `Finished`.
     pub onboarding_state: Option<String>,
+    /// Start at login: `"false"` when the owner turned the Settings switch off,
+    /// anything else (or no row) when it is on. The decision outlives installs and
+    /// updates; `crate::autostart` owns what the system's registration is.
+    pub autolaunch: Option<String>,
+    /// Update by itself: `"false"` when the owner turned the Settings switch off,
+    /// anything else (or no row) when it is on. It only gates the unattended
+    /// trigger — the release check, the changelog and the manual update are
+    /// unaffected.
+    pub autoupdate: Option<String>,
     /// Per-model provider routing.
     pub model_routings: Vec<ModelRouting>,
 }
@@ -624,6 +633,8 @@ string_config_fields! {
     tts_language [or(DEFAULT_TTS_LANGUAGE)],
     wake_word_templates [non_empty],
     onboarding_state [non_empty],
+    autolaunch [non_empty],
+    autoupdate [non_empty],
 }
 
 impl ConfigData {
@@ -687,6 +698,14 @@ pub(crate) fn parse_newline_list(s: &str) -> Vec<String> {
 #[must_use]
 fn non_empty(val: Option<String>) -> Option<String> {
     val.and_then(|s| trimmed_or_none(&s))
+}
+
+/// Whether a stored on/off switch reads as on: an absent row means on, and only a
+/// stored `false` reads off — trimmed and case-insensitive, so a row written by hand
+/// reads the way one written here does.
+#[must_use]
+pub(crate) fn flag_on(val: Option<&str>) -> bool {
+    !val.is_some_and(|val| val.trim().eq_ignore_ascii_case("false"))
 }
 
 /// Resolve a value with a fallback: use `val` if non-empty (after trimming), else `fallback`.

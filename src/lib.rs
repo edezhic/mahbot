@@ -166,6 +166,8 @@ pub mod config;
 pub mod disk_notice;
 // Asking the OS not to throttle a daemon whose window is never visible.
 pub mod power;
+// Start at login: the product's own registration with the operating system.
+pub mod autostart;
 // Downloading, verifying and swapping in a new version, under the instance
 // lock.
 pub mod self_update;

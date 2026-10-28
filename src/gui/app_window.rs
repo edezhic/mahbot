@@ -36,6 +36,25 @@ pub fn set_hidden(hidden: bool) {
     HIDDEN.store(hidden, Ordering::Relaxed);
 }
 
+/// Whether the system started this process at login (`crate::autostart`).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+static LOGIN_START: AtomicBool = AtomicBool::new(false);
+
+/// Record that the system started the process at login (`crate::autostart`). Such a launch is
+/// not a second launch and never brings the window up by itself — see [`login_start`].
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn set_login_start(login_start: bool) {
+    LOGIN_START.store(login_start, Ordering::Relaxed);
+}
+
+/// Whether this is a login start. It comes up as the tray icon only: the system asked for a
+/// quiet start, so neither a failed boot nor a missing tray may surface the window here — the
+/// tray, or a hand launch when there is none, is the way back.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn login_start() -> bool {
+    LOGIN_START.load(Ordering::Relaxed)
+}
+
 /// Hide the dashboard's window. Everything behind it keeps running, the window is hidden the
 /// way the platform hides one (its window state is kept, so nothing re-shows it), and the same
 /// window comes back as it was left — the same size, position, page and state — when [`show`]

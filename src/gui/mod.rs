@@ -90,6 +90,11 @@ const RUNTIME_REFRESH_COALESCE: Duration = Duration::from_millis(250);
 /// The left nav rail's fixed width, in px: the content area starts to its right.
 const SIDEBAR_RAIL_WIDTH: f32 = 56.0;
 
+/// The rail's icon size, in px — the nav icons, the voice status and the update
+/// entry — so an entry that came from the footer sits like its neighbours. The
+/// running-agent indicators are smaller.
+const RAIL_ICON_SIZE: f32 = 28.0;
+
 /// The bottom footer bar's fixed height, in px. The toast stack clears it (see
 /// [`Dashboard::view`]), and there is no bar to clear while
 /// [`Dashboard::footer_hidden`].
@@ -937,9 +942,16 @@ impl Dashboard {
         };
         // A boot that failed has nothing left to keep running hidden, and a launch the updater
         // restarted hidden has no way back without a tray icon: either way the window comes up
-        // rather than staying unreachable.
+        // rather than staying unreachable. A login start never does (see
+        // `app_window::login_start`).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self::app_window::hidden() && (!self.ready || !crate::tray::available()) {
+            if self::app_window::login_start() {
+                tracing::warn!(
+                    "the login start stays quiet with no way to reach it; a hand launch brings the window up"
+                );
+                return tasks;
+            }
             return tasks.chain(self::app_window::show());
         }
         tasks
@@ -974,8 +986,9 @@ impl Dashboard {
     /// the bar — and how it reports the failure — exactly where it is.
     ///
     /// With the bar hidden, what it carried moves into the rail: the voice
-    /// status under the nav icons and the running-agent indicators above the
-    /// bottom nav ([`Self::render_sidebar_mid`]).
+    /// status under the nav icons, the running-agent indicators above the bottom
+    /// nav ([`Self::render_sidebar_mid`]) and the update entry directly above
+    /// Settings ([`Self::render_sidebar_update`]).
     fn footer_hidden(&self) -> bool {
         self.workspaces_error.is_none()
             && self
@@ -1241,12 +1254,12 @@ impl Dashboard {
             // it starts a read rather than a render of stale entries.
             Page::Automations => self.automations_state.refresh().map(Message::Automations),
             Page::Settings => {
-                self.settings_state.refresh();
                 // Workspace list comes from the managed-workspace map; only the users
                 // list, the custom-tools area and the custom-roles list need a
                 // DB / folder read on navigation.
                 self.sync_settings_workspaces_from_map();
                 Task::batch([
+                    self.settings_state.refresh().map(Message::Settings),
                     self.refresh_settings_users(),
                     self.refresh_settings_custom_tools(),
                     self.refresh_settings_custom_roles(),
@@ -3184,13 +3197,15 @@ fn tts_download_subscription()
 
 /// Subscription that emits [`Message::RuntimeChanged`] (coalesced) when any
 /// runtime source the GUI renders directly changes: agent/non-agent registries,
-/// live transcript content, or voice status. The [`RuntimeEvent`] broadcast is
-/// initialized in `main` before the iced application runs (matching the
-/// [`LOG_BROADCAST`] convention); an uninitialized source would yield an
-/// immediately-ending stream, which iced's subscription tracker does not
-/// re-spawn. A burst of per-message / per-tool-call events collapses into a
-/// single trailing [`Message::RuntimeChanged`] per [`RUNTIME_REFRESH_COALESCE`]
-/// window — only "something changed" matters for a re-render.
+/// live transcript content, voice status, or the update availability that puts the
+/// footer's update entry — or the rail's, while the footer is hidden — on screen.
+/// The [`RuntimeEvent`] broadcast is initialized in `main` before the iced
+/// application runs (matching the [`LOG_BROADCAST`] convention); an uninitialized
+/// source would yield an immediately-ending stream, which iced's subscription
+/// tracker does not re-spawn. A burst of per-message / per-tool-call events
+/// collapses into a single trailing [`Message::RuntimeChanged`] per
+/// [`RUNTIME_REFRESH_COALESCE`] window — only "something changed" matters for a
+/// re-render.
 fn runtime_change_subscription() -> impl futures_util::Stream<Item = Message> {
     common::coalesced_broadcast_producer(
         128,
@@ -3474,6 +3489,24 @@ pub(crate) enum WindowAction {
     Close,
 }
 
+/// The update affordance both places draw: what it says, what pressing it does, and
+/// the color its glyph takes there.
+struct UpdateControl {
+    color: iced::Color,
+    tooltip: String,
+    on_press: Option<Message>,
+}
+
+impl UpdateControl {
+    /// The update glyph at `size`: each place draws it at its own.
+    fn glyph(&self, size: f32) -> Element<'static, Message> {
+        lucide::refresh_cw::<iced::Theme, iced::Renderer>()
+            .size(size)
+            .color(self.color)
+            .into()
+    }
+}
+
 impl Dashboard {
     /// The rail: the window's own chrome on a frameless platform, the top nav icons, the
     /// voice status while the footer is hidden, the stretch in between
@@ -3492,7 +3525,7 @@ impl Dashboard {
         }
         let rail = container(
             col.push(Self::render_sidebar_mid(footer_hidden))
-                .push(self.render_sidebar_bottom_nav()),
+                .push(self.render_sidebar_bottom_nav(footer_hidden)),
         )
         .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
         .height(Length::Fill)
@@ -3584,7 +3617,7 @@ impl Dashboard {
                 theme::TEXT_MUTED
             };
             col = col.push(Self::sidebar_rail_item(
-                page_icon(*page).size(28).color(color).into(),
+                page_icon(*page).size(RAIL_ICON_SIZE).color(color).into(),
                 page.label(),
                 Some(Message::Navigation(*page)),
                 entry,
@@ -3634,10 +3667,18 @@ impl Dashboard {
             .into()
     }
 
-    /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]).
-    fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
-        self.sidebar_nav_column(Page::sidebar_bottom_pages(), NavColumn::Bottom)
-            .into()
+    /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]), with the
+    /// self-update entry directly above them while the footer is hidden — the only
+    /// place the update is offered with no bar to carry it.
+    fn render_sidebar_bottom_nav(&self, footer_hidden: bool) -> Element<'_, Message> {
+        let mut col = Column::new().spacing(theme::SPACE_2);
+        if footer_hidden {
+            if let Some(entry) = Self::render_sidebar_update() {
+                col = col.push(entry);
+            }
+        }
+        col = col.push(self.sidebar_nav_column(Page::sidebar_bottom_pages(), NavColumn::Bottom));
+        col.into()
     }
 
     /// The rail's voice status, standing in for the footer bar's label while the
@@ -3657,7 +3698,7 @@ impl Dashboard {
         };
         Self::sidebar_rail_item(
             Self::voice_status_icon(&status)
-                .size(28)
+                .size(RAIL_ICON_SIZE)
                 .color(theme::TEXT_MUTED)
                 .into(),
             label,
@@ -3864,44 +3905,62 @@ impl Dashboard {
         )
     }
 
-    /// Render the self-update button in the footer bar.
-    /// Returns `None` when self-update is not available on this installation.
+    /// The update affordance: its tooltip and the press (none while an update is in
+    /// flight), shared by the footer button and the rail entry so the two can never
+    /// read as two different controls. `None` when no update is offered.
     ///
     /// Visibility is driven entirely by the shared availability cache — no
     /// platform gate is needed: a downloaded copy finds and puts this system's
     /// ready-made file at the standard location on every platform, and replacing a
     /// file that is in use there is the platform's own rename-aside, so a running
     /// copy is never in the way.
-    fn render_update_button() -> Option<Element<'static, Message>> {
+    fn update_control() -> Option<UpdateControl> {
         let availability = crate::self_update::update_availability();
-        // Show the button while an update is in flight even if `available` was
+        // Show the control while an update is in flight even if `available` was
         // transiently clobbered, so "Updating…" is never hidden mid-update.
         if !availability.available && !availability.in_progress {
             return None;
         }
-        let (update_color, tooltip_text, clickable) = if availability.in_progress {
-            (theme::TEXT_FAINT, "Updating…".to_string(), false)
+        let (color, tooltip, on_press) = if availability.in_progress {
+            (theme::TEXT_FAINT, "Updating…".to_string(), None)
         } else {
             let tooltip = match crate::self_update::update_latest() {
                 Some(v) => format!("Update MahBot to v{v}"),
                 None => "Update MahBot".to_string(),
             };
-            (theme::ACCENT, tooltip, true)
+            (theme::ACCENT, tooltip, Some(Message::UpdateBot))
         };
-        let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-            .size(theme::TEXT_24)
-            .color(update_color);
+        Some(UpdateControl {
+            color,
+            tooltip,
+            on_press,
+        })
+    }
+
+    /// Render the self-update button in the footer bar.
+    /// Returns `None` when self-update is not available on this installation.
+    fn render_update_button() -> Option<Element<'static, Message>> {
+        let control = Self::update_control()?;
         Some(widgets::icon_tooltip_button(
-            update_icon,
-            tooltip_text,
-            if clickable {
-                Some(Message::UpdateBot)
-            } else {
-                None
-            },
+            control.glyph(theme::TEXT_24),
+            control.tooltip,
+            control.on_press,
             theme::PAD_3,
             theme::button_text,
             tooltip::Position::Top,
+        ))
+    }
+
+    /// The same control in the rail, for a window whose footer is hidden — the only
+    /// place an update is offered then. It sits directly above the bottom nav, which
+    /// is where the Settings entry lives, and takes the rail's own glyph size.
+    fn render_sidebar_update() -> Option<Element<'static, Message>> {
+        let control = Self::update_control()?;
+        Some(Self::sidebar_rail_item(
+            control.glyph(RAIL_ICON_SIZE),
+            control.tooltip,
+            control.on_press,
+            RailEntry::Item,
         ))
     }
 

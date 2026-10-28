@@ -186,8 +186,9 @@ const BROKEN_PIPE_EXIT: i32 = 128 + 13;
 /// subcommand) running full main() and dying at instance-lock acquisition —
 /// its exit 1 is a legitimate grep no-match code, so the parent treats this
 /// message like the sentinel exit instead: unix re-runs the original command,
-/// Windows refuses the call. Mirrors `self_update::acquire_lock`'s error text.
-pub(super) const STALE_BINARY_LOCK_MSG: &str = "Another instance of mahbot is already running";
+/// Windows refuses the call. It is the refusal's own wording, from the one place
+/// that owns it.
+pub(super) const STALE_BINARY_LOCK_MSG: &str = crate::self_update::INSTANCE_REFUSAL_PREFIX;
 /// Engine stderr marker on a run that could not serve its member. The parent
 /// refuses a Windows call on this marker even when the sentinel exit status was
 /// masked by a pipeline tail (`grep … | tail -1` carries the tail's status),

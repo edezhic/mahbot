@@ -2309,6 +2309,7 @@ mod windows {
     };
 
     use super::{OwnerEnv, PATH_VISIBLE_MESSAGE, Written, planned_path_value, record_failure};
+    use crate::util::registry::{os_reason, utf16_text, wide};
 
     /// The per-user environment key `setx` writes and the system reads the
     /// owner's own environment from. The machine-wide environment is deliberately
@@ -2532,32 +2533,6 @@ mod windows {
                 std::ptr::null_mut(),
             );
         }
-    }
-
-    /// The text of a registry string value: UTF-16, little-endian, with the
-    /// terminating NUL the API stores dropped.
-    fn utf16_text(data: &[u8]) -> String {
-        let units: Vec<u16> = data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u16::from_le_bytes(*pair))
-            .collect();
-        String::from_utf16_lossy(&units)
-            .trim_end_matches('\0')
-            .to_string()
-    }
-
-    /// `text` as the NUL-terminated UTF-16 the registry API takes.
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    /// A failure's reason for the log: the module's own sentence with only the OS
-    /// error code appended, never a value read from the owner's environment.
-    #[must_use]
-    fn os_reason(what: &str, code: u32) -> String {
-        format!("{what} (os error {code})")
     }
 }
 

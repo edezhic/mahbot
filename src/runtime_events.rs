@@ -21,6 +21,9 @@ pub(crate) enum RuntimeEvent {
     /// The voice pipeline status value changed.
     #[cfg(target_os = "macos")]
     VoiceStatus,
+    /// The self-update availability cache changed: a release was found or is no
+    /// longer offered.
+    UpdateAvailability,
 }
 
 /// Process-wide broadcast of runtime-change events.

@@ -32,7 +32,9 @@
 //! prompt — no new surface, no confirmation, and no waiting for a quiet moment; a
 //! round the restart cuts is re-driven after the boot, like the round of any other
 //! update. Which copies update themselves, and for which release, is the whole of
-//! [`auto_update_target`].
+//! [`auto_update_target`]. A downloaded copy updates itself only while the owner's
+//! Autoupdate switch is on; with it off the release check still runs and the update
+//! is offered by the button instead.
 //!
 //! ## Where the new file comes from
 //!
@@ -247,17 +249,25 @@ pub fn is_handoff() -> bool {
     std::env::var(HANDOFF_ENV).is_ok_and(|value| value == "1")
 }
 
+/// The wording every instance refusal carries. It is a matched surface — the shell
+/// tool recognises a stale self-update binary by it
+/// (`shell::grep_engine::STALE_BINARY_LOCK_MSG`) — so it must not change.
+pub(crate) const INSTANCE_REFUSAL_PREFIX: &str = "Another instance of mahbot is already running";
+
 /// The error a launch gets when another instance holds the location.
-///
-/// The wording is a matched surface — the grep engine recognises a stale
-/// self-update binary by it (`shell::grep_engine::STALE_BINARY_LOCK_MSG`) — so
-/// it must not change.
 fn second_instance_refusal(lock_path: &Path) -> anyhow::Error {
     anyhow!(
-        "Another instance of mahbot is already running (lock file: {}). \
+        "{INSTANCE_REFUSAL_PREFIX} (lock file: {}). \
          The lock is a kernel flock released automatically when that instance exits.",
         lock_path.display()
     )
+}
+
+/// Whether `error` is [`acquire_lock`]'s "another instance is running" refusal, as
+/// opposed to a failure of the lock itself (an unreadable directory, an OS error).
+#[must_use]
+pub fn is_instance_refusal(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with(INSTANCE_REFUSAL_PREFIX)
 }
 
 /// Attempt to acquire an exclusive lock on the given file path.
@@ -822,9 +832,11 @@ fn is_registry_source_cache(manifest_dir: &Path) -> bool {
 /// opposed to a build from source. A checkout, a source-tarball extract and the
 /// package registry's source cache all keep a build source, and none of them was
 /// delivered by the release pipeline — even though the registry cache updates by
-/// downloading (see [`UpdateMode`]).
-fn is_published_copy() -> bool {
-    is_published_copy_at(Path::new(env!("CARGO_MANIFEST_DIR")))
+/// downloading (see [`UpdateMode`]). Bound once: the Settings page asks on every
+/// frame, and what the answer describes cannot change while the process runs.
+pub(crate) fn is_published_copy() -> bool {
+    static PUBLISHED: OnceLock<bool> = OnceLock::new();
+    *PUBLISHED.get_or_init(|| is_published_copy_at(Path::new(env!("CARGO_MANIFEST_DIR"))))
 }
 
 /// [`is_published_copy`] for a manifest-directory probe: the mode says the file
@@ -835,10 +847,12 @@ fn is_published_copy_at(manifest_dir: &Path) -> bool {
         && !is_registry_source_cache(manifest_dir)
 }
 
-/// Determine how the running binary was installed — see [`UpdateMode`].
+/// Determine how the running binary was installed — see [`UpdateMode`]. Bound
+/// once, for the same reason as [`is_published_copy`].
 #[must_use]
 pub(crate) fn update_mode() -> UpdateMode {
-    classify_update_mode(Path::new(env!("CARGO_MANIFEST_DIR")))
+    static MODE: OnceLock<UpdateMode> = OnceLock::new();
+    *MODE.get_or_init(|| classify_update_mode(Path::new(env!("CARGO_MANIFEST_DIR"))))
 }
 
 // ── Shared update availability cache ──────────────────────────────────────
@@ -1010,6 +1024,26 @@ pub(crate) fn set_update_cache_for_test(
 
 // ── Update availability refresh ──────────────────────────────────────────
 
+/// Write the release check's finding into the shared cache and tell the GUI when
+/// it changed — the update button must appear when the check finds a release,
+/// not at the next unrelated repaint.
+fn set_availability(latest: Option<semver::Version>) {
+    let cache = update_cache();
+    let available = latest.is_some();
+    let changed = {
+        let mut current = cache.latest.lock().unwrap_poison();
+        let changed = *current != latest;
+        if changed {
+            *current = latest;
+        }
+        changed
+    };
+    if changed {
+        cache.available.store(available, Ordering::SeqCst);
+        crate::runtime_events::publish(crate::runtime_events::RuntimeEvent::UpdateAvailability);
+    }
+}
+
 /// Refresh the shared update-availability cache once.
 ///
 /// A copy built from sources seeds `available = true` (idempotent, no network).
@@ -1039,14 +1073,8 @@ async fn refresh_update_cache() {
                 return;
             }
             match result {
-                Ok(Some(latest)) => {
-                    *cache.latest.lock().unwrap_poison() = Some(latest);
-                    cache.available.store(true, Ordering::SeqCst);
-                }
-                Ok(None) => {
-                    *cache.latest.lock().unwrap_poison() = None;
-                    cache.available.store(false, Ordering::SeqCst);
-                }
+                Ok(Some(latest)) => set_availability(Some(latest)),
+                Ok(None) => set_availability(None),
                 Err(_) => {
                     // Transient failure — preserve last-known availability.
                 }
@@ -1055,21 +1083,39 @@ async fn refresh_update_cache() {
     }
 }
 
+/// Wakes [`run_update_availability_refresh`] for a tick now. A nudge that arrives
+/// before the loop waits is kept until it does.
+static TICK_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Run an availability tick now instead of at the next interval: what re-enabling
+/// the Autoupdate switch does, so its promise holds without a restart.
+pub(crate) fn nudge_update_tick() {
+    TICK_NOW.notify_one();
+}
+
 /// Periodic refresh of the shared update-availability cache, and the unattended
 /// update of a downloaded copy.
 ///
 /// Spawned from the binary's background task set (cancellable via the global
 /// shutdown token). Ticks immediately so a fresh downloaded copy isn't hidden
-/// until the first 10-minute interval elapses, then every 10 minutes. Runs on
-/// all platforms/modes to keep the contract uniform — a copy built from sources
-/// is a no-op network-wise but keeps `available` seeded. Every tick is also what
-/// gives [`start_automatic_update_if_found`] the finding it decides on.
+/// until the first 10-minute interval elapses, then every 10 minutes — or at once
+/// when [`nudge_update_tick`] asks. Runs on all platforms/modes to keep the
+/// contract uniform — a copy built from sources is a no-op network-wise but keeps
+/// `available` seeded. Every tick is also what gives
+/// [`start_automatic_update_if_found`] the finding it decides on.
 pub async fn run_update_availability_refresh() {
     loop {
         refresh_update_cache().await;
         start_automatic_update_if_found().await;
-        if !crate::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)).await {
-            return;
+        tokio::select! {
+            // The owner switched Autoupdate back on: today's behaviour returns
+            // now, not up to ten minutes from now.
+            () = TICK_NOW.notified() => {}
+            alive = crate::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)) => {
+                if !alive {
+                    return;
+                }
+            }
         }
     }
 }
@@ -1112,6 +1158,11 @@ fn auto_update_target(
     (failed.is_none_or(|failed| latest > failed)).then(|| latest.clone())
 }
 
+/// The owner's Autoupdate switch (see `crate::config`): absence of the row means on.
+fn autoupdate_enabled() -> bool {
+    crate::config::flag_on(crate::config::CONFIG.autoupdate().as_deref())
+}
+
 /// The unattended trigger: run the release check's finding by itself.
 ///
 /// Called after every availability refresh. The update it starts is the ordinary
@@ -1119,6 +1170,12 @@ fn auto_update_target(
 /// checkpoint, restart and recovery of interrupted work — nobody pressed
 /// anything, and nothing else about it differs.
 async fn start_automatic_update_if_found() {
+    // The owner's Autoupdate switch: off means nothing installs itself. The
+    // check keeps running, so the button still reports the release, and an
+    // update already in flight is never cancelled here.
+    if !autoupdate_enabled() {
+        return;
+    }
     // An update in flight owns the flag, and the refresh skipped its check with
     // it — so the cached finding is the one that started it, not a new one.
     if update_in_progress() {
