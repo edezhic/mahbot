@@ -296,13 +296,15 @@ run_in "$sources/libvpx" make install
 
 # ── opus: Opus ──────────────────────────────────────────────────────
 
-# Opus implements ARM run-time detection for MSVC and for Linux/Android/BSD, and CMake
-# compiles its NEON entry points only together with that detection (presuming NEON
-# alone does not compile), so the ARM64 Windows leg builds the portable C: the codec is
-# the same, and only its fast paths' throughput is what this leg does without.
+# Opus compiles its NEON intrinsics sources whenever the compiler has `arm_neon.h`, yet the
+# declarations and dispatch table they call come only with run-time detection — and Opus
+# implements that detection for Windows under MSVC alone (`armcpu.c`'s `_MSC_VER` branch).
+# Under this environment's clang enabling it is a hard `#error`, and turning only
+# `OPUS_MAY_HAVE_NEON` off still compiles those sources, so the ARM64 Windows leg turns the
+# intrinsics off: the same codec, minus the intrinsics' fast paths.
 set -- -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF
 case "$platform-$arch" in
-windows-aarch64) set -- "$@" -DOPUS_MAY_HAVE_NEON=OFF ;;
+windows-aarch64) set -- "$@" -DOPUS_DISABLE_INTRINSICS=ON ;;
 esac
 cmark "$sources/opus" "$sources/opus/build" "$@"
 
