@@ -455,10 +455,11 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::bun::run_bun_management(),
     );
 
-    // The product's own ffmpeg and ffprobe (`mahbot::ffmpeg`). Its version is a
-    // compile-time constant, so nothing is looked up: a missing copy, and one that
-    // does not report the pinned version, are both installed. A failure is recorded,
-    // retried on the next start, and never removes a copy that already works.
+    // The product's own ffmpeg and ffprobe (`mahbot::ffmpeg`). Nothing about the
+    // build is compiled in: the newest build the product's own release stream offers
+    // is looked up and installed, and a build published later is picked up on a
+    // following start. A failure is recorded, retried on the next start, and never
+    // removes a copy that already works.
     spawn_cancellable(&mut tasks, &shutdown_token, "ffmpeg-install", async {
         mahbot::ffmpeg::install_on_start().await;
     });

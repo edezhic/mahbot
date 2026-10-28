@@ -26,41 +26,13 @@ const TAG_PREFIX: &str = "tgapi-v";
 /// never read or written here.
 const RELEASES_URL_ENV: &str = "MAHBOT_TGAPI_RELEASES_URL";
 
-/// How long the release listing may take: the archive download itself runs on the
-/// client's own bound, which is sized for a tens-of-megabytes build.
-const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// The total bound of one release download, matching the shared download client's
-/// existing policy for tens-of-megabytes artifacts.
-const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
-
-/// The client every request of this module runs on: the shared large-download
-/// client, whose long total bound and deliberate 30 s connect timeout are the
-/// policy an artifact of this size needs. The GitHub API is the one endpoint that
-/// requires a user agent, so the listing sets it on its own request.
-fn client() -> Result<&'static reqwest::Client, String> {
-    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            crate::util::http::build_download_client(DOWNLOAD_TIMEOUT)
-                .map_err(|e| format!("the release client could not be built: {e}"))
-        })
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-/// The `User-Agent` every GitHub API request needs: it answers `403` without one.
-const GITHUB_USER_AGENT: &str = concat!("mahbot/", env!("CARGO_PKG_VERSION"));
-
-/// The GitHub `owner/repo` release listing: the product's own repository, the same
-/// one [`crate::self_update::RELEASE_REPO`] names, so the server stream can never
-/// drift onto another host. The page query is added by [`latest`].
+/// The GitHub release listing of the product's own repository — the same one the
+/// ffmpeg stream uses. The page query is added by [`latest`].
 fn releases_url() -> String {
-    let repo = crate::self_update::RELEASE_REPO
-        .trim_start_matches("https://github.com/")
-        .trim_end_matches('/');
-    format!("https://api.github.com/repos/{repo}/releases")
+    format!(
+        "https://api.github.com/repos/{}/releases",
+        crate::util::managed_bin::release_repo()
+    )
 }
 
 /// The executable's file name on this platform.
@@ -113,13 +85,6 @@ fn asset_platform() -> Result<(&'static str, &'static str), String> {
     Ok((os, arch))
 }
 
-/// How many releases one listing page holds, and how many pages are read before a
-/// missing stream is reported: the server stream shares the listing with the
-/// product's own releases, so the newest server build is not on the first page
-/// once a page worth of newer releases exists.
-const LISTING_PAGE_SIZE: usize = 100;
-const LISTING_PAGES: u32 = 10;
-
 /// The newest release on offer for this host.
 ///
 /// Pages are read until one carries a server build. The listing is ordered by
@@ -127,49 +92,22 @@ const LISTING_PAGES: u32 = 10;
 pub(super) async fn latest() -> Result<Release, String> {
     let (os, arch) = asset_platform()?;
     let base = std::env::var(RELEASES_URL_ENV).unwrap_or_else(|_| releases_url());
-    for page in 1..=LISTING_PAGES {
-        let separator = if base.contains('?') { '&' } else { '?' };
-        let listing = fetch_listing(format!(
-            "{base}{separator}per_page={LISTING_PAGE_SIZE}&page={page}"
-        ))
-        .await?;
+    for page in 1..=crate::util::managed_bin::LISTING_PAGES {
+        // A body that is not a listing offers this stream nothing, exactly as an empty
+        // page does.
+        let listing =
+            crate::util::managed_bin::release_page(&base, page, "the newest server release")
+                .await?
+                .unwrap_or_default();
         if let Some(release) = newest_for(&listing, os, arch) {
             return Ok(release);
         }
         // A short page is the end of the listing: no further page can hold one.
-        if listing.as_array().map_or(0, Vec::len) < LISTING_PAGE_SIZE {
+        if listing.len() < crate::util::managed_bin::LISTING_PAGE_SIZE {
             break;
         }
     }
     Err(format!("no server release is published for {os}-{arch}"))
-}
-
-/// One page of the release listing.
-async fn fetch_listing(url: String) -> Result<serde_json::Value, String> {
-    let response = client()?
-        .get(&url)
-        .header(reqwest::header::USER_AGENT, GITHUB_USER_AGENT)
-        .timeout(LIST_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "the newest server release could not be looked up: {}",
-                crate::util::managed_bin::request_reason(&e)
-            )
-        })?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "the newest server release could not be looked up: HTTP {}",
-            response.status()
-        ));
-    }
-    response.json().await.map_err(|e| {
-        format!(
-            "the release listing could not be read: {}",
-            crate::util::managed_bin::request_reason(&e)
-        )
-    })
 }
 
 /// The Bot API version a `tgapi-v*` tag names (`tgapi-v10.3`), read with the
@@ -180,10 +118,9 @@ fn parse_version(text: &str) -> Option<Version> {
 
 /// The newest `tgapi-v*` release in `listing` that carries this host's archive,
 /// as the number the artifact reports.
-fn newest_for(listing: &serde_json::Value, os: &str, arch: &str) -> Option<Release> {
+fn newest_for(listing: &[serde_json::Value], os: &str, arch: &str) -> Option<Release> {
     let extension = if os == "windows" { "zip" } else { "tar.gz" };
     listing
-        .as_array()?
         .iter()
         .filter_map(|release| {
             let tag = release["tag_name"].as_str()?;
@@ -217,37 +154,13 @@ pub(super) async fn install(release: Release) -> Result<Version, String> {
 
     let dest = binary_path().ok_or_else(|| "the install directory is unavailable".to_string())?;
     let file = file_name();
-    let client = client()?;
+    let client = crate::util::managed_bin::download_client()?;
     let hash = match &release.sums_url {
         Some(url) => {
-            let body = client
-                .get(url)
-                .send()
-                .await
-                .map_err(|e| {
-                    format!(
-                        "the checksum list could not be fetched: {}",
-                        crate::util::managed_bin::request_reason(&e)
-                    )
-                })?
-                .text()
-                .await
-                .map_err(|e| {
-                    format!(
-                        "the checksum list could not be read: {}",
-                        crate::util::managed_bin::request_reason(&e)
-                    )
-                })?;
-            let asset = release
-                .archive_url
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            body.lines()
-                .filter_map(crate::util::managed_bin::parse_sha256_sidecar)
-                .find(|(_, name)| name == &asset)
-                .map(|(hash, _)| hash)
+            let body =
+                crate::util::managed_bin::fetch_sha256_sums(url, "the checksum list").await?;
+            let asset = release.archive_url.rsplit('/').next().unwrap_or_default();
+            crate::util::managed_bin::sha256_for(&body, asset)
                 .ok_or_else(|| "the release publishes no checksum for this artifact".to_string())?
         }
         None => return Err("the release publishes no checksum list".to_string()),
@@ -304,7 +217,7 @@ pub(super) async fn install(release: Release) -> Result<Version, String> {
 mod tests {
     use super::*;
 
-    fn listing() -> serde_json::Value {
+    fn listing() -> Vec<serde_json::Value> {
         serde_json::json!([
             {
                 "tag_name": "tgapi-v10.1",
@@ -338,6 +251,9 @@ mod tests {
                 ]
             }
         ])
+        .as_array()
+        .expect("the listing is an array")
+        .clone()
     }
 
     #[test]
@@ -354,6 +270,6 @@ mod tests {
     #[test]
     fn a_platform_without_an_artifact_is_not_served_by_another_one() {
         assert!(newest_for(&listing(), "macos", "aarch64").is_none());
-        assert!(newest_for(&serde_json::json!({}), "linux", "x86_64").is_none());
+        assert!(newest_for(&[], "linux", "x86_64").is_none());
     }
 }

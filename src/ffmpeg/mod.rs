@@ -444,6 +444,39 @@ fn audio_args(input: &Path, into: Option<&Path>) -> Vec<OsString> {
     args
 }
 
+/// Points the ffmpeg release hook ([`install::RELEASES_URL_ENV`]) at `base` for as
+/// long as it lives, and puts the previous value back — on a panic too, so no later
+/// check in this process inherits it. Holds no lock of its own: the caller keeps the
+/// crate's environment lock ([`crate::util::test::env_lock`]) for the check's duration
+/// and this guard is dropped before it — a second guard of that kind here would
+/// deadlock on it.
+#[cfg(test)]
+pub(crate) struct ReleasesHook(Option<std::ffi::OsString>);
+
+#[cfg(test)]
+impl ReleasesHook {
+    pub(crate) fn at(base: &str) -> Self {
+        let previous = std::env::var_os(install::RELEASES_URL_ENV);
+        // SAFETY: the caller holds the environment lock, and this guard is dropped
+        // before it.
+        unsafe { std::env::set_var(install::RELEASES_URL_ENV, base) };
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReleasesHook {
+    fn drop(&mut self) {
+        // SAFETY: the environment lock outlives this guard.
+        unsafe {
+            match self.0.take() {
+                Some(previous) => std::env::set_var(install::RELEASES_URL_ENV, previous),
+                None => std::env::remove_var(install::RELEASES_URL_ENV),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -500,11 +533,13 @@ mod tests {
         );
         let home = tempfile::tempdir().expect("temp home");
         let _home = crate::util::test::set_env_var("HOME", home.path().to_str());
-        let _hook = ReleasesHook::unreachable();
+        let _hook = ReleasesHook::at("http://127.0.0.1:1");
         let bin = home
             .path()
             .join(".mahbot/ffmpeg")
-            .join(install::TAG)
+            // Any parsable tag: a copy in place is what the operations use, and the
+            // name only says which build it is.
+            .join("ffmpeg-v7.1-mahbot.2")
             .join("bin");
         std::fs::create_dir_all(&bin).expect("install directory");
         for tool in ["ffmpeg", "ffprobe"] {
@@ -676,34 +711,6 @@ mod tests {
             "{unavailable:?}"
         );
         assert!(good.exists());
-    }
-
-    /// Points the releases hook at a base that cannot answer, for as long as it lives,
-    /// and puts the previous value back — on a panic too, so no later test in this
-    /// process inherits it. The `HOME` guard is what holds the environment lock; a
-    /// second guard of that kind would deadlock on it.
-    struct ReleasesHook(Option<std::ffi::OsString>);
-
-    impl ReleasesHook {
-        fn unreachable() -> Self {
-            let previous = std::env::var_os(install::RELEASES_URL_ENV);
-            // SAFETY: the caller holds the environment lock, and this guard is
-            // dropped before it.
-            unsafe { std::env::set_var(install::RELEASES_URL_ENV, "http://127.0.0.1:1") };
-            Self(previous)
-        }
-    }
-
-    impl Drop for ReleasesHook {
-        fn drop(&mut self) {
-            // SAFETY: the environment lock outlives this guard.
-            unsafe {
-                match self.0.take() {
-                    Some(previous) => std::env::set_var(install::RELEASES_URL_ENV, previous),
-                    None => std::env::remove_var(install::RELEASES_URL_ENV),
-                }
-            }
-        }
     }
 
     /// Run a real `ffmpeg` into `output`.

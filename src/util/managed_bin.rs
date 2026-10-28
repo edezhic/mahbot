@@ -18,7 +18,10 @@
 //! The helpers are release-format agnostic: the chrome-use installer reads a
 //! `<asset>.sha256` sidecar and a tar.gz archive, the bun installer reads a
 //! combined `SHASUMS256.txt` file and a zip archive — both share the same
-//! tag/version/swap/extract primitives.
+//! tag/version/swap/extract primitives. The two streams that publish prereleases
+//! (`crate::ffmpeg` and the Bot API server) are read through the stream's own
+//! listing instead of `releases/latest`, on the one client [`download_client`] owns
+//! ([`release_page`] is one page of it).
 //!
 //! [`install_on_start`] is the shared start-time policy: a missing (or
 //! non-executable) copy is installed at once, while a copy in place is left
@@ -67,6 +70,120 @@ pub(crate) async fn fetch_latest_tag(repo: &str, timeout: Duration) -> Result<St
         return Err("release redirect resolved to an empty tag".to_string());
     }
     Ok(tag)
+}
+
+/// The `owner/repo` a managed tool's release stream lives in: the product's own
+/// repository, named once by [`crate::self_update::RELEASE_REPO`], so no installer
+/// can drift onto another host.
+pub(crate) fn release_repo() -> &'static str {
+    crate::self_update::RELEASE_REPO
+        .trim_start_matches("https://github.com/")
+        .trim_end_matches('/')
+}
+
+/// The `User-Agent` every GitHub API request needs: it answers `403` without one.
+const GITHUB_USER_AGENT: &str = concat!("mahbot/", env!("CARGO_PKG_VERSION"));
+
+/// How many releases one page of a listing holds. The streams the product manages
+/// share the repository's listing with the product's own releases and each other's,
+/// so this is what a caller counts a page's entries against to know it is the last.
+pub(crate) const LISTING_PAGE_SIZE: usize = 100;
+
+/// How many pages are read before a stream is reported missing: the streams share one
+/// listing, so a stream's newest build is not on the first page once a page worth of
+/// newer releases exists.
+pub(crate) const LISTING_PAGES: u32 = 10;
+
+/// How long a release's own small files may take — a page of the listing, a checksum
+/// list — as opposed to the artifact itself, which runs on the download client's bound.
+pub(crate) const METADATA_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The total bound of one artifact download: a managed binary is tens of megabytes.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(20);
+
+/// The client every managed-binary request runs on: the shared download client, whose
+/// total bound and connect timeout are the policy an artifact of this size needs. One
+/// client per process — it owns the connection pool.
+pub(crate) fn download_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            crate::util::http::build_download_client(DOWNLOAD_TIMEOUT)
+                .map_err(|e| format!("the release client could not be built: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// One page of a GitHub release listing — the only place a prerelease is named, which
+/// is why a stream made of prereleases is read here instead of through
+/// `releases/latest`. `url` is the repository's `releases` endpoint or a stand-in
+/// answering in the same shape; the page query is appended here. `subject` names what is
+/// being looked up, because the failure is recorded and shown verbatim.
+///
+/// `None` is a body that parses as JSON but is not a release array — the API's own error
+/// message, a proxy's answer — which each stream reads the way its own contract needs: a
+/// host offering no release, or a listing that could not be read.
+pub(crate) async fn release_page(
+    url: &str,
+    page: u32,
+    subject: &str,
+) -> Result<Option<Vec<serde_json::Value>>, String> {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{separator}per_page={LISTING_PAGE_SIZE}&page={page}");
+    let response = download_client()?
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, GITHUB_USER_AGENT)
+        .timeout(METADATA_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("{subject} could not be fetched: {}", request_reason(&e)))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "{subject} could not be fetched: HTTP {}",
+            response.status()
+        ));
+    }
+    let listing: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("{subject} could not be read: {}", request_reason(&e)))?;
+    Ok(match listing {
+        serde_json::Value::Array(releases) => Some(releases),
+        _ => None,
+    })
+}
+
+/// A release's `SHA256SUMS` body — the file every digest is read out of. `subject` names it
+/// in the failure, which is recorded and shown verbatim.
+pub(crate) async fn fetch_sha256_sums(url: &str, subject: &str) -> Result<String, String> {
+    let response = download_client()?
+        .get(url)
+        .timeout(METADATA_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("{subject} could not be fetched: {}", request_reason(&e)))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "{subject} could not be fetched: HTTP {}",
+            response.status()
+        ));
+    }
+    response
+        .text()
+        .await
+        .map_err(|e| format!("{subject} could not be read: {}", request_reason(&e)))
+}
+
+/// The digest `asset` must have, read out of a `SHA256SUMS` body: the line naming that
+/// file. `None` when the body names no such file, which each installer reports in its own
+/// words — no other artifact is ever substituted.
+pub(crate) fn sha256_for(body: &str, asset: &str) -> Option<String> {
+    body.lines()
+        .filter_map(parse_sha256_sidecar)
+        .find(|(_, name)| name == asset)
+        .map(|(digest, _)| digest)
 }
 
 /// The newest release of a managed tool: the tag its download URLs are built
@@ -393,7 +510,7 @@ pub(crate) fn extract_single_file_tar_gz(
     dir: &Path,
     file_name: &str,
 ) -> Result<PathBuf, String> {
-    let path = sole(extract_named_files_tar_gz(archive, dir, &[file_name])?);
+    let path = sole(extract_named_files_tar_gz(archive, dir, &[file_name], &[])?);
     set_executable(&path)?;
     Ok(path)
 }
@@ -405,7 +522,7 @@ pub(crate) fn extract_single_file_zip(
     dir: &Path,
     file_name: &str,
 ) -> Result<PathBuf, String> {
-    let path = sole(extract_named_files_zip(archive, dir, &[file_name])?);
+    let path = sole(extract_named_files_zip(archive, dir, &[file_name], &[])?);
     set_executable(&path)?;
     Ok(path)
 }
@@ -416,22 +533,26 @@ fn sole(mut paths: Vec<PathBuf>) -> PathBuf {
     paths.pop().expect("one name, one path")
 }
 
-/// Extract every name in `names` from a tar.gz release archive into `dir` and
-/// return their paths in that order. An entry is matched by file name at any depth
-/// but always written to `<dir>/<name>`, so a nested vendor layout still lands
-/// correctly; `Err` names the first name that is not there as a regular file. The
-/// files land as the archive carried them — a caller extracting programs beside
-/// text makes the programs executable itself.
+/// Extract every name in `required`, and every name in `optional` that the archive
+/// carries, from a tar.gz release archive into `dir`, and return the required names'
+/// paths in that order. An entry is matched by file name at any depth but always
+/// written to `<dir>/<name>`, so a nested vendor layout still lands correctly; `Err`
+/// names the first required name that is not there as a regular file, while an
+/// optional name that is absent is simply not written. The files land as the archive
+/// carried them — a caller extracting programs beside text makes the programs
+/// executable itself.
 ///
 /// Failure messages name the operation and the io kind, never a path.
 pub(crate) fn extract_named_files_tar_gz(
     archive: &Path,
     dir: &Path,
-    names: &[&str],
+    required: &[&str],
+    optional: &[&str],
 ) -> Result<Vec<PathBuf>, String> {
     let file = fs::File::open(archive)
         .map_err(|e| format!("the release archive could not be opened ({})", e.kind()))?;
     let mut tar_archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let names = names_with_optional(required, optional);
     let mut extracted: Vec<Option<PathBuf>> = vec![None; names.len()];
     let entries = tar_archive
         .entries()
@@ -451,7 +572,7 @@ pub(crate) fn extract_named_files_tar_gz(
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        let Some(index) = index_of(&path, names) else {
+        let Some(index) = index_of(&path, &names) else {
             continue;
         };
         let name = names[index];
@@ -469,15 +590,16 @@ pub(crate) fn extract_named_files_tar_gz(
             break;
         }
     }
-    collected(names, extracted)
+    collected(required, extracted)
 }
 
-/// Extract every name in `names` from a zip release archive into `dir` and return
-/// their paths in that order. An entry is matched by file name at any depth (zip
-/// archives use `/` separators internally) but always written to the fixed
-/// `<dir>/<name>` — never the entry's internal path — so a nested `bun-<target>/`
-/// vendor layout still lands correctly; `Err` names the first name that is not
-/// there as a regular file.
+/// Extract every name in `required`, and every name in `optional` that the archive
+/// carries, from a zip release archive into `dir`, and return the required names' paths
+/// in that order. An entry is matched by file name at any depth (zip archives use `/`
+/// separators internally) but always written to the fixed `<dir>/<name>` — never the
+/// entry's internal path — so a nested `bun-<target>/` vendor layout still lands
+/// correctly; `Err` names the first required name that is not there as a regular file,
+/// while an optional name that is absent is simply not written.
 ///
 /// Failure messages name the operation and a reason the archive library's own
 /// error yields — the io kind it wraps, or its own short sentence for a malformed
@@ -485,12 +607,14 @@ pub(crate) fn extract_named_files_tar_gz(
 pub(crate) fn extract_named_files_zip(
     archive: &Path,
     dir: &Path,
-    names: &[&str],
+    required: &[&str],
+    optional: &[&str],
 ) -> Result<Vec<PathBuf>, String> {
     let file = fs::File::open(archive)
         .map_err(|e| format!("the release archive could not be opened ({})", e.kind()))?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| format!("the release archive could not be read ({})", zip_reason(&e)))?;
+    let names = names_with_optional(required, optional);
     let mut extracted: Vec<Option<PathBuf>> = vec![None; names.len()];
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| {
@@ -502,7 +626,7 @@ pub(crate) fn extract_named_files_zip(
         if !entry.is_file() {
             continue;
         }
-        let Some(index) = index_of(Path::new(entry.name()), names) else {
+        let Some(index) = index_of(Path::new(entry.name()), &names) else {
             continue;
         };
         let name = names[index];
@@ -520,7 +644,15 @@ pub(crate) fn extract_named_files_zip(
             break;
         }
     }
-    collected(names, extracted)
+    collected(required, extracted)
+}
+
+/// The names one extraction looks for: the required ones first, then the optional ones,
+/// so `collected` reads the required paths off the front. The scan can stop only once every
+/// name is found, since an optional name the archive lacks is known to be absent only at its
+/// end.
+fn names_with_optional<'a>(required: &[&'a str], optional: &[&'a str]) -> Vec<&'a str> {
+    required.iter().chain(optional).copied().collect()
 }
 
 /// The position in `names` an archive entry's file name matches, ignoring the
@@ -530,12 +662,13 @@ fn index_of(path: &Path, names: &[&str]) -> Option<usize> {
     names.iter().position(|name| file_name == OsStr::new(name))
 }
 
-/// The extracted paths in `names` order, or the one sentence naming the first name
-/// the archive did not carry.
-fn collected(names: &[&str], extracted: Vec<Option<PathBuf>>) -> Result<Vec<PathBuf>, String> {
+/// The required names' paths, read off the front of `extracted` — the optional names
+/// follow them in that vector — or the one sentence naming the first required name the
+/// archive did not carry.
+fn collected(required: &[&str], extracted: Vec<Option<PathBuf>>) -> Result<Vec<PathBuf>, String> {
     extracted
         .into_iter()
-        .zip(names)
+        .zip(required)
         .map(|(path, name)| path.ok_or_else(|| format!("the release archive carries no {name}")))
         .collect()
 }
@@ -860,6 +993,22 @@ mod tests {
             None
         );
         assert_eq!(parse_sha256_sidecar(""), None);
+    }
+
+    #[test]
+    fn a_sha256_body_names_the_digest_of_one_file() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let body = format!(
+            "{hash}  bun-linux-x64.zip\n{}  LICENCE.txt\n",
+            "f".repeat(64)
+        );
+
+        assert_eq!(
+            sha256_for(&body, "bun-linux-x64.zip"),
+            Some(hash.to_string())
+        );
+        // A file the body does not name has no digest, so no other one stands in.
+        assert_eq!(sha256_for(&body, "bun-darwin-arm64.zip"), None);
     }
 
     #[cfg(unix)]

@@ -1,7 +1,8 @@
 # The product's own ffmpeg release pipeline.
 #
 # This publishes this repository's builds of upstream FFmpeg — `ffmpeg` and
-# `ffprobe` — for the six platforms the product installs the pair on. Its tag
+# `ffprobe` — for the six platforms the product installs the pair on, linked
+# against the codec, image and TLS libraries the product's video jobs need. Its tag
 # prefix is `ffmpeg-v`, a stream of its own apart from the product's releases
 # (`v<version>`, which `release.yml` owns) and the Bot API server's (`tgapi-v`,
 # which `tgapi-release.yml` owns); nothing here runs on a `v*` tag.
@@ -10,7 +11,9 @@
 # product's own update channel untouched: `releases/latest` — read by
 # `src/self_update.rs`, `install.sh` and `install.ps1` — never names one, while a
 # release asset stays downloadable by a plain HTTP client, which is how the
-# product's installer (`src/ffmpeg/install.rs`) fetches the pair.
+# product's installer (`src/ffmpeg/install.rs`) fetches the pair. The installer
+# reads this stream's listing, so a build published here is picked up by every
+# installed copy at its next start; nothing waits for a release of the product.
 #
 # One release carries all six of these, built natively, or none of them:
 #
@@ -21,54 +24,82 @@
 #   ffmpeg-<version>-mahbot.<revision>-windows-x86_64.zip
 #   ffmpeg-<version>-mahbot.<revision>-windows-aarch64.zip
 #
-# and, beside them, what the six were built from and how:
+# and, beside them, what they were built from and how:
 #
 #   ffmpeg-<version>-mahbot.<revision>-source.tar.gz
-#                              the upstream tree, `git archive`d from the tag
-#                              the release was built from
-#   BUILD-RECIPE.txt           the configure line, the compiler identity and
-#                              the digests, each written by the machine that
-#                              ran that leg
-#   SHA256SUMS                 one `<sha256>  <file>` line per archive: the six
-#                              above and the source archive. The product's
-#                              installer reads this platform's line out of it and
-#                              checks the archive it downloads against it.
+#                              the upstream tree, `git archive`d from the tag the
+#                              release was built from
+#   x264-<short commit>-source.tar.gz, x265-<tag>-source.tar.gz,
+#   libvpx-<tag>-source.tar.gz, opus-<tag>-source.tar.gz,
+#   zimg-<tag>-source.tar.gz, zlib-<tag>-source.tar.gz,
+#   openssl-<tag>-source.tar.gz
+#                              every library linked into the pair, archived from
+#                              the tree it is built from
+#   LICENCE.txt                upstream's verbatim `COPYING.GPLv3`, the text of the
+#                              licence the whole build is distributed under
+#   BUILD-RECIPE.txt           the configure lines, the compiler identity and the
+#                              digests, each written by the machine that ran that leg
+#   SHA256SUMS                 one `<sha256>  <file>` line per platform archive, per
+#                              source archive and for `LICENCE.txt` — not for itself,
+#                              nor for `BUILD-RECIPE.txt`, which is assembled after it.
+#                              The product's installer reads this platform's archive
+#                              line out of it and checks the archive it downloads
+#                              against it.
 #
-# Windows on ARM is its own build and never the x64 one, and no leg may stand
-# in for another: a platform that cannot be built fails the release rather than
-# being covered by a neighbouring archive.
+# The build is GPLv3: `--enable-gpl` is what `--enable-libx264` and
+# `--enable-libx265` require, and `--enable-version3` is what the OpenSSL 3 backend
+# requires beside them. The product's own licence does not change — FFmpeg stays a
+# separate executable, invoked as a program and never linked into the product. The
+# licence material travels inside every archive, because the licence travels with
+# the binaries: `LICENCE.txt` is the build's own licence, `LICENCES.txt` the notices
+# of the libraries linked into it, and `SOURCE.txt` names the source of each, with
+# the archive that carries it. An archive missing one of the three is refused here,
+# which is where the obligation can be enforced: the product's installer takes the
+# notices from an archive that carries them and installs a build that predates them
+# with the licence and source note it has, so no installation depends on the order
+# in which a product release and a build of the pair are published.
+#
+# What the pair can do is proven per leg, by producing output with it:
+# `scripts/ffmpeg-smoke.sh` writes H.264, HEVC, VP9, Opus and PNG output, reads PNG
+# back, runs the zscale filter, fetches a file over https and runs the product's own
+# three jobs. An encoder is proven by the stream it wrote, never by a name in
+# `-encoders`; the lists any assertion reads are the build's own `-version`
+# configuration line and the decoders (and demuxers) of the formats the product
+# already accepts. The https fetch runs with every TLS variable removed from the
+# environment and verifies the peer on every leg: a store inherited from the runner
+# would prove the runner, not the build.
+#
+# Windows takes its TLS from SChannel — part of the system, with its own trust
+# store — and the unix legs carry OpenSSL built here, so no libssl is needed on the
+# owner's machine. That OpenSSL is configured with `--openssldir=/etc/ssl`, the
+# platform's own store, rather than a directory inside the build prefix that exists
+# only on the machine that built it. This FFmpeg (n7.1.3) reads CAs only from an
+# explicit `ca_file` — its OpenSSL backend learned to fall back to the compiled-in
+# store after this release — so the unix legs hand it the machine's bundle, while on
+# an owner's machine https opens without one and is verified only when a bundle is
+# passed. `--disable-autodetect` stops a leg from linking whatever else the runner
+# image happens to carry, which is what makes the published recipe describe the
+# builds that were made rather than the three images they were made on. The
+# assertion step after each build reads the binary's own `-version` back and looks at
+# what the binary links.
+#
+# Windows on ARM is its own build and never the x64 one, and no leg may stand in for
+# another: a platform that cannot be built fails the release rather than being
+# covered by a neighbouring archive.
 #
 # Each archive holds a directory named after itself — for instance
-# `ffmpeg-7.1-mahbot.1-linux-x86_64/` — with `bin/ffmpeg` and `bin/ffprobe`
-# (`ffmpeg.exe` and `ffprobe.exe` on Windows) and two texts at its root:
-# `LICENCE.txt`, upstream's verbatim `COPYING.LGPLv2.1`, and `SOURCE.txt`, which
-# names the upstream project, the tag, the commit the build was made from and
-# the source archive that carries that source. Both travel inside every archive
-# because the licence travels with the binaries: the LGPL obliges whoever hands
-# the pair on to hand its text and its source on too, and a file already copied
-# onto an owner's machine has no other way of finding them.
-#
-# The pair is built LGPL-only on every platform — `--disable-gpl
-# --disable-nonfree` — because no GPL component is needed by any of the three
-# jobs it does: probe (duration, upright dimensions, audio track presence), JPEG
-# frames at a rate with a bounded longest side, and 16 kHz mono WAV. The native
-# decoders, the `mjpeg` encoder and `pcm_s16le` all sit in the LGPL half of the
-# tree; `libx264`, `libx265` and `libxvid` are neither enabled nor wanted.
-# `--disable-autodetect` is part of the same promise: it stops a build from
-# linking whatever library a runner image happens to carry, which is what makes
-# the published recipe describe the builds that were made rather than the three
-# images they were made on. The assertion step after each build reads the
-# binary's own `-version` back and looks at what the binary links.
+# `ffmpeg-7.1.3-mahbot.2-linux-x86_64/` — with `bin/ffmpeg` and `bin/ffprobe`
+# (`ffmpeg.exe` and `ffprobe.exe` on Windows) and the three licence files at its root.
 #
 # `<version>` is the version the built binary reports in `ffmpeg -version` and
-# `<revision>` is this file's `BUILD_REVISION`. The version is read back out of
-# the binary that is published, so a tag, an archive name and the binary inside
-# it cannot disagree. Dispatching this workflow is the only way a build is
-# published, and a tag that exists is never re-published: a tag names one build,
-# and assets changing under it would hand an installed copy a different one at
-# the same version. A repaired build bumps `BUILD_REVISION` and so gets a tag of
-# its own. Nothing of a release has to be recorded in the product afterwards —
-# the installer verifies the archive against that release's own `SHA256SUMS`, so a
+# `<revision>` is this file's `BUILD_REVISION`. The version is read back out of the
+# binary that is published, so a tag, an archive name and the binary inside it
+# cannot disagree. Dispatching this workflow is the only way a build is published,
+# and a tag that exists is never re-published: a tag names one build, and assets
+# changing under it would hand an installed copy a different one at the same
+# version. A repaired build bumps `BUILD_REVISION` and so gets a tag of its own.
+# Nothing of a release has to be recorded in the product afterwards — the
+# installer verifies the archive against that release's own `SHA256SUMS`, so a
 # published release is installable as it stands.
 #
 # No code signing and no notarization: each leg builds on the platform's own
@@ -91,12 +122,28 @@ env:
   # and the revision of this build recipe. Bumping them — and dispatching this
   # workflow — is the only way a new build is published, and an existing tag is
   # never re-published: its `SHA256SUMS` digest is what every installed copy was
-  # verified against. A repaired build (a patch, a newer toolchain) bumps
+  # verified against. A repaired build (a patch, a newer library) bumps
   # BUILD_REVISION and keeps the tag's version; a newer upstream revision bumps
-  # FFMPEG_TAG and FFMPEG_VERSION together.
-  FFMPEG_TAG: n7.1
-  FFMPEG_VERSION: 7.1
-  BUILD_REVISION: 1
+  # FFMPEG_TAG and FFMPEG_VERSION together. The tag is 7.1's last patch release
+  # rather than 7.1 itself because that is the first of the line whose libx265
+  # wrapper pairs with x265 4.x — 7.1 hands the encoder the scalable-layers
+  # argument x265 dropped in 4.1, and every HEVC encode ends in a segfault.
+  FFMPEG_TAG: n7.1.3
+  FFMPEG_VERSION: "7.1.3"
+  BUILD_REVISION: 2
+
+  # The libraries the pair is linked against, each pinned to the release whose
+  # source archive the `source` job publishes and the legs compile. x264 publishes
+  # no release tags, so a commit is what it is pinned by; `X264_REF` is that
+  # commit's short name and the name its source archive carries.
+  X264_COMMIT: 31e19f92f00c7003fa115047ce50978bc98c3a0d
+  X264_REF: "31e19f92"
+  X265_REF: "4.2"
+  VPX_REF: "1.17.0"
+  OPUS_REF: "1.6.1"
+  ZIMG_REF: "3.0.6"
+  ZLIB_REF: "1.3.2"
+  OPENSSL_REF: "3.6.5"
 
 permissions:
   contents: write
@@ -111,9 +158,9 @@ concurrency:
 jobs:
   # ── The source every leg builds ───────────────────────────────────────────
 
-  # One clone, one archive: the six legs compile the same bytes, and the source
-  # archive is the file an owner asking for the source of a published binary is
-  # handed.
+  # One clone, eight archives and the licence text: the six legs compile these
+  # same bytes, and these archives are what an owner asking for the source of a
+  # published binary is handed.
   source:
     name: Resolve and archive the pinned source
     runs-on: ubuntu-22.04
@@ -185,6 +232,63 @@ jobs:
           fi
           ls -l "$RUNNER_TEMP/dist/$name"
 
+      # The licence the whole build is distributed under: the release publishes
+      # this text beside the archives, and every archive carries the same file.
+      - name: Collect the licence text
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/ffmpeg/COPYING.GPLv3" "$RUNNER_TEMP/dist/LICENCE.txt"
+
+      # Every library linked into the pair, archived from its own repository at
+      # the ref pinned above, so the release hands on the source of what it
+      # distributes.
+      - name: Clone and archive the linked libraries
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$dist"
+
+          # One archive per library, taken from the project's own repository at the
+          # ref pinned above: the legs compile exactly these bytes, and the release
+          # hands them on, which is what the GPL asks of a binary it distributes.
+          # A tag is fetched by its name and a commit by its SHA, so a ref that moved
+          # would be a different archive.
+          #
+          # archive <name> <ref-to-fetch> <name-token> <url...>
+          archive() {
+            name=$1
+            ref=$2
+            token=$3
+            shift 3
+            dest="$RUNNER_TEMP/clones/$name"
+            for candidate in "$@"; do
+              rm -rf "$dest"
+              if git init -q "$dest" &&
+                 git -C "$dest" fetch -q --depth 1 "$candidate" "$ref" &&
+                 git -C "$dest" checkout -q FETCH_HEAD; then
+                git -C "$dest" archive --format=tar.gz \
+                  --prefix="$name-$token/" -o "$dist/$name-$token-source.tar.gz" FETCH_HEAD
+                echo "$name: $candidate served $ref"
+                return 0
+              fi
+              echo "::warning::$candidate did not serve $name $ref"
+            done
+            echo "::error::no host served $name $ref"
+            return 1
+          }
+
+          archive x264 "$X264_COMMIT" "$X264_REF" \
+            https://code.videolan.org/videolan/x264.git \
+            https://github.com/mirror/x264.git
+          # x265's GitHub mirror is stale at 3.4, so upstream's own host —
+          # Bitbucket — is the only source used for it.
+          archive x265 "$X265_REF" "$X265_REF" https://bitbucket.org/multicoreware/x265_git
+          archive libvpx "v$VPX_REF" "$VPX_REF" https://github.com/webmproject/libvpx.git
+          archive opus "v$OPUS_REF" "$OPUS_REF" https://github.com/xiph/opus.git
+          archive zimg "release-$ZIMG_REF" "$ZIMG_REF" https://github.com/sekrit-twc/zimg.git
+          archive zlib "v$ZLIB_REF" "$ZLIB_REF" https://github.com/madler/zlib.git
+          archive openssl "openssl-$OPENSSL_REF" "$OPENSSL_REF" https://github.com/openssl/openssl.git
+
       - name: Hand the source to the build legs
         uses: actions/upload-artifact@v4
         with:
@@ -216,7 +320,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The floor is `GLIBC_FLOOR` above, and the configure step below refuses
+          # The floor is `GLIBC_FLOOR` above, and the build step below refuses
           # a base that carries a newer one.
           - runner: ubuntu-22.04
             target_os: linux
@@ -224,7 +328,7 @@ jobs:
           - runner: ubuntu-22.04-arm
             target_os: linux
             target_arch: aarch64
-          # The floor is `-mmacosx-version-min` in the configure step below, not the
+          # The floor is `-mmacosx-version-min` in the build step below, not the
           # image: the image only supplies the toolchain, so a newer one still
           # builds the same macOS 14.0 archive (`macos-14` is being retired).
           - runner: macos-15
@@ -244,34 +348,43 @@ jobs:
             target_os: windows
             target_arch: aarch64
     steps:
+      # The scripts, and nothing else: `scripts/ffmpeg-build.sh` is the recipe every
+      # leg runs and `scripts/ffmpeg-smoke.sh` is what proves its output.
+      - uses: actions/checkout@v4
+
       - name: Take the pinned source
         uses: actions/download-artifact@v4
         with:
           name: ffmpeg-source
           path: ${{ runner.temp }}/source
 
-      # `nasm` assembles ffmpeg's own x86 code and `build-essential` carries the
-      # compiler and make. Nothing else: `--disable-autodetect` below means no
-      # library from the image is linked in, so no other package belongs in the
-      # recipe.
+      # `nasm` is what the x86 assembly of x264, x265 and libvpx is assembled
+      # with, the autotools are what zimg's `autogen.sh` needs, and `cmake` with
+      # `ninja` build x265, opus and zimg. ffmpeg's configure finds the installed
+      # libraries through `pkg-config`, and `--disable-autodetect` keeps it from
+      # linking anything else the image carries.
       - name: Install the build prerequisites (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential nasm
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build nasm pkg-config autoconf automake libtool
 
-      # Xcode's clang and make are what macOS builds with; `nasm` is the one
-      # piece the image does not carry.
+      # Xcode's clang and make are what macOS builds with; the rest is what the
+      # libraries' own build systems need, `nasm` for their x86 assembly and the
+      # autotools for zimg's `autogen.sh`.
       - name: Install the build prerequisites (macOS)
         if: runner.os == 'macOS'
-        run: brew install nasm
+        run: brew install cmake ninja nasm autoconf automake libtool
 
       # Two toolchains, two environments: `MINGW64` targets x86_64 and
       # `CLANGARM64` targets aarch64, and each leg installs only its own. The
-      # pair is clang over mingw-w64, which with `-static` below links the
-      # compiler runtime in, so no DLL has to travel beside the exe. `nasm`
-      # exists for the x86 side only — aarch64 assembly is taken by the
-      # compiler's own assembler — and `objdump` reads the imports back out.
+      # pair is clang over mingw-w64, which with `-static` links the compiler
+      # runtime in, so no DLL has to travel beside the exe. `nasm` exists for the
+      # x86 side only — aarch64 assembly is taken by the compiler's own assembler
+      # — `cmake` and `ninja` build x265, opus and zimg, `pkgconf` is what
+      # ffmpeg's configure finds the installed libraries with, the autotools are
+      # what zimg's `autogen.sh` needs, and `objdump` reads the imports back out.
       - name: Set up the MSYS2 toolchain (Windows x86_64)
         if: runner.os == 'Windows' && matrix.target_arch == 'x86_64'
         uses: msys2/setup-msys2@v2
@@ -280,7 +393,7 @@ jobs:
           # No `pacman -Syu` mid-run: the packages the image ships are the
           # toolchain the recipe names.
           update: false
-          install: make tar zip binutils mingw-w64-x86_64-clang mingw-w64-x86_64-nasm
+          install: make tar zip binutils nasm autoconf automake libtool pkgconf mingw-w64-x86_64-clang mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf
 
       - name: Set up the MSYS2 toolchain (Windows arm64)
         if: runner.os == 'Windows' && matrix.target_arch == 'aarch64'
@@ -288,41 +401,109 @@ jobs:
         with:
           msystem: CLANGARM64
           update: false
-          install: make tar zip binutils mingw-w64-clang-aarch64-clang
+          install: make tar zip binutils autoconf automake libtool pkgconf mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-cmake mingw-w64-clang-aarch64-ninja mingw-w64-clang-aarch64-pkgconf
 
-      - name: Unpack the pinned source (Linux/macOS)
+      # Some steps below come in two forms. The Windows form runs in the MSYS2 shell,
+      # which exists on Windows only, and that shell is what puts the toolchain's `tar`,
+      # `objdump` and `cygpath` on the path — the build needs it for its compiler and the
+      # smoke proof for the `objdump` it reads the binary's imports with. The two forms of
+      # a pair differ in nothing but the path prefix.
+      #
+      # Every archive into a directory of its own, named after the component it
+      # holds, and `ffmpeg`'s must hold `configure`. The names are spelled out
+      # rather than globbed, so an archive that did not arrive fails the leg here
+      # and no archive can stand in for another.
+      - name: Unpack the sources (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/src"
-          tar -xzf "$RUNNER_TEMP/source/ffmpeg-$FFMPEG_VERSION-mahbot.$BUILD_REVISION-source.tar.gz" \
-            -C "$RUNNER_TEMP/src" --strip-components=1
-          test -x "$RUNNER_TEMP/src/configure"
+          src="$RUNNER_TEMP/source"
+          out="$RUNNER_TEMP/src"
 
-      - name: Unpack the pinned source (Windows)
+          mkdir -p "$out/ffmpeg"
+          tar -xzf "$src/ffmpeg-$FFMPEG_VERSION-mahbot.$BUILD_REVISION-source.tar.gz" \
+            -C "$out/ffmpeg" --strip-components=1
+
+          mkdir -p "$out/x264"
+          tar -xzf "$src/x264-$X264_REF-source.tar.gz" \
+            -C "$out/x264" --strip-components=1
+
+          mkdir -p "$out/x265"
+          tar -xzf "$src/x265-$X265_REF-source.tar.gz" \
+            -C "$out/x265" --strip-components=1
+
+          mkdir -p "$out/libvpx"
+          tar -xzf "$src/libvpx-$VPX_REF-source.tar.gz" \
+            -C "$out/libvpx" --strip-components=1
+
+          mkdir -p "$out/opus"
+          tar -xzf "$src/opus-$OPUS_REF-source.tar.gz" \
+            -C "$out/opus" --strip-components=1
+
+          mkdir -p "$out/zimg"
+          tar -xzf "$src/zimg-$ZIMG_REF-source.tar.gz" \
+            -C "$out/zimg" --strip-components=1
+
+          mkdir -p "$out/zlib"
+          tar -xzf "$src/zlib-$ZLIB_REF-source.tar.gz" \
+            -C "$out/zlib" --strip-components=1
+
+          mkdir -p "$out/openssl"
+          tar -xzf "$src/openssl-$OPENSSL_REF-source.tar.gz" \
+            -C "$out/openssl" --strip-components=1
+
+          test -f "$out/ffmpeg/configure"
+
+      - name: Unpack the sources (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           set -euo pipefail
           root="$(cygpath -u "$RUNNER_TEMP")"
-          mkdir -p "$root/src"
-          tar -xzf "$root/source/ffmpeg-$FFMPEG_VERSION-mahbot.$BUILD_REVISION-source.tar.gz" \
-            -C "$root/src" --strip-components=1
-          test -f "$root/src/configure"
+          src="$root/source"
+          out="$root/src"
 
-      # The licence line, and nothing else. `--disable-gpl --disable-nonfree`
-      # keep out every copyleft component; `--disable-autodetect` keeps out
-      # every library the runner image happens to carry; `--disable-shared
-      # --enable-static` fold the av* libraries into the two programs.
-      # `--disable-ffplay` drops the one program that needs SDL and
-      # `--disable-network` a surface the product never uses. The compiler line
-      # and the configure line are recorded here, by the shell that ran them,
-      # because that is what the published recipe is.
-      - name: Configure and build (Linux/macOS)
+          mkdir -p "$out/ffmpeg"
+          tar -xzf "$src/ffmpeg-$FFMPEG_VERSION-mahbot.$BUILD_REVISION-source.tar.gz" \
+            -C "$out/ffmpeg" --strip-components=1
+
+          mkdir -p "$out/x264"
+          tar -xzf "$src/x264-$X264_REF-source.tar.gz" \
+            -C "$out/x264" --strip-components=1
+
+          mkdir -p "$out/x265"
+          tar -xzf "$src/x265-$X265_REF-source.tar.gz" \
+            -C "$out/x265" --strip-components=1
+
+          mkdir -p "$out/libvpx"
+          tar -xzf "$src/libvpx-$VPX_REF-source.tar.gz" \
+            -C "$out/libvpx" --strip-components=1
+
+          mkdir -p "$out/opus"
+          tar -xzf "$src/opus-$OPUS_REF-source.tar.gz" \
+            -C "$out/opus" --strip-components=1
+
+          mkdir -p "$out/zimg"
+          tar -xzf "$src/zimg-$ZIMG_REF-source.tar.gz" \
+            -C "$out/zimg" --strip-components=1
+
+          mkdir -p "$out/zlib"
+          tar -xzf "$src/zlib-$ZLIB_REF-source.tar.gz" \
+            -C "$out/zlib" --strip-components=1
+
+          mkdir -p "$out/openssl"
+          tar -xzf "$src/openssl-$OPENSSL_REF-source.tar.gz" \
+            -C "$out/openssl" --strip-components=1
+
+          test -f "$out/ffmpeg/configure"
+
+      # The script is the whole recipe — the seven libraries, their configure
+      # lines and the pair itself — and it writes this leg's section of the
+      # published recipe as it runs.
+      - name: Build the pair (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/src"
 
           # The base's own glibc is the floor or older: a newer base silently makes
           # every archive need a newer system than the product runs on.
@@ -335,307 +516,46 @@ jobs:
             fi
           fi
 
-          configure=(
-            ./configure
-            --disable-gpl
-            --disable-nonfree
-            --disable-autodetect
-            --disable-shared
-            --enable-static
-            --disable-doc
-            --disable-ffplay
-            --disable-network
-            --disable-debug
-          )
-          # macOS builds with Xcode's clang by name, and stamps the floor the
-          # product itself is built for — `MACOS_FLOOR` in `src/self_update.rs`,
-          # `MACOSX_DEPLOYMENT_TARGET` in `.github/workflows/release.yml`, both
-          # pinned by `ffmpeg::install::tests::the_floors_are_the_product_own` — so
-          # the files never inherit whichever macOS the runner happens to be.
+          # Every object, the libraries included, is built against the product's own
+          # macOS floor; the script hands the flag to every compiler it drives.
+          floor=""
           if [ "$RUNNER_OS" = macOS ]; then
-            configure+=(--cc=clang)
-            configure+=(--extra-cflags=-mmacosx-version-min=14.0)
-            configure+=(--extra-ldflags=-mmacosx-version-min=14.0)
+            floor="-mmacosx-version-min=14.0"
           fi
-
-          "${configure[@]}"
 
           mkdir -p "$RUNNER_TEMP/dist"
-          {
-            echo "── $ASSET_OS-$ASSET_ARCH ──"
-            echo "runner: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
-            echo "system: $(uname -srm)"
-            if [ "$RUNNER_OS" = macOS ]; then
-              echo "macOS: $(sw_vers -productVersion)"
-            else
-              echo "libc: $(ldd --version 2>&1 | sed -n '1p')"
-            fi
-            echo "compiler: $(cc --version 2>&1 | sed -n '1p')"
-            echo "assembler: $(nasm -v 2>&1 | sed -n '1p')"
-            echo "source: ffmpeg $FFMPEG_TAG, commit $SOURCE_COMMIT (cloned from $SOURCE_HOST)"
-            echo "configure: $(printf '%q ' "${configure[@]}")"
-            echo
-          } > "$RUNNER_TEMP/dist/recipe-$ASSET_OS-$ASSET_ARCH.txt"
+          sh scripts/ffmpeg-build.sh "$RUNNER_TEMP/src" "$RUNNER_TEMP/deps" \
+            "$RUNNER_TEMP/dist/recipe-$ASSET_OS-$ASSET_ARCH.txt" "$floor"
 
-          make -j"$(getconf _NPROCESSORS_ONLN)"
-
-          # Linux is stripped. macOS is not: the linker's ad-hoc signature is
-          # what lets an arm64 file execute and `strip` would invalidate it, so
-          # the files are shipped exactly as the linker signed them.
-          if [ "$RUNNER_OS" = Linux ]; then
-            strip --strip-unneeded ffmpeg ffprobe
-          fi
-
-      # `--target-os` is named rather than detected: the ARM64 environment
-      # reports itself as `CLANGARM64_NT-*`, which upstream's configure does not
-      # know, and `--arch` goes with it. `--cc=clang` is what the environment
-      # installs — there is no gcc in CLANGARM64 at all — and `-static` folds
-      # the compiler runtime and libgcc in, so the exe needs nothing beside it.
-      - name: Configure and build (Windows)
+      - name: Build the pair (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           set -euo pipefail
           root="$(cygpath -u "$RUNNER_TEMP")"
-          cd "$root/src"
-
-          configure=(
-            ./configure
-            --cc=clang
-            --arch=$ASSET_ARCH
-            --target-os=mingw32
-            --disable-gpl
-            --disable-nonfree
-            --disable-autodetect
-            --disable-shared
-            --enable-static
-            --disable-doc
-            --disable-ffplay
-            --disable-network
-            --disable-debug
-            --extra-ldflags=-static
-          )
-          "${configure[@]}"
-
           mkdir -p "$root/dist"
-          {
-            echo "── $ASSET_OS-$ASSET_ARCH ──"
-            echo "runner: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
-            echo "system: $(uname -srm)"
-            echo "compiler: $(clang --version 2>&1 | sed -n '1p')"
-            echo "source: ffmpeg $FFMPEG_TAG, commit $SOURCE_COMMIT (cloned from $SOURCE_HOST)"
-            echo "configure: $(printf '%q ' "${configure[@]}")"
-            echo
-          } > "$root/dist/recipe-$ASSET_OS-$ASSET_ARCH.txt"
+          sh scripts/ffmpeg-build.sh "$root/src" "$MINGW_PREFIX" \
+            "$root/dist/recipe-$ASSET_OS-$ASSET_ARCH.txt"
 
-          make -j"$(nproc)"
-
-          # The ARM64 environment has no binutils to strip with, so `strip` is
-          # llvm's there.
-          if command -v strip >/dev/null 2>&1; then
-            strip ffmpeg.exe ffprobe.exe
-          else
-            llvm-strip ffmpeg.exe ffprobe.exe
-          fi
-
-      # The proof the configure line cannot give on its own: the binary that
-      # will be published says how it was configured, and it links nothing that
-      # is not part of the system it was built on.
-      - name: Assert LGPL-only and system libraries only (Linux/macOS)
+      # What the script proves, on the binary that will be published: the licence
+      # line of its own configuration, the libraries it needs, the decoders the
+      # product accepts, and every capability by writing output — H.264, HEVC,
+      # VP9, Opus, PNG written and read back, zscale, https, and the product's own
+      # probe, frames and WAV jobs. The https URL is this repository's own asset,
+      # so the handshake is a real one against a real certificate chain and the
+      # file comes from the same place the source does.
+      - name: Assert what the pair can do (Linux/macOS)
         if: runner.os != 'Windows'
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/src"
-          banner="$(./ffmpeg -version 2>&1 | tr -d '\r')"
+        env:
+          HTTPS_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/assets/mb-icon-256.png
+        run: sh scripts/ffmpeg-smoke.sh "$RUNNER_TEMP/src/ffmpeg" "$RUNNER_TEMP/smoke" "$HTTPS_URL"
 
-          if printf '%s\n' "$banner" | grep -qE -- '--enable-(gpl|nonfree)'; then
-            echo "::error::ffmpeg was configured with --enable-gpl or --enable-nonfree:"
-            printf '%s\n' "$banner"
-            exit 1
-          fi
-          if ! printf '%s\n' "$banner" | grep -q -- '--disable-gpl'; then
-            echo "::error::ffmpeg -version carries no --disable-gpl, so its configuration line proves nothing:"
-            printf '%s\n' "$banner"
-            exit 1
-          fi
-
-          if [ "$RUNNER_OS" = macOS ]; then
-            libs="$(otool -L ./ffmpeg | tail -n +2 | awk '{print $1}' | sort -u)"
-            foreign="$(printf '%s\n' "$libs" | grep -vE '^(/usr/lib/|/System/Library/)' || true)"
-          else
-            libs="$(ldd ./ffmpeg 2>&1 | grep -oE '/[^ ]+' | sort -u)"
-            foreign="$(printf '%s\n' "$libs" | grep -vE '^/(lib|lib64|usr/lib)(/|$)' || true)"
-          fi
-          if [ -n "$foreign" ]; then
-            echo "::error::ffmpeg links libraries that do not belong to the system:"
-            printf '%s\n' "$foreign"
-            exit 1
-          fi
-          echo "LGPL-only, and the only dynamic libraries are the system's:"
-          printf '%s\n' "$libs"
-
-      # The mingw runtime is what `-static` was for: a `libwinpthread-1.dll` or
-      # a `libgcc_s_seh-1.dll` in the imports would mean an exe that only runs
-      # where MSYS2 is installed. Only those names are looked for, so a Windows
-      # system DLL nobody thought of does not fail the leg.
-      - name: Assert LGPL-only and no mingw runtime (Windows)
+      - name: Assert what the pair can do (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: |
-          set -euo pipefail
-          root="$(cygpath -u "$RUNNER_TEMP")"
-          cd "$root/src"
-          banner="$(./ffmpeg.exe -version 2>&1 | tr -d '\r')"
-
-          if printf '%s\n' "$banner" | grep -qE -- '--enable-(gpl|nonfree)'; then
-            echo "::error::ffmpeg was configured with --enable-gpl or --enable-nonfree:"
-            printf '%s\n' "$banner"
-            exit 1
-          fi
-          if ! printf '%s\n' "$banner" | grep -q -- '--disable-gpl'; then
-            echo "::error::ffmpeg -version carries no --disable-gpl, so its configuration line proves nothing:"
-            printf '%s\n' "$banner"
-            exit 1
-          fi
-
-          dlls="$(objdump -p ffmpeg.exe | sed -nE 's/^[[:space:]]*DLL Name: (.*)$/\1/p' | sort -u)"
-          foreign="$(printf '%s\n' "$dlls" | grep -iE '^(libwinpthread|libgcc_s|libunwind|libstdc\+\+|libssp|zlib1|libbz2|libiconv)' || true)"
-          if [ -n "$foreign" ]; then
-            echo "::error::ffmpeg.exe imports the mingw runtime, so it is not self-contained:"
-            printf '%s\n' "$foreign"
-            exit 1
-          fi
-          echo "LGPL-only, and the imports are Windows system DLLs only:"
-          printf '%s\n' "$dlls"
-
-      # The coverage the product promises — every video and audio format it
-      # accepts today, plus the two containers it used to skip silently (mkv and
-      # avi) — asserted on the binary that will be published, because a configure
-      # line is a claim and this is the check.
-      #
-      # Then the three jobs themselves, on a clip this same binary makes out of
-      # lavfi sources: a probe reporting a video and an audio stream, a JPEG frame
-      # at a bounded side, and 16 kHz mono WAV. No sample file and no external
-      # encoder is involved, so the leg proves what the release ships.
-      - name: Assert the coverage and the three operations (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/src"
-
-          smoke="$RUNNER_TEMP/smoke"
-          mkdir -p "$smoke"
-
-          # Every name comes out of a list the binaries themselves print, written to
-          # a file first — one name per line, so the columns they use are not the
-          # check's business and no reader is killed with a closed pipe.
-          ./ffprobe -hide_banner -demuxers | tr ' ,' '\n\n' > "$smoke/demuxers"
-          for demuxer in mov matroska avi asf mpeg ogg wav mp3 flac; do
-            grep -qx "$demuxer" "$smoke/demuxers" || {
-              echo "::error::the build cannot read $demuxer"; exit 1; }
-          done
-          ./ffprobe -hide_banner -decoders | tr ' ,' '\n\n' > "$smoke/decoders"
-          for decoder in h264 hevc vp8 vp9 av1 mpeg4 aac vorbis opus flac pcm_s16le mjpeg; do
-            grep -qx "$decoder" "$smoke/decoders" || {
-              echo "::error::the build cannot decode $decoder"; exit 1; }
-          done
-          # The MP3 decoder is `mp3float` wherever the float one is the only one.
-          grep -qxE 'mp3|mp3float' "$smoke/decoders" || {
-            echo "::error::the build cannot decode mp3"; exit 1; }
-          ./ffmpeg -hide_banner -encoders | tr ' ,' '\n\n' > "$smoke/encoders"
-          for encoder in mjpeg pcm_s16le; do
-            grep -qx "$encoder" "$smoke/encoders" || {
-              echo "::error::there is no $encoder encoder, so the operations cannot write what they produce"
-              exit 1; }
-          done
-          ./ffmpeg -v error -y \
-            -f lavfi -i "testsrc=size=320x240:rate=25:duration=1" \
-            -f lavfi -i "sine=frequency=440:duration=1" \
-            -c:v mpeg4 -c:a pcm_s16le -shortest "$smoke/clip.mov"
-
-          ./ffprobe -v error -print_format json \
-            -show_entries "stream=codec_type,width,height:format=duration" \
-            "$smoke/clip.mov" > "$smoke/probe.json"
-          grep -q '"video"' "$smoke/probe.json" && grep -q '"audio"' "$smoke/probe.json" || {
-            echo "::error::the probe did not report the video and audio streams of the sample"
-            exit 1; }
-
-          ./ffmpeg -v error -nostdin -y -i "$smoke/clip.mov" \
-            -vf "fps=1,scale=160:160:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2" \
-            -frames:v 2 -q:v 3 -f image2 "$smoke/frame-%05d.jpg"
-          test -f "$smoke/frame-00001.jpg"
-
-          ./ffmpeg -v error -nostdin -y -i "$smoke/clip.mov" \
-            -vn -ac 1 -ar 16000 -c:a pcm_s16le -f wav "$smoke/audio.wav"
-          ./ffprobe -v error -print_format json \
-            -show_entries "stream=codec_name,sample_rate,channels" \
-            "$smoke/audio.wav" > "$smoke/wav.json"
-          grep -q '"pcm_s16le"' "$smoke/wav.json" &&
-            grep -qE '"sample_rate"[[:space:]]*:[[:space:]]*"?16000"?' "$smoke/wav.json" &&
-            grep -qE '"channels"[[:space:]]*:[[:space:]]*1' "$smoke/wav.json" || {
-            echo "::error::the extracted audio is not 16 kHz mono PCM"
-            exit 1; }
-
-          echo "the three operations work on $(uname -sm)"
-
-      - name: Assert the coverage and the three operations (Windows)
-        if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-          root="$(cygpath -u "$RUNNER_TEMP")"
-          cd "$root/src"
-
-          smoke="$root/smoke"
-          mkdir -p "$smoke"
-
-          ./ffprobe.exe -hide_banner -demuxers | tr ' ,' '\n\n' > "$smoke/demuxers"
-          for demuxer in mov matroska avi asf mpeg ogg wav mp3 flac; do
-            grep -qx "$demuxer" "$smoke/demuxers" || {
-              echo "::error::the build cannot read $demuxer"; exit 1; }
-          done
-          ./ffprobe.exe -hide_banner -decoders | tr ' ,' '\n\n' > "$smoke/decoders"
-          for decoder in h264 hevc vp8 vp9 av1 mpeg4 aac vorbis opus flac pcm_s16le mjpeg; do
-            grep -qx "$decoder" "$smoke/decoders" || {
-              echo "::error::the build cannot decode $decoder"; exit 1; }
-          done
-          grep -qxE 'mp3|mp3float' "$smoke/decoders" || {
-            echo "::error::the build cannot decode mp3"; exit 1; }
-          ./ffmpeg.exe -hide_banner -encoders | tr ' ,' '\n\n' > "$smoke/encoders"
-          for encoder in mjpeg pcm_s16le; do
-            grep -qx "$encoder" "$smoke/encoders" || {
-              echo "::error::there is no $encoder encoder, so the operations cannot write what they produce"
-              exit 1; }
-          done
-          ./ffmpeg.exe -v error -y \
-            -f lavfi -i "testsrc=size=320x240:rate=25:duration=1" \
-            -f lavfi -i "sine=frequency=440:duration=1" \
-            -c:v mpeg4 -c:a pcm_s16le -shortest "$smoke/clip.mov"
-
-          ./ffprobe.exe -v error -print_format json \
-            -show_entries "stream=codec_type,width,height:format=duration" \
-            "$smoke/clip.mov" > "$smoke/probe.json"
-          grep -q '"video"' "$smoke/probe.json" && grep -q '"audio"' "$smoke/probe.json" || {
-            echo "::error::the probe did not report the video and audio streams of the sample"
-            exit 1; }
-
-          ./ffmpeg.exe -v error -nostdin -y -i "$smoke/clip.mov" \
-            -vf "fps=1,scale=160:160:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2" \
-            -frames:v 2 -q:v 3 -f image2 "$smoke/frame-%05d.jpg"
-          test -f "$smoke/frame-00001.jpg"
-
-          ./ffmpeg.exe -v error -nostdin -y -i "$smoke/clip.mov" \
-            -vn -ac 1 -ar 16000 -c:a pcm_s16le -f wav "$smoke/audio.wav"
-          ./ffprobe.exe -v error -print_format json \
-            -show_entries "stream=codec_name,sample_rate,channels" \
-            "$smoke/audio.wav" > "$smoke/wav.json"
-          grep -q '"pcm_s16le"' "$smoke/wav.json" &&
-            grep -qE '"sample_rate"[[:space:]]*:[[:space:]]*"?16000"?' "$smoke/wav.json" &&
-            grep -qE '"channels"[[:space:]]*:[[:space:]]*1' "$smoke/wav.json" || {
-            echo "::error::the extracted audio is not 16 kHz mono PCM"
-            exit 1; }
-
-          echo "the three operations work on $(uname -sm)"
+        env:
+          HTTPS_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/assets/mb-icon-256.png
+        run: sh scripts/ffmpeg-smoke.sh "$(cygpath -u "$RUNNER_TEMP")/src/ffmpeg" "$(cygpath -u "$RUNNER_TEMP")/smoke" "$HTTPS_URL"
 
       # The version every name in this release carries, read from the binary
       # that will be published rather than declared anywhere: a tree that builds
@@ -644,7 +564,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          banner="$("$RUNNER_TEMP/src/ffmpeg" -version 2>&1 | tr -d '\r')"
+          banner="$("$RUNNER_TEMP/src/ffmpeg/ffmpeg" -version 2>&1 | tr -d '\r')"
           version="$(printf '%s\n' "$banner" | awk '{
             for (i = 1; i < NF; i++) if ($i == "version") { print $(i + 1); exit }
           }')"
@@ -662,7 +582,7 @@ jobs:
         run: |
           set -euo pipefail
           root="$(cygpath -u "$RUNNER_TEMP")"
-          banner="$("$root/src/ffmpeg.exe" -version 2>&1 | tr -d '\r')"
+          banner="$("$root/src/ffmpeg/ffmpeg.exe" -version 2>&1 | tr -d '\r')"
           version="$(printf '%s\n' "$banner" | awk '{
             for (i = 1; i < NF; i++) if ($i == "version") { print $(i + 1); exit }
           }')"
@@ -675,29 +595,20 @@ jobs:
           echo "The pair reports FFmpeg $version"
 
       # The layout the product reads (`src/ffmpeg/install.rs`): a folder named
-      # after the archive, `bin/` holding the two programs, and the two texts at
-      # its root. The licence is upstream's own file, copied byte for byte.
+      # after the archive, `bin/` holding the two programs, and the three licence
+      # files at its root. The build script wrote those beside the trees it built.
       - name: Package the archive (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/src"
+          cd "$RUNNER_TEMP/src/ffmpeg"
           stem="ffmpeg-$VERSION-mahbot.$BUILD_REVISION-$ASSET_OS-$ASSET_ARCH"
           stage="$RUNNER_TEMP/stage/$stem"
           mkdir -p "$stage/bin" "$RUNNER_TEMP/dist"
 
           cp ffmpeg ffprobe "$stage/bin/"
           chmod 0755 "$stage/bin/ffmpeg" "$stage/bin/ffprobe"
-          cp COPYING.LGPLv2.1 "$stage/LICENCE.txt"
-          {
-            printf 'FFmpeg %s - upstream project: FFmpeg (https://ffmpeg.org/), tag %s\n' \
-              "$VERSION" "$FFMPEG_TAG"
-            printf 'Upstream repository clone: %s\n' "$SOURCE_HOST"
-            printf 'Resolved commit: %s\n' "$SOURCE_COMMIT"
-            printf 'Source archive: ffmpeg-%s-mahbot.%s-source.tar.gz, published with this release\n' \
-              "$VERSION" "$BUILD_REVISION"
-            printf 'This is an unmodified LGPL build of FFmpeg: no GPL and no non-free component is enabled.\n'
-          } > "$stage/SOURCE.txt"
+          cp "$RUNNER_TEMP/src/LICENCE.txt" "$RUNNER_TEMP/src/LICENCES.txt" "$RUNNER_TEMP/src/SOURCE.txt" "$stage/"
 
           # `COPYFILE_DISABLE` keeps macOS `tar` from adding `._` extended
           # attribute entries beside the files.
@@ -711,22 +622,13 @@ jobs:
         run: |
           set -euo pipefail
           root="$(cygpath -u "$RUNNER_TEMP")"
-          cd "$root/src"
+          cd "$root/src/ffmpeg"
           stem="ffmpeg-$VERSION-mahbot.$BUILD_REVISION-$ASSET_OS-$ASSET_ARCH"
           stage="$root/stage/$stem"
           mkdir -p "$stage/bin" "$root/dist"
 
           cp ffmpeg.exe ffprobe.exe "$stage/bin/"
-          cp COPYING.LGPLv2.1 "$stage/LICENCE.txt"
-          {
-            printf 'FFmpeg %s - upstream project: FFmpeg (https://ffmpeg.org/), tag %s\n' \
-              "$VERSION" "$FFMPEG_TAG"
-            printf 'Upstream repository clone: %s\n' "$SOURCE_HOST"
-            printf 'Resolved commit: %s\n' "$SOURCE_COMMIT"
-            printf 'Source archive: ffmpeg-%s-mahbot.%s-source.tar.gz, published with this release\n' \
-              "$VERSION" "$BUILD_REVISION"
-            printf 'This is an unmodified LGPL build of FFmpeg: no GPL and no non-free component is enabled.\n'
-          } > "$stage/SOURCE.txt"
+          cp "$root/src/LICENCE.txt" "$root/src/LICENCES.txt" "$root/src/SOURCE.txt" "$stage/"
 
           # `-X` keeps the owner and group of this runner out of the archive;
           # the entries are stored with `/` separators, which is what the
@@ -747,10 +649,11 @@ jobs:
 
   # ── The release ───────────────────────────────────────────────────────────
 
-  # All six archives in one prerelease, plus the source they were built from,
-  # the recipe that built them and the single checksum list that covers them.
-  # Nothing becomes visible before every file is here, and the tag is derived
-  # from what arrived, so it cannot name a version no artifact implements.
+  # All six archives in one prerelease, plus the sources they were built from,
+  # the licence text, the recipe that built them and the single checksum list
+  # that covers them. Nothing becomes visible before every file is here, and the
+  # tag is derived from what arrived, so it cannot name a version no artifact
+  # implements.
   publish:
     name: Publish the FFmpeg prerelease
     needs: [source, build]
@@ -759,28 +662,40 @@ jobs:
       SOURCE_COMMIT: ${{ needs.source.outputs.commit }}
       SOURCE_HOST: ${{ needs.source.outputs.host }}
     steps:
-      - name: Download the six archives and the source
+      - name: Download the six archives, the eight sources and the licence text
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/dist
           merge-multiple: true
 
-      # One version, six platforms, one source, one line per file — and every
-      # name read back out of what arrived. A leg that failed is missing here,
-      # and a missing archive fails the release instead of being replaced by
-      # another.
+      # One version, six platforms, eight sources and the licence text, one line
+      # per file — and every name read back out of what arrived. A leg that
+      # failed is missing here, and a missing archive fails the release instead
+      # of being replaced by another.
       - name: Assemble SHA256SUMS and check all six arrived
         run: |
           set -euo pipefail
           shopt -s nullglob
           cd "$RUNNER_TEMP/dist"
 
-          sources=(ffmpeg-*-source.tar.gz)
-          if [ "${#sources[@]}" -ne 1 ]; then
-            echo "::error::one source archive was expected, ${#sources[@]} arrived"
+          sources=(*-source.tar.gz)
+          if [ "${#sources[@]}" -ne 8 ]; then
+            echo "::error::eight source archives were expected, ${#sources[@]} arrived"
             exit 1
           fi
-          source_archive="${sources[0]}"
+
+          # ffmpeg's own tree is the one the pair was made from; the other seven
+          # are the libraries linked into it.
+          source_archive=""
+          for source in "${sources[@]}"; do
+            case "$source" in
+              ffmpeg-*-source.tar.gz) source_archive="$source" ;;
+            esac
+          done
+          if [ -z "$source_archive" ]; then
+            echo "::error::no ffmpeg source archive arrived"
+            exit 1
+          fi
 
           # ffmpeg's releases are `<major>.<minor>`, with a third number for a
           # point release, so the version is one or more dotted numbers: the
@@ -794,9 +709,9 @@ jobs:
           revision=""
           count=0
           for archive in "${archives[@]}"; do
-            if [ "$archive" = "$source_archive" ]; then
-              continue
-            fi
+            case "$archive" in
+              *-source.tar.gz) continue ;;
+            esac
             if [[ ! "$archive" =~ $pattern ]]; then
               echo "::error::$archive is not ffmpeg-<version>-mahbot.<revision>-<os>-<arch>.<ext>"
               exit 1
@@ -839,20 +754,65 @@ jobs:
             exit 1
           fi
 
-          # The six lines in a fixed order, then the source: a digest list that
-          # differs only when one of the files does.
+          # The seven libraries, each named by the ref this file pins: a release
+          # that is missing one of them cannot hand on the source of the binary
+          # it publishes.
+          for component in "x264-$X264_REF" "x265-$X265_REF" "libvpx-$VPX_REF" \
+            "opus-$OPUS_REF" "zimg-$ZIMG_REF" "zlib-$ZLIB_REF" "openssl-$OPENSSL_REF"; do
+            name="$component-source.tar.gz"
+            if [ ! -f "$name" ]; then
+              echo "::error::$name did not arrive"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+          if [ ! -f LICENCE.txt ]; then
+            echo "::error::LICENCE.txt did not arrive"
+            exit 1
+          fi
+
+          # The six platform lines in a fixed order, then the sources, then the
+          # licence: a digest list that differs only when one of the files does.
           : > SHA256SUMS
           : > digests.txt
           for platform in "${platforms[@]}"; do
             sha256sum "ffmpeg-$version-mahbot.$revision-$platform.$(extension_of "$platform")" >> SHA256SUMS
           done
           cp SHA256SUMS digests.txt
-          sha256sum "$source_archive" >> SHA256SUMS
+          for source in "${sources[@]}"; do
+            sha256sum "$source" >> SHA256SUMS
+          done
+          sha256sum LICENCE.txt >> SHA256SUMS
           cat SHA256SUMS
 
           echo "VERSION=$version" >> "$GITHUB_ENV"
           echo "REVISION=$revision" >> "$GITHUB_ENV"
-          echo "FFmpeg $version build $revision: six archives, one source, one checksum list"
+          echo "FFmpeg $version build $revision: six archives, eight sources, one checksum list"
+
+      # The layout the product's installer reads out of an archive (`src/ffmpeg/install.rs`):
+      # the pair under `bin/`, the three licence files at the root. The installer refuses a
+      # pair, a licence text or a source note that is missing, and takes the notices only when
+      # the archive carries them — so this check, not the installer, is what catches a leg
+      # that dropped any of the three before the release is published.
+      - name: Check every archive carries the pair and the licence material
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dist"
+          for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64 windows-aarch64; do
+            stem="ffmpeg-$VERSION-mahbot.$REVISION-$platform"
+            exe=""
+            case "$platform" in
+              windows-*) archive="$stem.zip"; exe=.exe; entries=$(unzip -Z1 "$archive") ;;
+              *) archive="$stem.tar.gz"; entries=$(tar -tzf "$archive") ;;
+            esac
+            for entry in "bin/ffmpeg$exe" "bin/ffprobe$exe" LICENCE.txt LICENCES.txt SOURCE.txt; do
+              printf '%s\n' "$entries" | grep -qx "$stem/$entry" || {
+                echo "::error::$archive carries no $entry"
+                exit 1
+              }
+            done
+          done
 
       # The recipe, not the binaries, is what this release promises can be built
       # again. Its sections are the six legs' own writing and its digests are the
@@ -877,9 +837,10 @@ jobs:
             echo "Upstream: FFmpeg, tag $FFMPEG_TAG, commit $SOURCE_COMMIT"
             echo "Clone host: $SOURCE_HOST"
             echo "Source archive: ffmpeg-$VERSION-mahbot.$REVISION-source.tar.gz"
-            echo "Licence: GNU LGPL version 2.1 or later. Configured with --disable-gpl"
-            echo "and --disable-nonfree: no GPL and no non-free component is enabled,"
-            echo "because none is needed by probing, JPEG frames or 16 kHz mono WAV."
+            echo "Licence: GNU GPL version 3, configured with --enable-gpl and"
+            echo "--enable-version3. It links libx264, libx265, libvpx, libopus, zimg,"
+            echo "zlib and OpenSSL (SChannel on Windows), each built from the source"
+            echo "archive of its name published with this release."
             echo "The digests at the end cover the six archives this recipe built."
             echo
             echo "Each section below was written by the machine that ran that leg:"
@@ -902,7 +863,7 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/dist"
           tag="ffmpeg-v$VERSION-mahbot.$REVISION"
-          notes="FFmpeg $VERSION for the product's probe, frame and audio jobs, built from upstream $FFMPEG_TAG ($SOURCE_COMMIT), mahbot build revision $REVISION"
+          notes="GPLv3 FFmpeg $VERSION for the product's video jobs — H.264, HEVC, VP9, Opus, PNG, zscale and https — built natively for macos-x86_64, macos-aarch64, linux-x86_64, linux-aarch64, windows-x86_64 and windows-aarch64 from upstream $FFMPEG_TAG ($SOURCE_COMMIT), mahbot build revision $REVISION"
 
           # An existing release is left alone: a tag names one build, so assets
           # changing under it would hand an installed copy a different one at the
@@ -923,6 +884,14 @@ jobs:
             --notes "$notes" \
             ffmpeg-*.tar.gz \
             ffmpeg-*.zip \
+            x264-*-source.tar.gz \
+            x265-*-source.tar.gz \
+            libvpx-*-source.tar.gz \
+            opus-*-source.tar.gz \
+            zimg-*-source.tar.gz \
+            zlib-*-source.tar.gz \
+            openssl-*-source.tar.gz \
+            LICENCE.txt \
             BUILD-RECIPE.txt \
             SHA256SUMS
 

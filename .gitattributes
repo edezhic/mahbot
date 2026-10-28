@@ -19,3 +19,8 @@
 /assets/docgen/package.json text eol=lf
 /assets/docgen/bun.lock text eol=lf
 /assets/docgen/document-kit.js -text
+
+# The shell scripts are run with `sh` — the ffmpeg release legs run them on Windows
+# too — so a CRLF checkout would break them: their endings are pinned like the prompt
+# texts above.
+/scripts/*.sh text eol=lf

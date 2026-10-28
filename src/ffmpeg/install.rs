@@ -1,28 +1,36 @@
 //! Install and update the product's own build of ffmpeg and ffprobe.
 //!
 //! The pair is built and published by the product itself, in a release stream of
-//! its own: tags prefixed `ffmpeg-v`. That separate stream is what keeps the
-//! product's updater untouched — it reads `releases/latest` and `version.txt`,
-//! which never point at one — while the archives stay downloadable by a plain HTTP
-//! client with no credentials.
+//! its own: prereleases tagged `ffmpeg-v<version>-mahbot.<revision>`. That separate
+//! stream is what keeps the product's updater untouched — it reads
+//! `releases/latest` and `version.txt`, which never point at one — while the
+//! archives stay downloadable by a plain HTTP client with no credentials.
 //!
-//! Every install targets the one version this build of the product pins: nothing
-//! is discovered from a third party, so what runs is what was tested with the call
-//! sites in [`super`]. Integrity comes from the release itself, the way it does for
-//! the product's other managed binaries: the release's `SHA256SUMS` is fetched, and
-//! the archive is checked against the line for that archive. No digest of a release
-//! artefact is carried by this build, so a published release installs as it stands —
-//! and a checksum file rewritten together with its archive is not detected, which is
-//! the price of that.
+//! Nothing about the build is compiled into the product. At start the stream's
+//! listing is read and the newest build it offers for this host is installed,
+//! unless that already is the copy in use, so a build published after this binary
+//! was needs nothing from a release of the product. The newest is the highest
+//! (upstream version, build revision) among the releases that carry this platform's
+//! archive: every one of the six is a real build, and an archive missing from a
+//! release is a failed release, never a substitution.
 //!
-//! All six archives are real builds — one per shipped target, Windows on ARM
-//! included and never the x64 one — so an archive missing from a release is a
-//! failed release and never a substitution. The build is LGPL-only, so its licence
-//! text travels with the binaries.
+//! Integrity comes from the release itself, the way it does for the product's other
+//! managed binaries: the release's `SHA256SUMS` is fetched, and the archive is
+//! checked against the line for that archive. No digest of a release artefact is
+//! carried by this build, so a published release installs as it stands — and a
+//! checksum file rewritten together with its archive is not detected, which is the
+//! price of that.
 //!
-//! The copy in use is the newest one that runs, so a failed install never leaves the
-//! product with nothing to run. A failure names the step that failed and carries no
-//! path and no URL, because it is recorded and shown verbatim.
+//! The build is GPLv3 — upstream ffmpeg with libx264, libx265, libvpx, libopus,
+//! zimg, zlib and OpenSSL (SChannel on Windows, which is the system's own) — so
+//! what travels with the binaries is that licence, the notices of those components
+//! and a `SOURCE.txt` naming the source of every one of them. A build published
+//! before those notices existed installs with the licence and source note it carries
+//! rather than not at all; the notices arrive with the next build taken.
+//!
+//! The copy in use is the newest one that runs: a failed install leaves the host
+//! with whatever it had, and never with nothing. A failure names the step that
+//! failed and carries no path and no URL, because it is recorded and shown verbatim.
 //!
 //! Nothing is written outside the product's own configuration directory — no
 //! directory the owner's package manager owns, and no entry on `PATH`.
@@ -34,44 +42,40 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use semver::Version;
+
 use crate::util::UnwrapPoison;
 use crate::util::managed_bin;
 
-// ── The pin ─────────────────────────────────────────────────────────
-
-/// The release this build of the product pins: upstream ffmpeg 7.1, mahbot build
-/// revision 1, published in the `ffmpeg-v` stream beside the product's own releases.
-///
-/// One tag for every platform. A repair to the build — a patch, a rebuilt
-/// dependency — bumps the revision and publishes a new tag; a published tag is never
-/// re-published, because every copy in the field was installed against it.
-pub(super) const TAG: &str = "ffmpeg-v7.1-mahbot.1";
-
-/// Test hook: a releases base serving the layout the real one does
-/// (`{base}/{tag}/SHA256SUMS`, `{base}/{tag}/{asset}`).
-pub(super) const RELEASES_URL_ENV: &str = "MAHBOT_FFMPEG_RELEASES_URL";
+// ── The stream ──────────────────────────────────────────────────────
 
 /// The tag prefix of this stream, and the marker separating the upstream version
 /// from the build revision inside a tag.
 const TAG_PREFIX: &str = "ffmpeg-v";
 const REVISION_MARKER: &str = "-mahbot.";
 
-/// How long one archive download may take: a pair of static binaries is tens of
-/// megabytes, which is the size the shared large-download policy is written for.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(20);
-
-/// How long the small requests may take — the checksum file alone.
-const SUMS_TIMEOUT: Duration = Duration::from_secs(20);
+/// Test hook: a host answering the way the real pair of hosts does — the listing
+/// at `?per_page=&page=`, and each release's files at `{base}/{tag}/{asset}`.
+pub(super) const RELEASES_URL_ENV: &str = "MAHBOT_FFMPEG_RELEASES_URL";
 
 /// How long a staged binary may take to print its banner: a local file needing
 /// longer than this is a copy that cannot run.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The two files that travel with the binaries: the text of the licence the build
-/// is distributed under, and where that build's source is. A release without them
-/// is a failed install — a licence that does not travel with the binary is not
-/// honoured by shipping the binary alone.
-const LICENCE_FILES: [&str; 2] = ["LICENCE.txt", "SOURCE.txt"];
+/// The stream's listing, named the way every failure about it names it.
+const LISTING_SUBJECT: &str = "the ffmpeg release listing";
+
+/// The text of the licence the build is distributed under, and where that build's source
+/// is. Both have travelled since the stream's first build, so a release without either is
+/// a failed install — a licence that does not travel with the binary is not honoured by
+/// shipping the binary alone.
+const LICENCE_AND_SOURCE: [&str; 2] = ["LICENCE.txt", "SOURCE.txt"];
+
+/// The notices of the libraries linked into the build. Every archive the release job
+/// publishes carries it — that job refuses one that does not — but a build published
+/// before the notices existed carries none, and installing it with the material it has
+/// serves a host better than leaving it with no pair at all until a newer build lands.
+const COMPONENT_NOTICES: &str = "LICENCES.txt";
 
 // ── Naming ──────────────────────────────────────────────────────────
 
@@ -107,6 +111,14 @@ fn parse_tag(name: &str) -> Option<(semver::Version, u32)> {
     ))
 }
 
+/// A build the stream offers: the tag that names its release, and the upstream version
+/// its binaries must report — the tag's own, so an archive carrying another FFmpeg
+/// cannot pass for it.
+struct Build {
+    tag: String,
+    upstream: Version,
+}
+
 /// This host's archive for release `tag`: `ffmpeg-<tag stem>-<os>-<arch>.<ext>`,
 /// the extension being `zip` on Windows and `tar.gz` everywhere else. The stem
 /// comes from the tag, so the archive name and the release it lives under cannot
@@ -136,25 +148,22 @@ fn root() -> Result<PathBuf, String> {
         .map_err(|_| "the product's configuration directory is unavailable".to_string())
 }
 
-/// The copy in use under `root`, with the tag it was found under: the pinned tag
-/// when both its binaries are executable, else the newest usable one by (upstream
-/// version, revision). A directory whose name does not parse, and a directory
-/// holding anything but two executable files, are not copies at all.
-fn chosen(root: &Path) -> Option<(String, Binaries)> {
-    if let Some(binaries) = binaries_at(&root.join(TAG)) {
-        return Some((TAG.to_string(), binaries));
-    }
+/// The copy in use under `root`, with the build its directory is named after: the newest
+/// usable one by (upstream version, build revision). A directory whose name does not
+/// parse, and a directory holding anything but two executable files, are not copies at
+/// all.
+fn chosen(root: &Path) -> Option<(Build, Binaries)> {
     fs::read_dir(root)
         .ok()?
         .flatten()
         .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let tag = parse_tag(&name)?;
+            let tag = entry.file_name().into_string().ok()?;
+            let rank = parse_tag(&tag)?;
             let binaries = binaries_at(&entry.path())?;
-            Some((tag, name, binaries))
+            Some((rank, tag, binaries))
         })
         .max_by(|(left, _, _), (right, _, _)| left.cmp(right))
-        .map(|(_, name, binaries)| (name, binaries))
+        .map(|((upstream, _), tag, binaries)| (Build { tag, upstream }, binaries))
 }
 
 /// The pair at the fixed layout inside `dir`.
@@ -177,154 +186,234 @@ fn binaries_at(dir: &Path) -> Option<Binaries> {
 // ── Installation ────────────────────────────────────────────────────
 
 /// Holds the one install in flight, so the boot install and a first use never run
-/// beside each other and a queued caller re-checks instead of downloading the same
-/// release again.
+/// beside each other.
 static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The copy in use: the pinned pair when this host has one that reports the pinned
-/// version, and otherwise whatever installing that leaves.
-///
-/// The one path both entry points take — the boot task and every video operation —
-/// so every attempt is behind [`INSTALLING`] and no step can run beside another.
-/// Safe from anywhere: every step before the final rename leaves the host exactly as
-/// it was, and a copy already in place is never touched.
-///
-/// A failed attempt stands for the rest of the process, so no video file pays a
-/// network round-trip for it: the next start is what tries again.
-pub(super) async fn ensure_installed() -> Result<Binaries, String> {
-    let root = root()?;
-    if let Some(binaries) = verified_pin(&root).await {
-        return Ok(binaries);
-    }
-    let _installing = INSTALLING.lock().await;
-    // The caller that held the lock may have done the work while this one waited.
-    if let Some(binaries) = verified_pin(&root).await {
-        return Ok(binaries);
-    }
-    let reason = match attempt_failure() {
-        Some(reason) => reason,
-        None => match install(&root).await {
-            Ok(binaries) => {
-                tracing::info!("ffmpeg {TAG} installed");
-                return Ok(binaries);
-            }
-            Err(reason) => {
-                *ATTEMPT_FAILURE.lock().unwrap_poison() = Some(reason.clone());
-                reason
-            }
-        },
-    };
-    fallback(&root, &reason)
-}
-
-/// The pair at the pinned path, when it reports the pinned version — the only copy
-/// this product calls the pinned build. A pair that is there and reports something
-/// else is not one: [`ensure_installed`] installs over it, and [`fallback`] says what
-/// is left when that cannot be done.
-async fn verified_pin(root: &Path) -> Option<Binaries> {
-    let binaries = binaries_at(&root.join(TAG))?;
-    verified(&binaries).await.then_some(binaries)
-}
-
-/// What the pair at the pinned path reported about itself, asked once per process:
-/// only an install by this product changes the answer.
-static PINNED_VERIFIED: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
-
-/// Whether both binaries of the pair run and report the pinned upstream version.
-async fn verified(binaries: &Binaries) -> bool {
-    if let Some(verified) = *PINNED_VERIFIED.lock().unwrap_poison() {
-        return verified;
-    }
-    let Some(pinned) = upstream_parts(TAG) else {
-        return false;
-    };
-    let verified = reports_upstream(&binaries.ffmpeg, pinned).await
-        && reports_upstream(&binaries.ffprobe, pinned).await;
-    *PINNED_VERIFIED.lock().unwrap_poison() = Some(verified);
-    verified
-}
-
-/// Why this process's install attempt failed, when one did.
+/// Why this process's attempt at the stream failed, when one did.
 static ATTEMPT_FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// The recorded reason the pinned release cannot be installed in this process, if it
-/// is known.
-fn attempt_failure() -> Option<String> {
-    ATTEMPT_FAILURE.lock().unwrap_poison().clone()
+/// Run `attempt` as the one install in flight, so the caller that waited re-reads what is
+/// in use instead of downloading what the winner already placed.
+async fn installing<T, E>(attempt: impl AsyncFnOnce() -> Result<T, E>) -> Result<T, E> {
+    let _queue = INSTALLING.lock().await;
+    attempt().await
 }
 
-/// What is left once the pin cannot be installed: the newest copy that runs — said
-/// once, and never called the pinned one unless it is — or the reason nothing can be
-/// run.
-fn fallback(root: &Path, reason: &str) -> Result<Binaries, String> {
-    match chosen(root) {
-        // A copy that runs is what the product works with: one revision behind, or even
-        // one that does not report the pinned build, beats having nothing to run.
-        Some((tag, binaries)) => {
-            if first_time(&tag) {
-                if tag == TAG {
-                    tracing::warn!(
-                        "the copy installed as {TAG} is not the pinned build and could not be \
-                         replaced (retried on the next start): {reason}"
-                    );
-                } else {
-                    tracing::warn!(
-                        "ffmpeg is running {tag}, not the pinned {TAG}, which could not be \
-                         installed (retried on the next start): {reason}"
-                    );
-                }
-            }
-            Ok(binaries)
+/// The copy a video operation runs: whatever pair is in use, and — when there is
+/// none — the newest build the stream offers, installed first.
+///
+/// A copy already in place is used as it stands, with no proof and no network round-trip:
+/// it was proved before it was placed, and the boot task is what re-proves it — a pair
+/// damaged after that proof keeps serving video until the next start. Installing is behind
+/// [`installing`], so a first use never runs beside the boot task's own install, and the
+/// loser of that race re-checks before downloading anything.
+///
+/// A failed attempt stands for the rest of the process, so no further video file
+/// pays for it: the next start is what tries again.
+pub(super) async fn ensure_installed() -> Result<Binaries, String> {
+    let root = root()?;
+    if let Some((_, binaries)) = chosen(&root) {
+        return Ok(binaries);
+    }
+    let tag = installing(async || {
+        // The caller that held the lock may have installed a copy while this one
+        // waited.
+        if let Some((build, _)) = chosen(&root) {
+            return Ok(build.tag);
         }
-        None => Err(reason.to_string()),
-    }
+        if let Some(reason) = ATTEMPT_FAILURE.lock().unwrap_poison().clone() {
+            return Err(reason);
+        }
+        let build = newest().await.map_err(recorded)?;
+        install(&root, &build).await.map_err(recorded)?;
+        Ok(build.tag)
+    })
+    .await?;
+    Ok(binaries_in(&root.join(tag)))
 }
 
-/// Whether this state is news: one line per copy in use, not one per video, because a
-/// daemon that keeps running it asks about every file it processes.
-fn first_time(state: &str) -> bool {
-    static REPORTED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    let mut reported = REPORTED.lock().unwrap_poison();
-    if reported.as_deref() == Some(state) {
-        return false;
-    }
-    *reported = Some(state.to_string());
-    true
+/// What the host is running, proved once per start and carried into the failure line.
+#[derive(Debug)]
+enum Standing {
+    /// A copy that runs, exits clean and reports the build its directory is named after.
+    Working(String),
+    /// A copy that does not: damaged, half-written, or another build under that name.
+    Damaged(String),
+    /// No copy at all.
+    Missing,
 }
 
-/// The boot task: install the pin when this host does not have it, called once by the
-/// binary and never failing the boot.
-///
-/// Nothing is looked up first — the version is compile-time, so the only question is
-/// whether this host has it — and there is no retry of its own: a failure is left to
-/// the next start, and every use in this process answers from the record.
+/// A start that failed: the step that failed, and what the host is left running.
+#[derive(Debug)]
+struct Failure {
+    reason: String,
+    standing: Standing,
+}
+
+/// The boot task: bring this host to the newest build the stream offers, called once
+/// by the binary and never failing the boot.
 pub async fn install_on_start() {
-    if let Err(reason) = ensure_installed().await {
-        tracing::warn!("ffmpeg {TAG} could not be installed (retried on the next start): {reason}");
+    match update().await {
+        Ok(None) => tracing::debug!("ffmpeg needs nothing at this start"),
+        Ok(Some(tag)) => tracing::info!("ffmpeg {tag} installed"),
+        Err(failure) => report_failure(&failure),
     }
 }
 
-/// Download, verify, prove and place this build's pair, then prune what is older.
+/// The one WARN line a failed start leaves, stating what the host is left running and
+/// naming the step that failed.
+fn report_failure(failure: &Failure) {
+    let reason = &failure.reason;
+    match &failure.standing {
+        Standing::Damaged(tag) => tracing::warn!(
+            "ffmpeg {tag} is damaged and could not be replaced (retried on the next \
+             start): {reason}"
+        ),
+        Standing::Working(tag) => tracing::warn!(
+            "ffmpeg is running {tag}; the newest build is not installed (retried on the \
+             next start): {reason}"
+        ),
+        Standing::Missing => {
+            tracing::warn!("ffmpeg is not installed (retried on the next start): {reason}");
+        }
+    }
+}
+
+/// What the host runs now, proved with two local `-version` runs and no network.
+async fn standing(root: &Path) -> Standing {
+    match chosen(root) {
+        Some((in_use, binaries)) if proves_itself(&binaries, &in_use.upstream).await => {
+            Standing::Working(in_use.tag)
+        }
+        Some((in_use, _)) => Standing::Damaged(in_use.tag),
+        None => Standing::Missing,
+    }
+}
+
+/// Install the newest build the stream offers unless the copy in use already is it and
+/// still proves itself. `Ok(None)` is nothing to do; `Ok(Some(tag))` names what was
+/// installed.
 ///
-/// Runs only under [`INSTALLING`] — with one attempt at a time the download
-/// directory and the staging beside it are this attempt's own — and returns the
-/// pair the placed directory now holds.
+/// A stream that cannot be read is not a failure for a host whose copy proves itself: it
+/// runs the build it is named after, and the next start that can read the listing takes
+/// whatever newer build it offers.
+async fn update() -> Result<Option<String>, Failure> {
+    let root = root().map_err(|reason| Failure {
+        reason,
+        standing: Standing::Missing,
+    })?;
+    installing(async || {
+        let current = standing(&root).await;
+        let build = match newest().await {
+            Ok(build) => build,
+            Err(reason) => {
+                return match current {
+                    Standing::Working(tag) => {
+                        tracing::debug!("keeping ffmpeg {tag}: {reason}");
+                        Ok(None)
+                    }
+                    other => Err(Failure {
+                        reason: recorded(reason),
+                        standing: other,
+                    }),
+                };
+            }
+        };
+        if let Standing::Working(tag) = &current
+            && tag == &build.tag
+        {
+            return Ok(None);
+        }
+        install(&root, &build).await.map_err(|reason| Failure {
+            reason: recorded(reason),
+            standing: current,
+        })?;
+        Ok(Some(build.tag))
+    })
+    .await
+}
+
+/// Whether this pair is still the build it is named after: both binaries run, exit clean
+/// and report `upstream`. Two local `-version` runs and no network — the check a directory
+/// name cannot give, and what replaces a pair damaged after it was placed instead of
+/// failing every job that runs it.
+async fn proves_itself(binaries: &Binaries, upstream: &Version) -> bool {
+    reports_upstream(&binaries.ffmpeg, upstream).await
+        && reports_upstream(&binaries.ffprobe, upstream).await
+}
+
+/// Record a failed attempt, so no later operation in this process pays for it again.
+fn recorded(reason: String) -> String {
+    *ATTEMPT_FAILURE.lock().unwrap_poison() = Some(reason.clone());
+    reason
+}
+
+/// The newest build the stream offers for this host: the highest (upstream version,
+/// build revision) among the releases that carry this platform's archive.
+///
+/// Every page of the listing is read before the answer is given, because its order
+/// is publication, not version: a repair of an older line is published after the
+/// newer line exists. The one thing this cannot pick is a release that exists
+/// without this platform's archive — a failed release, never a substitution.
+async fn newest() -> Result<Build, String> {
+    let (os, arch) = managed_bin::host_os_arch()?;
+    let base = stream_url("https://api.github.com/repos", "releases");
+    let mut newest: Option<((Version, u32), String)> = None;
+    for page in 1..=managed_bin::LISTING_PAGES {
+        let releases = managed_bin::release_page(&base, page, LISTING_SUBJECT)
+            .await?
+            .ok_or_else(|| {
+                format!("{LISTING_SUBJECT} could not be read: it is not a JSON array")
+            })?;
+        for release in &releases {
+            let Some(tag) = release["tag_name"].as_str() else {
+                continue;
+            };
+            let Some(rank) = parse_tag(tag) else {
+                continue;
+            };
+            let asset = asset_name(tag, os, arch);
+            let carries_ours = release["assets"]
+                .as_array()
+                .is_some_and(|assets| assets.iter().any(|a| a["name"].as_str() == Some(&asset)));
+            if !carries_ours || newest.as_ref().is_some_and(|(best, _)| best >= &rank) {
+                continue;
+            }
+            newest = Some((rank, tag.to_string()));
+        }
+        if releases.len() < managed_bin::LISTING_PAGE_SIZE {
+            break;
+        }
+    }
+    let ((upstream, _), tag) =
+        newest.ok_or_else(|| format!("no ffmpeg build is published for {os}-{arch}"))?;
+    Ok(Build { tag, upstream })
+}
+
+/// Download, verify, prove and place the build's pair, then leave that copy as the only
+/// one under the root.
+///
+/// Runs only as the process's one install ([`installing`]): with one attempt at a time
+/// the download directory and the staging beside it are this attempt's own.
 ///
 /// The order is what makes a failure harmless: this platform's line in the release's
 /// checksum file is read before anything is downloaded, the archive is verified as it
 /// streams, and the pair is proven to run before the directory is renamed into place.
-async fn install(root: &Path) -> Result<Binaries, String> {
+async fn install(root: &Path, build: &Build) -> Result<(), String> {
     use crate::util::http::{DownloadSizeCheck, download_verified};
 
     let (os, arch) = managed_bin::host_os_arch()?;
-    let asset = asset_name(TAG, os, arch);
-    let base = releases_url();
-    let Some(pinned) = upstream_parts(TAG) else {
-        return Err(format!("{TAG} does not name an upstream version"));
-    };
+    let tag = &build.tag;
+    let asset = asset_name(tag, os, arch);
+    let base = stream_url("https://github.com", "releases/download");
 
-    let sums = fetch_sums(&format!("{base}/{TAG}/SHA256SUMS")).await?;
-    let digest = archive_digest(&sums, &asset)?;
+    let sums = managed_bin::fetch_sha256_sums(
+        &format!("{base}/{tag}/SHA256SUMS"),
+        "the release's checksum file",
+    )
+    .await?;
+    let digest = managed_bin::sha256_for(&sums, &asset)
+        .ok_or_else(|| "the release carries no checksum for this platform's archive".to_string())?;
 
     let downloads = root.join("downloads");
     let _ = fs::remove_dir_all(&downloads);
@@ -332,8 +421,8 @@ async fn install(root: &Path) -> Result<Binaries, String> {
         .map_err(|e| format!("the download directory could not be created ({})", e.kind()))?;
     let archive = downloads.join(&asset);
     download_verified(
-        client()?,
-        &format!("{base}/{TAG}/{asset}"),
+        managed_bin::download_client()?,
+        &format!("{base}/{tag}/{asset}"),
         &archive,
         &digest,
         None,
@@ -360,88 +449,32 @@ async fn install(root: &Path) -> Result<Binaries, String> {
     let _ = fs::remove_dir_all(&downloads);
 
     for (name, tool) in [("ffmpeg", ffmpeg_file()), ("ffprobe", ffprobe_file())] {
-        if !reports_upstream(&staging.path().join("bin").join(tool), pinned).await {
+        if !reports_upstream(&staging.path().join("bin").join(tool), &build.upstream).await {
             return Err(format!(
-                "the downloaded {name} could not run, or does not report ffmpeg {}.{}",
-                pinned.0, pinned.1
+                "the downloaded {name} could not run, or does not report ffmpeg {}",
+                build.upstream
             ));
         }
     }
-    let installed = root.join(TAG);
-    place(staging.path(), &installed)?;
-    prune(root);
-    // Both banners were just read: the pair in place is the pinned build.
-    *PINNED_VERIFIED.lock().unwrap_poison() = Some(true);
-    Ok(binaries_in(&installed))
+    place(staging.path(), &root.join(tag))?;
+    prune(root, tag);
+    Ok(())
 }
 
-/// The releases base this stream's assets live under: the product's own release
-/// host, or the test hook's stand-in.
-fn releases_url() -> String {
-    if let Ok(base) = std::env::var(RELEASES_URL_ENV) {
-        return base.trim_end_matches('/').to_string();
+/// One of this stream's two base URLs on the product's own release host — the repository's
+/// `releases/download` for the assets, its API `releases` for the listing — or the test
+/// hook's stand-in, which answers both with one base.
+fn stream_url(host: &str, path: &str) -> String {
+    match std::env::var(RELEASES_URL_ENV) {
+        Ok(base) => base.trim_end_matches('/').to_string(),
+        Err(_) => format!("{host}/{}/{path}", managed_bin::release_repo()),
     }
-    let repo = crate::self_update::RELEASE_REPO
-        .trim_start_matches("https://github.com/")
-        .trim_end_matches('/');
-    format!("https://github.com/{repo}/releases/download")
 }
 
-/// The client every request here runs on: the shared large-download client, whose
-/// total bound and connect timeout are the policy for an artifact of this size.
-/// One client per process — it owns the connection pool.
-fn client() -> Result<&'static reqwest::Client, String> {
-    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            crate::util::http::build_download_client(DOWNLOAD_TIMEOUT)
-                .map_err(|_| "the release client could not be built".to_string())
-        })
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-/// The release's `SHA256SUMS` body, the file every digest is read out of.
-async fn fetch_sums(url: &str) -> Result<String, String> {
-    let response = client()?
-        .get(url)
-        .timeout(SUMS_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "the release's checksum file could not be fetched: {}",
-                managed_bin::request_reason(&e)
-            )
-        })?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "the release's checksum file could not be fetched: HTTP {}",
-            response.status()
-        ));
-    }
-    response.text().await.map_err(|e| {
-        format!(
-            "the release's checksum file could not be read: {}",
-            managed_bin::request_reason(&e)
-        )
-    })
-}
-
-/// The digest `asset` must have, read out of the release's `SHA256SUMS` body: the
-/// line for this platform's archive. A body without one installs nothing, so no
-/// other platform's archive is ever substituted.
-fn archive_digest(body: &str, asset: &str) -> Result<String, String> {
-    body.lines()
-        .filter_map(managed_bin::parse_sha256_sidecar)
-        .find(|(_, name)| name == asset)
-        .map(|(digest, _)| digest)
-        .ok_or_else(|| "the release carries no checksum for this platform's archive".to_string())
-}
-
-/// Unpack one release archive into `staging` in one pass: the two binaries under
-/// `bin/`, the licence pair at the root — exactly the layout [`binaries_at`] reads.
+/// Unpack one release archive into `staging` in a single pass: the two binaries under
+/// `bin/`, the licence material at the root — exactly the layout [`binaries_at`] reads.
+/// The notices are taken when the archive carries them and are not required: the pair is
+/// already staged, so a build from before the notices existed still installs.
 fn extract_into(archive: &Path, staging: &Path) -> Result<(), String> {
     let bin_dir = staging.join("bin");
     fs::create_dir_all(&bin_dir).map_err(|e| {
@@ -450,14 +483,16 @@ fn extract_into(archive: &Path, staging: &Path) -> Result<(), String> {
             e.kind()
         )
     })?;
-    let names = [
-        ffmpeg_file(),
-        ffprobe_file(),
-        LICENCE_FILES[0],
-        LICENCE_FILES[1],
-    ];
-    let paths = extract(archive, staging, &names)?;
-    for (name, path) in [ffmpeg_file(), ffprobe_file()].into_iter().zip(&paths) {
+    let tools = [ffmpeg_file(), ffprobe_file()];
+    // The tools come first in `required`, in this order: `extract` returns their paths in
+    // the same order.
+    let required = tools
+        .iter()
+        .copied()
+        .chain(LICENCE_AND_SOURCE)
+        .collect::<Vec<_>>();
+    let paths = extract(archive, staging, &required, &[COMPONENT_NOTICES])?;
+    for (name, path) in tools.into_iter().zip(&paths) {
         managed_bin::set_executable(path)?;
         fs::rename(path, bin_dir.join(name))
             .map_err(|e| format!("the staged copy could not be arranged ({})", e.kind()))?;
@@ -465,50 +500,48 @@ fn extract_into(archive: &Path, staging: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Extract `names` out of `archive` into `dir`, whichever container this
-/// platform's release uses.
-fn extract(archive: &Path, dir: &Path, names: &[&str]) -> Result<Vec<PathBuf>, String> {
+/// Extract `required` and `optional` out of `archive` into `dir`, whichever container
+/// this platform's release uses.
+fn extract(
+    archive: &Path,
+    dir: &Path,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<Vec<PathBuf>, String> {
     if archive.extension().and_then(OsStr::to_str) == Some("zip") {
-        managed_bin::extract_named_files_zip(archive, dir, names)
+        managed_bin::extract_named_files_zip(archive, dir, required, optional)
     } else {
-        managed_bin::extract_named_files_tar_gz(archive, dir, names)
+        managed_bin::extract_named_files_tar_gz(archive, dir, required, optional)
     }
 }
 
-/// The `major.minor` `tag` pins, which is all a banner spells out — and `None` for a
-/// tag that does not parse, so an unreadable expectation verifies nothing.
-fn upstream_parts(tag: &str) -> Option<(u64, u64)> {
-    parse_tag(tag).map(|(version, _)| (version.major, version.minor))
-}
-
-/// The `major.minor` the first line of a `-version` banner claims: the product's
-/// own build reports a plain `7.1`, a vendor's `7.1-static` reads as 7.1 too, and
-/// both are the upstream version the pin is about.
-fn banner_version(stdout: &[u8]) -> Option<(u64, u64)> {
+/// The upstream version the first line of a `-version` banner claims, at the whole
+/// version a tag names: the product's own build reports `7.1.3`, a vendor's
+/// `7.1.3-static` reads as `7.1.3` too, and a build that spells only `7.1` is 7.1.0 —
+/// the same version an `ffmpeg-v7.1-…` tag names.
+fn banner_version(stdout: &[u8]) -> Option<Version> {
     let text = String::from_utf8_lossy(stdout);
     let line = text.lines().next()?;
     let token = line
         .split_whitespace()
         .skip_while(|word| *word != "version")
         .nth(1)?;
-    let version = token.split_once('-').map_or(token, |(head, _)| head);
-    let version = managed_bin::parse_short_version(version)?;
-    Some((version.major, version.minor))
+    managed_bin::parse_short_version(token.split_once('-').map_or(token, |(head, _)| head))
 }
 
-/// Whether `bin` runs, exits clean and reports `pinned` — the proof no checksum can
+/// Whether `bin` runs, exits clean and reports `upstream` — the proof no checksum can
 /// give, that the file is the expected build and that it can execute on this host.
-async fn reports_upstream(bin: &Path, pinned: (u64, u64)) -> bool {
+async fn reports_upstream(bin: &Path, upstream: &Version) -> bool {
     let Ok(output) = super::run_tool(bin, &["-version".into()], VERSION_TIMEOUT).await else {
         return false;
     };
-    output.success && banner_version(&output.stdout) == Some(pinned)
+    output.success && banner_version(&output.stdout).as_ref() == Some(upstream)
 }
 
 /// Move `staging` to `final_dir` in one step, so a half-installed directory can
-/// never stand where a whole one did: an existing directory — unusable, since
-/// [`chosen`] did not pick it — is moved aside by the crate's own swap, which also
-/// puts it back when the swap itself fails.
+/// never stand where a whole one did. An existing directory — a copy that failed its
+/// proof, or what a failed install left behind — is moved aside by the crate's own swap,
+/// which also puts it back when the swap itself fails.
 fn place(staging: &Path, final_dir: &Path) -> Result<(), String> {
     if !final_dir.exists() {
         return fs::rename(staging, final_dir)
@@ -517,27 +550,23 @@ fn place(staging: &Path, final_dir: &Path) -> Result<(), String> {
     managed_bin::rename_aside_swap(staging, final_dir)
 }
 
-/// Leave nothing this install made and no longer needs: a tag directory strictly
-/// older than the pin — never the pinned one, never a newer one — plus every
-/// leftover that is not a copy at all (an attempt's staging, its aside, the
+/// Leave nothing this install made and no longer needs: every copy but the one just
+/// installed — an older one, and a newer one the stream no longer offers or that failed
+/// to prove itself, which [`chosen`] would otherwise keep picking over the one just proved
+/// — plus every leftover that is not a copy at all (an attempt's staging, its aside, the
 /// download, a name from another layout).
 ///
 /// Infallible in effect: each removal is best effort, so a file another process is
-/// using can never fail an install that already succeeded.
-fn prune(root: &Path) {
-    let Some(pinned) = parse_tag(TAG) else {
-        return;
-    };
+/// using can never fail an install that already succeeded. On Windows that is also
+/// what a copy a running operation still holds looks like: it stays until a later
+/// start.
+fn prune(root: &Path, tag: &str) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        // A name that parses is a copy, and the pin or anything newer stays.
-        if parse_tag(name).is_some_and(|tag| tag >= pinned) {
+        if name == OsStr::new(tag) {
             continue;
         }
         let path = entry.path();
@@ -559,12 +588,31 @@ mod tests {
         io::Read as _,
         net::{TcpListener, TcpStream},
         sync::{
-            Arc, LazyLock, Mutex,
+            Arc, Mutex,
             atomic::{AtomicBool, Ordering},
         },
     };
 
     use super::*;
+    #[cfg(unix)]
+    use crate::ffmpeg::ReleasesHook;
+
+    /// The environment lock [`ReleasesHook`] needs, held for the caller's scope. A
+    /// `MutexGuard` binding cannot be held across an await point, and this one must outlive
+    /// the awaits around the hook it guards, so it travels inside a struct.
+    #[cfg(unix)]
+    #[must_use]
+    struct EnvHeld {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// Holds the environment lock for as long as the returned value lives.
+    #[cfg(unix)]
+    fn env_held() -> EnvHeld {
+        EnvHeld {
+            _lock: crate::util::test::env_lock().lock().unwrap_poison(),
+        }
+    }
 
     /// A tag directory holding two executable files, the way an install leaves it.
     fn install_fake(root: &Path, tag: &str) -> PathBuf {
@@ -576,6 +624,15 @@ mod tests {
             managed_bin::set_executable(&path).expect("make executable");
         }
         root.join(tag)
+    }
+
+    /// The build a tag names, for the checks that drive [`install`] and the banner.
+    fn build(tag: &str) -> Build {
+        let (upstream, _) = parse_tag(tag).expect("a parsable tag");
+        Build {
+            tag: tag.to_string(),
+            upstream,
+        }
     }
 
     #[test]
@@ -597,35 +654,36 @@ mod tests {
 
     #[test]
     fn every_platform_gets_its_own_archive() {
+        let tag = "ffmpeg-v7.1-mahbot.2";
         assert_eq!(
-            asset_name(TAG, "macos", "aarch64"),
-            "ffmpeg-7.1-mahbot.1-macos-aarch64.tar.gz"
+            asset_name(tag, "macos", "aarch64"),
+            "ffmpeg-7.1-mahbot.2-macos-aarch64.tar.gz"
         );
         assert_eq!(
-            asset_name(TAG, "macos", "x86_64"),
-            "ffmpeg-7.1-mahbot.1-macos-x86_64.tar.gz"
+            asset_name(tag, "macos", "x86_64"),
+            "ffmpeg-7.1-mahbot.2-macos-x86_64.tar.gz"
         );
         assert_eq!(
-            asset_name(TAG, "linux", "aarch64"),
-            "ffmpeg-7.1-mahbot.1-linux-aarch64.tar.gz"
+            asset_name(tag, "linux", "aarch64"),
+            "ffmpeg-7.1-mahbot.2-linux-aarch64.tar.gz"
         );
         assert_eq!(
-            asset_name(TAG, "linux", "x86_64"),
-            "ffmpeg-7.1-mahbot.1-linux-x86_64.tar.gz"
+            asset_name(tag, "linux", "x86_64"),
+            "ffmpeg-7.1-mahbot.2-linux-x86_64.tar.gz"
         );
         assert_eq!(
-            asset_name(TAG, "windows", "x86_64"),
-            "ffmpeg-7.1-mahbot.1-windows-x86_64.zip"
+            asset_name(tag, "windows", "x86_64"),
+            "ffmpeg-7.1-mahbot.2-windows-x86_64.zip"
         );
         // Windows on ARM is its own build, never the x64 one.
         assert_eq!(
-            asset_name(TAG, "windows", "aarch64"),
-            "ffmpeg-7.1-mahbot.1-windows-aarch64.zip"
+            asset_name(tag, "windows", "aarch64"),
+            "ffmpeg-7.1-mahbot.2-windows-aarch64.zip"
         );
     }
 
     #[test]
-    fn the_pinned_copy_wins_and_an_absent_pin_falls_back_to_the_newest() {
+    fn the_newest_copy_on_disk_is_the_one_in_use() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         install_fake(root, "ffmpeg-v6.0-mahbot.1");
@@ -634,9 +692,10 @@ mod tests {
         fs::create_dir_all(root.join(".staging-Kd7x2p")).expect("create staging");
         fs::create_dir(root.join("not-a-tag")).expect("create junk directory");
 
-        // No pinned copy yet: the newest usable one, by (upstream, revision).
-        let (tag, binaries) = chosen(root).expect("a copy is in use");
-        assert_eq!(tag, "ffmpeg-v7.2-mahbot.1");
+        // The newest by (upstream version, build revision): neither a staging
+        // directory nor a name from another layout is a copy.
+        let (build, binaries) = chosen(root).expect("a copy is in use");
+        assert_eq!(build.tag, "ffmpeg-v7.2-mahbot.1");
         assert_eq!(
             binaries.ffmpeg,
             root.join("ffmpeg-v7.2-mahbot.1")
@@ -644,53 +703,54 @@ mod tests {
                 .join(ffmpeg_file())
         );
 
-        // The pin appears: it is used although a newer build is installed.
-        let pinned = install_fake(root, TAG);
-        let (tag, binaries) = chosen(root).expect("a copy is in use");
-        assert_eq!(tag, TAG);
-        assert_eq!(binaries.ffprobe, pinned.join("bin").join(ffprobe_file()));
+        // A newer revision of the same upstream wins over the older one.
+        install_fake(root, "ffmpeg-v7.2-mahbot.2");
+        assert_eq!(
+            chosen(root).expect("a copy is in use").0.tag,
+            "ffmpeg-v7.2-mahbot.2"
+        );
 
         // A tagged directory holding one binary is not a copy.
-        fs::remove_file(pinned.join("bin").join(ffprobe_file())).expect("remove ffprobe");
+        let broken = root.join("ffmpeg-v7.2-mahbot.2");
+        fs::remove_file(broken.join("bin").join(ffprobe_file())).expect("remove ffprobe");
         assert_eq!(
-            chosen(root).expect("a copy is in use").0,
+            chosen(root).expect("a copy is in use").0.tag,
             "ffmpeg-v7.2-mahbot.1"
         );
 
         // A newer upstream wins over a newer revision of an older one.
-        fs::remove_dir_all(root.join("ffmpeg-v7.2-mahbot.1")).expect("remove newer");
-        fs::remove_dir_all(&pinned).expect("remove pinned");
+        fs::remove_dir_all(root.join("ffmpeg-v7.2-mahbot.1")).expect("remove the newer build");
         assert_eq!(
-            chosen(root).expect("a copy is in use").0,
+            chosen(root).expect("a copy is in use").0.tag,
             "ffmpeg-v7.1-mahbot.0"
         );
     }
 
     #[test]
-    fn pruning_keeps_the_pin_and_anything_newer() {
+    fn pruning_leaves_only_the_copy_just_installed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         for tag in [
             "ffmpeg-v6.0-mahbot.1",
             "ffmpeg-v7.1-mahbot.0",
-            TAG,
-            "ffmpeg-v7.2-mahbot.1",
+            "ffmpeg-v7.1-mahbot.2",
         ] {
             install_fake(root, tag);
         }
         fs::create_dir_all(root.join(".staging-Kd7x2p")).expect("create staging");
         fs::create_dir_all(root.join("downloads")).expect("create downloads");
 
-        prune(root);
-
-        assert!(root.join(TAG).exists(), "the pin stays");
+        // A copy newer than the one installed goes too: it is one the stream no longer
+        // offers or one that failed to prove itself, and `chosen` would keep picking it
+        // over the copy just proved — a download on every start that never converges.
+        prune(root, "ffmpeg-v7.1-mahbot.0");
         assert!(
-            root.join("ffmpeg-v7.2-mahbot.1").exists(),
-            "a newer copy stays"
+            root.join("ffmpeg-v7.1-mahbot.0").exists(),
+            "the installed copy stays"
         );
         for gone in [
             "ffmpeg-v6.0-mahbot.1",
-            "ffmpeg-v7.1-mahbot.0",
+            "ffmpeg-v7.1-mahbot.2",
             ".staging-Kd7x2p",
             "downloads",
         ] {
@@ -699,66 +759,53 @@ mod tests {
     }
 
     #[test]
-    fn the_sums_body_must_carry_this_archive() {
-        let archive = "ffmpeg-7.1-mahbot.1-macos-aarch64.tar.gz";
-        let digest = "0123456789abcdef".repeat(4);
-        let body = format!("{digest}  {archive}\n{}  LICENCE.txt\n", "f".repeat(64));
-
-        assert_eq!(
-            archive_digest(&body, archive).expect("this archive's line"),
-            digest
-        );
-
-        // The body without this platform's line is refused: no other archive stands in.
-        let reason = archive_digest(&body, "ffmpeg-7.1-mahbot.1-windows-aarch64.zip")
-            .expect_err("a body without this archive is refused");
-        assert!(reason.contains("no checksum for this platform"), "{reason}");
-    }
-
-    #[test]
     fn the_banner_names_the_upstream_version() {
+        let tagged = build("ffmpeg-v7.1.3-mahbot.2");
         assert_eq!(
-            upstream_parts(TAG),
-            Some((7, 1)),
-            "the pinned tag names the version every banner is compared against"
+            tagged.upstream,
+            Version::new(7, 1, 3),
+            "the tag names the version every banner is compared against"
         );
         // What the release's own build prints: upstream's banner carries the
         // upstream version and nothing of the product's revision.
         assert_eq!(
-            banner_version(b"ffmpeg version 7.1 Copyright (c) 2000-2024 the FFmpeg developers\n"),
-            Some((7, 1))
+            banner_version(b"ffmpeg version 7.1.3 Copyright (c) 2000-2024 the FFmpeg developers\n"),
+            Some(tagged.upstream.clone())
         );
         // A vendor's suffix is not part of the version.
         assert_eq!(
-            banner_version(b"ffprobe version 7.1-static Copyright (c) 2000-2024\n"),
-            Some((7, 1))
+            banner_version(b"ffprobe version 7.1.3-static Copyright (c) 2000-2024\n"),
+            Some(tagged.upstream)
         );
+        // A banner spelling only `major.minor` carries no patch to read.
         assert_eq!(
-            banner_version(b"ffmpeg version 6.0 Copyright\n"),
-            Some((6, 0))
+            banner_version(b"ffmpeg version 7.1 Copyright\n"),
+            Some(Version::new(7, 1, 0))
         );
         assert_eq!(banner_version(b"nothing to see\n"), None);
         assert_eq!(banner_version(b""), None);
     }
 
-    /// The four entries a release archive carries: the pair under `bin/` inside a
-    /// vendor directory, the licence pair at the root.
-    fn release_entries() -> Vec<(String, &'static [u8])> {
+    /// The entries a release archive carries: the pair under `bin/` inside a vendor
+    /// directory, the licence material at the root. The stand-in binaries print the
+    /// upstream version the tag names, so the pair is provable the way a real build is.
+    fn release_entries(tag: &str) -> Vec<(String, Vec<u8>)> {
+        let upstream = parse_tag(tag).expect("a parsable tag").0;
+        let script =
+            format!("#!/bin/sh\necho 'ffmpeg version {upstream} stand-in build'\n").into_bytes();
         vec![
+            (format!("pkg/bin/{}", ffmpeg_file()), script.clone()),
+            (format!("pkg/bin/{}", ffprobe_file()), script),
+            ("LICENCE.txt".to_string(), b"GPLv3".to_vec()),
             (
-                format!("pkg/bin/{}", ffmpeg_file()),
-                b"FFMPEG" as &'static [u8],
+                "LICENCES.txt".to_string(),
+                b"x264: GPL-2.0-or-later\n".to_vec(),
             ),
-            (
-                format!("pkg/bin/{}", ffprobe_file()),
-                b"FFPROBE" as &'static [u8],
-            ),
-            ("LICENCE.txt".to_string(), b"LGPL"),
-            ("SOURCE.txt".to_string(), b"upstream source"),
+            ("SOURCE.txt".to_string(), b"upstream source".to_vec()),
         ]
     }
 
-    fn write_tar_gz(path: &Path, entries: &[(String, &'static [u8])]) {
+    fn write_tar_gz(path: &Path, entries: &[(String, Vec<u8>)]) {
         let encoder = flate2::write::GzEncoder::new(
             fs::File::create(path).expect("create archive"),
             flate2::Compression::default(),
@@ -770,7 +817,7 @@ mod tests {
             header.set_mode(0o644);
             header.set_entry_type(tar::EntryType::Regular);
             builder
-                .append_data(&mut header, name.as_str(), *contents)
+                .append_data(&mut header, name.as_str(), contents.as_slice())
                 .expect("append entry");
         }
         builder
@@ -780,7 +827,7 @@ mod tests {
             .expect("finish gzip");
     }
 
-    fn write_zip(path: &Path, entries: &[(String, &'static [u8])]) {
+    fn write_zip(path: &Path, entries: &[(String, Vec<u8>)]) {
         let mut writer = zip::ZipWriter::new(fs::File::create(path).expect("create archive"));
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
@@ -793,17 +840,24 @@ mod tests {
         writer.finish().expect("finish zip");
     }
 
-    /// The staged layout is what the installer reads back: two executable
-    /// binaries under `bin/`, the licence pair at the root.
+    /// The staged layout is what the installer reads back: two executable binaries
+    /// under `bin/`, the licence material at the root — the notices included, which the
+    /// release's archives carry.
     fn assert_staged(archive: &Path, staging: &Path) {
         extract_into(archive, staging).expect("extract the release archive");
         for tool in [ffmpeg_file(), ffprobe_file()] {
             let path = staging.join("bin").join(tool);
             assert!(crate::util::is_executable(&path), "{tool} is executable");
         }
+        for licence in LICENCE_AND_SOURCE.into_iter().chain([COMPONENT_NOTICES]) {
+            assert!(
+                staging.join(licence).is_file(),
+                "{licence} is at the archive's root"
+            );
+        }
         assert_eq!(
             fs::read(staging.join("LICENCE.txt")).expect("read the licence"),
-            b"LGPL" as &[u8]
+            b"GPLv3" as &[u8]
         );
         assert_eq!(
             fs::read(staging.join("SOURCE.txt")).expect("read the source note"),
@@ -815,7 +869,7 @@ mod tests {
     fn a_tar_gz_release_lands_in_the_staging_layout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive = dir.path().join("pkg.tar.gz");
-        write_tar_gz(&archive, &release_entries());
+        write_tar_gz(&archive, &release_entries("ffmpeg-v7.1-mahbot.2"));
         assert_staged(&archive, &dir.path().join("staging"));
     }
 
@@ -823,7 +877,7 @@ mod tests {
     fn a_zip_release_lands_in_the_staging_layout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive = dir.path().join("pkg.zip");
-        write_zip(&archive, &release_entries());
+        write_zip(&archive, &release_entries("ffmpeg-v7.1-mahbot.2"));
         assert_staged(&archive, &dir.path().join("staging"));
     }
 
@@ -831,7 +885,7 @@ mod tests {
     fn a_release_without_the_licence_is_a_failed_install() {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive = dir.path().join("pkg.tar.gz");
-        let entries: Vec<(String, &'static [u8])> = release_entries()
+        let entries: Vec<(String, Vec<u8>)> = release_entries("ffmpeg-v7.1-mahbot.2")
             .into_iter()
             .filter(|(name, _)| !name.starts_with("LICENCE"))
             .collect();
@@ -842,10 +896,38 @@ mod tests {
         assert!(reason.contains("LICENCE.txt"), "{reason}");
     }
 
-    /// The floors the archives are built against are the product's own, so an
-    /// archive that checksums can still start on every machine the product runs on.
-    /// One fact, told by both the workflow that builds them and the product's own
-    /// constants; a drift offers a file to a system that cannot load it.
+    /// A build from before the component notices existed installs with the material it
+    /// carries: a host with no pair at all is worse served than one running that build
+    /// until the next start takes a newer one.
+    #[test]
+    fn a_build_that_predates_the_notices_installs_with_what_it_carries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("pkg.tar.gz");
+        let entries: Vec<(String, Vec<u8>)> = release_entries("ffmpeg-v7.1-mahbot.2")
+            .into_iter()
+            .filter(|(name, _)| name != COMPONENT_NOTICES)
+            .collect();
+        write_tar_gz(&archive, &entries);
+
+        let staging = dir.path().join("staging");
+        extract_into(&archive, &staging).expect("a build from before the notices installs");
+        for licence in LICENCE_AND_SOURCE {
+            assert!(staging.join(licence).is_file(), "{licence} is there");
+        }
+        assert!(
+            !staging.join(COMPONENT_NOTICES).exists(),
+            "no notices to copy"
+        );
+        assert!(
+            crate::util::is_executable(&staging.join("bin").join(ffmpeg_file())),
+            "the pair is staged regardless"
+        );
+    }
+
+    /// The floors the archives are built against are the product's own, so an archive
+    /// that checksums can still start on every machine the product runs on. One fact,
+    /// told by both the workflow that builds them and the product's own constants; a
+    /// drift offers a file to a system that cannot load it.
     #[test]
     fn the_floors_are_the_product_own() {
         let workflow = fs::read_to_string(
@@ -874,49 +956,23 @@ mod tests {
         );
     }
 
-    // ── The stand-in release host ───────────────────────────────────
+    // ── The stand-in release stream ─────────────────────────────────
 
-    /// The banner a stand-in "binary" prints: a shell script, because the product's
-    /// own copies are real executables built per platform and a check has none of
-    /// them. It reports the pinned version in the shape the release's own build
-    /// does, which is what [`reports_upstream`] reads — and the only thing that
-    /// proves the file ran.
+    /// This host's archive name for `tag`: the one the installer asks the release
+    /// for.
     #[cfg(unix)]
-    static SCRIPT: LazyLock<Vec<u8>> = LazyLock::new(|| {
-        let (major, minor) = upstream_parts(TAG).expect("the pinned tag names a version");
-        format!("#!/bin/sh\necho 'ffmpeg version {major}.{minor} stand-in build'\n").into_bytes()
-    });
-
-    /// The entries a stand-in release carries: the same layout [`extract_into`]
-    /// reads, with scripts where the real binaries go.
-    #[cfg(unix)]
-    fn scripted_entries() -> Vec<(String, &'static [u8])> {
-        let script = &SCRIPT[..];
-        vec![
-            (format!("pkg/bin/{}", ffmpeg_file()), script),
-            (format!("pkg/bin/{}", ffprobe_file()), script),
-            ("LICENCE.txt".to_string(), b"LGPL" as &'static [u8]),
-            (
-                "SOURCE.txt".to_string(),
-                b"upstream source" as &'static [u8],
-            ),
-        ]
-    }
-
-    /// This host's archive name: the one the installer asks the release for.
-    #[cfg(unix)]
-    fn host_asset() -> String {
+    fn host_asset(tag: &str) -> String {
         let (os, arch) =
             managed_bin::host_os_arch().expect("this host is one the product builds for");
-        asset_name(TAG, os, arch)
+        asset_name(tag, os, arch)
     }
 
-    /// A real archive of [`scripted_entries`], made once and served as bytes, since
-    /// the host answers with what it was handed.
+    /// A real archive of [`release_entries`], made once and served as bytes, since the
+    /// host answers with what it was handed.
     #[cfg(unix)]
-    fn archive_bytes(dir: &Path) -> Vec<u8> {
-        let archive = dir.join(host_asset());
-        write_tar_gz(&archive, &scripted_entries());
+    fn archive_bytes(dir: &Path, tag: &str) -> Vec<u8> {
+        let archive = dir.join(host_asset(tag));
+        write_tar_gz(&archive, &release_entries(tag));
         fs::read(&archive).expect("read the stand-in archive")
     }
 
@@ -944,8 +1000,8 @@ mod tests {
             .collect()
     }
 
-    /// Every name under `root`, sorted: what an install left behind, a copy or a
-    /// leftover.
+    /// Every name under `root`, sorted: what an install left behind, a copy or
+    /// otherwise.
     #[cfg(unix)]
     fn entries(root: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(root)
@@ -960,22 +1016,29 @@ mod tests {
         names
     }
 
-    /// A stand-in for the release host, serving one release: the checksum file and
-    /// this platform's archive at the two paths the installer asks for, and a 404
-    /// for anything else. Shaped like `FakeTelegram` in `channels/telegram_tests.rs`
-    /// — a non-blocking accept loop polling a stop flag, one thread and one answer
-    /// per connection — because the installer is a real HTTP client and no check
-    /// may ask the real host.
+    /// The releases a stand-in stream offers: each tag and the asset names it carries.
+    #[cfg(unix)]
+    type Offered = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+    /// A stand-in for the release stream: the listing at `?per_page=&page=`, and one
+    /// release's files at `{base}/{tag}/SHA256SUMS` and `{base}/{tag}/{asset}`, with a
+    /// 404 for anything else. Shaped like `FakeTelegram` in
+    /// `channels/telegram_tests.rs` — a non-blocking accept loop polling a stop flag,
+    /// one thread and one answer per connection — because the installer is a real HTTP
+    /// client and no check may ask the real host.
     #[cfg(unix)]
     struct FakeRelease {
         /// The base [`RELEASES_URL_ENV`] is pointed at.
         base: String,
-        tag: String,
-        asset: String,
+        /// Every release the stream offers: its tag and the asset names it carries.
+        offered: Offered,
         /// The bytes each path answers with, replaced between cases.
         served: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         /// Every path asked for, in arrival order.
         asked: Arc<Mutex<Vec<String>>>,
+        /// A listing body to answer with instead of the stream's own, for the check that
+        /// asks what a host answering with something that is not a release array does.
+        listing: Arc<Mutex<Option<Vec<u8>>>>,
         /// Set by `Drop`, so the accept loop — which polls — lets go of the socket.
         stop: Arc<AtomicBool>,
         accept: Option<std::thread::JoinHandle<()>>,
@@ -983,37 +1046,42 @@ mod tests {
 
     #[cfg(unix)]
     impl FakeRelease {
-        /// Start a host offering the release `tag` names: `sums` as the body of its
-        /// `SHA256SUMS` and `archive` as this platform's asset.
-        fn start(tag: &str, asset: &str, sums: &str, archive: &[u8]) -> Self {
+        fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind the stand-in host");
             listener
                 .set_nonblocking(true)
                 .expect("the stand-in host accepts without blocking");
             let port = listener.local_addr().expect("stand-in host address").port();
+            let offered = Arc::new(Mutex::new(Vec::new()));
             let served = Arc::new(Mutex::new(HashMap::new()));
             let asked = Arc::new(Mutex::new(Vec::new()));
+            let listing = Arc::new(Mutex::new(None));
             let stop = Arc::new(AtomicBool::new(false));
             let accept = std::thread::spawn({
+                let offered = Arc::clone(&offered);
                 let served = Arc::clone(&served);
                 let asked = Arc::clone(&asked);
+                let listing = Arc::clone(&listing);
                 let stop = Arc::clone(&stop);
                 move || {
                     while !stop.load(Ordering::Relaxed) {
                         match listener.accept() {
                             Ok((stream, _)) => {
                                 // The accepted socket can inherit the listener's
-                                // non-blocking mode (it does on macOS), and a
-                                // reader that polls would see a half-arrived
-                                // request.
+                                // non-blocking mode (it does on macOS), and a reader
+                                // that polls would see a half-arrived request.
                                 let _ = stream.set_nonblocking(false);
+                                let offered = Arc::clone(&offered);
                                 let served = Arc::clone(&served);
                                 let asked = Arc::clone(&asked);
-                                std::thread::spawn(move || serve(stream, &served, &asked));
+                                let listing = Arc::clone(&listing);
+                                std::thread::spawn(move || {
+                                    serve(stream, &offered, &served, &asked, &listing);
+                                });
                             }
-                            // Polling rather than blocking, so the loop can see
-                            // `stop`: a blocking accept would outlive the check
-                            // that drops the host.
+                            // Polling rather than blocking, so the loop can see `stop`:
+                            // a blocking accept would outlive the check that drops the
+                            // host.
                             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(Duration::from_millis(2));
                             }
@@ -1024,35 +1092,34 @@ mod tests {
                     }
                 }
             });
-            let host = Self {
+            Self {
                 base: format!("http://127.0.0.1:{port}"),
-                tag: tag.to_string(),
-                asset: asset.to_string(),
+                offered,
                 served,
                 asked,
+                listing,
                 stop,
                 accept: Some(accept),
-            };
-            host.offer(sums, archive);
-            host
+            }
         }
 
-        /// Offer this release from now on: one case's bytes, then the next case's.
-        /// The archive is served under the path its name spells either way, so a
-        /// case that changes only the checksum file changes only what a digest
-        /// says.
-        fn offer(&self, sums: &str, archive: &[u8]) {
-            *self.served.lock().expect("fake release files") = HashMap::from([
-                (
-                    format!("/{}/SHA256SUMS", self.tag),
-                    sums.as_bytes().to_vec(),
-                ),
-                (format!("/{}/{}", self.tag, self.asset), archive.to_vec()),
+        /// Offer `tag` carrying `asset`, with `sums` as its checksum file and `archive`
+        /// as the file that asset names. A second call for the same tag replaces its
+        /// files and leaves the listing as it was.
+        fn offer(&self, tag: &str, asset: &str, sums: &str, archive: &[u8]) {
+            let mut offered = self.offered.lock().expect("fake listing");
+            if !offered.iter().any(|(name, _)| name == tag) {
+                offered.push((tag.to_string(), vec![asset.to_string()]));
+            }
+            drop(offered);
+            self.served.lock().expect("fake release files").extend([
+                (format!("/{tag}/SHA256SUMS"), sums.as_bytes().to_vec()),
+                (format!("/{tag}/{asset}"), archive.to_vec()),
             ]);
         }
 
-        /// The base the release hook is pointed at, so every attempt in the check
-        /// asks this host and never the real one.
+        /// The base the release hook is pointed at, so every attempt in the check asks
+        /// this host and never the real one.
         fn base(&self) -> &str {
             &self.base
         }
@@ -1060,6 +1127,11 @@ mod tests {
         /// Every path asked for, in arrival order.
         fn asked(&self) -> Vec<String> {
             self.asked.lock().expect("fake release log").clone()
+        }
+
+        /// Answer the listing with `body`, whatever pages are asked for.
+        fn listing_is(&self, body: &[u8]) {
+            *self.listing.lock().expect("fake listing override") = Some(body.to_vec());
         }
     }
 
@@ -1073,22 +1145,32 @@ mod tests {
         }
     }
 
-    /// Answer one request: the bytes registered for its path, or a 404.
+    /// Answer one request: the listing, the bytes registered for its path, or a 404.
     #[cfg(unix)]
     fn serve(
         mut stream: TcpStream,
+        offered: &Mutex<Vec<(String, Vec<String>)>>,
         served: &Mutex<HashMap<String, Vec<u8>>>,
         asked: &Mutex<Vec<String>>,
+        listing: &Mutex<Option<Vec<u8>>>,
     ) {
         let Some(path) = request_path(&mut stream) else {
             return;
         };
         asked.lock().expect("fake release log").push(path.clone());
-        let body = served
-            .lock()
-            .expect("fake release files")
-            .get(&path)
-            .cloned();
+        let override_body = listing.lock().expect("fake listing override").clone();
+        let body = match path.strip_prefix("/?") {
+            // A case that wants the host to answer with a body of its own.
+            Some(_) if override_body.is_some() => override_body,
+            // Page one is the whole stream here; a later page is its end.
+            Some(query) if query.contains("page=1") => Some(listing_body(offered)),
+            Some(_) => Some(b"[]".to_vec()),
+            None => served
+                .lock()
+                .expect("fake release files")
+                .get(&path)
+                .cloned(),
+        };
         let head = match &body {
             Some(bytes) => format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
@@ -1104,8 +1186,29 @@ mod tests {
         }
     }
 
-    /// The target of the one request on this connection: the request line, read up
-    /// to the blank line that ends the head. Every request here is a bodyless GET.
+    /// The listing, in the shape the GitHub API answers with: one entry per offered
+    /// release, each carrying the asset names it was offered under.
+    #[cfg(unix)]
+    fn listing_body(offered: &Mutex<Vec<(String, Vec<String>)>>) -> Vec<u8> {
+        let releases: Vec<serde_json::Value> = offered
+            .lock()
+            .expect("fake listing")
+            .iter()
+            .map(|(tag, assets)| {
+                serde_json::json!({
+                    "tag_name": tag,
+                    "assets": assets
+                        .iter()
+                        .map(|name| serde_json::json!({ "name": name }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(releases).to_string().into_bytes()
+    }
+
+    /// The target of the one request on this connection: the request line, read up to
+    /// the blank line that ends the head. Every request here is a bodyless GET.
     #[cfg(unix)]
     fn request_path(stream: &mut TcpStream) -> Option<String> {
         let mut buffer = Vec::new();
@@ -1124,55 +1227,325 @@ mod tests {
         Some(head.lines().next()?.split_whitespace().nth(1)?.to_string())
     }
 
-    /// The whole install path against a host standing in for the release stream: a
-    /// release whose checksum file carries this platform's line installs and becomes
-    /// the copy in use, and every way a release can lie — no line for this platform's
-    /// archive, bytes that are not the declared ones — installs nothing and leaves the
-    /// working copy in place.
+    /// A throwaway install root — `$HOME/.mahbot/ffmpeg`, the directory the product
+    /// resolves — with `HOME` relocated for as long as the guard lives.
+    #[cfg(unix)]
+    fn temp_root() -> (tempfile::TempDir, crate::util::test::EnvVarGuard, PathBuf) {
+        let home = tempfile::tempdir().expect("temp home");
+        let guard = crate::util::test::set_env_var("HOME", home.path().to_str());
+        let root = root().expect("the install root resolves under the temp home");
+        (home, guard, root)
+    }
+
+    /// The boot task against a stream that offers four builds: the newest one this
+    /// host has an archive for is installed, a following start has nothing left to
+    /// download, and a build published after that start is picked up by the next one.
     #[cfg(unix)]
     #[tokio::test]
-    #[serial_test::serial(ffmpeg_releases)] // points the release hook at a local host
-    async fn the_install_checks_the_release_against_its_own_checksums() {
-        let dir = tempfile::tempdir().expect("install root");
-        let root = dir.path();
+    #[serial_test::serial(ffmpeg_releases)]
+    async fn the_boot_installs_the_newest_build_the_stream_offers() {
         let files = tempfile::tempdir().expect("stand-in release files");
-        let asset = host_asset();
-        let archive = archive_bytes(files.path());
-        let sums = checksum_line(&sha256_hex(&archive), &asset);
-
-        // 1. The release's checksum file names this platform's archive: the whole
-        //    path runs, and the copy it leaves is under the pinned tag with nothing
-        //    of the attempt beside it.
-        let host = FakeRelease::start(TAG, &asset, &sums, &archive);
-        // The hook is read on every attempt, so no real host is asked for the rest
-        // of the check; the guard puts the variable back when it drops.
-        let _hook = crate::util::test::set_env_var(RELEASES_URL_ENV, Some(host.base()));
-        install(root).await.expect("the release installs");
-        assert_eq!(
-            host.asked(),
-            [format!("/{TAG}/SHA256SUMS"), format!("/{TAG}/{asset}")],
-            "the checksum file and this platform's archive, both under the pin"
-        );
-        assert_eq!(
-            chosen(root).expect("a copy is in use").0,
-            TAG,
-            "the copy in use is the pinned one"
-        );
-        for tool in [ffmpeg_file(), ffprobe_file()] {
-            assert!(
-                crate::util::is_executable(&root.join(TAG).join("bin").join(tool)),
-                "{tool} is installed executable"
-            );
+        let (_home, _lock, root) = temp_root();
+        let host = FakeRelease::start();
+        for tag in [
+            "ffmpeg-v7.1-mahbot.2",
+            "ffmpeg-v7.0-mahbot.9",
+            "ffmpeg-v7.1-mahbot.1",
+        ] {
+            let asset = host_asset(tag);
+            let archive = archive_bytes(files.path(), tag);
+            let sums = checksum_line(&sha256_hex(&archive), &asset);
+            host.offer(tag, &asset, &sums, &archive);
         }
-        for licence in LICENCE_FILES {
+        // Newer than every build above, and carrying this host no archive at all.
+        host.offer(
+            "ffmpeg-v9.0-mahbot.1",
+            &asset_name("ffmpeg-v9.0-mahbot.1", "windows", "aarch64"),
+            "",
+            b"",
+        );
+        let _hook = ReleasesHook::at(host.base());
+
+        assert_eq!(
+            update()
+                .await
+                .expect("the newest build installs")
+                .as_deref(),
+            Some("ffmpeg-v7.1-mahbot.2")
+        );
+        assert_eq!(
+            chosen(&root).expect("a copy is in use").0.tag,
+            "ffmpeg-v7.1-mahbot.2",
+            "the newest build the stream carries for this host is the one in use"
+        );
+        assert_eq!(
+            entries(&root),
+            ["ffmpeg-v7.1-mahbot.2"],
+            "one copy: nothing older, no download and no staging left"
+        );
+        for licence in LICENCE_AND_SOURCE.into_iter().chain([COMPONENT_NOTICES]) {
             assert!(
-                root.join(TAG).join(licence).is_file(),
+                root.join("ffmpeg-v7.1-mahbot.2").join(licence).is_file(),
                 "{licence} travelled with the pair"
             );
         }
         assert_eq!(
+            host.asked().first().map(String::as_str),
+            Some("/?per_page=100&page=1"),
+            "the listing is what the boot starts from"
+        );
+
+        // A following start finds the copy already the newest: the listing is read and
+        // nothing is downloaded.
+        let asked = host.asked().len();
+        assert_eq!(update().await.expect("nothing to do"), None);
+        assert_eq!(
+            host.asked().len(),
+            asked + 1,
+            "only the listing is read again"
+        );
+
+        // A build published after this product binary was is picked up by a later
+        // start, and the build it replaces is pruned.
+        let newer = "ffmpeg-v7.1-mahbot.3";
+        let asset = host_asset(newer);
+        let archive = archive_bytes(files.path(), newer);
+        let sums = checksum_line(&sha256_hex(&archive), &asset);
+        host.offer(newer, &asset, &sums, &archive);
+        assert_eq!(
+            update().await.expect("the newer build installs").as_deref(),
+            Some(newer)
+        );
+        assert_eq!(entries(&root), [newer], "the build it replaced is gone");
+    }
+
+    /// A pair damaged after it was placed — executable files under the right tag, but no
+    /// longer the build they are named after — is replaced at the next start, without a
+    /// newer build having to appear for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(ffmpeg_releases)]
+    async fn a_damaged_copy_is_reinstalled_at_the_next_start() {
+        let files = tempfile::tempdir().expect("stand-in release files");
+        let (_home, _lock, root) = temp_root();
+        let host = FakeRelease::start();
+        let tag = "ffmpeg-v7.1-mahbot.2";
+        let asset = host_asset(tag);
+        let archive = archive_bytes(files.path(), tag);
+        let sums = checksum_line(&sha256_hex(&archive), &asset);
+        host.offer(tag, &asset, &sums, &archive);
+        let _hook = ReleasesHook::at(host.base());
+        update().await.expect("the build installs");
+
+        // A truncation or a quarantine leaves exactly this: the directory parses and the
+        // files are executable, but one of them is not the build anymore.
+        let damaged = root.join(tag).join("bin").join(ffmpeg_file());
+        fs::write(
+            &damaged,
+            b"#!/bin/sh\necho 'ffmpeg version 0.0.0 damaged'\n",
+        )
+        .expect("damage the copy");
+        managed_bin::set_executable(&damaged).expect("keep it executable");
+
+        assert_eq!(
+            update()
+                .await
+                .expect("the damaged copy is replaced")
+                .as_deref(),
+            Some(tag),
+            "the same build is installed again"
+        );
+        assert_eq!(
+            update().await.expect("nothing to do").as_deref(),
+            None,
+            "the replacement proves itself"
+        );
+    }
+
+    /// A copy whose tag outranks the stream's newest — a withdrawn build, or one that no
+    /// longer proves itself — is replaced by the build the stream offers and removed, so a
+    /// start converges on one copy instead of downloading the same archive forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(ffmpeg_releases)]
+    async fn a_copy_newer_than_the_stream_is_replaced_once() {
+        let files = tempfile::tempdir().expect("stand-in release files");
+        let (_home, _lock, root) = temp_root();
+        let host = FakeRelease::start();
+        let tag = "ffmpeg-v7.1-mahbot.2";
+        let asset = host_asset(tag);
+        let archive = archive_bytes(files.path(), tag);
+        let sums = checksum_line(&sha256_hex(&archive), &asset);
+        host.offer(tag, &asset, &sums, &archive);
+        let _hook = ReleasesHook::at(host.base());
+
+        install_fake(&root, "ffmpeg-v7.1-mahbot.9");
+
+        assert_eq!(
+            update()
+                .await
+                .expect("the build the stream offers installs")
+                .as_deref(),
+            Some(tag)
+        );
+        assert_eq!(
+            entries(&root),
+            [tag],
+            "the copy the stream no longer offers is gone"
+        );
+
+        let asked = host.asked().len();
+        assert_eq!(
+            update().await.expect("nothing to do"),
+            None,
+            "the following start converges on the one copy"
+        );
+        assert_eq!(
+            host.asked().len(),
+            asked + 1,
+            "only the listing is read again"
+        );
+    }
+
+    /// A stream that cannot be read leaves a copy that proves itself alone: nothing is
+    /// installed, nothing is reported, and the copy stays in use.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(ffmpeg_releases)]
+    async fn an_unreadable_stream_leaves_a_proven_copy_alone() {
+        let files = tempfile::tempdir().expect("stand-in release files");
+        let (_home, _lock, root) = temp_root();
+        let host = FakeRelease::start();
+        let tag = "ffmpeg-v7.1-mahbot.2";
+        let asset = host_asset(tag);
+        let archive = archive_bytes(files.path(), tag);
+        let sums = checksum_line(&sha256_hex(&archive), &asset);
+        host.offer(tag, &asset, &sums, &archive);
+        {
+            let _hook = ReleasesHook::at(host.base());
+            update().await.expect("the build installs");
+        }
+
+        let _hook = ReleasesHook::at("http://127.0.0.1:1");
+        assert_eq!(
+            update()
+                .await
+                .expect("a copy that proves itself needs no listing"),
+            None
+        );
+        assert_eq!(entries(&root), [tag], "the copy stays in use");
+    }
+
+    /// A copy in place is what the operations run, and a stream that cannot be reached
+    /// is never asked about it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(ffmpeg_releases)]
+    async fn a_copy_in_place_is_used_without_asking_the_stream() {
+        let (_home, _lock, root) = temp_root();
+        install_fake(&root, "ffmpeg-v7.1-mahbot.1");
+        let _hook = ReleasesHook::at("http://127.0.0.1:1");
+
+        let binaries = ensure_installed().await.expect("the copy in place is used");
+        assert_eq!(
+            binaries.ffmpeg,
+            root.join("ffmpeg-v7.1-mahbot.1")
+                .join("bin")
+                .join(ffmpeg_file())
+        );
+    }
+
+    /// A stream with no build for this host is a reason, never another platform's
+    /// archive.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(ffmpeg_releases)]
+    async fn no_build_for_this_host_is_a_reason() {
+        let host = FakeRelease::start();
+        host.offer(
+            "ffmpeg-v7.1-mahbot.2",
+            &asset_name("ffmpeg-v7.1-mahbot.2", "windows", "aarch64"),
+            "",
+            b"",
+        );
+        let _lock = env_held();
+        let _hook = ReleasesHook::at(host.base());
+        let Err(reason) = newest().await else {
+            panic!("this host has no build in the stream");
+        };
+        let (os, arch) = managed_bin::host_os_arch().expect("a supported host");
+        assert!(
+            reason.contains(&format!("no ffmpeg build is published for {os}-{arch}")),
+            "{reason}"
+        );
+    }
+
+    /// A host answering the listing with a JSON body that is not a release array — the API's
+    /// own rate-limit message, a proxy's answer — is a listing that could not be read, never
+    /// the claim that this platform has no published build.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(ffmpeg_releases)]
+    async fn a_listing_that_is_not_one_is_a_read_failure() {
+        let host = FakeRelease::start();
+        host.listing_is(br#"{"message":"API rate limit exceeded"}"#);
+        let _lock = env_held();
+        let _hook = ReleasesHook::at(host.base());
+        let Err(reason) = newest().await else {
+            panic!("a body that is not a release array names no build");
+        };
+        assert!(
+            reason.contains("could not be read: it is not a JSON array"),
+            "{reason}"
+        );
+    }
+
+    /// The whole install path against a host standing in for the release stream: a
+    /// release whose checksum file carries this platform's line lands as the copy in
+    /// use, and every way a release can lie — no line for this platform's archive, bytes
+    /// that are not the declared ones — installs nothing and leaves the working copy in
+    /// place.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(ffmpeg_releases)]
+    async fn the_install_checks_the_release_against_its_own_checksums() {
+        let dir = tempfile::tempdir().expect("install root");
+        let root = dir.path();
+        let files = tempfile::tempdir().expect("stand-in release files");
+        let tag = "ffmpeg-v7.1-mahbot.2";
+        let asset = host_asset(tag);
+        let archive = archive_bytes(files.path(), tag);
+        let sums = checksum_line(&sha256_hex(&archive), &asset);
+
+        // 1. The release's checksum file names this platform's archive: the whole path
+        //    runs, and the copy it leaves is the tag's own with nothing of the attempt
+        //    beside it.
+        let host = FakeRelease::start();
+        host.offer(tag, &asset, &sums, &archive);
+        let _lock = env_held();
+        let _hook = ReleasesHook::at(host.base());
+        install(root, &build(tag))
+            .await
+            .expect("the release installs");
+        assert_eq!(
+            host.asked(),
+            [format!("/{tag}/SHA256SUMS"), format!("/{tag}/{asset}")],
+            "the checksum file and this platform's archive, both under the tag"
+        );
+        assert_eq!(
+            chosen(root).expect("a copy is in use").0.tag,
+            tag,
+            "the copy in use is the one installed"
+        );
+        for tool in [ffmpeg_file(), ffprobe_file()] {
+            assert!(
+                crate::util::is_executable(&root.join(tag).join("bin").join(tool)),
+                "{tool} is installed executable"
+            );
+        }
+        assert_eq!(
             entries(root),
-            [TAG.to_string()],
+            [tag.to_string()],
             "the whole install is one directory: no download and no staging left"
         );
 
@@ -1180,16 +1553,16 @@ mod tests {
         //    platform's archive is ever substituted.
         let elsewhere = checksum_line(
             &sha256_hex(&archive),
-            &asset_name(TAG, "windows", "aarch64"),
+            &asset_name(tag, "windows", "aarch64"),
         );
-        host.offer(&elsewhere, &archive);
-        let reason = install(root)
+        host.offer(tag, &asset, &elsewhere, &archive);
+        let reason = install(root, &build(tag))
             .await
             .expect_err("a release without this platform's archive is refused");
         assert!(reason.contains("no checksum for this platform"), "{reason}");
         assert_eq!(
-            chosen(root).expect("the installed copy survives").0,
-            TAG,
+            chosen(root).expect("the installed copy survives").0.tag,
+            tag,
             "the copy in use is untouched"
         );
         assert!(
@@ -1201,18 +1574,18 @@ mod tests {
             "nothing was staged for a release without this archive"
         );
 
-        // 3. The declared digest, with an archive whose bytes are not the declared
-        //    ones: the download is refused and nothing of it is kept.
+        // 3. The declared digest, with an archive whose bytes are not the declared ones:
+        //    the download is refused and nothing of it is kept.
         let mut altered = archive.clone();
         *altered.last_mut().expect("the archive has bytes") ^= 0xff;
-        host.offer(&sums, &altered);
-        let reason = install(root)
+        host.offer(tag, &asset, &sums, &altered);
+        let reason = install(root, &build(tag))
             .await
             .expect_err("an archive that does not match its digest is refused");
         assert!(reason.contains("does not match the checksum"), "{reason}");
         assert_eq!(
-            chosen(root).expect("the installed copy survives").0,
-            TAG,
+            chosen(root).expect("the installed copy survives").0.tag,
+            tag,
             "the copy in use is untouched"
         );
         assert!(
@@ -1224,35 +1597,30 @@ mod tests {
             "nothing was staged for a rejected download"
         );
 
-        // 4. An unusable copy standing where the pin belongs — one of its binaries is
-        //    gone — is replaced by the pinned one in a single swap, so the host is
-        //    never left without a copy and no half-installed directory survives.
-        host.offer(&sums, &archive);
-        fs::remove_file(root.join(TAG).join("bin").join(ffprobe_file()))
+        // 4. An unusable copy standing where the tag belongs — one of its binaries is
+        //    gone — is replaced in a single swap, so the host is never left without a
+        //    copy and no half-installed directory survives.
+        host.offer(tag, &asset, &sums, &archive);
+        fs::remove_file(root.join(tag).join("bin").join(ffprobe_file()))
             .expect("break the installed copy");
         assert!(
             chosen(root).is_none(),
             "a copy that lost a binary is not a copy"
         );
-        install(root)
+        install(root, &build(tag))
             .await
             .expect("the release replaces the broken copy");
         for tool in [ffmpeg_file(), ffprobe_file()] {
             assert!(
-                crate::util::is_executable(&root.join(TAG).join("bin").join(tool)),
+                crate::util::is_executable(&root.join(tag).join("bin").join(tool)),
                 "{tool} is back after the swap"
             );
         }
-        for licence in LICENCE_FILES {
+        for licence in LICENCE_AND_SOURCE {
             assert!(
-                root.join(TAG).join(licence).is_file(),
+                root.join(tag).join(licence).is_file(),
                 "{licence} survives the swap"
             );
         }
-        assert_eq!(
-            entries(root),
-            [TAG.to_string()],
-            "the swap leaves nothing beside the copy"
-        );
     }
 }
