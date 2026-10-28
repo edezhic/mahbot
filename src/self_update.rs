@@ -2198,8 +2198,13 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
         return Err(e);
     }
 
-    // 7. Exit — spawn succeeded.
+    // 7. Exit — spawn succeeded. The tray icon is taken out before it: `exit(0)` runs no
+    //    destructors, and a Windows notification-area icon its owner never removed stays
+    //    behind as a stale one. The removal is bounded, so a platform that cannot answer
+    //    in time delays this exit by seconds rather than holding it.
     crate::channels::chat_draft::flush_global();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    crate::tray::remove();
     std::process::exit(0);
 }
 

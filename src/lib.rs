@@ -126,6 +126,10 @@ pub mod gui;
 pub(crate) mod onboarding;
 // A broadcast that tells the dashboard an in-memory registry changed.
 pub(crate) mod runtime_events;
+// The tray icon where the platform has one: the macOS menu bar and the Windows
+// notification area, with the click that brings the window up and the menu that quits.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod tray;
 
 // ── CLI and prompts ──────────────────────────────────────────────────────
 // The operation channel a `mahbot` command line carries into the live instance,

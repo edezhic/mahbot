@@ -391,6 +391,14 @@ pub enum Message {
     WindowHandle(u64),
     /// A window action the rail asks for ([`WindowAction`]).
     WindowAction(WindowAction),
+    /// The tray icon was clicked: [`Dashboard::bring_window_up`]. A click before boot or
+    /// during a drain does nothing.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    TrayClicked,
+    /// The tray menu's one item: the same exit a window close runs, the second-ask escape
+    /// included.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    TrayQuit,
     /// Keyboard shortcut: Cmd+F — focus the primary search input on the current page.
     FocusSearch,
     /// Keyboard shortcut: Cmd+L — open the Logs page, which has no rail item.
@@ -1016,16 +1024,33 @@ impl Dashboard {
         iced::window::latest().and_then(move |id| iced::window::resize(id, size))
     }
 
+    /// Bring the window up: restore it if it is minimized, then raise and focus it,
+    /// including while another application is in front.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn bring_window_up() -> Task<Message> {
+        #[cfg(target_os = "macos")]
+        {
+            bring_window_forward();
+            Task::none()
+        }
+        // A minimized window ignores a focus request, so the restore is chained ahead of it.
+        #[cfg(target_os = "windows")]
+        {
+            iced::window::latest()
+                .and_then(|id| window::minimize(id, false).chain(window::gain_focus(id)))
+        }
+    }
+
     /// Act on a request for the product to exit: name the route that asked, then start the wait
     /// the request calls for.
     ///
-    /// The requests that reach it — the window's own close, the rail control's and an
-    /// ordinary platform quit — are handled identically, because full parity is the point
-    /// of the interception; so are the states with no drain to complete (a self-update
-    /// finalizing, a boot that has not finished, a boot that failed). `route` is the
-    /// platform's wording for the ask ([`crate::shutdown::MACOS_QUIT_TRIGGER`], beside the
-    /// route that produces it), or `None` for the window's own close, whose wording the
-    /// exit line already falls back to.
+    /// The requests that reach it — the window's own close, the rail control's, an
+    /// ordinary platform quit and the tray menu's Quit — are handled identically, because
+    /// full parity is the point of the interception; so are the states with no drain to
+    /// complete (a self-update finalizing, a boot that has not finished, a boot that
+    /// failed). `route` is the platform's wording for the ask, one of the route constants
+    /// beside the routes that produce them, or `None` for the window's own close, whose
+    /// wording the exit line already falls back to.
     /// It is recorded where this request is what drives the exit (or, in the self-update window,
     /// may yet drive it once the update is seen to fail); a request that finds the exit already
     /// pending leaves the record to the one that caused it.
@@ -1571,6 +1596,8 @@ impl Dashboard {
                 generation,
             } => self.apply_boot_workspaces(workspaces, &restored_name, remember, generation),
             Message::CloseRequested(_) => self.request_exit(None),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Message::TrayQuit => self.request_exit(Some(crate::shutdown::TRAY_QUIT_TRIGGER)),
             Message::WindowAction(action) => match action {
                 // The window follows the pointer for the rest of the gesture.
                 WindowAction::Drag => iced::window::latest().and_then(iced::window::drag),
@@ -1681,6 +1708,14 @@ impl Dashboard {
             _ if !self.ready => Task::none(),
 
             // ── Post-ready handlers (no per-arm guards needed) ──
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Message::TrayClicked => {
+                if crate::shutdown::is_draining() {
+                    Task::none()
+                } else {
+                    Self::bring_window_up()
+                }
+            }
             Message::WorkspacePick(name) => self.select_workspace(&name),
             Message::ToastExpired(id) => {
                 // Dismissing an already-expired/unknown id is a safe no-op.
@@ -2915,6 +2950,12 @@ impl Dashboard {
             }),
             window::close_requests().map(Message::CloseRequested),
             iced::Subscription::run(quit_requests_subscription),
+            // The tray's own gestures, subscribed from the start like the platform's quit
+            // asks: a tray quit before boot is done ends the process the way a close does,
+            // while a click falls to the not-ready no-op arm in `update`. A platform
+            // without a tray has no such gestures.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            iced::Subscription::run(tray_subscription),
         ]);
         if !self.ready {
             return always_on;
@@ -3056,6 +3097,68 @@ fn quit_requests_subscription() -> impl futures_util::Stream<Item = Message> {
             // Backpressure, not a dropped request: the next quit gesture during a drain is
             // what forces the exit, so it must not be lost to a full channel.
             if output.send(Message::QuitRequested).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// macOS: activates the application and brings its window to the front, out of the
+/// minimized state as well, in one step — iced's `gain_focus` cannot lift it, because the
+/// platform refuses to activate an application whose windows are all minimized and a
+/// window brought back while the application is still behind stays behind.
+///
+/// The dashboard's window is the only one this process can minimize — the status item's
+/// own window and AppKit's tooltip windows cannot be — which is what finds it.
+#[cfg(target_os = "macos")]
+fn bring_window_forward() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+
+    // The dashboard's update runs on the main thread, which is where AppKit is used; a
+    // call from anywhere else is simply skipped.
+    let Some(marker) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(marker);
+    let window = app
+        .windows()
+        .iter()
+        .find(|window| window.isMiniaturizable());
+    // Deprecated in favour of `activate()`, which the platform grants only to an
+    // application it considers driven by the user right now — not to one whose windows are
+    // all minimized, which is exactly the state this lifts.
+    #[expect(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    let Some(window) = window else {
+        return;
+    };
+    window.deminiaturize(None);
+    window.makeKeyAndOrderFront(None);
+}
+
+/// Subscription that turns the tray icon's gestures into their messages: a click on the
+/// icon brings the window up, and the menu's single item is an ordinary exit request.
+///
+/// The source is the process-lifetime channel [`crate::tray::install`] fills before the
+/// iced application runs. Neither gesture ever waits on the platform: the handlers only
+/// enqueue, and the platform's own menu tracking is never held up by the interface.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn tray_subscription() -> impl futures_util::Stream<Item = Message> {
+    use futures_util::SinkExt;
+    use iced::futures::channel::mpsc;
+    iced::stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
+        let Some(mut actions) = crate::tray::take_actions() else {
+            return;
+        };
+        while let Some(action) = actions.recv().await {
+            // Backpressure, not a dropped gesture: the next quit during a drain is what
+            // forces the exit, so it must not be lost to a full channel.
+            let message = match action {
+                crate::tray::TrayAction::Clicked => Message::TrayClicked,
+                crate::tray::TrayAction::Quit => Message::TrayQuit,
+            };
+            if output.send(message).await.is_err() {
                 return;
             }
         }

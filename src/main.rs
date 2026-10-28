@@ -929,11 +929,17 @@ fn main() -> Result<()> {
     // The icon on the surfaces the window itself does not carry.
     mahbot::app_icon::install_desktop_integration();
 
+    // The tray icon, where the platform has one: the click that brings the window up and
+    // the menu that quits. macOS creates the status item on its main thread once iced's
+    // own loop is running; Windows on a thread of its own. Never fatal (see `tray`).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    mahbot::tray::install();
+
     // The geometry the window opens at, and the dashboard's own copy of it: a
     // close persists the last size the window reported, and a fresh window's
     // start-up width is settled by the board's first read (see `StartupWidth`).
     let window_settings = dashboard_window_settings(&window_state);
-    iced::application(
+    let run = iced::application(
         move || {
             (
                 Dashboard::loading(&window_state),
@@ -956,11 +962,18 @@ fn main() -> Result<()> {
     .theme(Dashboard::theme)
     .window(window_settings)
     .exit_on_close_request(false)
-    .run()
+    .run();
+
+    // The interface is gone, so its tray icon goes with it: a Windows notification-area
+    // icon whose owner never removed it outlives the process as a stale one. An iced
+    // error is an exit as well. The self-update tail reaches the removal from its own
+    // thread instead (see `self_update`).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    mahbot::tray::remove();
     // Returning here with an error leaves without the teardown below — one of the exits
     // `shutdown`'s module docs name — and without the shutdown token fired: an iced error means
     // the interface never ran, so there would be nothing to drain.
-    .map_err(|e| anyhow::anyhow!("Iced application error: {e}"))?;
+    run.map_err(|e| anyhow::anyhow!("Iced application error: {e}"))?;
 
     // Iced dropped its runtime; use a short-lived one for async teardown.
     let rt = tokio::runtime::Builder::new_current_thread()

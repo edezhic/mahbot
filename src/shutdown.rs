@@ -296,9 +296,9 @@ pub fn urgent_release_budget() -> Option<Duration> {
 }
 
 /// The last stop request the platform delivered, for the exit path to name: the Windows stop
-/// deliveries (the console protocol loop and the session-end listener) and a macOS quit (the
-/// dashboard's exit request) write one — the macOS route only where that request is what drives
-/// the exit, so a repeat gesture leaves the record to the request that caused it. `None` when
+/// deliveries (the console protocol loop and the session-end listener), a macOS quit and the tray
+/// menu's quit write one — the macOS and tray routes only where that request is what drives the
+/// exit, so a repeat gesture leaves the record to the request that caused it. `None` when
 /// nothing was recorded: a dashboard window close and a Unix signal record nothing, and the exit
 /// line then keeps the wording it always had. A `Mutex`, not a `OnceLock`: a later request takes
 /// the record over from the one before it.
@@ -955,6 +955,11 @@ mod session_end {
 /// ask — ⌘Q, the application menu's Quit item, the Dock's Quit — arrives as the one AppleEvent
 /// `macos_quit` takes over, so they share one label.
 pub(crate) const MACOS_QUIT_TRIGGER: &str = "macOS quit";
+
+/// The wording the tray menu's one item records for itself in [`EXIT_TRIGGER`]: its own ask, on
+/// either platform that has a tray, is neither a window close nor the platform's quit.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) const TRAY_QUIT_TRIGGER: &str = "tray quit";
 
 /// Install the source of the platform's quit requests: the quit channel, and on macOS the
 /// interception of the platform's own asks.

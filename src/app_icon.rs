@@ -1,7 +1,7 @@
 //! The product's icon — the artwork itself, and every surface outside the
 //! window it has to appear on: the file's own resource on Windows, the running
-//! application's Dock tile on macOS, the launcher entry on Linux, and the
-//! dashboard's own renderings.
+//! application's Dock tile on macOS, the launcher entry on Linux, the tray icon of
+//! `crate::tray`, and the dashboard's own renderings.
 //!
 //! One approved file serves everything this code owns: `assets/mb-icon-256.png`,
 //! decoded once and handed out as it is. Where a platform asks for a size the
@@ -105,6 +105,174 @@ pub fn install_desktop_integration() {
     install_launcher_entry();
 }
 
+/// The size a macOS status item draws its image at: the menu bar's own height, which is
+/// what the system's items beside it occupy.
+#[cfg(target_os = "macos")]
+const TRAY_STATUS_POINTS: u32 = 18;
+
+/// The same mark at backing-store resolution — what a Retina menu bar draws it from.
+#[cfg(target_os = "macos")]
+const TRAY_MARK_SIDE: u32 = TRAY_STATUS_POINTS * 2;
+
+/// The artwork's mark at the resolution a Retina menu bar draws, derived once — the
+/// histogram, crop and scale in [`mark_pixels`] are the most work anything here does.
+#[cfg(target_os = "macos")]
+fn tray_mark() -> Option<&'static [u8]> {
+    static MARK: LazyLock<Option<Vec<u8>>> = LazyLock::new(|| mark_pixels(TRAY_MARK_SIDE));
+    MARK.as_deref()
+}
+
+/// The tray icon's own image, for [`crate::tray`]. `None` when it cannot be built, which
+/// leaves the tray uncreated rather than drawn blank.
+///
+/// macOS: the artwork's *mark* — its letters without the dark tile they are drawn on — as
+/// a template image, which the system tints like its own menu-bar items; the tile is
+/// illegible at that size and would only be a dark square there. This is the 1× copy that
+/// lays the status item out, and `tray_status_image` replaces it with a sharp one.
+///
+/// Windows: the executable's icon resource, the one `build.rs` embedded, at the
+/// notification area's small size — the same artwork the taskbar and Alt-Tab show.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[must_use]
+pub(crate) fn tray_icon_image() -> Option<tray_icon::Icon> {
+    #[cfg(target_os = "macos")]
+    {
+        let pixels = downscaled(tray_mark()?, TRAY_MARK_SIDE, TRAY_STATUS_POINTS);
+        tray_icon::Icon::from_rgba(pixels, TRAY_STATUS_POINTS, TRAY_STATUS_POINTS).ok()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+
+        // The shell draws the icon at its small-icon size, which follows the display's
+        // scaling; the resource holds that size and the larger ones.
+        let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
+        let size = u32::try_from(size).unwrap_or(0);
+        tray_icon::Icon::from_resource(ICON_RESOURCE_ID, Some((size, size))).ok()
+    }
+}
+
+/// macOS: the same mark at backing-store resolution, sized to the points the status item
+/// draws, as a template image. A menu-bar image is drawn at its point size, so this is
+/// what keeps the mark sharp on a Retina display. `None` leaves the 1× copy above in
+/// place, which still shows the mark.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn tray_status_image() -> Option<objc2::rc::Retained<objc2_app_kit::NSImage>> {
+    let image = square_nsimage(tray_mark()?, TRAY_MARK_SIDE, f64::from(TRAY_STATUS_POINTS))?;
+    image.setTemplate(true);
+    Some(image)
+}
+
+/// A square RGBA image scaled down to `to` pixels a side, from one `from` a side.
+#[cfg(target_os = "macos")]
+fn downscaled(pixels: &[u8], from: u32, to: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_raw(from, from, pixels.to_vec())
+        .expect("a square RGBA image is as long as its side says");
+    image::imageops::resize(&image, to, to, image::imageops::FilterType::Triangle).into_raw()
+}
+
+/// The artwork's mark as a `side`-pixel square of black pixels whose alpha carries the
+/// shape — what a monochrome template image is made of. The artwork's own dominant opaque
+/// colour is the tile the mark is drawn on and becomes transparent; what differs from it
+/// is the mark, cropped to its own bounds and scaled to fill the square, so it stays
+/// legible at the size a status area draws it. `None` when the artwork holds no mark.
+#[cfg(target_os = "macos")]
+fn mark_pixels(side: u32) -> Option<Vec<u8>> {
+    /// Below this distance from the tile a pixel is the tile's own — noise in its flat
+    /// colour, not the mark drawn on it.
+    const CUTOFF: u8 = 8;
+
+    let artwork = artwork();
+    let tile = dominant_colour(artwork);
+    let mut pixels = image::RgbaImage::new(artwork.width, artwork.height);
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    let mut strongest = 0u8;
+    for (index, pixel) in artwork.rgba.as_chunks::<4>().0.iter().enumerate() {
+        let distance = (0..3)
+            .map(|channel| pixel[channel].abs_diff(tile[channel]))
+            .max()
+            .unwrap_or(0);
+        // Only the tile's own pixels can carry the mark: the artwork's transparent
+        // background is not part of it, and neither is the tile's anti-aliased edge, which
+        // would draw a ring around the letters and stretch the crop over the whole tile.
+        let opacity = if pixel[3] == 255 { distance } else { 0 };
+        strongest = strongest.max(opacity);
+        #[expect(clippy::cast_possible_truncation)]
+        let (x, y) = (index as u32 % artwork.width, index as u32 / artwork.width);
+        pixels.put_pixel(x, y, image::Rgba([0, 0, 0, opacity]));
+        if opacity > CUTOFF {
+            let (left, top, right, bottom) = bounds.unwrap_or((x, y, x, y));
+            bounds = Some((left.min(x), top.min(y), right.max(x), bottom.max(y)));
+        }
+    }
+    // Nothing above the cutoff means the artwork holds no mark at all.
+    let (left, top, right, bottom) = bounds?;
+
+    let mut mark =
+        image::imageops::crop_imm(&pixels, left, top, right - left + 1, bottom - top + 1)
+            .to_image();
+    // Fully opaque where the mark is at its strongest, proportional everywhere else: a
+    // template image is drawn in the system's colour, so only the shape it carries matters.
+    for pixel in mark.pixels_mut() {
+        let alpha = u16::from(pixel.0[3]) * 255 / u16::from(strongest);
+        pixel.0[3] = u8::try_from(alpha).unwrap_or(u8::MAX);
+    }
+    // A one-pixel margin on each side, so the mark does not sit flush against the item's
+    // edges the way a cropped image would.
+    let inner = side.saturating_sub(2).max(1);
+    let scale = f64::from(inner) / f64::from(mark.width().max(mark.height()));
+    // A proportional fit, rounded to at least one pixel so a mark of any shape survives.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (width, height) = (
+        ((f64::from(mark.width()) * scale).round() as u32).max(1),
+        ((f64::from(mark.height()) * scale).round() as u32).max(1),
+    );
+    let scaled =
+        image::imageops::resize(&mark, width, height, image::imageops::FilterType::Lanczos3);
+    let mut square = image::RgbaImage::new(side, side);
+    image::imageops::overlay(
+        &mut square,
+        &scaled,
+        i64::from((side - width) / 2),
+        i64::from((side - height) / 2),
+    );
+    Some(square.into_raw())
+}
+
+/// The colour most of the artwork's opaque pixels have: the tile the mark is drawn on.
+/// Read from a histogram of the 4 high bits of each channel — enough to separate a tile
+/// from anything drawn on it — and reported as that bucket's middle.
+#[cfg(target_os = "macos")]
+fn dominant_colour(artwork: &Artwork) -> [u8; 3] {
+    const LEVELS: usize = 16;
+
+    let mut counts = vec![0u32; LEVELS * LEVELS * LEVELS];
+    for pixel in artwork
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[3] == 255)
+    {
+        let bucket = (usize::from(pixel[0] >> 4) << 8)
+            | (usize::from(pixel[1] >> 4) << 4)
+            | usize::from(pixel[2] >> 4);
+        counts[bucket] += 1;
+    }
+    let bucket = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| **count)
+        .map_or(0, |(bucket, _)| bucket);
+    let middle = |shift: usize| {
+        #[expect(clippy::cast_possible_truncation)]
+        let level = ((bucket >> shift) & 0x0F) as u8;
+        (level << 4) | 0x08
+    };
+    [middle(8), middle(4), middle(0)]
+}
+
 /// Reports a placement that did not happen, through the boot-diagnostic funnel
 /// rather than `tracing` directly: this work runs before the log subscriber exists,
 /// and a message written to no subscriber at all would be exactly the silent pass
@@ -119,64 +287,73 @@ fn not_placed(surface: &str, reason: &str) {
 /// application's own icon image is what the Dock tile displays; it returns to the
 /// system's generic icon when the process ends.
 #[cfg(target_os = "macos")]
-// The casts below are the artwork's own dimensions (a 256-pixel image): the
-// 32-bit narrowing the lint warns about cannot be reached by them.
-#[expect(clippy::cast_possible_wrap)]
 fn set_dock_icon() {
-    use objc2::{AnyThread, MainThreadMarker};
-    use objc2_app_kit::{NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSImage};
-    use objc2_foundation::NSSize;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
 
     let Some(marker) = MainThreadMarker::new() else {
         not_placed("the Dock icon", "it can only be set from the main thread");
         return;
     };
     let artwork = artwork();
-    let (width, height) = (artwork.width as isize, artwork.height as isize);
-    // Built from the pixels rather than the encoded file: an image made from
-    // encoded data decodes lazily, so its bytes would have to outlive it.
-    // SAFETY: a null `planes` is the documented request for a representation that
-    // allocates its own buffer, and the remaining arguments describe exactly the
-    // RGBA layout the artwork was decoded into.
-    let bitmap = unsafe {
-        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-            NSBitmapImageRep::alloc(),
-            std::ptr::null_mut(),
-            width,
-            height,
-            8,
-            4,
-            true,
-            false,
-            NSDeviceRGBColorSpace,
-            width * 4,
-            32,
-        )
-    };
-    let Some(bitmap) = bitmap else {
+    let Some(icon) = square_nsimage(&artwork.rgba, artwork.width, f64::from(artwork.width)) else {
         not_placed("the Dock icon", "its bitmap could not be allocated");
         return;
     };
-    // SAFETY: the representation allocated `height * bytes_per_row` bytes for us,
-    // which is what the copy fills; both it and the icon are released by their own
-    // `Retained` values when this call returns.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            artwork.rgba.as_ptr(),
-            bitmap.bitmapData(),
-            artwork.rgba.len(),
-        );
-    }
-    let icon = NSImage::initWithSize(
-        NSImage::alloc(),
-        NSSize::new(f64::from(artwork.width), f64::from(artwork.height)),
-    );
-    icon.addRepresentation(&bitmap);
     // SAFETY: called on the main thread, which is the thread AppKit's own state
     // belongs to; the image is only read by AppKit after this call.
     unsafe {
         NSApplication::sharedApplication(marker).setApplicationIconImage(Some(&icon));
     }
+}
+
+/// An `NSImage` of a `side`-pixel RGBA square, drawn `points` square: the pixels are the
+/// backing store, the points what the system lays it out at. Built from pixels rather
+/// than from an encoded file, because an image made from encoded data decodes lazily and
+/// its bytes would then have to outlive it. `None` when the bitmap cannot be allocated.
+#[cfg(target_os = "macos")]
+// The casts below are the image's own dimensions, and its points: both are pixel counts
+// of artwork this process embedded, so the narrowing the lint warns about is unreachable.
+#[expect(clippy::cast_possible_wrap)]
+fn square_nsimage(
+    pixels: &[u8],
+    side: u32,
+    points: f64,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSImage>> {
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{NSBitmapImageRep, NSDeviceRGBColorSpace, NSImage};
+    use objc2_foundation::NSSize;
+
+    let side = side as isize;
+    // SAFETY: a null `planes` is the documented request for a representation that
+    // allocates its own buffer, and the remaining arguments describe exactly the RGBA
+    // layout the pixels are in.
+    let bitmap = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            side,
+            side,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            side * 4,
+            32,
+        )
+    };
+    let bitmap = bitmap?;
+    // SAFETY: the representation allocated `side * side * 4` bytes for us, which is what
+    // the copy fills; both it and the image are released by their own `Retained` values
+    // once the caller drops them.
+    unsafe {
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bitmap.bitmapData(), pixels.len());
+    }
+    bitmap.setSize(NSSize::new(points, points));
+    let icon = NSImage::initWithSize(NSImage::alloc(), NSSize::new(points, points));
+    icon.addRepresentation(&bitmap);
+    Some(icon)
 }
 
 /// Linux: writes the launcher entry and the icon-theme copies the desktop reads.
@@ -316,6 +493,11 @@ fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The icon group `build.rs` embeds is the executable's first one: the window's icons
+/// ([`apply_window_icons`]) and the tray's ([`tray_icon_image`]) both read it.
+#[cfg(target_os = "windows")]
+const ICON_RESOURCE_ID: u16 = 1;
+
 /// Windows: attaches the executable's own icons to the window.
 ///
 /// winit registers the window's class with no icon at all and sets only the
@@ -339,16 +521,13 @@ pub(crate) fn apply_window_icons(raw_handle: u64) {
         WM_SETICON,
     };
 
-    /// The icon group `build.rs` embeds is the executable's first one.
-    const ICON_RESOURCE_ID: usize = 1;
-
     let window = raw_handle as isize;
     // SAFETY: `window` is the live window's own handle on the thread that created
     // it, the resource name is the id the build script wrote into this executable,
     // and a shared icon handle is neither freed nor owned by the caller.
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
-        let resource = ICON_RESOURCE_ID as *const u16;
+        let resource = usize::from(ICON_RESOURCE_ID) as *const u16;
         let big = LoadImageW(
             instance,
             resource,
