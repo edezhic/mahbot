@@ -93,8 +93,8 @@
 //! `debug`, then best-effort deletes garbage rows (debug on success, warn
 //! on transient failure without failing boot) while the intentional shared
 //! namespaces written by other subsystems (the nightly-discovery marker, the
-//! temp-cleanup cadence state and the update notice's records) are left
-//! untouched.
+//! temp-cleanup cadence state, the update notice's records and the low-disk
+//! notice's ladder) are left untouched.
 //! Downgrade resurrection is therefore lost — under the previous ghost policy
 //! orphans were retained and would re-appear on downgrade, now they are deleted
 //! on first reboot. New orphans cannot be created via the settings path because
@@ -1221,9 +1221,10 @@ pub async fn reload_from_db() -> Result<()> {
 /// Delete `config_kv` rows whose keys are no longer recognized config fields
 /// (e.g. a setting removed in an upgrade), so stale values cannot resurface if
 /// the key is ever reintroduced. The shared namespaces written by other
-/// subsystems (the nightly-discovery marker, the temp-cleanup cadence state and
-/// the update notice's records) are left untouched. Delete failures are logged
-/// and tolerated (transient, retried on the next reload).
+/// subsystems (the nightly-discovery marker, the temp-cleanup cadence state, the
+/// update notice's records and the low-disk notice's ladder) are left untouched.
+/// Delete failures are logged and tolerated (transient, retried on the next
+/// reload).
 async fn purge_unknown_kv_orphans(store: &crate::config_db::ConfigStore, kvs: &[(String, String)]) {
     let orphans: Vec<String> = kvs
         .iter()
@@ -1234,6 +1235,7 @@ async fn purge_unknown_kv_orphans(store: &crate::config_db::ConfigStore, kvs: &[
                 && key != crate::temp::TEMP_CLEANUP_MODE_KV_KEY
                 && key != crate::self_update::UPDATE_LAST_RUN_VERSION_KV_KEY
                 && key != crate::self_update::UPDATE_PENDING_CHANGELOG_KV_KEY
+                && key != crate::disk_notice::LADDER_KV_KEY
         })
         .map(|(key, _)| key.clone())
         .collect();
@@ -2399,6 +2401,10 @@ mod tests {
             .set_kv(crate::self_update::UPDATE_PENDING_CHANGELOG_KV_KEY, "{}")
             .await
             .unwrap();
+        store
+            .set_kv(crate::disk_notice::LADDER_KV_KEY, "2@2026-10-28T00:00:00Z")
+            .await
+            .unwrap();
 
         let kvs = store.get_all_kv().await.unwrap();
         purge_unknown_kv_orphans(&store, &kvs).await;
@@ -2447,10 +2453,11 @@ mod tests {
         for key in [
             crate::self_update::UPDATE_LAST_RUN_VERSION_KV_KEY,
             crate::self_update::UPDATE_PENDING_CHANGELOG_KV_KEY,
+            crate::disk_notice::LADDER_KV_KEY,
         ] {
             assert!(
                 store.get_kv(key).await.unwrap().is_some(),
-                "update-notice state must survive the purge: {key}"
+                "state shared with another subsystem must survive the purge: {key}"
             );
         }
     }

@@ -157,6 +157,9 @@ pub(crate) mod onnx;
 pub mod boot;
 // Defaults, persisted overrides, model routing and the process-global handle.
 pub mod config;
+// The built-in low-disk notice: the admin assistant is told when free space on
+// the temp volume falls below 5%, on a widening reminder ladder.
+pub mod disk_notice;
 // Asking the OS not to throttle a daemon whose window is never visible.
 pub mod power;
 // Downloading, verifying and swapping in a new version, under the instance

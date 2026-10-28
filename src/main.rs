@@ -354,6 +354,16 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::temp::run_temp_cleanup_loop(),
     );
 
+    // The built-in low-disk notice: tells the admin assistant when the temp
+    // volume's free space falls below 5%, on a widening reminder ladder. It
+    // deletes nothing and keeps its own cadence (see `mahbot::disk_notice`).
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "low-disk-notice",
+        mahbot::disk_notice::run_low_disk_notice_loop(),
+    );
+
     // Debug IPC query endpoint: `mahbot debug` connects to this local socket
     // (UDS on Unix, named pipe on Windows) to run read-only SQL against the
     // live stores while an instance holds the lock. Binds after the stores
