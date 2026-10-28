@@ -14,16 +14,12 @@
 //! Truthfulness rules:
 //! - The card's first row is the role icon followed inline by the token/elapsed
 //!   metrics (collapsed and expanded alike), with no fill spacers; the rest of
-//!   the card content (thinking fallback, trace groups, tool blocks, activity
-//!   line) starts on the second row at the card's left edge. Narration (the
-//!   assistant's short reasoning text) is shown exactly once — as the current
-//!   (latest) trace-group label, which shows a neutral "clanking" placeholder
-//!   while its narration hasn't committed; a brand-new agent — or a current
-//!   user turn with no tool rounds yet — shows a card-level "clanking"
-//!   placeholder. The narration renders at 14px italic, never truncated — the
-//!   full reasoning text stays a hover tooltip — while a silent round (empty
-//!   narration) with a decoded Reasoning block promotes that reasoning into
-//!   the label: capped, plain, no tooltip. The live activity phase label (a
+//!   the card content (trace-group lines, tool blocks, activity line) starts on
+//!   the second row at the card's left edge. Every trace group renders one line
+//!   about what the agent is doing, derived from that group's newest step by
+//!   [`trace_line`] — see [`visible_lines`] for how a group with no text of its
+//!   own holds the line already on the card, and when the neutral "clanking"
+//!   placeholder appears instead. The live activity phase label (a
 //!   non-tool LLM call) renders as a separate line at the very bottom of the
 //!   card in both the collapsed and expanded state.
 //!   In-flight tool state is derived from the live transcript history: a tool
@@ -66,8 +62,8 @@ use crate::ChatRole;
 use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey};
 use crate::gui::dialog;
 use crate::gui::session_view::{
-    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, ToolBlockView, ToolCallEntry, build_ledger,
-    collapse_control_chars, promoted_reasoning, tool_block, truncate_at_boundary,
+    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, ToolBlockView, ToolCallEntry, build_ledger, tool_block,
+    truncate_at_boundary,
 };
 use crate::gui::theme;
 use crate::gui::widgets;
@@ -81,6 +77,12 @@ use iced_fonts::lucide;
 use super::Message;
 
 use crate::Workspace;
+
+mod trace_line;
+
+/// How many collapsed previous trace groups the expanded card shows, besides
+/// the current one.
+const MAX_PREVIOUS_GROUPS: usize = 5;
 
 /// Maximum display length (Unicode chars) of an analyze/research group header
 /// label (the question/task text). Truncated at a word/path-delimiter boundary
@@ -667,16 +669,16 @@ fn workspace_label_for(
 /// inline in the first row, then the current user turn's trace groups. The
 /// whole card is clickable to expand/collapse the trace groups.
 ///
-/// Narration (the assistant's short reasoning text) lives solely in the
-/// current trace-group label, which shows a "clanking" placeholder while its
-/// narration hasn't committed; a brand-new agent — or a current user turn
-/// with no tool rounds yet — shows a card-level "clanking" placeholder. The
-/// live activity phase label (an
-/// in-flight non-tool LLM call, e.g. extracting/summarizing/transcribing)
-/// renders as a separate accent line at the very bottom of the card in both
-/// the collapsed and expanded state. Trace groups come from the live
-/// transcript snapshot (the unpersisted tail included): the current (latest)
-/// group, plus up to 5 previous groups when expanded.
+/// Each trace group renders one line about what the agent is doing, following
+/// that group's newest step (see [`trace_line`]); no line a newer group already
+/// shows is repeated, and the neutral "clanking" placeholder appears only while
+/// the card has no line at all (see [`visible_lines`]). The live activity phase
+/// label (an in-flight non-tool LLM call, e.g.
+/// extracting/summarizing/transcribing) renders as a separate accent line at the
+/// very bottom of the card in both the collapsed and expanded state. Trace groups
+/// come from the live transcript snapshot (the unpersisted tail included): the
+/// current (latest) group, plus up to [`MAX_PREVIOUS_GROUPS`] previous groups
+/// when expanded.
 fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, RunningMessage> {
     let h = &card.handle;
     // Color resolution via the canonical string helper (handles derivative
@@ -687,14 +689,15 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     let icon = theme::role_icon(&role).size(theme::TEXT_24).color(fg);
     let elapsed = format_elapsed(h.started_at);
 
-    // The live transcript snapshot feeds the trace groups below (and the
-    // current group's narration label), scoped to the current user turn, so
-    // fetch it once up front.
+    // The live transcript snapshot feeds the trace groups below (and their
+    // lines), scoped to the current user turn, so fetch it once up front. The
+    // groups borrow the ledger, so it outlives them within this render.
     let snapshot = crate::session::TRANSCRIPT_REGISTRY.snapshot(&h.agent_id);
-    let groups = snapshot
+    let ledger = snapshot
         .as_ref()
-        .map(|s| derive_trace_groups(current_turn_entries(&build_ledger(&s.history))))
+        .map(|snapshot| build_ledger(&snapshot.history))
         .unwrap_or_default();
+    let groups = derive_trace_groups(current_turn_entries(&ledger));
 
     let token_count = snapshot.as_ref().and_then(|s| s.token_count);
 
@@ -710,17 +713,17 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         .push(icon)
         .push(render_metrics(token_count, &elapsed));
     content = content.push(first_row);
-    // A brand-new agent — or the current user turn with no tool rounds yet —
-    // shows a card-level "clanking" placeholder. Once the current turn has any
-    // group, the current group's own label handles narration / thinking, so
-    // this fallback must not render at card level.
-    if groups.is_empty() {
+    // The line each visible group renders, and — while no group has one at all
+    // (a brand-new agent, a new user turn, or a turn whose groups carry no text
+    // yet) — the card-level "clanking" placeholder standing in for it.
+    let lines = visible_lines(&groups, expanded);
+    if !lines.iter().any(|line| matches!(line, GroupLine::Line(_))) {
         content = content.push(clanking_placeholder());
     }
     // Trace groups from the live snapshot, scoped to the current user turn.
     // Content-only assistant messages (final answers) are deliberately
     // omitted — only tool-call assistant messages form groups.
-    for group in render_visible_groups(&groups, expanded) {
+    for group in render_visible_groups(&groups, lines) {
         content = content.push(group);
     }
     // The live activity phase label (an in-flight non-tool LLM call) renders
@@ -751,38 +754,20 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     .into()
 }
 
-/// The narration typography of the trace-group labels: italic at
-/// [`theme::NARRATION_TEXT_SIZE`] with wrapping within the row. A narration
-/// label is never truncated and keeps the full reasoning as a hover tooltip;
-/// a promoted reasoning label is pre-capped by
-/// [`promoted_reasoning_label`] and carries no tooltip.
-fn narration_text(narration: &str) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
-    text(narration.to_owned())
+/// The typography of a trace group's line: italic at
+/// [`theme::NARRATION_TEXT_SIZE`], wrapping within the row. The text is already
+/// one line of whole sentences within the card's character budget (see
+/// [`trace_line::line_for_step`]); only a sentence longer than the budget is cut.
+fn trace_line_text(line: &str) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
+    text(line.to_owned())
         .size(theme::NARRATION_TEXT_SIZE)
         .font(theme::FONT_ITALIC)
         .color(theme::TEXT_SECONDARY)
         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
 }
 
-/// Max display length (Unicode chars) of a promoted reasoning label. The
-/// narration itself never truncates, but a promoted long CoT fallback is
-/// capped so it cannot dominate the card.
-const MAX_PROMOTED_LABEL_CHARS: usize = 200;
-
-/// Single-line display form of a promoted reasoning label: control
-/// characters collapsed to spaces ([`collapse_control_chars`]), then capped
-/// at [`MAX_PROMOTED_LABEL_CHARS`] chars at a word/path-delimiter boundary
-/// with "…" ([`truncate_at_boundary`]).
-fn promoted_reasoning_label(reasoning: &str) -> String {
-    truncate_at_boundary(
-        &collapse_control_chars(reasoning, MAX_PROMOTED_LABEL_CHARS),
-        MAX_PROMOTED_LABEL_CHARS,
-    )
-}
-
-/// The neutral "clanking" placeholder shown while a narration has not
-/// committed yet (a brand-new agent with no trace groups, or a current
-/// group awaiting its first narration).
+/// The neutral "clanking" placeholder: the card has no line to show yet — a
+/// brand-new agent, a new user turn, or a turn whose groups are all textless.
 fn clanking_placeholder() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     text("clanking")
         .size(theme::TEXT_13)
@@ -828,81 +813,127 @@ fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, R
     metrics.into()
 }
 
+/// What a trace group's line row renders.
+enum GroupLine<'a> {
+    /// The line the group shows.
+    Line(trace_line::Line<'a>),
+    /// Nothing to show here: the group carries no text and no earlier line to
+    /// hold, or a newer group already shows the very same line.
+    Blank,
+}
+
 /// Render the visible trace groups for a card: the current (latest) group
-/// always (last, chronologically, newest round expanded), plus up to 5
-/// previous groups (collapsed) when the card is expanded. Every group renders
-/// its narration label (see [`render_trace_group`]). Empty input renders
-/// nothing.
-fn render_visible_groups(
-    groups: &[TraceGroup],
-    expanded: bool,
+/// always (last, chronologically, newest step expanded), plus up to
+/// [`MAX_PREVIOUS_GROUPS`] previous groups (collapsed) when the card is
+/// expanded. `lines` are the lines [`visible_lines`] derived for that same tail.
+fn render_visible_groups<'a>(
+    groups: &'a [TraceGroup<'a>],
+    lines: Vec<GroupLine<'a>>,
 ) -> Vec<Element<'static, RunningMessage>> {
-    let mut rendered = Vec::new();
-    let Some((current, previous)) = groups.split_last() else {
-        return rendered;
-    };
-    if expanded {
-        // The 5 most-recent previous groups, oldest first, then current.
-        for group in previous.iter().rev().take(5).rev() {
-            rendered.push(render_trace_group(group, false));
+    let start = groups.len() - lines.len();
+    let current = groups.len().saturating_sub(1);
+    groups[start..]
+        .iter()
+        .zip(lines)
+        .enumerate()
+        .map(|(offset, (group, line))| render_trace_group(group, start + offset == current, line))
+        .collect()
+}
+
+/// The line every visible group renders, oldest first. A group shows its own
+/// line (its newest step's text); the current group, while it carries no text,
+/// holds the line already on the card — the newest line of an earlier group — so
+/// a running agent's card never goes blank mid-run. One phrase appears at most
+/// once: a line a newer group already shows is dropped from the older group, the
+/// card's line always being the newest copy. A group with nothing to show renders
+/// no line row at all, and the caller renders the neutral placeholder once while
+/// no visible group has a line (a fresh agent, a new user turn, or a turn whose
+/// groups carry no text yet).
+fn visible_lines<'a>(groups: &'a [TraceGroup<'a>], expanded: bool) -> Vec<GroupLine<'a>> {
+    let depth = if expanded { MAX_PREVIOUS_GROUPS + 1 } else { 1 };
+    let start = groups.len().saturating_sub(depth);
+    let mut lines: Vec<GroupLine<'a>> = groups[start..]
+        .iter()
+        .map(|group| group_line(group).map_or(GroupLine::Blank, GroupLine::Line))
+        .collect();
+    if let Some(GroupLine::Blank) = lines.last() {
+        // The line the card already shows: the newest one already computed for a
+        // visible group, else the newest from the groups scrolled out of the
+        // list (the collapsed card has none of the former).
+        let held = lines[..lines.len() - 1]
+            .iter()
+            .rev()
+            .find_map(|line| match line {
+                GroupLine::Line(line) => Some((line.text.clone(), line.hover)),
+                GroupLine::Blank => None,
+            })
+            .or_else(|| {
+                groups[..start]
+                    .iter()
+                    .rev()
+                    .find_map(group_line)
+                    .map(|line| (line.text, line.hover))
+            });
+        if let Some((text, hover)) = held {
+            *lines.last_mut().expect("non-empty tail") =
+                GroupLine::Line(trace_line::Line { text, hover });
         }
     }
-    // Current group: newest round expanded, earlier rounds collapsed.
-    rendered.push(render_trace_group(current, true));
-    rendered
-}
-
-/// The text a trace group renders as its narration label: the group's
-/// narration (wrapped in the reasoning hover tooltip), or — when the
-/// narration is empty (whitespace-only counts as empty) — the group's
-/// promoted reasoning as a capped label (no tooltip: the label already
-/// shows the text), or the neutral "clanking" placeholder for a silent
-/// group (no narration and no reasoning).
-enum GroupLabelText<'a> {
-    Narration(&'a str),
-    Promoted(String),
-    Placeholder,
-}
-
-fn group_label_text(group: &TraceGroup) -> GroupLabelText<'_> {
-    if let Some(reasoning) = promoted_reasoning(Some(&group.narration), group.reasoning.as_deref())
-    {
-        GroupLabelText::Promoted(promoted_reasoning_label(reasoning))
-    } else if !group.narration.trim().is_empty() {
-        GroupLabelText::Narration(&group.narration)
-    } else {
-        GroupLabelText::Placeholder
+    let mut shown: HashSet<String> = HashSet::new();
+    for line in lines.iter_mut().rev() {
+        let GroupLine::Line(group_line) = line else {
+            continue;
+        };
+        if !shown.insert(group_line.text.clone()) {
+            *line = GroupLine::Blank;
+        }
     }
+    lines
 }
 
-/// Render one trace group. `expand_current` renders the newest round's calls
-/// expanded (current group); otherwise every call collapses to a name-only
-/// line (previous groups). The group's narration label always renders (the
-/// short reasoning text, its promoted capped reasoning, or the "clanking"
-/// placeholder); hovering the narration label — not the promoted one, which
-/// already shows the text — reveals the group's full decoded Reasoning when
-/// it carried one.
-fn render_trace_group(
-    group: &TraceGroup,
+/// The line a trace group shows: the newest step's own line (its narration, else
+/// its reasoning — see [`trace_line::line_for_step`]), or an earlier step's line
+/// while the newest one carries no usable text, so a group that already showed
+/// a line keeps showing one. `None` when no step of the group has any text.
+fn group_line<'a>(group: &TraceGroup<'a>) -> Option<trace_line::Line<'a>> {
+    group
+        .steps
+        .iter()
+        .rev()
+        .find_map(|step| trace_line::line_for_step(step.narration, step.reasoning))
+}
+
+/// Render one trace group. `expand_current` renders the newest step's calls
+/// expanded (current group); otherwise every call collapses to a name-only line
+/// (previous groups). `line` is the text line the group shows (see
+/// [`visible_lines`]); hovering it reveals the reasoning of the step it came
+/// from (see [`reasoning_tooltip`]).
+fn render_trace_group<'a>(
+    group: &TraceGroup<'a>,
     expand_current: bool,
+    line: GroupLine<'a>,
 ) -> Element<'static, RunningMessage> {
     let mut column = Column::new()
         .spacing(theme::SPACE_4)
         .align_x(Alignment::Start);
-    let label: Element<'static, RunningMessage> = match group_label_text(group) {
-        GroupLabelText::Narration(narration) => {
-            reasoning_tooltip(group.reasoning.as_deref(), narration_text(narration).into())
+    match line {
+        GroupLine::Line(line) => {
+            column = column.push(reasoning_tooltip(
+                line.hover,
+                trace_line_text(&line.text).into(),
+            ));
         }
-        GroupLabelText::Promoted(promoted) => narration_text(&promoted).into(),
-        GroupLabelText::Placeholder => clanking_placeholder().into(),
-    };
-    column = column.push(label);
+        // Nothing to show here: the card-level placeholder covers the case where
+        // no group has a line at all, and a second copy of another group's line
+        // is never rendered.
+        GroupLine::Blank => {}
+    }
 
     if expand_current {
         let (newest, earlier) = group
-            .rounds
+            .steps
             .split_last()
-            .expect("a trace group always carries at least one round");
+            .expect("a trace group always carries at least one step");
         if !earlier.is_empty() {
             column = column.push(
                 text(collapsed_calls_line(earlier))
@@ -910,12 +941,12 @@ fn render_trace_group(
                     .color(theme::TEXT_SECONDARY),
             );
         }
-        for entry in newest {
+        for entry in newest.calls {
             column = column.push(tool_row(entry));
         }
     } else {
         column = column.push(
-            text(collapsed_calls_line(&group.rounds))
+            text(collapsed_calls_line(&group.steps))
                 .size(theme::TEXT_10)
                 .color(theme::TEXT_SECONDARY),
         );
@@ -940,15 +971,16 @@ fn tool_row(entry: &ToolCallEntry) -> Element<'static, RunningMessage> {
     }
 }
 
-/// Wrap a narration label in a hover tooltip revealing the full decoded
-/// Reasoning behind it (see [`TraceGroup::reasoning`]). When there is no
-/// reasoning the label renders bare.
+/// Wrap a group's line in a hover tooltip revealing the reasoning of the step
+/// the line came from (see [`TraceStep::reasoning`]), already cut to the prefix
+/// that was read: the whole block reaches tens of kilobytes and is copied per
+/// render. When that step has no reasoning the line renders bare.
 fn reasoning_tooltip<'a>(
     reasoning: Option<&str>,
-    label: Element<'a, RunningMessage>,
+    line: Element<'a, RunningMessage>,
 ) -> Element<'a, RunningMessage> {
-    let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) else {
-        return label;
+    let Some(reasoning) = reasoning else {
+        return line;
     };
     let tooltip_content: Element<'static, RunningMessage> = container(
         text(reasoning.to_string())
@@ -958,23 +990,23 @@ fn reasoning_tooltip<'a>(
     )
     .max_width(MAX_TOOL_TOOLTIP_WIDTH)
     .into();
-    tooltip(label, tooltip_content, tooltip::Position::Top)
+    tooltip(line, tooltip_content, tooltip::Position::Top)
         .gap(theme::SPACE_4)
         .style(theme::tooltip_style)
         .into()
 }
 
-/// Compose the collapsed name-only line for a set of tool-call rounds: tool
-/// names with underscores replaced by spaces, in first-appearance order, each
-/// unique name suffixed with `xN` when it appears more than once within the
-/// collapsed set (e.g. `read file x2, list files`). An in-flight call
-/// (result not yet committed) gets its display name suffixed with a running
-/// marker (`…`) before the xN counting, so it never looks settled.
-fn collapsed_calls_line(rounds: &[Vec<ToolCallEntry>]) -> String {
+/// Compose the collapsed name-only line for a set of trace steps: tool names
+/// with underscores replaced by spaces, in first-appearance order, each unique
+/// name suffixed with `xN` when it appears more than once within the collapsed
+/// set (e.g. `read file x2, list files`). An in-flight call (result not yet
+/// committed) gets its display name suffixed with a running marker (`…`) before
+/// the xN counting, so it never looks settled.
+fn collapsed_calls_line(steps: &[TraceStep<'_>]) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for round in rounds {
-        for call in round {
+    for step in steps {
+        for call in step.calls {
             let base = call.tool.name.replace('_', " ");
             let display = if call.result.is_none() {
                 format!("{base} …")
@@ -1011,32 +1043,34 @@ pub(crate) fn prune_expanded(expanded: &mut HashSet<(String, u64)>, agents: &[Ag
     expanded.retain(|key| live.contains(key));
 }
 
+/// One step of an agent's work: one tool-call assistant round with the text
+/// that round itself carried, borrowed from the ledger entry it was projected
+/// from so a re-render copies neither reasoning nor tool payload.
+struct TraceStep<'a> {
+    /// The assistant's own intermediate text, the short visible narration it
+    /// wrote for the reader (the decoded assistant `content`, NEVER the long
+    /// `Reasoning` / `[thinking]` block). Empty when the round narrated
+    /// nothing.
+    narration: &'a str,
+    /// The round's decoded long Reasoning. The step's line falls back to it
+    /// when the narration carries no line, and its bounded prefix is the line's
+    /// hover text otherwise.
+    reasoning: Option<&'a str>,
+    /// The round's tool calls (name/args pairs plus the tool_call_id-matched
+    /// result), so the display can distinguish an in-flight call (result not
+    /// yet committed) from a settled one.
+    calls: &'a [ToolCallEntry],
+}
+
 /// One trace group in a running agent's live transcript: a maximal run of
 /// consecutive tool-call assistant rounds sharing a single (possibly empty)
-/// visible narration, bounded by a real user turn or a new narration.
-///
-/// Derived from the shared session ledger: the group's narration comes from
-/// the decoded assistant `content` (the short visible reasoning text); its
-/// `reasoning` is the long decoded `Reasoning` block of the group's rounds,
-/// surfaced on hover or promoted into the label. A group always carries at
-/// least one round.
-struct TraceGroup {
-    /// The assistant's short visible narration (empty → renders "clanking",
-    /// or the promoted capped reasoning label when the group carries one).
-    /// This is the decoded assistant `content`, NEVER the long `Reasoning`
-    /// / `[thinking]` block.
-    narration: String,
-    /// The full decoded Reasoning of the group: the first non-empty reasoning
-    /// among its rounds. Surfaced on hover behind a narration label, or
-    /// promoted into the label itself when the narration is empty. `None` when
-    /// the rounds carried none (a silent group then renders "clanking").
-    reasoning: Option<String>,
-    /// Tool-call rounds in first-appearance order; the LAST round is the newest
-    /// (expanded in the current group), earlier rounds collapse. Each round
-    /// carries the full ledger tool-call entries (name/args pairs plus the
-    /// tool_call_id-matched result), so the display can distinguish an in-flight
-    /// call (result not yet committed) from a settled one.
-    rounds: Vec<Vec<ToolCallEntry>>,
+/// visible narration, bounded by a real user turn or a new narration. Every
+/// round's own text is kept (see [`TraceStep`]) because the group's line
+/// follows the newest step. A group always carries at least one step.
+struct TraceGroup<'a> {
+    /// The group's steps in chronological order; the LAST one is the newest
+    /// (expanded in the current group, and the one its line is derived from).
+    steps: Vec<TraceStep<'a>>,
 }
 
 /// A real user turn boundary in the ledger: a User message that is neither
@@ -1066,16 +1100,16 @@ fn current_turn_entries(entries: &[SessionEntry]) -> &[SessionEntry] {
 /// chronological order.
 ///
 /// Boundary rules:
-/// - A new (non-empty) narration in a tool-call assistant round starts a new
-///   group; that narration becomes the group's `narration`.
+/// - A new (non-blank) narration in a tool-call assistant round starts a new
+///   group; that round becomes the group's first step.
 /// - Consecutive tool-call rounds with no narration accumulate into the current
-///   group.
+///   group as further steps, each keeping its own narration and reasoning.
 /// - A real user turn closes the current group; the next tool-call round then
-///   starts a fresh one even with no narration (its `narration` slots to
-///   "clanking"). An empty (whitespace) User message or a synthetic
+///   starts a fresh one even with no narration, and the card has no line to
+///   hold across that turn. An empty (whitespace) User message or a synthetic
 ///   tool-injected one (content starting with the
 ///   [`crate::util::INJECTED_IMAGE_TAG`] marker) is NOT a boundary.
-fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup> {
+fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup<'_>> {
     let mut groups: Vec<TraceGroup> = Vec::new();
     let mut current: Option<TraceGroup> = None;
     for entry in entries {
@@ -1085,25 +1119,18 @@ fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup> {
                 reasoning,
                 calls,
             } => {
-                let narration = narration.clone().unwrap_or_default();
-                let new_group = !narration.is_empty() || current.is_none();
-                if new_group {
-                    if let Some(group) = current.take() {
-                        groups.push(group);
-                    }
-                }
-                let group = current.get_or_insert_with(|| TraceGroup {
-                    narration,
-                    reasoning: None,
-                    rounds: Vec::new(),
-                });
-                if group.reasoning.is_none()
-                    && let Some(reasoning) = reasoning
-                    && !reasoning.is_empty()
+                let narration = narration.as_deref().unwrap_or_default();
+                if !narration.trim().is_empty()
+                    && let Some(group) = current.take()
                 {
-                    group.reasoning = Some(reasoning.clone());
+                    groups.push(group);
                 }
-                group.rounds.push(calls.clone());
+                let group = current.get_or_insert_with(|| TraceGroup { steps: Vec::new() });
+                group.steps.push(TraceStep {
+                    narration,
+                    reasoning: reasoning.as_deref(),
+                    calls,
+                });
             }
             SessionEntry::Message { .. } => {
                 if is_user_turn_boundary(entry)
@@ -1706,10 +1733,11 @@ mod tests {
                 &[("edit", serde_json::json!({"path": "b.rs"}))],
             ),
         ];
-        let groups = derive_trace_groups(&build_ledger(&history));
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
         assert_eq!(groups.len(), 2, "new narration starts a new group");
-        assert_eq!(groups[0].narration, "Reading the file");
-        assert_eq!(groups[1].narration, "Editing it");
+        assert_eq!(groups[0].steps[0].narration, "Reading the file");
+        assert_eq!(groups[1].steps[0].narration, "Editing it");
     }
 
     #[test]
@@ -1718,10 +1746,11 @@ mod tests {
             assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
             assistant_tool_call("", &[("list", serde_json::json!({"path": "."}))]),
         ];
-        let groups = derive_trace_groups(&build_ledger(&history));
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
         assert_eq!(groups.len(), 1, "no narration → same group");
-        assert_eq!(groups[0].rounds.len(), 2);
-        assert!(groups[0].narration.is_empty());
+        assert_eq!(groups[0].steps.len(), 2);
+        assert!(groups[0].steps.iter().all(|s| s.narration.is_empty()));
     }
 
     #[test]
@@ -1734,11 +1763,12 @@ mod tests {
             ChatMessage::user("ok now fix it\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
             assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
         ];
-        let groups = derive_trace_groups(&build_ledger(&history));
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
         assert_eq!(groups.len(), 2, "user turn closes the group");
-        assert_eq!(groups[0].narration, "Narration");
+        assert_eq!(groups[0].steps[0].narration, "Narration");
         // The post-reset empty-narration round starts a fresh group.
-        assert_eq!(groups[1].rounds.len(), 1);
+        assert_eq!(groups[1].steps.len(), 1);
     }
 
     #[test]
@@ -1750,9 +1780,10 @@ mod tests {
             ])),
             assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
         ];
-        let groups = derive_trace_groups(&build_ledger(&history));
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
         assert_eq!(groups.len(), 1, "synthetic image stays in the same group");
-        assert_eq!(groups[0].rounds.len(), 2);
+        assert_eq!(groups[0].steps.len(), 2);
     }
 
     #[test]
@@ -1764,16 +1795,16 @@ mod tests {
             ChatMessage::user(""),
             assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
         ];
-        let groups = derive_trace_groups(&build_ledger(&history));
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
         assert_eq!(groups.len(), 1, "empty user message is not a boundary");
-        assert_eq!(groups[0].rounds.len(), 2);
+        assert_eq!(groups[0].steps.len(), 2);
     }
 
     #[test]
-    fn trace_group_reasoning_is_first_non_empty_round() {
-        // Reasoning is captured from the first non-empty reasoning among the
-        // group's rounds; rounds with no reasoning are skipped, and a group
-        // with none at all carries None (the narration label renders bare).
+    fn every_step_keeps_its_own_reasoning() {
+        // Each round keeps its own reasoning, so the label can follow the
+        // newest step instead of latching onto the group's first one.
         let history = vec![
             assistant_tool_call_reasoning(
                 "",
@@ -1791,20 +1822,11 @@ mod tests {
                 Some("second"),
             ),
         ];
-        let groups = derive_trace_groups(&build_ledger(&history));
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
         assert_eq!(groups.len(), 1, "no narration → same group");
-        assert_eq!(groups[0].reasoning.as_deref(), Some("first"));
-    }
-
-    #[test]
-    fn trace_group_without_reasoning_is_none() {
-        let history = vec![assistant_tool_call_reasoning(
-            "Narration",
-            &[("read", serde_json::json!({"path": "a.rs"}))],
-            None,
-        )];
-        let groups = derive_trace_groups(&build_ledger(&history));
-        assert_eq!(groups[0].reasoning, None);
+        let reasoning: Vec<_> = groups[0].steps.iter().map(|step| step.reasoning).collect();
+        assert_eq!(reasoning, vec![None, Some("first"), Some("second")]);
     }
 
     /// Build a ledger tool-call entry for the collapsed/in-flight projection
@@ -1821,20 +1843,28 @@ mod tests {
         }
     }
 
+    /// A bare trace step carrying only tool calls, for the collapsed-line test.
+    fn step(calls: &[ToolCallEntry]) -> TraceStep<'_> {
+        TraceStep {
+            narration: "",
+            reasoning: None,
+            calls,
+        }
+    }
+
     #[test]
     fn collapsed_calls_line_counts_and_orders() {
-        let rounds = vec![
-            vec![
-                entry("read_file", serde_json::json!({"path": "a.rs"}), Some("ok")),
-                entry("list_files", serde_json::json!({"path": "."}), Some("ok")),
-            ],
-            vec![
-                entry("read_file", serde_json::json!({"path": "b.rs"}), Some("ok")),
-                entry("read_file", serde_json::json!({"path": "c.rs"}), None),
-            ],
+        let read_calls = [
+            entry("read_file", serde_json::json!({"path": "a.rs"}), Some("ok")),
+            entry("list_files", serde_json::json!({"path": "."}), Some("ok")),
         ];
+        let edit_calls = [
+            entry("read_file", serde_json::json!({"path": "b.rs"}), Some("ok")),
+            entry("read_file", serde_json::json!({"path": "c.rs"}), None),
+        ];
+        let steps = vec![step(&read_calls), step(&edit_calls)];
         assert_eq!(
-            collapsed_calls_line(&rounds),
+            collapsed_calls_line(&steps),
             "read file x2, list files, read file …",
             "underscores become spaces; settled names stay exact, an in-flight call gets a running suffix; `xN` counts collapsed repetitions; first-appearance order"
         );
@@ -1851,7 +1881,7 @@ mod tests {
         let ledger = build_ledger(&history);
         let groups = derive_trace_groups(current_turn_entries(&ledger));
         assert_eq!(groups.len(), 1, "only the post-turn group is shown");
-        assert_eq!(groups[0].narration, "Second");
+        assert_eq!(groups[0].steps[0].narration, "Second");
     }
 
     #[test]
@@ -1863,8 +1893,8 @@ mod tests {
         let ledger = build_ledger(&history);
         let groups = derive_trace_groups(current_turn_entries(&ledger));
         assert_eq!(groups.len(), 2, "no boundary → whole ledger is current");
-        assert_eq!(groups[0].narration, "A");
-        assert_eq!(groups[1].narration, "B");
+        assert_eq!(groups[0].steps[0].narration, "A");
+        assert_eq!(groups[1].steps[0].narration, "B");
     }
 
     #[test]
@@ -1898,7 +1928,7 @@ mod tests {
             1,
             "injected + empty user messages are not boundaries"
         );
-        assert_eq!(groups[0].rounds.len(), 2);
+        assert_eq!(groups[0].steps.len(), 2);
     }
 
     #[test]
@@ -1918,7 +1948,7 @@ mod tests {
         let ledger = build_ledger(&history);
         let groups = derive_trace_groups(&ledger);
         assert_eq!(groups.len(), 1);
-        let round = &groups[0].rounds[0];
+        let round = &groups[0].steps[0].calls;
         assert_eq!(round.len(), 2, "both calls preserved in the round");
         let settled = round
             .iter()
@@ -1940,68 +1970,188 @@ mod tests {
     }
 
     #[test]
-    fn promoted_reasoning_is_group_label() {
-        // A silent round (empty narration) that carries a decoded Reasoning
-        // block still forms exactly one group (boundary unchanged) and its
-        // label is the promoted reasoning text — not a placeholder. A later
-        // narrated round starts a second group (fragmentation did not grow).
+    fn line_follows_the_newest_step() {
+        let history = vec![
+            assistant_tool_call_reasoning(
+                "Now editing the parser",
+                &[("edit", serde_json::json!({"path": "b.rs"}))],
+                Some("Reading the whole file first."),
+            ),
+            assistant_tool_call_reasoning(
+                "",
+                &[("read", serde_json::json!({"path": "a.rs"}))],
+                Some("The parser struct is missing the offset field, so the columns drift."),
+            ),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
+        assert_eq!(groups.len(), 1, "a silent round stays in the same group");
+        let line = group_line(&groups[0]).expect("the group carries text");
+        assert_eq!(
+            line.text, "The parser struct is missing the offset field, so the columns drift.",
+            "the line comes from the newest step, not the group's first one"
+        );
+        assert_eq!(
+            line.hover,
+            Some("The parser struct is missing the offset field, so the columns drift."),
+            "hover text is the reasoning of the step the line came from"
+        );
+    }
+
+    #[test]
+    fn silent_step_keeps_the_previous_line() {
+        // A step with no text and a step narrated with whitespace only both
+        // keep the line already on screen, and neither starts a new group.
+        for narration in ["", " "] {
+            let history = vec![
+                assistant_tool_call_reasoning(
+                    "",
+                    &[("read", serde_json::json!({"path": "a.rs"}))],
+                    Some("Checking the whole file first."),
+                ),
+                assistant_tool_call(narration, &[("edit", serde_json::json!({"path": "b.rs"}))]),
+            ];
+            let ledger = build_ledger(&history);
+            let groups = derive_trace_groups(&ledger);
+            assert_eq!(groups.len(), 1, "a blank narration is not a boundary");
+            assert_eq!(
+                group_line(&groups[0]).map(|line| line.text),
+                Some("Checking the whole file first.".to_string()),
+                "narration {narration:?} keeps the line already on screen"
+            );
+        }
+    }
+
+    /// What each visible line row shows, for assertions: the text itself, or
+    /// `<blank>` where the group renders no line (no text to show, or a newer
+    /// group already shows the same line).
+    fn shown_lines(groups: &[TraceGroup<'_>], expanded: bool) -> Vec<String> {
+        visible_lines(groups, expanded)
+            .into_iter()
+            .map(|line| match line {
+                GroupLine::Line(line) => line.text,
+                GroupLine::Blank => "<blank>".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn textless_group_holds_the_previous_groups_line() {
+        // A new group whose only step narrates a bare rule (no text) has
+        // nothing of its own: the card keeps the last line it showed instead of
+        // swapping to the placeholder, and a turn's first group — with no
+        // previous group to hold — still shows the placeholder.
         let history = vec![
             assistant_tool_call_reasoning(
                 "",
                 &[("read", serde_json::json!({"path": "a.rs"}))],
-                Some("Checking the file first"),
+                Some("Checking the whole file first."),
             ),
-            assistant_tool_call_reasoning(
-                "Now editing",
-                &[("edit", serde_json::json!({"path": "b.rs"}))],
-                None,
-            ),
+            assistant_tool_call("---", &[("edit", serde_json::json!({"path": "b.rs"}))]),
         ];
-        let groups = derive_trace_groups(&build_ledger(&history));
-        assert_eq!(groups.len(), 2, "new narration starts a second group");
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
+        assert_eq!(groups.len(), 2, "a rule-only narration starts a group");
         assert!(
-            groups[0].narration.is_empty(),
-            "silent round keeps empty narration"
+            group_line(&groups[1]).is_none(),
+            "the new group has no text"
         );
-        assert!(
-            matches!(
-                group_label_text(&groups[0]),
-                GroupLabelText::Promoted(s) if s == "Checking the file first"
-            ),
-            "silent round with reasoning labels as its promoted reasoning"
+        assert_eq!(
+            shown_lines(&groups, false),
+            vec!["Checking the whole file first."],
+            "the card holds the previous line"
         );
-        assert_eq!(groups[1].narration, "Now editing");
-    }
-
-    #[test]
-    fn silent_round_without_reasoning_is_placeholder() {
-        let history = vec![assistant_tool_call(
-            "",
+        // A turn whose first group is textless has no earlier line to hold.
+        let textless = vec![assistant_tool_call(
+            "---",
             &[("read", serde_json::json!({"path": "a.rs"}))],
         )];
-        let groups = derive_trace_groups(&build_ledger(&history));
-        assert_eq!(groups.len(), 1);
-        assert!(
-            matches!(group_label_text(&groups[0]), GroupLabelText::Placeholder),
-            "no narration and no reasoning → neutral placeholder"
+        let textless_ledger = build_ledger(&textless);
+        let textless_groups = derive_trace_groups(&textless_ledger);
+        assert_eq!(
+            shown_lines(&textless_groups, false),
+            vec!["<blank>"],
+            "no line exists yet → the card renders its placeholder instead"
         );
     }
 
     #[test]
-    fn promoted_label_caps_at_limit() {
-        // A long multi-word reasoning is collapsed to one line and capped at
-        // the word/path-delimiter boundary with "…" (the narration itself is
-        // never truncated, but a promoted fallback must not dominate the card).
-        let long = "word ".repeat(80); // 400 chars
-        let capped = promoted_reasoning_label(&long);
-        assert!(capped.ends_with('…'));
-        assert!(
-            capped.chars().count() <= MAX_PROMOTED_LABEL_CHARS + 1,
-            "cap adds at most the trailing ellipsis"
+    fn a_held_line_is_not_shown_twice_in_the_previous_groups_list() {
+        // The current group holds an earlier group's line; that earlier group
+        // must not render the same sentence again above it.
+        let history = vec![
+            assistant_tool_call_reasoning(
+                "",
+                &[("read", serde_json::json!({"path": "a.rs"}))],
+                Some("Checking the whole file first."),
+            ),
+            assistant_tool_call("---", &[("edit", serde_json::json!({"path": "b.rs"}))]),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
+        assert_eq!(
+            shown_lines(&groups, true),
+            vec!["<blank>", "Checking the whole file first."],
+            "the phrase appears once, on the newest group"
         );
-        // Short text passes through unchanged, with control chars collapsed.
-        assert_eq!(promoted_reasoning_label("do it now"), "do it now");
-        assert_eq!(promoted_reasoning_label("line1\nline2"), "line1 line2");
+        assert_eq!(
+            shown_lines(&groups, false),
+            vec!["Checking the whole file first."],
+            "the collapsed card never had a second copy either"
+        );
+    }
+
+    #[test]
+    fn a_repeated_line_is_dropped_even_when_older_groups_sit_between() {
+        // Two groups that narrate the same sentence are not adjacent: the older
+        // copy goes, not just a repeat of the newest line.
+        let history = vec![
+            assistant_tool_call_reasoning(
+                "",
+                &[("read", serde_json::json!({"path": "a.rs"}))],
+                Some("The same line here."),
+            ),
+            ChatMessage::user("go on\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
+            assistant_tool_call(
+                "Something else.",
+                &[("edit", serde_json::json!({"path": "b.rs"}))],
+            ),
+            ChatMessage::user("now the rest\n\n<timestamp>2026-01-01 00:00:01 (UTC)</timestamp>"),
+            assistant_tool_call_reasoning(
+                "",
+                &[("list", serde_json::json!({"path": "."}))],
+                Some("The same line here."),
+            ),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(
+            shown_lines(&groups, true),
+            vec!["<blank>", "Something else.", "The same line here."],
+            "one phrase never appears twice on the card"
+        );
+    }
+
+    #[test]
+    fn a_textless_previous_group_renders_no_line_rather_than_a_placeholder() {
+        // Only the current group holds an earlier line; an older group with no
+        // text of its own shows no line row, and never a second punctuation.
+        let history = vec![
+            assistant_tool_call("---", &[("read", serde_json::json!({"path": "a.rs"}))]),
+            assistant_tool_call(
+                "Now editing.",
+                &[("edit", serde_json::json!({"path": "b.rs"}))],
+            ),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            shown_lines(&groups, true),
+            vec!["<blank>", "Now editing."],
+            "a textless previous group has nothing to show"
+        );
     }
 
     #[test]

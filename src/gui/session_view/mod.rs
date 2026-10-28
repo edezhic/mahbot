@@ -23,9 +23,7 @@ mod render;
 
 // Shared components re-exported for the Sessions page (full view) and the
 // Running Agents page (compact projection).
-pub(crate) use render::{
-    MAX_TOOL_TOOLTIP_WIDTH, ToolBlockView, collapse_control_chars, tool_block, truncate_at_boundary,
-};
+pub(crate) use render::{MAX_TOOL_TOOLTIP_WIDTH, ToolBlockView, tool_block, truncate_at_boundary};
 
 /// One entry of the flat session ledger: a regular message (system/user/
 /// assistant, optionally carrying a thinking block) or one assistant
@@ -242,8 +240,7 @@ pub(crate) fn parse_entry_bodies(
 /// assistant text content is empty (whitespace-only counts as empty) while a
 /// decoded Reasoning block is present. Render-only signal — the ledger itself
 /// is untouched, empty content stays empty in the history and in the model
-/// replay. Used by both the Sessions page (narration body) and the Running
-/// Agents page (trace-group label fallback).
+/// replay. Used by the Sessions page's narration body.
 pub(crate) fn promoted_reasoning<'a>(
     narration: Option<&'a str>,
     reasoning: Option<&'a str>,

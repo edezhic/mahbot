@@ -65,7 +65,7 @@ pub(crate) fn truncate_at_boundary(s: &str, max_chars: usize) -> String {
 /// collapsed to spaces, collecting at most `max_chars + 1` chars — all that
 /// [`truncate_at_boundary`] can need to honour a `max_chars` cap, so a long
 /// source is never fully scanned per render.
-pub(crate) fn collapse_control_chars(s: &str, max_chars: usize) -> String {
+fn collapse_control_chars(s: &str, max_chars: usize) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(max_chars + 1)
