@@ -55,7 +55,7 @@ use iced::widget::{
     Column, Row, Space, button, column, container, image, pick_list, row, rule, scrollable, text,
     tooltip,
 };
-// The window-dragging area: only a frameless window is dragged by the rail.
+// The window-dragging area: the rail drags the window where the platform's title bar is hidden.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use iced::widget::mouse_area;
 use iced::window;
@@ -390,10 +390,11 @@ pub enum Message {
     /// is tracked for persist-on-exit, and file drops, which attach to the
     /// chat composer while the Home page is showing.
     WindowEvent(window::Id, window::Event),
-    /// The dashboard window was created, carrying the id of the new window.
-    /// Windows only: the icons the taskbar and Alt-Tab show have to be attached to
-    /// the window's own handle (see [`crate::app_icon`]).
-    #[cfg(target_os = "windows")]
+    /// The dashboard window was created, carrying the id of the new window. macOS and Windows
+    /// only: the window is the app's own there — macOS hides the system's title strip before
+    /// showing the window (see [`crate::gui::app_window`]), and Windows attaches to its handle
+    /// the icons the taskbar and Alt-Tab show (see [`crate::app_icon`]).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     WindowOpened(window::Id),
     /// The window's own platform handle, the answer to [`Message::WindowOpened`].
     /// Windows only — the value is the window's `HWND`.
@@ -1724,6 +1725,8 @@ impl Dashboard {
                 }
                 _ => Task::none(),
             },
+            #[cfg(target_os = "macos")]
+            Message::WindowOpened(_) => self::app_window::opened(),
             #[cfg(target_os = "windows")]
             Message::WindowOpened(id) => window::raw_id::<Message>(id).map(Message::WindowHandle),
             #[cfg(target_os = "windows")]
@@ -2978,10 +2981,10 @@ impl Dashboard {
                     Some(Message::WindowEvent(id, event))
                 }
                 // The window is created after this subscription is registered, so
-                // its first `Opened` event arrives here. Windows needs the id it
-                // carries: it is the window's handle, and the taskbar/Alt-Tab icon
-                // has to be attached to it (see `crate::app_icon`).
-                #[cfg(target_os = "windows")]
+                // its first `Opened` event arrives here: macOS uses it to hide the system's
+                // title strip before the window is ever shown, Windows to attach the
+                // taskbar/Alt-Tab icon to the window's handle (see `crate::app_icon`).
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 window::Event::Opened { .. } => Some(Message::WindowOpened(id)),
                 _ => None,
             }),
@@ -3475,9 +3478,9 @@ enum NavColumn {
     Bottom,
 }
 
-/// A window action the app performs for itself, the platform's title bar having been removed
-/// on macOS and Windows: the one control the rail carries in its place and the drag its empty
-/// space starts ([`Dashboard::sidebar_view`]).
+/// A window action the app performs for itself, the platform's title bar being hidden on macOS
+/// and Windows: the one control the rail carries in its place and the drag its empty space
+/// starts ([`Dashboard::sidebar_view`]).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WindowAction {
@@ -3508,13 +3511,13 @@ impl UpdateControl {
 }
 
 impl Dashboard {
-    /// The rail: the window's own chrome on a frameless platform, the top nav icons, the
-    /// voice status while the footer is hidden, the stretch in between
-    /// ([`Self::render_sidebar_mid`]) and the bottom nav icons — all of it draggable there,
-    /// where the platform's title bar is gone.
+    /// The rail: the window's own chrome where the platform's title bar is hidden, the top
+    /// nav icons, the voice status while the footer is hidden, the stretch in between
+    /// ([`Self::render_sidebar_mid`]) and the bottom nav icons — all of it draggable, the title
+    /// bar being hidden there.
     fn sidebar_view(&self, footer_hidden: bool) -> Element<'_, Message> {
         let mut col = Column::new().spacing(theme::SPACE_2);
-        // The window's own chrome, where the platform's frame is gone.
+        // The window's own chrome, where the platform's title bar is hidden.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             col = col.push(Self::render_window_control());
@@ -3647,6 +3650,14 @@ impl Dashboard {
         let glyph = |icon: iced::widget::Text<'static, iced::Theme, iced::Renderer>| {
             icon.size(theme::TEXT_14).color(theme::TEXT_SECONDARY)
         };
+        // macOS rounds the window's corners by the system's own radius, which reaches into the
+        // rail's first entry: the extra padding keeps the glyph and the entry's hit area inside
+        // the rounded shape. Windows rounds at a smaller radius the entry already clears.
+        let top = if cfg!(target_os = "macos") {
+            theme::PAD_12
+        } else {
+            theme::PAD_8
+        };
         container(Self::sidebar_rail_item(
             glyph(lucide::x()).into(),
             "close window",
@@ -3654,7 +3665,7 @@ impl Dashboard {
             RailEntry::WindowControl,
         ))
         .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
-        .padding([theme::PAD_8, theme::PAD_2])
+        .padding([top, theme::PAD_2])
         .into()
     }
 

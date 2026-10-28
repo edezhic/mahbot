@@ -1044,8 +1044,8 @@ fn main() -> Result<()> {
 
 /// The dashboard window's own settings: the geometry it opens with
 /// ([`mahbot::gui::WindowState::opening_size`], a saved one or the narrower
-/// default a fresh window starts with), whether it opens hidden, and the icon and announced
-/// name the platform's identity surfaces need.
+/// default a fresh window starts with), whether it opens hidden, the frame the platform draws
+/// around it, and the icon and announced name the platform's identity surfaces need.
 fn dashboard_window_settings(
     state: &mahbot::gui::WindowState,
     start_hidden: bool,
@@ -1055,17 +1055,36 @@ fn dashboard_window_settings(
         position: state.position(),
         // A restart the updater made for a hidden window comes back hidden (see
         // `self_update::starts_hidden`): the window is created without ever being shown, so
-        // nothing is drawn for it until the tray brings it up.
-        visible: !start_hidden,
+        // nothing is drawn for it until the tray brings it up. macOS shows its window itself,
+        // once the title strip is hidden (`gui::app_window`), so iced leaves it hidden there and
+        // a hidden start is a window that is never shown.
+        visible: !start_hidden && cfg!(not(target_os = "macos")),
         min_size: Some(iced::Size::new(
             mahbot::gui::MIN_WINDOW_WIDTH,
             mahbot::gui::MIN_WINDOW_HEIGHT,
         )),
-        // No system title bar or frame on macOS and Windows: the top of the window is the
-        // app's own, and the rail carries the one window control and the drag
-        // (`gui::WindowAction`). Corner rounding is then the platform's — square where it
-        // draws square. Every other platform keeps the frame `gui::app_window` describes.
-        decorations: cfg!(not(any(target_os = "macos", target_os = "windows"))),
+        // The frame this platform draws around the window, or none where the app draws its own
+        // chrome instead: Windows keeps no frame and asks the system to round the corners of what
+        // is left — one request, which a system that does not know it ignores, so Windows 10
+        // keeps square corners. macOS keeps the system's titled window, the one shape the system
+        // rounds and shadows itself, with its whole title strip hidden (`gui::app_window`).
+        // Linux keeps the frame it draws.
+        decorations: cfg!(not(target_os = "windows")),
+        // macOS: the strip draws nothing and the content fills the window. The full-size content
+        // view is also what keeps the frame equal to the content rect, so the saved size and
+        // position (`gui::WindowState`) open exactly as they were saved.
+        #[cfg(target_os = "macos")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        },
+        // Windows: the whole request — the system's own corners (see `decorations`).
+        #[cfg(target_os = "windows")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            corner_preference: iced::window::settings::platform::CornerPreference::Round,
+            ..Default::default()
+        },
         // The window's own icon where the platform has one (the window's icon on X11,
         // and on Windows the small one, the big one attached separately); macOS and
         // Wayland carry no window icon and ignore it.
