@@ -9,9 +9,9 @@
 # zimg, zlib and (on unix) openssl, each in a directory named after the
 # component. <deps-prefix> is where every dependency is installed: the unix legs
 # pass their own scratch prefix, the Windows legs the MSYS2 toolchain's own
-# (`$MINGW_PREFIX`), which is where its pkg-config already looks. <recipe-file>
-# receives every command this script runs, together with what it ran them with —
-# that file is the leg's section of the published BUILD-RECIPE.txt.
+# (`$MINGW_PREFIX`). <recipe-file> receives every command this script runs,
+# together with what it ran them with — that file is the leg's section of the
+# published BUILD-RECIPE.txt.
 # <macos-floor> is the macOS legs' `-mmacosx-version-min` flag, empty elsewhere.
 #
 # The build's own identities come from the environment, because they are what
@@ -74,12 +74,16 @@ Linux*) platform=linux ;;
 esac
 
 # The MSYS2 environments share one kernel: the environment, not `uname`, is what
-# says which machine the result runs on.
+# says which machine the result runs on, and the two the release builds in — MINGW64
+# and CLANGARM64 — differ in the C++ runtime they carry.
 if [ -n "${MSYSTEM:-}" ]; then
     case $MSYSTEM in
+    MINGW64) arch=x86_64 ;;
     CLANGARM64) arch=aarch64 ;;
-    MINGW32) arch=i686 ;;
-    *) arch=x86_64 ;;
+    *)
+        echo "unsupported MSYS2 environment: $MSYSTEM (the legs use MINGW64 or CLANGARM64)" >&2
+        exit 1
+        ;;
     esac
 else
     case $(uname -m) in
@@ -108,35 +112,25 @@ if [ -n "$floor" ]; then
     export MACOSX_DEPLOYMENT_TARGET=${floor#-mmacosx-version-min=}
 fi
 
-# The unix legs' libraries go to a prefix of their own, so pkg-config has to be
-# told where. On Windows they go into the toolchain's prefix, which pkg-config
-# already searches.
-if [ "$platform" != windows ]; then
-    export PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-fi
-
-# ffmpeg links the C++ libraries (x265, zimg) with the C driver, so the C++ runtime is
-# named on the link line, and which one it is belongs to the toolchain: Apple's clang
-# always links libc++ and ships no static libc++.a for a probe to find, llvm-mingw
-# carries one, and gcc's toolchains link libstdc++.
-cxx=${CXX:-c++}
-if [ "$platform" = macos ] || [ "$($cxx -print-file-name=libc++.a)" != libc++.a ]; then
-    cxx_runtime=-lc++
-else
-    cxx_runtime=-lstdc++
-fi
+# configure finds the dependencies this script installs: pkg-config searches the
+# prefix's own directory and nothing else, whatever the environment exports. On Windows
+# that prefix is the toolchain's, so its other .pc files are there too — every name
+# configure asks for is one this build installs over them.
+unset PKG_CONFIG_PATH
+export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
 
 : >"$recipe"
 
-# A command line, verbatim, in the recipe; the command itself follows in the log.
-record() {
-    printf '%s\n' "$*" >>"$recipe"
-}
-
+# A command line in the recipe; the command itself follows in the log. Every argument is
+# quoted, so the published line runs again as it reads.
 run_in() {
     dir=$1
     shift
-    record "( cd $dir && $* )"
+    {
+        printf "( cd '%s' &&" "$dir"
+        printf " '%s'" "$@"
+        printf ' )\n'
+    } >>"$recipe"
     ( cd "$dir" && "$@" ) || {
         status=$?
         echo "failed: $*" >&2
@@ -236,9 +230,7 @@ cp "$sources/ffmpeg/COPYING.GPLv3" "$sources/LICENCE.txt"
     if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
         echo "MACOSX_DEPLOYMENT_TARGET: $MACOSX_DEPLOYMENT_TARGET"
     fi
-    if [ -n "${PKG_CONFIG_PATH:-}" ]; then
-        echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
-    fi
+    echo "PKG_CONFIG_LIBDIR: $PKG_CONFIG_LIBDIR"
     echo
 } >>"$recipe"
 
@@ -262,16 +254,17 @@ run_in "$sources/x264" make install
 
 # The cli, the shared library and libnuma are all off: only the static library is
 # installed, and libnuma would be one more thing the owner's system must carry.
-# x265's aarch64 assembly is written for the ELF assembler and not for Windows on
-# ARM, so that leg builds the portable C++ (MSYS2's own build does the same) — the
-# encoder is the same, only slower.
-x265_assembly=ON
-if [ "$platform" = windows ] && [ "$arch" != x86_64 ]; then
-    x265_assembly=OFF
-fi
-cmark "$sources/x265/source" "$sources/x265/build" \
-    -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_LIBNUMA=OFF \
-    -DENABLE_HDR10_PLUS=OFF -DHIGH_BIT_DEPTH=OFF -DENABLE_ASSEMBLY="$x265_assembly"
+# Windows on ARM builds the portable C++ — x265's aarch64 assembly is written for the
+# ELF assembler. The Linux ARM64 leg keeps its NEON, DotProd and I8MM assembly but drops
+# SVE and SVE2: those are assembled with `-march=armv9-a`, which the base's gcc 11 does
+# not know, and x265 keeps their targets even when its own SVE test fails.
+set -- -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_LIBNUMA=OFF \
+    -DENABLE_HDR10_PLUS=OFF -DHIGH_BIT_DEPTH=OFF
+case "$platform-$arch" in
+windows-aarch64) set -- "$@" -DENABLE_ASSEMBLY=OFF ;;
+linux-aarch64) set -- "$@" -DENABLE_SVE=OFF ;;
+esac
+cmark "$sources/x265/source" "$sources/x265/build" "$@"
 
 # ── libvpx: VP9 ─────────────────────────────────────────────────────
 
@@ -303,8 +296,15 @@ run_in "$sources/libvpx" make install
 
 # ── opus: Opus ──────────────────────────────────────────────────────
 
-cmark "$sources/opus" "$sources/opus/build" \
-    -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF
+# Opus implements ARM run-time detection for MSVC and for Linux/Android/BSD, and CMake
+# compiles its NEON entry points only together with that detection (presuming NEON
+# alone does not compile), so the ARM64 Windows leg builds the portable C: the codec is
+# the same, and only its fast paths' throughput is what this leg does without.
+set -- -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF
+case "$platform-$arch" in
+windows-aarch64) set -- "$@" -DOPUS_MAY_HAVE_NEON=OFF ;;
+esac
+cmark "$sources/opus" "$sources/opus/build" "$@"
 
 # ── zimg: zscale ────────────────────────────────────────────────────
 
@@ -345,7 +345,19 @@ fi
 # not in a second one after them.
 cflags=-I"$prefix"/include
 ldflags=-L"$prefix"/lib
-libs=$cxx_runtime
+# ffmpeg links the C++ libraries (x265, zimg) with the C driver, so the runtime goes on
+# the link line: static libstdc++ on Linux, so no GLIBCXX version is asked of the owner's
+# machine; `-lm` is the static libraries' own math, which `pkg-config --libs` does not
+# print.
+case "$platform-$arch" in
+macos-aarch64 | macos-x86_64 | windows-aarch64) libs=-lc++ ;;
+windows-x86_64) libs=-lstdc++ ;;
+linux-aarch64 | linux-x86_64) libs="-Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lm" ;;
+*)
+    echo "no C++ runtime for $platform-$arch" >&2
+    exit 1
+    ;;
+esac
 if [ "$platform" = windows ]; then
     # The mingw C++ runtimes forward their threads to winpthreads, which the C driver
     # does not add by itself; `-static` folds it in, so no DLL travels beside the exe.

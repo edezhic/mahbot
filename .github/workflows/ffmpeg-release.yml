@@ -78,10 +78,11 @@
 # store after this release — so the unix legs hand it the machine's bundle, while on
 # an owner's machine https opens without one and is verified only when a bundle is
 # passed. `--disable-autodetect` stops a leg from linking whatever else the runner
-# image happens to carry, which is what makes the published recipe describe the
-# builds that were made rather than the three images they were made on. The
-# assertion step after each build reads the binary's own `-version` back and looks at
-# what the binary links.
+# image happens to carry, and `scripts/ffmpeg-build.sh` confines `pkg-config` to the
+# prefix that build installed into — the toolchain's own on Windows — so the published
+# recipe describes the builds that were made rather than the three images they were
+# made on. The assertion step after each build reads the binary's own `-version` back
+# and looks at what the binary links.
 #
 # Windows on ARM is its own build and never the x64 one, and no leg may stand in for
 # another: a platform that cannot be built fails the release rather than being
@@ -371,11 +372,11 @@ jobs:
             build-essential cmake ninja-build nasm pkg-config autoconf automake libtool
 
       # Xcode's clang and make are what macOS builds with; the rest is what the
-      # libraries' own build systems need, `nasm` for their x86 assembly and the
-      # autotools for zimg's `autogen.sh`.
+      # libraries' own build systems need, `nasm` for their x86 assembly, the
+      # autotools for zimg's `autogen.sh` and `pkg-config` for ffmpeg's configure.
       - name: Install the build prerequisites (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake ninja nasm autoconf automake libtool
+        run: brew install cmake ninja nasm autoconf automake libtool pkg-config
 
       # Two toolchains, two environments: `MINGW64` targets x86_64 and
       # `CLANGARM64` targets aarch64, and each leg installs only its own. The
