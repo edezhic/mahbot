@@ -30,6 +30,7 @@ pub(crate) mod markdown_breaks;
 pub(crate) mod media_markers;
 pub(crate) mod menus;
 pub(crate) mod pasteboard;
+pub(crate) mod pulse;
 pub(crate) mod running;
 pub(crate) mod selectable;
 pub(crate) mod session_view;
@@ -37,14 +38,13 @@ pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod shell;
 pub(crate) mod shortcut_keys;
-pub(crate) mod spinner;
 pub(crate) mod text_rendering;
 pub(crate) mod theme;
 pub(crate) mod users;
 pub(crate) mod widgets;
 pub(crate) mod workspaces;
 
-pub(crate) use self::spinner::spinner;
+pub(crate) use self::pulse::activity_dot;
 
 use crate::git::commands::GitPushDestination;
 use crate::logs::LogStore;

@@ -193,11 +193,11 @@ enum SessionActivity {
     /// No agent holds the session.
     Idle,
     /// A registered agent is working in it: the row is pinned to the top of the
-    /// list and carries the spinner.
+    /// list and carries the activity dot.
     Working,
     /// A registered agent was frozen by a workspace pause. It stops at its next
     /// round boundary, so it is not working: the row keeps its place and shows
-    /// the state instead of the spinner.
+    /// the state instead of the dot.
     Paused,
 }
 
@@ -937,10 +937,10 @@ impl SessionsState {
                     SessionActivity::Working => {
                         title_row = title_row
                             .push(Space::new().width(Length::Fill))
-                            .push(super::spinner(theme::TEXT_14));
+                            .push(super::activity_dot());
                     }
                     // A frozen agent produces nothing: its row keeps its place
-                    // and says so rather than spinning.
+                    // and says so rather than carrying the activity dot.
                     SessionActivity::Paused => {
                         title_row = title_row
                             .push(Space::new().width(Length::Fill))

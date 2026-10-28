@@ -368,7 +368,7 @@ fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'stat
 #[cfg(target_os = "macos")]
 fn recording_dot() -> Element<'static, HomeMessage> {
     // Padded so the dot sits at the height of the icon buttons beside it.
-    container(super::spinner::pulse_dot(theme::TEXT_10))
+    container(super::pulse::pulse_dot(theme::TEXT_10, theme::STATUS_ERROR))
         .padding(theme::PAD_5)
         .into()
 }

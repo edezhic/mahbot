@@ -3920,9 +3920,9 @@ impl SettingsState {
             .width(Length::Fill)
             .push(summary);
         if busy {
-            // The switch reports progress through the same line, so a bare spinner
+            // The switch reports progress through the same line, so the dot alone
             // is enough: the text beside it already says where the bot is going.
-            line = line.push(super::spinner(theme::TEXT_13));
+            line = line.push(super::activity_dot());
         }
         Some(line.push(self.telegram_line_controls(&status, busy)).into())
     }

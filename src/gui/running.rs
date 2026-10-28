@@ -925,7 +925,7 @@ fn render_trace_group(
 
 /// A single expanded tool-call row in the current group. Settled calls render
 /// exactly as [`tool_block`]; an in-flight call (result not yet committed)
-/// gains a small accent spinning dot-ring marker after the block.
+/// gains the pulsing activity dot after the block.
 fn tool_row(entry: &ToolCallEntry) -> Element<'static, RunningMessage> {
     let block = tool_block(&entry.tool, ToolBlockView::Compact);
     if entry.result.is_none() {
@@ -933,7 +933,7 @@ fn tool_row(entry: &ToolCallEntry) -> Element<'static, RunningMessage> {
             .spacing(theme::SPACE_6)
             .align_y(Alignment::Center)
             .push(block)
-            .push(super::spinner(theme::TEXT_14))
+            .push(super::activity_dot())
             .into()
     } else {
         block
