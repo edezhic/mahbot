@@ -1065,8 +1065,8 @@ impl Dashboard {
     }
 
     /// The window's close — the platform's own close request (Alt+F4 on Windows, the system
-    /// menu, whatever a shortcut asks for) and the rail's one control: a hide where a hidden
-    /// window is still reachable, the exit path otherwise.
+    /// menu, whatever a shortcut asks for) and the one control the rail, the splash and a failed
+    /// boot carry: a hide where a hidden window is still reachable, the exit path otherwise.
     ///
     /// A hide would be wrong while there is nothing to keep working (before the boot finished,
     /// a boot that failed), while the product is already on its way out
@@ -1663,8 +1663,8 @@ impl Dashboard {
             Message::WindowAction(action) => match action {
                 // The window follows the pointer for the rest of the gesture.
                 WindowAction::Drag => iced::window::latest().and_then(iced::window::drag),
-                // The rail's one control is the window's close: on these platforms that is a
-                // hide (`close_window`).
+                // The control hides the window on these platforms; where it cannot hide — the
+                // splash and a failed boot, before the app runs — it quits (`close_window`).
                 WindowAction::Close => self.close_window(),
             },
             Message::QuitRequested => self.request_exit(Some(crate::shutdown::MACOS_QUIT_TRIGGER)),
@@ -3636,29 +3636,34 @@ impl Dashboard {
             .into()
     }
 
-    /// The window's one control, built like the rail's entries: the close glyph, which hides the
-    /// window ([`Self::close_window`]). Minimizing is the platform's own — the taskbar's menu on
-    /// Windows — and the tray brings a minimized window back like a hidden one.
+    /// The window's one control, built like the rail's entries. `glyph` is what the press does
+    /// where the control is drawn: the eye-off that hides the window on the rail
+    /// ([`Self::close_window`]), the cross that quits from the surfaces drawn before the app
+    /// runs. Minimizing is the platform's own — the taskbar's menu on Windows — and the tray
+    /// brings a minimized window back like a hidden one.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn window_control() -> Element<'static, Message> {
-        let glyph = |icon: iced::widget::Text<'static, iced::Theme, iced::Renderer>| {
-            icon.size(theme::TEXT_14).color(theme::TEXT_SECONDARY)
-        };
+    fn window_control(
+        glyph: iced::widget::Text<'static, iced::Theme, iced::Renderer>,
+    ) -> Element<'static, Message> {
         Self::sidebar_rail_item(
-            glyph(lucide::x()).into(),
+            glyph
+                .size(theme::TEXT_14)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
             "close window",
             Some(Message::WindowAction(WindowAction::Close)),
             RailEntry::WindowControl,
         )
     }
 
-    /// The rail's placement of it: padding at its sides and below, and none above, so the control
-    /// meets the window's top edge and the system's own rounded corner cuts its top border — the
-    /// intended look. That edge is the platform's: the rows just below it are the window's resize
-    /// band, where a press resizes the window instead of reaching the control.
+    /// The rail's placement of it, with the hide glyph: padding at its sides and below, and none
+    /// above, so the control meets the window's top edge and the system's own rounded corner cuts
+    /// its top border — the intended look. That edge is the platform's: the rows just below it
+    /// are the window's resize band, where a press resizes the window instead of reaching the
+    /// control.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn rail_window_control() -> Element<'static, Message> {
-        container(Self::window_control())
+        container(Self::window_control(lucide::eye_off()))
             .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
             .padding(iced::Padding {
                 top: 0.0,
@@ -3669,11 +3674,12 @@ impl Dashboard {
             .into()
     }
 
-    /// The rail-less placement — the start-up splash, a failed boot — which keeps the padding on
-    /// every side, the room the system's rounded corner needs above the glyph included.
+    /// The rail-less placement — the start-up splash, a failed boot — with the cross: there the
+    /// app does not run yet, so the press quits. It keeps the padding on every side, the room the
+    /// system's rounded corner needs above the glyph included.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn chrome_window_control() -> Element<'static, Message> {
-        container(Self::window_control())
+        container(Self::window_control(lucide::x()))
             .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
             .padding([WINDOW_CONTROL_PADDING, theme::PAD_2])
             .into()
