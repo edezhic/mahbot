@@ -9,16 +9,17 @@
 //! about the stored content changes.
 //!
 //! The text that reaches `markdown::parse()` therefore never carries a
-//! picture, and the stored body is never rewritten. What a marker becomes:
+//! picture, and the stored body is never rewritten. What each marker draws:
 //!
-//! - `[IMAGE:path]` → an attachment: a `data:` URI, an absolute path or a
-//!   valid remote address draws; an undecodable or oversized payload degrades
-//!   to the `🖼️ image` label (never raw base64 text, never a blank)
-//! - `![alt](url)` → the same attachment; inside code — a fenced or indented
+//! - `[IMAGE:generated/poster.png]` → the picture: a `data:` URI or a local
+//!   file draws; a remote, undecodable, missing or oversized target shows its
+//!   `🖼️` label instead (never raw base64 text, never a blank)
+//! - `![alt](url)` → the same picture; inside code — a fenced or indented
 //!   block, an inline span — the source stays visible as written
-//! - `[AUDIO:path]` → 🎵 filename, `[VIDEO:path]` → 🎬 Video: filename,
-//!   `[FILE:path]` → 📄 filename (an attachment too; its click reveals the
-//!   file in the OS file manager)
+//! - `[AUDIO:recordings/take.ogg]` → 🎵 filename,
+//!   `[VIDEO:generated/clip.mp4]` → 🎬 Video: filename,
+//!   `[FILE:generated/report.pdf]` → 📄 filename, whose click reveals the file
+//!   in the OS file manager
 //! - `[Audio transcription of ...]: text` → 🔊 emoji + transcribed text
 //! - `[Video transcription of ...]: text` → 🎬 emoji + transcribed text
 //! - `[Saved image: path]` → stripped (the image renders separately from its
@@ -26,12 +27,25 @@
 //! - `[Saved video: path]` → `🎬 Video: filename` (there is no separate video
 //!   renderer, so the clip path must stay visible rather than be hidden)
 //!
-//! # Marker resolution and refusals
+//! # When a marker is an attachment
 //!
-//! Targets are placed by [`media_target::resolve_marker_target`], the authority
-//! Telegram delivery uses too; one that names something but cannot be shown
-//! becomes a [`media_target::marker_refusal`] notice, while content the owner
-//! typed keeps its structural display ([`MarkerContext::refusals`]).
+//! One rule decides it, in every message — a system message, a user's, a tool
+//! result and an agent's reply — and for every kind: a marker becomes an
+//! attachment if and only if its target is a reference — a path, an address, or
+//! an inline payload, as [`media_target::resolve_marker_target`] (the authority
+//! Telegram delivery uses too) classifies it. An address counts in any scheme
+//! casing: [`referenced_target`] canonicalises it first, because the resolver
+//! reads a scheme exactly as written. Prose that merely mentions the syntax — a
+//! bare word, `<path in your workspace>` — stays text as the author wrote it,
+//! and so do a malformed address and one of a scheme the product has no way to
+//! show: none of them is a reference, so none carries a notice.
+//!
+//! A reference stays one when its file is gone: the row draws and a click
+//! behaves like any missing file. (A bare word is a reference only while a
+//! workspace file of that name is — the resolver's existence probe, shared with
+//! delivery, not a display decision.) Only a reference that cannot be attached
+//! *as that kind* — an inline payload claiming to be audio, video or a file, an
+//! address for a file — becomes a [`media_target::marker_refusal`] notice.
 //!
 //! # Canonical marker pattern
 //!
@@ -54,7 +68,7 @@
 
 use iced::widget::{Column, image, markdown, text};
 use iced::{ContentFit, Element, Length};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::ops::Range;
@@ -63,6 +77,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 use super::{selectable, theme, widgets};
+use crate::gui::markdown_breaks;
 use crate::gui::markdown_breaks::iced_markdown_options;
 use crate::util::media_target::{self, MarkerTarget};
 use crate::util::{
@@ -72,32 +87,18 @@ use crate::util::{
 /// The `image` crate, aliased because `image` here is iced's widget module.
 use ::image as image_crate;
 
-/// What marker resolution needs from the content's surroundings.
-pub(crate) struct MarkerContext<'a> {
-    /// The workspace the message belongs to: a relative marker target names a
-    /// file here. `None` when the surface knows no workspace. A desktop surface
-    /// has exactly one root, so relayed content naming a file in its originating
-    /// workspace can only resolve that far on Telegram, which carries both.
-    pub workspace: Option<&'a Path>,
-    /// Whether an undeliverable marker becomes a refusal reason. Only a reply
-    /// the product delivers gets one; verbatim content — what the owner typed, a
-    /// tool result, reasoning promoted into a narration slot — keeps the
-    /// structural display it has always had.
-    pub refusals: bool,
-}
-
 /// One attachment a rendered body carries, in body order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MediaAttachment {
-    /// The picture to draw (a `data:` URI, an absolute path, or a remote
-    /// address); `None` for a named file (audio, video, document) and for a
+    /// The picture to draw (a `data:` URI, a local path — absolute once a
+    /// workspace resolves it — or a remote address, which only ever shows its
+    /// label); `None` for a named file (audio, video, document) and for a
     /// picture whose payload the content no longer carries.
     pub image: Option<String>,
     /// How a plain-text rendition names it — `🖼️ image`, `🖼️ poster.png`,
     /// `🎵 song.mp3`, `🎬 Video: clip.mp4`, `📄 report.pdf`.
     pub label: String,
-    /// What a `[FILE:…]` click reveals; `None` for anything else, and for a
-    /// marker that names a payload rather than a path.
+    /// What a `[FILE:…]` click reveals; `None` for anything else.
     pub reveal: Option<String>,
 }
 
@@ -135,7 +136,11 @@ impl Preprocessed {
 /// One ordered pass over the body: the attachments come out in the order it
 /// carried them, whichever source — a `[KIND:…]` marker or a markdown picture
 /// — wrote each one.
-pub(crate) fn preprocess(content: &str, markers: &MarkerContext<'_>) -> Preprocessed {
+///
+/// `workspace` is the root the message's relative marker targets name a file
+/// in; `None` when the surface knows no workspace, leaving each target to the
+/// module's rule as it was written.
+pub(crate) fn preprocess(content: &str, workspace: Option<&Path>) -> Preprocessed {
     // Order matters: the transcription annotations contain the words "Audio"
     // and "Video", which overlap with the raw `[AUDIO:...]`/`[VIDEO:...]`
     // patterns.  Handle them first.
@@ -148,9 +153,30 @@ pub(crate) fn preprocess(content: &str, markers: &MarkerContext<'_>) -> Preproce
         };
     }
     let (code, mut edits) = scan(&s);
-    edits.extend(marker_edits(&s, markers, &code));
+    edits.extend(marker_edits(&s, workspace, &code));
     edits.sort_by_key(|edit| edit.range.start);
     apply_edits(&s, edits)
+}
+
+/// Parse a chat body for display: extract its markers into attachments, escape
+/// the HTML-classified regions so angle-bracket text renders literally, turn
+/// soft breaks into hard ones, and parse what is left.
+///
+/// Both chat surfaces — Home and the Sessions transcript — run exactly this
+/// pipeline. The order is load-bearing: markers are extracted before the escape
+/// and the break pass, so a payload or a target is never rewritten as HTML or
+/// re-wrapped as prose.
+pub(crate) fn parse_body(
+    content: &str,
+    workspace: Option<&Path>,
+) -> (Vec<markdown::Item>, Vec<MediaAttachment>) {
+    let rendered = preprocess(content, workspace);
+    let escaped = markdown_breaks::escape_html_blocks(&rendered.text);
+    let with_breaks = markdown_breaks::hard_breaks(&escaped);
+    (
+        markdown::parse(&with_breaks).collect(),
+        rendered.attachments,
+    )
 }
 
 /// `[Audio transcription of {filename}]: {text}` → 🔊, `[Video transcription
@@ -175,116 +201,110 @@ fn replace_transcription(s: &str) -> String {
     .to_string()
 }
 
-/// The display form of one marker: the replacement it becomes, or `None` when it
-/// is not a reference and stays as the author wrote it.
-fn render_marker(
-    kind: MediaMarkerKind,
-    target: &str,
-    markers: &MarkerContext<'_>,
-    roots: &[PathBuf],
-) -> Option<Replacement> {
-    // Verbatim content — what the owner typed, a tool result, promoted
-    // reasoning — keeps the structural display: never resolved, never refused.
-    if !markers.refusals {
-        return render_own_text(kind, target);
-    }
-    match media_target::resolve_marker_target(target, roots) {
+/// The display form of one marker under the module's one rule: the replacement
+/// it becomes, or `None` when its target is prose and stays as the author wrote
+/// it. [`referenced_target`] settles how the target reads; the resolver then
+/// says whether it is a reference at all.
+fn render_marker(kind: MediaMarkerKind, target: &str, roots: &[PathBuf]) -> Option<Replacement> {
+    let target = referenced_target(target)?;
+    match media_target::resolve_marker_target(&target, roots) {
         MarkerTarget::NotAReference => None,
-        MarkerTarget::Inline => match kind {
+        MarkerTarget::Inline => Some(match kind {
             MediaMarkerKind::Image => {
-                Some(Replacement::Attachment(picture_attachment(target, target)))
+                Replacement::Attachment(delivered_marker(kind, &target, None))
             }
             MediaMarkerKind::Audio | MediaMarkerKind::Video | MediaMarkerKind::File => {
-                Some(Replacement::Text(media_target::inline_marker_refusal(kind)))
+                Replacement::Text(media_target::inline_marker_refusal(kind))
             }
-        },
-        MarkerTarget::Remote => match media_target::remote_marker(kind, target) {
-            media_target::RemoteMarker::Refused(notice) => Some(Replacement::Text(notice)),
-            media_target::RemoteMarker::Deliverable => Some(Replacement::Attachment(
-                delivered_marker(kind, target, target),
-            )),
-        },
-        MarkerTarget::Local(path) => match media_target::local_refusal(kind, &path) {
-            Some(reason) => Some(Replacement::Text(media_target::marker_refusal_for(
-                target, reason,
-            ))),
-            None => Some(Replacement::Attachment(delivered_marker(
-                kind,
-                target,
-                &path.to_string_lossy(),
-            ))),
-        },
+        }),
+        MarkerTarget::Remote => Some(match media_target::remote_marker(kind, &target) {
+            media_target::RemoteMarker::Refused(notice) => Replacement::Text(notice),
+            media_target::RemoteMarker::Deliverable => {
+                Replacement::Attachment(delivered_marker(kind, &target, None))
+            }
+        }),
+        MarkerTarget::Local(path) => Some(Replacement::Attachment(delivered_marker(
+            kind,
+            &target,
+            Some(&path.to_string_lossy()),
+        ))),
     }
 }
 
-/// The attachment a marker whose target is deliverable becomes: `resolved` is
-/// what the thing is reached by, while the label keeps naming the target as the
+/// The target as this layer classifies it, or `None` when it names no
+/// reference.
+///
+/// The resolver reads a scheme exactly as written, so the address reading is
+/// settled here: a scheme-written target is the address it spells, in any
+/// casing, and never a path, while one that is not a well-formed http(s)
+/// address names nothing. An empty target names nothing too — joined to a root
+/// it would be that root directory.
+fn referenced_target(target: &str) -> Option<Cow<'_, str>> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let Some(scheme) = scheme_of(target) else {
+        return Some(Cow::Borrowed(target));
+    };
+    let canonical = if scheme.chars().any(|c| c.is_ascii_uppercase()) {
+        let rest = &target[scheme.len() + 3..];
+        Cow::Owned(format!("{}://{rest}", scheme.to_ascii_lowercase()))
+    } else {
+        Cow::Borrowed(target)
+    };
+    media_target::is_valid_remote_url(&canonical).then_some(canonical)
+}
+
+/// The scheme `target` is written with — `HTTPS://example.com/x.png` → `HTTPS`.
+/// A `://` further into the target belongs to it, not to a scheme, and only an
+/// RFC-valid scheme passes, so a `data:` payload whose body holds one (a
+/// hand-written SVG, say) is never read as an address.
+fn scheme_of(target: &str) -> Option<&str> {
+    let (scheme, _) = target.split_once("://")?;
+    let mut chars = scheme.chars();
+    (chars.next()?.is_ascii_alphabetic()
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+    .then_some(scheme)
+}
+
+/// The attachment a marker that names a reference becomes. `resolved` is what
+/// the thing is reached by when that differs from the written target (a local
+/// target's absolute path); the label always keeps naming the target as the
 /// message spelled it.
-fn delivered_marker(kind: MediaMarkerKind, target: &str, resolved: &str) -> MediaAttachment {
-    match kind {
-        MediaMarkerKind::Image => picture_attachment(resolved, target),
-        MediaMarkerKind::File => label_attachment(kind, target, Some(resolved.to_string())),
-        MediaMarkerKind::Audio | MediaMarkerKind::Video => label_attachment(kind, target, None),
-    }
-}
-
-/// The attachment a marker that draws no picture becomes: its label, plus the
-/// path a click reveals — `None` where nothing is revealed (audio and video have
-/// no player, and a payload names no path).
-fn label_attachment(
+fn delivered_marker(
     kind: MediaMarkerKind,
     target: &str,
-    reveal: Option<String>,
+    resolved: Option<&str>,
 ) -> MediaAttachment {
-    MediaAttachment {
-        image: None,
-        label: if kind == MediaMarkerKind::File {
-            file_marker_label(target)
-        } else {
-            media_label(kind, target)
+    let resolved = resolved.unwrap_or(target);
+    match kind {
+        MediaMarkerKind::Image => picture_attachment(resolved, Some(target)),
+        MediaMarkerKind::File => MediaAttachment {
+            image: None,
+            label: format!("📄 {}", file_name_or_path(target)),
+            reveal: Some(resolved.to_string()),
         },
-        reveal,
+        MediaMarkerKind::Audio | MediaMarkerKind::Video => MediaAttachment {
+            image: None,
+            label: media_label(kind, target),
+            reveal: None,
+        },
     }
-}
-
-/// The display form of a marker in verbatim content (what the owner typed, a
-/// tool result, promoted reasoning). The product does not resolve or refuse
-/// text it does not own, so this is the structural gate the page has always
-/// used: an inline payload, a well-formed address or an absolute path draws;
-/// anything else is left as typed.
-fn render_own_text(kind: MediaMarkerKind, target: &str) -> Option<Replacement> {
-    let attachment = match kind {
-        MediaMarkerKind::Image => {
-            let draws = target.starts_with("data:")
-                || target.starts_with(crate::util::DATA_URI_OMITTED_PREFIX)
-                || media_target::is_valid_remote_url(target)
-                || Path::new(target).is_absolute();
-            return draws.then(|| Replacement::Attachment(picture_attachment(target, target)));
-        }
-        MediaMarkerKind::Audio | MediaMarkerKind::Video => label_attachment(kind, target, None),
-        MediaMarkerKind::File => label_attachment(
-            kind,
-            target,
-            (!target.starts_with("data:")
-                && !target.starts_with(crate::util::DATA_URI_OMITTED_PREFIX))
-            .then(|| target.to_string()),
-        ),
-    };
-    Some(Replacement::Attachment(attachment))
 }
 
 /// The attachment a picture becomes: `image` is what the renderer draws, while
-/// the label names it by file name — or generically, because an inline payload
-/// has no name and a stripped one has no bytes left to draw.
-fn picture_attachment(image: &str, label_target: &str) -> MediaAttachment {
-    let payload = image.starts_with("data:");
+/// the label names it by file name — by the written target when that differs
+/// from what is drawn — or generically, because an inline payload has no name
+/// and a stripped one has no bytes left to draw.
+fn picture_attachment(image: &str, label_target: Option<&str>) -> MediaAttachment {
     let stripped = image.starts_with(crate::util::DATA_URI_OMITTED_PREFIX);
     MediaAttachment {
         image: (!stripped).then(|| image.to_string()),
-        label: if payload || stripped {
+        label: if media_target::is_inline_payload(image) {
             "🖼️ image".to_string()
         } else {
-            format!("🖼️ {}", file_name_or_path(label_target))
+            format!("🖼️ {}", file_name_or_path(label_target.unwrap_or(image)))
         },
         reveal: None,
     }
@@ -296,18 +316,6 @@ fn media_label(kind: MediaMarkerKind, target: &str) -> String {
     match kind {
         MediaMarkerKind::Audio => format!("🎵 {}", file_name_or_path(target)),
         _ => format!("🎬 Video: {}", file_name_or_path(target)),
-    }
-}
-
-/// The label a `[FILE:path]` marker shows: `📄 name`. A payload carries no file
-/// name (`file_name_or_path` would return a chunk of its base64), so it is named
-/// generically instead of dumping the blob into the bubble.
-fn file_marker_label(path: &str) -> String {
-    let path = path.trim();
-    if path.starts_with("data:") || path.starts_with(crate::util::DATA_URI_OMITTED_PREFIX) {
-        "📄 file".to_string()
-    } else {
-        format!("📄 {}", file_name_or_path(path))
     }
 }
 
@@ -409,7 +417,7 @@ fn scan(text: &str) -> (Vec<Range<usize>>, Vec<Edit>) {
                 let replacement = if dest.is_empty() {
                     Replacement::Text(String::new())
                 } else {
-                    Replacement::Attachment(picture_attachment(dest, dest))
+                    Replacement::Attachment(picture_attachment(dest, None))
                 };
                 pictures.push(Edit {
                     range: start..range.end,
@@ -425,17 +433,12 @@ fn scan(text: &str) -> (Vec<Range<usize>>, Vec<Edit>) {
 /// The edits the body's `[KIND:…]` markers become, in body order, through the
 /// canonical [`MEDIA_MARKER_RE`].
 ///
-/// A deliverable marker becomes an attachment and contributes nothing to the
-/// text; a refusal notice and a marker left as written keep their place in it.
-/// A target that names something but cannot be shown becomes a refusal notice
-/// when the context allows one; a bare word of prose is left as written; and a
-/// marker inside code is source, so it stays as written too.
-fn marker_edits(text: &str, markers: &MarkerContext<'_>, code: &[Range<usize>]) -> Vec<Edit> {
-    let roots: Vec<PathBuf> = markers
-        .workspace
-        .map(Path::to_path_buf)
-        .into_iter()
-        .collect();
+/// A reference becomes an attachment and contributes nothing to the text; a
+/// refusal notice and a marker left as written keep their place in it. A target
+/// that is prose stays as written, and a marker inside code is source, so it
+/// stays as written too.
+fn marker_edits(text: &str, workspace: Option<&Path>, code: &[Range<usize>]) -> Vec<Edit> {
+    let roots: Vec<PathBuf> = workspace.map(Path::to_path_buf).into_iter().collect();
     let mut edits = Vec::new();
     for caps in MEDIA_MARKER_RE.captures_iter(text) {
         let whole = caps.get_match();
@@ -443,7 +446,7 @@ fn marker_edits(text: &str, markers: &MarkerContext<'_>, code: &[Range<usize>]) 
             continue;
         }
         let (kind, target) = parse_media_marker(&caps);
-        let Some(replacement) = render_marker(kind, target.trim(), markers, &roots) else {
+        let Some(replacement) = render_marker(kind, target, &roots) else {
             continue;
         };
         edits.push(Edit {
@@ -815,19 +818,9 @@ fn file_link_uri(target: &str) -> String {
     format!("{FILE_LINK_PREFIX}{target}")
 }
 
-/// Resolve a marker target the way a hand-over does: an absolute target as it
-/// is, a relative one against the conversation's workspace.
+/// Resolve a hand-over's target: an absolute one as it is, a relative one
+/// against the conversation's workspace.
 fn resolve_file_marker_target(target: &str, workspace: Option<&Path>) -> Result<PathBuf, String> {
-    if target.is_empty() {
-        return Err("The marker does not name a file.".to_string());
-    }
-    // `[FILE:…]` is local-only, exactly as at delivery time.
-    if media_target::is_valid_remote_url(target) {
-        return Err(format!(
-            "Not a local file: {}",
-            media_target::marker_name(target)
-        ));
-    }
     let raw = Path::new(target);
     if raw.is_absolute() {
         return Ok(raw.to_path_buf());
@@ -966,23 +959,6 @@ mod tests {
     use iced::widget::markdown;
     use std::io::Cursor;
 
-    /// The context an assistant-authored body renders under: markers resolve
-    /// against `workspace`, and an undeliverable one becomes a reason.
-    fn agent(workspace: &Path) -> MarkerContext<'_> {
-        MarkerContext {
-            workspace: Some(workspace),
-            refusals: true,
-        }
-    }
-
-    /// The context of content the owner typed: no resolution, no refusals.
-    fn owner(workspace: &Path) -> MarkerContext<'_> {
-        MarkerContext {
-            workspace: Some(workspace),
-            refusals: false,
-        }
-    }
-
     /// A picture attachment, drawn from `image`.
     fn picture(image: Option<&str>, label: &str) -> MediaAttachment {
         MediaAttachment {
@@ -1046,20 +1022,21 @@ mod tests {
         let valid_uri = data_uri(&tiny_png(2, 1));
         let gone = root.join("cleaned_up.png");
         let gone_str = gone.to_string_lossy().into_owned();
-        let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
+        let not_an_image = root.join("notes.txt");
+        std::fs::write(&not_an_image, b"not an image").unwrap();
+        let not_an_image_str = not_an_image.to_string_lossy().into_owned();
 
         let cases: Vec<(&str, String, String, Vec<MediaAttachment>)> = vec![
             (
-                "resolves a workspace-relative image marker",
-                "Look [IMAGE:photo.png] here".into(),
-                "Look here".into(),
-                vec![picture(Some(&photo_str), "🖼️ photo.png")],
-            ),
-            (
-                "uses an absolute image marker as it is",
-                format!("Look [IMAGE:{photo_str}] here"),
-                "Look here".into(),
-                vec![picture(Some(&photo_str), "🖼️ photo.png")],
+                // A relative target resolves against the workspace, an absolute
+                // one is taken as written: the same row either way.
+                "resolves a workspace-relative image marker and takes an absolute one as it is",
+                format!("Look [IMAGE:photo.png] and [IMAGE:{photo_str}] here"),
+                "Look and here".into(),
+                vec![
+                    picture(Some(&photo_str), "🖼️ photo.png"),
+                    picture(Some(&photo_str), "🖼️ photo.png"),
+                ],
             ),
             (
                 "delivers markers written in lowercase",
@@ -1071,10 +1048,15 @@ mod tests {
                 ],
             ),
             (
-                "refuses a lowercase marker it cannot deliver instead of showing it",
-                "see [image:cleaned_up.png]".into(),
-                "see Could not send \"cleaned_up.png\": file not found.".into(),
-                Vec::new(),
+                // Casing, a relative and an absolute target: all three are
+                // references, so all three draw even with no file behind them.
+                "draws markers whose file is gone like any missing file",
+                format!("see [image:cleaned_up.png] and [IMAGE:{gone_str}] here"),
+                "see and here".into(),
+                vec![
+                    picture(Some(gone_str.as_str()), "🖼️ cleaned_up.png"),
+                    picture(Some(gone_str.as_str()), "🖼️ cleaned_up.png"),
+                ],
             ),
             (
                 "resolves a relative image marker with spaces in the path",
@@ -1083,32 +1065,31 @@ mod tests {
                 vec![picture(Some(&spaced_str), "🖼️ my file.png")],
             ),
             (
-                "reports a relative image marker whose file is gone",
-                "Look [IMAGE:cleaned_up.png] here".into(),
-                "Look Could not send \"cleaned_up.png\": file not found. here".into(),
+                "draws a target that is not an image, letting the viewer show its placeholder",
+                format!("[IMAGE:{not_an_image_str}]"),
+                String::new(),
+                vec![picture(Some(not_an_image_str.as_str()), "🖼️ notes.txt")],
+            ),
+            (
+                // Neither a malformed address nor one of a scheme the product
+                // has no way to show is a reference: the words stay exactly as
+                // written, with no notice.
+                "keeps an address it cannot show as written",
+                "see [IMAGE:https://exa mple.com/x.png], [FILE:https://exa mple.com/a.pdf] \
+                 and [FILE:ftp://example.com/a.pdf] here"
+                    .into(),
+                "see [IMAGE:https://exa mple.com/x.png], [FILE:https://exa mple.com/a.pdf] \
+                 and [FILE:ftp://example.com/a.pdf] here"
+                    .into(),
                 Vec::new(),
             ),
             (
-                "reports an absolute image marker whose file is gone instead of drawing a placeholder",
-                format!("Look [IMAGE:{gone_str}] here"),
-                "Look Could not send \"cleaned_up.png\": file not found. here".into(),
-                Vec::new(),
-            ),
-            (
-                "reports a directory image target",
-                format!("[IMAGE:{}]", root.display()),
-                format!("Could not send \"{root_name}\": it is a directory."),
-                Vec::new(),
-            ),
-            (
-                "reports a target that is not an image",
-                {
-                    let text = root.join("notes.txt");
-                    std::fs::write(&text, b"not an image").unwrap();
-                    format!("[IMAGE:{}]", text.display())
-                },
-                "Could not send \"notes.txt\": it is not an image.".into(),
-                Vec::new(),
+                // An address is one in any scheme casing: the same row as the
+                // canonical form, never a local path.
+                "reads an address in a non-canonical scheme casing",
+                "see [IMAGE:HTTPS://Example.com/x.png] here".into(),
+                "see here".into(),
+                vec![picture(Some("https://Example.com/x.png"), "🖼️ x.png")],
             ),
             (
                 "names the stripped-data-URI placeholder generically and draws nothing",
@@ -1123,9 +1104,33 @@ mod tests {
                 vec![picture(Some(&valid_uri), "🖼️ image")],
             ),
             (
-                "keeps a bare word of prose as written",
-                "use `[IMAGE:path]` or `[VIDEO:...]` here".into(),
-                "use `[IMAGE:path]` or `[VIDEO:...]` here".into(),
+                // A payload is a value whatever its body carries, so the `://`
+                // inside a hand-written one never makes it look like an address.
+                "draws an inline payload whose body holds an address",
+                r#"Look [IMAGE:data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>] here"#
+                    .into(),
+                "Look here".into(),
+                vec![picture(
+                    Some(r#"data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>"#),
+                    "🖼️ image",
+                )],
+            ),
+            (
+                // The role prompt's own examples, plus prose beside a real clip:
+                // the text is untouched, the reference draws.
+                "keeps prose marker examples as written, beside a reference that draws",
+                "send with [IMAGE:path], [VIDEO:path] or [FILE:<path in your workspace>]; \
+                 then [VIDEO:video.mp4]"
+                    .into(),
+                "send with [IMAGE:path], [VIDEO:path] or [FILE:<path in your workspace>]; \
+                 then"
+                    .into(),
+                vec![named("🎬 Video: video.mp4", None)],
+            ),
+            (
+                "keeps an empty marker target as written",
+                "an empty [FILE: ] names nothing".into(),
+                "an empty [FILE: ] names nothing".into(),
                 Vec::new(),
             ),
             (
@@ -1141,10 +1146,10 @@ mod tests {
                 vec![named("🎵 rec.ogg", None)],
             ),
             (
-                "reports a missing audio marker",
+                "draws a missing audio marker like any missing file",
                 "Listen [AUDIO:gone.ogg]".into(),
-                "Listen Could not send \"gone.ogg\": file not found.".into(),
-                Vec::new(),
+                "Listen".into(),
+                vec![named("🎵 gone.ogg", None)],
             ),
             (
                 "resolves a relative video marker",
@@ -1165,10 +1170,13 @@ mod tests {
                 vec![named("📄 README", Some(&readme_str))],
             ),
             (
-                "reports a file marker whose file is gone",
+                "draws a file marker whose file is gone, revealing where it was",
                 "Get [FILE:generated/gone.pdf]".into(),
-                "Get Could not send \"gone.pdf\": file not found.".into(),
-                Vec::new(),
+                "Get".into(),
+                vec![named(
+                    "📄 gone.pdf",
+                    Some(&root.join("generated/gone.pdf").to_string_lossy()),
+                )],
             ),
             (
                 "reports a file marker that names an address",
@@ -1177,7 +1185,7 @@ mod tests {
                 Vec::new(),
             ),
             (
-                "refuses a file marker's inline payload instead of naming the blob",
+                "refuses a file marker's inline payload, which cannot become a file row",
                 "Get [FILE:data:text/plain;base64,aGVsbG8=]".into(),
                 "Get Could not send \"file\": it carries an inline payload, not a file.".into(),
                 Vec::new(),
@@ -1274,7 +1282,7 @@ mod tests {
         ];
 
         for (i, (name, input, expected_text, expected_attachments)) in cases.iter().enumerate() {
-            let rendered = preprocess(input, &agent(root));
+            let rendered = preprocess(input, Some(root));
             assert_eq!(rendered.text, *expected_text, "case {i} ({name}) text");
             assert_eq!(
                 rendered.attachments, *expected_attachments,
@@ -1283,87 +1291,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn own_text_keeps_the_structural_display() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let photo = root.join("photo.png");
-        std::fs::write(&photo, tiny_png(2, 1)).unwrap();
-        let photo_str = photo.to_string_lossy().into_owned();
-
-        // What the owner typed is never resolved into something else and never
-        // turned into a notice: a relative marker stays their words, an
-        // absolute one draws exactly as before.
-        let rendered = preprocess("[IMAGE:generated/x.png] [VIDEO:clip.mp4]", &owner(root));
-        assert_eq!(rendered.text, "[IMAGE:generated/x.png]");
-        assert_eq!(
-            rendered.attachments,
-            vec![named("🎬 Video: clip.mp4", None)]
-        );
-
-        let rendered = preprocess(
-            &format!("[IMAGE:{photo_str}] [IMAGE:/tmp/gone.png]"),
-            &owner(root),
-        );
-        assert_eq!(rendered.text, "", "the pictures leave no text behind");
-        assert_eq!(
-            rendered.attachments,
-            vec![
-                picture(Some(&photo_str), "🖼️ photo.png"),
-                picture(Some("/tmp/gone.png"), "🖼️ gone.png"),
-            ]
-        );
-
-        let rendered = preprocess("[FILE:notes.txt]", &owner(root));
-        assert_eq!(rendered.text, "");
-        assert_eq!(
-            rendered.attachments,
-            vec![named("📄 notes.txt", Some("notes.txt"))],
-            "an owner-typed file keeps its own target"
-        );
-    }
-
     // ── Extracted pictures ───────────────────────────────────────
-
-    #[test]
-    fn a_picture_attachment_keeps_its_whole_target() {
-        // The renderer needs the full payload or path — a truncated or escaped
-        // one never draws — and the parser must see no image item at all.
-        let tmp = tempfile::tempdir().unwrap();
-        let spaced = tmp.path().join("my file.png");
-        std::fs::write(&spaced, tiny_png(2, 1)).unwrap();
-        let spaced_str = spaced.to_string_lossy().into_owned();
-        let uri = data_uri(&tiny_png(2, 1));
-
-        for (input, image, label) in [
-            (format!("see [IMAGE:{uri}]"), uri.clone(), "🖼️ image"),
-            (
-                "see [IMAGE:my file.png]".to_string(),
-                spaced_str.clone(),
-                "🖼️ my file.png",
-            ),
-        ] {
-            let rendered = preprocess(&input, &agent(tmp.path()));
-            assert_eq!(
-                rendered.attachments,
-                vec![picture(Some(&image), label)],
-                "one attachment per picture"
-            );
-            assert_eq!(rendered.text, "see");
-            assert!(
-                !rendered.text.contains("!["),
-                "no markdown image reaches the parser: {:?}",
-                rendered.text
-            );
-            let items: Vec<_> = markdown::parse(&rendered.text).collect();
-            assert!(
-                items
-                    .iter()
-                    .all(|item| !matches!(item, markdown::Item::Image { .. })),
-                "the body never carries an image item: {items:?}"
-            );
-        }
-    }
 
     #[test]
     fn text_beside_a_picture_survives_the_parse() {
@@ -1372,7 +1300,7 @@ mod tests {
         // never drawn. Extraction leaves them in the body.
         let tmp = tempfile::tempdir().unwrap();
         let uri = data_uri(&tiny_png(2, 1));
-        let rendered = preprocess(&format!("8. the body [IMAGE:{uri}]"), &agent(tmp.path()));
+        let rendered = preprocess(&format!("8. the body [IMAGE:{uri}]"), Some(tmp.path()));
         assert_eq!(rendered.attachments, vec![picture(Some(&uri), "🖼️ image")]);
 
         let items: Vec<_> = markdown::parse(&rendered.text).collect();
@@ -1390,7 +1318,7 @@ mod tests {
         // An agent writes markdown itself; the same extraction keeps the words
         // around its picture.
         let tmp = tempfile::tempdir().unwrap();
-        let rendered = preprocess("Look ![shot](url) here", &agent(tmp.path()));
+        let rendered = preprocess("Look ![shot](url) here", Some(tmp.path()));
         assert_eq!(rendered.text, "Look here");
         assert_eq!(rendered.attachments, vec![picture(Some("url"), "🖼️ url")]);
         assert!(!rendered.text.contains("!["));
@@ -1402,7 +1330,7 @@ mod tests {
         // paragraph: taking that line with it leaves the one line break the
         // body had, so the text stays a single paragraph.
         let tmp = tempfile::tempdir().unwrap();
-        let rendered = preprocess("before\n![shot](url)\nafter", &agent(tmp.path()));
+        let rendered = preprocess("before\n![shot](url)\nafter", Some(tmp.path()));
         assert_eq!(rendered.text, "before\nafter");
         assert_eq!(rendered.attachments, vec![picture(Some("url"), "🖼️ url")]);
         let items: Vec<_> = markdown::parse(&rendered.text).collect();
@@ -1412,7 +1340,7 @@ mod tests {
         );
 
         // A blank line on either side is a paragraph gap and stays one.
-        let rendered = preprocess("before\n\n![shot](url)\n\nafter", &agent(tmp.path()));
+        let rendered = preprocess("before\n\n![shot](url)\n\nafter", Some(tmp.path()));
         assert_eq!(rendered.text, "before\n\nafter");
     }
 
@@ -1431,7 +1359,7 @@ mod tests {
             format!("    [IMAGE:{img_str}]\n    ![x](y)"),
             format!("use `[IMAGE:{img_str}]` and `![x](y)` here"),
         ] {
-            let rendered = preprocess(&body, &agent(tmp.path()));
+            let rendered = preprocess(&body, Some(tmp.path()));
             assert!(rendered.attachments.is_empty(), "nothing is extracted");
             assert_eq!(rendered.text, body);
         }
@@ -1453,7 +1381,7 @@ mod tests {
             ),
             (format!("![second](second.png) and [IMAGE:{img_str}]"), true),
         ] {
-            let rendered = preprocess(&body, &agent(tmp.path()));
+            let rendered = preprocess(&body, Some(tmp.path()));
             let marker = picture(Some(&img_str), "🖼️ shot.png");
             let literal = picture(Some("second.png"), "🖼️ second.png");
             let expected = if second_first {
@@ -1466,38 +1394,6 @@ mod tests {
     }
 
     // ── Clickable file markers ────────────────────────────────────
-
-    #[test]
-    fn file_markers_pair_labels_with_resolved_targets() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let report = root.join("generated/report.pdf");
-        std::fs::create_dir_all(report.parent().unwrap()).unwrap();
-        std::fs::write(&report, b"pdf").unwrap();
-        let notes = root.join("notes.txt");
-        std::fs::write(&notes, b"notes").unwrap();
-        let readme = root.join("README");
-        std::fs::write(&readme, b"readme").unwrap();
-
-        let body = "Get [FILE:generated/report.pdf] and [FILE:notes.txt] and [FILE:README] then \
-                    [FILE:generated/gone.pdf] and [FILE:data:text/plain;base64,aGVsbG8=]";
-        let rendered = preprocess(body, &agent(root));
-        assert_eq!(
-            rendered.attachments,
-            vec![
-                named("📄 report.pdf", Some(&report.to_string_lossy())),
-                named("📄 notes.txt", Some(&notes.to_string_lossy())),
-                // A bare word the workspace has is a file, not prose.
-                named("📄 README", Some(&readme.to_string_lossy())),
-            ],
-            "only the files the body delivers become attachments"
-        );
-        assert!(
-            !rendered.text.contains("[FILE:"),
-            "no marker survives in what the user reads: {}",
-            rendered.text
-        );
-    }
 
     #[test]
     fn file_marker_targets_resolve_against_the_workspace() {
@@ -1518,14 +1414,6 @@ mod tests {
         assert_eq!(
             resolve_file_marker_target("report.pdf", None).unwrap_err(),
             "Cannot open 'report.pdf': the conversation's workspace is unknown."
-        );
-        assert_eq!(
-            resolve_file_marker_target("https://example.com/report.pdf", Some(root)).unwrap_err(),
-            "Not a local file: report.pdf"
-        );
-        assert_eq!(
-            resolve_file_marker_target("", Some(root)).unwrap_err(),
-            "The marker does not name a file."
         );
     }
 

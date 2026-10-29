@@ -29,7 +29,7 @@ use super::ToastMessage;
 use super::media_markers;
 use super::menus::{ContextMenu, MenuItem};
 use super::session_view::preview::{
-    MAX_PREVIEW_LINES, MessageMeasure, measure_message, re_measure, width_bucket,
+    BodyText, MAX_PREVIEW_LINES, MessageMeasure, measure_message, re_measure, width_bucket,
 };
 use super::session_view::{self, ParsedBody, SessionEntry, ToolCallEntry};
 use super::theme;
@@ -838,8 +838,8 @@ impl SessionsState {
     /// The merge is append-oriented and diffed by the longest common entry
     /// prefix, so markdown re-parsing is limited to the changed tail and
     /// measurement-cache keys of unchanged entries stay valid (built entries
-    /// drop their key and re-measure lazily; an in-place edit changes
-    /// `content_len`, which the stale fingerprint re-measures anyway).
+    /// drop their key and re-measure lazily; an in-place edit changes the
+    /// content length, which re-measures it anyway).
     /// Index-keyed expansion sets stay valid because the tail is append-only
     /// and out-of-range keys are harmless. Snapshot lookup doubles as the
     /// running check — `None` when the agent is not running; a recycled agent
@@ -1199,18 +1199,17 @@ fn bubble_row(
 }
 
 /// Resolve the collapse measurement for an element at the current
-/// `text_width`, measuring on cache miss (cached per element and width; the
-/// session ledger is append-only, so a cached entry stays valid). Returns the
-/// wrapped-line count and — only when
-/// `need_preview` is set (the element is currently collapsed) — its 3-line
-/// plain-text preview, so expanded elements do not pay a per-frame preview
-/// clone. `font_size` is the body size the element renders at (body or
-/// narration).
+/// `text_width`, measuring on cache miss (cached per element and width). Returns
+/// the wrapped-line count and — only when `need_preview` is set (the element is
+/// currently collapsed) — its 3-line plain-text preview, so expanded elements do
+/// not pay a per-frame preview clone. `font_size` is the body size the element
+/// renders at (body or narration); `body` is how the text is drawn, so the
+/// measurement matches it.
 ///
-/// Stale-fingerprint semantics: a cache hit with the same width bucket,
-/// `content_len`, and `font_size` is reused; the same content at a different
-/// bucket (or size) is re-measured via [`re_measure`]; otherwise a fresh
-/// measurement runs.
+/// Stale-fingerprint semantics: a cache hit with the same content length and
+/// `font_size` is reused when its width bucket still matches, re-measured via
+/// [`re_measure`] when only the bucket moved, and otherwise replaced by a fresh
+/// measurement.
 #[expect(
     clippy::float_cmp,
     reason = "font sizes are theme constants passed verbatim; exact identity is intended"
@@ -1222,28 +1221,19 @@ fn element_measurement(
     need_preview: bool,
     content: &str,
     font_size: f32,
-    markers: &media_markers::MarkerContext<'_>,
+    body: BodyText<'_>,
 ) -> (u32, Option<String>) {
     let bucket = width_bucket(text_width);
-    let content_len = content.len();
     let mut cache = measure_cache.borrow_mut();
     let cache_hit = cache.get(&key);
-    let stale = cache_hit.is_none_or(|m| {
-        m.width_bucket != bucket || m.content_len != content_len || m.font_size != font_size
-    });
-    if stale {
-        // Cache miss: measure. A pure width change reuses the cached
-        // processed display text (an `Arc` clone); otherwise measure from the
-        // caller's plain-text content.
-        let m = match cache_hit {
-            Some(m)
-                if m.width_bucket != bucket
-                    && m.content_len == content_len
-                    && m.font_size == font_size =>
-            {
-                re_measure(m, text_width)
-            }
-            _ => measure_message(content, markers, text_width, content_len, font_size),
+    // The same body at the same size: only a width change can be served from
+    // the cached processed text (an `Arc` clone) instead of a fresh measure.
+    let unchanged =
+        cache_hit.filter(|m| m.source.len() == content.len() && m.font_size == font_size);
+    if unchanged.is_none_or(|m| m.width_bucket != bucket) {
+        let m = match unchanged {
+            Some(m) => re_measure(m, text_width),
+            None => measure_message(content, body, text_width, font_size),
         };
         cache.insert(key, m);
     }
@@ -1308,29 +1298,17 @@ fn click_toggle(
     }
 }
 
-/// The marker context a transcript body resolves under: its session workspace,
-/// and whether an undeliverable marker becomes a refusal.
-fn marker_context<'a>(
-    ctx: &'a TranscriptCtx<'_>,
-    refusals: bool,
-) -> media_markers::MarkerContext<'a> {
-    media_markers::MarkerContext {
-        workspace: ctx.workspace_root.as_deref(),
-        refusals,
-    }
-}
-
 /// Shared collapse-state preamble for the transcript's collapsible elements:
 /// returns `(is_expanded, collapses, preview)` — whether the user expanded the
 /// element, whether it renders more than [`MAX_PREVIEW_LINES`] wrapped lines
-/// at `font_size` (measured at the bubble body width), and the measured
-/// 3-line preview if it can collapse.
+/// at `font_size` (measured at the bubble body width, the way `body` draws it),
+/// and the measured 3-line preview if it can collapse.
 fn collapse_state(
     ctx: &TranscriptCtx<'_>,
     key: (usize, usize),
     content: &str,
     font_size: f32,
-    refusals: bool,
+    body: BodyText<'_>,
 ) -> (bool, bool, Option<String>) {
     let is_expanded = ctx.expanded.contains(&key);
     let (wrapped_lines, preview) = element_measurement(
@@ -1340,7 +1318,7 @@ fn collapse_state(
         !is_expanded,
         content,
         font_size,
-        &marker_context(ctx, refusals),
+        body,
     );
     (is_expanded, wrapped_lines > MAX_PREVIEW_LINES, preview)
 }
@@ -1358,8 +1336,13 @@ fn plain_collapsible<'a>(
     content: &'a str,
     color: iced::Color,
 ) -> Element<'a, SessionsMessage> {
-    let (is_expanded, collapses, preview) =
-        collapse_state(ctx, key, content, theme::MARKDOWN_TEXT_SIZE, false);
+    let (is_expanded, collapses, preview) = collapse_state(
+        ctx,
+        key,
+        content,
+        theme::MARKDOWN_TEXT_SIZE,
+        BodyText::Plain,
+    );
     let el = collapsible_text_block(
         collapses,
         is_expanded,
@@ -1381,8 +1364,13 @@ fn thinking_block<'a>(
     key: (usize, usize),
     content: &'a str,
 ) -> Element<'a, SessionsMessage> {
-    let (is_expanded, collapses, preview) =
-        collapse_state(ctx, key, content, theme::MARKDOWN_TEXT_SIZE, false);
+    let (is_expanded, collapses, preview) = collapse_state(
+        ctx,
+        key,
+        content,
+        theme::MARKDOWN_TEXT_SIZE,
+        BodyText::Plain,
+    );
     let header = row![
         lucide::brain::<iced::Theme, iced::Renderer>()
             .size(theme::TEXT_11)
@@ -1413,11 +1401,10 @@ fn thinking_block<'a>(
 /// draws the body through [`media_markers::body`] — its attachments as one
 /// group above its whole text, never interleaved and neither ever dropped.
 /// `content` is the plain text used for the collapse measurement (at the bubble
-/// body width; the measurement runs the same preprocessing and takes
-/// `display_text()`, so preview and expanded agree); `md` is the parsed body
-/// (markdown items, attachments and whether its markers became refusals) for
-/// the expanded view. Narration bodies render italic at
-/// [`theme::NARRATION_TEXT_SIZE`]; user/assistant bodies stay at
+/// body width; it is measured the way the body is drawn, so preview and expanded
+/// agree); `md` is the parsed body (markdown items and attachments) for the
+/// expanded view, `None` when the body draws as raw text. Narration bodies
+/// render italic at [`theme::NARRATION_TEXT_SIZE`]; user/assistant bodies stay at
 /// [`theme::MARKDOWN_TEXT_SIZE`] regular.
 fn body_block<'a>(
     ctx: &TranscriptCtx<'a>,
@@ -1431,10 +1418,14 @@ fn body_block<'a>(
     } else {
         theme::MARKDOWN_TEXT_SIZE
     };
-    // The refusal rule is a property of the parsed body, so the measurement of
-    // a body always resolves under the context it was parsed with.
-    let refusals = md.is_some_and(|parsed| parsed.refusals);
-    let (is_expanded, collapses, preview) = collapse_state(ctx, key, content, size, refusals);
+    // A body with no parsed form — promoted reasoning, an unparsed message —
+    // draws as raw text, so it must be measured as raw text too.
+    let body = if md.is_some() {
+        BodyText::Markdown(ctx.workspace_root.as_deref())
+    } else {
+        BodyText::Plain
+    };
+    let (is_expanded, collapses, preview) = collapse_state(ctx, key, content, size, body);
     let font = if is_narration {
         theme::FONT_ITALIC
     } else {
@@ -1538,7 +1529,7 @@ fn render_tool_round<'a>(
                 false,
                 result,
                 theme::MARKDOWN_TEXT_SIZE,
-                &marker_context(ctx, false),
+                BodyText::Plain,
             );
             wrapped_lines > MAX_PREVIEW_LINES
         });
@@ -1817,8 +1808,8 @@ mod tests {
         std::fs::create_dir_all(photo.parent().unwrap()).unwrap();
         std::fs::write(&photo, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
 
-        // Loaded before the workspace could be named: with no root the relative
-        // picture is refused rather than drawn.
+        // Loaded before the workspace could be named: the marker is a reference
+        // either way, so its row is there — with nothing to resolve it to.
         let mut state = SessionsState::new();
         state.selected_session = Some("s1".to_string());
         state.entries = vec![msg(
@@ -1827,7 +1818,15 @@ mod tests {
         )];
         state.entry_md = session_view::parse_entry_bodies(&state.entries, None);
         assert_eq!(state.workspace_root, None);
-        assert!(state.entry_md[0].as_ref().unwrap().attachments.is_empty());
+        assert_eq!(
+            state.entry_md[0].as_ref().unwrap().attachments,
+            vec![media_markers::MediaAttachment {
+                image: Some("generated/poster.png".to_string()),
+                label: "🖼️ poster.png".to_string(),
+                reveal: None,
+            }],
+            "an unresolved relative target still draws its row"
+        );
         assert!(
             state.entry_md[0]
                 .as_ref()
@@ -1838,7 +1837,7 @@ mod tests {
         );
 
         // The workspace list arrives later: the already-loaded ledger is
-        // re-parsed under the root, so the picture now renders.
+        // re-parsed under the root, so the picture now resolves to its file.
         let workspaces = HashMap::from([(
             "ws".to_string(),
             Workspace {
@@ -1855,10 +1854,6 @@ mod tests {
 
         assert_eq!(state.workspace_root.as_deref(), Some(tmp.path()));
         let parsed = state.entry_md[0].as_ref().unwrap();
-        assert!(
-            parsed.refusals,
-            "an assistant body is the product's own reply"
-        );
         let expected = photo.to_string_lossy().into_owned();
         assert_eq!(
             parsed.attachments,

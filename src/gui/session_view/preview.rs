@@ -3,9 +3,8 @@
 //! The sessions page collapses messages that render more than
 //! [`MAX_PREVIEW_LINES`] wrapped lines into a short plain-text preview with
 //! an expand/collapse toggle. This module implements the line-count
-//! measurement: a flat wrapped-line count of the message's display text
-//! (after media-marker processing) at body metrics and the actual transcript
-//! content width.
+//! measurement: a flat wrapped-line count of the message's display text at body
+//! metrics and the actual transcript content width.
 //!
 //! The measurement intentionally errs toward collapsing:
 //! - a safety margin narrows the measured width so markdown structure the
@@ -17,9 +16,11 @@
 //!   places them unwrapped in a horizontally scrollable block); fence
 //!   delimiter lines count too — a 2-line code block with fences measures 4
 //!   and collapses, a deliberate over-collapse in the collapse direction;
-//! - media markers and pictures are extracted into their attachments before
-//!   measuring, and their labels measure in the place the expanded body draws
-//!   them (above the text), so a base64 data-URI blob cannot skew the count.
+//! - a markdown body has its media markers and pictures extracted into their
+//!   attachments before measuring, and their labels measure in the place the
+//!   expanded body draws them (above the text), so a base64 data-URI blob
+//!   cannot skew the count; a body drawn as raw text measures that text
+//!   unchanged.
 //!
 //! Preview extraction is BiDi-safe: cosmic-text lays glyphs out in visual
 //! order (L2 reordering), so an RTL run can appear with decreasing byte
@@ -40,6 +41,7 @@
 //! yields a single overflowing line). The result is cached per message and
 //! width by [`crate::gui::sessions::SessionsState`].
 
+use std::path::Path;
 use std::sync::Arc;
 
 use cosmic_text::{Attrs, AttrsList, BufferLine, Family, LineEnding, Shaping, Wrap};
@@ -158,14 +160,9 @@ pub(crate) struct MessageMeasure {
     /// Media-placeholder-reduced display text the measurement was actually
     /// computed from. Kept so a width-bucket change re-measures via
     /// [`re_measure`] without re-running media preprocessing (two full
-    /// String copies + regex passes per message) on every window resize.
+    /// String copies + regex passes per message) on every window resize. A
+    /// [`BodyText::Plain`] body's processed text is its source, unchanged.
     pub(crate) processed: Arc<str>,
-    /// Length of the raw message content this measurement was derived from —
-    /// a cheap content fingerprint. The index-keyed cache is stale when the
-    /// underlying message is replaced by session compaction with content of a
-    /// different length, so the entry is re-measured instead of showing a
-    /// stale preview until the session is reopened.
-    pub(crate) content_len: usize,
     /// Body font size (px) the measurement was computed at. A width-bucket
     /// re-measure via [`re_measure`] carries it forward, so a narration body
     /// measured at the narration size keeps that size on a resize.
@@ -180,33 +177,48 @@ pub(crate) fn width_bucket(width: f32) -> u32 {
     (width.max(0.0) / 16.0) as u32
 }
 
+/// How a collapsible body draws its text, so the measurement matches what is
+/// drawn: a markdown body has its markers extracted into attachment labels,
+/// while a plain one (a tool result, a thinking block, promoted reasoning) shows
+/// the raw text.
+#[derive(Clone, Copy)]
+pub(crate) enum BodyText<'a> {
+    /// A bubble body parsed as markdown; relative markers resolve against the
+    /// workspace.
+    Markdown(Option<&'a Path>),
+    /// A body drawn as raw selectable text.
+    Plain,
+}
+
 /// Measure the wrapped line count of a message body at `width`, producing a
 /// [`MAX_PREVIEW_LINES`]-line plain-text preview when the message exceeds
 /// the budget.
 ///
 /// `display_text` is the raw message body (the same text that the Sessions
-/// ledger's `parse_entry_bodies` feeds to `markdown::parse`); media-marker
-/// preprocessing happens here, under the same [`media_markers::MarkerContext`]
-/// the render uses so a notice and a picture measure as what they render. The
-/// measured text is [`media_markers::Preprocessed::display_text`] — the
-/// attachment labels above the text, the order the expanded body draws — so a
-/// base64 payload counts as one short label instead of a blob of characters.
-/// The source is owned as [`Arc<str>`] so a width-bucket change can re-measure
-/// without copying the (potentially hundreds of KB) display text again.
-/// `font_size` is the body size the text renders at (body or narration), used
-/// for wrap and preview-line-budget shaping and heading scaling.
+/// ledger's `parse_entry_bodies` feeds to `markdown::parse`); [`BodyText`] says
+/// how it is drawn, so the measured text is what the element shows — a markdown
+/// body measures [`media_markers::Preprocessed::display_text`] (the attachment
+/// labels above the text, the order the expanded body draws, so a base64 payload
+/// counts as one short label instead of a blob of characters), a plain one
+/// measures its own raw text. The source is owned as [`Arc<str>`] so a
+/// width-bucket change can re-measure without copying the (potentially hundreds
+/// of KB) display text again. `font_size` is the body size the text renders at
+/// (body or narration), used for wrap and preview-line-budget shaping and
+/// heading scaling.
 pub(crate) fn measure_message(
     display_text: impl Into<Arc<str>>,
-    markers: &media_markers::MarkerContext<'_>,
+    body: BodyText<'_>,
     width: f32,
-    content_len: usize,
     font_size: f32,
 ) -> MessageMeasure {
     let source = display_text.into();
-    let processed: Arc<str> = media_markers::preprocess(&source, markers)
-        .display_text()
-        .into();
-    measure_processed(source, processed, width, content_len, font_size)
+    let processed: Arc<str> = match body {
+        BodyText::Markdown(workspace) => media_markers::preprocess(&source, workspace)
+            .display_text()
+            .into(),
+        BodyText::Plain => source.clone(),
+    };
+    measure_processed(source, processed, width, font_size)
 }
 
 /// Re-measure a cached entry at a new width, reusing the cached processed
@@ -218,7 +230,6 @@ pub(crate) fn re_measure(cached: &MessageMeasure, width: f32) -> MessageMeasure 
         cached.source.clone(),
         cached.processed.clone(),
         width,
-        cached.content_len,
         cached.font_size,
     )
 }
@@ -230,7 +241,6 @@ fn measure_processed(
     source: Arc<str>,
     processed: Arc<str>,
     width: f32,
-    content_len: usize,
     font_size: f32,
 ) -> MessageMeasure {
     let bucket = width_bucket(width);
@@ -415,7 +425,6 @@ fn measure_processed(
         preview: (total_lines > MAX_PREVIEW_LINES).then_some(preview),
         source,
         processed,
-        content_len,
         font_size,
     }
 }
@@ -564,22 +573,12 @@ mod tests {
     /// per wrapped line at 13px JetBrains Mono (0.6em advance = 7.8px/char).
     const TEST_WIDTH: f32 = 500.0;
 
-    /// The marker context an assistant body measures under: no workspace to
-    /// resolve against, refusals enabled.
-    fn agent_markers() -> media_markers::MarkerContext<'static> {
-        media_markers::MarkerContext {
-            workspace: None,
-            refusals: true,
-        }
-    }
-
     fn measure(text: &str) -> MessageMeasure {
         ensure_fonts_loaded();
         measure_message(
             text,
-            &agent_markers(),
+            BodyText::Markdown(None),
             TEST_WIDTH,
-            text.len(),
             MARKDOWN_TEXT_SIZE,
         )
     }
@@ -824,7 +823,7 @@ mod tests {
         // Two short words plus the label — fits within the budget.
         assert!(m.wrapped_lines <= 3, "{} lines", m.wrapped_lines);
         assert!(m.preview.is_none());
-        let measured = media_markers::preprocess(&text, &agent_markers()).display_text();
+        let measured = media_markers::preprocess(&text, None).display_text();
         assert!(!measured.contains("base64"), "got: {measured:?}");
         assert_eq!(measured, "🖼️ image\nbefore after");
     }

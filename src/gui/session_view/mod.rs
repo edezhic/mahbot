@@ -4,9 +4,6 @@
 //! compact view is a projection of the same ledger, never a second data
 //! structure.
 
-use std::borrow::Cow;
-use std::ops::Range;
-
 use iced::widget::markdown;
 
 use crate::ChatMessage;
@@ -15,7 +12,6 @@ use crate::providers::plaintext_for_display;
 use crate::session::{DecodedNativeHistoryMessage, decode_native_history_message};
 use crate::util::none_if_empty;
 
-use super::markdown_breaks;
 use super::media_markers;
 
 pub(crate) mod preview;
@@ -185,25 +181,20 @@ pub(crate) fn build_ledger_with_sources(
     (entries, sources)
 }
 
-/// A transcript body parsed for display: its markdown items, the attachments it
-/// carries in body order (the viewer draws them as one block above the text and
-/// turns a file row's click into a reveal), and whether an undeliverable marker
-/// became a refusal — carried so the collapse measurement of the same body
-/// resolves under the context it was parsed with.
+/// A transcript body parsed for display: its markdown items and the attachments
+/// it carries in body order (the viewer draws them as one block above the text
+/// and turns a file row's click into a reveal).
 pub(crate) struct ParsedBody {
     pub items: Vec<markdown::Item>,
     pub attachments: Vec<media_markers::MediaAttachment>,
-    pub refusals: bool,
 }
 
 /// Per-entry markdown parse for bubble bodies: Message → its content,
 /// ToolRound → its narration. None = nothing to render.
 ///
 /// `workspace` is the root the session's relative marker targets resolve
-/// against. Only an assistant body (a message from the model, or a round's
-/// narration) turns an undeliverable marker into a notice — a user or tool
-/// message keeps the structural display, because the product never rewrites
-/// what a person typed into a refusal.
+/// against. Every body follows the same rule — the role it arrived under does
+/// not change what its markers become.
 pub(crate) fn parse_entry_bodies(
     entries: &[SessionEntry],
     workspace: Option<&std::path::Path>,
@@ -211,27 +202,12 @@ pub(crate) fn parse_entry_bodies(
     entries
         .iter()
         .map(|entry| {
-            let (display, refusals) = match entry {
-                SessionEntry::Message { role, content, .. } => (
-                    content.as_deref()?,
-                    matches!(role, crate::ChatRole::Assistant),
-                ),
-                SessionEntry::ToolRound { narration, .. } => (narration.as_deref()?, true),
+            let display = match entry {
+                SessionEntry::Message { content, .. } => content.as_deref()?,
+                SessionEntry::ToolRound { narration, .. } => narration.as_deref()?,
             };
-            let rendered = media_markers::preprocess(
-                display,
-                &media_markers::MarkerContext {
-                    workspace,
-                    refusals,
-                },
-            );
-            let escaped = escape_html_blocks(&rendered.text);
-            let with_breaks = markdown_breaks::hard_breaks(&escaped);
-            Some(ParsedBody {
-                items: markdown::parse(&with_breaks).collect(),
-                attachments: rendered.attachments,
-                refusals,
-            })
+            let (items, attachments) = media_markers::parse_body(display, workspace);
+            Some(ParsedBody { items, attachments })
         })
         .collect()
 }
@@ -249,59 +225,6 @@ pub(crate) fn promoted_reasoning<'a>(
         Some(reasoning) if narration.is_none_or(|n| n.trim().is_empty()) => Some(reasoning),
         _ => None,
     }
-}
-
-/// Escape `<` → `&lt;` only inside the regions the markdown parser classifies
-/// as HTML (block-level `Event::Html` plus inline `Event::InlineHtml`), so
-/// angle-bracket tag blocks (`<system-notification>`, `<analyze-tool-result>`,
-/// `<timestamp>` …) render as visible literal text instead of being dropped
-/// wholesale.
-///
-/// This is deliberately a `<`-only escape: `util::escape_html` is not reused
-/// (it also escapes `>` — breaking blockquotes — and `&`, which would
-/// double-encode existing entities).
-fn escape_html_blocks(text: &str) -> Cow<'_, str> {
-    if !text.contains('<') {
-        return Cow::Borrowed(text);
-    }
-    let mut ranges: Vec<Range<usize>> = Vec::new();
-    for (event, range) in
-        pulldown_cmark::Parser::new_ext(text, markdown_breaks::iced_markdown_options())
-            .into_offset_iter()
-    {
-        match event {
-            pulldown_cmark::Event::Html(_) | pulldown_cmark::Event::InlineHtml(_) => {
-                ranges.push(range);
-            }
-            _ => {}
-        }
-    }
-    if ranges.is_empty() {
-        return Cow::Borrowed(text);
-    }
-    // Events arrive in document order with disjoint ranges; merge overlapping
-    // or adjacent ones so multi-line HTML blocks collapse into single
-    // replacement regions.
-    ranges.sort_by_key(|r| (r.start, r.end));
-    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        if let Some(last) = merged.last_mut() {
-            if range.start <= last.end {
-                last.end = last.end.max(range.end);
-                continue;
-            }
-        }
-        merged.push(range);
-    }
-    let mut out = String::with_capacity(text.len() + merged.len() * 4);
-    let mut pos = 0;
-    for range in &merged {
-        out.push_str(&text[pos..range.start]);
-        out.push_str(&text[range.clone()].replace('<', "&lt;"));
-        pos = range.end;
-    }
-    out.push_str(&text[pos..]);
-    Cow::Owned(out)
 }
 
 #[cfg(test)]

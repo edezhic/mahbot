@@ -15,20 +15,76 @@
 //! text (a `CodeBlock`/`Code` event, not a `SoftBreak`). Paragraph gaps (blank
 //! lines) are block boundaries, not soft breaks, so they are preserved, and an
 //! existing hard break (two trailing spaces or a backslash) is left as-is.
+//!
+//! The module also owns [`escape_html_blocks`], the `<`-escape both chat views
+//! run before the parse so angle-bracket text renders literally instead of
+//! being dropped as HTML.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 /// Markdown options iced's `markdown::parse` runs with (iced_widget
-/// `src/markdown.rs`, `parse_with`). The Sessions `escape_html_blocks`
-/// pre-scan and the soft-break scan in [`hard_breaks`] both use this exact set
-/// so they classify regions identically to the real parse; keep in sync if
-/// iced's defaults change.
+/// `src/markdown.rs`, `parse_with`). [`escape_html_blocks`] and the soft-break
+/// scan in [`hard_breaks`] both use this exact set so they classify regions
+/// identically to the real parse; keep in sync if iced's defaults change.
 pub(crate) fn iced_markdown_options() -> pulldown_cmark::Options {
     pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
         | pulldown_cmark::Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
         | pulldown_cmark::Options::ENABLE_TABLES
         | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
         | pulldown_cmark::Options::ENABLE_TASKLISTS
+}
+
+/// Escape `<` → `&lt;` only inside the regions the markdown parser classifies
+/// as HTML (block-level `Event::Html` plus inline `Event::InlineHtml`), so
+/// angle-bracket tag blocks (`<system-notification>`, `<analyze-tool-result>`,
+/// `<timestamp>` …) render as visible literal text instead of being dropped
+/// wholesale.
+///
+/// This is deliberately a `<`-only escape: `util::escape_html` is not reused
+/// (it also escapes `>` — breaking blockquotes — and `&`, which would
+/// double-encode existing entities).
+pub(crate) fn escape_html_blocks(text: &str) -> Cow<'_, str> {
+    if !text.contains('<') {
+        return Cow::Borrowed(text);
+    }
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(text, iced_markdown_options()).into_offset_iter()
+    {
+        match event {
+            pulldown_cmark::Event::Html(_) | pulldown_cmark::Event::InlineHtml(_) => {
+                ranges.push(range);
+            }
+            _ => {}
+        }
+    }
+    if ranges.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    // Events arrive in document order with disjoint ranges; merge overlapping
+    // or adjacent ones so multi-line HTML blocks collapse into single
+    // replacement regions.
+    ranges.sort_by_key(|r| (r.start, r.end));
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    let mut out = String::with_capacity(text.len() + merged.len() * 4);
+    let mut pos = 0;
+    for range in &merged {
+        out.push_str(&text[pos..range.start]);
+        out.push_str(&text[range.clone()].replace('<', "&lt;"));
+        pos = range.end;
+    }
+    out.push_str(&text[pos..]);
+    Cow::Owned(out)
 }
 
 /// Convert single-newline soft breaks into hard breaks so multi-line chat

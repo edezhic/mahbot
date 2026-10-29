@@ -1,32 +1,37 @@
 //! Shared semantics for `[KIND:…]` media-marker targets.
 //!
 //! [`resolve_marker_target`] is the single authority on what a target names,
-//! used by both delivery surfaces: an http(s) address, an inline payload, a
-//! bare word of prose, or a local path — a relative one resolved against the
-//! workspace the message belongs to, exactly as `[FILE:…]` targets are. It
-//! performs no containment: only `[FILE:…]` is workspace-confined, and the
-//! other kinds deliberately accept any location on disk. What a placed target
-//! becomes is also decided here — [`local_refusal`], [`remote_marker`] and
-//! [`inline_marker_refusal`] are the gates both surfaces ask — and a target that
-//! cannot be delivered is reported with [`marker_refusal`], whose wording and
-//! reasons are shared so a refused picture reads the same in the desktop chat
-//! and in Telegram.
+//! used by the delivery surfaces and by the desktop's display layer (which
+//! canonicalises an address's scheme casing before asking): an http(s) address,
+//! an inline payload, a bare word of prose, or a local path — a relative one
+//! resolved against the workspace the message belongs to, exactly as `[FILE:…]`
+//! targets are. It reads a scheme exactly as written, so only a canonical
+//! lowercase http(s) target is an address. It performs no containment: only
+//! `[FILE:…]` is workspace-confined, and the other kinds deliberately accept any
+//! location on disk. What a placed target becomes is also decided here —
+//! [`local_refusal`] gates delivery (Telegram, which must ship bytes), and
+//! [`remote_marker`] and [`inline_marker_refusal`] are asked wherever a marker of
+//! a kind the target cannot serve is refused — and a target that cannot be
+//! delivered is reported with [`marker_refusal`], whose wording is shared so a
+//! refused marker reads the same wherever it is shown.
 //!
 //! Consumers that must decide whether a target is a "real image" use
 //! [`classify_media_image_target`] (Telegram and enrichment, which offload the
 //! blocking local-file decode off the async path). Two consumers deliberately
 //! do NOT route a decode through it: the GUI render path (a full decode would
-//! run on the render thread — the preprocessor asks [`local_refusal`], which for
-//! an image is metadata and a head read, and the viewer does the bounded decode
-//! itself) and the provider's agent-context scanner (`compatible.rs`, which must
-//! never read a local file during request serialization and calls
-//! [`is_native_data_uri`] directly). No workspace-boundary containment — a valid
-//! raster anywhere on disk is valid. Local files are validated by a real raster
-//! decode (memoized per canonical path + mtime); remote URLs by
-//! well-formedness. A `data:...` URI is NOT classified here — it is an inline
-//! payload validated by its own [`is_native_data_uri`] gate, which only the
-//! provider uses directly; other consumers route through the classifier, which
-//! rejects a `data:` target cheaply before any decode.
+//! run on the render thread — the display layer decides from
+//! [`resolve_marker_target`] whether a marker is a row, reading no bytes (a
+//! relative target only costs a workspace-existence probe), and the viewer does
+//! the bounded decode itself) and the provider's agent-context
+//! scanner (`compatible.rs`, which must never read a local file during request
+//! serialization and calls [`is_native_data_uri`] directly). No
+//! workspace-boundary containment — a valid raster anywhere on disk is valid.
+//! Local files are validated by a real raster decode (memoized per canonical
+//! path + mtime); remote URLs by well-formedness. A `data:...` URI is NOT
+//! classified here — it is an inline payload validated by its own
+//! [`is_native_data_uri`] gate, which only the provider uses directly; other
+//! consumers route through the classifier, which rejects a `data:` target
+//! cheaply before any decode.
 
 use crate::util::{MediaMarkerKind, UnwrapPoison};
 use base64::{
@@ -51,10 +56,10 @@ pub(crate) enum MediaTarget {
     LocalImage,
     /// Well-formed http(s) URL for an image reference.
     RemoteUrl,
-    /// Anything else — not deliverable as an image reference, so a consumer that
-    /// shows the marker to the user refuses it instead. (A `data:...` URI is NOT
-    /// classified here: it is an inline payload validated by
-    /// [`is_native_data_uri`], which the provider uses directly.)
+    /// Anything else — not deliverable as an image reference, so a delivery
+    /// consumer refuses it instead. (A `data:...` URI is NOT classified here: it
+    /// is an inline payload validated by [`is_native_data_uri`], which the
+    /// provider uses directly.)
     Invalid,
 }
 
@@ -133,13 +138,15 @@ pub(crate) enum MarkerTarget {
 /// target resolves. Existence decides whether a bare word is a reference, so
 /// `[FILE:Makefile]` delivers the workspace's file; only a target that names
 /// nothing anywhere stays prose. Without a root the path stays relative, which
-/// [`local_target_refusal`] reports as an unknown workspace.
+/// [`local_target_refusal`] reports as an unknown workspace, while the desktop
+/// still shows it as the row it is: a reference is one whether or not its file
+/// is there.
 #[must_use]
 pub(crate) fn resolve_marker_target(target: &str, roots: &[PathBuf]) -> MarkerTarget {
     let target = target.trim();
     // The stripped-payload placeholder is a data URI's stand-in: still a value,
     // never a path or an address.
-    if target.starts_with("data:") || target.starts_with(crate::util::DATA_URI_OMITTED_PREFIX) {
+    if is_inline_payload(target) {
         return MarkerTarget::Inline;
     }
     if crate::util::is_http_url(target) {
@@ -166,6 +173,13 @@ pub(crate) fn resolve_marker_target(target: &str, roots: &[PathBuf]) -> MarkerTa
     )
 }
 
+/// True when `target` is a value rather than a location: a `data:` payload, or
+/// the placeholder left where one was stripped.
+#[must_use]
+pub(crate) fn is_inline_payload(target: &str) -> bool {
+    target.starts_with("data:") || target.starts_with(crate::util::DATA_URI_OMITTED_PREFIX)
+}
+
 /// True when a target names something rather than being a bare word: it has a
 /// path separator, or its last segment carries an extension (`photo.png`). Only
 /// `[IMAGE:path]`-shaped prose — a bare word, no separator, no extension, and no
@@ -188,8 +202,8 @@ pub(crate) enum RemoteMarker {
 }
 
 /// Judge an http(s) address for `kind`: a `[FILE:…]` address is never a local
-/// file, and an `[IMAGE:…]` address must be well-formed. This one mapping
-/// governs both surfaces, so neither states the rule itself.
+/// file, and an `[IMAGE:…]` address must be well-formed. Every delivering
+/// surface asks this, so none states the rule itself.
 #[must_use]
 pub(crate) fn remote_marker(kind: MediaMarkerKind, target: &str) -> RemoteMarker {
     let reason = match kind {
@@ -212,8 +226,9 @@ pub(crate) fn inline_marker_refusal(kind: MediaMarkerKind) -> String {
 /// Why a resolved local target cannot be delivered as `kind`, or `None` when it
 /// can: an image must carry a native raster signature, any other kind only needs
 /// to name an existing regular file. No size cap applies — an outgoing
-/// attachment's only size gate is the transport's own, and the desktop transfers
-/// nothing at all.
+/// attachment's only size gate is the transport's own. Delivery only: the
+/// desktop display layer never asks this, so a local reference shows its row
+/// whether or not the file is there.
 #[must_use]
 pub(crate) fn local_refusal(kind: MediaMarkerKind, path: &Path) -> Option<&'static str> {
     if kind == MediaMarkerKind::Image {
@@ -242,10 +257,10 @@ fn local_target_refusal(path: &Path) -> Option<&'static str> {
 
 /// Why a local image target cannot be delivered, or `None` when it is a regular
 /// file whose head carries a native raster signature. Metadata plus a bounded
-/// head read — no decode — so the desktop can ask this on the render thread.
-/// A file that passes the signature without decoding is still delivered as the
-/// attachment it was named: the desktop shows the viewer's placeholder for it,
-/// and the transport carries it as a document.
+/// head read — no decode — so a delivery path can ask this cheaply. A file that
+/// passes the signature without decoding is still delivered as the attachment it
+/// was named: the desktop shows the viewer's placeholder for it, and the
+/// transport carries it as a document.
 #[must_use]
 fn image_target_refusal(path: &Path) -> Option<&'static str> {
     use std::io::Read as _;
@@ -270,7 +285,7 @@ fn image_target_refusal(path: &Path) -> Option<&'static str> {
 }
 
 /// Why a marker could not be delivered. Every surface quotes the same reasons,
-/// so a refusal reads identically in the desktop chat and in Telegram.
+/// so a refusal reads identically wherever it is shown.
 pub(crate) const FILE_NOT_FOUND_REASON: &str = "file not found.";
 pub(crate) const DIRECTORY_REASON: &str = "it is a directory.";
 pub(crate) const NO_WORKSPACE_REASON: &str = "the message's workspace is unknown.";
@@ -306,9 +321,11 @@ fn without_credentials(target: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{scheme}://{host}/{path}"))
 }
 
-/// The notice a user reads where an undeliverable marker was: a marker is never
-/// shown to the user as markup — either the thing arrives, or this says why it
-/// did not.
+/// The notice a user reads where a marker could not be delivered: either the
+/// thing arrives, or this says why it did not. The desktop display layer quotes
+/// the same wording for the targets it cannot attach as the kind they claim (an
+/// inline payload for audio, video or a file, an address for a file), while a
+/// reference whose file is gone keeps its row there.
 #[must_use]
 pub(crate) fn marker_refusal(name: &str, reason: &str) -> String {
     format!("Could not send \"{name}\": {reason}")

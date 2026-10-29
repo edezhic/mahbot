@@ -84,9 +84,9 @@ struct DisplayMessage {
 /// messages.
 ///
 /// Markers resolve against the conversation's own workspace — Home shows the
-/// admin's personal conversation, so that is the root — and only an agent's
-/// message turns an undeliverable marker into a notice; what the owner typed
-/// stays their words.
+/// admin's personal conversation, so that is the root. Every message follows the
+/// same rule: a marker whose target is a reference becomes an attachment,
+/// whatever its direction, and one whose file has gone still does.
 #[expect(clippy::too_many_arguments)]
 fn display_message(
     id: Option<i64>,
@@ -98,20 +98,11 @@ fn display_message(
     reply_reference: Option<ReplyReference>,
     is_optimistic: bool,
 ) -> DisplayMessage {
-    use iced::widget::markdown;
     let (md_items, attachments) = if direction == ChatDirection::Divider {
         (Vec::new(), Vec::new())
     } else {
         let workspace = HomeState::conversation_workspace_path();
-        let rendered = super::media_markers::preprocess(
-            &content,
-            &super::media_markers::MarkerContext {
-                workspace: Some(&workspace),
-                refusals: direction == ChatDirection::Agent,
-            },
-        );
-        let processed = super::markdown_breaks::hard_breaks(&rendered.text);
-        (markdown::parse(&processed).collect(), rendered.attachments)
+        super::media_markers::parse_body(&content, Some(&workspace))
     };
     DisplayMessage {
         id,
@@ -2474,43 +2465,53 @@ mod tests {
     }
 
     #[test]
-    fn only_an_agent_message_turns_an_undeliverable_marker_into_a_notice() {
+    fn a_marker_naming_a_file_is_an_attachment_in_every_message() {
         // The desktop resolves a relative target against the conversation's own
-        // workspace — Home shows the admin's personal one — and reports the
-        // reason in the product's own reply...
-        let agent = display_message(
-            None,
-            "m1".to_string(),
-            "see [IMAGE:generated/poster.png]".to_string(),
-            ChatDirection::Agent,
-            None,
-            None,
-            None,
-            false,
-        );
-        let text = rendered_text(&agent.md_items);
-        assert!(
-            text.contains("Could not send \"poster.png\": file not found."),
-            "got: {text:?}"
-        );
-        assert!(!text.contains("[IMAGE:"), "got: {text:?}");
+        // workspace — Home shows the admin's personal one — and both directions
+        // follow the same rule: a file-shaped target leaves the text as a row.
+        for direction in [ChatDirection::Agent, ChatDirection::User] {
+            let message = display_message(
+                None,
+                "m1".to_string(),
+                "see [IMAGE:generated/poster.png]".to_string(),
+                direction,
+                None,
+                None,
+                None,
+                false,
+            );
+            let text = rendered_text(&message.md_items);
+            assert!(!text.contains("[IMAGE:"), "got: {text:?}");
+            assert_eq!(
+                message.attachments.len(),
+                1,
+                "the picture is a row, not prose: got {text:?}"
+            );
+            assert_eq!(message.attachments[0].label, "🖼️ poster.png");
+        }
 
-        // ...while what the owner typed stays their own words.
-        let owner = display_message(
-            None,
-            "m2".to_string(),
-            "see [IMAGE:generated/poster.png]".to_string(),
-            ChatDirection::User,
-            None,
-            None,
-            None,
-            false,
-        );
-        let text = rendered_text(&owner.md_items);
-        assert!(
-            text.contains("[IMAGE:generated/poster.png]"),
-            "got: {text:?}"
-        );
+        // A marker naming nothing is prose in both, and is never rewritten —
+        // the whole example, angle brackets included, reaches the parser as
+        // text. (`<path in your workspace>` is shape-unambiguously not a path,
+        // unlike a bare word that a workspace file could happen to match.)
+        for direction in [ChatDirection::Agent, ChatDirection::User] {
+            let message = display_message(
+                None,
+                "m2".to_string(),
+                "reference the output with [FILE:<path in your workspace>]".to_string(),
+                direction,
+                None,
+                None,
+                None,
+                false,
+            );
+            let text = rendered_text(&message.md_items);
+            assert!(
+                text.contains("[FILE:<path in your workspace>]"),
+                "an example stays text: {text:?}"
+            );
+            assert!(message.attachments.is_empty());
+        }
     }
 
     /// All paragraph text a rendered body carries, flattened, for asserting on
