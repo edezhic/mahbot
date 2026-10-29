@@ -591,7 +591,7 @@ pub const MAX_BOUNCES: usize = 10;
 pub const BOUNCE_BADGE_WARNING_THRESHOLD: usize = 5;
 
 /// Every [`BOUNCE_NOTICE_INTERVAL`]-th return to development the Manager gets a
-/// looping notice — the 2nd, 4th, 6th, 8th and 10th at the current
+/// bounce warning — the 2nd, 4th, 6th, 8th and 10th at the current
 /// [`MAX_BOUNCES`]. See [`bounce_notice_mark`].
 const BOUNCE_NOTICE_INTERVAL: usize = 2;
 
@@ -665,8 +665,8 @@ pub(crate) struct TransitionCtx<'t, 'l> {
     actor: &'l str,
     /// True when this Failed transition was a bounce-breaker drain.
     breaker_trip: bool,
-    /// The return-to-development count to report in the Manager's looping
-    /// notice; `Some` only on a bounce that lands on the notice grid, which is
+    /// The return-to-development count to report in the Manager's bounce
+    /// warning; `Some` only on a bounce that lands on the notice grid, which is
     /// also what forces that bounce to notify immediately.
     bounce_notice: Option<i64>,
 }
@@ -1046,10 +1046,33 @@ async fn last_comment_as_failure_details(ticket_id: &str) -> String {
     }
 }
 
-/// Enqueue a notification for the Manager about a ticket transition, with the
-/// extra section the transition context calls for: the failure-triage block on
-/// a Failed transition, or the looping notice on a bounce that lands on the
-/// ticket's return-to-development notice grid.
+/// Join the blocks that live inside the notification envelope, separated by the
+/// blank line the sessions view reads block boundaries from.
+fn envelope_body(blocks: &[String]) -> String {
+    blocks
+        .iter()
+        .map(|block| block.trim())
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Whether a transition's notification carries the ticket header — the
+/// transition line, the separator and the ticket's id, title and new phase.
+/// Keyed on the target phase: every other notification names its ticket in a
+/// block of its own, so nothing else can acquire a header by accident.
+fn carries_header(target: TicketPhase) -> bool {
+    matches!(
+        target,
+        TicketPhase::Planning | TicketPhase::Done | TicketPhase::Failed
+    )
+}
+
+/// Enqueue a notification for the Manager about a ticket transition: the
+/// envelope with the digest of the transition that triggered it, plus the extra
+/// block the transition context calls for — the failure-triage block on a Failed
+/// transition, or the bounce warning on a return to development that lands on
+/// the ticket's notice grid.
 async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
     let ticket = ctx.ticket;
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
@@ -1082,50 +1105,54 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
     }
 
     let drained = crate::pipeline::chronicle::drain(&ws.name).await;
-
-    let mut message = substitute(
-        &load_prompt("pipeline/notification.md"),
-        &[
-            ("{{ticket_id}}", &ticket.id),
-            ("{{ticket_title}}", &ticket.title),
-            ("{{ticket_phase}}", ctx.target.as_ref()),
-            ("{{transition_log}}", &transition_log),
-            ("{{ticket_updates}}", &drained),
-        ],
-    );
+    let mut blocks = vec![drained];
 
     if ctx.target == TicketPhase::Failed {
         let failure_details = last_comment_as_failure_details(&ticket.id).await;
+        // The rework budget is described only in the Manager's own instructions,
+        // so a failure it stopped says so here.
         let workspace_status = if ctx.breaker_trip {
-            "Beware that all the other tickets have been moved back from Queued \
-             to Planning."
+            "Beware that the rework budget was exhausted, so all the other tickets \
+             were moved back from Queued to Planning."
                 .to_string()
         } else {
             pause_status_sentence(ws.paused)
         };
 
-        let warning = substitute(
+        blocks.push(substitute(
             &load_prompt("pipeline/failure_notification.md"),
             &[
                 ("{{failure_details}}", &failure_details),
                 ("{{workspace_status}}", &workspace_status),
             ],
-        );
-        message.push_str("\n\n");
-        message.push_str(&warning);
+        ));
     }
 
     if let Some(bounce_count) = ctx.bounce_notice {
-        let notice = substitute(
-            &load_prompt("pipeline/bounce_notification.md"),
+        blocks.push(substitute(
+            &load_prompt("pipeline/bounce_warning.md"),
             &[
+                ("{{ticket_id}}", &ticket.id),
                 ("{{bounce_count}}", &bounce_count.to_string()),
-                ("{{max_bounces}}", &MAX_BOUNCES.to_string()),
             ],
-        );
-        message.push_str("\n\n");
-        message.push_str(&notice);
+        ));
     }
+
+    let template = if carries_header(ctx.target) {
+        "pipeline/notification.md"
+    } else {
+        "pipeline/notification_no_header.md"
+    };
+    let message = substitute(
+        &load_prompt(template),
+        &[
+            ("{{ticket_id}}", &ticket.id),
+            ("{{ticket_title}}", &ticket.title),
+            ("{{ticket_phase}}", ctx.target.as_ref()),
+            ("{{transition_log}}", &transition_log),
+            ("{{body}}", &envelope_body(&blocks)),
+        ],
+    );
 
     let agent_id = manager_agent_id(&ws.name);
     message_router::route(
@@ -1766,7 +1793,7 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
     usize::try_from(bounce_count).unwrap_or(usize::MAX) >= MAX_BOUNCES
 }
 
-/// The return-to-development count to report in the Manager's looping notice
+/// The return-to-development count to report in the Manager's bounce warning
 /// when the bounce being applied lands on the notice grid, or `None` when this
 /// bounce carries no notice. `bounce_count` is the count *before* the increment,
 /// so matching exactly (never `>=`) keeps each notice once-per-ticket and never
@@ -1893,31 +1920,4 @@ async fn bounce_to_development(
         }
     }
     outcome
-}
-
-/// Determine whether to notify immediately or buffer the Done transition.
-async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> NotifyPolicy {
-    match board()
-        .has_active_tickets_excluding(workspace_name, ticket_id)
-        .await
-    {
-        Ok(true) => {
-            debug!(
-                ticket = %ticket_id,
-                workspace = %workspace_name,
-                "Other active tickets remain — buffering Done notification",
-            );
-            NotifyPolicy::Buffer
-        }
-        Ok(false) => NotifyPolicy::Notify,
-        Err(e) => {
-            warn!(
-                ticket = %ticket_id,
-                workspace = %workspace_name,
-                error = %e,
-                "Failed to check active tickets — notifying to be safe",
-            );
-            NotifyPolicy::Notify
-        }
-    }
 }

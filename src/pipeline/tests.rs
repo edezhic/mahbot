@@ -621,14 +621,16 @@ async fn run_claim_pipeline_claims_new_work() {
     );
 }
 
-/// The Manager gets a looping notice on every second return to development (the
-/// 2nd, 4th, 6th, 8th and 10th of the shared budget) and on no other bounce — so
-/// a ticket is never double-notified and a ticket already past a grid point is
-/// never backfilled.
+/// The Manager's board notifications: the ticket header — transition line,
+/// separator and the ticket's id, title and new phase — on planning, done and
+/// failed only; a bounce warning block with its count on every second return to
+/// development (the 2nd, 4th, 6th, 8th and 10th of the shared budget) and on no
+/// other bounce; a done that notifies while another ticket is still queued.
 #[tokio::test]
 async fn every_second_bounce_notifies_manager() {
     let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
     let ws = create_test_workspace("/tmp/bounce_notice_ws", "bounce_notice_ws").await;
     crate::workspace::store()
         .set_status(&ws.name, &WorkspaceStatus::Ready)
@@ -650,12 +652,15 @@ async fn every_second_bounce_notifies_manager() {
             let job = notice.expect("every second bounce notifies the Manager");
             assert!(
                 job.content.contains(&format!(
-                    "⏳ This ticket has been returned to development {} times already; \
-                     the rework budget allows {budget} returns in total, after which the \
-                     next verification failure stops the ticket.",
-                    bounced.bounce_count,
+                    "<bounce-warning ticket=\"{}\" count=\"{}\">",
+                    bounced.id, bounced.bounce_count,
                 )),
-                "looping notice missing or miscounted:\n{}",
+                "bounce warning missing or miscounted:\n{}",
+                job.content,
+            );
+            assert!(
+                !job.content.contains("New phase:") && !job.content.contains("Title:"),
+                "a bounce notice carries no header:\n{}",
                 job.content,
             );
         } else {
@@ -667,10 +672,87 @@ async fn every_second_bounce_notifies_manager() {
         }
     }
 
-    // Exhausting the budget stops the ticket.
+    // The header identifies the ticket on planning.
+    let planning_id = make_ticket(store, &ws, "Planned", TicketPhase::Planning).await;
+    let planning = expect_ticket(store, &planning_id).await;
+    super::notify_ticket(&super::TransitionCtx::notifying(
+        &planning,
+        TicketPhase::Analysis,
+        TicketPhase::Planning,
+        "Analyst",
+        crate::Role::Analyst.as_str(),
+    ))
+    .await;
+    let job = manager_inbox
+        .try_recv()
+        .expect("planning notifies the Manager");
+    assert_has_header(&job.content, &planning.id, "Planned", "planning");
+
+    // A done notifies — and names the ticket — even while another ticket is
+    // still ticking in the queue.
+    let _queued_sibling = make_ticket(store, &ws, "Queued sibling", TicketPhase::Queued).await;
+    let done_id = make_ticket(store, &ws, "Finished", TicketPhase::InSanitation).await;
+    let done = expect_ticket(store, &done_id).await;
+    assert!(
+        matches!(
+            super::with_comment_and_transition(
+                super::TransitionCtx::notifying(
+                    &done,
+                    TicketPhase::InSanitation,
+                    TicketPhase::Done,
+                    "Finalize",
+                    crate::Role::Sanitation.as_str(),
+                ),
+                async |_tx| Ok(()),
+            )
+            .await,
+            super::FinalizeOutcome::Applied,
+        ),
+        "the done transition must be applied",
+    );
+    let job = manager_inbox
+        .try_recv()
+        .expect("done notifies the Manager with a queued sibling");
+    assert_has_header(&job.content, &done.id, "Finished", "done");
+
+    // Exhausting the budget stops the ticket, and the failure says the budget was
+    // what stopped it.
     let failed = bounce_once(&ws, budget).await;
     assert_eq!(failed.phase, TicketPhase::Failed);
+    let job = manager_inbox
+        .try_recv()
+        .expect("the failed transition notifies the Manager");
+    assert_has_header(&job.content, &failed.id, "Bounce", "failed");
+    assert!(
+        job.content.contains("the rework budget was exhausted"),
+        "a breaker failure names the exhausted budget:\n{}",
+        job.content,
+    );
     crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
+}
+
+/// Assert the notification opens with the ticket header for `ticket_id`, `title`
+/// and `phase` — the transition line and separator, then the three fields, all
+/// before the blank line that opens the envelope's body.
+fn assert_has_header(content: &str, ticket_id: &str, title: &str, phase: &str) {
+    let header = content
+        .strip_prefix("<board-notification>\n")
+        .and_then(|rest| rest.split("\n\n").next())
+        .unwrap_or_else(|| panic!("notification does not open with the envelope:\n{content}"));
+    assert!(
+        header.contains("\n---\n"),
+        "header lacks the separator:\n{content}",
+    );
+    for expected in [
+        format!("\nTicket: {ticket_id}"),
+        format!("\nTitle: {title}"),
+        format!("\nNew phase: {phase}"),
+    ] {
+        assert!(
+            header.contains(&expected),
+            "header lacks '{expected}':\n{content}",
+        );
+    }
 }
 
 /// Bounce a fresh Verification ticket whose bounce counter starts at
@@ -1394,6 +1476,10 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         .unwrap();
     let id = make_ticket(store, &ws, "Lifecycle", TicketPhase::Backlog).await;
     age_ticket_past_grace(store, &id).await;
+    // Registered up front so the notifications, including the Done one, land in
+    // a local inbox instead of spawning real Manager turns.
+    let mut manager_inbox =
+        crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
 
     // Puller claim Backlog → Analysis.
     super::run_claim_pipeline(&ws).await;
@@ -1589,6 +1675,18 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         "a dirty-tree sanitation round must create a new commit",
     );
 
+    // The Done transition announces itself: the header names the ticket and the
+    // phase, whether or not the workspace still holds other tickets.
+    let mut done_notified = false;
+    while let Ok(job) = manager_inbox.try_recv() {
+        if job.content.contains("New phase: done\n") {
+            assert_has_header(&job.content, &id, "Lifecycle", "done");
+            done_notified = true;
+        }
+    }
+    assert!(done_notified, "the Done transition must notify the Manager");
+
+    crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
     drop(repo_dir);
 }
 

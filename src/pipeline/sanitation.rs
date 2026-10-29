@@ -8,10 +8,10 @@ use crate::{Agent, Role, Workspace};
 
 use super::{
     BoardStore, FinalizeOutcome, StageRunKind, TicketPhase, TransitionCtx, board,
-    bounce_to_development, clear_implementation_roster, determine_notify_policy, error,
-    guard_job_phase, guard_stage, info, list_new_or_untracked_files, notify_manager_system,
-    pause_freezing, pause_status_sentence, reset_phase_attempt, run_git_status, run_stage_agent,
-    sync_phase_job_task, warn, with_comment_and_transition,
+    bounce_to_development, clear_implementation_roster, error, guard_job_phase, guard_stage, info,
+    list_new_or_untracked_files, notify_manager_system, pause_freezing, pause_status_sentence,
+    reset_phase_attempt, run_git_status, run_stage_agent, sync_phase_job_task, warn,
+    with_comment_and_transition,
 };
 
 /// Fixed commit-message prefix for the tickets the maintainer filed — their
@@ -32,14 +32,12 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
 /// tree) use this so the fallback is silent in ticket history; `reason`
 /// preserves the specific cause in the log.
 async fn transition_ticket_to_done_no_comment(ticket: &Ticket, source: TicketPhase, reason: &str) {
-    let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
     if matches!(
         with_comment_and_transition(
-            TransitionCtx::new(
+            TransitionCtx::notifying(
                 ticket,
                 source,
                 TicketPhase::Done,
-                notify_policy,
                 "Finalize",
                 Role::Sanitation.as_str(),
             ),
@@ -193,8 +191,6 @@ async fn finalize_commit_and_transition(
 
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
 
-    let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-
     let log_label = format!(
         "finalize Done transition from {phase_label} ({})",
         commit_info.short_hash(),
@@ -202,11 +198,10 @@ async fn finalize_commit_and_transition(
 
     if matches!(
         with_comment_and_transition(
-            TransitionCtx::new(
+            TransitionCtx::notifying(
                 ticket,
                 source,
                 TicketPhase::Done,
-                notify_policy,
                 &log_label,
                 Role::Sanitation.as_str(),
             ),

@@ -131,8 +131,7 @@ crate::columns! {
 /// [`TicketPhase::Failed`] is deliberately NOT a member: a failure awaiting
 /// Manager triage parks new starts through the claim predicate's own
 /// failed-sibling gate, not through this set. Adding it here would also
-/// suppress Manager triage (this set gates in-flight-ticket updates) and Done
-/// notifications.
+/// suppress Manager triage — this set gates in-flight-ticket updates.
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::Verification,
@@ -1593,51 +1592,6 @@ impl BoardStore {
             }
             other => anyhow::Error::from(other),
         })
-    }
-
-    /// Check if the workspace has any active tickets other than the excluded one.
-    ///
-    /// "Active" means a pipeline-occupied phase ([`PIPELINE_OCCUPIED_PHASES`])
-    /// or [`TicketPhase::Queued`]. This is not [`WORKING_PHASES`]: `Analysis`
-    /// is working but not active, while `Queued` is active but not working.
-    ///
-    /// Archived tickets are excluded — the GUI can archive a ticket in any
-    /// phase, even though callers are expected to archive only terminal ones
-    /// (see [`count_pre_dev_tickets`](Self::count_pre_dev_tickets)).
-    ///
-    /// # Race condition note
-    ///
-    /// When multiple occupied tickets in the same workspace are finalized
-    /// concurrently (each via [`tokio::spawn`] in the poller), both may see
-    /// each other as active and both buffer their Done transitions. In this
-    /// scenario all tickets are already in Done in the database — the only
-    /// consequence is that Done notifications are delayed until the next
-    /// [`crate::agent::message_router::MessageKind::UserMessage`] drains the
-    /// buffer. This is an accepted trade-off: the race window is small and the
-    /// buffer always drains eventually.
-    pub(crate) async fn has_active_tickets_excluding(
-        &self,
-        workspace_name: &str,
-        exclude_ticket_id: &str,
-    ) -> Result<bool> {
-        let occupied_sql = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES);
-        let sql = format!(
-            "SELECT 1 FROM tickets WHERE \
-             (phase IN ({occupied_sql}) OR phase = ?2) \
-             AND workspace_name = ?1 AND is_archived = 0 AND id != ?3 LIMIT 1",
-        );
-        let rows = self
-            .conn
-            .query(
-                &sql,
-                db::params![
-                    workspace_name,
-                    TicketPhase::Queued.as_ref(),
-                    exclude_ticket_id
-                ],
-            )
-            .await?;
-        Ok(!rows.is_empty())
     }
 
     /// Add a comment to a ticket (append-only).
