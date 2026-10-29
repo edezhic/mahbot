@@ -12,9 +12,11 @@
 //! The command's own EXIT STATUS decides the call, never the fate of the pipe
 //! readers: a command that exited 0 is a success and one that exited non-zero is
 //! its own failure, and its output is what its pipes delivered. Two bounds frame
-//! that output — the per-stream capture cap ([`SHELL_PIPE_READ_CAP`]) and the
-//! post-exit drain ([`DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS`]) — and neither turns a
-//! finished command into an error.
+//! that output — the per-stream capture ([`SHELL_PIPE_READ_CAP`]): a head, and the
+//! [`SHELL_PIPE_TAIL_CAP`] end a flood would otherwise push it past, keeping the
+//! verdict a run ends with — and the post-exit drain
+//! ([`DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS`]) — and neither turns a finished command
+//! into an error.
 //!
 //! A process the command left behind can keep a capture pipe open past the drain
 //! bound, so EOF never arrives. It is abandoned work: the run's whole tree is ended
@@ -25,9 +27,11 @@
 //! to stop it ([`format_leftover_note`]).
 //!
 //! `leftovers` decides what the call reports ([`LeftoverPolicy`]): an agent's
-//! command keeps its own exit status, while a program this product runs for itself
-//! (a user's automation, a custom tool's script, the document kit) is reported as a
-//! failure ([`ShellRunResult::EndedWithLeftovers`]). A process a `Full` agent
+//! command keeps its own exit status and output and names the leftover it could not
+//! stop, while a program this product runs for itself (a user's automation, a custom
+//! tool's script, the document kit, the renderer's installs, browser probes and
+//! renders) has its leftover ended first and is then judged by the exit status it had
+//! already produced ([`ShellRunResult::EndedWithLeftovers`]). A process a `Full` agent
 //! starts to keep running belongs to the background session ([`bg`]), not to a
 //! call, so it never reaches this path.
 //!
@@ -195,8 +199,9 @@ pub(super) const NON_DELEGATING_PREFIXES: &[&str] =
 /// the subcommand as their "value" and bypass read-only validation entirely.
 const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c"];
 
-/// Default maximum shell command execution time before kill.
-const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
+/// Default maximum shell command execution time before kill, and the ceiling an
+/// ordinary product call is held to.
+pub(crate) const DEFAULT_SHELL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Absolute maximum allowed shell command timeout (1 hour).
 /// Prevents agents from setting absurdly long timeouts.
 const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
@@ -215,16 +220,27 @@ const DRAIN_CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// first tick is immediate.
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 /// Cap bytes collected from a run's pipes during command execution (including
-/// timeouts): what each stream of a run's capture gets ([`CaptureBudget`]).
+/// timeouts): the head of what each stream of a run's capture gets
+/// ([`CaptureBudget`]).
 ///
 /// # Truncation safety
 ///
-/// This cap (256 KB) is well below 1 MB, so the [`decode_and_strip_ansi`]
-/// output never reaches a size where truncation would be necessary. If this
-/// cap is ever raised above 1 MB, re-add truncation safeguards (e.g.,
+/// One stream delivers this head, the [`SHELL_PIPE_TAIL_CAP`] end and the
+/// [`TRUNCATED_MIDDLE`] join — 288 KB — which a lossy decode can expand to at most
+/// three bytes per byte. Both stay below 1 MB, so the [`decode_and_strip_ansi`]
+/// output never reaches a size where truncation would be necessary. If either cap is
+/// raised past that, re-add truncation safeguards (e.g.,
 /// [`truncate_sandwich`](crate::util::truncate_sandwich) after ANSI stripping)
 /// to prevent unbounded output.
 const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
+/// Bytes kept from the *end* of a stream the head above had no room for: a run's
+/// verdict, its last error line and its exit summary are written after everything
+/// else, so the end is the part a reader needs most — and the one an unbounded run
+/// (a render) would otherwise lose to its own progress noise.
+const SHELL_PIPE_TAIL_CAP: usize = 32 * 1024;
+/// Where a stream outgrew its head: a line of its own, so a reader that scans lines
+/// never mistakes the join for the program's own output.
+const TRUNCATED_MIDDLE: &str = "\n…\n";
 /// Max chars of partial output included in timeout error messages.
 const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
 /// Max chars of the engine's own stderr line quoted as the cause of a refused
@@ -637,8 +653,9 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
 ///
 /// `cwd` is the caller's choice, not necessarily a workspace: the program paths
 /// take a workspace root, while the document kit runs inside its own materialized
-/// directory so bun cannot load a config from a workspace (see
-/// [`crate::docgen`]).
+/// directory and the renderer inside the product's own package directory, so bun
+/// cannot load a config from a workspace (see [`crate::docgen`] and
+/// [`crate::hyperframes`]).
 fn program_command_with(
     program: &Path,
     args: &[String],
@@ -669,22 +686,30 @@ fn program_command_with(
 ///
 /// These are the owner's own commands doing his own work — an automation's program, a
 /// custom tool, a plan step — so his environment is handed over whole. The
-/// product's own work goes through [`build_internal_program_command`] instead.
+/// product's own work goes through [`internal_program_command`] instead.
 fn build_program_command(program: &Path, args: &[String], cwd: &Path) -> tokio::process::Command {
     program_command_with(program, args, cwd, apply_agent_env)
 }
 
-/// [`build_program_command`] for the product's OWN work — the document kit: the
-/// reduced [`internal_env_pairs`] environment, which holds none of the owner's
-/// secrets. The separate entry point means no caller has to name an environment,
-/// so a product run can never inherit the owner's by mistake.
-fn build_internal_program_command(
+/// The one product-owned command: `extra` variables over the reduced
+/// [`internal_env_pairs`] environment, and end-of-file on stdin, so a program that
+/// decides to ask a question never reads the daemon's terminal.
+///
+/// Contained as an agent's command is ([`program_command_with`]): the child leads
+/// its own process group on Unix, and on Windows a [`RunOwner::Agent`] run gets the
+/// job object — a product program starts descendants of its own (a render's browser
+/// workers), and none of them may outlive the product.
+fn internal_program_command(
+    cwd: &Path,
     program: &Path,
     args: &[String],
-    cwd: &Path,
+    extra: &[(OsString, OsString)],
 ) -> tokio::process::Command {
+    let mut env = internal_env_pairs();
+    env.extend_from_slice(extra);
     program_command_with(program, args, cwd, |process| {
-        apply_env_pairs(process.as_std_mut(), &internal_env_pairs());
+        process.stdin(Stdio::null());
+        apply_env_pairs(process.as_std_mut(), &env);
     })
 }
 
@@ -723,12 +748,13 @@ enum ShellRunResult {
     /// The main process exited but a process it left behind held a capture pipe open
     /// past the drain bound, so the run's tree was ended ([`LeftoverPolicy::Program`] —
     /// the program paths, [`run_program_outcome`] and [`run_program_with_timeout`]).
-    /// The partial output the readers had collected is carried for the failure prose,
-    /// but no exit status: a run this product ended for a leftover is not described
-    /// by the status of the process that happened to exit first.
+    /// The exit status it had already produced and the output the readers had collected
+    /// are carried, and that status is the verdict: a run whose own process had exited
+    /// finished, whatever kept writing after it.
     EndedWithLeftovers {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        status: std::process::ExitStatus,
         elapsed: Duration,
     },
     TimedOut {
@@ -757,18 +783,24 @@ enum ShellRunResult {
 /// a capture pipe past the drain bound — one policy per run, so the two behaviours
 /// cannot drift apart ([`leftover_result`] is where each is shaped).
 ///
+/// The two differ in what they do with the leftover, not in how they read the run: the
+/// run's own exit status is the answer either way, because its own process had already
+/// exited.
+///
 /// `Command` is the agent-facing behaviour (the shell tool's commands in both modes,
-/// and the rewritten-line plan runner): the command's own exit status and output are
-/// the result. `Program` is the program paths' behaviour (`run_program_outcome` — a
-/// user's automation — and the `run_program_with_timeout` /
+/// and the rewritten-line plan runner): the leftover is stopped and the command's own
+/// exit status and output are the result. `Program` is the program paths' behaviour
+/// (`run_program_outcome` — a user's automation — and the `run_program_with_timeout` /
 /// `run_internal_program_with_timeout` pair — a custom tool's script, the document
-/// kit): the run is reported as a failure
-/// ([`ShellRunResult::EndedWithLeftovers`]).
+/// kit — plus [`run_internal_program_outcome`]'s product runs, the renderer included):
+/// the run's whole tree is ended at once and the result is the status it had already
+/// produced ([`ShellRunResult::EndedWithLeftovers`]).
 #[derive(Clone, Copy)]
 pub(super) enum LeftoverPolicy {
-    /// An agent's command: the run's own status is the answer.
+    /// An agent's command: stop the leftover, then report the run's own status.
     Command,
-    /// A program this product runs for itself: report the run as a failure.
+    /// A program this product runs for itself: end the run's tree, then report the
+    /// status the run had already produced.
     Program,
 }
 
@@ -796,19 +828,27 @@ struct MemorySample {
 /// cannot measure. Shared by [`run_command_with_timeout`] and the plan runner
 /// ([`plan::run`]) so the two cannot drift on the bounds they enforce.
 struct Watchdog {
-    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    deadline: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     sample: tokio::time::Interval,
     measure_failed: bool,
 }
 
 impl Watchdog {
-    /// `timeout` is the run's whole-run deadline; the memory cadence is
-    /// [`MEMORY_SAMPLE_INTERVAL`] for every run.
-    pub(in crate::tools::shell) fn new(timeout: Duration) -> Self {
+    /// `timeout` is the run's whole-run deadline, `None` for a run whose
+    /// operation has no ceiling of its own — the deadline future is then
+    /// pending forever, so the other bounds still fire and the select arms
+    /// stay as they are; the memory cadence is [`MEMORY_SAMPLE_INTERVAL`] for
+    /// every run.
+    pub(in crate::tools::shell) fn new(timeout: Option<Duration>) -> Self {
         let mut sample = tokio::time::interval(MEMORY_SAMPLE_INTERVAL);
         sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let deadline: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            match timeout {
+                Some(timeout) => Box::pin(tokio::time::sleep(timeout)),
+                None => Box::pin(std::future::pending()),
+            };
         Self {
-            deadline: Box::pin(tokio::time::sleep(timeout)),
+            deadline,
             sample,
             measure_failed: false,
         }
@@ -879,14 +919,22 @@ enum Stream {
 /// the split between two of them is decided by which reads first; what is guaranteed
 /// is the total (the cap), which is the truncation-safety property
 /// [`SHELL_PIPE_READ_CAP`] documents.
+///
+/// What the cap refuses is kept as the stream's *end* instead, up to
+/// [`SHELL_PIPE_TAIL_CAP`]: a run's verdict is written after everything else it
+/// printed, so a run that outruns the head still says how it ended.
 #[derive(Clone)]
-struct CaptureBudget(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+struct CaptureBudget {
+    head: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
 
 impl CaptureBudget {
     fn new(cap: usize) -> Self {
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
-            cap,
-        )))
+        Self {
+            head: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(cap)),
+            tail: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 
     /// Charge `bytes` kept bytes against the budget, returning how many the
@@ -896,13 +944,13 @@ impl CaptureBudget {
     fn claim(&self, bytes: usize) -> usize {
         use std::sync::atomic::Ordering;
 
-        let mut remaining = self.0.load(Ordering::Relaxed);
+        let mut remaining = self.head.load(Ordering::Relaxed);
         loop {
             let take = bytes.min(remaining);
             if take == 0 {
                 return 0;
             }
-            match self.0.compare_exchange_weak(
+            match self.head.compare_exchange_weak(
                 remaining,
                 remaining - take,
                 Ordering::Relaxed,
@@ -912,6 +960,20 @@ impl CaptureBudget {
                 Err(actual) => remaining = actual,
             }
         }
+    }
+
+    /// Keep what the head refused — the part of the stream it had no room for, which
+    /// is where a run says how it ended — bounded by [`SHELL_PIPE_TAIL_CAP`].
+    fn keep_end(&self, refused: &[u8]) {
+        let mut tail = self.tail.lock().unwrap_poison();
+        tail.extend_from_slice(refused);
+        let excess = tail.len().saturating_sub(SHELL_PIPE_TAIL_CAP);
+        tail.drain(..excess);
+    }
+
+    /// The end the head had no room for, taken: empty when the stream fitted.
+    fn take_end(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.tail.lock().unwrap_poison())
     }
 }
 
@@ -946,13 +1008,15 @@ async fn read_stream_limited(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         // Whatever the budget still allows is kept; the rest is
-                        // read and discarded, so a spent budget never stops the
-                        // member from writing (the drain half of the original
-                        // per-pipe cap).
+                        // read and kept as the stream's end, so a spent budget
+                        // never stops the member from writing (the drain half of
+                        // the original per-pipe cap) and never loses how the run
+                        // ended.
                         let keep = budget.claim(n);
                         if keep > 0 {
                             buf.lock().unwrap_poison().extend_from_slice(&chunk[..keep]);
                         }
+                        budget.keep_end(&chunk[keep..n]);
                     }
                 }
             }
@@ -1211,6 +1275,9 @@ struct Reader {
     /// collector takes (and so drains) it, so a leftover that keeps writing can
     /// never grow it past the cap.
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// The same budget, kept so the collector can take the stream's end — the bytes
+    /// the head had no room for ([`CaptureBudget::take_end`]).
+    budget: CaptureBudget,
     task: ReaderTask,
 }
 
@@ -1267,7 +1334,8 @@ impl Readers {
         self.readers.push(Reader {
             stream,
             buf: std::sync::Arc::clone(&buf),
-            task: ReaderTask::Reading(spawn_pipe_reader(pipe, budget, cancel, buf)),
+            task: ReaderTask::Reading(spawn_pipe_reader(pipe, budget.clone(), cancel, buf)),
+            budget,
         });
     }
 
@@ -1340,25 +1408,37 @@ impl Readers {
         }
     }
 
-    /// Every reader's kept bytes, in the order the readers were created,
-    /// separated by stream. Each buffer is emptied by the take, and a reader a
-    /// surviving leftover keeps ([`Readers::retain_pending`]) grows nothing further
-    /// once its (shared, already charged) budget is spent — the bound is the
-    /// reader's, not this call's.
+    /// Every reader's kept bytes, in the order the readers were created, separated by
+    /// stream, then the ends the streams' heads had no room for — gathered per stream and
+    /// placed after everything that stream kept, because a plan's members share one budget
+    /// per stream and a tail belongs to the stream, not to whichever reader met it first.
+    /// Each buffer and each tail is emptied by the take.
     ///
     /// This is the leftover path's snapshot: the output collected up to the moment a
     /// leftover is detected, never what arrives after it ([`leftover_result`] takes it
     /// before the stop for exactly that reason).
     fn take(&mut self) -> (Vec<u8>, Vec<u8>) {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        let mut streams = [Vec::new(), Vec::new()];
+        let mut ends: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
         for reader in &mut self.readers {
             let bytes = std::mem::take(&mut *reader.buf.lock().unwrap_poison());
-            match reader.stream {
-                Captured::Stdout => stdout.extend_from_slice(&bytes),
-                Captured::Stderr => stderr.extend_from_slice(&bytes),
+            let index = match reader.stream {
+                Captured::Stdout => 0,
+                Captured::Stderr => 1,
+            };
+            streams[index].extend_from_slice(&bytes);
+            // A shared budget answers the second reader with nothing: its tail was taken.
+            ends[index].extend_from_slice(&reader.budget.take_end());
+        }
+        // A stream longer than the head held says so, then ends where it really did: the
+        // verdict a run prints last is never the part that is lost.
+        for (stream, end) in streams.iter_mut().zip(ends) {
+            if !end.is_empty() {
+                stream.extend_from_slice(TRUNCATED_MIDDLE.as_bytes());
+                stream.extend_from_slice(&end);
             }
         }
+        let [stdout, stderr] = streams;
         (stdout, stderr)
     }
 }
@@ -1637,15 +1717,17 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout`.
-/// After the main process exits, remaining output must drain within
-/// `drain_limit` — a leftover backgrounded process holding the pipes open
-/// otherwise blocks EOF forever. Such a leftover is abandoned work, so the run's
-/// whole tree is ended at the detection, and `leftovers` decides what the call
-/// reports: an agent's command is stopped through [`stop_leftover`] and keeps its
-/// own exit status, reporting the leftover only when the stop did not take
-/// ([`ShellRunResult::ExitedWithLeftovers`]), while a program run is reported as a
-/// failure ([`ShellRunResult::EndedWithLeftovers`]).
+/// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout` when the
+/// run has one (`None` for an operation whose length is its own, see
+/// [`run_internal_program_outcome`]). After the main process exits, remaining
+/// output must drain within `drain_limit` — a leftover backgrounded process
+/// holding the pipes open otherwise blocks EOF forever. Such a leftover is
+/// abandoned work, so the run's whole tree is ended at the detection, and
+/// `leftovers` decides what happens to it: an agent's command is stopped
+/// through [`stop_leftover`] and keeps its own exit status, reporting the leftover
+/// only when the stop did not take ([`ShellRunResult::ExitedWithLeftovers`]),
+/// while a program run ends its whole tree at once and is judged by the exit status
+/// it had already produced ([`ShellRunResult::EndedWithLeftovers`]).
 ///
 /// While the child runs, its whole process tree is also sampled for resident
 /// memory ([`mem`]); a sample over `memory_limit` ends the run the way the
@@ -1661,7 +1743,7 @@ impl Drop for KillOnDrop {
 /// is kept in a file instead of being read and discarded.
 async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
-    timeout: Duration,
+    timeout: Option<Duration>,
     drain_limit: Duration,
     memory_limit: Option<u64>,
     owner: RunOwner,
@@ -1770,13 +1852,13 @@ async fn run_command_with_timeout(
 }
 
 /// Wait for the run to end on the first of its three bounds — the child
-/// exiting, `timeout`, or the resident memory its whole tree has grown to
-/// above `memory_limit` — and say which one fired. The memory sample rides
-/// the runtime path the wait already occupies: a sample is a handful of
+/// exiting, `timeout` (when the run has one), or the resident memory its whole
+/// tree has grown to above `memory_limit` — and say which one fired. The memory
+/// sample rides the runtime path the wait already occupies: a sample is a handful
 /// syscalls, no thread of its own.
 async fn await_run_end(
     child: &mut tokio::process::Child,
-    timeout: Duration,
+    timeout: Option<Duration>,
     memory_limit: Option<u64>,
     pid: Option<u32>,
 ) -> WaitOutcome {
@@ -1870,12 +1952,11 @@ async fn stop_leftover(tree: Tree, readers: &mut Readers) -> bool {
 /// output collected up to the detection are the result: a stop that took leaves a
 /// plain completed command, with no note and no record, and only the residual case
 /// keeps today's shape — its note and its log-store record hang off
-/// [`ShellRunResult::ExitedWithLeftovers`]. A program run is a failure instead: its
-/// tree is ended, its readers cancelled and their partial output carried for the
-/// failure prose (a reader that already finished keeps its output — a completed
-/// JoinHandle must not be re-awaited), and no exit status is reported, because what
-/// the program paths say is the failure, not the status of the process that happened
-/// to exit first.
+/// [`ShellRunResult::ExitedWithLeftovers`]. A program run ends its whole tree, cancels
+/// its readers and carries the partial output for the prose (a reader that already
+/// finished keeps its output — a completed JoinHandle must not be re-awaited) together
+/// with the exit status the run had already produced: what the program paths say is the
+/// status of the process that exited, never a verdict the leftover invented.
 async fn leftover_result(
     leftovers: LeftoverPolicy,
     tree: Tree,
@@ -1916,6 +1997,7 @@ async fn leftover_result(
             ShellRunResult::EndedWithLeftovers {
                 stdout,
                 stderr,
+                status,
                 elapsed: start.elapsed(),
             }
         }
@@ -1939,9 +2021,103 @@ pub(crate) struct ProgramOutcome {
     pub output: String,
     /// Whether the program emitted anything at all.
     pub has_output: bool,
-    /// The run was stopped by its wall-clock ceiling rather than finishing: a
+    /// How the product intervened in this run: it never started it, its wall-clock
+    /// ceiling, or its memory watchdog. A stop is a verdict about the machine, never about
+    /// the program.
+    pub stop: Option<Stop>,
+}
+
+/// How the product intervened in a run before the program's own verdict could be read:
+/// it never started, its ceiling, or its memory watchdog. A run whose own process had
+/// exited carries no stop — a leftover that kept our capture pipe open did not change
+/// its verdict ([`ShellRunResult::EndedWithLeftovers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// The program could not be started at all: the machine's verdict, not the
+    /// program's, so the same call is worth another attempt.
+    Spawn,
+    /// The wall-clock ceiling the run was given.
+    Timeout,
+    /// The memory watchdog: the run's tree crossed the machine's share.
+    Memory,
+}
+
+impl ProgramOutcome {
+    /// Whether the run was stopped by its wall-clock ceiling rather than finishing: a
     /// verdict about the machine, not about the check.
-    pub timed_out: bool,
+    pub(crate) fn timed_out(&self) -> bool {
+        self.stop == Some(Stop::Timeout)
+    }
+
+    /// Whether the product intervened in the run at all — it never started it, its
+    /// ceiling, its memory watchdog — rather than the program finishing on its own. A stop
+    /// is a verdict about the machine, not about the program.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.is_some()
+    }
+
+    /// What ended the run, without the memory watchdog's `terminated: ` prefix — the reason
+    /// a caller that already says the run was stopped needs, where
+    /// `terminated: exceeded memory limit (…)` would read twice.
+    pub(crate) fn stop_reason(&self) -> &str {
+        self.detail
+            .strip_prefix(mem::TERMINATED)
+            .unwrap_or(&self.detail)
+    }
+}
+
+/// The sentence a run the product stopped carries: what ended it and how long it was
+/// given.
+pub(crate) fn timeout_sentence(label: &str, ceiling: Duration) -> String {
+    format!(
+        "timeout: {label} did not finish within {}s and was killed",
+        ceiling.as_secs()
+    )
+}
+
+/// A finished run's own verdict: the one reading every consumer of the shared run machinery
+/// takes, so a leftover that held our capture pipe open past the drain bound cannot change it.
+#[derive(Clone, Copy)]
+enum ExitVerdict {
+    /// The run exited with status 0.
+    Clean,
+    /// It exited with this status.
+    Failed(i32),
+    /// A signal ended it.
+    Signalled,
+}
+
+impl ExitVerdict {
+    /// Whether the run exited clean.
+    fn clean(self) -> bool {
+        matches!(self, Self::Clean)
+    }
+
+    /// `exit status 0`, `exit status 2`, or `terminated by signal`.
+    fn detail(self) -> String {
+        match self {
+            Self::Clean => "exit status 0".to_string(),
+            Self::Failed(code) => format!("exit status {code}"),
+            Self::Signalled => "terminated by signal".to_string(),
+        }
+    }
+
+    /// The `[exit status: …]` note a failed run's output carries, `None` for a clean exit.
+    fn note(self) -> Option<String> {
+        match self {
+            Self::Clean => None,
+            Self::Failed(code) => Some(format_exit_status_note(Some(code))),
+            Self::Signalled => Some(format_exit_status_note(None)),
+        }
+    }
+}
+
+fn exit_verdict(status: std::process::ExitStatus) -> ExitVerdict {
+    match status.code() {
+        Some(0) => ExitVerdict::Clean,
+        Some(code) => ExitVerdict::Failed(code),
+        None => ExitVerdict::Signalled,
+    }
 }
 
 /// Build the outcome for a run that produced (possibly partial) raw streams.
@@ -1954,7 +2130,7 @@ fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) 
         // The raw streams decide: only a run that emitted nothing at all
         // reported nothing.
         has_output: !stdout.is_empty() || !stderr.is_empty(),
-        timed_out: false,
+        stop: None,
     }
 }
 
@@ -1976,12 +2152,13 @@ async fn run_program(
 }
 
 /// Perform one [`run_command_with_timeout`] call with the bounds every direct
-/// run is held to: `timeout` as the whole-run ceiling, the per-pipe output cap
-/// and the post-exit drain bound. `owner` decides the run's containment.
+/// run is held to: `timeout` as the whole-run ceiling — `None` for a run whose
+/// operation has no ceiling of its own — the per-pipe output cap and the
+/// post-exit drain bound. `owner` decides the run's containment.
 async fn run_bounded_within(
     mut cmd: tokio::process::Command,
     owner: RunOwner,
-    timeout: Duration,
+    timeout: Option<Duration>,
     spill: Option<CompleteOutput>,
 ) -> ShellRunResult {
     run_command_with_timeout(
@@ -1997,19 +2174,13 @@ async fn run_bounded_within(
 }
 
 /// [`run_bounded_within`] under the default ceiling every direct run is held to
-/// ([`DEFAULT_SHELL_TIMEOUT_SECS`]).
+/// ([`DEFAULT_SHELL_TIMEOUT`]).
 async fn run_bounded(
     cmd: tokio::process::Command,
     owner: RunOwner,
     spill: Option<CompleteOutput>,
 ) -> ShellRunResult {
-    run_bounded_within(
-        cmd,
-        owner,
-        Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
-        spill,
-    )
-    .await
+    run_bounded_within(cmd, owner, Some(DEFAULT_SHELL_TIMEOUT), spill).await
 }
 
 /// Run `program` with `args` in `cwd` and report the run as an outcome instead
@@ -2024,13 +2195,7 @@ pub(crate) async fn run_program_outcome(
     program: &Path,
     args: &[String],
 ) -> ProgramOutcome {
-    run_program_outcome_within(
-        cwd,
-        program,
-        args,
-        Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
-    )
-    .await
+    run_program_outcome_within(cwd, program, args, DEFAULT_SHELL_TIMEOUT).await
 }
 
 /// [`run_program_outcome`] under an explicit wall-clock ceiling. A run stopped
@@ -2046,58 +2211,106 @@ pub(crate) async fn run_program_outcome_within(
     let result = run_bounded_within(
         build_program_command(program, args, cwd),
         RunOwner::Service,
+        Some(timeout),
+        None,
+    )
+    .await;
+    program_outcome_from(result, Some(timeout))
+}
+
+/// [`run_program_outcome_within`] for a program that is the product's own rather
+/// than an agent's: `extra` is applied over the reduced [`internal_env_pairs`]
+/// environment ([`internal_program_command`]), so none of the owner's variables
+/// reach it. `timeout` is the whole-run ceiling, `None` for a run whose operation
+/// has no ceiling of its own.
+///
+/// The run is contained as an agent's command is ([`RunOwner::Agent`]) rather than
+/// as a service's: a product program starts descendants of its own, and none of
+/// them may outlive the product. The per-pipe output cap, the post-exit drain
+/// bound, the memory watchdog and the leftover policy are the same as every other
+/// direct run's.
+pub(crate) async fn run_internal_program_outcome(
+    cwd: &Path,
+    program: &Path,
+    args: &[String],
+    extra: &[(OsString, OsString)],
+    timeout: Option<Duration>,
+) -> ProgramOutcome {
+    let result = run_bounded_within(
+        internal_program_command(cwd, program, args, extra),
+        RunOwner::Agent,
         timeout,
         None,
     )
     .await;
+    program_outcome_from(result, timeout)
+}
+
+/// The outcome a direct run reports. `ceiling` is the wall clock the run was held to —
+/// the number a stop names; a run without one has no deadline to fire.
+///
+/// A run whose own process exited is judged by the status it gave, wherever it sits in
+/// this match: `Completed` is the ordinary case, and the two leftover variants are the
+/// same answer — the process had exited before a leftover took the pipes, so only our
+/// capture of what it printed after that was lost, never its verdict. `EndedWithLeftovers`
+/// is the only one a direct run reaches ([`LeftoverPolicy::Program`]); the other is shaped
+/// alike rather than left uncovered.
+fn program_outcome_from(result: ShellRunResult, ceiling: Option<Duration>) -> ProgramOutcome {
     match result {
         ShellRunResult::Completed {
             stdout,
             stderr,
             status,
             ..
-        } => {
-            let code = status.code();
-            program_outcome(
-                code == Some(0),
-                match code {
-                    Some(n) => format!("exit status {n}"),
-                    None => "terminated by signal".to_string(),
-                },
-                &stdout,
-                &stderr,
-            )
         }
-        ShellRunResult::TimedOut { stdout, stderr, .. } => ProgramOutcome {
-            timed_out: true,
+        | ShellRunResult::ExitedWithLeftovers {
+            stdout,
+            stderr,
+            status,
+            ..
+        }
+        | ShellRunResult::EndedWithLeftovers {
+            stdout,
+            stderr,
+            status,
+            ..
+        } => {
+            let verdict = exit_verdict(status);
+            program_outcome(verdict.clean(), verdict.detail(), &stdout, &stderr)
+        }
+        // A stop always means the run had a deadline: its wall clock, the only one
+        // that ends a run from here. `unwrap_or` stands in for a ceiling that cannot
+        // exist — a run given none has no deadline to fire.
+        ShellRunResult::TimedOut {
+            stdout,
+            stderr,
+            elapsed,
+            ..
+        } => ProgramOutcome {
+            stop: Some(Stop::Timeout),
             ..program_outcome(
                 false,
-                format!("timed out after {}s", timeout.as_secs()),
+                format!("timed out after {}s", ceiling.unwrap_or(elapsed).as_secs()),
                 &stdout,
                 &stderr,
             )
         },
-        // `ExitedWithLeftovers` cannot come out of a direct run — it is always
-        // ENDED, never kept ([`LeftoverPolicy::Program`]) — but both outcomes say
-        // the same thing here: the run's own exit was observed while a process
-        // it left behind held its output pipes.
-        ShellRunResult::ExitedWithLeftovers { stdout, stderr, .. }
-        | ShellRunResult::EndedWithLeftovers { stdout, stderr, .. } => program_outcome(
-            false,
-            "output drain overrun — a leftover process held the pipes".to_string(),
-            &stdout,
-            &stderr,
-        ),
         ShellRunResult::MemoryExceeded {
             stdout,
             stderr,
             used,
             limit,
             ..
-        } => program_outcome(false, mem::exceeded_failure(used, limit), &stdout, &stderr),
-        ShellRunResult::SpawnFailed(e) => {
-            program_outcome(false, format!("failed to start: {e}"), &[], &[])
-        }
+        } => ProgramOutcome {
+            stop: Some(Stop::Memory),
+            ..program_outcome(false, mem::exceeded_failure(used, limit), &stdout, &stderr)
+        },
+        // A program the machine would not start is the machine's verdict, not the
+        // program's: it never ran, so it is a stop rather than a failure of what it does.
+        ShellRunResult::SpawnFailed(e) => ProgramOutcome {
+            stop: Some(Stop::Spawn),
+            ..program_outcome(false, format!("failed to start: {e}"), &[], &[])
+        },
     }
 }
 
@@ -2116,8 +2329,9 @@ pub(crate) async fn run_program_outcome_within(
 /// Returns the run's combined output, annotated the way the shell annotates a
 /// failure: the `[exit status: …]` note is appended as its own paragraph for
 /// anything but a clean exit. `Err` is a run that could not complete — spawn
-/// failure, timeout, drain overrun or the memory ceiling — never a non-zero
-/// exit, so a script's own failure stays the script's output.
+/// failure, timeout or the memory ceiling — never a non-zero exit, and never a
+/// leftover the product ended after the run's own process had exited: a script's own
+/// failure stays the script's output.
 ///
 /// `spill_in` is the directory the run's complete-output file goes in
 /// ([`CompleteOutput`]); the captured streams stay the answer if no file could be
@@ -2149,7 +2363,7 @@ pub(crate) async fn run_internal_program_with_timeout(
 ) -> anyhow::Result<String> {
     annotate_run(
         run_bounded(
-            build_internal_program_command(program, args, cwd),
+            internal_program_command(cwd, program, args, &[]),
             RunOwner::Agent,
             None,
         )
@@ -2163,6 +2377,10 @@ pub(crate) async fn run_internal_program_with_timeout(
 /// the caller's answer. `spill` keeps a run that outgrows the inline budget in
 /// its file — applied to the output alone, so the `[exit status: …]` note still
 /// follows a spilled result the way it follows an inline one.
+///
+/// A run whose own process exited is a finished run, so it is answered with its output
+/// and the note its own status earns — including one a leftover kept our capture pipe
+/// open past the drain bound: that is our bookkeeping, not the caller's failure.
 fn annotate_run(
     run: ShellRunResult,
     label: &str,
@@ -2174,17 +2392,29 @@ fn annotate_run(
             stderr,
             status,
             ..
+        }
+        | ShellRunResult::ExitedWithLeftovers {
+            stdout,
+            stderr,
+            status,
+            ..
+        }
+        | ShellRunResult::EndedWithLeftovers {
+            stdout,
+            stderr,
+            status,
+            ..
         } => {
-            let code = status.code();
+            let verdict = exit_verdict(status);
             let output = decode_raw_streams(&stdout, &stderr);
             let output = match spill {
                 Some(spill) => spill.finish(output),
                 None => output,
             };
-            if code == Some(0) {
-                return Ok(output);
-            }
-            Ok(with_note(&output, &format_exit_status_note(code)))
+            Ok(match verdict.note() {
+                Some(note) => with_note(&output, &note),
+                None => output,
+            })
         }
         // The same error class as the shell tool's timeout (a run that could
         // not complete), but a typed one-liner carrying the output tail rather
@@ -2198,25 +2428,8 @@ fn annotate_run(
             elapsed,
             ..
         } => Err(anyhow::anyhow!(
-            "timeout: {label} did not finish within {DEFAULT_SHELL_TIMEOUT_SECS}s and was killed\n{}",
-            program_error_tail(elapsed, &stdout, &stderr),
-        )),
-        // The same impossibility as `run_program_outcome`: a direct run is
-        // always ended, never kept — both outcomes are reported alike here.
-        ShellRunResult::ExitedWithLeftovers {
-            stdout,
-            stderr,
-            elapsed,
-            ..
-        }
-        | ShellRunResult::EndedWithLeftovers {
-            stdout,
-            stderr,
-            elapsed,
-        } => Err(anyhow::anyhow!(
-            "timeout: {label} exited but a leftover process kept its output pipes open \
-             past the drain limit — hint: keep any process the script launches inside its \
-             own lifetime\n{}",
+            "{}\n{}",
+            timeout_sentence(label, DEFAULT_SHELL_TIMEOUT),
             program_error_tail(elapsed, &stdout, &stderr),
         )),
         ShellRunResult::MemoryExceeded {
@@ -2676,7 +2889,7 @@ impl ShellTool {
         // Allow agent to override the default timeout via `timeout_secs`.
         // Capped at MAX_SHELL_TIMEOUT_SECS to prevent absurdly long runs.
         let timeout_secs = super::get_opt_u64(&args, "timeout_secs")?
-            .map_or(DEFAULT_SHELL_TIMEOUT_SECS, |s| {
+            .map_or(DEFAULT_SHELL_TIMEOUT.as_secs(), |s| {
                 s.min(MAX_SHELL_TIMEOUT_SECS)
             });
         let timeout = Duration::from_secs(timeout_secs);
@@ -2743,7 +2956,7 @@ impl ShellTool {
             let mut cmd = build_shell_command(&exec_str, ws.as_path());
             run_command_with_timeout(
                 &mut cmd,
-                timeout,
+                Some(timeout),
                 drain_limit,
                 mem::default_limit(),
                 RunOwner::Agent,
@@ -2840,7 +3053,7 @@ impl ShellTool {
                 let mut original = build_shell_command(base.as_ref(), ws.as_path());
                 run_command_with_timeout(
                     &mut original,
-                    timeout,
+                    Some(timeout),
                     drain_limit,
                     mem::default_limit(),
                     RunOwner::Agent,
@@ -2933,6 +3146,12 @@ impl ShellTool {
                 status,
                 elapsed,
                 ..
+            }
+            | ShellRunResult::EndedWithLeftovers {
+                stdout,
+                stderr,
+                status,
+                elapsed,
             } => {
                 let stdout = decode_and_strip_ansi(&stdout);
                 let stderr = decode_and_strip_ansi(&stderr);
@@ -2996,13 +3215,6 @@ impl ShellTool {
                 };
                 Ok((combined, exit_code))
             }
-            // A run whose tree was ended because a leftover held its output pipes
-            // past the drain limit must never be folded into a finished call.
-            ShellRunResult::EndedWithLeftovers { elapsed, .. } => anyhow::bail!(
-                "Shell command exited but a leftover process held its output pipes open \
-                 past the drain limit; the run's tree was ended (elapsed: {:.1}s)",
-                elapsed.as_secs_f64()
-            ),
             ShellRunResult::TimedOut {
                 stdout,
                 stderr,
@@ -3092,15 +3304,16 @@ impl ShellTool {
                 }
                 | ShellRunResult::ExitedWithLeftovers {
                     elapsed, status, ..
+                }
+                | ShellRunResult::EndedWithLeftovers {
+                    elapsed, status, ..
                 },
             ) => (Some(crate::util::millis_i64(*elapsed)), status.code()),
-            // A stopped run and one whose tree was ended for a leftover
-            // ([`LeftoverPolicy::Program`], never a tool call's own result) report a
-            // clock and no exit status.
+            // A stopped run reports a clock and no exit status: the program never
+            // produced one.
             Some(
                 ShellRunResult::TimedOut { elapsed, .. }
-                | ShellRunResult::MemoryExceeded { elapsed, .. }
-                | ShellRunResult::EndedWithLeftovers { elapsed, .. },
+                | ShellRunResult::MemoryExceeded { elapsed, .. },
             ) => (Some(crate::util::millis_i64(*elapsed)), None),
             // A spawn failure has an attempt behind it but no clock to read: the
             // duration is the placeholder zero, and the absent exit status is
@@ -6240,13 +6453,47 @@ mod tests {
             Duration::from_secs(1),
         )
         .await;
-        assert!(out.timed_out, "the stop must be visible to the automation");
+        assert!(
+            out.timed_out(),
+            "the stop must be visible to the automation"
+        );
         assert!(!out.success);
         assert_eq!(out.detail, "timed out after 1s");
         assert!(
             out.output.contains("started"),
             "partial output is still carried: {}",
             out.output
+        );
+    }
+
+    /// A stream longer than the head holds keeps its end: a run's verdict is written
+    /// last, so the one thing an unbounded run may not lose to its own progress is
+    /// where it says how it ended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_flooded_stream_keeps_the_end_it_ended_with() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = crate::workspace::test_ws(tmp.path());
+
+        let out = run_program_outcome(
+            ws.as_path(),
+            Path::new("/bin/sh"),
+            &sh_args("head -c 1048576 /dev/zero | tr '\\0' x; echo; echo the verdict"),
+        )
+        .await;
+        assert!(
+            out.output.len() > SHELL_PIPE_READ_CAP,
+            "the head is kept and the end follows it: {}",
+            out.output.len()
+        );
+        assert!(
+            out.output.trim_end().ends_with("the verdict"),
+            "the last line is what the head had to drop"
+        );
+        assert!(
+            out.output.contains(TRUNCATED_MIDDLE.trim()),
+            "the gap is marked: {}",
+            &out.output[out.output.len() - 200..]
         );
     }
 
@@ -6536,7 +6783,7 @@ mod tests {
         cmd.arg("-c").arg("sleep 10");
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             Duration::from_secs(10),
             mem::default_limit(),
             RunOwner::Agent,
@@ -6573,7 +6820,7 @@ mod tests {
         cmd.arg("-c").arg("echo started; sleep 60");
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
             Duration::from_secs(10),
             mem::default_limit(),
             RunOwner::Agent,
@@ -6612,7 +6859,7 @@ mod tests {
         let mut cmd = build_shell_command("echo before-timeout; sleep 30", tmp.path());
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             Duration::from_secs(10),
             mem::default_limit(),
             RunOwner::Agent,
@@ -6717,7 +6964,7 @@ mod tests {
 
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(30),
+            Some(Duration::from_secs(30)),
             Duration::from_secs(5),
             Some(CEILING),
             RunOwner::Agent,
@@ -6774,7 +7021,7 @@ mod tests {
 
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
             Duration::from_secs(5),
             mem::default_limit(),
             RunOwner::Agent,
@@ -6804,7 +7051,7 @@ mod tests {
             Duration::from_secs(2),
             run_command_with_timeout(
                 &mut cmd,
-                Duration::from_secs(30),
+                Some(Duration::from_secs(30)),
                 Duration::from_secs(5),
                 mem::default_limit(),
                 RunOwner::Agent,
@@ -6840,7 +7087,7 @@ mod tests {
 
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(30),
+            Some(Duration::from_secs(30)),
             Duration::from_millis(150),
             mem::default_limit(),
             RunOwner::Agent,
@@ -6936,7 +7183,7 @@ mod tests {
         let mut cmd = build_shell_command("echo done; sleep 0.2 &", dir.path());
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(30),
+            Some(Duration::from_secs(30)),
             Duration::from_secs(5),
             mem::default_limit(),
             RunOwner::Agent,
@@ -6963,7 +7210,7 @@ mod tests {
         let mut cmd = build_shell_command("echo out; sleep 5 >/dev/null &", dir.path());
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(30),
+            Some(Duration::from_secs(30)),
             Duration::from_millis(150),
             mem::default_limit(),
             RunOwner::Agent,
@@ -6982,8 +7229,9 @@ mod tests {
     }
 
     /// The [`LeftoverPolicy::Program`] path — the program paths' — ends the run's tree
-    /// at the drain bound: the leftover holder is killed, and the result is the
-    /// failure those callers report ([`ShellRunResult::EndedWithLeftovers`]).
+    /// at the drain bound: the leftover holder is killed, and the result carries both
+    /// the output collected up to it and the exit status the run had already produced
+    /// ([`ShellRunResult::EndedWithLeftovers`]).
     #[cfg(unix)]
     #[tokio::test]
     async fn the_end_policy_kills_the_leftover_holder() {
@@ -6995,7 +7243,7 @@ mod tests {
 
         let result = run_command_with_timeout(
             &mut cmd,
-            Duration::from_secs(30),
+            Some(Duration::from_secs(30)),
             Duration::from_millis(150),
             mem::default_limit(),
             RunOwner::Agent,
@@ -7003,18 +7251,64 @@ mod tests {
             None,
         )
         .await;
-        let ShellRunResult::EndedWithLeftovers { stdout, .. } = result else {
+        let ShellRunResult::EndedWithLeftovers { stdout, status, .. } = result else {
             panic!("expected EndedWithLeftovers, got {result:?}");
         };
         assert!(
+            status.success(),
+            "the command's own exit status is the run's verdict: {status:?}"
+        );
+        assert!(
             String::from_utf8_lossy(&stdout).contains("before-end"),
-            "the output collected up to the bound is the failure's to report: {stdout:?}"
+            "the output collected up to the bound is the run's to report: {stdout:?}"
         );
 
         let pid_content = std::fs::read_to_string(&pid_path)
             .expect("grandchild PID file must exist — grandchild was launched");
         let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
         wait_for_death(pid).await;
+    }
+
+    /// A finished run whose leftover held its output pipes is judged by its own exit
+    /// status in both shapers of the shared machinery: the program outcome the
+    /// automations, the renderer and the browser probe read, and the annotated answer a
+    /// custom tool's script and the document kit read. A clean run is not retroactively
+    /// a failure, and a non-zero one keeps its own verdict.
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_run_is_judged_by_its_own_status_whatever_held_the_pipes() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let drained = |code: i32| ShellRunResult::EndedWithLeftovers {
+            stdout: b"the report\n".to_vec(),
+            stderr: Vec::new(),
+            status: std::process::ExitStatus::from_raw(code << 8),
+            elapsed: Duration::from_secs(1),
+        };
+
+        let clean = program_outcome_from(drained(0), None);
+        assert!(
+            clean.success,
+            "a run whose own process exited clean is not a failure"
+        );
+        assert_eq!(
+            clean.stop, None,
+            "the product stopped nothing: the run exited on its own"
+        );
+        assert_eq!(clean.output, "the report\n");
+
+        let failed = program_outcome_from(drained(3), None);
+        assert!(!failed.success);
+        assert_eq!(failed.detail, "exit status 3");
+        assert_eq!(failed.stop, None);
+
+        assert_eq!(
+            annotate_run(drained(0), "the test program", None).unwrap(),
+            "the report\n"
+        );
+        let noted = annotate_run(drained(3), "the test program", None).unwrap();
+        assert!(noted.starts_with("the report"), "got: {noted}");
+        assert!(noted.contains("[exit status: 3]"), "got: {noted}");
     }
 
     /// A command that exited 0 while a leftover held its output is a plain SUCCESS

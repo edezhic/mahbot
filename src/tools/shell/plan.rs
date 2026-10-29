@@ -1744,8 +1744,8 @@ impl CaptureBudgets {
 /// A leftover descendant still holding a capture pipe is stopped with the run's tree
 /// ([`super::stop_leftover`]): the last member's own status is the answer, and only a
 /// stop that did not take reports it. A plan is only ever built for an agent's
-/// rewritten line, so nothing here reports a run as a failure for a leftover the way
-/// the program paths do ([`super::LeftoverPolicy::Program`]).
+/// rewritten line, so it takes the agent's shaping — a plan run is never reported for a
+/// leftover the run's own status already settled ([`super::LeftoverPolicy`]).
 pub(super) async fn run(
     plan: &Plan,
     timeout: Duration,
@@ -1764,7 +1764,7 @@ pub(super) async fn run(
     let budgets = CaptureBudgets::new();
     let mut readers = Readers::default();
     // The run's bounds, watched across every group: one deadline, one cadence.
-    let mut watchdog = Watchdog::new(timeout);
+    let mut watchdog = Watchdog::new(Some(timeout));
     // cmd's errorlevel: the last executed group's status decides whether the next
     // one runs, and a skipped group leaves it in place.
     let mut previous: Option<i32> = None;
@@ -2235,6 +2235,8 @@ async fn collect_stopped(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::{SHELL_PIPE_TAIL_CAP, TRUNCATED_MIDDLE};
     use super::*;
     use std::ops::Range;
 
@@ -3504,7 +3506,11 @@ mod tests {
         let ShellRunResult::Completed { stdout, stderr, .. } = result else {
             panic!("a completed run");
         };
-        assert_eq!(stdout.len(), SHELL_PIPE_READ_CAP);
+        assert_eq!(
+            stdout.len(),
+            SHELL_PIPE_READ_CAP + SHELL_PIPE_TAIL_CAP + TRUNCATED_MIDDLE.len(),
+            "the head is the cap and the rest is kept as the stream's end"
+        );
         assert_eq!(String::from_utf8_lossy(&stderr), "marker\n");
     }
 

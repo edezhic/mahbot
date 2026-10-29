@@ -298,10 +298,10 @@ use crate::tools::path::PathAccess;
 use crate::tools::{
     AddAutomationTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ArchiveTool,
     ChromeTool, ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool,
-    GetTicketTool, ImageGenTool, ListAutomationsTool, ListTicketsTool, MahbotConfigTool,
-    MahbotDebugTool, RasterizeTool, ReadTool, RemoveAutomationTool, SearchArchivedTicketsTool,
-    SearchTool, SendTool, ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoEditTool,
-    VideoGenTool, WebSearchBackend, WebSearchTool, WorkspaceTool,
+    GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
+    MahbotConfigTool, MahbotDebugTool, RasterizeTool, ReadTool, RemoveAutomationTool,
+    SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool, SleepTool,
+    UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool, WorkspaceTool,
 };
 
 /// Tools in the admin Assistant's set that a custom role is never offered or
@@ -406,6 +406,9 @@ impl Role {
             // own call keeps its outputs inside that agent's workspace, and
             // its input paths follow the caller's access.
             Box::new(DocumentTool::new(file_access)),
+            // Likewise, the video action serves every account: the composition
+            // is read and the output written under the caller's own access.
+            Box::new(HyperframesTool::new(file_access)),
         ];
         // A guest's Assistant has no shell, so moving a stale file out of the
         // way needs a tool of its own; the admin's has a shell and gets none.

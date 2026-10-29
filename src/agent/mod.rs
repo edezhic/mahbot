@@ -281,27 +281,45 @@ fn extract_media_from_outcomes(
 ) -> Vec<(&'static str, String)> {
     let mut paths = Vec::new();
     for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
-        if outcome.success
-            && let Some(marker_prefix) = find_tool(tools, &call.name).and_then(Tool::media_marker)
-        {
-            // Derive the regex kind from the marker prefix, e.g. "[IMAGE:" -> "IMAGE".
-            // This relies on the documented invariant that media_marker() returns "[KIND:".
-            let marker = &marker_prefix[1..marker_prefix.len() - 1];
-            let mut matched = false;
-            for caps in MEDIA_MARKER_RE.captures_iter(&outcome.output) {
-                let (captured_kind, path) = parse_media_marker(&caps);
-                if captured_kind.token() == marker {
-                    matched = true;
-                    paths.push((marker_prefix, path.to_string()));
-                }
+        if !outcome.success {
+            continue;
+        }
+        let Some(tool) = find_tool(tools, &call.name) else {
+            continue;
+        };
+        let Some(marker_prefix) = tool.media_marker() else {
+            continue;
+        };
+        // Derive the regex kind from the marker prefix, e.g. "[IMAGE:" -> "IMAGE".
+        // This relies on the documented invariant that media_marker() returns "[KIND:".
+        let marker = &marker_prefix[1..marker_prefix.len() - 1];
+        let mut matched = false;
+        for caps in MEDIA_MARKER_RE.captures_iter(&outcome.output) {
+            let (captured_kind, path) = parse_media_marker(&caps);
+            if captured_kind.token() == marker {
+                matched = true;
+                paths.push((marker_prefix, path.to_string()));
             }
-            if !matched {
-                tracing::warn!(
-                    media_tool = %call.name,
-                    marker = %marker_prefix,
-                    "Could not parse media path from tool output — skipping media marker",
-                );
-            }
+        }
+        if matched {
+            continue;
+        }
+        // A tool whose every answer carries a marker ([`Tool::media_marker_always`])
+        // and did not: that is a defect to see. A tool that also answers with text
+        // alone (the renderer's documents and checks) is normal here.
+        let message = "a successful media call carried no media marker";
+        if tool.media_marker_always() {
+            tracing::warn!(
+                media_tool = %call.name,
+                marker = %marker_prefix,
+                "{message}",
+            );
+        } else {
+            tracing::debug!(
+                media_tool = %call.name,
+                marker = %marker_prefix,
+                "{message}",
+            );
         }
     }
     paths

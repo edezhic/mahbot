@@ -30,6 +30,12 @@ const BUN_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "macos")]
 const BUN_SYSCTL_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// The flags every product invocation of the managed bun carries before the
+/// script: no dependency install (a missing package must fail rather than be
+/// fetched into whatever directory the run was given) and no `.env` file (bun must
+/// not load the environment of that directory either).
+pub(crate) const SCRIPT_GUARDS: [&str; 2] = ["--no-install", "--no-env-file"];
+
 /// The platform-appropriate bun binary name.
 const fn bun_file_name() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -315,6 +321,7 @@ pub async fn run_bun_management() {
             crate::util::managed_bin::latest_release(BUN_RELEASE_REPO, BUN_RELEASE_TIMEOUT).await
         },
         async |release| install_latest(release).await,
+        crate::util::managed_bin::WhenMissing::Install,
     )
     .await;
 }

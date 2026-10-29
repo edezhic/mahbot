@@ -491,12 +491,14 @@ fn managed_runtime() -> Result<PathBuf> {
 /// token ("timeout:", "io:", "terminated:"), as it does for the custom tool:
 /// the model reads one class and a subject, not two classes for one failure.
 async fn run_kit(dir: &Path, runtime: &Path, request_path: &Path) -> Result<String> {
-    let args = vec![
-        "--no-install".to_string(),
-        "--no-env-file".to_string(),
-        dir.join(KIT_SCRIPT_NAME).to_string_lossy().into_owned(),
-        request_path.to_string_lossy().into_owned(),
-    ];
+    let args: Vec<String> = crate::tools::bun::SCRIPT_GUARDS
+        .iter()
+        .map(|flag| (*flag).to_string())
+        .chain([
+            dir.join(KIT_SCRIPT_NAME).to_string_lossy().into_owned(),
+            request_path.to_string_lossy().into_owned(),
+        ])
+        .collect();
     // The kit is the product's own code and needs none of the owner's
     // environment, which is what this entry point is for.
     crate::tools::shell::run_internal_program_with_timeout(dir, runtime, &args, "the document kit")

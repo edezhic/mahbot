@@ -1,0 +1,3 @@
+Turn an HTML composition into a video file on this machine: a page whose timeline is animated with GSAP or CSS is seeked frame by frame in a headless browser and encoded to MP4, WebM, MOV/ProRes or GIF. Local, no cloud, no per-render cost, and a render has no timeout of its own.
+
+`action: "instructions"` returns the full field guide and `action: "reference"` one deep topic — `authoring`, `rendering` or `troubleshooting`. `inspect` checks a composition without rendering it, and `render` writes the file you name — never overwriting one that exists — and answers with a `[VIDEO:path]` marker that sends the video to the user.

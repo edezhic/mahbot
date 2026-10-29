@@ -470,6 +470,14 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::ffmpeg::install_on_start().await;
     });
 
+    // HyperFrames (`mahbot::hyperframes`): the renderer is installed from the npm
+    // registry on its first use and costs nothing until then; a copy already
+    // installed is brought to the newest release at start. A failure is recorded,
+    // retried on the next start, and never removes a copy that already works.
+    spawn_cancellable(&mut tasks, &shutdown_token, "hyperframes-refresh", async {
+        mahbot::hyperframes::refresh_on_start().await;
+    });
+
     // macOS-only voice-assistant pipeline: runs in the background, managing
     // wake-word detection, command recording, transcription, and routing.
     #[cfg(target_os = "macos")]

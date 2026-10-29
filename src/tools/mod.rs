@@ -20,6 +20,7 @@ pub(crate) mod delegation;
 pub(crate) mod document;
 pub(crate) mod edit;
 pub(crate) mod grants;
+pub(crate) mod hyperframes;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
 pub(crate) mod listing;
@@ -197,6 +198,7 @@ pub(crate) use computer::ComputerTool;
 pub(crate) use custom::CustomTool;
 pub(crate) use document::DocumentTool;
 pub(crate) use edit::EditTool;
+pub(crate) use hyperframes::HyperframesTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use mahbot_config::MahbotConfigTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
@@ -1735,6 +1737,10 @@ pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'
         .map(Box::as_ref)
 }
 
+/// The workspace's own output subdirectory — the fallback for every caller but a
+/// command-line call, which names its destination.
+pub(crate) const GENERATED_DIR: &str = "generated";
+
 /// The directory a produced file must land in: the destination a
 /// command-line caller chose ([`crate::agent::tool_output_dir`]), and the
 /// workspace's own `fallback` directory for every other caller.
@@ -1793,7 +1799,7 @@ pub(crate) async fn resolve_local_media_path(
     if crate::agent::tool_command_line() {
         return Ok(canonical);
     }
-    let roots: Vec<PathBuf> = ["uploads", "generated"]
+    let roots: Vec<PathBuf> = ["uploads", GENERATED_DIR]
         .iter()
         .map(|d| ws.as_path().join(d))
         .filter_map(|r| std::fs::canonicalize(&r).ok())
@@ -1838,7 +1844,7 @@ async fn save_generated_file(
     prefix: &str,
     ext: &str,
 ) -> anyhow::Result<PathBuf> {
-    let generated_dir = output_directory(ws, "generated");
+    let generated_dir = output_directory(ws, GENERATED_DIR);
     tokio::fs::create_dir_all(&generated_dir)
         .await
         .with_context(|| {
@@ -2292,7 +2298,7 @@ mod tests {
     // ── media_marker coverage ────────────────────────────────────────
     fn all_media_tools_implement_media_marker() {
         // Each media-generation tool must return Some from media_marker()
-        let tools: [(&str, Box<dyn Tool>); 5] = [
+        let tools: [(&str, Box<dyn Tool>); 6] = [
             ("ImageGenTool", Box::new(ImageGenTool)),
             ("VideoGenTool", Box::new(VideoGenTool)),
             ("VideoEditTool", Box::new(VideoEditTool)),
@@ -2303,6 +2309,10 @@ mod tests {
             (
                 "RasterizeTool",
                 Box::new(RasterizeTool::new(path::PathAccess::Workspace)),
+            ),
+            (
+                "HyperframesTool",
+                Box::new(HyperframesTool::new(path::PathAccess::Workspace)),
             ),
         ];
         for (name, tool) in &tools {

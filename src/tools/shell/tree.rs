@@ -4,7 +4,8 @@
 //! point where its output collection hit the drain bound because a leftover held a
 //! pipe (an agent's command then goes through [`super::stop_leftover`], which ends
 //! the tree and judges the stop by the channels closing; a program run ends the tree
-//! and reports [`super::ShellRunResult::EndedWithLeftovers`]) or the run being torn
+//! and reports the exit status it had already produced
+//! ([`super::ShellRunResult::EndedWithLeftovers`])) or the run being torn
 //! down (its tool call dropped, its agent destroyed) — takes the whole tree on both
 //! platforms. An abrupt death of the service takes it too, but only where something
 //! holds the tree on the run's behalf: a background session's watcher or job handle
@@ -56,9 +57,10 @@
 //! [`RunOwner`] draws the boundary and it is the *only* thing the two owners
 //! differ in. [`RunOwner::Agent`] — the shell tool in both modes, which is also
 //! the path the pipeline's project commands take, the `custom` tool's script
-//! run, and the document kit (the product's own work, through
-//! [`super::run_internal_program_with_timeout`], which gives it the reduced
-//! internal environment) — gets the job. [`RunOwner::Service`] — a
+//! run, the document kit (through [`super::run_internal_program_with_timeout`])
+//! and the renderer tool's package install, browser probe and renders (through
+//! [`super::run_internal_program_outcome`]) — the product's own work, which also
+//! gets the reduced internal environment — gets the job. [`RunOwner::Service`] — a
 //! user's automation program — does not: it is not an agent's work and keeps exactly
 //! the treatment it had before job containment existed. Everything *else* the
 //! service launches for its own operation — the browser, the replacement
@@ -116,7 +118,7 @@
 //! (`tools::chrome_daemon::spawn_chrome_detached`); every agent command through the
 //! shell builders (`tools::shell::program_command_with`, the shared start of the
 //! direct-program builders `tools::shell::build_program_command` and
-//! `tools::shell::build_internal_program_command`, and
+//! `tools::shell::internal_program_command`, and
 //! `tools::shell::build_shell_command` through the shared start above — the shell
 //! tool, the diagnostics runner, the `custom` tool's script, a user's automation program,
 //! and every step of a rewritten line's plan, [`super::plan`] included) with the grep

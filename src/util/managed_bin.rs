@@ -338,6 +338,33 @@ fn swap_binary_in_place(fresh: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
+/// Place a tree that was built elsewhere at `dest`: a tree already there is
+/// swapped aside ([`rename_aside_swap`]), else the staged tree is renamed into
+/// place. One rule for every tree the product builds in scratch space — the ffmpeg
+/// payload, the renderer's package and its browser.
+///
+/// Failure messages carry no path, only the failing step and its io kind.
+pub(crate) fn place_staged_tree(staged: &Path, dest: &Path) -> Result<(), String> {
+    if dest.exists() {
+        return rename_aside_swap(staged, dest);
+    }
+    fs::rename(staged, dest).map_err(|e| {
+        format!(
+            "the staged copy could not be moved into place ({})",
+            e.kind()
+        )
+    })
+}
+
+/// The name a swap sets the replaced tree aside under: the destination's own whole name plus
+/// `.old` — not its extension replaced, which a name carrying a dot would lose, and a version
+/// directory set aside still names the same build.
+fn aside_of(dest: &Path) -> PathBuf {
+    let mut aside = dest.as_os_str().to_os_string();
+    aside.push(".old");
+    PathBuf::from(aside)
+}
+
 /// The rename-aside swap: move `dest` aside, rename the prepared `tmp` copy into
 /// place, and restore the aside if the final rename fails. On Windows it is what
 /// makes replacing a running exe possible at all — one cannot be overwritten or
@@ -346,13 +373,14 @@ fn swap_binary_in_place(fresh: &Path, dest: &Path) -> Result<(), String> {
 /// one did. `dest` must exist; the swap starts by moving it aside.
 ///
 /// Aside removal is best-effort — while the old copy is still in use it cannot be
-/// removed; the next successful swap clears it. Platform-neutral plain
+/// removed; the next swap clears it, and the tree it names also matches the sweeps a
+/// caller runs over its own directory (`<dest>.old`). Platform-neutral plain
 /// `fs::rename`/`remove_file`/`remove_dir_all`, so it is unit-testable on every OS.
 ///
 /// Failure messages carry no path (the location may be one the owner's own
 /// package manager keeps), only the failing step and its io kind.
-pub(crate) fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
-    let aside = dest.with_extension("old");
+fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
+    let aside = aside_of(dest);
     remove_any(&aside);
     fs::rename(dest, &aside)
         .map_err(|e| format!("the installed copy could not be moved aside ({})", e.kind()))?;
@@ -377,8 +405,9 @@ pub(crate) fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// Remove whatever sits at `path`, best effort: a file a failed swap left beside its
-/// destination, or the directory an ffmpeg install swaps out.
-fn remove_any(path: &Path) {
+/// destination, the directory an ffmpeg install swaps out, or any tree a sweep of the
+/// product's own directories finds.
+pub(crate) fn remove_any(path: &Path) {
     if path.is_dir() {
         let _ = fs::remove_dir_all(path);
     } else {
@@ -418,16 +447,26 @@ pub(crate) fn place_extracted(fresh: &Path, dest: &Path) -> Result<(), String> {
 /// (and any download it leads to) never competes with the boot.
 const REFRESH_DELAY: Duration = Duration::from_mins(5);
 
+/// What [`install_on_start`] does with a tool whose copy is absent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WhenMissing {
+    /// Install it: for the product's own components, the copy is what must exist.
+    Install,
+    /// Leave the machine alone: a tool that was never used costs nothing until it is.
+    Skip,
+}
+
 /// Bring one of the product's own tools to the newest release. `present` reports
 /// whether the tool's own directory holds an executable copy — it decides
 /// whether anything is compared at all and, after a failure, whether the host
-/// was left with a working copy. A copy that is absent (or not executable) has
-/// nothing to probe or compare, so it is installed straight away; a copy in
-/// place is left untouched until [`REFRESH_DELAY`] has passed and only then
-/// checked. Each step is a closure this function calls, so none of them can run
-/// before that delay: `installed_version` answers with the copy's version (`None`
-/// when it cannot run), `latest` looks the newest release up, and `install` runs
-/// only when the two differ — a matching version is a [`tracing::debug`] line and
+/// was left with a working copy. A copy that is absent (or not executable) is
+/// installed straight away, or left alone when `when_missing` says the tool is one
+/// whose absence is normal ([`WhenMissing`]); a copy in place is left untouched
+/// until [`REFRESH_DELAY`] has passed and only then checked. Each step is a
+/// closure this function calls, so none of them can run before that delay:
+/// `installed_version` answers with the copy's version (`None` when it cannot
+/// run), `latest` looks the newest release up, and `install` runs only when the
+/// two differ — a matching version is a [`tracing::debug`] line and
 /// no download at all. `install` receives the release the comparison already
 /// resolved (`None` when there was nothing to compare, so it resolves one
 /// itself), which is what keeps the release tag from being fetched twice on the
@@ -450,8 +489,13 @@ pub(crate) async fn install_on_start(
     installed_version: impl AsyncFnOnce() -> Option<semver::Version>,
     latest: impl AsyncFnOnce() -> Result<Release, String>,
     install: impl AsyncFnOnce(Option<Release>) -> Result<PathBuf, String>,
+    when_missing: WhenMissing,
 ) {
     let missing = !present();
+    if missing && when_missing == WhenMissing::Skip {
+        tracing::debug!("{tool} was never used — nothing to refresh");
+        return;
+    }
     let mut release = None;
     if !missing {
         // Both facts a comparison needs are kept off the boot path: the probe
@@ -591,6 +635,80 @@ pub(crate) fn extract_named_files_tar_gz(
         }
     }
     collected(required, extracted)
+}
+
+/// Extract every entry of a zip release archive under `dir`, keeping each entry's own
+/// place in the archive's tree — the shape a whole directory of files (a browser
+/// build, a tree of binaries) needs, where [`extract_named_files_zip`] collects a few
+/// names.
+///
+/// Only entries that stay inside `dir` are written: an entry whose path is absolute,
+/// rooted or carries a `..` component is refused rather than followed, so an archive
+/// can never place a file outside the tree it is unpacked into.
+pub(crate) fn extract_tree_zip(archive: &Path, dir: &Path) -> Result<(), String> {
+    let file = fs::File::open(archive)
+        .map_err(|e| format!("the release archive could not be opened ({})", e.kind()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| format!("the release archive could not be read ({})", zip_reason(&e)))?;
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index).map_err(|e| {
+            format!(
+                "a release archive entry could not be read ({})",
+                zip_reason(&e)
+            )
+        })?;
+        let Some(relative) = safe_entry_path(entry.name()) else {
+            return Err("the release archive holds a path outside its own tree".to_string());
+        };
+        let out = dir.join(relative);
+        if entry.is_dir() {
+            create_dir(&out)?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            create_dir(parent)?;
+        }
+        let mut out_file = fs::File::create(&out).map_err(|e| {
+            format!(
+                "a release archive entry could not be written ({})",
+                e.kind()
+            )
+        })?;
+        std::io::copy(&mut entry, &mut out_file).map_err(|e| {
+            format!(
+                "a release archive entry could not be extracted ({})",
+                e.kind()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// One directory of the extracted tree.
+fn create_dir(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|e| {
+        format!(
+            "a release archive directory could not be created ({})",
+            e.kind()
+        )
+    })
+}
+
+/// The path an archive entry is written to under the extraction root, `None` when
+/// the entry names anything outside it: an absolute path, a drive or root, or a
+/// `..` component anywhere in it.
+fn safe_entry_path(name: &str) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut path = PathBuf::new();
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!path.as_os_str().is_empty()).then_some(path)
 }
 
 /// Extract every name in `required`, and every name in `optional` that the archive
@@ -885,6 +1003,24 @@ const SYSTEM_BIN_DIR: &str = "/usr/local/bin";
 mod tests {
     use super::*;
     use std::io::Write;
+    #[test]
+    fn safe_entry_path_rejects_anything_outside_the_extraction_root() {
+        assert_eq!(
+            safe_entry_path("chrome-headless-shell-linux64/chrome-headless-shell"),
+            Some(PathBuf::from("chrome-headless-shell-linux64").join("chrome-headless-shell"))
+        );
+        assert_eq!(
+            safe_entry_path("./a//b"),
+            Some(PathBuf::from("a").join("b"))
+        );
+        assert_eq!(safe_entry_path("../escape"), None);
+        assert_eq!(safe_entry_path("a/../../escape"), None);
+        assert_eq!(safe_entry_path("/etc/passwd"), None);
+        assert_eq!(safe_entry_path("."), None);
+        #[cfg(windows)]
+        assert_eq!(safe_entry_path("C:\\Windows\\system32\\x.dll"), None);
+    }
+
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -1060,7 +1196,7 @@ mod tests {
         rename_aside_swap(&tmp, &dest).expect("swap");
         assert_eq!(fs::read(&dest).expect("read dest"), b"new");
         // The aside and the prepared copy are both gone after a clean swap.
-        assert!(!dest.with_extension("old").exists());
+        assert!(!aside_of(&dest).exists());
         assert!(!tmp.exists());
     }
 
@@ -1075,7 +1211,7 @@ mod tests {
         assert!(rename_aside_swap(&tmp, &dest).is_err());
         // The previous binary was restored at its original location.
         assert_eq!(fs::read(&dest).expect("read dest"), b"old");
-        assert!(!dest.with_extension("old").exists(), "aside was moved back");
+        assert!(!aside_of(&dest).exists(), "aside was moved back");
     }
 
     /// Build a tar.gz archive in `dir` with the given (path, contents) entries.

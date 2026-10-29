@@ -61,9 +61,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// The workspace's own output subdirectory — the fallback for every caller but a
-/// command-line call, which names its destination.
-const GENERATED_DIR: &str = "generated";
+use super::GENERATED_DIR;
 
 /// The marker every produced file reaches a caller through: `[FILE:<path>]`.
 pub(crate) const FILE_MARKER: &str = "[FILE:";

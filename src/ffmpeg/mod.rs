@@ -27,9 +27,9 @@
 //! cannot be decoded end the same way — so a failed decode is settled by asking the
 //! file again.
 
-// Each item of the three operations' surface carries `expect(dead_code)` rather than a
-// module-wide `allow`: `expect` turns the first caller outside this module into a
-// build error that must remove the annotation with it.
+// The items only this module's own operations use carry `expect(dead_code)` rather than a
+// module-wide `allow`: `expect` turns their first caller outside this module into a build
+// error that must remove the annotation with it.
 mod install;
 mod probe;
 
@@ -60,20 +60,18 @@ const PROBE_ENTRIES: &str = "format=duration:stream=codec_type,width,height,dura
                             :stream_disposition=attached_pic";
 
 /// The video facts the product needs about one file.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClipInfo {
     pub(crate) duration: Duration,
     /// The upright size of the first video stream — what a person watching the
     /// file sees, so a rotated phone clip reports its portrait size — or `None`
-    /// when the file carries no video stream at all.
+    /// when the file carries no video stream the probe could read extents from.
     pub(crate) dimensions: Option<(u32, u32)>,
     /// Whether the file carries an audio stream.
     pub(crate) has_audio: bool,
 }
 
 /// Why a video operation could not answer.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FfmpegError {
     /// The product's own half could not do it: its copy cannot be run (not
@@ -140,13 +138,19 @@ pub(crate) struct FrameOptions {
     pub(crate) max_frames: u32,
 }
 
+/// The product's own pair, installed on first use — the crate's one entry to the installer, so
+/// nothing outside this module names it. The reason names the failing step and carries no path;
+/// an operation turns it into its own [`FfmpegError::Unavailable`].
+pub(crate) async fn binaries() -> Result<Binaries, String> {
+    install::ensure_installed().await
+}
+
 /// Duration, upright dimensions and audio presence of one file.
 ///
 /// [`FfmpegError::Undecodable`] when the tools cannot read the file at all.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) async fn probe(path: &Path) -> Result<ClipInfo, FfmpegError> {
     bounded(PROBE_TIMEOUT, async {
-        let bin = binaries().await?;
+        let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
         probe_with(&bin.ffprobe, path).await
     })
     .await
@@ -174,7 +178,7 @@ pub(crate) async fn extract_frames(
     }
 
     bounded(FRAMES_TIMEOUT, async {
-        let bin = binaries().await?;
+        let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
         let dir = scratch()?;
         let args = frames_args(input, Some(dir.path()), &options);
         let output = run_tool(&bin.ffmpeg, &args, FRAMES_TIMEOUT).await?;
@@ -192,7 +196,7 @@ pub(crate) async fn extract_frames(
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) async fn extract_audio(input: &Path) -> Result<Audio, FfmpegError> {
     bounded(AUDIO_TIMEOUT, async {
-        let bin = binaries().await?;
+        let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
         let dir = scratch()?;
         let path = dir.path().join("audio.wav");
         let args = audio_args(input, Some(&path));
@@ -216,13 +220,6 @@ where
     tokio::time::timeout(bound, operation)
         .await
         .map_err(|_| FfmpegError::TimedOut)?
-}
-
-/// The product's own pair, installed if it is not there yet.
-async fn binaries() -> Result<Binaries, FfmpegError> {
-    install::ensure_installed()
-        .await
-        .map_err(FfmpegError::Unavailable)
 }
 
 /// `ffprobe`'s answer for one file, or [`FfmpegError::Undecodable`] when the file
@@ -545,7 +542,9 @@ mod tests {
         for tool in ["ffmpeg", "ffprobe"] {
             std::fs::copy(host.join(tool), bin.join(tool)).expect("copy the stand-in tool");
         }
-        let found = binaries().await.expect("the copy in place is used");
+        let found = install::ensure_installed()
+            .await
+            .expect("the copy in place is used");
         assert_eq!(found.ffmpeg, bin.join("ffmpeg"), "by path, not by origin");
         assert_eq!(found.ffprobe, bin.join("ffprobe"));
 

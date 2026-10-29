@@ -2624,6 +2624,7 @@ pub async fn run_chrome_use_management() {
             .await
         },
         async |release| install_chrome_use(release).await,
+        crate::util::managed_bin::WhenMissing::Install,
     )
     .await;
     // Only a working copy can be registered; with none, the install above already

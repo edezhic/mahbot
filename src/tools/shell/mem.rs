@@ -66,6 +66,10 @@ pub(super) fn gib(bytes: u64) -> String {
     format!("{whole}.{tenth} GiB")
 }
 
+/// The failure class a run the product ended carries, in front of the reason itself: what
+/// [`super::ProgramOutcome::stop_reason`] reads the reason out of.
+pub(super) const TERMINATED: &str = "terminated: ";
+
 /// The one-line memory failure every run shape reports, e.g.
 /// `terminated: exceeded memory limit (used ~15.4 GiB of 18.0 GiB)`. Spelled
 /// once so the tool's error block and a direct run's typed error cannot drift.
@@ -78,7 +82,7 @@ pub(super) fn gib(bytes: u64) -> String {
 pub(super) fn exceeded_failure(used: u64, limit: u64) -> String {
     let total = physical_memory().unwrap_or(limit);
     format!(
-        "terminated: exceeded memory limit (used ~{} of {})",
+        "{TERMINATED}exceeded memory limit (used ~{} of {})",
         gib(used),
         gib(total),
     )

@@ -79,6 +79,11 @@ pub(crate) mod reader_output;
 // release stream, never the owner's copy — and the three operations they serve:
 // probing, JPEG frames and 16 kHz mono WAV.
 pub mod ffmpeg;
+// HyperFrames, the HTML-composition renderer: installed from the npm registry by
+// the product's managed bun, run with its own browser and ffmpeg, and never
+// handed a wall-clock ceiling on a render. Public only so the binary can start
+// its boot task; everything else in it is crate-internal.
+pub mod hyperframes;
 
 // ── Providers and model I/O ──────────────────────────────────────────────
 // A standalone benchmark for OpenRouter models, run outside the product.
@@ -1616,6 +1621,15 @@ pub(crate) trait Tool: Send + Sync {
     /// The marker format is `[TYPE:path]` where `TYPE` is the uppercase media type.
     fn media_marker(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Whether every successful answer of this tool carries a media marker.
+    ///
+    /// `true` for a tool that exists to produce media. `false` for one that also
+    /// answers with text alone (the renderer returns documents and lint reports as
+    /// well as videos), so a marker-less answer is not a fault to report.
+    fn media_marker_always(&self) -> bool {
+        true
     }
 
     /// Format the media output marker `[TYPE:path]` for a generated file.

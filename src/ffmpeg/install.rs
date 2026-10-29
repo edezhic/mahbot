@@ -132,11 +132,11 @@ fn asset_name(tag: &str, os: &str, arch: &str) -> String {
 
 // ── The copy in use ─────────────────────────────────────────────────
 
-/// The pair in use.
+/// The pair in use, by role: the encoder and the prober.
 #[derive(Debug)]
-pub(super) struct Binaries {
-    pub(super) ffmpeg: PathBuf,
-    pub(super) ffprobe: PathBuf,
+pub(crate) struct Binaries {
+    pub(crate) ffmpeg: PathBuf,
+    pub(crate) ffprobe: PathBuf,
 }
 
 /// The directory the product's own copies live in: one subdirectory per tag,
@@ -440,7 +440,8 @@ async fn install(root: &Path, build: &Build) -> Result<(), String> {
     // One staging directory per attempt, on the same filesystem as its destination
     // so the final rename is a rename — the download directory above has already
     // made the root. The guard removes it on every failure the `?` below carries
-    // out, and has nothing to remove after a successful `place`.
+    // out, and has nothing to remove after a successful
+    // [`managed_bin::place_staged_tree`].
     let staging = tempfile::Builder::new()
         .prefix(".staging-")
         .tempdir_in(root)
@@ -456,7 +457,7 @@ async fn install(root: &Path, build: &Build) -> Result<(), String> {
             ));
         }
     }
-    place(staging.path(), &root.join(tag))?;
+    managed_bin::place_staged_tree(staging.path(), &root.join(tag))?;
     prune(root, tag);
     Ok(())
 }
@@ -536,18 +537,6 @@ async fn reports_upstream(bin: &Path, upstream: &Version) -> bool {
         return false;
     };
     output.success && banner_version(&output.stdout).as_ref() == Some(upstream)
-}
-
-/// Move `staging` to `final_dir` in one step, so a half-installed directory can
-/// never stand where a whole one did. An existing directory — a copy that failed its
-/// proof, or what a failed install left behind — is moved aside by the crate's own swap,
-/// which also puts it back when the swap itself fails.
-fn place(staging: &Path, final_dir: &Path) -> Result<(), String> {
-    if !final_dir.exists() {
-        return fs::rename(staging, final_dir)
-            .map_err(|e| format!("the new copy could not be moved into place ({})", e.kind()));
-    }
-    managed_bin::rename_aside_swap(staging, final_dir)
 }
 
 /// Leave nothing this install made and no longer needs: every copy but the one just

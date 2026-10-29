@@ -12,9 +12,10 @@
 //! A check stopped by its time limit is not a verdict about the automation: nothing
 //! is delivered for that attempt, the occurrence stays pending and is retried
 //! after a short cool-down. Every other non-clean outcome — a non-zero exit, the
-//! memory ceiling, an output drain overrun, a check that could not run at all —
-//! is a broken check and takes the automation with it. A stored check that cannot be
-//! read is a check that cannot run, and is treated as one.
+//! memory ceiling, a check that could not run at all — is a broken check and takes the
+//! automation with it. A check whose own process exited is judged by the status it
+//! gave, even when something it left behind held its output. A stored check that cannot
+//! be read is a check that cannot run, and is treated as one.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -988,7 +989,7 @@ impl TriggerOutcome {
     /// that failed, and output of any kind, whatever it looks like — except a run
     /// the ceiling stopped, which is settled by the retry rule instead.
     fn from_run(outcome: ProgramOutcome) -> Self {
-        if outcome.timed_out {
+        if outcome.timed_out() {
             return Self::Unfinished;
         }
         if outcome.success && !outcome.has_output {
@@ -1597,7 +1598,7 @@ mod tests {
             detail: detail.to_string(),
             output: output.to_string(),
             has_output,
-            timed_out: false,
+            stop: None,
         }
     }
 
@@ -1976,7 +1977,7 @@ mod tests {
         )
         .await;
         assert!(
-            stopped.timed_out,
+            stopped.timed_out(),
             "the one-second ceiling must stop the run"
         );
         settle_trigger_attempt(
