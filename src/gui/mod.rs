@@ -95,6 +95,21 @@ const SIDEBAR_RAIL_WIDTH: f32 = 56.0;
 /// running-agent indicators are smaller.
 const RAIL_ICON_SIZE: f32 = 28.0;
 
+/// The window control's vertical padding where it is drawn in its own chrome — the start-up splash,
+/// a failed boot: the room the system's rounded corner needs, 12px on macOS, whose radius is the
+/// deeper one, and 8px on Windows.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const WINDOW_CONTROL_PADDING: f32 = if cfg!(target_os = "macos") {
+    theme::PAD_12
+} else {
+    theme::PAD_8
+};
+
+/// The gap under the rail's control, before the first nav entry — 12px on macOS, 8px on Windows:
+/// the same padding the control keeps below itself rather than above.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const RAIL_WINDOW_CONTROL_GAP: f32 = WINDOW_CONTROL_PADDING;
+
 /// The bottom footer bar's fixed height, in px. The toast stack clears it (see
 /// [`Dashboard::view`]), and there is no bar to clear while
 /// [`Dashboard::footer_hidden`].
@@ -3388,7 +3403,7 @@ impl RunningIndicator {
         )
     }
 
-    /// The rail's presentation: an inset rail entry, tooltip to the side like
+    /// The rail's presentation: a full-bleed rail entry, tooltip to the side like
     /// every other item in the rail.
     fn rail(self) -> Element<'static, Message> {
         Dashboard::sidebar_rail_item(
@@ -3420,22 +3435,18 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
     }
 }
 
-/// What a rail entry is, which decides how its button's highlight is painted. A
-/// navigation entry is full-bleed — its highlight spans the rail's whole width —
-/// and at the rail's bottom end it reaches the layout's edge too, while every
-/// other item keeps [`theme::PAD_4`] at the rail's sides.
+/// Which vertical padding a rail entry takes. Every entry spans the rail's whole width, its
+/// highlight and hit area reaching both sides and, at the rail's ends, the layout's edges; the
+/// window control is the one entry that keeps [`theme::PAD_2`] beside its glyph.
 #[derive(Clone, Copy)]
 enum RailEntry {
-    /// A navigation entry away from the rail's bottom end.
-    Nav,
-    /// The navigation entry at the rail's bottom end.
-    NavAtBottom,
-    /// The window's own control: full-bleed and half-height, so it stays a narrow strip at
-    /// the rail's top.
+    /// A rail entry away from the rail's bottom end.
+    Item,
+    /// The rail entry at the rail's bottom end.
+    AtBottom,
+    /// The window's own control: half-height, so it stays a narrow strip at the rail's top.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     WindowControl,
-    /// Any other rail item: the voice status, the running-agent indicators.
-    Item,
 }
 
 impl RailEntry {
@@ -3444,10 +3455,10 @@ impl RailEntry {
     /// for a window control.
     fn content_padding(self) -> iced::Padding {
         let (top, bottom) = match self {
-            Self::NavAtBottom => (theme::PAD_10, theme::PAD_14),
+            Self::AtBottom => (theme::PAD_10, theme::PAD_14),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Self::WindowControl => (theme::PAD_6, theme::PAD_6),
-            Self::Nav | Self::Item => (theme::PAD_10, theme::PAD_10),
+            Self::Item => (theme::PAD_10, theme::PAD_10),
         };
         iced::Padding {
             top,
@@ -3455,23 +3466,10 @@ impl RailEntry {
             ..iced::Padding::default()
         }
     }
-
-    /// The rail's [`theme::PAD_4`] inset around every entry that is not full-bleed.
-    fn button_inset(self) -> iced::Padding {
-        let inset = match self {
-            Self::Item => theme::PAD_4,
-            _ => 0.0,
-        };
-        iced::Padding {
-            left: inset,
-            right: inset,
-            ..iced::Padding::default()
-        }
-    }
 }
 
 /// Which end of the rail a nav column sits at. Only the bottom one reaches the
-/// layout's edge, so only there does the last entry take [`RailEntry::NavAtBottom`].
+/// layout's edge, so only there does the last entry take [`RailEntry::AtBottom`].
 #[derive(Clone, Copy)]
 enum NavColumn {
     Top,
@@ -3513,14 +3511,14 @@ impl UpdateControl {
 impl Dashboard {
     /// The rail: the window's own chrome where the platform's title bar is hidden, the top
     /// nav icons, the voice status while the footer is hidden, the stretch in between
-    /// ([`Self::render_sidebar_mid`]) and the bottom nav icons — all of it draggable, the title
-    /// bar being hidden there.
+    /// ([`Self::render_sidebar_mid`]) and the bottom nav icons. Its empty space drags the window,
+    /// the title bar being hidden there.
     fn sidebar_view(&self, footer_hidden: bool) -> Element<'_, Message> {
         let mut col = Column::new().spacing(theme::SPACE_2);
         // The window's own chrome, where the platform's title bar is hidden.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            col = col.push(Self::render_window_control());
+            col = col.push(Self::rail_window_control());
         }
         col = col.push(self.render_sidebar_nav());
         if footer_hidden {
@@ -3560,7 +3558,7 @@ impl Dashboard {
         Space::new().height(Length::Fill).into()
     }
 
-    /// A rail entry: its content centered in the entry's width, tooltip to the
+    /// A rail entry: its content centered in the entry's full width, tooltip to the
     /// side — iced snaps Top tooltips into the viewport, overlapping the topmost
     /// rail entry. `on_press: None` makes a static entry (the voice status, which
     /// only reports).
@@ -3570,7 +3568,7 @@ impl Dashboard {
         on_press: Option<Message>,
         entry: RailEntry,
     ) -> Element<'static, Message> {
-        let tip = tooltip(
+        tooltip(
             button(
                 // The container's vertical padding gives the button a large hit
                 // area and keeps the icon's place.
@@ -3586,11 +3584,8 @@ impl Dashboard {
             text(label.into()).size(theme::TEXT_11),
             tooltip::Position::Right,
         )
-        .style(theme::tooltip_style);
-        container(tip)
-            .width(Length::Fill)
-            .padding(entry.button_inset())
-            .into()
+        .style(theme::tooltip_style)
+        .into()
     }
 
     /// Shared nav-icon column for the sidebar top and bottom navs. Each page is
@@ -3610,9 +3605,9 @@ impl Dashboard {
                 continue;
             }
             let entry = if Some(index) == edge {
-                RailEntry::NavAtBottom
+                RailEntry::AtBottom
             } else {
-                RailEntry::Nav
+                RailEntry::Item
             };
             let color = if self.page == *page {
                 theme::ACCENT
@@ -3630,43 +3625,58 @@ impl Dashboard {
     }
 
     /// A view that has no rail — the start-up splash, a failed boot — with the
-    /// window's own chrome above it: the rail's control at the top, the whole
-    /// surface draggable.
+    /// window's own chrome above it: its control at the top, the whole surface
+    /// draggable.
     fn window_chrome(view: Element<'_, Message>) -> Element<'_, Message> {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         return view;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        mouse_area(column![Self::render_window_control(), view])
+        mouse_area(column![Self::chrome_window_control(), view])
             .on_press(Message::WindowAction(WindowAction::Drag))
             .into()
     }
 
-    /// The rail's one window control, at the rail's top and built like the entries below it:
-    /// the close glyph, which hides the window ([`Self::close_window`]). Minimizing is the
-    /// platform's own — the taskbar's menu on Windows — and the tray brings a minimized window
-    /// back like a hidden one.
+    /// The window's one control, built like the rail's entries: the close glyph, which hides the
+    /// window ([`Self::close_window`]). Minimizing is the platform's own — the taskbar's menu on
+    /// Windows — and the tray brings a minimized window back like a hidden one.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn render_window_control() -> Element<'static, Message> {
+    fn window_control() -> Element<'static, Message> {
         let glyph = |icon: iced::widget::Text<'static, iced::Theme, iced::Renderer>| {
             icon.size(theme::TEXT_14).color(theme::TEXT_SECONDARY)
         };
-        // macOS rounds the window's corners by the system's own radius, which reaches into the
-        // rail's first entry: the extra padding keeps the glyph and the entry's hit area inside
-        // the rounded shape. Windows rounds at a smaller radius the entry already clears.
-        let top = if cfg!(target_os = "macos") {
-            theme::PAD_12
-        } else {
-            theme::PAD_8
-        };
-        container(Self::sidebar_rail_item(
+        Self::sidebar_rail_item(
             glyph(lucide::x()).into(),
             "close window",
             Some(Message::WindowAction(WindowAction::Close)),
             RailEntry::WindowControl,
-        ))
-        .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
-        .padding([top, theme::PAD_2])
-        .into()
+        )
+    }
+
+    /// The rail's placement of it: padding at its sides and below, and none above, so the control
+    /// meets the window's top edge and the system's own rounded corner cuts its top border — the
+    /// intended look. That edge is the platform's: the rows just below it are the window's resize
+    /// band, where a press resizes the window instead of reaching the control.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn rail_window_control() -> Element<'static, Message> {
+        container(Self::window_control())
+            .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
+            .padding(iced::Padding {
+                top: 0.0,
+                bottom: RAIL_WINDOW_CONTROL_GAP,
+                left: theme::PAD_2,
+                right: theme::PAD_2,
+            })
+            .into()
+    }
+
+    /// The rail-less placement — the start-up splash, a failed boot — which keeps the padding on
+    /// every side, the room the system's rounded corner needs above the glyph included.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn chrome_window_control() -> Element<'static, Message> {
+        container(Self::window_control())
+            .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
+            .padding([WINDOW_CONTROL_PADDING, theme::PAD_2])
+            .into()
     }
 
     /// Sidebar top nav icons (see [`Page::sidebar_pages`]). Running Agents is not
