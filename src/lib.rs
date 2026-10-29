@@ -228,36 +228,6 @@ pub use audio_cli::run as run_audio_cli;
 /// instance lock — browser automation that runs alongside the daemon).
 pub use chrome::cli::run_cli as run_chrome_cli;
 
-/// Test/subprocess-harness rewrite entry with an explicit home (fixture `~`
-/// operands); production single-file gate. Only compiled for the e2e harness.
-///
-/// These harness exports are gated exactly as the items they re-export — the
-/// feature alone: the harness is a macOS-targeted lane that bails at runtime, so
-/// it must still compile wherever its own feature does, on any platform.
-#[cfg(feature = "grep-engine-e2e")]
-#[doc(hidden)]
-pub use tools::shell::grep_engine::grep_engine_rewrite_for_test;
-
-/// Whether the served grep member(s) exercise the parallel recursive walk
-/// (subprocess harness relaxes its byte-exact diff to sorted-line comparison).
-#[cfg(feature = "grep-engine-e2e")]
-#[doc(hidden)]
-pub use tools::shell::grep_engine::served_spec_walks_directory;
-
-/// Record-split + byte-sort helper for ordering-insensitive output comparison
-/// (shared with the e2e bench's parallel-walk rows).
-#[cfg(feature = "grep-engine-e2e")]
-#[doc(hidden)]
-pub use tools::shell::grep_engine::grep_sorted_lines;
-
-/// Opens the grep engine's runtime locale-parity gate for the e2e harness: the
-/// harness's subject is the engine's own equivalence proof against its pinned
-/// locale, while the runtime gate has its own tests in the engine's `parity`
-/// module.
-#[cfg(feature = "grep-engine-e2e")]
-#[doc(hidden)]
-pub use tools::shell::grep_engine::grep_engine_establish_parity_for_harness;
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -1,44 +1,77 @@
-//! Subprocess end-to-end harness for the transparent grep engine.
+//! Subprocess differential of the transparent grep engine against the system grep.
 //!
-//! The parent role rewrites commands via the engine's analysis, spawns
-//! `sh -c` with the bench binary acting as the hidden `__grep-engine`
-//! subcommand, and diffs the result against the real system grep. The child
-//! role dispatches the engine from argv (the same code path `main()` uses).
+//! Every row is rendered by the production router ([`super::serve_command`]) and
+//! then run by a real `sh`, with the shipped `mahbot` binary acting as the hidden
+//! `__grep-engine` subcommand; the output is diffed byte-for-byte against the real
+//! `grep` that same shell runs on the original row — as sorted record sets for the
+//! recursive rows, whose cross-file order is the workers'.
 //!
-//! Run with: `cargo bench --no-default-features --features grep-engine-e2e --bench grep_engine_e2e`
+//! The rows span plain and pathological operands, recursive walks, counting and
+//! listing modes, redirects, pipelines, fail-closed refusals, exec-in-place
+//! fallbacks and SIGPIPE. macOS-only: the comparison target is this platform's own
+//! grep and the rows are pinned to what it prints.
 //!
-//! Exit codes: 0 = all differential rows byte-identical, 1 = mismatch, 2 = harness error.
-#![allow(clippy::print_stdout, clippy::print_stderr)]
+//! Ignored by default — it spawns ~250 child processes, so it runs on request:
+//!
+//! ```text
+//! cargo build --bin mahbot
+//! cargo test --lib -- --ignored --nocapture subprocess_differential
+//! ```
 
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("__grep-engine") {
-        let code = mahbot::run_grep_engine(&args[1..]);
-        std::process::exit(code);
-    }
-    if args.first().map(String::as_str) == Some("--probe") {
-        std::process::exit(0);
-    }
+use super::test_support::{open_the_gate, sorted_lines};
+use super::{ShellPlatform, analyze_command, serve_command, spec_uses_parallel_walk};
+use crate::tools::path::shell_quote;
+use crate::util::test::built_binary;
+
+#[test]
+#[ignore = "subprocess differential: needs the built product binary — `cargo build --bin mahbot` first"]
+fn subprocess_differential_against_system_grep() {
+    let exe = built_binary().unwrap_or_else(|| {
+        panic!(
+            "no `mahbot` binary beside this test harness — build it first: `cargo build --bin mahbot`"
+        )
+    });
+    let modified = fs::metadata(&exe)
+        .and_then(|meta| meta.modified())
+        .map_or_else(
+            |e| format!("modified unknown ({e})"),
+            |t| {
+                format!(
+                    "modified {}",
+                    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+                )
+            },
+        );
+    println!("binary: {} ({modified})", exe.display());
     // This lane's subject is the engine's own equivalence proof against its
-    // pinned locale, so it opens the runtime parity gate for its own process; the
+    // pinned locale, so it opens the runtime parity gate for its own thread; the
     // gate's fail-closed behaviour has its own tests in the engine's `parity`
     // module. Nothing about the rows or their assertions is relaxed by this.
-    mahbot::grep_engine_establish_parity_for_harness();
-    std::process::exit(run_matrix());
+    open_the_gate();
+    let failures = run_matrix(&exe);
+    assert_eq!(failures, 0, "{failures} differential rows failed");
+}
+
+/// Print one row's verdict and count it when it failed.
+fn tally(failures: &mut usize, label: &str, result: Result<(), String>) {
+    match result {
+        Ok(()) => println!("PASS: {label}"),
+        Err(msg) => {
+            println!("FAIL: {label}: {msg}");
+            *failures += 1;
+        }
+    }
 }
 
 /// Full subprocess-path differential: the rewritten command through a real
-/// shell against the real system grep (macOS BSD).
-fn run_matrix() -> i32 {
-    if !cfg!(target_os = "macos") {
-        eprintln!("subprocess matrix is macOS-gated (BSD grep parity target)");
-        return 2;
-    }
+/// shell against the real system grep (macOS BSD). Returns the failure count.
+#[allow(clippy::too_many_lines)] // one table of rows per family: splitting it would scatter the matrix
+fn run_matrix(exe: &Path) -> usize {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ws = tmp.path().join("ws");
     let home = tmp.path().join("home");
@@ -186,13 +219,7 @@ fn run_matrix() -> i32 {
 
     let mut failures = 0;
     for row in rows {
-        match check_row(row, &ws, &home) {
-            Ok(()) => println!("PASS: {row}"),
-            Err(msg) => {
-                println!("FAIL: {row}: {msg}");
-                failures += 1;
-            }
-        }
+        tally(&mut failures, row, check_row(row, &ws, &home, exe));
     }
 
     // Glued redirect operators: the rewrite hands the raw spelling back and the
@@ -235,13 +262,11 @@ fn run_matrix() -> i32 {
             "redirect-walk-ctx.txt",
         ),
     ] {
-        match check_redirect_row(row, target, &ws, &home) {
-            Ok(()) => println!("PASS: {row}"),
-            Err(msg) => {
-                println!("FAIL: {row}: {msg}");
-                failures += 1;
-            }
-        }
+        tally(
+            &mut failures,
+            row,
+            check_redirect_row(row, target, &ws, &home, exe),
+        );
     }
 
     // ── Redirected searches whose result is larger than OUTPUT_CAP (256 KiB) ──
@@ -271,13 +296,11 @@ fn run_matrix() -> i32 {
             "redirect-large-exec.txt",
         ),
     ] {
-        match check_redirect_row(row, target, &ws, &home) {
-            Ok(()) => println!("PASS: {row}"),
-            Err(msg) => {
-                println!("FAIL: {row}: {msg}");
-                failures += 1;
-            }
-        }
+        tally(
+            &mut failures,
+            row,
+            check_redirect_row(row, target, &ws, &home, exe),
+        );
     }
 
     // A redirected walk whose entries end in a count line and (for a match) a
@@ -288,13 +311,11 @@ fn run_matrix() -> i32 {
     // tail must be released with the entry — a hold-back that waits for the next
     // record boundary would drop it.
     let count_row = "grep -rcl --null needle plain sub > redirect-walk-count-null.txt";
-    match check_redirect_row(count_row, "redirect-walk-count-null.txt", &ws, &home) {
-        Ok(()) => println!("PASS: {count_row}"),
-        Err(msg) => {
-            println!("FAIL: {count_row}: {msg}");
-            failures += 1;
-        }
-    }
+    tally(
+        &mut failures,
+        count_row,
+        check_redirect_row(count_row, "redirect-walk-count-null.txt", &ws, &home, exe),
+    );
 
     // Fail-closed rows: the parent must NOT rewrite these (the original
     // command — a shell syntax error / a real grep pipeline — runs instead).
@@ -305,24 +326,20 @@ fn run_matrix() -> i32 {
         ("stdin-fed with a '-' operand", "cat a.txt | grep foo -"),
         ("process substitution", "grep -rn needle <(cat a.txt)"),
     ] {
-        match check_fallback(row, &ws, &home) {
-            Ok(()) => println!("PASS (fallback): {row}"),
-            Err(msg) => {
-                println!("FAIL: {label}: {row}: {msg}");
-                failures += 1;
-            }
-        }
+        tally(
+            &mut failures,
+            &format!("{row} (fallback: {label})"),
+            check_fallback(row, &ws, &home, exe),
+        );
     }
 
     // The exec-in-place fallback: a spec whose expected cwd does not match
     // the process cwd must exec the real grep and produce ITS output.
-    match check_exec_fallback(&ws) {
-        Ok(()) => println!("PASS: exec-in-place cwd fallback"),
-        Err(msg) => {
-            println!("FAIL: exec-in-place cwd fallback: {msg}");
-            failures += 1;
-        }
-    }
+    tally(
+        &mut failures,
+        "exec-in-place fallback",
+        check_exec_fallback(&ws, exe),
+    );
 
     // SIGPIPE: a served grep piped to `head` must not hang (a Rust child
     // ignoring SIGPIPE would scan everything; the engine dies like grep).
@@ -339,22 +356,10 @@ fn run_matrix() -> i32 {
             "cat bigdir/big.txt | grep needle | head -1",
         ),
     ] {
-        match check_sigpipe(cmd, &ws, &home) {
-            Ok(()) => println!("PASS: {label}"),
-            Err(msg) => {
-                println!("FAIL: {label}: {msg}");
-                failures += 1;
-            }
-        }
+        tally(&mut failures, label, check_sigpipe(cmd, &ws, &home, exe));
     }
 
-    if failures == 0 {
-        println!("grep-engine-e2e: all rows passed");
-        0
-    } else {
-        println!("grep-engine-e2e: {failures} failures");
-        1
-    }
+    failures
 }
 
 fn build_fixture(ws: &Path, home: &Path) {
@@ -446,9 +451,34 @@ fn git_fixture(ws: &Path) {
     ]);
 }
 
-fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
-    let rewritten = mahbot::grep_engine_rewrite_for_test(row, ws, home)
-        .ok_or_else(|| "not servable".to_string())?;
+/// `command` served as the shell tool serves it: unix platform, the fixture's
+/// own `$HOME`, the engine probe bypassed (the caller drove the build), and
+/// `exe` as the program the rendered member names. `None` when the command is
+/// not servable.
+fn rewrite(command: &str, ws: &Path, home: &Path, exe: &Path) -> Option<String> {
+    serve_command(
+        command,
+        ws,
+        Some(home),
+        ShellPlatform::Unix,
+        || true,
+        Some(exe),
+    )
+    .rewritten
+}
+
+/// Whether the served grep member(s) for `command` exercise the parallel
+/// recursive walk, whose cross-file order is the workers' and so is compared as a
+/// sorted record set.
+fn walks_directory(command: &str, ws: &Path, home: &Path) -> bool {
+    let Ok(analyzed) = analyze_command(command, ws, home, ShellPlatform::Unix, false) else {
+        return false;
+    };
+    analyzed.specs.iter().any(spec_uses_parallel_walk)
+}
+
+fn check_row(row: &str, ws: &Path, home: &Path, exe: &Path) -> Result<(), String> {
+    let rewritten = rewrite(row, ws, home, exe).ok_or_else(|| "not servable".to_string())?;
     let engine_out = run_sh(&rewritten, ws)?;
     // The real grep: parse the original row's command via sh -c (the authentic
     // execution path) — this also validates the rewrite against the original.
@@ -456,7 +486,7 @@ fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
     if engine_out == real_out {
         return Ok(());
     }
-    if mahbot::served_spec_walks_directory(row, ws, home) {
+    if walks_directory(row, ws, home) {
         // Parallel-walk rows may order files across workers non-deterministically,
         // so an order-sensitive pipeline tail (head/tail) selects a different
         // subset. Fall back to comparing the engine member's own output (before
@@ -471,7 +501,7 @@ fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
         // rather than guarded.
         let engine_member = run_sh(engine_member_prefix(&rewritten), ws)?;
         let real_member = run_sh(engine_member_prefix(row), ws)?;
-        if mahbot::grep_sorted_lines(&engine_member.0) == mahbot::grep_sorted_lines(&real_member.0)
+        if sorted_lines(&engine_member.0) == sorted_lines(&real_member.0)
             && engine_member.1 == real_member.1
         {
             Ok(())
@@ -527,14 +557,19 @@ fn mismatch(what: &str, engine: &[u8], real: &[u8]) -> String {
 /// from a deleted target, so an `>>` row never appends to the other run's file.
 /// Parallel-walk rows relax to sorted record sets, exactly as [`check_row`] does
 /// (the member's stream reaches the target in cross-file worker order).
-fn check_redirect_row(row: &str, target: &str, ws: &Path, home: &Path) -> Result<(), String> {
-    let rewritten = mahbot::grep_engine_rewrite_for_test(row, ws, home)
-        .ok_or_else(|| "not servable".to_string())?;
+fn check_redirect_row(
+    row: &str,
+    target: &str,
+    ws: &Path,
+    home: &Path,
+    exe: &Path,
+) -> Result<(), String> {
+    let rewritten = rewrite(row, ws, home, exe).ok_or_else(|| "not servable".to_string())?;
     let path = ws.join(target);
     let engine = run_redirect_case(&rewritten, &path, ws)?;
     let real = run_redirect_case(row, &path, ws)?;
-    let same: fn(&[u8], &[u8]) -> bool = if mahbot::served_spec_walks_directory(row, ws, home) {
-        |a, b| mahbot::grep_sorted_lines(a) == mahbot::grep_sorted_lines(b)
+    let same: fn(&[u8], &[u8]) -> bool = if walks_directory(row, ws, home) {
+        |a, b| sorted_lines(a) == sorted_lines(b)
     } else {
         |a, b| a == b
     };
@@ -602,11 +637,12 @@ fn run_sh(command: &str, cwd: &Path) -> Result<(Vec<u8>, i32), String> {
     Ok((out.stdout, out.status.code().unwrap_or(-1)))
 }
 
-fn check_exec_fallback(ws: &Path) -> Result<(), String> {
+fn check_exec_fallback(ws: &Path, exe: &Path) -> Result<(), String> {
     // A spec whose expected cwd does not match the process cwd must exec the
     // real grep, which then runs in the ACTUAL cwd.
     check_exec_case(
         ws,
+        exe,
         r#"{"version":5,"verb":"grep","mode":"Basic","flags":{"n":true,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":true,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{"display":".","resolved":"/nonexistent","trailing_slash":false}],"cwd":"/nonexistent","fallback":["grep","-rn","x","."],"piped":false,"stdin":false,"report_stream_bytes":false}"#,
         "grep -rn x .",
     )?;
@@ -615,6 +651,7 @@ fn check_exec_fallback(ws: &Path) -> Result<(), String> {
     // fail-closed swap direction the rollout depends on.
     check_exec_case(
         ws,
+        exe,
         r#"{"version":4,"verb":"grep","mode":"Basic","flags":{"n":true,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":true,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{"display":".","resolved":"/nonexistent","trailing_slash":false}],"cwd":"/nonexistent","fallback":["grep","-rn","x","."],"piped":false}"#,
         "grep -rn x .",
     )?;
@@ -624,14 +661,15 @@ fn check_exec_fallback(ws: &Path) -> Result<(), String> {
     let json = format!(
         r#"{{"version":5,"verb":"grep","mode":"Basic","flags":{{"n":false,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":false,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0}},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{{"display":"-x1","resolved":"{dash_abs}","trailing_slash":false}}],"cwd":"/nonexistent","fallback":["grep","-e","x","--","-x1"],"piped":false,"stdin":false,"report_stream_bytes":false}}"#
     );
-    check_exec_case(ws, &json, "grep -e x -- -x1")
+    check_exec_case(ws, exe, &json, "grep -e x -- -x1")
 }
 
-fn check_exec_case(ws: &Path, json: &str, real_cmd: &str) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+fn check_exec_case(ws: &Path, exe: &Path, json: &str, real_cmd: &str) -> Result<(), String> {
+    // The program is quoted the way the router quotes it, so a workspace path
+    // with a space in it reaches `sh` as one word.
     let cmd = format!(
         "{} __grep-engine '{}'",
-        exe.to_string_lossy(),
+        shell_quote(&exe.to_string_lossy()),
         json.replace('\'', "'\\''")
     );
     let (out, code) = run_sh(&cmd, ws)?;
@@ -648,19 +686,18 @@ fn check_exec_case(ws: &Path, json: &str, real_cmd: &str) -> Result<(), String> 
     }
 }
 
-fn check_fallback(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
-    if mahbot::grep_engine_rewrite_for_test(row, ws, home).is_some() {
+fn check_fallback(row: &str, ws: &Path, home: &Path, exe: &Path) -> Result<(), String> {
+    if rewrite(row, ws, home, exe).is_some() {
         return Err("expected fallback, got served".to_string());
     }
     Ok(())
 }
 
-fn check_sigpipe(command: &str, ws: &Path, home: &Path) -> Result<(), String> {
+fn check_sigpipe(command: &str, ws: &Path, home: &Path, exe: &Path) -> Result<(), String> {
     // A huge-output grep piped to head must terminate promptly (SIGPIPE):
     // the >64 KiB fixture fills the pipe, so the engine must die on the
     // closed pipe instead of scanning everything.
-    let rewritten = mahbot::grep_engine_rewrite_for_test(command, ws, home)
-        .ok_or_else(|| "not servable".to_string())?;
+    let rewritten = rewrite(command, ws, home, exe).ok_or_else(|| "not servable".to_string())?;
     let start = std::time::Instant::now();
     let mut child = Command::new("sh")
         .arg("-c")
@@ -681,6 +718,7 @@ fn check_sigpipe(command: &str, ws: &Path, home: &Path) -> Result<(), String> {
         }
         if start.elapsed() > Duration::from_secs(10) {
             let _ = child.kill();
+            let _ = child.wait();
             return Err("engine hung under head (SIGPIPE not effective)".into());
         }
         std::thread::sleep(Duration::from_millis(50));

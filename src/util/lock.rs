@@ -42,7 +42,7 @@ pub(crate) fn lock_file_path(storage_root: &Path) -> PathBuf {
 /// - `Ok(true)` — lock acquired.
 /// - `Ok(false)` — the lock is already held.
 /// - `Err(io::Error)` — non-retryable OS error.
-pub fn try_flock(file: &File) -> io::Result<bool> {
+pub(crate) fn try_flock(file: &File) -> io::Result<bool> {
     match file.try_lock() {
         Ok(()) => Ok(true),
         Err(TryLockError::WouldBlock) => Ok(false),
@@ -68,8 +68,8 @@ pub(crate) enum InstanceLockState {
 /// decides whether opening a store is safe — refuses, and both halves show in
 /// the sentence. Shared by both consumers so they cannot drift apart, and
 /// returned as a clause without terminal punctuation: each appends its own
-/// continuation (`mahbot debug` its re-run advice, the bench what it uses
-/// instead).
+/// continuation (`mahbot debug` its re-run advice, `bench-openrouter` what it
+/// uses instead).
 pub(crate) fn lock_state_unknown(root: &Path, e: &io::Error) -> String {
     format!(
         "cannot tell whether a mahbot instance holds {} ({e}); the live store was left untouched \

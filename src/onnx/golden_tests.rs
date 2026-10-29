@@ -5,10 +5,9 @@
 //! **bit-exactly** against reference tensors captured from the removed
 //! `candle-onnx-mahbot` fork, preserved in the repo as these fixtures.
 //!
-//! Feature-gated behind `voice-tests` (like the wake_word bench)
-//! because they require the ~383 MB model files on disk under
-//! `~/.mahbot/models/supertonic3/onnx`.  When the models are absent the tests
-//! skip with a notice instead of failing.
+//! Feature-gated behind `voice-tests` because they require the ~383 MB model
+//! files on disk under `~/.mahbot/models/supertonic3/onnx`.  When the models
+//! are absent the tests skip with a notice instead of failing.
 //!
 //! Fixture format (`src/onnx/golden/*.bin`): `u32` little-endian dimension
 //! count, `u32` little-endian dims, then `f32` little-endian elements.

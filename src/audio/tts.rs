@@ -390,24 +390,6 @@ pub fn download_failed() -> bool {
     STATE.load(Ordering::Acquire) == ModelState::Failed
 }
 
-/// Try to load TTS engine from cache — returns `Ok(())` if models are
-/// ready after the call, or an error message explaining how to resolve.
-///
-/// Used only by the feature-gated e2e bench module
-/// (`voice::voice_pipeline_e2e_test`). It checks
-/// [`models_ready()`] first (fast path), then [`try_load_cached()`]
-/// (loads from disk if available), and only fails if neither succeeds.
-#[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
-pub(super) fn ensure_ready() -> Result<(), String> {
-    if models_ready() {
-        return Ok(());
-    }
-    if try_load_cached() {
-        return Ok(());
-    }
-    Err("TTS models not available. Run the app once to download them.".to_string())
-}
-
 /// Retry model download after a previous failure.
 ///
 /// Atomically transitions [`STATE`] from [`ModelState::Failed`] → [`ModelState::Uninit`]
@@ -568,87 +550,6 @@ pub fn init_global() -> Result<()> {
     // the Settings enable toggle, or the wake-word cues ([`crate::audio::cue`]),
     // which share the same device.
     Ok(())
-}
-
-/// List available voice style names (e.g., "M1.json", "F1.json", etc.).
-///
-/// Returns only the styles that are actually cached on disk. The full set
-/// is downloaded during model initialization.
-#[must_use]
-pub fn list_voice_styles() -> Vec<String> {
-    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
-        return Vec::new();
-    };
-    let styles_dir = dir.join(VOICE_STYLES_DIR);
-    let mut available = Vec::new();
-    for &name in ALL_VOICE_STYLE_NAMES {
-        if styles_dir.join(name).exists() {
-            available.push(name.to_string());
-        }
-    }
-    available
-}
-
-/// Synthesize `text` with the given `voice_style` and return raw mono PCM
-/// samples at the specified sample rate (f32 in [-1.0, 1.0]).
-///
-/// This is a **pure synthesis** function — no playback, no rodio, no
-/// cancellation channel. Use it for data generation, offline processing,
-/// or any scenario where you need audio samples rather than immediate
-/// playback.
-///
-/// # Arguments
-///
-/// * `text` — The text to synthesize. Preprocessing (markdown strip, emoji
-///   removal, abbreviation expansion) is applied automatically.
-/// * `voice_style` — One of the style file names (e.g. `"M1.json"`,
-///   `"F1.json"`). Use [`list_voice_styles()`] to discover available styles.
-/// * `seed` — Random seed for the flow-matching noise. Different seeds
-///   produce different prosody/intonation while preserving same text content.
-///   Use `42` for deterministic output matching the default playback behavior
-///   (same as [`speak_async`]).
-/// * `target_sample_rate` — Desired output sample rate in Hz. The Supertonic 3
-///   model natively outputs 44100 Hz; passing a different rate triggers
-///   resampling. Common values: `44100` (native, no resampling), `16000` (voice
-///   pipeline), `24000` (upsampled).
-///
-/// # Errors
-///
-/// Returns an error if the TTS engine is not ready, the voice style is not
-/// found or cannot be parsed, or synthesis fails.
-///
-/// # Sample rate
-///
-/// The Supertonic 3 model natively outputs 44100 Hz audio. The function
-/// resamples to `target_sample_rate` for compatibility. For training data
-/// generation targeting the voice pipeline (which expects 16 kHz), pass
-/// `target_sample_rate = 16000` to avoid an intermediate resampling step.
-///
-pub fn synthesize(
-    text: &str,
-    voice_style: &str,
-    seed: u64,
-    target_sample_rate: u32,
-) -> Result<Vec<f32>> {
-    let engine = get_engine_clone().context("TTS engine not ready")?;
-    let dir = models_subdir(MODEL_DIR_NAME).context("Cannot resolve model directory")?;
-    let (style_dp, style_ttl) = load_voice_style(&dir, voice_style)?;
-    let processed = preprocess_text(text);
-    if processed.is_empty() {
-        anyhow::bail!("Empty text after preprocessing");
-    }
-    let native_rate = engine.sample_rate;
-    let samples = synthesize_internal(&engine, &processed, &style_dp, &style_ttl, seed)?;
-    // Resample from native rate to target rate
-    if native_rate == target_sample_rate {
-        Ok(samples)
-    } else {
-        Ok(crate::audio::util::resample_audio(
-            &samples,
-            native_rate,
-            target_sample_rate,
-        ))
-    }
 }
 
 /// The ONNX model files in `dir`, in the order the set is fetched: the six files

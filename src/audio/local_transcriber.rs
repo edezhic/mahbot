@@ -402,10 +402,6 @@ pub(crate) enum AudioFormat {
 ///
 /// Supports WAV (directly via qwen-asr's parser for maximum compatibility),
 /// OGG/Opus (Telegram voice messages), MP3, and raw audio.
-///
-/// `pub(crate)`: the voice-tests wake_word bench's real-audio
-/// FAPH phase reuses this decoder for the pinned corpus (WAV/OGG/MP3 only —
-/// the corpus format pin), so the bench binary needs no new decoder crates.
 pub(crate) fn decode_audio_to_mono_f32(path: &Path) -> Result<Vec<f32>> {
     let ext = path
         .extension()
@@ -1050,8 +1046,7 @@ fn try_lock_init() -> Option<bool> {
 /// awaits it (fast with a warm page cache — no SHA256 re-verification).
 ///
 /// Used by every first operation that needs the model:
-/// [`transcribe_file_async`], the TTS e2e test, and the wake-word benchmark
-/// (`voice_pipeline_e2e_test::ensure_voice_models_loaded`).
+/// [`transcribe_file_async`] and the TTS e2e test.
 pub async fn ensure_loaded() -> bool {
     if let Some(ready) = try_lock_init() {
         if ready {

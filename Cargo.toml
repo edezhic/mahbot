@@ -12,36 +12,21 @@ keywords = ["ai", "agent"]
 categories = ["development-tools"]
 rust-version = "1.96"
 resolver = "2"
-# `scripts/` and `benches/` are dev-only assets; never ship them to crates.io.
-exclude = [".DS_Store", "scripts", "benches"]
+# `scripts/` is a dev-only asset; never ship it to crates.io.
+exclude = [".DS_Store", "scripts"]
 
 [features]
-# `full` is a default-on marker feature used by `required-features` on the app
-# binary ([[bin]]).  It gates NO code or dependencies itself; it exists so that
-# `--no-default-features` bench builds skip the binary entirely — the bin is a
-# second full-program link that bench runs never exercise.
-default = ["full"]
-full = []
 # Audio dev/test markers. A feature cannot be platform-gated, so off macOS
 # these gate nothing at all: every `voice-tests`/`voice-debug` site lives
-# inside the macOS-only audio subsystem, and the wake-word bench they selected
-# compiles to an inert stub there (see `benches/wake_word.rs`).
+# inside the macOS-only audio/onnx subsystem. `voice-tests` gates the two
+# bit-exact model-regression suites: the ONNX golden tests and the TTS
+# full-pipeline PCM golden test.
 voice-tests = []
 voice-debug = []
-# Gates the grep-engine subprocess end-to-end harness (benches/grep_engine_e2e.rs):
-# the parent rewrites commands and spawns `sh -c` with the bench binary acting as
-# the hidden engine subcommand, then diffs against the real system grep.
-grep-engine-e2e = []
 
 [[bin]]
 name = "mahbot"
 path = "src/main.rs"
-# Skip the app binary for `--no-default-features` builds.  The canonical bench
-# invocation `cargo bench --no-default-features --features voice-tests` uses
-# this to avoid the bin's full-program link.
-# NOTE: `bench = false` does NOT prevent `cargo bench` from building the bin
-# (rust-lang/cargo#15702); `required-features` is the reliable mechanism.
-required-features = ["full"]
 
 [lib]
 name = "mahbot"
@@ -414,19 +399,6 @@ tray-icon = { version = "0.26", default-features = false }
 http = "1.5"
 serial_test = "3"
 
-# macOS-only (the audio subsystem it exercises): `required-features` cannot be
-# platform-gated, so off macOS the bench target still builds but its file is an
-# inert stub — see benches/wake_word.rs.
-[[bench]]
-name = "wake_word"
-harness = false
-required-features = ["voice-tests"]
-
-[[bench]]
-name = "grep_engine_e2e"
-harness = false
-required-features = ["grep-engine-e2e"]
-
 [profile.dev]
 incremental = true
 opt-level = 0
@@ -471,11 +443,3 @@ panic = "unwind"
 inherits = "dev"
 debug = "line-tables-only"
 codegen-units = 256
-
-[profile.bench]
-# Release-like (opt-level 2 / codegen-units 32 / no LTO): the bench is a
-# production-performance proxy, and release codegen rebuilds ~3-4x faster than
-# the old opt-level 3 + fat-LTO profile.  incremental must stay explicitly off
-# here — the release profile it inherits enables it.
-inherits = "release"
-incremental = false

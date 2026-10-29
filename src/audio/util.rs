@@ -6,8 +6,9 @@
 //! is macOS-only.
 
 use anyhow::{Context as _, Result};
+#[cfg(test)]
 use rand::RngExt;
-#[cfg(any(test, feature = "voice-tests"))]
+#[cfg(test)]
 use rand::SeedableRng;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -192,9 +193,7 @@ mod verify_sha256_tests {
 ///
 /// The canonical implementation uses 16 octaves (~3 dB/octave rolloff down
 /// to 0.03 Hz at 16 kHz) and the high-pass delta variant for DC-free output.
-///
-/// Used by the voice-pipeline benchmark (`voice-tests`) and default-build unit tests.
-#[cfg(any(test, feature = "voice-tests"))]
+#[cfg(test)]
 pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f32> {
     const NUM_OCTAVES: usize = 16;
     let mut values = [0.0f32; NUM_OCTAVES];
@@ -228,59 +227,15 @@ pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f3
     noise
 }
 
-/// Pink-noise alias of [`add_noise_color`] — kept for the recipe's variant-4
-/// call sites; the SNR-scaling/clamp arithmetic lives in one place.
-/// Used by the voice-pipeline bench (`voice-tests`) and default-build unit tests.
-#[cfg(any(test, feature = "voice-tests"))]
+/// Add pink noise to PCM audio at the given SNR (deterministic, seeded).
+///
+/// Generates unit-RMS pink noise from a seeded RNG, scales it to the SNR
+/// target relative to the signal's own RMS, and clamps the mix to ±1.0.
+#[cfg(test)]
 pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
-    add_noise_color(pcm, snr_db, NoiseColor::Pink, seed)
-}
-
-/// Apply a fixed gain to PCM audio.
-///
-/// DETERMINISTIC — no RNG involved. The gain is `10^(gain_db / 20)`.
-/// Negative values attenuate, positive values amplify.
-/// Used by the voice-pipeline bench (`voice-tests`) and default-build unit tests.
-#[cfg(any(test, feature = "voice-tests"))]
-pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
-    let amp = 10.0_f32.powf(gain_db / 20.0);
-    pcm.iter().map(|&s| s * amp).collect()
-}
-
-/// Noise colors supported by the noise-mixing helpers (voice-tests bench and
-/// default-build unit tests).
-#[cfg(any(test, feature = "voice-tests"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NoiseColor {
-    Pink,
-    // Constructed only by the voice-tests bench augmentation; the default
-    // test build exercises Pink only.
-    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
-    Brown,
-}
-
-/// Add color noise to PCM audio at the given SNR (deterministic, seeded).
-///
-/// Mirrors [`add_noise`]'s arithmetic (unit-RMS noise scaled to the SNR
-/// target, clamped mix) with the color selector.  `Brown` is a leaky
-/// integration of white noise (DC-free-ish, low-frequency dominant).
-/// Used by the voice-pipeline bench (`voice-tests`) and default-build unit tests.
-#[cfg(any(test, feature = "voice-tests"))]
-pub(crate) fn add_noise_color(pcm: &[f32], snr_db: f32, color: NoiseColor, seed: u64) -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let signal_rms = compute_rms(pcm).max(1e-10);
-    let noise: Vec<f32> = match color {
-        NoiseColor::Pink => generate_pink_noise(pcm.len(), &mut rng),
-        NoiseColor::Brown => {
-            let mut acc = 0.0f32;
-            (0..pcm.len())
-                .map(|_| {
-                    acc = 0.999 * acc + (rng.random::<f32>() * 2.0 - 1.0);
-                    acc
-                })
-                .collect()
-        }
-    };
+    let noise = generate_pink_noise(pcm.len(), &mut rng);
     let noise_rms_target = signal_rms * 10.0_f32.powf(-snr_db / 20.0);
     let noise_rms_current = compute_rms(&noise).max(1e-10);
     let scale = noise_rms_target / noise_rms_current;
@@ -288,6 +243,16 @@ pub(crate) fn add_noise_color(pcm: &[f32], snr_db: f32, color: NoiseColor, seed:
         .zip(noise.iter())
         .map(|(&s, &n)| (s + n * scale).clamp(-1.0, 1.0))
         .collect()
+}
+
+/// Apply a fixed gain to PCM audio.
+///
+/// DETERMINISTIC — no RNG involved. The gain is `10^(gain_db / 20)`.
+/// Negative values attenuate, positive values amplify.
+#[cfg(test)]
+pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
+    let amp = 10.0_f32.powf(gain_db / 20.0);
+    pcm.iter().map(|&s| s * amp).collect()
 }
 
 /// Compute the RMS (root mean square) of audio samples.
@@ -306,30 +271,6 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
-/// Compute both Box-Muller branches from two uniform draws in `(0, 1]`.
-///
-/// `z1 = sqrt(-2 ln u1) cos(2π u2)`, `z2 = sqrt(-2 ln u1) sin(2π u2)`.
-/// Shared math for the bench's EPSILON-clamp pair sampler below.
-#[must_use]
-#[inline]
-pub(crate) fn gaussian_pair_from_uniforms(u1: f32, u2: f32) -> (f32, f32) {
-    let r = (-2.0 * u1.ln()).sqrt();
-    let theta = 2.0 * core::f32::consts::PI * u2;
-    (r * theta.cos(), r * theta.sin())
-}
-
-/// Draw a standard-normal pair via Box-Muller with EPSILON-clamped draws
-/// (2 draws per 2 samples).  Preserves the bench's draw sequence and
-/// degenerate-input semantics (`u1`/`u2` floored at [`f32::EPSILON`] rather
-/// than re-rolled).  Used by the `voice-tests` bench and the seeded-sequence
-/// equivalence test.
-#[cfg_attr(not(any(feature = "voice-tests", test)), allow(dead_code))]
-pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f32) {
-    let u1: f32 = rng.random::<f32>().max(f32::EPSILON);
-    let u2: f32 = rng.random::<f32>().max(f32::EPSILON);
-    gaussian_pair_from_uniforms(u1, u2)
-}
-
 /// Apply speed perturbation by resampling.
 ///
 /// Changes both speed and pitch (time-domain resampling). For wake word
@@ -346,9 +287,8 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
 /// # Returns
 ///
 /// Speed-adjusted audio at the original `sample_rate`.
-/// Used by the voice-pipeline bench (`voice-tests`) and default-build unit tests.
 #[must_use]
-#[cfg(any(test, feature = "voice-tests"))]
+#[cfg(test)]
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -368,8 +308,7 @@ pub(crate) fn speed_perturbation(samples: &[f32], sample_rate: u32, factor: f32)
 
 // ── Audio utility regression tests ─────────────────────────────────────
 // In-place regression net for speed perturbation, gain, noise, and pink noise.
-// The utilities are gated `any(test, voice-tests)`, so the tests run in the
-// default build.
+// The utilities are `cfg(test)`-gated, like the tests that exercise them.
 
 #[cfg(test)]
 mod audio_util_tests {
@@ -538,68 +477,6 @@ mod audio_util_tests {
             "speed-down and volume-down should differ"
         );
         assert_ne!(speed_down, noise, "speed-down and noise should differ");
-    }
-}
-
-// ── Shared Gaussian sampler seeded-sequence equivalence ────────────────
-// The shared helper consumes exactly the same RNG draws as the inline formula
-// it was extracted from, so seeded outputs stay byte-identical. These tests
-// prove it over ~8000 seeded draw pairs.
-
-#[cfg(test)]
-mod gaussian_sampler_tests {
-    use super::{gaussian_pair_from_uniforms, sample_gaussian_pair_clamped};
-    use rand::RngExt;
-    use rand::SeedableRng;
-
-    /// Reference: the bench's pre-extraction EPSILON-clamp pair sampler
-    /// (2 draws per 2 samples, cos+sin).
-    fn reference_bench_pair(rng: &mut impl rand::Rng) -> (f32, f32) {
-        let u1: f32 = rng.random::<f32>().max(f32::EPSILON);
-        let u2: f32 = rng.random::<f32>().max(f32::EPSILON);
-        let z1 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).cos();
-        let z2 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).sin();
-        (z1, z2)
-    }
-
-    #[test]
-    fn seeded_bench_sequence_byte_identical() {
-        // Bench seed 43; 8000 samples = 4000 draw pairs (2 draws per 2 samples).
-        const DRAW_PAIRS: usize = 4000;
-        let mut shared_rng = rand::rngs::StdRng::seed_from_u64(43);
-        let mut ref_rng = rand::rngs::StdRng::seed_from_u64(43);
-        for i in 0..DRAW_PAIRS {
-            let shared = sample_gaussian_pair_clamped(&mut shared_rng);
-            let reference = reference_bench_pair(&mut ref_rng);
-            #[expect(clippy::float_cmp)] // same-seed RNG must be byte-identical
-            {
-                assert_eq!(shared.0, reference.0, "bench z1 divergence at pair {i}");
-            }
-            #[expect(clippy::float_cmp)] // same-seed RNG must be byte-identical
-            {
-                assert_eq!(shared.1, reference.1, "bench z2 divergence at pair {i}");
-            }
-        }
-    }
-
-    #[test]
-    fn pair_math_matches_inline_formulas() {
-        // gaussian_pair_from_uniforms must equal the inline cos/sin formulas.
-        for &(u1, u2) in &[(0.1, 0.2), (0.5, 0.9), (0.001, 0.999), (0.25, 0.75)] {
-            let (z1, z2) = gaussian_pair_from_uniforms(u1, u2);
-            let r = (-2.0 * u1.ln()).sqrt();
-            let theta = 2.0 * std::f32::consts::PI * u2;
-            #[expect(clippy::float_cmp)]
-            // identical expression ordering — bit-identical by construction
-            {
-                assert_eq!(z1, r * theta.cos(), "z1 for ({u1}, {u2})");
-            }
-            #[expect(clippy::float_cmp)]
-            // identical expression ordering — bit-identical by construction
-            {
-                assert_eq!(z2, r * theta.sin(), "z2 for ({u1}, {u2})");
-            }
-        }
     }
 }
 

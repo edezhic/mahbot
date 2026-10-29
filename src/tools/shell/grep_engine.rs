@@ -149,6 +149,13 @@ pub(super) mod windows;
 /// the engine agrees with the real search for the member's shape.
 mod parity;
 
+/// The subprocess differential against this platform's own grep: the rewrite run
+/// by a real `sh` with the shipped binary as the hidden engine subcommand, diffed
+/// byte-for-byte against the real `grep`. macOS-only, because that is the grep it
+/// is compared against; ignored by default, because it needs the built binary.
+#[cfg(all(test, target_os = "macos"))]
+mod subprocess_matrix;
+
 /// The parity hooks the owner-environment reader drives (see [`parity`]): the
 /// reader is what changes the environment — and so the locale — an agent's
 /// commands get.
@@ -512,6 +519,8 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepSer
         // The probe is deferred to the point where a member is servable (see
         // `serve_command`), so a shell call carrying no search never spawns it.
         engine_available,
+        // No program handed in: the rendered member names this process's own image.
+        None,
     )
 }
 
@@ -558,12 +567,19 @@ fn demoted(platform: ShellPlatform, mut outcomes: Vec<GrepOutcome>, reason: &str
 /// means nothing that could resolve `~` is served — except on Windows, where
 /// nothing expands `~` at all and no analysis decision consults it, so the
 /// analysis proceeds without one.
+///
+/// `exe` is the program the rendered engine member names. `None` means this
+/// process's own image (`current_exe()`), resolved at the rendering step below —
+/// the lookup stays deferred to there, so a command carrying no search never pays
+/// for it. The subprocess differential passes the built binary it drives, so the
+/// rewrite names the shipped path rather than a test binary.
 fn serve_command(
     command: &str,
     workspace_root: &Path,
     home: Option<&Path>,
     platform: ShellPlatform,
     engine_ready: impl Fn() -> bool,
+    exe: Option<&Path>,
 ) -> GrepServe {
     let windows = platform == ShellPlatform::Windows;
     let home = match home {
@@ -646,13 +662,19 @@ fn serve_command(
     // created and then abandoned by a later demotion. The engine's own path is
     // part of that rendering: without it there is no rewrite, so a runtime doubt
     // demotes the command (unix runs the original, Windows refuses the call)
-    // rather than panicking. Each reader looks the path up for itself — the probe
-    // here, this rendering, and the plan's own dispatch — and all of them read the
-    // same process's own image, so they cannot name different programs.
-    let rendered = std::env::current_exe()
-        .map(|exe| exe.to_string_lossy().into_owned())
-        .map_err(|e| Fallback::Handoff(format!("no own executable path: {e}")))
-        .and_then(|exe| join_rewritten(&segments, &specs, &jsons, platform, &exe, &root_cwd));
+    // rather than panicking. `exe` is that program when the caller names one (the
+    // subprocess differential drives the built binary); otherwise it is this
+    // process's own image — which the probe and the plan's own dispatch look up
+    // for themselves too, all of them reading the same process, so they cannot
+    // name different programs.
+    let exe = match exe {
+        Some(exe) => Ok(exe.to_string_lossy().into_owned()),
+        None => std::env::current_exe()
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|e| Fallback::Handoff(format!("no own executable path: {e}"))),
+    };
+    let rendered =
+        exe.and_then(|exe| join_rewritten(&segments, &specs, &jsons, platform, &exe, &root_cwd));
     let Joined {
         text: rewritten,
         spec_files,
@@ -774,58 +796,17 @@ fn lightweight_scan(command: &str) -> (bool, usize, String) {
     (recursive, operand_count, flag_str)
 }
 
-/// Rewrite `command` for a harness-supplied workspace/home, on the unix
-/// platform the `sh`-driven e2e harness runs on. The production serve gate
-/// (`engine_available`) is deliberately bypassed so the harness can drive the
-/// rewrite directly; the analyser's own fallbacks still apply, and so does the
-/// spec-size cap — enforced here, the way the production path enforces it in
-/// [`serve_command`].
-#[cfg(feature = "grep-engine-e2e")]
-fn served_rewrite(command: &str, workspace_root: &Path, home: &Path) -> Option<String> {
-    serve_command(
-        command,
-        workspace_root,
-        Some(home),
-        ShellPlatform::Unix,
-        || true,
-    )
-    .rewritten
-}
-
-#[cfg(feature = "grep-engine-e2e")]
-#[doc(hidden)]
-#[must_use]
-pub fn grep_engine_rewrite_for_test(
-    command: &str,
-    workspace_root: &Path,
-    home: &Path,
-) -> Option<String> {
-    served_rewrite(command, workspace_root, home)
-}
-
-/// Establish the locale-parity verdict for the e2e harness.
-///
-/// The harness's subject is the engine's own equivalence proof — it drives the
-/// served path end to end against the real grep under its own pinned locale —
-/// while the runtime gate has its own tests ([`parity`]); so the harness opens
-/// the gate for its own process instead of measuring. It is a separate export
-/// because the gate's verdict is process-global.
-#[cfg(feature = "grep-engine-e2e")]
-#[doc(hidden)]
-pub fn grep_engine_establish_parity_for_harness() {
-    parity::publish_all_for_harness();
-}
-
 /// Whether a served spec exercises the parallel recursive directory walk
 /// (`-r`/`-R` with at least one directory operand). Cross-file worker ordering
 /// is non-deterministic for such rows, so parity comparisons relax to sorted
 /// line-sets; in-file ordering stays stable. Only the macOS-gated parity matrix
-/// and the e2e harness use this, so every other lane leaves it unused.
+/// and the subprocess differential use this, so every other lane leaves it
+/// unused.
 #[cfg_attr(
-    not(any(all(test, target_os = "macos"), feature = "grep-engine-e2e")),
+    not(all(test, target_os = "macos")),
     expect(
         dead_code,
-        reason = "used only by the macOS-gated parity matrix and the e2e harness"
+        reason = "used only by the macOS-gated differential matrices"
     )
 )]
 fn spec_uses_parallel_walk(spec: &EngineSpec) -> bool {
@@ -834,36 +815,6 @@ fn spec_uses_parallel_walk(spec: &EngineSpec) -> bool {
             .operands
             .iter()
             .any(|op| std::fs::metadata(&op.resolved).is_ok_and(|m| m.is_dir()))
-}
-
-/// Whether the served grep member(s) for `command` exercise the parallel
-/// recursive directory walk (the subprocess harness relaxes its byte-identical
-/// diff to sorted-line comparison for those rows — cross-file worker ordering
-/// is non-deterministic).
-#[cfg(feature = "grep-engine-e2e")]
-#[doc(hidden)]
-#[must_use]
-pub fn served_spec_walks_directory(command: &str, workspace_root: &Path, home: &Path) -> bool {
-    let Ok(analyzed) = analyze_command(command, workspace_root, home, ShellPlatform::Unix, false)
-    else {
-        return false;
-    };
-    analyzed.specs.iter().any(spec_uses_parallel_walk)
-}
-
-/// Split `bytes` on `\n`/`\0` record terminators and sort the non-empty records
-/// byte-wise. Ordering-insensitive output comparison for parallel-walk rows;
-/// shared with the e2e bench so the differential gate uses the same matcher.
-#[cfg(feature = "grep-engine-e2e")]
-#[doc(hidden)]
-#[must_use]
-pub fn grep_sorted_lines(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut v: Vec<&[u8]> = bytes
-        .split(|&b| b == b'\n' || b == b'\0')
-        .filter(|l| !l.is_empty())
-        .collect();
-    v.sort();
-    v
 }
 
 /// The shell tool's pinned `$HOME` — the child shell's synthetic baseline
@@ -4796,7 +4747,7 @@ impl Output {
 
 #[cfg(all(test, target_os = "macos"))]
 mod parity_tests {
-    use super::test_support::{engine_run, engine_run_with_stdin};
+    use super::test_support::{engine_run, engine_run_with_stdin, sorted_lines};
     use super::*;
     use std::process::Command;
 
@@ -4910,7 +4861,8 @@ mod parity_tests {
     }
 
     /// Run the real grep with the spec's fallback argv (the grep member only —
-    /// used for pipeline rows, whose head member the e2e bench covers end-to-end).
+    /// used for pipeline rows, whose head member the subprocess differential
+    /// covers end-to-end).
     fn real_run_fallback(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
         real_run_fallback_with_stdin(spec, &[])
     }
@@ -5094,17 +5046,6 @@ mod parity_tests {
         assert_eq!(ecode, rcode, "exit mismatch for {command}");
     }
 
-    /// Records (separated by `\n` or BSD's `--null`/`-z` `\0` terminator)
-    /// sorted byte-wise; ordering-insensitive parity for parallel-walk rows.
-    fn sorted_lines(bytes: &[u8]) -> Vec<&[u8]> {
-        let mut v: Vec<&[u8]> = bytes
-            .split(|&b| b == b'\n' || b == b'\0')
-            .filter(|l| !l.is_empty())
-            .collect();
-        v.sort();
-        v
-    }
-
     /// The members after the served grep member, rejoined with their
     /// connectors — must survive the rewrite verbatim (stdin-fed rows).
     fn grep_tail(command: &str) -> Option<String> {
@@ -5175,9 +5116,9 @@ mod parity_tests {
     /// `unix_operator_pins`), and stderr-free rows, so a merged `&>` file is the
     /// member's stdout alone. This reproduces the shell's own write only while
     /// the row's result stays below [`OUTPUT_CAP`]; a redirected result above it
-    /// is pinned by the e2e redirect lane in `benches/grep_engine_e2e.rs`, not
-    /// here (the in-process harness can never select [`StdoutDest::File`], so an
-    /// oversized row would compare a capped stream against the whole file).
+    /// is pinned by the subprocess differential (`grep_engine::subprocess_matrix`),
+    /// not here (the in-process harness can never select [`StdoutDest::File`], so
+    /// an oversized row would compare a capped stream against the whole file).
     fn assert_redirect_parity(command: &str, target: &str, ws: &Path, home: &Path) {
         let (specs, _, rewritten, _) = analyze_joined(command, ws, home, false)
             .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
@@ -5198,8 +5139,9 @@ mod parity_tests {
             .unwrap_or_else(|e| panic!("{command}: the original's shell wrote {target}: {e}"));
         assert!(
             eout.len() < OUTPUT_CAP && written.len() < OUTPUT_CAP,
-            "{command}: a result at or above OUTPUT_CAP is pinned by the e2e redirect \
-             lane in benches/grep_engine_e2e.rs, not this capped in-process harness"
+            "{command}: a result at or above OUTPUT_CAP is pinned by the subprocess \
+             differential in grep_engine::subprocess_matrix, not this capped in-process \
+             harness"
         );
         if spec_uses_parallel_walk(&specs[0]) {
             assert_eq!(
@@ -5487,7 +5429,8 @@ mod parity_tests {
             "grep -rn needle '~user'",   // literal path, no such file (stderr row)
             "grep -rn needle ~/\"htree\"", // mixed form: `~/` expands, quoted rest joins
             // ── any-length pipelines: any tail is served verbatim (grep
-            //    member parity; full-pipeline parity lives in the e2e bench).
+            //    member parity; full-pipeline parity lives in the subprocess
+            //    differential).
             //    The 2>&1 row covers the benign ordering only — engine stderr
             //    is buffered to finish while BSD emits at operand-open, so
             //    missing-first or order-sensitive tails diverge (accepted
@@ -6377,8 +6320,8 @@ mod writer_pins {
     /// The destination decides what the result is worth — not the search. A
     /// captured member stops at [`OUTPUT_CAP`] bytes (the parent's pipe reader
     /// caps at the same value); a file the command redirects into gets the whole
-    /// stream. Both are observed here on the engine's own writer; the e2e lane
-    /// observes the fd-1 reading that picks between them.
+    /// stream. Both are observed here on the engine's own writer; the subprocess
+    /// differential observes the fd-1 reading that picks between them.
     #[test]
     fn the_destination_decides_whether_the_result_is_cut() {
         // ~380 KiB of matches in lines far shorter than the cap: long enough to
@@ -6481,6 +6424,19 @@ mod test_support {
         parity::publish_for_test((true, true, true));
     }
 
+    /// The non-empty records of a search result (BSD's `--null`/`-z` `\0`
+    /// terminator included), byte-sorted: the ordering-insensitive comparison the
+    /// recursive rows use, whose cross-file order is the workers'.
+    #[cfg(target_os = "macos")]
+    pub(super) fn sorted_lines(bytes: &[u8]) -> Vec<&[u8]> {
+        let mut records: Vec<&[u8]> = bytes
+            .split(|&b| b == b'\n' || b == b'\0')
+            .filter(|record| !record.is_empty())
+            .collect();
+        records.sort_unstable();
+        records
+    }
+
     /// The temp tree the platform pin modules serve against: a workspace holding
     /// the operand paths their rows name, and a home tree beside it. Bind the
     /// returned `TempDir` for the whole test — dropping it deletes the trees.
@@ -6507,7 +6463,7 @@ mod test_support {
         home: &Path,
         platform: ShellPlatform,
     ) -> (String, Vec<PathBuf>) {
-        let mut serve = serve_command(command, ws, Some(home), platform, || true);
+        let mut serve = serve_command(command, ws, Some(home), platform, || true, None);
         assert!(
             serve.refusal.is_none(),
             "{command}: served, not refused: {:?}",
@@ -6707,14 +6663,28 @@ mod read_only_serve_pins {
         let (_tmp, ws, home) = serve_fixture();
         let command = "grep -n needle src/main.rs";
 
-        let windows = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || true);
+        let windows = serve_command(
+            command,
+            &ws,
+            Some(&home),
+            ShellPlatform::Windows,
+            || true,
+            None,
+        );
         assert!(
             windows.rewritten.is_some(),
             "single-file serving on Windows"
         );
         drop(SpecFiles(windows.spec_files));
 
-        let unix = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+        let unix = serve_command(
+            command,
+            &ws,
+            Some(&home),
+            ShellPlatform::Unix,
+            || true,
+            None,
+        );
         assert!(unix.rewritten.is_none(), "the unix perf gate stays");
         assert_eq!(unix.outcomes.len(), 1);
         assert_eq!(unix.outcomes[0].reason, "single file");
@@ -6864,7 +6834,14 @@ mod refusal_pins {
     /// message names its cause and says the search did not run. Returns the
     /// cause.
     fn refused(command: &str, ws: &Path, home: &Path) -> String {
-        let mut serve = serve_command(command, ws, Some(home), ShellPlatform::Windows, || true);
+        let mut serve = serve_command(
+            command,
+            ws,
+            Some(home),
+            ShellPlatform::Windows,
+            || true,
+            None,
+        );
         assert!(
             serve.rewritten.is_none(),
             "{command}: expected no rewrite (got {:?})",
@@ -6905,11 +6882,25 @@ mod refusal_pins {
             true
         };
 
-        let no_search = serve_command("echo hi", &ws, Some(&home), ShellPlatform::Unix, probe);
+        let no_search = serve_command(
+            "echo hi",
+            &ws,
+            Some(&home),
+            ShellPlatform::Unix,
+            probe,
+            None,
+        );
         assert!(no_search.rewritten.is_none());
         assert_eq!(asked.get(), 0, "a command with no search must not probe");
 
-        let servable = serve_command("grep -rn x .", &ws, Some(&home), ShellPlatform::Unix, probe);
+        let servable = serve_command(
+            "grep -rn x .",
+            &ws,
+            Some(&home),
+            ShellPlatform::Unix,
+            probe,
+            None,
+        );
         assert_eq!(asked.get(), 1, "a servable member asks exactly once");
         assert!(servable.rewritten.is_some());
 
@@ -6919,6 +6910,7 @@ mod refusal_pins {
             Some(&home),
             ShellPlatform::Unix,
             || false,
+            None,
         );
         assert!(unavailable.rewritten.is_none());
         assert_eq!(unavailable.outcomes.len(), 1, "the member is analysed");
@@ -6958,7 +6950,14 @@ mod refusal_pins {
             // its keyword.
             "if true; then export LC_ALL=C; fi; grep -rn needle .",
         ] {
-            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            let serve = serve_command(
+                command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Unix,
+                || true,
+                None,
+            );
             assert!(serve.rewritten.is_none(), "{command}: expected no serve");
             assert_eq!(serve.outcomes.len(), 1, "{command}: the member is analysed");
             assert!(
@@ -6986,7 +6985,14 @@ mod refusal_pins {
             "export LC_ALL=C | grep needle",
             "LC_ALL=C echo hi | grep needle",
         ] {
-            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            let serve = serve_command(
+                command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Unix,
+                || true,
+                None,
+            );
             assert!(
                 serve.rewritten.is_some(),
                 "{command}: expected to be served, got {:?}",
@@ -7002,6 +7008,7 @@ mod refusal_pins {
             Some(&home),
             ShellPlatform::Windows,
             || true,
+            None,
         );
         assert!(
             serve.refusal.is_none(),
@@ -7027,8 +7034,14 @@ mod refusal_pins {
             format!("{image} -V | grep needle"),
             format!("echo hi && {image} -V && grep -rn needle ."),
         ] {
-            let mut serve =
-                serve_command(&command, &ws, Some(&home), ShellPlatform::Windows, || true);
+            let mut serve = serve_command(
+                &command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Windows,
+                || true,
+                None,
+            );
             assert!(
                 serve.refusal.is_none(),
                 "{command}: must be served, not refused: {:?}",
@@ -7269,7 +7282,14 @@ mod refusal_pins {
     fn windows_does_not_refuse_a_grep_word_in_argument_position() {
         let (_tmp, ws, home) = serve_fixture();
         for command in ["echo hi & echo (grep is a tool)", "echo (grep x f.txt)"] {
-            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || true);
+            let serve = serve_command(
+                command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Windows,
+                || true,
+                None,
+            );
             assert!(
                 serve.refusal.is_none(),
                 "{command}: must not be refused: {:?}",
@@ -7290,6 +7310,7 @@ mod refusal_pins {
             Some(&home),
             ShellPlatform::Windows,
             || true,
+            None,
         );
         assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
         assert!(serve.rewritten.is_some(), "a serveable search");
@@ -7327,7 +7348,14 @@ mod refusal_pins {
             // the `+` spelling of the same `find` refuses instead.
             r"find . -exec grep x {} \;",
         ] {
-            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || true);
+            let serve = serve_command(
+                command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Windows,
+                || true,
+                None,
+            );
             assert!(
                 serve.refusal.is_none(),
                 "{command}: must not be refused: {:?}",
@@ -7344,6 +7372,7 @@ mod refusal_pins {
             Some(&home),
             ShellPlatform::Windows,
             || true,
+            None,
         );
         assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
         assert!(serve.rewritten.is_none());
@@ -7359,6 +7388,7 @@ mod refusal_pins {
             Some(&home),
             ShellPlatform::Windows,
             || true,
+            None,
         );
         assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
         assert!(serve.rewritten.is_none());
@@ -7380,7 +7410,14 @@ mod refusal_pins {
             "git grep x",
         ];
         for command in rows {
-            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            let serve = serve_command(
+                command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Unix,
+                || true,
+                None,
+            );
             assert!(
                 serve.refusal.is_none(),
                 "{command}: unix keeps the fallback: {:?}",
@@ -7410,6 +7447,7 @@ mod refusal_pins {
             None,
             ShellPlatform::Windows,
             || true,
+            None,
         );
         assert!(windows.refusal.is_none(), "{:?}", windows.refusal);
         let rewritten = windows.rewritten.take().expect("served with no home");
@@ -7418,7 +7456,14 @@ mod refusal_pins {
         assert!(cwd.ends_with("src"), "tracked cwd: {cwd}");
         drop(SpecFiles(windows.spec_files));
 
-        let unix = serve_command("grep -rn needle .", &ws, None, ShellPlatform::Unix, || true);
+        let unix = serve_command(
+            "grep -rn needle .",
+            &ws,
+            None,
+            ShellPlatform::Unix,
+            || true,
+            None,
+        );
         assert!(unix.rewritten.is_none(), "unix demotes without a home");
         assert!(unix.refusal.is_none(), "and refuses nothing there");
     }
@@ -7436,6 +7481,7 @@ mod refusal_pins {
             Some(&home),
             ShellPlatform::Unix,
             || true,
+            None,
         );
         assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
         assert!(serve.rewritten.is_none());
@@ -7455,6 +7501,7 @@ mod refusal_pins {
             Some(&home),
             ShellPlatform::Unix,
             || true,
+            None,
         );
         assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
         let rewritten = serve.rewritten.take().expect("the sibling is served");
@@ -7473,7 +7520,14 @@ mod refusal_pins {
             "grep -rn x --include=%x% .",
             "grep -rn \"a!b\" .",
         ] {
-            let mut serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            let mut serve = serve_command(
+                command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Unix,
+                || true,
+                None,
+            );
             assert!(serve.refusal.is_none(), "{command}: {:?}", serve.refusal);
             assert!(
                 serve.rewritten.is_some(),
@@ -7501,7 +7555,14 @@ mod plan_pins {
     /// Windows, with the engine probe bypassed. The platform and the probe are
     /// arguments, so the whole decomposition is drivable from this host.
     fn served_with_plan(command: &str, ws: &Path, home: &Path) -> (String, Plan, Vec<PathBuf>) {
-        let mut serve = serve_command(command, ws, Some(home), ShellPlatform::Windows, || true);
+        let mut serve = serve_command(
+            command,
+            ws,
+            Some(home),
+            ShellPlatform::Windows,
+            || true,
+            None,
+        );
         assert!(
             serve.refusal.is_none(),
             "{command}: served, not refused: {:?}",
@@ -7708,7 +7769,14 @@ mod plan_pins {
     fn a_demoted_command_carries_no_plan() {
         let (_tmp, ws, home) = serve_fixture();
         for command in ["grep -rn needle .", "grep -P needle f.txt"] {
-            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || false);
+            let serve = serve_command(
+                command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Windows,
+                || false,
+                None,
+            );
             assert!(
                 serve.plan.is_none(),
                 "{command}: a demotion carries no plan"
@@ -7723,6 +7791,7 @@ mod plan_pins {
             Some(&home),
             ShellPlatform::Unix,
             || true,
+            None,
         );
         assert!(unix.plan.is_none());
         assert!(unix.rewritten.is_some());
@@ -7733,7 +7802,7 @@ mod plan_pins {
 // The reading the module header states, observed from both sides: which text
 // the member is served on, and that the operator is handed back to the shell
 // to perform. The wider differential rows live in the parity matrix and the
-// e2e bench.
+// subprocess differential.
 
 #[cfg(all(test, unix))]
 mod unix_operator_pins {
@@ -8100,7 +8169,14 @@ mod unix_operator_pins {
             "grep -rn needle <(cat f.txt) .",
             "grep -rn needle . >(cat f.txt)",
         ] {
-            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            let serve = serve_command(
+                command,
+                &ws,
+                Some(&home),
+                ShellPlatform::Unix,
+                || true,
+                None,
+            );
             assert!(serve.refusal.is_none(), "{command}: unix never refuses");
             assert!(
                 serve.rewritten.is_none(),

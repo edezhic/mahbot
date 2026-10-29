@@ -111,9 +111,10 @@ const NEG_TAIL_Z: f32 = 2.33;
 /// The encoder scale is absolute and does not move with the negative pool, so
 /// this anchor pins the effective firing cosine.  Provenance: with the
 /// historical floor 0.75 and factor 0.55 the effective firing cosine was
-/// 0.75 + 0.55 × 0.25 = 0.8875 at 90% bench recall; raising the floor to 0.85
-/// at the same factor (firing 0.9325) collapsed recall to 37.5%.  0.89 anchors
-/// recall while the raised floor zeroes the negative bulk.
+/// 0.75 + 0.55 × 0.25 = 0.8875, which recognised 90% of genuine wake
+/// utterances; raising the floor to 0.85 at the same factor (firing 0.9325)
+/// dropped that to 37.5%.  0.89 anchors recall while the raised floor zeroes
+/// the negative bulk.
 const POS_MATCH_COSINE_ANCHOR: f32 = 0.89;
 
 /// Legacy per-frame soft-score factor; the effective static fire factor is its

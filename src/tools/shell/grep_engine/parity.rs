@@ -440,20 +440,6 @@ pub(super) fn publish_for_test(verdict: (bool, bool, bool)) {
     });
 }
 
-/// Publish an all-established verdict for the e2e harness.
-///
-/// The harness's subject is the engine's own equivalence proof against the
-/// pinned locale — it drives the served path end to end and diffs it against the
-/// real grep — while the runtime gate has its own tests; so the harness opens the
-/// gate for the whole of its own process, which neither measures nor refreshes.
-/// This is the one verdict published without a key (the rule [`record`] applies to
-/// measured ones): there is no environment here for a key to name. Nothing here
-/// weakens the harness's assertions.
-#[cfg(feature = "grep-engine-e2e")]
-pub(super) fn publish_all_for_harness() {
-    publish(Established::all());
-}
-
 // ── The differential battery ──────────────────────────────────────────────
 
 /// The battery's tallies, and the verdict they fold into.

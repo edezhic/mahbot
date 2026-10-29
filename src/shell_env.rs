@@ -1233,6 +1233,7 @@ mod tests {
 #[cfg(all(test, unix))]
 mod evidence {
     use super::*;
+    use crate::util::test::built_binary;
     use std::collections::BTreeSet;
 
     /// The names in a newline-separated `NAME=VALUE` listing.
@@ -1266,15 +1267,6 @@ mod evidence {
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
             .collect()
-    }
-
-    /// The path this test's build put the `mahbot` binary at, so the read can ask
-    /// the real binary to dump: `target/debug/mahbot` beside the test harness'
-    /// `target/debug/deps/…`.
-    fn built_binary() -> Option<PathBuf> {
-        let harness = std::env::current_exe().ok()?;
-        let candidate = harness.parent()?.parent()?.join("mahbot");
-        candidate.is_file().then_some(candidate)
     }
 
     /// The same shell the read uses, listing its own environment between two

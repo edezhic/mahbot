@@ -523,10 +523,15 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
-    /// Files that are test-only end to end — `util/test.rs` is `#![cfg(test)]`
-    /// and `db/store_lock_check.rs` is included as `#[cfg(all(unix, test))]`.
+    /// Files that are test-only end to end — `util/test.rs` is `#![cfg(test)]`,
+    /// `db/store_lock_check.rs` is included as `#[cfg(all(unix, test))]`, and the
+    /// grep engine's subprocess matrix as `#[cfg(all(test, target_os = "macos"))]`.
     /// Their spawns are test scaffolding, not commands the service starts.
-    const TEST_ONLY_FILES: [&str; 2] = ["src/util/test.rs", "src/db/store_lock_check.rs"];
+    const TEST_ONLY_FILES: [&str; 3] = [
+        "src/util/test.rs",
+        "src/db/store_lock_check.rs",
+        "src/tools/shell/grep_engine/subprocess_matrix.rs",
+    ];
 
     /// The verdict on a `#[cfg(...)]` predicate, on the question "can this code
     /// be the windows production path?" — `No` is the only verdict that lets the

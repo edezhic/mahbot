@@ -6768,8 +6768,8 @@ mod tests {
 
     /// The product's own binary is judged by its own rule: only its read-only
     /// second words run, everything else — a bare launch, the chrome frontend,
-    /// the configuration, workspace and producing families, a
-    /// bench binary — is refused. The second word is read POSITIONALLY, so
+    /// the configuration, workspace and producing families, the OpenRouter
+    /// provider benchmark — is refused. The second word is read POSITIONALLY, so
     /// `mahbot foo debug` is a refusal too, and the comparison is case-sensitive
     /// on every platform (the binary's command table is too, so `mahbot DEBUG`
     /// names no entry point rather than querying). The path-spelled

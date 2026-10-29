@@ -16,8 +16,8 @@ use std::time::Duration;
 /// reqwest 0.13's `rustls-no-provider` feature leaves the process without a
 /// default `CryptoProvider`; building any `reqwest::Client` without one fails
 /// at build time ("No rustls crypto provider is configured"). Every client
-/// factory must call this before constructing a client — including tests and
-/// benches that build clients directly.
+/// factory must call this before constructing a client — including tests and the
+/// OpenRouter benchmark, which build clients directly.
 ///
 /// Idempotent: a process-local `OnceLock` guarantees the underlying
 /// `install_default` runs at most once. The `AlreadyInstalled` error is also
@@ -603,8 +603,7 @@ impl Drop for TempDownload {
 ///
 /// On every failure path the temp file is removed (a failed rename included);
 /// on success it is atomically renamed into place. A temp file a killed process
-/// left behind is taken by the next fetch of the same file. (The bench-only sync
-/// downloader in `voice_pipeline_e2e_test.rs` stays separate.) The temp name is
+/// left behind is taken by the next fetch of the same file. The temp name is
 /// unique per fetcher, so a concurrent download of the same file can never
 /// interleave writes into this one.
 pub(crate) async fn download_verified(

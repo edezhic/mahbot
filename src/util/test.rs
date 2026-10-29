@@ -1530,3 +1530,16 @@ pub fn noisy_webp(width: u32, height: u32) -> Vec<u8> {
 pub fn canonical_without_verbatim_prefix(path: &Path) -> PathBuf {
     crate::util::strip_verbatim_prefix(&std::fs::canonicalize(path).expect("canonicalize"))
 }
+
+/// The `mahbot` binary this test's own build put beside the harness:
+/// `target/<profile>/mahbot` from `target/<profile>/deps/<test binary>`.
+///
+/// `None` when the binary was never built (a `cargo test --lib` run that did not
+/// build the bin), which each lane reports its own way. Unix-gated with the lanes
+/// that drive it.
+#[cfg(unix)]
+pub(crate) fn built_binary() -> Option<PathBuf> {
+    let harness = std::env::current_exe().ok()?;
+    let candidate = harness.parent()?.parent()?.join("mahbot");
+    candidate.is_file().then_some(candidate)
+}

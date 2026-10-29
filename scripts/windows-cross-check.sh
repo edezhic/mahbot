@@ -1,10 +1,9 @@
 #!/bin/sh
 # Local Windows cross-check: type-checks mahbot (lib + bins + the unit-test
-# target + the benches under the `voice-tests` marker), runs the workspace lint
-# gate with warnings denied, and compiles the lib to a Windows rlib — all for
-# the Windows target. Manual release-gate tool, not wired into any CI, hooks or
-# pipeline. Compile-only: nothing is linked into a runnable binary and nothing
-# of the result is executed.
+# target), runs the workspace lint gate with warnings denied, and compiles the
+# lib to a Windows rlib — all for the Windows target. Manual release-gate tool,
+# not wired into any CI, hooks or pipeline. Compile-only: nothing is linked into
+# a runnable binary and nothing of the result is executed.
 #
 # Its purpose is to keep the Windows-only breakage from creeping back: the
 # project is regularly tested on macOS/Linux only, so without this check the
@@ -122,17 +121,11 @@ export AR_x86_64_pc_windows_gnu="zig ar"
 
 # The real tree, not a copy: nothing here patches the manifest (the audio
 # subsystem and its dependencies are not part of a Windows build at all).
-# Audio benches and the `voice-tests` dev marker: the feature cannot be
-# platform-gated, so these lanes prove the marker enables nothing here and the
-# wake-word bench compiles to its inert stub instead of reaching for the
-# macOS-only audio subsystem.
-echo "==> type-check (lib + bins + tests + audio benches) for $TARGET"
+echo "==> type-check (lib + bins + tests) for $TARGET"
 cargo check --target "$TARGET" --lib --bins --tests
-cargo check --target "$TARGET" --benches --features voice-tests
 
-echo "==> lint (lib + bins + tests + audio benches), warnings denied, for $TARGET"
+echo "==> lint (lib + bins + tests), warnings denied, for $TARGET"
 cargo clippy --target "$TARGET" --lib --bins --tests -- -D warnings
-cargo clippy --target "$TARGET" --benches --features voice-tests -- -D warnings
 
 echo "==> codegen (lib) for $TARGET"
 cargo zigbuild --target "$TARGET" --lib

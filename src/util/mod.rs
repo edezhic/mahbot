@@ -679,8 +679,9 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// subcommand that returned an error — go through these two rather than through the
 /// standard print macros, which panic on a write that really fails (a closed pipe, a
 /// full disk). The subcommand CLIs that always run with wired stdio (the `debug`
-/// verb's own usage and argument errors, chrome, the benchmark) still print through
-/// the macros: a failed write there can only reach a caller that stopped reading.
+/// verb's own usage and argument errors, chrome, the OpenRouter benchmark) still
+/// print through the macros: a failed write there can only reach a caller that
+/// stopped reading.
 /// The families of [`crate::cli`] and `mahbot audio …` print the product's
 /// answer and their own diagnostics through these two writers too:
 /// their exit code, not the delivered text, reports whether the operation was
