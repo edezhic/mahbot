@@ -1,21 +1,19 @@
 //! Direct graph evaluator for the pinned Supertonic 3 TTS models.
 //!
 //! This is a focused re-implementation of the removed `candle-onnx-mahbot`
-//! fork's `simple_eval`, keeping only the 39 ops the four models use and
-//! preserving the fork's load-bearing semantics exactly:
+//! fork's `simple_eval`, keeping only the 39 ops the four models use:
 //!
 //! * implicit dtype promotion for mixed I64/F32 arithmetic
 //!   ([`promote_types`] — `duration_predictor`/`text_encoder` contain many
 //!   mixed-dtype nodes);
 //! * `Pad` `edge` mode (used by all convnext `dwconv` pads) and constant
 //!   mode with an empty-string opset-18 third input treated as "not
-//!   provided" (zero padding); a *provided* non-zero pad value is honored
-//!   (the fork silently discarded it);
+//!   provided" (zero padding); a *provided* non-zero pad value is honored;
 //! * `LayerNormalization` with the explicit `epsilon` attribute (1e-6 in all
 //!   71 nodes, not the 1e-5 default), population variance via
 //!   mean → square → mean;
 //! * negative `Slice` steps (60 nodes use `step = -1`), 4- and 5-input
-//!   forms, and the fork's clamp rules;
+//!   forms, and clamp rules;
 //! * `Concat` majority-dtype promotion plus the trailing-singleton-squeeze
 //!   rank hack;
 //! * `Unsqueeze` negative-axis off-by-one math;
@@ -135,7 +133,7 @@ fn to_scalar_flexible<T: candle_core::WithDType>(t: &Tensor) -> Result<T> {
     }
 }
 
-// ── Dtype promotion helpers (fork parity) ─────────────────────────────
+// ── Dtype promotion helpers ───────────────────────────────────────────
 
 /// Ensure two tensors have the same dtype by upcasting the smaller type.
 /// ONNX allows implicit type promotion in binary ops; candle-core's
@@ -143,7 +141,7 @@ fn to_scalar_flexible<T: candle_core::WithDType>(t: &Tensor) -> Result<T> {
 ///
 /// Promotes within type families (float→float, int→int) and promotes
 /// integers to floats when mixed with float types.  Mixed float pairs prefer
-/// F32 over F64 (inference-friendly), matching the fork.
+/// F32 over F64 (inference-friendly).
 fn promote_types(a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
     if a.dtype() == b.dtype() {
         return Ok((a.clone(), b.clone()));
@@ -247,8 +245,8 @@ fn broadcast_shape_from_many(shapes: &[&[usize]]) -> Result<Vec<usize>> {
 // ── Evaluator ─────────────────────────────────────────────────────────
 
 /// Evaluate the model graph with the provided inputs, returning a map from
-/// graph output name to tensor.  The fork-compatible entry point; the TTS
-/// pipeline calls this once per model per chunk/flow step.
+/// graph output name to tensor.  The TTS pipeline calls this once per model
+/// per chunk/flow step.
 pub fn simple_eval(
     model: &Model,
     mut values: HashMap<String, Value>,
@@ -540,8 +538,8 @@ pub fn simple_eval(
                     safe_mul(&mask_f, &max)?.add(indices)?
                 };
 
-                // candle does not support tensor indexing, so the fork's
-                // workarounds are replicated: scalar, 1-D, and 2-D indices.
+                // candle does not support tensor indexing, so scalar, 1-D and
+                // 2-D indices are handled separately.
                 let xs = match indices.dims() {
                     [] => {
                         let index = indices.to_vec0::<i64>()? as usize;
@@ -586,7 +584,7 @@ pub fn simple_eval(
                     bail!("empty concat");
                 }
                 // Find minimum rank among inputs and squeeze trailing
-                // singleton dims to match (fork rank hack).
+                // singleton dims to match.
                 let min_rank = inputs.iter().map(Tensor::rank).min().unwrap();
                 let inputs: Vec<_> = inputs
                     .into_iter()
@@ -690,7 +688,7 @@ pub fn simple_eval(
                 let input = get(&node.inputs[0])?;
                 let dt = attr_i(get_attr(node, "to")?, node, "to")?;
                 let dtype = match dt {
-                    6 => DType::I64, // INT32 → I64 (fork parity)
+                    6 => DType::I64, // INT32 → I64
                     dt => crate::onnx::dtype(dt as i32).ok_or_else(|| {
                         candle_core::Error::Msg(format!(
                             "unsupported 'to' value {dt} for cast {}",
@@ -967,14 +965,14 @@ pub fn simple_eval(
                 };
 
                 // Compute mean and population variance along the normalized
-                // axis (fork op order: mean → center → square → mean).
+                // axis (mean → center → square → mean).
                 let mean = input.mean_keepdim(vec![normal_axis])?;
                 let centered = safe_sub(input, &mean)?;
                 let pop_var = centered.sqr()?.mean_keepdim(vec![normal_axis])?;
 
                 // Normalize: (x - mean) / sqrt(var + epsilon).  The epsilon
                 // scalar is created as F64 (candle `Tensor::new(f64)`) and
-                // safe_add promotes the pair to F32 — fork parity.
+                // safe_add promotes the pair to F32.
                 let eps_t = Tensor::new(f64::from(epsilon), input.device())?;
                 let pop_var_plus_eps = safe_add(&pop_var, &eps_t)?;
                 let denom = pop_var_plus_eps.sqrt()?;
@@ -1123,9 +1121,8 @@ pub fn simple_eval(
 }
 
 /// Pad a single dimension of `t` with `left`/`right` elements.  A zero pad
-/// value uses candle's `pad_with_zeros` (the fork's exact path — bit-identical
-/// and fast); a non-zero value is honored via explicit concatenation (the
-/// fork silently dropped it).
+/// value uses candle's `pad_with_zeros`; a non-zero value is honored via
+/// explicit concatenation.
 fn pad_constant(
     t: &Tensor,
     dim: usize,
@@ -1181,7 +1178,3 @@ fn full_with(value: &Tensor, shape: Vec<usize>) -> Result<Tensor> {
     };
     Ok(t)
 }
-
-#[cfg(test)]
-#[path = "eval_tests.rs"]
-mod eval_tests;

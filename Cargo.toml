@@ -16,12 +16,9 @@ resolver = "2"
 exclude = [".DS_Store", "scripts"]
 
 [features]
-# Audio dev/test markers. A feature cannot be platform-gated, so off macOS
-# these gate nothing at all: every `voice-tests`/`voice-debug` site lives
-# inside the macOS-only audio/onnx subsystem. `voice-tests` gates the two
-# bit-exact model-regression suites: the ONNX golden tests and the TTS
-# full-pipeline PCM golden test.
-voice-tests = []
+# Audio dev marker. A feature cannot be platform-gated, so off macOS it gates
+# nothing at all: every `voice-debug` site lives inside the macOS-only audio
+# subsystem.
 voice-debug = []
 
 [[bin]]

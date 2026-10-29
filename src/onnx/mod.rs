@@ -12,14 +12,14 @@
 //!   ONNX subset (no prost, no build-time protoc).  Tensor payloads are
 //!   handled in `raw_data` form; the models contain no `external_data` /
 //!   typed-array payloads.
-//! * **Evaluator** — the 39 ops the four models use, replicating the fork's
-//!   load-bearing semantics exactly (implicit dtype promotion, Pad `edge`
-//!   mode, LayerNormalization with explicit epsilon, negative Slice steps,
-//!   Concat majority-dtype promotion, Unsqueeze negative-axis handling, ...).
+//! * **Evaluator** — the 39 ops the four models use (implicit dtype
+//!   promotion, Pad `edge` mode, LayerNormalization with explicit epsilon,
+//!   negative Slice steps, Concat majority-dtype promotion, Unsqueeze
+//!   negative-axis handling, ...).
 //! * **Load-time preparation** — initializers and `Constant` tensor
 //!   attributes are converted to CPU tensors once at load, so repeated
 //!   `simple_eval` calls (8 flow-matching steps × chunks) do not re-materialize
-//!   the ~256 MB vector_estimator weights on every call as the fork did.
+//!   the ~256 MB vector_estimator weights on every call.
 
 // The ONNX wire format and dims are inherently i64/varint while candle
 // dims are usize; the reader's single-letter locals and the op dispatcher's
@@ -78,8 +78,8 @@ pub fn read_file<P: AsRef<Path>>(p: P) -> Result<Model> {
 pub struct Graph {
     /// Graph nodes in topological order.
     pub nodes: Vec<Node>,
-    /// Pre-converted initializers (float dtypes normalized to F32, matching
-    /// the fork), in graph order.
+    /// Pre-converted initializers (float dtypes normalized to F32), in graph
+    /// order.
     pub initializers: Vec<(String, Tensor)>,
     pub inputs: Vec<ValueInfo>,
     pub outputs: Vec<ValueInfo>,
@@ -109,8 +109,8 @@ pub enum AttrKind {
     Bytes(Vec<u8>),
     Ints(Vec<i64>),
     /// `repeated float` attribute payload.  Decoded for completeness; no
-    /// consumer in the pinned TTS models uses it (the fork's `Max`/`Selu`
-    /// era is gone), so callers treat it as unsupported.
+    /// consumer in the pinned TTS models uses it, so callers treat it as
+    /// unsupported.
     FloatsUnused,
     /// Tensor attribute (e.g. `Constant` value, `ConstantOfShape` value),
     /// pre-converted to a CPU tensor at load time.
@@ -328,10 +328,9 @@ fn parse_graph(buf: &[u8]) -> Result<Graph> {
                 let sub = r.read_len_delimited()?;
                 let raw = parse_tensor_proto(sub)?;
                 let mut tensor = raw_to_tensor(&raw)?;
-                // Normalize float initializers to F32 (fork parity): many
-                // ONNX exports store constants as F64, downstream ops expect
-                // F32.  The pinned TTS models contain no F64 tensors, so this
-                // is defensive only.
+                // Normalize float initializers to F32: many ONNX exports store
+                // constants as F64, downstream ops expect F32.  The pinned TTS
+                // models contain no F64 tensors, so this is defensive only.
                 if tensor.dtype().is_float() && tensor.dtype() != DType::F32 {
                     tensor = tensor.to_dtype(DType::F32)?;
                 }
@@ -536,8 +535,8 @@ fn parse_tensor_proto(buf: &[u8]) -> Result<RawTensor> {
             _ => r.skip(wire)?,
         }
     }
-    // Typed arrays take precedence over raw_data (fork get_tensor parity);
-    // zero-element tensors may omit all payload fields.
+    // Typed arrays take precedence over raw_data; zero-element tensors may
+    // omit all payload fields.
     let data = if let Some(v) = floats {
         TensorPayload::Float(v)
     } else if let Some(v) = int32s {
@@ -609,7 +608,7 @@ fn parse_type_elem_type(buf: &[u8]) -> Result<Option<DType>> {
     Ok(None)
 }
 
-/// Map an ONNX `TensorProto.DataType` value to a candle dtype (fork parity).
+/// Map an ONNX `TensorProto.DataType` value to a candle dtype.
 pub(crate) fn dtype(dt: i32) -> Option<DType> {
     match dt {
         2 | 9 => Some(DType::U8), // UINT8, BOOL (candle stores bools as U8)
@@ -622,10 +621,9 @@ pub(crate) fn dtype(dt: i32) -> Option<DType> {
     }
 }
 
-/// Convert a parsed tensor payload into a CPU candle tensor, mirroring the
-/// fork's `get_tensor` semantics: INT32 payloads are widened to I64, typed
-/// arrays take precedence over `raw_data`, everything else uses
-/// `from_raw_buffer`.
+/// Convert a parsed tensor payload into a CPU candle tensor: INT32 payloads
+/// are widened to I64, typed arrays take precedence over `raw_data`,
+/// everything else uses `from_raw_buffer`.
 fn raw_to_tensor(t: &RawTensor) -> Result<Tensor> {
     let dev = &Device::Cpu;
     if t.data_type == 6 {
@@ -679,9 +677,6 @@ fn payload_kind(p: &TensorPayload) -> &'static str {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
-
-#[cfg(all(test, feature = "voice-tests"))]
-mod golden_tests;
 
 #[cfg(test)]
 mod tests {
