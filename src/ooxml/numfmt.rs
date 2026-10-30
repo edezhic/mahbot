@@ -1621,39 +1621,124 @@ mod tests {
         assert_eq!(display(5.0, 164, Some("[$-409]general"), false), None);
     }
 
+    /// The plain, grouped and percentage sections of the builtin table: the places
+    /// a section names decide what is shown, and a `%` scales the value by a
+    /// hundred.
     #[test]
     fn plain_formats_round_pad_and_group() {
-        assert_eq!(by_id(5.4, 1), Some("5".to_owned()));
-        assert_eq!(by_id(5.5, 1), Some("6".to_owned()));
-        assert_eq!(by_id(5.5, 2), Some("5.50".to_owned()));
-        assert_eq!(by_id(1234.0, 3), Some("1,234".to_owned()));
-        assert_eq!(by_id(1234.5, 3), Some("1,235".to_owned()));
-        assert_eq!(by_id(1234.5, 4), Some("1,234.50".to_owned()));
+        for (label, value, id, shown) in [
+            ("a whole section has no places", 5.4, 1_u32, "5"),
+            ("a value on the tie rounds up", 5.5, 1, "6"),
+            ("two places pad a short fraction", 5.5, 2, "5.50"),
+            ("a grouped section prints its commas", 1234.0, 3, "1,234"),
+            ("a grouped section rounds", 1234.5, 3, "1,235"),
+            ("a grouped section keeps two places", 1234.5, 4, "1,234.50"),
+            ("a percentage scales the value", 0.25, 9, "25%"),
+            ("a percentage keeps two places", 0.25, 10, "25.00%"),
+        ] {
+            assert_eq!(by_id(value, id).as_deref(), Some(shown), "{label}");
+        }
     }
 
-    #[test]
-    fn percentages_scale_the_value_by_a_hundred() {
-        assert_eq!(by_id(0.25, 9), Some("25%".to_owned()));
-        assert_eq!(by_id(0.25, 10), Some("25.00%".to_owned()));
-    }
-
+    /// The currency and accounting sections, and the `[$…]` directive a format may
+    /// name: a negative is parenthesised where the format says so, a zero shows the
+    /// dash section, and a directive prints the symbol it names while a directive
+    /// naming no symbol is only a locale.
     #[test]
     fn currency_formats_wrap_negatives_in_parentheses() {
-        assert_eq!(by_id(1234.0, 5), Some("$1,234".to_owned()));
-        assert_eq!(by_id(-1234.0, 5), Some("($1,234)".to_owned()));
-        assert_eq!(by_id(-1234.0, 6), Some("($1,234)".to_owned()));
-        assert_eq!(by_id(-1234.5, 7), Some("($1,234.50)".to_owned()));
-        assert_eq!(by_id(1234.5, 8), Some("$1,234.50".to_owned()));
-    }
-
-    #[test]
-    fn accounting_formats_render_zero_as_the_dash_section() {
-        assert_eq!(by_id(1234.0, 41), Some("1,234".to_owned()));
-        assert_eq!(by_id(-1234.0, 41), Some("(1,234)".to_owned()));
-        assert_eq!(by_id(0.0, 41), Some("-".to_owned()));
-        assert_eq!(by_id(0.0, 42), Some("$-".to_owned()));
-        assert_eq!(by_id(0.0, 43), Some("-".to_owned()));
-        assert_eq!(by_id(0.0, 44), Some("$-".to_owned()));
+        for (label, value, id, code, shown) in [
+            ("a dollar section", 1234.0, 5_u32, None, Some("$1,234")),
+            (
+                "a negative is parenthesised",
+                -1234.0,
+                5,
+                None,
+                Some("($1,234)"),
+            ),
+            (
+                "the plain currency negative section",
+                -1234.0,
+                6,
+                None,
+                Some("($1,234)"),
+            ),
+            (
+                "a negative with places",
+                -1234.5,
+                7,
+                None,
+                Some("($1,234.50)"),
+            ),
+            ("a positive with places", 1234.5, 8, None, Some("$1,234.50")),
+            ("an accounting section", 1234.0, 41, None, Some("1,234")),
+            ("an accounting negative", -1234.0, 41, None, Some("(1,234)")),
+            ("zero shows the dash section", 0.0, 41, None, Some("-")),
+            (
+                "zero in the dollar accounting zero section",
+                0.0,
+                42,
+                None,
+                Some("$-"),
+            ),
+            (
+                "zero in the two-place accounting zero section",
+                0.0,
+                43,
+                None,
+                Some("-"),
+            ),
+            (
+                "zero in the two-place dollar zero section",
+                0.0,
+                44,
+                None,
+                Some("$-"),
+            ),
+            (
+                "a suffix directive",
+                1234.5,
+                164,
+                Some("#,##0.00 [$€-407]"),
+                Some("1,234.50 €"),
+            ),
+            (
+                "a prefix directive",
+                1234.5,
+                164,
+                Some("[$$-409]#,##0.00"),
+                Some("$1,234.50"),
+            ),
+            (
+                "a named symbol",
+                1234.5,
+                164,
+                Some("[$USD-409]#,##0.00"),
+                Some("USD1,234.50"),
+            ),
+            (
+                "a locale-only directive prints nothing",
+                1234.5,
+                164,
+                Some("#,##0.00[$-409]"),
+                Some("1,234.50"),
+            ),
+            (
+                "a BCP-47 locale prints nothing",
+                1234.5,
+                164,
+                Some("[$-en-US]#,##0.00"),
+                Some("1,234.50"),
+            ),
+            (
+                "a system-date directive prints nothing",
+                1234.5,
+                164,
+                Some("[$-x-sysdate]0.0"),
+                Some("1234.5"),
+            ),
+        ] {
+            assert_eq!(display(value, id, code, false).as_deref(), shown, "{label}");
+        }
     }
 
     /// Excel displays a number rounded from the 15 significant decimal digits it
@@ -1663,55 +1748,285 @@ mod tests {
     /// zero.
     #[test]
     fn a_tie_rounds_the_way_excel_displays_it() {
-        assert_eq!(by_id(1.005, 2), Some("1.01".to_owned()));
-        assert_eq!(by_id(0.145, 2), Some("0.15".to_owned()));
-        assert_eq!(by_id(0.285, 2), Some("0.29".to_owned()));
-        assert_eq!(by_id(8.575, 2), Some("8.58".to_owned()));
-        assert_eq!(by_id(2.5, 1), Some("3".to_owned()));
-        assert_eq!(by_id(999.5, 11), Some("1.00E+03".to_owned()));
-        assert_eq!(by_id(0.9995, 11), Some("1.00E+00".to_owned()));
-        assert_eq!(by_id(-0.4, 1), Some("0".to_owned()));
-        assert_eq!(by_id(-0.04, 2), Some("-0.04".to_owned()));
-        assert_eq!(by_id(-0.5, 1), Some("-1".to_owned()));
+        for (label, value, id, shown) in [
+            ("a decimal tie", 1.005, 2_u32, "1.01"),
+            ("a tie from below", 0.145, 2, "0.15"),
+            ("another tie", 0.285, 2, "0.29"),
+            ("a tie in a longer fraction", 8.575, 2, "8.58"),
+            ("a half rounds away from zero", 2.5, 1, "3"),
+            ("a tie rounds into the exponent", 999.5, 11, "1.00E+03"),
+            ("a tie rounds to the next decade", 0.9995, 11, "1.00E+00"),
+            ("a value rounding to nothing has no minus", -0.4, 1, "0"),
+            ("a value keeping a digit keeps its minus", -0.04, 2, "-0.04"),
+            ("a negative half rounds away from zero", -0.5, 1, "-1"),
+        ] {
+            assert_eq!(by_id(value, id).as_deref(), Some(shown), "{label}");
+        }
     }
 
     /// Excel normalises a scientific mantissa into `[1, 10^width)` — `width` the
     /// integer placeholders the section names — so the exponent is a multiple of
-    /// that width and the neighbouring section shapes disagree.
+    /// that width, and the section keeps everything it names after the exponent: a
+    /// `%` scales the value and is printed where it is written, and a literal
+    /// stands where it is written.
     #[test]
     fn scientific_formats_normalise_the_mantissa() {
-        assert_eq!(by_id(12345.678, 11), Some("1.23E+04".to_owned()));
-        assert_eq!(by_id(12345.0, 48), Some("12.3E+3".to_owned()));
-        assert_eq!(by_id(1234.0, 48), Some("1.2E+3".to_owned()));
-        assert_eq!(by_id(1.0, 48), Some("1.0E+0".to_owned()));
-        assert_eq!(by_id(1_000_000.0, 48), Some("1.0E+6".to_owned()));
-        // A `0` placeholder pads the mantissa to its own width; a `#` shows
-        // nothing where the mantissa has no digit.
-        assert_eq!(
-            display(12_345.0, 164, Some("00.0E+0"), false),
-            Some("01.2E+4".to_owned())
-        );
+        for (label, value, id, code, shown) in [
+            (
+                "a two-integer mantissa",
+                12345.678,
+                11_u32,
+                None,
+                "1.23E+04",
+            ),
+            ("three integer places", 12345.0, 48, None, "12.3E+3"),
+            ("one integer place", 1234.0, 48, None, "1.2E+3"),
+            ("a single digit", 1.0, 48, None, "1.0E+0"),
+            ("a million", 1_000_000.0, 48, None, "1.0E+6"),
+            (
+                "a zero placeholder pads the mantissa",
+                12_345.0,
+                164,
+                Some("00.0E+0"),
+                "01.2E+4",
+            ),
+            (
+                "a trailing percent scales and prints",
+                0.25,
+                164,
+                Some("0.00E+00%"),
+                "2.50E+01%",
+            ),
+            (
+                "a percent inside the mantissa is applied once",
+                0.25,
+                164,
+                Some("0.00%E+00"),
+                "2.50%E+01",
+            ),
+            (
+                "a percent ahead of the mantissa",
+                0.25,
+                164,
+                Some("%0.00E+00"),
+                "%2.50E+01",
+            ),
+            (
+                "a literal after the exponent",
+                1234.5,
+                164,
+                Some("0.00E+00\" kg\""),
+                "1.23E+03 kg",
+            ),
+            ("a negative mantissa", -1234.5, 11, None, "-1.23E+03"),
+            (
+                "a trailing comma run scales and is not printed",
+                1.5,
+                164,
+                Some("0.0E+0,,"),
+                "1.5E-6",
+            ),
+        ] {
+            assert_eq!(
+                display(value, id, code, false).as_deref(),
+                Some(shown),
+                "{label}"
+            );
+        }
     }
 
-    /// A value far below the place a format shows rounds to the zero that place
-    /// holds — the display Excel gives it — rather than being declined as a value
-    /// with no display at all.
+    /// Excel uses the first section whose condition holds — not simply the section
+    /// the value's sign names. The first two sections' conditions are tested in
+    /// order, the one that holds serves the value through its own section — as a
+    /// magnitude when the condition itself names the negative side (`[<0]`,
+    /// `[<=-1]`, `[=-3]`) — and a value no condition serves falls to the section
+    /// Excel keeps for what none of them takes. A colour is not a condition.
     #[test]
-    fn a_value_below_the_shown_place_rounds_to_zero() {
-        assert_eq!(by_id(1e-300, 2), Some("0.00".to_owned()));
-        assert_eq!(by_id(5e-324, 2), Some("0.00".to_owned()));
-        assert_eq!(by_id(1e-30, 2), Some("0.00".to_owned()));
-        assert_eq!(by_id(-1e-300, 2), Some("0.00".to_owned()));
+    fn a_conditional_section_serves_the_value_its_condition_names() {
+        for &(label, value, code, shown) in CONDITIONAL_SECTIONS {
+            assert_eq!(
+                display(value, 164, Some(code), false).as_deref(),
+                shown,
+                "{label}"
+            );
+        }
     }
+
+    const CONDITIONAL_SECTIONS: &[(&str, f64, &str, Option<&str>)] = &[
+        (
+            "the first condition holds",
+            500.0,
+            "[>1000]0.0;[<=1000]0.00",
+            Some("500.00"),
+        ),
+        (
+            "the second condition holds",
+            1500.0,
+            "[>1000]0.0;[<=1000]0.00",
+            Some("1500.0"),
+        ),
+        (
+            "a positive through the second section",
+            1234.0,
+            "[<0]\"neg\";0",
+            Some("1234"),
+        ),
+        (
+            "a negative through the first section",
+            -1234.0,
+            "[<0]\"neg\";0",
+            Some("neg"),
+        ),
+        (
+            "a colour is not a condition",
+            1234.0,
+            "[Red]0.0",
+            Some("1234.0"),
+        ),
+        (
+            "a condition after a directive still gates",
+            5000.0,
+            "[$$-409][>100]0.00;0.0",
+            Some("$5000.00"),
+        ),
+        (
+            "a value under the condition",
+            5.0,
+            "[$$-409][>100]0.00;0.0",
+            Some("5.0"),
+        ),
+        (
+            "a negative under the condition",
+            -5.0,
+            "[$$-409][>100]0.00;0.0",
+            Some("-5.0"),
+        ),
+        (
+            "a positive the first condition serves",
+            5.0,
+            "[>=1]0;0",
+            Some("5"),
+        ),
+        (
+            "a negative the second section serves",
+            -2.0,
+            "[>=1]0;0",
+            Some("-2"),
+        ),
+        (
+            "a negative through the second's places",
+            -12.3,
+            "[>=1000000]#,,\" M\";####.00",
+            Some("-12.30"),
+        ),
+        (
+            "a negative through a third section",
+            -2.0,
+            "[>=1]0;0;0.00",
+            Some("2"),
+        ),
+        (
+            "a value no condition takes draws the third section",
+            -2.0,
+            "[>=1]0.0;[>=0]0.0;0.00",
+            Some("-2.00"),
+        ),
+        (
+            "a scaling section keeps its literal",
+            1_021_021.0,
+            "[>=1000000]0.0,,\"M\";[>=1000]0.0,\"K\";0",
+            Some("1.0M"),
+        ),
+        (
+            "the second scaling section",
+            102_102.0,
+            "[>=1000000]0.0,,\"M\";[>=1000]0.0,\"K\";0",
+            Some("102.1K"),
+        ),
+        (
+            "a negative no condition takes",
+            -500.0,
+            "[>=1000000]0.0,,\"M\";[>=1000]0.0,\"K\";0",
+            Some("-500"),
+        ),
+        (
+            "a condition serving a negative shows its magnitude",
+            -2.0,
+            "[>=-1]0;0",
+            Some("2"),
+        ),
+        (
+            "a negative served as a magnitude",
+            -1.0,
+            "[<0]0.0;0.00",
+            Some("1.0"),
+        ),
+        (
+            "a negative against a negative bound",
+            -2.0,
+            "[<=-1]0;0",
+            Some("2"),
+        ),
+        ("an equality condition", -3.0, "[=-3]0;0", Some("3")),
+        (
+            "a minus the section writes itself",
+            -2.0,
+            "[<0]-0.0;0.00",
+            Some("-2.0"),
+        ),
+        (
+            "a value no condition takes draws the fallback",
+            5.0,
+            "[>10]0;0.0;\"n/a\"",
+            Some("n/a"),
+        ),
+        (
+            "a negative falls to the second section",
+            -1.0,
+            "[>10]0;0.0;\"n/a\"",
+            Some("1.0"),
+        ),
+        (
+            "a positive through a condition-less first section",
+            200.0,
+            "0.00;[>100]#,##0",
+            Some("200.00"),
+        ),
+        (
+            "a value no section serves is declined",
+            -5.0,
+            "0.00;[>100]#,##0",
+            None,
+        ),
+        (
+            "a value both conditions miss is declined",
+            -2.0,
+            "[>=1]0;[>=0]0",
+            None,
+        ),
+        (
+            "a text-only section whose minus would be the reader's is declined",
+            -1.0,
+            "[>0]\"plus\";\"minus\"",
+            None,
+        ),
+    ];
 
     #[test]
     fn unsupported_formats_come_back_as_none() {
-        assert_eq!(by_id(1.5, 12), None);
-        assert_eq!(by_id(1.5, 999), None);
-        assert_eq!(
-            display(1.5, 999, Some("0.0"), false),
-            Some("1.5".to_owned())
-        );
+        for (label, value, id, code, shown) in [
+            ("a date section for a fraction", 1.5, 12_u32, None, None),
+            ("an id beyond the table", 1.5, 999, None, None),
+            (
+                "a declared code wins over an unknown id",
+                1.5,
+                999,
+                Some("0.0"),
+                Some("1.5"),
+            ),
+        ] {
+            assert_eq!(display(value, id, code, false).as_deref(), shown, "{label}");
+        }
     }
 
     /// A format no value can be shown through is declined rather than rendered
@@ -1758,129 +2073,96 @@ mod tests {
         }
     }
 
-    /// Excel uses the first section whose condition holds — not simply the
-    /// section the value's sign names.
+    /// The 1900 system counts from its own epoch, `1904` from its, and a section
+    /// carrying both a date and a time appends the clock.
     #[test]
-    fn a_conditional_section_serves_the_value_its_condition_names() {
-        let code = Some("[>1000]0.0;[<=1000]0.00");
-        assert_eq!(display(500.0, 164, code, false), Some("500.00".to_owned()));
-        assert_eq!(display(1500.0, 164, code, false), Some("1500.0".to_owned()));
-        let code = Some("[<0]\"neg\";0");
-        assert_eq!(display(1234.0, 164, code, false), Some("1234".to_owned()));
-        assert_eq!(display(-1234.0, 164, code, false), Some("neg".to_owned()));
-        // A colour is not a condition, so the section still serves its sign.
-        assert_eq!(
-            display(1234.0, 164, Some("[Red]0.0"), false),
-            Some("1234.0".to_owned())
-        );
-        // A condition standing after a currency directive gates the section too,
-        // and the directive still prints its symbol.
-        let code = Some("[$$-409][>100]0.00;0.0");
-        assert_eq!(
-            display(5000.0, 164, code, false),
-            Some("$5000.00".to_owned())
-        );
-        assert_eq!(display(5.0, 164, code, false), Some("5.0".to_owned()));
-        assert_eq!(display(-5.0, 164, code, false), Some("-5.0".to_owned()));
+    fn dates_follow_the_1900_system_by_default() {
+        for (label, value, id, date1904, shown) in [
+            ("a 1900 serial", 45000.0, 14_u32, false, "2023-03-15"),
+            ("the 1900 leap-day fiction", 60.0, 14, false, "1900-02-29"),
+            ("the day after the fiction", 61.0, 14, false, "1900-03-01"),
+            ("a 1904 serial", 45000.0, 14, true, "2027-03-16"),
+            ("the 1904 epoch", 0.0, 14, true, "1904-01-01"),
+            (
+                "a date and a time",
+                45000.5,
+                22,
+                false,
+                "2023-03-15 12:00:00",
+            ),
+        ] {
+            assert_eq!(
+                display(value, id, None, date1904).as_deref(),
+                Some(shown),
+                "{label}"
+            );
+        }
     }
 
-    /// A colour before the condition is still a colour, and the condition still
-    /// gates the section.
+    /// A time-only section prints the units it names, and nothing it does not.
     #[test]
-    fn a_colour_before_a_condition_does_not_hide_it() {
-        let code = Some("[Red][<100]0.0;0");
-        assert_eq!(display(50.0, 164, code, false), Some("50.0".to_owned()));
-        assert_eq!(display(5000.0, 164, code, false), Some("5000".to_owned()));
+    fn time_only_sections_print_the_units_they_name() {
+        for (label, value, id, shown) in [
+            ("a half day is noon", 0.5, 20_u32, "12:00"),
+            ("minutes and seconds alone", 1805.0 / 86_400.0, 45, "30:05"),
+        ] {
+            assert_eq!(by_id(value, id).as_deref(), Some(shown), "{label}");
+        }
     }
 
-    /// Excel's own conditional rule, as the engines that reproduce it measure it:
-    /// the first two sections' conditions are tested in order, the one that holds
-    /// serves the value through its own section — as a magnitude when the condition
-    /// itself names the negative side (`[<0]`, `[<=-1]`, `[=-3]`) — and a value no
-    /// condition serves falls to the section Excel keeps for what none of them takes.
+    /// A section naming fractional seconds shows them, and the section's own
+    /// precision decides the rounding — a `mm:ss.0` rounds at the tenth of a
+    /// second, a `hh:mm:ss` at the second — while an elapsed unit counts the whole
+    /// span, however long.
     #[test]
-    fn a_conditional_format_keeps_a_negative_values_own_sign() {
-        let code = Some("[>=1]0;0");
-        assert_eq!(display(5.0, 164, code, false), Some("5".to_owned()));
-        // The second section serves it, and carries no minus of its own.
-        assert_eq!(display(-2.0, 164, code, false), Some("-2".to_owned()));
-        assert_eq!(
-            display(-12.3, 164, Some("[>=1000000]#,,\" M\";####.00"), false),
-            Some("-12.30".to_owned())
-        );
-        // A longer format keeps a section of its own for the negative side, so a value
-        // no condition serves goes through the second as its magnitude.
-        assert_eq!(
-            display(-2.0, 164, Some("[>=1]0;0;0.00"), false),
-            Some("2".to_owned())
-        );
-        // No condition holds, and the third section a longer format keeps for what
-        // none of them takes is the one that serves the value, minus and all.
-        assert_eq!(
-            display(-2.0, 164, Some("[>=1]0.0;[>=0]0.0;0.00"), false),
-            Some("-2.00".to_owned())
-        );
-        // A section that scales its value keeps its own literals and its sign.
-        let code = Some("[>=1000000]0.0,,\"M\";[>=1000]0.0,\"K\";0");
-        assert_eq!(
-            display(1_021_021.0, 164, code, false),
-            Some("1.0M".to_owned())
-        );
-        assert_eq!(
-            display(102_102.0, 164, code, false),
-            Some("102.1K".to_owned())
-        );
-        assert_eq!(display(-500.0, 164, code, false), Some("-500".to_owned()));
-        // The format's own first section carries no minus: a condition that serves
-        // a negative value through it shows the magnitude, as Excel does.
-        assert_eq!(
-            display(-2.0, 164, Some("[>=-1]0;0"), false),
-            Some("2".to_owned())
-        );
-        assert_eq!(
-            display(-1.0, 164, Some("[<0]0.0;0.00"), false),
-            Some("1.0".to_owned())
-        );
-        assert_eq!(
-            display(-2.0, 164, Some("[<=-1]0;0"), false),
-            Some("2".to_owned())
-        );
-        assert_eq!(
-            display(-3.0, 164, Some("[=-3]0;0"), false),
-            Some("3".to_owned())
-        );
-        // A minus the first section writes itself is still shown.
-        assert_eq!(
-            display(-2.0, 164, Some("[<0]-0.0;0.00"), false),
-            Some("-2.0".to_owned())
-        );
-        // A section stating no condition after one that compares is not the section
-        // Excel falls back to: a value no condition takes draws the third one a
-        // longer format keeps, or the second of a two-section format.
-        assert_eq!(
-            display(5.0, 164, Some("[>10]0;0.0;\"n/a\""), false),
-            Some("n/a".to_owned())
-        );
-        assert_eq!(
-            display(-1.0, 164, Some("[>10]0;0.0;\"n/a\""), false),
-            Some("1.0".to_owned())
-        );
-        // A positive value is read through a first section that states no condition.
-        assert_eq!(
-            display(200.0, 164, Some("0.00;[>100]#,##0"), false),
-            Some("200.00".to_owned())
-        );
-        // A value no section serves is declined: the caller shows the stored text
-        // marked as stored.
-        assert_eq!(display(-5.0, 164, Some("0.00;[>100]#,##0"), false), None);
-        assert_eq!(display(-2.0, 164, Some("[>=1]0;[>=0]0"), false), None);
-        // A text-only section whose minus would be the reader's to write is
-        // declined too: Excel writes its own minus into some such sections and not
-        // others, so the format is not shown with the sign dropped.
-        assert_eq!(
-            display(-1.0, 164, Some("[>0]\"plus\";\"minus\""), false),
-            None
-        );
+    fn a_section_naming_fractional_seconds_shows_them() {
+        for (label, value, id, code, shown) in [
+            (
+                "a tenth of a second rounds at the tenth",
+                0.500_046_3,
+                47_u32,
+                None,
+                "00:04.0",
+            ),
+            (
+                "seconds alone round at the second",
+                0.500_046_3,
+                45,
+                None,
+                "00:04",
+            ),
+            (
+                "three fractional digits",
+                4.492 / 86_400.0,
+                164,
+                Some("hh:mm:ss.000"),
+                "00:00:04.492",
+            ),
+            (
+                "an elapsed hour keeps its tenth",
+                1.5,
+                164,
+                Some("[h]:mm:ss.0"),
+                "36:00:00.0",
+            ),
+        ] {
+            assert_eq!(
+                display(value, id, code, false).as_deref(),
+                Some(shown),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_date_serial_is_declined() {
+        for (label, value, id) in [
+            ("a negative serial", -1.0, 14_u32),
+            // The 1900 system's day 0 is the fake `1900-01-00`, which is no date.
+            ("the 1900 day zero", 0.0, 14),
+        ] {
+            assert_eq!(by_id(value, id), None, "{label}");
+        }
     }
 
     /// The minus the reader writes follows the cell's own number and the section's
@@ -1888,26 +2170,22 @@ mod tests {
     /// cell's, and a minus standing there is not written a second time.
     #[test]
     fn the_reader_writes_the_minus_only_where_no_section_does() {
-        assert_eq!(
-            display(-0.4, 164, Some("\"v1 \"0"), false),
-            Some("v1 0".to_owned())
-        );
-        assert_eq!(
-            display(-1.4, 164, Some("\"v1 \"0"), false),
-            Some("-v1 1".to_owned())
-        );
-        assert_eq!(
-            display(-2.0, 164, Some("-$0.00"), false),
-            Some("-$2.00".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_section_that_shows_nothing_is_none() {
-        assert_eq!(display(5.0, 164, Some(";;;"), false), None);
-        assert_eq!(display(-5.0, 164, Some("0;"), false), None);
-        assert_eq!(display(0.0, 164, Some("#"), false), None);
-        assert_eq!(display(5.0, 164, Some("#"), false), Some("5".to_owned()));
+        for (label, value, code, shown) in [
+            ("a literal digit is no number", -0.4, "\"v1 \"0", "v1 0"),
+            ("the reader writes the minus", -1.4, "\"v1 \"0", "-v1 1"),
+            (
+                "a minus in the section's own text",
+                -2.0,
+                "-$0.00",
+                "-$2.00",
+            ),
+        ] {
+            assert_eq!(
+                display(value, 164, Some(code), false).as_deref(),
+                Some(shown),
+                "{label}"
+            );
+        }
     }
 
     /// The point a section names stands even when the value shows no digit behind
@@ -1917,170 +2195,131 @@ mod tests {
     /// keeps its zero.
     #[test]
     fn a_named_point_stands_and_a_zero_mantissa_follows_its_width() {
-        assert_eq!(
-            display(1.0, 164, Some("#.#####"), false),
-            Some("1.".to_owned())
-        );
-        assert_eq!(
-            display(0.0, 164, Some("#.#####"), false),
-            Some(".".to_owned())
-        );
-        assert_eq!(
-            display(0.5, 164, Some("#.##"), false),
-            Some(".5".to_owned())
-        );
-        assert_eq!(
-            display(1000.0, 164, Some("#,##0.##"), false),
-            Some("1,000.".to_owned())
-        );
-        assert_eq!(display(0.0, 48, None, false), None);
-        assert_eq!(display(0.0, 11, None, false), Some("0.00E+00".to_owned()));
-        assert_eq!(by_id(1234.0, 48), Some("1.2E+3".to_owned()));
-    }
-
-    #[test]
-    fn a_declared_code_wins_with_literals_and_a_negative_section() {
-        let code = Some("#,##0.00\" kr\";[Red](#,##0.00\" kr\")");
-        assert_eq!(
-            display(1234.5, 164, code, false),
-            Some("1,234.50 kr".to_owned())
-        );
-        assert_eq!(
-            display(-1234.5, 164, code, false),
-            Some("(1,234.50 kr)".to_owned())
-        );
-    }
-
-    #[test]
-    fn dates_follow_the_1900_system_by_default() {
-        assert_eq!(by_id(45000.0, 14), Some("2023-03-15".to_owned()));
-        assert_eq!(by_id(60.0, 14), Some("1900-02-29".to_owned()));
-        assert_eq!(by_id(61.0, 14), Some("1900-03-01".to_owned()));
-    }
-
-    #[test]
-    fn dates_follow_the_1904_system_when_asked() {
-        assert_eq!(
-            display(45000.0, 14, None, true),
-            Some("2027-03-16".to_owned())
-        );
-        assert_eq!(display(0.0, 14, None, true), Some("1904-01-01".to_owned()));
-    }
-
-    #[test]
-    fn date_and_time_sections_append_the_clock() {
-        assert_eq!(by_id(45000.5, 22), Some("2023-03-15 12:00:00".to_owned()));
-    }
-
-    #[test]
-    fn time_only_sections_print_the_units_they_name() {
-        assert_eq!(by_id(0.5, 20), Some("12:00".to_owned()));
-        assert_eq!(by_id(1805.0 / 86_400.0, 45), Some("30:05".to_owned()));
-    }
-
-    /// A section naming fractional seconds shows them, and the section's own
-    /// precision decides the rounding — a `mm:ss.0` rounds at the tenth of a
-    /// second, a `hh:mm:ss` at the second.
-    #[test]
-    fn a_section_naming_fractional_seconds_shows_them() {
-        assert_eq!(by_id(0.500_046_3, 47), Some("00:04.0".to_owned()));
-        assert_eq!(by_id(0.500_046_3, 45), Some("00:04".to_owned()));
-        assert_eq!(
-            display(4.492 / 86_400.0, 164, Some("hh:mm:ss.000"), false),
-            Some("00:00:04.492".to_owned())
-        );
-        assert_eq!(
-            display(1.5, 164, Some("[h]:mm:ss.0"), false),
-            Some("36:00:00.0".to_owned())
-        );
-    }
-
-    #[test]
-    fn an_elapsed_unit_counts_the_whole_span() {
-        assert_eq!(by_id(1.5, 46), Some("36:00:00".to_owned()));
-        assert_eq!(display(1.5, 164, Some("[h]"), false), Some("36".to_owned()));
-    }
-
-    #[test]
-    fn a_negative_date_serial_is_declined() {
-        assert_eq!(by_id(-1.0, 14), None);
-        // The 1900 system's day 0 is the fake `1900-01-00`, which is no date.
-        assert_eq!(by_id(0.0, 14), None);
-    }
-
-    #[test]
-    fn a_currency_directive_prints_the_symbol_it_names() {
-        assert_eq!(
-            display(1234.5, 164, Some("#,##0.00 [$€-407]"), false),
-            Some("1,234.50 €".to_owned())
-        );
-        assert_eq!(
-            display(1234.5, 164, Some("[$$-409]#,##0.00"), false),
-            Some("$1,234.50".to_owned())
-        );
-        assert_eq!(
-            display(1234.5, 164, Some("[$USD-409]#,##0.00"), false),
-            Some("USD1,234.50".to_owned())
-        );
-        // A directive naming no symbol is only a locale, and prints nothing —
-        // both the hex LCID Excel writes and the BCP-47 tags a workbook holds.
-        assert_eq!(
-            display(1234.5, 164, Some("#,##0.00[$-409]"), false),
-            Some("1,234.50".to_owned())
-        );
-        assert_eq!(
-            display(1234.5, 164, Some("[$-en-US]#,##0.00"), false),
-            Some("1,234.50".to_owned())
-        );
-        assert_eq!(
-            display(1234.5, 164, Some("[$-x-sysdate]0.0"), false),
-            Some("1234.5".to_owned())
-        );
+        for (label, value, id, code, shown) in [
+            (
+                "the point stands alone",
+                1.0,
+                164_u32,
+                Some("#.#####"),
+                Some("1."),
+            ),
+            (
+                "a zero value still names its point",
+                0.0,
+                164,
+                Some("#.#####"),
+                Some("."),
+            ),
+            (
+                "a fraction with no integer",
+                0.5,
+                164,
+                Some("#.##"),
+                Some(".5"),
+            ),
+            (
+                "a grouped whole part leaves its point",
+                1000.0,
+                164,
+                Some("#,##0.##"),
+                Some("1,000."),
+            ),
+            (
+                "a zero mantissa whose width would widen it is declined",
+                0.0,
+                48,
+                None,
+                None,
+            ),
+            (
+                "a zero mantissa keeps its integer run",
+                0.0,
+                11,
+                None,
+                Some("0.00E+00"),
+            ),
+        ] {
+            assert_eq!(display(value, id, code, false).as_deref(), shown, "{label}");
+        }
     }
 
     /// A literal standing *between* the placeholders keeps its place among the
-    /// digits: a phone number or an identifier is never rendered as its digits
-    /// followed by the format's punctuation.
+    /// digits — a phone number or an identifier is never rendered as its digits
+    /// followed by the format's punctuation — and a `*` fill contributes nothing.
+    /// The `@` text placeholder has no text to stand for in a cell holding a
+    /// number, so the caller shows the stored value instead.
     #[test]
     fn a_literal_between_placeholders_lays_out_with_the_digits() {
-        assert_eq!(
-            display(
+        let phone = "[<=9999999]###-####;(###) ###-####";
+        for (label, value, id, code, shown) in [
+            (
+                "a phone number",
                 5_551_234.0,
-                164,
-                Some("[<=9999999]###-####;(###) ###-####"),
-                false
+                164_u32,
+                Some(phone),
+                Some("555-1234"),
             ),
-            Some("555-1234".to_owned())
-        );
-        assert_eq!(
-            display(
+            (
+                "a parenthesised phone number",
                 5_551_234_567.0,
                 164,
-                Some("[<=9999999]###-####;(###) ###-####"),
-                false
+                Some(phone),
+                Some("(555) 123-4567"),
             ),
-            Some("(555) 123-4567".to_owned())
-        );
-        assert_eq!(
-            display(123_456_789.0, 164, Some("000-00-0000"), false),
-            Some("123-45-6789".to_owned())
-        );
-        // The sign a `%` stands for is a literal like any other: it keeps its place
-        // among the digits, which a value whose digits do not fill the layout cannot.
-        assert_eq!(
-            display(1.0, 164, Some("0%00"), false),
-            Some("1%00".to_owned())
-        );
-        assert_eq!(display(5.0, 164, Some("0%0"), false), None);
-        // A literal only around the body is still a prefix or a suffix.
-        assert_eq!(
-            display(1234.5, 164, Some("\\$#,##0.00"), false),
-            Some("$1,234.50".to_owned())
-        );
-        assert_eq!(
-            display(-1234.5, 164, Some("#,##0.00\" kr\""), false),
-            Some("-1,234.50 kr".to_owned())
-        );
+            (
+                "an identifier",
+                123_456_789.0,
+                164,
+                Some("000-00-0000"),
+                Some("123-45-6789"),
+            ),
+            (
+                "a percent keeps its place among the digits",
+                1.0,
+                164,
+                Some("0%00"),
+                Some("1%00"),
+            ),
+            (
+                "a percent with no digit to hold it",
+                5.0,
+                164,
+                Some("0%0"),
+                None,
+            ),
+            (
+                "an escaped prefix",
+                1234.5,
+                164,
+                Some("\\$#,##0.00"),
+                Some("$1,234.50"),
+            ),
+            (
+                "a quoted suffix",
+                -1234.5,
+                164,
+                Some("#,##0.00\" kr\""),
+                Some("-1,234.50 kr"),
+            ),
+            (
+                "a fill contributes nothing",
+                5_551_234.0,
+                164,
+                Some("###-####* "),
+                Some("555-1234"),
+            ),
+            ("a text-only builtin section", 1.5, 49, None, None),
+            ("a text placeholder beside text", 1.5, 164, Some("@"), None),
+            (
+                "a text placeholder after text",
+                1.5,
+                164,
+                Some("pre @"),
+                None,
+            ),
+        ] {
+            assert_eq!(display(value, id, code, false).as_deref(), shown, "{label}");
+        }
     }
 
     /// An over-wide value, an under-wide one, a fractional part and a grouping
@@ -2089,34 +2328,29 @@ mod tests {
     /// number.
     #[test]
     fn a_layered_body_declines_what_it_cannot_hold() {
-        assert_eq!(
-            display(1_234_567_890.0, 164, Some("000-00-0000"), false),
-            None
-        );
-        assert_eq!(display(12_345_678.0, 164, Some("###-####"), false), None);
-        assert_eq!(
-            display(55_512_345_678.0, 164, Some("(###) ###-####"), false),
-            None
-        );
-        // Fewer digits than places: a literal would stand with no digits beside it.
-        assert_eq!(display(123.0, 164, Some("###-####"), false), None);
-        assert_eq!(
-            display(5_551_234.0, 164, Some("(###) ###-####"), false),
-            None
-        );
-        assert_eq!(display(12_345.0, 164, Some("#,##0-#"), false), None);
-        assert_eq!(display(1234.5, 164, Some("##-###.0"), false), None);
-    }
-
-    /// A `*` fill pads the cell out to its own width, which a line of text has no
-    /// column for: it contributes nothing, wherever it stands.
-    #[test]
-    fn a_fill_contributes_nothing() {
-        assert_eq!(by_id(1234.0, 41), Some("1,234".to_owned()));
-        assert_eq!(
-            display(5_551_234.0, 164, Some("###-####* "), false),
-            Some("555-1234".to_owned())
-        );
+        for (label, value, code) in [
+            ("more digits than places", 1_234_567_890.0, "000-00-0000"),
+            ("a value wider than the layout", 12_345_678.0, "###-####"),
+            (
+                "a value wider than a parenthesised layout",
+                55_512_345_678.0,
+                "(###) ###-####",
+            ),
+            (
+                "fewer digits than places, so no literal keeps its neighbour",
+                123.0,
+                "###-####",
+            ),
+            (
+                "a literal with no digits beside it",
+                5_551_234.0,
+                "(###) ###-####",
+            ),
+            ("a grouping comma in a layered body", 12_345.0, "#,##0-#"),
+            ("a fraction in a layered body", 1234.5, "##-###.0"),
+        ] {
+            assert_eq!(display(value, 164, Some(code), false), None, "{label}");
+        }
     }
 
     /// A section with no placeholder at all is a format's own wording, and only
@@ -2126,71 +2360,22 @@ mod tests {
     /// passed off as the cell's value.
     #[test]
     fn a_placeholder_less_section_is_text_only_when_the_format_asks_for_it() {
-        assert_eq!(by_id(0.0, 41), Some("-".to_owned()));
-        assert_eq!(
-            display(-5.0, 164, Some("0;\"neg\""), false),
-            Some("neg".to_owned())
-        );
-        assert_eq!(
-            display(5.0, 164, Some("\"-\""), false),
-            Some("-".to_owned())
-        );
-        for code in [
-            "[$-419]ДД.ММ.ГГГГ",
-            "General",
-            " General ",
-            "General;General",
-            "%",
-            ",",
-            "[$USD-409]",
+        for (label, value, code, shown) in [
+            ("a quoted text section", -5.0, "0;\"neg\"", Some("neg")),
+            ("a quoted literal", 5.0, "\"-\"", Some("-")),
+            ("a date-format code", 5.0, "[$-419]ДД.ММ.ГГГГ", None),
+            ("General names no placeholder", 5.0, "General", None),
+            ("padding does not hide General", 5.0, " General ", None),
+            ("a repeated General", 5.0, "General;General", None),
+            ("a lone percent", 5.0, "%", None),
+            ("a lone comma", 5.0, ",", None),
+            ("a lone directive", 5.0, "[$USD-409]", None),
         ] {
-            assert_eq!(display(5.0, 164, Some(code), false), None, "{code}");
+            assert_eq!(
+                display(value, 164, Some(code), false).as_deref(),
+                shown,
+                "{label}"
+            );
         }
-    }
-
-    /// A scientific section keeps everything it names after the exponent: a `%`
-    /// scales the value and is printed, and a literal stands where it is written.
-    /// A `%` inside the mantissa is applied once, where it is written.
-    #[test]
-    fn a_scientific_section_keeps_its_scaling_and_its_literals() {
-        assert_eq!(
-            display(0.25, 164, Some("0.00E+00%"), false),
-            Some("2.50E+01%".to_owned())
-        );
-        assert_eq!(
-            display(0.25, 164, Some("0.00%E+00"), false),
-            Some("2.50%E+01".to_owned())
-        );
-        assert_eq!(
-            display(0.25, 164, Some("%0.00E+00"), false),
-            Some("%2.50E+01".to_owned())
-        );
-        assert_eq!(
-            display(1234.5, 164, Some("0.00E+00\" kg\""), false),
-            Some("1.23E+03 kg".to_owned())
-        );
-        assert_eq!(by_id(-1234.5, 11), Some("-1.23E+03".to_owned()));
-        // A trailing `,` run scales the value there too, and is not printed.
-        assert_eq!(
-            display(1.5, 164, Some("0.0E+0,,"), false),
-            Some("1.5E-6".to_owned())
-        );
-    }
-
-    /// The `@` text placeholder has no text to stand for in a cell holding a
-    /// number, so the caller shows the stored value rather than this section's
-    /// literal text.
-    #[test]
-    fn the_text_placeholder_is_declined_for_a_number() {
-        assert_eq!(by_id(1.5, 49), None);
-        assert_eq!(display(1.5, 164, Some("@"), false), None);
-        assert_eq!(display(1.5, 164, Some("pre @"), false), None);
-    }
-
-    #[test]
-    fn a_scientific_exponent_is_as_wide_as_the_section_names() {
-        assert_eq!(by_id(123_456.0, 11), Some("1.23E+05".to_owned()));
-        assert_eq!(by_id(123_456.0, 48), Some("123.5E+3".to_owned()));
-        assert_eq!(by_id(0.000_123_4, 11), Some("1.23E-04".to_owned()));
     }
 }

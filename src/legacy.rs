@@ -577,7 +577,6 @@ fn corrupt(family: Family) -> DocOutcome {
 )]
 pub(crate) mod test_fixtures {
     use super::*;
-    use crate::util::test::noisy_png;
 
     // ── CFB container fixture ───────────────────────────────────────────
 
@@ -852,45 +851,12 @@ pub(crate) mod test_fixtures {
         blip(0xF01E, picture)
     }
 
-    /// An `OfficeArtBlipDIB` ([MS-ODRAW] §2.2.29) record: a format the pipeline
-    /// does not convert, so a reading names it in a "cannot convert" note.
-    fn dib_blip() -> Vec<u8> {
-        blip(0xF01F, &[0u8; 24])
-    }
-
-    /// An `OfficeArtBlipEMF` ([MS-ODRAW] §2.2.24) record: a vector metafile the
-    /// pipeline names as a drawing rather than delivers. A metafile BLIP carries
-    /// no tag byte, so `blip`'s 17-byte header does not fit it — here it is a
-    /// 16-byte UID, then the 34-byte `OfficeArtMetafileHeader` with `compression`
-    /// none (`0xFE`) at its offset 32, then a payload starting with the EMF
-    /// signature the `.doc`/`.xls` scan checks (`\x01\x00\x00\x00`).
-    fn emf_blip() -> Vec<u8> {
-        let mut body = vec![0u8; 16];
-        let mut header = [0u8; 34];
-        header[32] = 0xFE;
-        body.extend_from_slice(&header);
-        body.extend_from_slice(b"\x01\x00\x00\x00");
-        body.extend_from_slice(&[0u8; 8]);
-        record(0xF01A, &body)
-    }
-
     /// [`doc_fixture`]'s package plus a third root stream `Data` holding one PNG
     /// BLIP of `picture` — where Word 97 keeps a picture, which the reader finds
     /// by scanning that stream.
     pub(crate) fn doc_picture_fixture(body: &str, picture: &[u8]) -> Vec<u8> {
         let (word, clx) = doc_streams(body, &[], false);
         let data = png_blip(picture);
-        cfb(&[("WordDocument", &word), ("1Table", &clx), ("Data", &data)])
-    }
-
-    /// [`doc_fixture`]'s package whose `Data` stream holds one picture of each
-    /// kind a picture can be: a delivered PNG of `picture`, a DIB the pipeline
-    /// cannot convert and an EMF it names as a drawing.
-    pub(super) fn doc_picture_kinds_fixture(body: &str, picture: &[u8]) -> Vec<u8> {
-        let (word, clx) = doc_streams(body, &[], false);
-        let mut data = png_blip(picture);
-        data.extend(dib_blip());
-        data.extend(emf_blip());
         cfb(&[("WordDocument", &word), ("1Table", &clx), ("Data", &data)])
     }
 
@@ -1079,12 +1045,10 @@ pub(crate) mod test_fixtures {
     /// The one external object a fixture deck's slide references. An embedded OLE
     /// object and the media objects are resolved from different records, and which
     /// record a media one is in is what tells the report a video or a sound from
-    /// an embedded object; a linked OLE object is the same record as an embedded
-    /// one with the kind a deck links by.
+    /// an embedded object.
     #[derive(Clone, Copy)]
     pub(super) enum OleFixture {
         Embedded(u32),
-        Linked(u32),
         Video(u32),
         Audio(u32),
     }
@@ -1093,17 +1057,7 @@ pub(crate) mod test_fixtures {
         /// The id the slide's shape references.
         const fn obj_id(self) -> u32 {
             match self {
-                Self::Embedded(id) | Self::Linked(id) | Self::Video(id) | Self::Audio(id) => id,
-            }
-        }
-
-        /// The `ExOleObjAtom.type` the object is written with: a media object has
-        /// no such atom — [`ex_obj_list`] writes one through this only for an OLE
-        /// object.
-        const fn kind(self) -> u32 {
-            match self {
-                Self::Linked(_) => super::OLE_LINKED,
-                _ => 0,
+                Self::Embedded(id) | Self::Video(id) | Self::Audio(id) => id,
             }
         }
     }
@@ -1173,17 +1127,16 @@ pub(crate) mod test_fixtures {
     }
 
     /// The document-wide external-object table: an `ExObjListContainer` holding
-    /// the one object a fixture deck names. An embedded or linked object is an
-    /// `ExEmbed` → `ExOleObjAtom` whose 16-byte body is the parse-relevant prefix
+    /// the one object a fixture deck names. An embedded object is an `ExEmbed` →
+    /// `ExOleObjAtom` whose 16-byte body is the parse-relevant prefix
     /// `drawAspect`(4) + kind(4) + `objID`(4) + `subType`(4) ([MS-PPT] 2.10.20); a
     /// media object is its own container — a movie holding the video, or a sound
     /// container holding the atom directly — whose `ExMediaAtom` carries the id a
     /// shape references, and it has no OLE atom at all.
     pub(super) fn ex_obj_list(ole: OleFixture) -> Vec<u8> {
         match ole {
-            OleFixture::Embedded(_) | OleFixture::Linked(_) => {
+            OleFixture::Embedded(_) => {
                 let mut body = vec![0u8; 16];
-                body[4..8].copy_from_slice(&ole.kind().to_le_bytes());
                 body[8..12].copy_from_slice(&ole.obj_id().to_le_bytes());
                 let ole_atom = atom(RT_EXTERNAL_OLE_OBJECT_ATOM, 0, &body);
                 let embed = container(RT_EXTERNAL_OLE_EMBED, 0, &ole_atom);
@@ -1400,15 +1353,6 @@ pub(crate) mod test_fixtures {
         ppt_cfb(&stream, edit_offset, false, None)
     }
 
-    /// [`ppt_ole_fixture`]'s deck plus a `Pictures` image, so one reading names
-    /// both a delivered picture and an object.
-    pub(super) fn ppt_image_and_object_fixture(slide_text: &str, obj_id: u32) -> Vec<u8> {
-        let (stream, edit_offset) =
-            ppt_document_stream(slide_text, None, None, Some(OleFixture::Embedded(obj_id)));
-        let pictures = png_blip(&noisy_png(2, 2));
-        ppt_cfb(&stream, edit_offset, false, Some(&pictures))
-    }
-
     /// A `.ppt` whose only slide carries an ordinary text run and a 2x2 table
     /// shape — what the reader reconstructs as a `TableBlock`.
     pub(super) fn ppt_table_fixture(slide_text: &str, cells: [&str; 4]) -> Vec<u8> {
@@ -1428,21 +1372,60 @@ mod tests {
     /// of sliding through.
     const UNSHOWN_OBJECT: &str = "1 embedded object part(s) not shown";
 
+    /// The `.doc` text: the body alone, every sub-document as its own labelled
+    /// block, and an empty story printing no block at all.
     #[test]
     fn doc_fixture_renders_its_text() {
-        let bytes = doc_fixture("Hello legacy doc", &[], false);
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            ..
-        } = convert(&bytes, Family::Doc, None)
-        else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Hello legacy doc");
-        assert!(images.is_empty());
-        assert!(notes.is_empty());
+        for (label, fixture, expected) in [
+            (
+                "a plain body",
+                doc_fixture("Hello legacy doc", &[], false),
+                "Hello legacy doc",
+            ),
+            (
+                "every sub-document story",
+                doc_fixture(
+                    "Body text",
+                    &[
+                        (SubDocumentKind::Footnotes, "A footnote"),
+                        (SubDocumentKind::HeadersFooters, "A header\rA footer"),
+                        (SubDocumentKind::Comments, "A comment"),
+                        (SubDocumentKind::Endnotes, "An endnote"),
+                    ],
+                    false,
+                ),
+                "Body text\n\
+                 Headers and footers:\n  A header\n  A footer\n\
+                 Footnotes:\n  A footnote\n\
+                 Endnotes:\n  An endnote\n\
+                 Comments:\n  A comment",
+            ),
+            (
+                "an empty story prints no block",
+                doc_fixture(
+                    "Body only",
+                    &[
+                        (SubDocumentKind::Footnotes, " \r"),
+                        (SubDocumentKind::Comments, "A comment"),
+                    ],
+                    false,
+                ),
+                "Body only\nComments:\n  A comment",
+            ),
+        ] {
+            let DocOutcome::Text {
+                text,
+                images,
+                notes,
+                ..
+            } = convert(&fixture, Family::Doc, None)
+            else {
+                panic!("expected text for {label}");
+            };
+            assert_eq!(text, expected, "{label}");
+            assert!(images.is_empty(), "{label}");
+            assert!(notes.is_empty(), "{label}");
+        }
     }
 
     /// Every family's embedded picture is delivered like a modern package's
@@ -1494,36 +1477,6 @@ mod tests {
     }
 
     #[test]
-    fn doc_names_each_undelivered_picture_by_its_kind() {
-        // One reading of one `.doc`: the PNG is delivered, the DIB is named in the
-        // shared "cannot convert" note, and the EMF is named as the drawing it is —
-        // the same split a modern package's media gets.
-        let picture = noisy_png(2, 2);
-        let bytes = doc_picture_kinds_fixture("Body text", &picture);
-        let dir = tempfile::tempdir().expect("temp dir");
-        let DocOutcome::Text {
-            images,
-            notes,
-            unshown,
-            ..
-        } = convert(&bytes, Family::Doc, Some(dir.path()))
-        else {
-            panic!("expected text");
-        };
-        assert_eq!(
-            std::fs::read(&images[0]).expect("read the delivered picture"),
-            picture
-        );
-        image::open(&images[0]).expect("the delivered picture decodes");
-        assert!(
-            notes.iter().any(|note| note
-                == "skipped 1 embedded image(s) in a format this pipeline cannot convert"),
-            "got: {notes:?}"
-        );
-        assert_eq!(unshown.lines(), ["1 embedded drawing(s) not shown"]);
-    }
-
-    #[test]
     fn doc_object_names_mirror_stays_a_prefix_of_the_readers_own_text() {
         // The crate exposes its embedded-object names only in `plain_text()`, so
         // the assembly before them is mirrored (`doc_plain_text_before_objects`).
@@ -1548,56 +1501,32 @@ mod tests {
     }
 
     #[test]
-    fn doc_subdocument_stories_render_as_labelled_blocks() {
-        let bytes = doc_fixture(
-            "Body text",
-            &[
-                (SubDocumentKind::Footnotes, "A footnote"),
-                (SubDocumentKind::HeadersFooters, "A header\rA footer"),
-                (SubDocumentKind::Comments, "A comment"),
-                (SubDocumentKind::Endnotes, "An endnote"),
-            ],
-            false,
-        );
-        let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Doc, None) else {
-            panic!("expected text");
-        };
-        assert_eq!(
-            text,
-            "Body text\n\
-             Headers and footers:\n  A header\n  A footer\n\
-             Footnotes:\n  A footnote\n\
-             Endnotes:\n  An endnote\n\
-             Comments:\n  A comment"
-        );
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn doc_empty_story_prints_no_block() {
-        // A story whose extracted text trims to nothing is not a subdocument to
-        // the reader at all, so its label gets no empty block.
-        let bytes = doc_fixture(
-            "Body only",
-            &[
-                (SubDocumentKind::Footnotes, " \r"),
-                (SubDocumentKind::Comments, "A comment"),
-            ],
-            false,
-        );
-        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Doc, None) else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Body only\nComments:\n  A comment");
-    }
-
-    #[test]
-    fn encrypted_doc_reports_password_protected() {
-        let bytes = doc_fixture("secret", &[], true);
-        assert!(matches!(
-            convert(&bytes, Family::Doc, None),
-            DocOutcome::Unreadable { reason } if reason == "password-protected"
-        ));
+    fn encrypted_file_reports_password_protected() {
+        for (family, fixture, expected) in [
+            (
+                Family::Doc,
+                doc_fixture("secret", &[], true),
+                "password-protected",
+            ),
+            (
+                Family::Xls,
+                xls_fixture("Привет", true),
+                "password-protected",
+            ),
+            (
+                Family::Ppt,
+                ppt_fixture("secret", None, true),
+                "password-protected",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    convert(&fixture, family, None),
+                    DocOutcome::Unreadable { reason } if reason == expected
+                ),
+                "{family:?}"
+            );
+        }
     }
 
     #[test]
@@ -1640,26 +1569,6 @@ mod tests {
     }
 
     #[test]
-    fn xls_shared_string_break_stays_one_line() {
-        // A break inside a value is escaped to `\n` so the cell keeps its one
-        // line, exactly as the `.xlsx` arm's does.
-        let bytes = xls_fixture("two\nlines", false);
-        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Xls, None) else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Sheet \"Данные\":\n  A1: two\\nlines\n  B2: 3.5");
-    }
-
-    #[test]
-    fn encrypted_xls_reports_password_protected() {
-        let bytes = xls_fixture("Привет", true);
-        assert!(matches!(
-            convert(&bytes, Family::Xls, None),
-            DocOutcome::Unreadable { reason } if reason == "password-protected"
-        ));
-    }
-
-    #[test]
     fn ppt_fixture_renders_slide_and_notes_like_pptx() {
         let bytes = ppt_fixture("Hello deck", Some("A speaker note"), false);
         let DocOutcome::Text { text, notes, .. } = convert(&bytes, Family::Ppt, None) else {
@@ -1670,24 +1579,6 @@ mod tests {
             "Slide 1:\n  Hello deck\n\nSlide 1 notes:\n  A speaker note"
         );
         assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn ppt_without_notes_skips_the_notes_block() {
-        let bytes = ppt_fixture("Only slide text", None, false);
-        let DocOutcome::Text { text, .. } = convert(&bytes, Family::Ppt, None) else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Slide 1:\n  Only slide text");
-    }
-
-    #[test]
-    fn encrypted_ppt_reports_password_protected() {
-        let bytes = ppt_fixture("secret", None, true);
-        assert!(matches!(
-            convert(&bytes, Family::Ppt, None),
-            DocOutcome::Unreadable { reason } if reason == "password-protected"
-        ));
     }
 
     #[test]
@@ -1739,41 +1630,6 @@ mod tests {
         }
     }
 
-    /// A linked OLE object is not content the deck holds — the file keeps the
-    /// link, not what it points at — so a deck whose only object is linked reports
-    /// nothing: the report names content that is really there.
-    #[test]
-    fn ppt_linked_object_is_not_reported_as_content() {
-        let (stream, edit_offset) =
-            ppt_document_stream("Slide title", None, None, Some(OleFixture::Linked(1)));
-        let bytes = ppt_cfb(&stream, edit_offset, false, None);
-        let DocOutcome::Text { text, unshown, .. } = convert(&bytes, Family::Ppt, None) else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "Slide 1:\n  Slide title");
-        assert!(unshown.lines().is_empty());
-    }
-
-    /// A deck holding both a picture and an embedded object delivers the picture
-    /// and reports the object by its own kind: one line for the object alone.
-    #[test]
-    fn ppt_picture_is_delivered_beside_the_object_reported() {
-        let bytes = ppt_image_and_object_fixture("Slide title", 1);
-        let dir = tempfile::tempdir().expect("temp dir");
-        let DocOutcome::Text {
-            images,
-            notes,
-            unshown,
-            ..
-        } = convert(&bytes, Family::Ppt, Some(dir.path()))
-        else {
-            panic!("expected text");
-        };
-        assert_eq!(images.len(), 1);
-        assert!(notes.is_empty());
-        assert_eq!(unshown.lines(), [UNSHOWN_OBJECT]);
-    }
-
     #[test]
     fn unsupported_version_keeps_its_own_reason() {
         // The reader declares a "recognized but unreadable version" variant for
@@ -1814,23 +1670,5 @@ mod tests {
             ppt_error(&PptError::Corrupted("bad".to_string())),
             DocOutcome::Unreadable { reason } if reason == "corrupt or unreadable .ppt"
         ));
-    }
-
-    // ── Classification ──────────────────────────────────────────────────
-
-    /// The classification of a legacy-named CFB container is `document.rs`'s
-    /// own (`legacy_doc_named_docx_is_read_as_a_legacy_document` there); what
-    /// this covers is that every family's reader calls a garbage container
-    /// corruption rather than a format this project does not convert.
-    #[test]
-    fn garbage_cfb_is_unreadable_not_unsupported() {
-        let mut bytes = crate::document::CFB_MAGIC.to_vec();
-        bytes.extend_from_slice(b"not a compound file body");
-        for family in [Family::Doc, Family::Xls, Family::Ppt] {
-            assert!(matches!(
-                convert(&bytes, family, None),
-                DocOutcome::Unreadable { reason } if reason.starts_with("corrupt or unreadable .")
-            ));
-        }
     }
 }

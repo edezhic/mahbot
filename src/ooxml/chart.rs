@@ -1018,9 +1018,10 @@ mod tests {
         read_part(xml.as_bytes(), false).lines()
     }
 
-    /// A bar chart's content is printed as its kind, its title, its other text and
-    /// one line per series of category and value — several series each, and the
-    /// category label paired with its value.
+    /// A chart's content is printed as its kind, its title, its other text and one
+    /// line per series of category and value. A rich-text title keeps its
+    /// paragraphs apart, and a data label's own text prints under its own label, so
+    /// a model can tell it from an axis title.
     #[test]
     fn a_chart_is_described_by_its_kind_title_and_series() {
         let plot = format!(
@@ -1030,37 +1031,36 @@ mod tests {
             series("Cost", &["Jan", "Feb"], &["4", "8"]),
         );
         let title = r"<c:title><c:tx><c:rich><a:p><a:r><a:t>Sales by region</a:t></a:r></a:p></c:rich></c:tx></c:title>";
-        let xml = chart_space(&plot, title, "");
-        assert_eq!(
-            lines_of(&xml),
-            [
-                "Chart (column chart):",
-                "  Title: Sales by region",
-                "  Text: Month",
-                "  Series \"Revenue\": Jan: 10, Feb: 20",
-                "  Series \"Cost\": Jan: 4, Feb: 8",
-            ]
-        );
-    }
-
-    /// A rich-text title keeps its paragraphs apart, and a data label's own text
-    /// prints under its own label, so a model can tell it from an axis title.
-    #[test]
-    fn rich_text_paragraphs_and_data_labels_are_kept_apart() {
-        let plot = format!(
+        let labelled = format!(
             r#"<c:barChart><c:barDir val="col"/><c:ser>{}</c:ser><c:dLbls><c:dLbl><c:tx><c:rich><a:p><a:r><a:t>Peak</a:t></a:r></a:p></c:rich></c:tx></c:dLbl></c:dLbls></c:barChart>"#,
             r#"<c:val><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt></c:numCache></c:val>"#,
         );
-        let title = r"<c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p><a:p><a:r><a:t>by region</a:t></a:r></a:p></c:rich></c:tx></c:title>";
-        assert_eq!(
-            lines_of(&chart_space(&plot, title, "")),
-            [
-                "Chart (column chart):",
-                "  Title: Sales by region",
-                "  Label: Peak",
-                "  Series 1: 10",
-            ]
-        );
+        let rich_title = r"<c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p><a:p><a:r><a:t>by region</a:t></a:r></a:p></c:rich></c:tx></c:title>";
+        for (label, xml, shown) in [
+            (
+                "a kind, a title, an axis text and two series",
+                chart_space(&plot, title, ""),
+                &[
+                    "Chart (column chart):",
+                    "  Title: Sales by region",
+                    "  Text: Month",
+                    "  Series \"Revenue\": Jan: 10, Feb: 20",
+                    "  Series \"Cost\": Jan: 4, Feb: 8",
+                ][..],
+            ),
+            (
+                "a rich-text title and a data label kept apart",
+                chart_space(&labelled, rich_title, ""),
+                &[
+                    "Chart (column chart):",
+                    "  Title: Sales by region",
+                    "  Label: Peak",
+                    "  Series 1: 10",
+                ][..],
+            ),
+        ] {
+            assert_eq!(lines_of(&xml), shown, "{label}");
+        }
     }
 
     /// The cache's own format decides how a value is shown, so a date reads as a
@@ -1070,35 +1070,40 @@ mod tests {
     fn a_cached_value_keeps_its_own_number_format() {
         let dates = cache("numCache", Some("mmm-yy"), &["45200", "45231"]);
         let shares = cache("numCache", Some("0.00%"), &["0.25", "0.5"]);
-        let plot = format!(
+        let formatted = format!(
             r#"<c:lineChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Sales</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat>{dates}</c:cat><c:val>{shares}</c:val></c:ser></c:lineChart>"#
         );
-        assert_eq!(
-            lines_of(&chart_space(&plot, "", "")),
-            [
-                "Chart (line chart):",
-                "  Series \"Sales\": 2023-10-01: 25.00%, 2023-11-01: 50.00%",
-            ]
-        );
-
-        // A format this reading does not reproduce is said once, with the number
-        // as stored rather than a display this reader would have to invent.
         let values = cache("numCache", Some("# ?/?"), &["1.5"]);
-        let plot = format!(
+        let unreproduced = format!(
             r#"<c:pieChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Share</c:v></c:pt></c:strCache></c:strRef></c:tx><c:val>{values}</c:val></c:ser></c:pieChart>"#
         );
-        assert_eq!(
-            lines_of(&chart_space(&plot, "", "")),
-            [
-                "Chart (pie chart):",
-                "  Series \"Share\": 1.5 (stored number, format not shown)",
-            ]
-        );
+        for (label, xml, shown) in [
+            (
+                "a date and a percentage",
+                chart_space(&formatted, "", ""),
+                &[
+                    "Chart (line chart):",
+                    "  Series \"Sales\": 2023-10-01: 25.00%, 2023-11-01: 50.00%",
+                ][..],
+            ),
+            (
+                "a format this reading does not reproduce",
+                chart_space(&unreproduced, "", ""),
+                &[
+                    "Chart (pie chart):",
+                    "  Series \"Share\": 1.5 (stored number, format not shown)",
+                ][..],
+            ),
+        ] {
+            assert_eq!(lines_of(&xml), shown, "{label}");
+        }
     }
 
     /// A series without a name is numbered, a chart without a plot type prints no
     /// kind, several plot types are named together, and a scatter chart's x values
-    /// are the labels its y values are paired with.
+    /// are the labels its y values are paired with. A multi-level category list
+    /// prints its levels root first, a group label stated once spanning every point
+    /// under it, and a bubble chart prints each value's size beside it.
     #[test]
     fn kinds_names_and_scatter_are_all_printed() {
         let plot = format!(
@@ -1108,25 +1113,6 @@ mod tests {
             cache("numCache", None, &["1", "2"]),
             cache("numCache", None, &["10", "20"]),
         );
-        assert_eq!(
-            lines_of(&chart_space(&plot, "", "")),
-            [
-                "Chart (stacked bar chart + scatter chart):",
-                "  Series 1: A: 1",
-                "  Series \"Points\": 1: 10, 2: 20",
-            ]
-        );
-        assert_eq!(
-            lines_of(&chart_space("", "", "")),
-            ["Chart:", "  (no values in the chart part)"]
-        );
-    }
-
-    /// A multi-level category list prints its levels root first, a coarser level's
-    /// label spanning the points under it, and a bubble chart prints each value's
-    /// size beside it.
-    #[test]
-    fn multi_level_categories_and_bubble_sizes_are_printed() {
         // The levels are stated innermost first, as a part writes them.
         let two_levels = format!(
             r"<c:multiLvlStrRef><c:multiLvlStrCache>{}{}</c:multiLvlStrCache></c:multiLvlStrRef>",
@@ -1140,63 +1126,68 @@ mod tests {
         );
         let sizes = cache("numCache", None, &["5", "7"]);
         let values = cache("numCache", None, &["10", "20"]);
-        let plot = |categories: &str| {
+        let bubble = |categories: &str| {
             format!(
                 r"<c:bubbleChart><c:ser><c:cat>{categories}</c:cat><c:val>{values}</c:val><c:bubbleSize>{sizes}</c:bubbleSize></c:ser></c:bubbleChart>"
             )
         };
-        assert_eq!(
-            lines_of(&chart_space(&plot(&two_levels), "", "")),
-            [
-                "Chart (bubble chart):",
-                "  Series 1: East / Q1: 10 (size 5), West / Q2: 20 (size 7)",
-            ]
-        );
-        // A group label stated once covers every point of the group.
-        assert_eq!(
-            lines_of(&chart_space(&plot(&spanning), "", "")),
-            [
-                "Chart (bubble chart):",
-                "  Series 1: East / Q1: 10 (size 5), East / Q2: 20 (size 7)",
-            ]
-        );
+        for (label, xml, shown) in [
+            (
+                "several kinds, a numbered series and a scatter chart",
+                chart_space(&plot, "", ""),
+                &[
+                    "Chart (stacked bar chart + scatter chart):",
+                    "  Series 1: A: 1",
+                    "  Series \"Points\": 1: 10, 2: 20",
+                ][..],
+            ),
+            (
+                "a chart naming no kind",
+                chart_space("", "", ""),
+                &["Chart:", "  (no values in the chart part)"][..],
+            ),
+            (
+                "multi-level categories and bubble sizes",
+                chart_space(&bubble(&two_levels), "", ""),
+                &[
+                    "Chart (bubble chart):",
+                    "  Series 1: East / Q1: 10 (size 5), West / Q2: 20 (size 7)",
+                ][..],
+            ),
+            (
+                "a group label stated once spanning its points",
+                chart_space(&bubble(&spanning), "", ""),
+                &[
+                    "Chart (bubble chart):",
+                    "  Series 1: East / Q1: 10 (size 5), East / Q2: 20 (size 7)",
+                ][..],
+            ),
+        ] {
+            assert_eq!(lines_of(&xml), shown, "{label}");
+        }
     }
 
     /// A cut chart part is a loss, not a chart whose content happens to end where
-    /// the package stopped.
+    /// the package stopped — and so is a part nested past the depth bound, a walk
+    /// that would keep a stack entry per level for a document to decide.
     #[test]
     fn a_cut_part_is_a_loss() {
         let cut = r#"<c:chartSpace xmlns:c="x"><c:chart><c:plotArea><c:barChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Revenue</c:v>"#;
-        assert_eq!(
-            read_part(cut.as_bytes(), false).lines(),
-            ["Chart: (the chart part could not be read)"]
-        );
-    }
-
-    /// A point index far beyond any chart allocates nothing: the cache is sparse,
-    /// so the index the part gives a point only names it.
-    #[test]
-    fn a_wild_point_index_allocates_nothing() {
-        let wild = r#"<c:chartSpace xmlns:c="x"><c:chart><c:plotArea><c:barChart><c:ser><c:val><c:numCache><c:pt idx="18446744073709551615"><c:v>1</c:v></c:pt></c:numCache></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
-        assert_eq!(
-            read_part(wild.as_bytes(), false).lines(),
-            ["Chart (column chart):", "  Series 1: 1"]
-        );
-    }
-
-    /// A part nested past the depth bound is a loss rather than a walk that keeps
-    /// a stack entry per level for a document to decide.
-    #[test]
-    fn a_part_nested_past_the_bound_is_a_loss() {
         let deep = format!(
             r#"<c:chartSpace xmlns:c="x"><c:chart><c:plotArea><c:barChart>{}{}</c:barChart></c:plotArea></c:chart></c:chartSpace>"#,
             "<c:x>".repeat(MAX_DEPTH),
             "</c:x>".repeat(MAX_DEPTH),
         );
-        assert_eq!(
-            read_part(deep.as_bytes(), false).lines(),
-            ["Chart: (the chart part could not be read)"]
-        );
+        for (label, part) in [
+            ("a part cut short", cut),
+            ("a part nested past the bound", deep.as_str()),
+        ] {
+            assert_eq!(
+                read_part(part.as_bytes(), false).lines(),
+                ["Chart: (the chart part could not be read)"],
+                "{label}"
+            );
+        }
     }
 
     /// A chart whose values are only referenced states that for the series that
@@ -1205,80 +1196,67 @@ mod tests {
     #[test]
     fn a_chart_without_cached_values_says_where_its_numbers_are() {
         let plot = r#"<c:barChart><c:barDir val="col"/><c:ser><c:tx><c:strRef><c:f>Sheet1!$B$1</c:f></c:strRef></c:tx><c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:val></c:ser></c:barChart>"#;
-        assert_eq!(
-            lines_of(&chart_space(plot, "", "")),
-            [
-                "Chart (column chart):",
-                "  Series 1: (no values in the chart part)",
-            ]
-        );
         let external = r#"<c:externalData r:id="rId1"/>"#;
-        assert_eq!(
-            lines_of(&chart_space(plot, "", external)),
-            [
-                "Chart (column chart):",
-                "  Series 1: (values only in the attached table)",
-            ]
-        );
-        // The title and the series' name the part does carry are still shown.
         let title = r"<c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p></c:rich></c:tx></c:title>";
         let named = r#"<c:barChart><c:barDir val="col"/><c:ser><c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Revenue</c:v></c:pt></c:strCache></c:strRef></c:tx><c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:val></c:ser></c:barChart>"#;
-        assert_eq!(
-            lines_of(&chart_space(named, title, external)),
-            [
-                "Chart (column chart):",
-                "  Title: Sales",
-                "  Series \"Revenue\": (values only in the attached table)",
-            ]
-        );
-        // The labels the missing values would be keyed by are the part's own
-        // content too, so the categories it caches are still printed.
-        let categories = cache("strCache", None, &["Jan", "Feb"]);
         let labelled = format!(
-            r#"<c:barChart><c:barDir val="col"/><c:ser><c:cat>{categories}</c:cat><c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:val></c:ser></c:barChart>"#
+            r#"<c:barChart><c:barDir val="col"/><c:ser><c:cat>{}</c:cat><c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:val></c:ser></c:barChart>"#,
+            cache("strCache", None, &["Jan", "Feb"]),
         );
-        assert_eq!(
-            lines_of(&chart_space(&labelled, "", "")),
-            [
-                "Chart (column chart):",
-                "  Series 1: Jan, Feb (no values in the chart part)",
-            ]
-        );
-        // A chart with one series cached beside one that is not says so for the
-        // series it could not print, rather than dropping it.
         let uncached = r"<c:ser><c:tx><c:strRef><c:f>Sheet1!$C$1</c:f></c:strRef></c:tx><c:val><c:numRef><c:f>Sheet1!$C$2:$C$3</c:f></c:numRef></c:val></c:ser>";
         let mixed = format!(
             r#"<c:barChart><c:barDir val="col"/><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Revenue</c:v></c:pt></c:strCache></c:strRef></c:tx><c:val><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt></c:numCache></c:val></c:ser>{uncached}</c:barChart>"#
         );
-        assert_eq!(
-            lines_of(&chart_space(&mixed, "", "")),
-            [
-                "Chart (column chart):",
-                "  Series \"Revenue\": 10",
-                "  Series 2: (no values in the chart part)",
-            ]
-        );
+        for (label, xml, shown) in [
+            (
+                "a series whose values are only referenced",
+                chart_space(plot, "", ""),
+                &[
+                    "Chart (column chart):",
+                    "  Series 1: (no values in the chart part)",
+                ][..],
+            ),
+            (
+                "a chart with its table attached",
+                chart_space(plot, "", external),
+                &[
+                    "Chart (column chart):",
+                    "  Series 1: (values only in the attached table)",
+                ][..],
+            ),
+            (
+                "the title and the name the part does carry",
+                chart_space(named, title, external),
+                &[
+                    "Chart (column chart):",
+                    "  Title: Sales",
+                    "  Series \"Revenue\": (values only in the attached table)",
+                ][..],
+            ),
+            (
+                "the categories the part still caches",
+                chart_space(&labelled, "", ""),
+                &[
+                    "Chart (column chart):",
+                    "  Series 1: Jan, Feb (no values in the chart part)",
+                ][..],
+            ),
+            (
+                "one cached series beside one that is not",
+                chart_space(&mixed, "", ""),
+                &[
+                    "Chart (column chart):",
+                    "  Series \"Revenue\": 10",
+                    "  Series 2: (no values in the chart part)",
+                ][..],
+            ),
+        ] {
+            assert_eq!(lines_of(&xml), shown, "{label}");
+        }
         // A chart whose every series is uncached keeps its place in the report.
-        let read = read_part(chart_space(plot, "", "").as_bytes(), false);
-        assert!(!read.described());
-    }
-
-    /// A part this reading cannot parse is said to be unreadable, and an extended
-    /// `chartEx` part — a schema of its own — is named as that rather than read as
-    /// a chart with no content.
-    #[test]
-    fn parts_of_another_schema_are_said_not_read() {
-        assert_eq!(
-            read_part(b"<chart/>", false).lines(),
-            ["Chart: (the chart part could not be read)"]
-        );
-        assert_eq!(
-            read_part(
-                br#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData/></cx:chartSpace>"#,
-                false
-            )
-            .lines(),
-            ["Chart: (an extended chart kind, not read)"]
+        assert!(
+            !read_part(chart_space(plot, "", "").as_bytes(), false).described(),
+            "a chart with no cached values is still described"
         );
     }
 
@@ -1300,10 +1278,22 @@ mod tests {
         });
         let plot = format!(r"<c:lineChart>{sers}{axes}</c:lineChart>");
         let lines = lines_of(&chart_space(&plot, "", ""));
-        assert_eq!(lines[0], "Chart (line chart):");
-        assert_eq!(lines.len(), 1 + MAX_TEXTS + 1 + MAX_SERIES + 1);
-        assert_eq!(lines[MAX_TEXTS + 1], format!("  {} more text(s)", 1));
-        assert_eq!(lines.last().map(String::as_str), Some("  2 more series"));
+        assert_eq!(lines[0], "Chart (line chart):", "the kind line");
+        assert_eq!(
+            lines.len(),
+            1 + MAX_TEXTS + 1 + MAX_SERIES + 1,
+            "one line per kept text and series, and one per excess"
+        );
+        assert_eq!(
+            lines[MAX_TEXTS + 1],
+            format!("  {} more text(s)", 1),
+            "the texts past the cap are counted"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("  2 more series"),
+            "the series past the cap are counted"
+        );
         assert!(
             lines[MAX_TEXTS + 2].ends_with(", 3 more value(s)"),
             "{:?}",

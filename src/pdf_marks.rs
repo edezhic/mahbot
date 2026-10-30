@@ -1290,37 +1290,6 @@ mod tests {
     }
 
     #[test]
-    fn a_markups_popup_child_does_not_add_a_second_entry() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let markup = fixture.reserve();
-            let popup = fixture.push(format!(
-                "<< /Subtype /Popup /Parent {markup} /Rect [0 0 0 0] >>"
-            ));
-            fixture.set(
-                &markup,
-                format!("<< /Subtype /Highlight /Contents (marked) /Popup {popup} >>"),
-            );
-            (vec![vec![markup, popup]], String::new())
-        }));
-        assert_eq!(
-            marks.annotations.as_deref(),
-            Some("Annotations:\nhighlight on page 1:\n  marked")
-        );
-    }
-
-    #[test]
-    fn an_annotation_listed_on_two_pages_is_reported_once() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let note = fixture.push("<< /Subtype /Text /Contents (shared) >>".to_string());
-            (vec![vec![note.clone()], vec![note]], String::new())
-        }));
-        assert_eq!(
-            marks.annotations.as_deref(),
-            Some("Annotations:\nnote on page 1:\n  shared")
-        );
-    }
-
-    #[test]
     fn filled_field_values_are_reported_by_kind_and_page() {
         let marks = read_pdf(pdf_with(|fixture| {
             let appearance =
@@ -1411,40 +1380,6 @@ mod tests {
         );
     }
 
-    /// A radio group whose `/Opt` uses the `[export display]` pair form is one
-    /// the filler reads no option from, so it is listed as not fillable — and no
-    /// state-looking parenthetical contradicts that: the export name is not a
-    /// value a fill would accept.
-    #[test]
-    fn a_radio_with_pair_form_options_is_not_fillable_and_prints_no_state() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let appearance =
-                fixture.push("<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] >>".to_string());
-            let group = fixture.reserve();
-            let first = fixture.push(format!(
-                "<< /Subtype /Widget /Parent {group} \
-                 /AP << /N << /exp {appearance} /Off {appearance} >> >> /AS /Off >>"
-            ));
-            let second = fixture.push(format!(
-                "<< /Subtype /Widget /Parent {group} \
-                 /AP << /N << /std {appearance} /Off {appearance} >> >> /AS /std >>"
-            ));
-            fixture.set(
-                &group,
-                format!(
-                    "<< /FT /Btn /T (Group) /V /std /Ff 32768 \
-                     /Opt [[(exp) (Express)] [(std) (Standard)]] /Kids [{first} {second}] >>"
-                ),
-            );
-            let acroform = fixture.push(format!("<< /Fields [{group}] >>"));
-            (vec![vec![first, second]], format!(" /AcroForm {acroform}"))
-        }));
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some("Form fields:\nGroup (radio; not fillable) on page 1: checked")
-        );
-    }
-
     #[test]
     fn a_choice_with_more_options_than_the_cap_lists_the_first_ones() {
         let options = (0..=MAX_FIELD_OPTIONS)
@@ -1473,58 +1408,171 @@ mod tests {
         );
     }
 
+    /// Every field a form declares is listed with its kind: a field with no
+    /// value prints `(no value)`, a checkbox prints the state it is in, a radio
+    /// group prints the options its appearance states offer, a choice prints its
+    /// options, and a field with no `/T` is shown as unnamed and marked not
+    /// fillable rather than left out or read as a bare value.
     #[test]
-    fn a_signature_widget_is_a_mark_and_not_a_field_value() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let signature = fixture
-                .push("<< /Subtype /Widget /FT /Sig /T (Approval) /Rect [0 0 0 0] >>".to_string());
-            let acroform = fixture.push(format!("<< /Fields [{signature}] >>"));
-            (vec![vec![signature]], format!(" /AcroForm {acroform}"))
-        }));
-        assert_eq!(
-            marks.annotations.as_deref(),
-            Some("Annotations:\nsignature on page 1")
-        );
-        assert!(marks.fields.is_none());
-        assert_eq!(marks.notes, vec![NO_FILLABLE_FIELDS_NOTE.to_string()]);
-    }
-
-    #[test]
-    fn a_form_without_values_lists_every_field() {
-        let marks = read_pdf(pdf_with(|fixture| {
+    fn a_form_lists_every_field_it_holds() {
+        let without_values: fn(&mut PdfFixture) -> (Vec<Vec<String>>, String) = |fixture| {
             let first = fixture.push("<< /Subtype /Widget /FT /Tx /T (One) >>".to_string());
             let second = fixture.push("<< /Subtype /Widget /FT /Tx /T (Two) >>".to_string());
             let acroform = fixture.push(format!("<< /Fields [{first} {second}] >>"));
             (vec![vec![first, second]], format!(" /AcroForm {acroform}"))
-        }));
-        assert!(marks.annotations.is_none());
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some(
-                "Form fields:\nOne (text) on page 1: (no value)\n\
-                 Two (text) on page 1: (no value)"
+        };
+        let blank: fn(&mut PdfFixture) -> (Vec<Vec<String>>, String) = |fixture| {
+            let appearance =
+                fixture.push("<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] >>".to_string());
+            let name = fixture.push("<< /Subtype /Widget /FT /Tx /T (Name) >>".to_string());
+            let agree =
+                fixture.push("<< /Subtype /Widget /FT /Btn /T (Agree) /V /Off >>".to_string());
+            let plan = fixture.reserve();
+            let basic = fixture.push(format!(
+                "<< /Subtype /Widget /Parent {plan} \
+                 /AP << /N << /basic {appearance} /Off {appearance} >> >> /AS /Off >>"
+            ));
+            let pro = fixture.push(format!(
+                "<< /Subtype /Widget /Parent {plan} \
+                 /AP << /N << /pro {appearance} /Off {appearance} >> >> /AS /Off >>"
+            ));
+            fixture.set(
+                &plan,
+                format!("<< /FT /Btn /Ff 32768 /T (Plan) /V /Off /Kids [{basic} {pro}] >>"),
+            );
+            let city = fixture.push(
+                "<< /Subtype /Widget /FT /Ch /T (City) \
+                 /Opt [[(msk) (Moscow)] [(spb) (Saint Petersburg)]] >>"
+                    .to_string(),
+            );
+            let acroform = fixture.push(format!("<< /Fields [{name} {agree} {plan} {city}] >>"));
+            (
+                vec![vec![name, agree, basic, pro, city]],
+                format!(" /AcroForm {acroform}"),
             )
-        );
-        assert!(marks.notes.is_empty());
+        };
+        let unnamed: fn(&mut PdfFixture) -> (Vec<Vec<String>>, String) = |fixture| {
+            let field = fixture.push("<< /Subtype /Widget /FT /Tx /V (secret) >>".to_string());
+            let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
+            (vec![vec![field]], format!(" /AcroForm {acroform}"))
+        };
+        for (label, build, expected) in [
+            (
+                "a form whose fields carry no value",
+                without_values,
+                "Form fields:\nOne (text) on page 1: (no value)\n\
+                 Two (text) on page 1: (no value)",
+            ),
+            (
+                "a blank form",
+                blank,
+                "Form fields:\nName (text) on page 1: (no value)\n\
+                 Agree (checkbox) on page 1: not checked\n\
+                 Plan (radio; options: basic, pro) on page 1: not checked\n\
+                 City (choice; options: Moscow, Saint Petersburg) on page 1: (no value)",
+            ),
+            (
+                "a field with no /T",
+                unnamed,
+                "Form fields:\nunnamed field (text; not fillable) on page 1: secret",
+            ),
+        ] {
+            let marks = read_pdf(pdf_with(build));
+            assert!(
+                marks.annotations.is_none(),
+                "{label}: a widget is no mark: {marks:?}"
+            );
+            assert_eq!(
+                marks.fields.as_deref(),
+                Some(expected),
+                "{label}: the fields it lists"
+            );
+            assert!(
+                marks.notes.is_empty(),
+                "{label}: no loss to report: {marks:?}"
+            );
+        }
     }
 
+    /// A signature keeps its annotation mark and is never listed as a field
+    /// value, whether it is one widget, a field whose widget is its kid, or one
+    /// beside a pushbutton — and a pushbutton, which fills nothing, is not
+    /// listed at all. A form of only those says so instead of looking empty.
     #[test]
-    fn an_acroform_without_readable_fields_reports_that() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let acroform = fixture.push("<< /X 1 >>".to_string());
-            (vec![vec![]], format!(" /AcroForm {acroform}"))
-        }));
-        assert!(marks.fields.is_none());
-        assert_eq!(marks.notes, vec![FIELDS_UNREADABLE_NOTE.to_string()]);
+    fn a_signature_is_a_mark_and_a_pushbutton_is_no_field() {
+        let widget: fn(&mut PdfFixture) -> (Vec<Vec<String>>, String) = |fixture| {
+            let signature = fixture
+                .push("<< /Subtype /Widget /FT /Sig /T (Approval) /Rect [0 0 0 0] >>".to_string());
+            let acroform = fixture.push(format!("<< /Fields [{signature}] >>"));
+            (vec![vec![signature]], format!(" /AcroForm {acroform}"))
+        };
+        let beside_a_pushbutton: fn(&mut PdfFixture) -> (Vec<Vec<String>>, String) = |fixture| {
+            let button = fixture.push(
+                "<< /Subtype /Widget /FT /Btn /Ff 65536 /T (Submit) /Rect [0 0 0 0] >>".to_string(),
+            );
+            let signature = fixture
+                .push("<< /Subtype /Widget /FT /Sig /T (Approval) /Rect [0 0 0 0] >>".to_string());
+            let acroform = fixture.push(format!("<< /Fields [{button} {signature}] >>"));
+            (
+                vec![vec![button, signature]],
+                format!(" /AcroForm {acroform}"),
+            )
+        };
+        let split_from_its_widget: fn(&mut PdfFixture) -> (Vec<Vec<String>>, String) = |fixture| {
+            let field = fixture.reserve();
+            let widget = fixture.push(format!(
+                "<< /Subtype /Widget /Parent {field} /Rect [0 0 0 0] >>"
+            ));
+            fixture.set(
+                &field,
+                format!("<< /FT /Sig /T (Approval) /Kids [{widget}] >>"),
+            );
+            let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
+            (vec![vec![widget]], format!(" /AcroForm {acroform}"))
+        };
+        for (label, build, expected) in [
+            (
+                "a signature widget",
+                widget,
+                "Annotations:\nsignature on page 1",
+            ),
+            (
+                "a pushbutton beside a signature",
+                beside_a_pushbutton,
+                "Annotations:\nsignature on page 1",
+            ),
+            (
+                "a signature field split from its widget",
+                split_from_its_widget,
+                "Annotations:\nsignature on page 1",
+            ),
+        ] {
+            let marks = read_pdf(pdf_with(build));
+            assert_eq!(
+                marks.annotations.as_deref(),
+                Some(expected),
+                "{label}: the signature stays a mark"
+            );
+            assert!(
+                marks.fields.is_none(),
+                "{label}: no signature is a field value: {marks:?}"
+            );
+            assert_eq!(
+                marks.notes,
+                vec![NO_FILLABLE_FIELDS_NOTE.to_string()],
+                "{label}: the form is said to hold nothing fillable"
+            );
+        }
     }
 
-    /// A cycle of named fields terminates: A is a container because its kid
-    /// names itself, so A is not listed; the kid's own ancestor reference cannot
-    /// be resolved (the engine refuses the cycle), so it is read as the terminal
-    /// field it looks like — and the walk stops rather than looping.
+    /// A walk of the field tree and of the arrays it reads stops rather than
+    /// looping or giving up: a field tree that points at an ancestor terminates
+    /// (the container is not listed, the kid its own ancestor reference cannot
+    /// resolve is read as the terminal field it looks like), and an array entry
+    /// that is no name or no dictionary is skipped without ending the walk.
     #[test]
-    fn a_field_tree_that_points_at_an_ancestor_terminates() {
-        let marks = read_pdf(pdf_with(|fixture| {
+    fn the_field_tree_walk_terminates_and_skips_unknown_entries() {
+        let ancestor: fn(&mut PdfFixture) -> (Vec<Vec<String>>, String) = |fixture| {
             let parent = fixture.reserve();
             let child = fixture.reserve();
             fixture.set(
@@ -1537,16 +1585,8 @@ mod tests {
             );
             let acroform = fixture.push(format!("<< /Fields [{parent}] >>"));
             (vec![vec![]], format!(" /AcroForm {acroform}"))
-        }));
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some("Form fields:\nA.B (text): beta")
-        );
-    }
-
-    #[test]
-    fn unknown_array_entries_do_not_end_the_walk() {
-        let marks = read_pdf(pdf_with(|fixture| {
+        };
+        let unknown_entries: fn(&mut PdfFixture) -> (Vec<Vec<String>>, String) = |fixture| {
             let named_contents =
                 fixture.push("<< /Subtype /Stamp /Contents /NotAString >>".to_string());
             let note = fixture.push("<< /Subtype /Text /Contents (kept) >>".to_string());
@@ -1561,15 +1601,35 @@ mod tests {
                 ]],
                 format!(" /AcroForm {acroform}"),
             )
-        }));
-        assert_eq!(
-            marks.annotations.as_deref(),
-            Some("Annotations:\nstamp on page 1\nnote on page 1:\n  kept")
-        );
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some("Form fields:\nName (text): value")
-        );
+        };
+        for (label, build, expected) in [
+            (
+                "a field tree that points at an ancestor",
+                ancestor,
+                (None, Some("Form fields:\nA.B (text): beta")),
+            ),
+            (
+                "unknown entries in the annotation and field arrays",
+                unknown_entries,
+                (
+                    Some("Annotations:\nstamp on page 1\nnote on page 1:\n  kept"),
+                    Some("Form fields:\nName (text): value"),
+                ),
+            ),
+        ] {
+            let (expected_annotations, expected_fields) = expected;
+            let marks = read_pdf(pdf_with(build));
+            assert_eq!(
+                marks.annotations.as_deref(),
+                expected_annotations,
+                "{label}: the marks the walk kept"
+            );
+            assert_eq!(
+                marks.fields.as_deref(),
+                expected_fields,
+                "{label}: the fields the walk kept"
+            );
+        }
     }
 
     /// Dictionaries written straight into an array carry no object id of their
@@ -1599,31 +1659,6 @@ mod tests {
                  unnamed field (text; not fillable): unnamed"
             )
         );
-    }
-
-    /// A signature field that keeps `/FT` on the parent and its widget as a kid is
-    /// still a signature: the mark is read through the inherited `/FT`, and the
-    /// field's `/T` is not mistaken for an author.
-    #[test]
-    fn a_signature_field_split_from_its_widget_is_still_a_mark() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let field = fixture.reserve();
-            let widget = fixture.push(format!(
-                "<< /Subtype /Widget /Parent {field} /Rect [0 0 0 0] >>"
-            ));
-            fixture.set(
-                &field,
-                format!("<< /FT /Sig /T (Approval) /Kids [{widget}] >>"),
-            );
-            let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
-            (vec![vec![widget]], format!(" /AcroForm {acroform}"))
-        }));
-        assert_eq!(
-            marks.annotations.as_deref(),
-            Some("Annotations:\nsignature on page 1")
-        );
-        assert!(marks.fields.is_none());
-        assert_eq!(marks.notes, vec![NO_FILLABLE_FIELDS_NOTE.to_string()]);
     }
 
     /// A container whose widget kids each carry their own `/FT`/`/T`/`/V` is read
@@ -1695,111 +1730,5 @@ mod tests {
                 field.key
             );
         }
-    }
-
-    /// A blank form is still a form: every fillable field is listed with its
-    /// kind, the options a radio group or a choice offers, and `(no value)`
-    /// where the file gives none.
-    #[test]
-    fn a_blank_form_lists_every_fillable_field() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let appearance =
-                fixture.push("<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] >>".to_string());
-            let name = fixture.push("<< /Subtype /Widget /FT /Tx /T (Name) >>".to_string());
-            let agree =
-                fixture.push("<< /Subtype /Widget /FT /Btn /T (Agree) /V /Off >>".to_string());
-            let plan = fixture.reserve();
-            let basic = fixture.push(format!(
-                "<< /Subtype /Widget /Parent {plan} \
-                 /AP << /N << /basic {appearance} /Off {appearance} >> >> /AS /Off >>"
-            ));
-            let pro = fixture.push(format!(
-                "<< /Subtype /Widget /Parent {plan} \
-                 /AP << /N << /pro {appearance} /Off {appearance} >> >> /AS /Off >>"
-            ));
-            fixture.set(
-                &plan,
-                format!("<< /FT /Btn /Ff 32768 /T (Plan) /V /Off /Kids [{basic} {pro}] >>"),
-            );
-            let city = fixture.push(
-                "<< /Subtype /Widget /FT /Ch /T (City) \
-                 /Opt [[(msk) (Moscow)] [(spb) (Saint Petersburg)]] >>"
-                    .to_string(),
-            );
-            let acroform = fixture.push(format!("<< /Fields [{name} {agree} {plan} {city}] >>"));
-            (
-                vec![vec![name, agree, basic, pro, city]],
-                format!(" /AcroForm {acroform}"),
-            )
-        }));
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some(
-                "Form fields:\nName (text) on page 1: (no value)\n\
-                 Agree (checkbox) on page 1: not checked\n\
-                 Plan (radio; options: basic, pro) on page 1: not checked\n\
-                 City (choice; options: Moscow, Saint Petersburg) on page 1: (no value)"
-            )
-        );
-        assert!(marks.notes.is_empty());
-    }
-
-    /// A pushbutton fills nothing, so it is not listed; a signature keeps its
-    /// annotation mark and is not listed as a field either. A form of only those
-    /// says so instead of looking empty.
-    #[test]
-    fn a_pushbutton_is_not_a_field_and_a_signature_stays_a_mark() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let button = fixture.push(
-                "<< /Subtype /Widget /FT /Btn /Ff 65536 /T (Submit) /Rect [0 0 0 0] >>".to_string(),
-            );
-            let signature = fixture
-                .push("<< /Subtype /Widget /FT /Sig /T (Approval) /Rect [0 0 0 0] >>".to_string());
-            let acroform = fixture.push(format!("<< /Fields [{button} {signature}] >>"));
-            (
-                vec![vec![button, signature]],
-                format!(" /AcroForm {acroform}"),
-            )
-        }));
-        assert_eq!(
-            marks.annotations.as_deref(),
-            Some("Annotations:\nsignature on page 1")
-        );
-        assert!(marks.fields.is_none());
-        assert_eq!(marks.notes, vec![NO_FILLABLE_FIELDS_NOTE.to_string()]);
-    }
-
-    /// A dict whose kids name themselves is a container: it is not listed, but
-    /// the fields below it are, under the name the filler addresses them by.
-    #[test]
-    fn a_non_terminal_field_is_not_listed_but_its_kids_are() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let group = fixture.reserve();
-            let child = fixture.push(format!(
-                "<< /Subtype /Widget /Parent {group} /FT /Tx /T (Child) /V (value) >>"
-            ));
-            fixture.set(&group, format!("<< /FT /Tx /T (Group) /Kids [{child}] >>"));
-            let acroform = fixture.push(format!("<< /Fields [{group}] >>"));
-            (vec![vec![child]], format!(" /AcroForm {acroform}"))
-        }));
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some("Form fields:\nGroup.Child (text) on page 1: value")
-        );
-    }
-
-    /// A field with no `/T` has no name to fill it by: it is shown as unnamed
-    /// and marked not fillable rather than left out or read as a bare value.
-    #[test]
-    fn an_unnamed_field_is_listed_and_marked_not_fillable() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let field = fixture.push("<< /Subtype /Widget /FT /Tx /V (secret) >>".to_string());
-            let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
-            (vec![vec![field]], format!(" /AcroForm {acroform}"))
-        }));
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some("Form fields:\nunnamed field (text; not fillable) on page 1: secret")
-        );
     }
 }

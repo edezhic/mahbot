@@ -2693,159 +2693,130 @@ mod tests {
         );
     }
 
-    /// A chart a body draws is read where the drawing sits: its kind, title and
-    /// series are printed in the body, and the chart is no longer reported as one
-    /// the reading did not show.
+    // ── Charts ──────────────────────────────────────────────────
+
+    /// A chart is described where the drawing sits, in the body or in a story the
+    /// package prints beside it; one whose story is dropped, or that sits in a
+    /// merge continuation the reading shows no value of, stays a loss the census
+    /// names.
     #[test]
-    fn docx_describes_a_body_chart_where_it_sits() {
+    fn docx_describes_a_chart_where_it_sits_and_keeps_the_ones_it_cannot() {
         let body = r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p><w:p><w:r><w:t>After</w:t></w:r></w:p>"#;
         let document_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
-        let bytes = package(
+        let body_chart = package(
             body,
             &[
                 ("word/_rels/document.xml.rels", &document_rels),
                 ("word/charts/chart1.xml", COLUMN_CHART),
             ],
         );
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text {
-            text,
-            notes,
-            unshown,
-            ..
-        } = convert_docx(&bytes, dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(
-            text,
-            "Before\n\
-             Chart (column chart):\n  \
-             Title: Sales\n  \
-             Series \"Revenue\": Jan: 10, Feb: 20\n\
-             After"
-        );
-        assert!(
-            unshown.lines().is_empty(),
-            "a described chart is no longer a loss: {:?}",
-            unshown.lines()
-        );
-        assert!(notes.is_empty(), "the report carries no loss: {notes:?}");
-    }
-
-    /// A chart a header draws is described where that story prints it: the whole
-    /// package is what a reading shows, so a chart outside the body is not left to
-    /// the report as a count.
-    #[test]
-    fn docx_describes_a_header_chart_where_it_sits() {
-        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+        let header_body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
         let header = r#"<w:hdr><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p></w:hdr>"#;
-        let document_rels = rels(&rel("rId1", "header", "header1.xml"));
-        let header_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
-        let bytes = package(
-            body,
+        let header_document_rels = rels(&rel("rId1", "header", "header1.xml"));
+        let header_chart_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
+        let header_chart = package(
+            header_body,
             &[
-                ("word/_rels/document.xml.rels", &document_rels),
+                ("word/_rels/document.xml.rels", &header_document_rels),
                 ("word/header1.xml", header),
-                ("word/_rels/header1.xml.rels", &header_rels),
+                ("word/_rels/header1.xml.rels", &header_chart_rels),
                 ("word/charts/chart1.xml", COLUMN_CHART),
             ],
         );
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text {
-            text,
-            notes,
-            unshown,
-            ..
-        } = convert_docx(&bytes, dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(
-            text,
-            "Body\n\
-             Header (default):\n  \
-             Chart (column chart):\n    \
-             Title: Sales\n    \
-             Series \"Revenue\": Jan: 10, Feb: 20"
-        );
-        assert!(
-            unshown.lines().is_empty(),
-            "a described chart is no longer a loss: {:?}",
-            unshown.lines()
-        );
-        assert!(notes.is_empty(), "the report carries no loss: {notes:?}");
-    }
 
-    /// A story the walk gives up on takes its charts with it: a chart whose
-    /// content the reading drops is not passed off as described, so the census
-    /// still names it.
-    #[test]
-    fn docx_a_dropped_story_keeps_its_chart_in_the_report() {
-        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+        let dropped_body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
         // The chart is drawn, then the part nests past what the walk reads.
-        let header = format!(
+        let dropped_header = format!(
             r#"<w:hdr><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p>{}"#,
             "<w:p>".repeat(MAX_ELEMENT_DEPTH),
         );
-        let document_rels = rels(&rel("rId1", "header", "header1.xml"));
-        let header_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
-        let bytes = package(
-            body,
+        let dropped = package(
+            dropped_body,
             &[
-                ("word/_rels/document.xml.rels", &document_rels),
-                ("word/header1.xml", &header),
-                ("word/_rels/header1.xml.rels", &header_rels),
+                ("word/_rels/document.xml.rels", &header_document_rels),
+                ("word/header1.xml", &dropped_header),
+                ("word/_rels/header1.xml.rels", &header_chart_rels),
                 ("word/charts/chart1.xml", COLUMN_CHART),
             ],
         );
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, unshown, .. } = convert_docx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(text, "Body", "the part is dropped whole: {text:?}");
-        assert_eq!(
-            unshown.lines(),
-            ["1 chart(s) not shown"],
-            "the chart of a dropped part is still a loss the report names"
+        let merged_body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol/></w:tblGrid><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Origin</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p></w:tc></w:tr></w:tbl>"#;
+        let document_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
+        let merged = package(
+            merged_body,
+            &[
+                ("word/_rels/document.xml.rels", &document_rels),
+                ("word/charts/chart1.xml", COLUMN_CHART),
+            ],
         );
+
+        let cases: Vec<(&str, Vec<u8>, &str, &[&str])> = vec![
+            (
+                "a body chart",
+                body_chart,
+                "Before\n\
+                 Chart (column chart):\n  \
+                 Title: Sales\n  \
+                 Series \"Revenue\": Jan: 10, Feb: 20\n\
+                 After",
+                &[],
+            ),
+            (
+                "a header chart",
+                header_chart,
+                "Body\n\
+                 Header (default):\n  \
+                 Chart (column chart):\n    \
+                 Title: Sales\n    \
+                 Series \"Revenue\": Jan: 10, Feb: 20",
+                &[],
+            ),
+            (
+                "a chart in a story the walk drops",
+                dropped,
+                "Body",
+                &["1 chart(s) not shown"],
+            ),
+            (
+                "a chart in a merge continuation",
+                merged,
+                "Body\nTable 1: 2 rows, 1 column\n  R1: C1: Origin\n  R2: C1 (part of R1C1):",
+                &["1 chart(s) not shown"],
+            ),
+        ];
+        for (label, bytes, expected, expected_unshown) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let DocOutcome::Text {
+                text,
+                notes,
+                unshown,
+                ..
+            } = convert_docx(&bytes, dir.path())
+            else {
+                panic!("{label}: expected Text outcome for a well-formed docx");
+            };
+            assert_eq!(text, expected, "{label}");
+            assert_eq!(unshown.lines(), expected_unshown, "{label}");
+            if expected_unshown.is_empty() {
+                assert!(
+                    notes.is_empty(),
+                    "{label}: a described chart is no loss: {notes:?}"
+                );
+            }
+        }
     }
 
-    /// A chart drawn in a merge continuation is not described: the cell shows no
-    /// value of its own, so the content that value carries is not printed either —
-    /// and the census keeps the chart rather than letting it vanish from both.
-    #[test]
-    fn docx_a_chart_in_a_merge_continuation_stays_a_loss() {
-        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol/></w:tblGrid><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Origin</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p></w:tc></w:tr></w:tbl>"#;
-        let document_rels = rels(&rel("rId1", "chart", "charts/chart1.xml"));
-        let bytes = package(
-            body,
-            &[
-                ("word/_rels/document.xml.rels", &document_rels),
-                ("word/charts/chart1.xml", COLUMN_CHART),
-            ],
-        );
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, unshown, .. } = convert_docx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(
-            text, "Body\nTable 1: 2 rows, 1 column\n  R1: C1: Origin\n  R2: C1 (part of R1C1):",
-            "the continuation shows no value: {text:?}"
-        );
-        assert_eq!(
-            unshown.lines(),
-            ["1 chart(s) not shown"],
-            "a chart the reading did not print stays in the report"
-        );
-    }
+    // ── Tables ──────────────────────────────────────────────────
 
     /// A table is one block: a labelled header, one line per row, one token per
-    /// cell — and a `vMerge` continuation names its origin instead of repeating
-    /// the value under a new column.
+    /// cell. A `gridSpan` names the columns a cell covers with or without a
+    /// `vMerge`, and a `vMerge` continuation names its origin instead of
+    /// repeating a value stored in it.
     #[test]
     fn docx_renders_table_rows_cells_and_merges() {
-        let body = r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p><w:tbl>
+        let cases = [
+            (
+                "a spanning start and a vertical continuation",
+                r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p><w:tbl>
 <w:tblGrid><w:gridCol/><w:gridCol/><w:gridCol/></w:tblGrid>
 <w:tr>
 <w:tc><w:tcPr><w:vMerge w:val="restart"/><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Merged</w:t></w:r></w:p></w:tc>
@@ -2856,85 +2827,77 @@ mod tests {
 <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
 <w:tc><w:p><w:r><w:t>Y</w:t></w:r></w:p></w:tc>
 </w:tr>
-</w:tbl>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Before\n\
-             Table 1: 2 rows, 3 columns\n  \
-             R1: C1 (spans C1-C2): Merged | C3: X\n  \
-             R2: C1 (part of R1C1): | C2 (part of R1C1): | C3: Y"
-        );
-    }
-
-    /// The common single-row horizontal merge carries no `w:vMerge` at all, and
-    /// its cell still says which columns it covers.
-    #[test]
-    fn docx_spans_a_merge_without_a_vertical_one() {
-        let body = r#"<w:tbl><w:tblGrid><w:gridCol/><w:gridCol/><w:gridCol/></w:tblGrid>
+</w:tbl>"#,
+                "Before\n\
+                 Table 1: 2 rows, 3 columns\n  \
+                 R1: C1 (spans C1-C2): Merged | C3: X\n  \
+                 R2: C1 (part of R1C1): | C2 (part of R1C1): | C3: Y",
+            ),
+            (
+                "a horizontal merge with no vertical one",
+                r#"<w:tbl><w:tblGrid><w:gridCol/><w:gridCol/><w:gridCol/></w:tblGrid>
 <w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Merged header</w:t></w:r></w:p></w:tc>
 <w:tc><w:p><w:r><w:t>Third</w:t></w:r></w:p></w:tc></w:tr>
-</w:tbl>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Table 1: 1 row, 3 columns\n  R1: C1 (spans C1-C2): Merged header | C3: Third"
-        );
-    }
-
-    /// A continuation is not a value of its own, even when the producer stored
-    /// one in it: the value belongs to the cell it names.
-    #[test]
-    fn docx_does_not_repeat_a_merge_continuation_value() {
-        let body = r#"<w:tbl><w:tblGrid><w:gridCol/></w:tblGrid>
+</w:tbl>"#,
+                "Table 1: 1 row, 3 columns\n  R1: C1 (spans C1-C2): Merged header | C3: Third",
+            ),
+            (
+                "a continuation that stored its own value",
+                r#"<w:tbl><w:tblGrid><w:gridCol/></w:tblGrid>
 <w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Merged</w:t></w:r></w:p></w:tc></w:tr>
 <w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>Merged</w:t></w:r></w:p></w:tc></w:tr>
-</w:tbl>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Table 1: 2 rows, 1 column\n  \
-             R1: C1: Merged\n  \
-             R2: C1 (part of R1C1):"
-        );
+</w:tbl>"#,
+                "Table 1: 2 rows, 1 column\n  \
+                 R1: C1: Merged\n  \
+                 R2: C1 (part of R1C1):",
+            ),
+        ];
+        for (label, body, expected) in cases {
+            assert_eq!(text_of(&package(body, &[])), expected, "{label}");
+        }
     }
 
     /// The geometry a package asks for is clamped, so a `w:gridSpan` or a
     /// `w:gridBefore` of four billion columns cannot decide how much the walk
-    /// allocates.
+    /// allocates — and a row's cells add up, so the running column is clamped as
+    /// well: a row of wide cells sizes the merge map no more than one wide cell.
     #[test]
-    fn docx_clamps_document_controlled_table_geometry() {
-        let body = r#"<w:tbl><w:tblGrid><w:gridCol/></w:tblGrid>
+    fn docx_bounds_the_geometry_a_row_of_wide_cells_adds_up_to() {
+        let clamped = r#"<w:tbl><w:tblGrid><w:gridCol/></w:tblGrid>
 <w:tr><w:tc><w:tcPr><w:gridSpan w:val="4000000000"/></w:tcPr><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr>
 <w:tr><w:trPr><w:gridBefore w:val="4000000000"/></w:trPr><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr>
 </w:tbl>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Table 1: 2 rows, 256 columns\n  \
-             R1: C1 (spans C1-C256): A\n  \
-             R2: C256: B"
-        );
-    }
-
-    /// A row's cells add up, so the running column is clamped as well: a row of
-    /// wide cells sizes the merge map no more than one wide cell does.
-    #[test]
-    fn docx_bounds_the_geometry_a_row_of_wide_cells_adds_up_to() {
         let cell = |text: &str| {
             format!(
                 r#"<w:tc><w:tcPr><w:gridSpan w:val="4000000000"/></w:tcPr>\
 <w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>"#
             )
         };
-        let body = format!(
+        let wide_row = format!(
             "<w:tbl><w:tr>{}{}{}{}</w:tr></w:tbl>",
             cell("A"),
             cell("B"),
             cell("C"),
             cell("D")
         );
-        assert_eq!(
-            text_of(&package(&body, &[])),
-            "Table 1: 1 row, 256 columns\n  \
-             R1: C1 (spans C1-C256): A | C256: B | C256: C | C256: D"
-        );
+        let cases = [
+            (
+                "a four-billion-column span and gridBefore",
+                clamped,
+                "Table 1: 2 rows, 256 columns\n  \
+                 R1: C1 (spans C1-C256): A\n  \
+                 R2: C256: B",
+            ),
+            (
+                "a row of wide cells that add up",
+                wide_row.as_str(),
+                "Table 1: 1 row, 256 columns\n  \
+                 R1: C1 (spans C1-C256): A | C256: B | C256: C | C256: D",
+            ),
+        ];
+        for (label, body, expected) in cases {
+            assert_eq!(text_of(&package(body, &[])), expected, "{label}");
+        }
     }
 
     /// A table nested in a cell is numbered after the table that holds it, and
@@ -2975,65 +2938,58 @@ mod tests {
         );
     }
 
-    /// A cell's own revision, its merge and its formatting are annotations in
-    /// the fixed order, and a deleted cell keeps its text — that is what the
-    /// marker is for.
+    /// A table's, a cell's and a row's own revisions are annotations in the fixed
+    /// order and in the place the revised thing shows, and a deleted cell keeps
+    /// its text — that is what the marker is for.
     #[test]
     fn docx_annotates_cells_and_a_revised_table() {
-        let body = r#"<w:tbl>
+        let cases = [
+            (
+                "a revised table and a revised cell",
+                r#"<w:tbl>
 <w:tblPr><w:tblPrChange w:author="Anna"/></w:tblPr>
 <w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid>
 <w:tr>
 <w:tc><w:tcPr><w:cellIns/><w:cellDel/><w:cellMerge/></w:tcPr><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>
 <w:tc><w:tcPr><w:tcPrChange w:author="Anna"/></w:tcPr><w:p/></w:tc>
 </w:tr>
-</w:tbl>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Unaccepted tracked changes: 1 insertion, 1 deletion, 3 formatting changes \
-             (authors: Anna).\n\n\
-             Table 1 (formatting revised): 1 row, 2 columns\n  \
-             R1: C1 (inserted, deleted, merge revised): C | C2 (formatting revised):"
-        );
-    }
-
-    /// A row's table-property exception sits beside `w:trPr`, and the row it
-    /// belongs to is where its revision shows — once, even when the row's own
-    /// properties changed as well.
-    #[test]
-    fn docx_marks_a_row_property_exception() {
-        let body = r#"<w:tbl><w:tblGrid><w:gridCol/></w:tblGrid>
+</w:tbl>"#,
+                "Unaccepted tracked changes: 1 insertion, 1 deletion, 3 formatting changes \
+                 (authors: Anna).\n\n\
+                 Table 1 (formatting revised): 1 row, 2 columns\n  \
+                 R1: C1 (inserted, deleted, merge revised): C | C2 (formatting revised):",
+            ),
+            (
+                "a row property exception beside the row's own change",
+                r#"<w:tbl><w:tblGrid><w:gridCol/></w:tblGrid>
 <w:tr><w:tblPrEx><w:tblPrExChange w:author="QA"/></w:tblPrEx><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr>
 <w:tr><w:trPr><w:trPrChange w:author="QA"/></w:trPr><w:tblPrEx><w:tblPrExChange w:author="QA"/></w:tblPrEx><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr>
-</w:tbl>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Unaccepted tracked changes: 3 formatting changes (authors: QA).\n\n\
-             Table 1: 2 rows, 1 column\n  \
-             R1 (formatting revised): C1: A\n  \
-             R2 (formatting revised): C1: B"
-        );
-    }
-
-    /// `w:tblGridChange` carries nothing in Word's own output, and inside its
-    /// `w:tblGrid`, where Word writes it, it still marks the table it revises.
-    #[test]
-    fn docx_marks_a_revised_grid() {
-        let body = r#"<w:tbl><w:tblGrid><w:gridCol/><w:tblGridChange w:author="QA"/></w:tblGrid>
+</w:tbl>"#,
+                "Unaccepted tracked changes: 3 formatting changes (authors: QA).\n\n\
+                 Table 1: 2 rows, 1 column\n  \
+                 R1 (formatting revised): C1: A\n  \
+                 R2 (formatting revised): C1: B",
+            ),
+            (
+                "a revised grid",
+                r#"<w:tbl><w:tblGrid><w:gridCol/><w:tblGridChange w:author="QA"/></w:tblGrid>
 <w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr>
-</w:tbl>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Unaccepted tracked changes: 1 formatting change (authors: QA).\n\n\
-             Table 1 (formatting revised): 1 row, 1 column\n  R1: C1: A"
-        );
+</w:tbl>"#,
+                "Unaccepted tracked changes: 1 formatting change (authors: QA).\n\n\
+                 Table 1 (formatting revised): 1 row, 1 column\n  R1: C1: A",
+            ),
+        ];
+        for (label, body, expected) in cases {
+            assert_eq!(text_of(&package(body, &[])), expected, "{label}");
+        }
     }
 
     // ── Headers, footers and fields ─────────────────────────────
 
     /// Every variant named is read and labelled, the part serving two variants
     /// is read once, and each is numbered only because more than one is
-    /// emitted.
+    /// emitted. A body with no text of its own is not a document with no text:
+    /// what the headers read is the text.
     #[test]
     fn docx_reads_header_and_footer_variants_and_a_field() {
         let body = r#"<w:p><w:r><w:t>Body text</w:t></w:r></w:p><w:sectPr>
@@ -3042,7 +2998,7 @@ mod tests {
 <w:headerReference w:type="default" r:id="rId1"/>
 <w:footerReference w:type="even" r:id="rId3"/>
 </w:sectPr>"#;
-        let rels = rels(&format!(
+        let document_rels = rels(&format!(
             "{}{}{}",
             rel("rId1", "header", "header1.xml"),
             rel("rId2", "header", "header2.xml"),
@@ -3053,32 +3009,20 @@ mod tests {
         let footer = r#"<w:ftr><w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r>\
 <w:r><w:fldSimple w:instr=" PAGE "/></w:r>\
 <w:r><w:t xml:space="preserve"> 5</w:t></w:r></w:p></w:ftr>"#;
-        let bytes = package(
+        let variants = package(
             body,
             &[
-                ("word/_rels/document.xml.rels", &rels),
+                ("word/_rels/document.xml.rels", &document_rels),
                 ("word/header1.xml", header1),
                 ("word/header2.xml", header2),
                 ("word/footer1.xml", footer),
             ],
         );
-        assert_eq!(
-            text_of(&bytes),
-            "Body text\n\
-             Header 1 (default):\n  Company\n\
-             Header 2 (first page):\n  Draft\n\
-             Footer (even pages):\n  Page [field PAGE] 5"
-        );
-    }
 
-    /// A body with no text of its own is not a document with no text: what the
-    /// headers read is the text.
-    #[test]
-    fn docx_reads_a_body_whose_only_text_is_in_a_header() {
-        let body =
+        let only_header_body =
             r#"<w:p/><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
-        let bytes = package(
-            body,
+        let only_header = package(
+            only_header_body,
             &[
                 (
                     "word/_rels/document.xml.rels",
@@ -3090,7 +3034,25 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(text_of(&bytes), "Header (default):\n  Only here");
+
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            (
+                "every header and footer variant, each read once",
+                variants,
+                "Body text\n\
+                 Header 1 (default):\n  Company\n\
+                 Header 2 (first page):\n  Draft\n\
+                 Footer (even pages):\n  Page [field PAGE] 5",
+            ),
+            (
+                "a body whose only text is in a header",
+                only_header,
+                "Header (default):\n  Only here",
+            ),
+        ];
+        for (label, bytes, expected) in cases {
+            assert_eq!(text_of(&bytes), expected, "{label}");
+        }
     }
 
     /// `Table N:` labels count the whole package, so a header's table takes the
@@ -3125,14 +3087,15 @@ mod tests {
         );
     }
 
-    /// A part, or a definition, that shows nothing shows none of its revisions
-    /// either: the summary never names a change the text does not carry.
+    /// The summary covers the whole package, not only the body — while a part,
+    /// or a definition, that shows nothing shows none of its revisions either:
+    /// it never names a change the text does not carry.
     #[test]
-    fn docx_does_not_tally_what_it_does_not_show() {
-        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>
+    fn docx_summarises_revisions_from_every_part() {
+        let empty_body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>
 <w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
-        let bytes = package(
-            body,
+        let empty = package(
+            empty_body,
             &[
                 (
                     "word/_rels/document.xml.rels",
@@ -3155,17 +3118,11 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(text_of(&bytes), "Body");
-    }
 
-    /// A revision in a header or a footnote is a revision of the document too:
-    /// the summary covers the whole package, not only the body.
-    #[test]
-    fn docx_summarises_revisions_from_every_part() {
-        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>
+        let revised_body = r#"<w:p><w:r><w:t>Body</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>
 <w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
-        let bytes = package(
-            body,
+        let revised = package(
+            revised_body,
             &[
                 (
                     "word/_rels/document.xml.rels",
@@ -3185,16 +3142,25 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(
-            text_of(&bytes),
-            "Unaccepted tracked changes: 1 insertion, 1 deletion (authors: Anna).\n\n\
-             Body[footnote 1]\n\
-             Header (default):\n  [ins]Draft[/ins]\n\
-             Footnote 1:\n  [del]gone[/del]"
-        );
+
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("a part and a definition that render nothing", empty, "Body"),
+            (
+                "a revision in a header and in a footnote",
+                revised,
+                "Unaccepted tracked changes: 1 insertion, 1 deletion (authors: Anna).\n\n\
+                 Body[footnote 1]\n\
+                 Header (default):\n  [ins]Draft[/ins]\n\
+                 Footnote 1:\n  [del]gone[/del]",
+            ),
+        ];
+        for (label, bytes, expected) in cases {
+            assert_eq!(text_of(&bytes), expected, "{label}");
+        }
     }
 
     // ── Notes, comments and fields ──────────────────────────────
+
     /// A note is numbered in Word's display order, its definition is a labelled
     /// block, a comment's range is not repeated at its point reference, and a
     /// note part's separator entries are not text.
@@ -3243,48 +3209,20 @@ mod tests {
         );
     }
 
-    /// A definition the flow references is reported even when it holds nothing,
-    /// or its anchor would name a block that is not there. One nothing
-    /// references and that holds nothing stays out.
-    #[test]
-    fn docx_reports_a_referenced_definition_with_no_text() {
-        let body = r#"<w:p><w:r><w:t>Text</w:t></w:r>\
-<w:r><w:footnoteReference w:id="1"/></w:r>\
-<w:r><w:footnoteReference w:id="2"/></w:r></w:p>"#;
-        let footnotes = r#"<w:footnotes>\
-<w:footnote w:id="1"><w:p/></w:footnote>\
-<w:footnote w:id="2"><w:p><w:r><w:t>note</w:t></w:r></w:p></w:footnote>\
-<w:footnote w:id="3"><w:p/></w:footnote>\
-</w:footnotes>"#;
-        let bytes = package(
-            body,
-            &[
-                (
-                    "word/_rels/document.xml.rels",
-                    &rels(&rel("rId5", "footnotes", "footnotes.xml")),
-                ),
-                ("word/footnotes.xml", footnotes),
-            ],
-        );
-        assert_eq!(
-            text_of(&bytes),
-            "Text[footnote 1][footnote 2]\n\
-             Footnote 1:\n\
-             Footnote 2:\n  note"
-        );
-    }
-
-    /// A comment range runs inside one part: opened in the body, it does not
-    /// suppress the same comment's point reference in a header.
+    /// A comment range runs inside one part — after a header or a notes part as
+    /// much as beside another body block — and a referenced definition is
+    /// reported even when it holds nothing: its anchor would otherwise name a
+    /// block that is not there. One nothing references and that holds nothing
+    /// stays out.
     #[test]
     fn docx_resets_a_comment_range_between_parts() {
-        let body = r#"<w:p><w:commentRangeStart w:id="2"/>\
+        let between_body = r#"<w:p><w:commentRangeStart w:id="2"/>\
 <w:r><w:t>body</w:t></w:r>\
 <w:commentRangeEnd w:id="2"/>\
 </w:p>\
 <w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
-        let bytes = package(
-            body,
+        let between = package(
+            between_body,
             &[
                 (
                     "word/_rels/document.xml.rels",
@@ -3304,24 +3242,12 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(
-            text_of(&bytes),
-            "[comment 1 starts]body[comment 1 ends]\n\
-             Header (default):\n  [comment 1]\n\
-             Comment 1 (Ivan Petrov):\n  note"
-        );
-    }
 
-    /// The reset covers the notes parts, which are walked after the body like
-    /// any other: a range the body left open does not suppress a footnote's
-    /// point reference to the same comment.
-    #[test]
-    fn docx_resets_a_comment_range_before_a_notes_part() {
-        let body = r#"<w:p><w:commentRangeStart w:id="2"/>\
+        let notes_body = r#"<w:p><w:commentRangeStart w:id="2"/>\
 <w:r><w:t>body</w:t></w:r>\
 <w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
-        let bytes = package(
-            body,
+        let before_notes = package(
+            notes_body,
             &[
                 (
                     "word/_rels/document.xml.rels",
@@ -3339,96 +3265,134 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(
-            text_of(&bytes),
-            "[comment 1 starts]body[footnote 1]\n\
-             Footnote 1:\n  [comment 1]\n\
-             Comment 1 (Ivan Petrov):\n  note"
+
+        let empty_body = r#"<w:p><w:r><w:t>Text</w:t></w:r>\
+<w:r><w:footnoteReference w:id="1"/></w:r>\
+<w:r><w:footnoteReference w:id="2"/></w:r></w:p>"#;
+        let empty_definition = package(
+            empty_body,
+            &[
+                (
+                    "word/_rels/document.xml.rels",
+                    &rels(&rel("rId5", "footnotes", "footnotes.xml")),
+                ),
+                (
+                    "word/footnotes.xml",
+                    "<w:footnotes>\
+<w:footnote w:id=\"1\"><w:p/></w:footnote>\
+<w:footnote w:id=\"2\"><w:p><w:r><w:t>note</w:t></w:r></w:p></w:footnote>\
+<w:footnote w:id=\"3\"><w:p/></w:footnote>\
+</w:footnotes>",
+                ),
+            ],
         );
+
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            (
+                "a range opened in the body and a point in a header",
+                between,
+                "[comment 1 starts]body[comment 1 ends]\n\
+                 Header (default):\n  [comment 1]\n\
+                 Comment 1 (Ivan Petrov):\n  note",
+            ),
+            (
+                "a range opened in the body and a point in a footnote",
+                before_notes,
+                "[comment 1 starts]body[footnote 1]\n\
+                 Footnote 1:\n  [comment 1]\n\
+                 Comment 1 (Ivan Petrov):\n  note",
+            ),
+            (
+                "a referenced definition with no text",
+                empty_definition,
+                "Text[footnote 1][footnote 2]\n\
+                 Footnote 1:\n\
+                 Footnote 2:\n  note",
+            ),
+        ];
+        for (label, bytes, expected) in cases {
+            assert_eq!(text_of(&bytes), expected, "{label}");
+        }
     }
 
     // ── Revisions ───────────────────────────────────────────────
 
     /// Every marker the walk raises, and the summary line that tallies them:
-    /// `w:moveFrom`/`w:moveTo` are one move, not two.
+    /// `w:moveFrom`/`w:moveTo` are one move, not two — one moved range is one
+    /// move whatever number of marks it brackets, and a range that brackets no
+    /// moved content is no move the text shows.
     #[test]
     fn docx_names_tracked_changes_and_their_authors() {
-        let body = r#"<w:p>\
+        let cases = [
+            (
+                "every marker, with moveFrom and moveTo one move",
+                r#"<w:p>\
 <w:pPr><w:pPrChange w:author="Anna"/></w:pPr>\
 <w:r><w:rPr><w:rPrChange w:author="Ivan Petrov"/></w:rPr><w:t>kept</w:t></w:r>\
 <w:ins w:author="Ivan Petrov"><w:r><w:t xml:space="preserve"> added</w:t></w:r></w:ins>\
 <w:del w:author="Anna"><w:r><w:delText xml:space="preserve"> gone</w:delText></w:r></w:del>\
 <w:moveFrom w:author="Anna"><w:r><w:t xml:space="preserve"> away</w:t></w:r></w:moveFrom>\
 <w:moveTo w:author="Anna"><w:r><w:t xml:space="preserve"> here</w:t></w:r></w:moveTo>\
-<w:ins w:author="Ivan Petrov"/></w:p>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Unaccepted tracked changes: 2 insertions, 1 deletion, 1 move, \
-             2 formatting changes (authors: Anna, Ivan Petrov).\n\n\
-             [fmt]kept[ins] added[/ins][del] gone[/del]\
-             [moved-away] away[/moved-away][moved-here] here[/moved-here][fmt ¶]"
-        );
-    }
-
-    /// Word brackets a move with its range marks, and a range holds as many
-    /// marks as it likes: it is still one move.
-    #[test]
-    fn docx_counts_a_moved_range_once() {
-        let body = r#"<w:p>\
+<w:ins w:author="Ivan Petrov"/></w:p>"#,
+                "Unaccepted tracked changes: 2 insertions, 1 deletion, 1 move, \
+                 2 formatting changes (authors: Anna, Ivan Petrov).\n\n\
+                 [fmt]kept[ins] added[/ins][del] gone[/del]\
+                 [moved-away] away[/moved-away][moved-here] here[/moved-here][fmt ¶]",
+            ),
+            (
+                "a move bracketed by range marks",
+                r#"<w:p>\
 <w:moveFromRangeStart w:id="1" w:author="Anna" w:name="move1"/>\
 <w:moveFrom w:author="Anna"><w:r><w:t>away</w:t></w:r></w:moveFrom>\
 <w:moveTo w:author="Anna"><w:r><w:t>here</w:t></w:r></w:moveTo>\
 <w:moveToRangeEnd w:id="2"/>\
 <w:moveTo w:author="Anna"><w:r><w:t> and there</w:t></w:r></w:moveTo>\
-</w:p>"#;
-        assert!(
-            text_of(&package(body, &[]))
-                .starts_with("Unaccepted tracked changes: 1 move (authors: Anna).\n\n")
-        );
-    }
-
-    /// A range mark brackets content the walk marks as moved. Bracketing content
-    /// that carries no such mark is not a move the text shows, so the summary
-    /// does not name one.
-    #[test]
-    fn docx_does_not_count_a_move_range_it_never_marks() {
-        let body = r#"<w:moveFromRangeStart w:id="1" w:author="Anna" w:name="move1"/>\
+</w:p>"#,
+                "Unaccepted tracked changes: 1 move (authors: Anna).\n\n\
+                 [moved-away]away[/moved-away][moved-here]here[/moved-here]\
+                 [moved-here] and there[/moved-here]",
+            ),
+            (
+                "a range that marks no moved content",
+                r#"<w:moveFromRangeStart w:id="1" w:author="Anna" w:name="move1"/>\
 <w:p><w:r><w:t>Plain</w:t></w:r></w:p>\
-<w:moveFromRangeEnd w:id="1"/>"#;
-        assert_eq!(text_of(&package(body, &[])), "Plain");
+<w:moveFromRangeEnd w:id="1"/>"#,
+                "Plain",
+            ),
+        ];
+        for (label, body, expected) in cases {
+            assert_eq!(text_of(&package(body, &[])), expected, "{label}");
+        }
     }
 
-    /// The paragraph mark's own revision is marked at the paragraph's end, and a
-    /// `w:sectPr/w:sectPrChange` is the section's.
+    /// The paragraph mark's own revision is marked at the paragraph's end, a
+    /// `w:sectPr/w:sectPrChange` is the section's, and the document's own last
+    /// section lives in `w:body/w:sectPr`, where no paragraph is open: its
+    /// revision is marked in the flow rather than only counted.
     #[test]
     fn docx_marks_the_paragraph_and_section_marks() {
-        let body = r#"<w:p><w:pPr>\
+        let cases = [
+            (
+                "a paragraph's own mark and a section inside it",
+                r#"<w:p><w:pPr>\
 <w:rPr><w:del w:author="Anna"/></w:rPr>\
 <w:pPrChange w:author="Anna"/>\
 <w:sectPr><w:sectPrChange w:author="Anna"/></w:sectPr>\
-</w:pPr><w:r><w:t>Text</w:t></w:r></w:p>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Unaccepted tracked changes: 1 deletion, 2 formatting changes \
-             (authors: Anna).\n\n\
-             Text[del ¶][fmt ¶][fmt section]"
-        );
-    }
-
-    /// The document's own last section lives in `w:body/w:sectPr`, where no
-    /// paragraph is open: its revision is marked in the flow rather than only
-    /// counted.
-    #[test]
-    fn docx_marks_a_document_level_section_revision() {
-        let body = concat!(
-            r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>"#,
-            r#"<w:sectPr><w:sectPrChange w:author="Anna"/></w:sectPr>"#,
-        );
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Unaccepted tracked changes: 1 formatting change (authors: Anna).\n\n\
-             Body\n[fmt section]"
-        );
+</w:pPr><w:r><w:t>Text</w:t></w:r></w:p>"#,
+                "Unaccepted tracked changes: 1 deletion, 2 formatting changes \
+                 (authors: Anna).\n\n\
+                 Text[del ¶][fmt ¶][fmt section]",
+            ),
+            (
+                "the document's last section",
+                r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:sectPrChange w:author="Anna"/></w:sectPr>"#,
+                "Unaccepted tracked changes: 1 formatting change (authors: Anna).\n\n\
+                 Body\n[fmt section]",
+            ),
+        ];
+        for (label, body, expected) in cases {
+            assert_eq!(text_of(&package(body, &[])), expected, "{label}");
+        }
     }
 
     // ── Headings and links ──────────────────────────────────────
@@ -3436,6 +3400,8 @@ mod tests {
     /// A heading's level comes from the paragraph's own `w:outlineLvl` — where
     /// the body-text value suppresses the style — or from its style chain, and a
     /// style id may name a heading even when the package states no styles at all.
+    /// A heading that printed nothing gets no mark, and one whose only content
+    /// is a block is marked on the line that block opens.
     #[test]
     fn docx_marks_a_heading_from_its_own_level_or_its_style() {
         let styles = concat!(
@@ -3446,7 +3412,7 @@ mod tests {
             r#"<w:style w:type="paragraph" w:styleId="Q"><w:pPr><w:outlineLvl w:val="2"/></w:pPr></w:style>"#,
             r#"</w:styles>"#,
         );
-        let body = concat!(
+        let styled_body = concat!(
             // (a) a style id that names a heading on its own.
             r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>A</w:t></w:r></w:p>"#,
             // (b) the paragraph's own outline level.
@@ -3466,8 +3432,8 @@ mod tests {
             // (h) a style the part does not define and whose id is no heading.
             r#"<w:p><w:pPr><w:pStyle w:val="Nope"/></w:pPr><w:r><w:t>I</w:t></w:r></w:p>"#,
         );
-        let bytes = package(
-            body,
+        let with_styles = package(
+            styled_body,
             &[
                 (
                     "word/_rels/document.xml.rels",
@@ -3476,26 +3442,8 @@ mod tests {
                 ("word/styles.xml", styles),
             ],
         );
-        assert_eq!(
-            text_of(&bytes),
-            "[heading 1] A\n\
-             [heading 2] B\n\
-             C\n\
-             D\n\
-             E\n\
-             [heading 2] F\n\
-             [heading 2] G\n\
-             [heading 3] H\n\
-             I"
-        );
-    }
 
-    /// A heading whose paragraph holds no words follows the same rule: a heading
-    /// that printed nothing gets no mark, and one whose only content is a block
-    /// is marked on the line that block opens.
-    #[test]
-    fn docx_marks_a_heading_that_printed_only_a_block_or_nothing() {
-        let body = concat!(
+        let inline_body = concat!(
             r#"<w:p><w:r><w:t>before</w:t></w:r></w:p>"#,
             r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr></w:p>"#,
             // A leading break opens an empty first line: the mark goes with the
@@ -3508,10 +3456,31 @@ mod tests {
             r#"</mc:AlternateContent></w:r></w:p>"#,
             r#"<w:p><w:r><w:t>after</w:t></w:r></w:p>"#,
         );
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "before\n[heading 1] broken\n[heading 1] [text box]\n  boxed\nafter"
-        );
+        let inline = package(inline_body, &[]);
+
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            (
+                "a level from the paragraph, its style chain or its style id",
+                with_styles,
+                "[heading 1] A\n\
+                 [heading 2] B\n\
+                 C\n\
+                 D\n\
+                 E\n\
+                 [heading 2] F\n\
+                 [heading 2] G\n\
+                 [heading 3] H\n\
+                 I",
+            ),
+            (
+                "a heading that printed a block or nothing",
+                inline,
+                "before\n[heading 1] broken\n[heading 1] [text box]\n  boxed\nafter",
+            ),
+        ];
+        for (label, bytes, expected) in cases {
+            assert_eq!(text_of(&bytes), expected, "{label}");
+        }
     }
 
     /// A link shows the address it points at after its own text, an anchor alone
@@ -3598,7 +3567,8 @@ mod tests {
     // ── Text boxes ──────────────────────────────────────────────
 
     /// Word writes a text box twice — as an `mc:Choice` and as the
-    /// `mc:Fallback` beside it — and reading both would report it twice.
+    /// `mc:Fallback` beside it — and reading both would report it twice, in the
+    /// body and in a header alike.
     #[test]
     fn docx_reads_a_word_text_box_once() {
         let body = r#"<w:p><w:r><mc:AlternateContent>\
@@ -3609,74 +3579,8 @@ mod tests {
 <w:p><w:r><w:t>one</w:t></w:r></w:p><w:p><w:r><w:t>two</w:t></w:r></w:p>\
 </w:txbxContent></v:textbox></w:pict></mc:Fallback>\
 </mc:AlternateContent></w:r><w:r><w:t>after</w:t></w:r></w:p>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "[text box]\n  one\n  two\nafter"
-        );
-    }
 
-    /// The copy Word writes twice is counted once too: the revisions inside the
-    /// `mc:Fallback` the walk discards are the rendered copy's, not the
-    /// document's second set.
-    #[test]
-    fn docx_does_not_tally_a_discarded_alternate_copy() {
-        let body = r#"<w:p><w:r><mc:AlternateContent>\
-<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>\
-<w:p><w:ins w:author="Anna"><w:r><w:t>once</w:t></w:r></w:ins></w:p>\
-</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
-<mc:Fallback><w:pict><v:textbox><w:txbxContent>\
-<w:p><w:ins w:author="Anna"><w:r><w:t>once</w:t></w:r></w:ins></w:p>\
-</w:txbxContent></v:textbox></w:pict></mc:Fallback>\
-</mc:AlternateContent></w:r></w:p>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Unaccepted tracked changes: 1 insertion (authors: Anna).\n\n\
-             [text box]\n  [ins]once[/ins]"
-        );
-    }
-
-    /// A discarded copy contributes nothing at all: a property change inside it
-    /// raises no marker on what the rendered copy sits in.
-    #[test]
-    fn docx_does_not_mark_from_a_discarded_copy() {
-        let body = r#"<w:tbl><w:tblGrid><w:gridCol/></w:tblGrid>
-<w:tr><w:tc><w:p><w:r><mc:AlternateContent>\
-<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>\
-<w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
-<mc:Fallback><w:pict><v:textbox><w:txbxContent>\
-<w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent>\
-<w:tblGridChange w:author="QA"/></v:textbox></w:pict></mc:Fallback>\
-</mc:AlternateContent></w:r></w:p></w:tc></w:tr>
-</w:tbl>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Table 1: 1 row, 1 column\n  R1: C1: [text box]   box"
-        );
-    }
-
-    /// A copy that rendered nothing is not a set of revisions of its own: the
-    /// copy beside it, the one that carries the text, is the one the summary
-    /// counts.
-    #[test]
-    fn docx_does_not_tally_a_copy_that_rendered_nothing() {
-        let body = r#"<w:p><w:r><mc:AlternateContent>\
-<mc:Choice Requires="wps"><w:ins w:author="Anna"/></mc:Choice>\
-<mc:Choice Requires="wpg"><w:drawing><wps:txbx><w:txbxContent>\
-<w:p><w:ins w:author="Anna"><w:r><w:t>once</w:t></w:r></w:ins></w:p>\
-</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
-</mc:AlternateContent></w:r></w:p>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "Unaccepted tracked changes: 1 insertion (authors: Anna).\n\n\
-             [text box]\n  [ins]once[/ins]"
-        );
-    }
-
-    /// A text box is read once wherever it sits: the header's own is a
-    /// `[text box]` block inside the header's block.
-    #[test]
-    fn docx_reads_a_header_text_box_once() {
-        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>
+        let header_body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>
 <w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
         let choice = r#"<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>\
 <w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>"#;
@@ -3685,8 +3589,8 @@ mod tests {
         let header = format!(
             "<w:hdr><w:p><w:r><mc:AlternateContent>{choice}{fallback}</mc:AlternateContent></w:r></w:p></w:hdr>"
         );
-        let bytes = package(
-            body,
+        let header_box = package(
+            header_body,
             &[
                 (
                     "word/_rels/document.xml.rels",
@@ -3695,46 +3599,116 @@ mod tests {
                 ("word/header1.xml", &header),
             ],
         );
-        assert_eq!(
-            text_of(&bytes),
-            "Body\nHeader (default):\n  [text box]\n    box"
-        );
+
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            (
+                "a body text box written as a choice and a fallback",
+                package(body, &[]),
+                "[text box]\n  one\n  two\nafter",
+            ),
+            (
+                "a header text box written as a choice and a fallback",
+                header_box,
+                "Body\nHeader (default):\n  [text box]\n    box",
+            ),
+        ];
+        for (label, bytes, expected) in cases {
+            assert_eq!(text_of(&bytes), expected, "{label}");
+        }
     }
 
-    /// A `mc:Choice` that renders nothing at all leaves the fallback to speak
-    /// for the box.
+    /// Only the alternate copy that rendered counts: the `mc:Fallback` is
+    /// discarded whether it repeats the choice's revisions or carries them
+    /// alone, a copy that rendered nothing yields to the next one, and a
+    /// fallback speaks only when no choice has content.
     #[test]
-    fn docx_falls_back_when_a_choice_renders_nothing() {
-        let body = r#"<w:p><mc:AlternateContent>\
+    fn docx_reads_only_the_alternate_copy_that_rendered() {
+        let repeated_revisions = r#"<w:p><w:r><mc:AlternateContent>\
+<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>\
+<w:p><w:ins w:author="Anna"><w:r><w:t>once</w:t></w:r></w:ins></w:p>\
+</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
+<mc:Fallback><w:pict><v:textbox><w:txbxContent>\
+<w:p><w:ins w:author="Anna"><w:r><w:t>once</w:t></w:r></w:ins></w:p>\
+</w:txbxContent></v:textbox></w:pict></mc:Fallback>\
+</mc:AlternateContent></w:r></w:p>"#;
+
+        let marker_from_discarded = r#"<w:tbl><w:tblGrid><w:gridCol/></w:tblGrid>
+<w:tr><w:tc><w:p><w:r><mc:AlternateContent>\
+<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>\
+<w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
+<mc:Fallback><w:pict><v:textbox><w:txbxContent>\
+<w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent>\
+<w:tblGridChange w:author="QA"/></v:textbox></w:pict></mc:Fallback>\
+</mc:AlternateContent></w:r></w:p></w:tc></w:tr>
+</w:tbl>"#;
+
+        let empty_choice = r#"<w:p><w:r><mc:AlternateContent>\
+<mc:Choice Requires="wps"><w:ins w:author="Anna"/></mc:Choice>\
+<mc:Choice Requires="wpg"><w:drawing><wps:txbx><w:txbxContent>\
+<w:p><w:ins w:author="Anna"><w:r><w:t>once</w:t></w:r></w:ins></w:p>\
+</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
+</mc:AlternateContent></w:r></w:p>"#;
+
+        let fallback_body = r#"<w:p><mc:AlternateContent>\
 <mc:Choice Requires="wps"><w:drawing/></mc:Choice>\
 <mc:Fallback><w:pict><v:textbox><w:txbxContent><w:p><w:r><w:t>vml</w:t></w:r></w:p>\
 </w:txbxContent></v:textbox></w:pict></mc:Fallback>\
 </mc:AlternateContent></w:p>"#;
-        assert_eq!(text_of(&package(body, &[])), "[text box]\n  vml");
-    }
 
-    /// A choice that renders nothing is not the copy that counts: a later choice
-    /// carrying content is read in its place, and the fallback stays unread.
-    #[test]
-    fn docx_reads_a_later_choice_that_has_content() {
-        let body = r#"<w:p><mc:AlternateContent>\
+        let later_choice = r#"<w:p><mc:AlternateContent>\
 <mc:Choice Requires="wps"><w:drawing/></mc:Choice>\
 <mc:Choice Requires="wpg"><w:drawing><wps:txbx><w:txbxContent>\
 <w:p><w:r><w:t>second</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
 <mc:Fallback><w:pict><v:textbox><w:txbxContent>\
 <w:p><w:r><w:t>vml</w:t></w:r></w:p></w:txbxContent></v:textbox></w:pict></mc:Fallback>\
 </mc:AlternateContent></w:p>"#;
-        assert_eq!(text_of(&package(body, &[])), "[text box]\n  second");
+
+        let cases = [
+            (
+                "revisions of the copy word writes twice",
+                repeated_revisions,
+                "Unaccepted tracked changes: 1 insertion (authors: Anna).\n\n\
+                 [text box]\n  [ins]once[/ins]",
+            ),
+            (
+                "a discarded copy raises no marker",
+                marker_from_discarded,
+                "Table 1: 1 row, 1 column\n  R1: C1: [text box]   box",
+            ),
+            (
+                "a copy that rendered nothing is not tallied",
+                empty_choice,
+                "Unaccepted tracked changes: 1 insertion (authors: Anna).\n\n\
+                 [text box]\n  [ins]once[/ins]",
+            ),
+            (
+                "a choice that renders nothing leaves the fallback",
+                fallback_body,
+                "[text box]\n  vml",
+            ),
+            (
+                "a later choice that has content",
+                later_choice,
+                "[text box]\n  second",
+            ),
+        ];
+        for (label, body, expected) in cases {
+            assert_eq!(text_of(&package(body, &[])), expected, "{label}");
+        }
     }
 
     // ── Fields ──────────────────────────────────────────────────
 
     /// A complex field's instruction is reported at its `separate` — the cached
-    /// result after it is ordinary text — and a field that never separates is
-    /// reported at its `end`.
+    /// result after it is ordinary text — a field that never separates is
+    /// reported at its `end`, and a `w:fldChar begin` a part never closes is
+    /// reported where the part ends, with the text it was holding.
     #[test]
     fn docx_reports_field_instructions_and_their_results() {
-        let body = r#"<w:p>\
+        let cases = [
+            (
+                "a field that separates and one that never does",
+                r#"<w:p>\
 <w:r><w:fldChar w:fldCharType="begin"/></w:r>\
 <w:r><w:instrText xml:space="preserve"> PAGE \</w:instrText></w:r>\
 <w:r><w:instrText xml:space="preserve">* MERGEFORMAT </w:instrText></w:r>\
@@ -3744,11 +3718,21 @@ mod tests {
 <w:r><w:fldChar w:fldCharType="begin"/></w:r>\
 <w:r><w:instrText>DATE</w:instrText></w:r>\
 <w:r><w:fldChar w:fldCharType="end"/></w:r>\
-</w:p>"#;
-        assert_eq!(
-            text_of(&package(body, &[])),
-            "[field PAGE \\* MERGEFORMAT]7[field DATE]"
-        );
+</w:p>"#,
+                "[field PAGE \\* MERGEFORMAT]7[field DATE]",
+            ),
+            (
+                "a field a part left open",
+                r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t></w:r>\
+<w:r><w:fldChar w:fldCharType="begin"/></w:r>\
+<w:r><w:instrText>PAGE</w:instrText></w:r>\
+<w:r><w:t>After</w:t></w:r></w:p>"#,
+                "Before \n[field PAGE]After",
+            ),
+        ];
+        for (label, body, expected) in cases {
+            assert_eq!(text_of(&package(body, &[])), expected, "{label}");
+        }
     }
 
     /// A field's instruction is reported up to the cap — with no separator left
@@ -3763,18 +3747,6 @@ mod tests {
             text_of(&package(&body, &[])),
             format!("[field {}]x", "a".repeat(MAX_FIELD_INSTRUCTION_CHARS - 1))
         );
-    }
-
-    /// A `w:fldChar begin` a part never closes must not swallow the rest of the
-    /// part as its instruction: the field is reported where the part ends, with
-    /// the text it was holding.
-    #[test]
-    fn docx_reports_a_field_a_part_left_open() {
-        let body = r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t></w:r>\
-<w:r><w:fldChar w:fldCharType="begin"/></w:r>\
-<w:r><w:instrText>PAGE</w:instrText></w:r>\
-<w:r><w:t>After</w:t></w:r></w:p>"#;
-        assert_eq!(text_of(&package(body, &[])), "Before \n[field PAGE]After");
     }
 
     // ── Degrading ───────────────────────────────────────────────
@@ -4010,8 +3982,7 @@ mod tests {
     /// The literals of `source` that are shaped like a mark a reading prints: the
     /// ones it carries a character an ordinary sentence of prose does not — a
     /// bracket, a parenthesis or the `¶` a paragraph mark states. This is the
-    /// narrowing the scan below rests on, so it is stated once and pinned on prose
-    /// by [`the_mark_scan_leaves_a_sentence_of_prose_alone`].
+    /// narrowing the scan below rests on, so it is stated once.
     fn mark_literals(source: &str) -> Vec<String> {
         let literal = regex::Regex::new(r#""((?:[^"\\]|\\.)*)""#).expect("the literal pattern");
         literal
@@ -4096,40 +4067,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The scan above must not read a sentence of prose for a mark: a reader's own
-    /// error message that happened to spell a mark word would otherwise send its
-    /// author to `rules.json` for a spelling no reading prints. The sample holds the
-    /// messages that did exactly that under the shape check this replaces.
-    #[test]
-    fn the_mark_scan_leaves_a_sentence_of_prose_alone() {
-        let prose = r#"
-            let a = "text is not in the body";
-            let b = "Comment range is unclosed";
-            let c = "part of the document";
-            let d = "the field instruction is reported up to this many characters";
-        "#;
-        assert!(
-            mark_literals(prose).is_empty(),
-            "prose read as a mark: {:?}",
-            mark_literals(prose)
-        );
-        // And a literal that IS a mark the list does not name is still read: a
-        // template-built bracket mark, a parenthesis mark, and one written as a
-        // raw string (the scan sees the quoted run wherever it sits).
-        let marks = r#"
-            let e = format!("[revision {}]", n);
-            let f = "(revision started)";
-            let g = r"[revision note]";
-        "#;
-        assert_eq!(
-            mark_literals(marks),
-            [
-                r"[revision {}]".to_owned(),
-                "(revision started)".to_owned(),
-                "[revision note]".to_owned(),
-            ]
-        );
     }
 }

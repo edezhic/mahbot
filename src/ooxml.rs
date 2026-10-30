@@ -1747,41 +1747,6 @@ mod tests {
     use super::test_fixtures::*;
     use super::*;
 
-    /// A presentation that declares a slide whose own relationship cannot be
-    /// resolved keeps that slide's number: dropping it would renumber the slides
-    /// after it and label their content with someone else's number.
-    #[test]
-    fn pptx_keeps_the_number_of_a_slide_it_cannot_resolve() {
-        let bytes = zip_fixture(&[
-            (
-                "ppt/presentation.xml",
-                br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rId2"/><p:sldId id="258" r:id="rId3"/></p:sldIdLst></p:presentation>"#,
-            ),
-            // `rId2` is never declared, so the second slide's part is unknown.
-            (
-                "ppt/_rels/presentation.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId3" Target="slides/slide2.xml"/></Relationships>"#,
-            ),
-            (
-                "ppt/slides/slide1.xml",
-                br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>First</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
-            ),
-            (
-                "ppt/slides/slide2.xml",
-                br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Third</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a presentation");
-        };
-        assert_eq!(
-            text, "Slide 1:\n  First\n\nSlide 3:\n  Third",
-            "the unresolvable slide keeps its own number"
-        );
-        assert_eq!(notes, ["slide 2 could not be read"]);
-    }
-
     // ── PowerPoint ──────────────────────────────────────────────
     /// Slides resolve in the presentation's own relationship order (never by
     /// part index), speaker notes come through the slide's own relationships
@@ -1842,48 +1807,6 @@ mod tests {
         assert_eq!(images, vec![dir.path().join("pic.png")]);
         assert_eq!(unshown.lines(), ["1 chart(s) not shown"]);
         assert!(notes.is_empty(), "the report carries the chart loss");
-    }
-
-    /// A chart a slide draws is read where it sits: its kind, title and one line
-    /// per series are printed under the slide's block, and the chart is no longer
-    /// reported as one the reading did not show.
-    #[test]
-    fn pptx_describes_a_slide_chart_where_it_sits() {
-        let bytes = zip_fixture(&[
-            (
-                "ppt/presentation.xml",
-                br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
-            ),
-            (
-                "ppt/_rels/presentation.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
-            ),
-            (
-                "ppt/slides/slide1.xml",
-                br#"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Quarterly sales</a:t></a:r></a:p></p:txBody></p:sp><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>"#,
-            ),
-            (
-                "ppt/slides/_rels/slide1.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
-            ),
-            ("ppt/charts/chart1.xml", COLUMN_CHART.as_bytes()),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, unshown, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed pptx");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  Quarterly sales\n  \
-             Chart (column chart):\n    \
-             Title: Sales\n    \
-             Series \"Revenue\": Jan: 10, Feb: 20"
-        );
-        assert!(
-            unshown.lines().is_empty(),
-            "a described chart is no longer a loss: {:?}",
-            unshown.lines()
-        );
     }
 
     /// A deck's media is named by what each part is: a vector drawing, a video and
@@ -1985,65 +1908,154 @@ mod tests {
         assert!(notes.is_empty(), "no part may be reported lost: {notes:?}");
     }
 
-    /// A slide's notes are announced rather than dropped in silence, however they
-    /// are lost: a relationship that resolves to a part the package does not have.
-    /// A slide whose relationships part cannot be read at all — or one cut at an
-    /// element boundary, which parses as a shorter list than the file meant —
-    /// names (or may name) every part it owns: notes, comments, layout, diagrams,
-    /// charts, so the loss is said once as the slide's relationships, and never
-    /// read as a slide that declares none of them.
+    /// A hidden slide is marked, keeps its number, and still says it is hidden
+    /// when it holds nothing; `showMasterSp` is not the slide's own show flag.
     #[test]
-    fn pptx_reports_notes_it_cannot_read() {
-        let slide = br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide text</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
-            .as_slice();
-        // The notes relationship resolves to a part the package does not have;
-        // then a relationships part cut short mid-tag, and one cut at an element
-        // boundary — which parses, and so is caught only by its own wholeness.
-        let lost: [(&[u8], &str); 3] = [
+    fn pptx_marks_a_hidden_slide_and_keeps_its_number() {
+        let bytes = zip_fixture(&[
             (
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#,
-                "slide 1 notes could not be read",
+                "ppt/presentation.xml",
+                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/></p:sldIdLst></p:presentation>"#,
             ),
             (
-                br#"<Relationships><Relationship Id="rId"#,
-                "slide 1 relationships could not be read",
+                "ppt/_rels/presentation.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/><Relationship Id="rId3" Target="slides/slide3.xml"/></Relationships>"#,
             ),
             (
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>"#,
-                "slide 1 relationships could not be read",
+                "ppt/slides/slide1.xml",
+                br#"<p:sld show="0"><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Hidden</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
             ),
-        ];
-        for (rels, expectation) in lost {
-            let bytes = zip_fixture(&[
-                (
-                    "ppt/presentation.xml",
-                    br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
-                ),
-                (
-                    "ppt/_rels/presentation.xml.rels",
-                    br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
-                ),
+            (
+                "ppt/slides/slide2.xml",
+                br#"<p:sld showMasterSp="0"><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Shown</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
+            ),
+            (
+                "ppt/slides/slide3.xml",
+                br#"<p:sld show="0"><p:spTree/></p:sld>"#,
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
+            panic!("expected Text outcome for a readable presentation");
+        };
+        assert_eq!(
+            text,
+            "Slide 1: (hidden slide)\n  Hidden\n\n\
+             Slide 2:\n  Shown\n\n\
+             Slide 3: (hidden slide) (no text)"
+        );
+    }
+
+    /// A part a slide declares and the reading cannot show is named per slide
+    /// rather than dropped in silence: a notes relationship resolving to a part
+    /// the package does not hold, a slide's relationships part cut short — mid
+    /// tag, or at an element boundary, which parses as a shorter list than the
+    /// file meant — and a comments part absent from the package or replaced by
+    /// an error page. A slide whose own relationship never resolves keeps its
+    /// number, so the slides after it are not renumbered.
+    #[test]
+    fn pptx_reports_the_slide_parts_it_cannot_read() {
+        let presentation: &'static [u8] = br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#;
+        let presentation_rels: &'static [u8] = br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#;
+        let slide: &'static [u8] = br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide text</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>";
+        let notes_rels: &'static [u8] = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#;
+        let comments_rels: &'static [u8] = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/></Relationships>"#;
+        // One slide, with its own relationships part and whatever parts the case
+        // says the package holds beside it.
+        let deck = |rels: &'static [u8], extra: &[(&'static str, &'static [u8])]| {
+            let mut entries: Vec<(&'static str, &'static [u8])> = vec![
+                ("ppt/presentation.xml", presentation),
+                ("ppt/_rels/presentation.xml.rels", presentation_rels),
                 ("ppt/slides/slide1.xml", slide),
                 ("ppt/slides/_rels/slide1.xml.rels", rels),
-            ]);
+            ];
+            entries.extend_from_slice(extra);
+            entries
+        };
+        // A deck declaring three slides, the second of them never declared in
+        // the presentation's relationships.
+        let three_slides: &'static [u8] = br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rId2"/><p:sldId id="258" r:id="rId3"/></p:sldIdLst></p:presentation>"#;
+        let three_slides_rels: &'static [u8] = br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId3" Target="slides/slide2.xml"/></Relationships>"#;
+        let first_slide: &'static [u8] = br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>First</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>";
+        let third_slide: &'static [u8] = br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Third</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>";
+        let readable = "Slide 1:\n  Slide text";
+        for (label, fixture, expected) in [
+            (
+                "a notes part the package does not hold",
+                deck(notes_rels, &[]),
+                (readable, ["slide 1 notes could not be read"].as_slice()),
+            ),
+            (
+                "a relationships part cut mid-tag",
+                deck(br#"<Relationships><Relationship Id="rId"#, &[]),
+                (
+                    readable,
+                    ["slide 1 relationships could not be read"].as_slice(),
+                ),
+            ),
+            (
+                "a relationships part cut at an element boundary",
+                deck(
+                    br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>"#,
+                    &[],
+                ),
+                (
+                    readable,
+                    ["slide 1 relationships could not be read"].as_slice(),
+                ),
+            ),
+            (
+                "a comments part the package does not hold",
+                deck(comments_rels, &[]),
+                (readable, ["slide 1 comments could not be read"].as_slice()),
+            ),
+            (
+                "a comments part holding an error page",
+                deck(
+                    comments_rels,
+                    &[("ppt/comments/comment1.xml", b"<html>404</html>")],
+                ),
+                (readable, ["slide 1 comments could not be read"].as_slice()),
+            ),
+            (
+                "a slide whose own relationship never resolves",
+                vec![
+                    ("ppt/presentation.xml", three_slides),
+                    ("ppt/_rels/presentation.xml.rels", three_slides_rels),
+                    ("ppt/slides/slide1.xml", first_slide),
+                    ("ppt/slides/slide2.xml", third_slide),
+                ],
+                (
+                    "Slide 1:\n  First\n\nSlide 3:\n  Third",
+                    ["slide 2 could not be read"].as_slice(),
+                ),
+            ),
+        ] {
+            let (expected_text, expected_notes) = expected;
+            let bytes = zip_fixture(&fixture);
             let dir = tempfile::tempdir().expect("tempdir");
             let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
-                panic!("expected Text outcome for a readable presentation");
+                panic!("{label}: expected Text outcome for a readable presentation");
             };
-            assert_eq!(text, "Slide 1:\n  Slide text");
-            assert_eq!(notes, [expectation]);
+            assert_eq!(text, expected_text, "{label}: the slides it could read");
+            assert_eq!(
+                notes, expected_notes,
+                "{label}: the part it could not read is named once"
+            );
         }
     }
 
-    /// A slide's legacy comments are read through its own relationships and
-    /// printed under it: each entry's author resolves through the deck's author
-    /// registry, and an `authorId` the registry does not hold prints its text
-    /// alone rather than passing the comment off as one by nobody. An entry the
-    /// part states is always shown, so one with no words prints the no-text mark
+    /// A slide's comments are read through its own relationships and printed
+    /// under it, each entry's author resolved through the deck's own registry —
+    /// the legacy author list or the 2018 one — and an `authorId` the registry
+    /// does not hold printing its text alone rather than passing the comment off
+    /// as one by nobody. A reply follows the comment it answers even where the
+    /// part closes it first, a multi-paragraph body reads as one line with a
+    /// field's text left out, and an entry with no words prints the no-text mark
     /// instead of vanishing.
     #[test]
-    fn pptx_reads_legacy_comments_with_their_authors() {
-        let bytes = zip_fixture(&[
+    fn pptx_reads_comments_with_their_authors() {
+        let legacy = zip_fixture(&[
             (
                 "ppt/presentation.xml",
                 br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
@@ -2069,27 +2081,7 @@ mod tests {
                 br#"<p:cmLst><p:cm authorId="0" idx="1" dt="2026-01-01T00:00:00"><p:pos x="1" y="2"/><p:text>needs a citation</p:text></p:cm><p:cm authorId="7" idx="2"><p:text>agreed</p:text></p:cm><p:cm authorId="1" idx="3"><p:text>  </p:text></p:cm><p:cm authorId="7" idx="4"><p:text/></p:cm></p:cmLst>"#,
             ),
         ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  Slide text\n\n\
-             Slide 1 comments:\n  Anna Petrova: needs a citation\n  agreed\n  \
-             Ivan Petrov: (no text)\n  (no text)"
-        );
-        assert!(notes.is_empty(), "the comments are shown: {notes:?}");
-    }
-
-    /// A slide's 2018 threaded comments are read through its own relationships
-    /// too: a reply is shown after the comment it answers (though the part closes
-    /// it first), each author resolves through the deck's 2018 registry, and a
-    /// multi-paragraph body is one line, as every comment's text is — with a line
-    /// break separating its runs and a field's text left out.
-    #[test]
-    fn pptx_reads_modern_threaded_comments_and_their_replies() {
-        let bytes = zip_fixture(&[
+        let threaded = zip_fixture(&[
             (
                 "ppt/presentation.xml",
                 br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
@@ -2115,62 +2107,41 @@ mod tests {
                 br#"<p188:cmLst><p188:cm authorId="{5C4A1C0A-0000-0000-0000-000000000001}" idx="1"><p188:txBody><a:p><a:r><a:t>Needs</a:t></a:r><a:br/><a:r><a:t>a citation</a:t></a:r><a:fld id="1" type="slidenum"><a:t>7</a:t></a:fld></a:p><a:p><a:r><a:t>for the figure</a:t></a:r></a:p></p188:txBody><p188:replyLst><p188:reply authorId="{5C4A1C0A-0000-0000-0000-000000000002}"><p188:txBody><a:p><a:r><a:t>Agreed</a:t></a:r></a:p></p188:txBody></p188:reply></p188:replyLst></p188:cm></p188:cmLst>"#,
             ),
         ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  Slide text\n\n\
-             Slide 1 comments:\n  Anna Petrova: Needs a citation for the figure\n  Ivan Petrov: Agreed"
-        );
-        assert!(notes.is_empty(), "the comments are shown: {notes:?}");
-    }
-
-    /// A comments part a slide declares and the reading cannot show is said per
-    /// slide, whether the package does not hold the part or holds something else
-    /// in its place: comments are content, never a silent omission.
-    #[test]
-    fn pptx_reports_comments_it_cannot_read() {
-        let slide = br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide text</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
-            .as_slice();
-        let comments_rels = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/></Relationships>"#;
-        // The comments part is absent from the package, and, second, the package
-        // holds an error page in its place.
-        let lost: [Option<&[u8]>; 2] = [None, Some(b"<html>404</html>")];
-        for part in lost {
-            let mut entries: Vec<(&str, &[u8])> = vec![
-                (
-                    "ppt/presentation.xml",
-                    br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
-                ),
-                (
-                    "ppt/_rels/presentation.xml.rels",
-                    br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
-                ),
-                ("ppt/slides/slide1.xml", slide),
-                ("ppt/slides/_rels/slide1.xml.rels", comments_rels),
-            ];
-            if let Some(part) = part {
-                entries.push(("ppt/comments/comment1.xml", part));
-            }
-            let bytes = zip_fixture(&entries);
+        for (label, fixture, expected) in [
+            (
+                "legacy comments",
+                legacy,
+                "Slide 1:\n  Slide text\n\n\
+                 Slide 1 comments:\n  Anna Petrova: needs a citation\n  agreed\n  \
+                 Ivan Petrov: (no text)\n  (no text)",
+            ),
+            (
+                "2018 threaded comments",
+                threaded,
+                "Slide 1:\n  Slide text\n\n\
+                 Slide 1 comments:\n  Anna Petrova: Needs a citation for the figure\n  Ivan Petrov: Agreed",
+            ),
+        ] {
             let dir = tempfile::tempdir().expect("tempdir");
-            let DocOutcome::Text { text, notes, .. } = convert_pptx(&bytes, dir.path()) else {
-                panic!("expected Text outcome for a readable presentation");
+            let DocOutcome::Text { text, notes, .. } = convert_pptx(&fixture, dir.path()) else {
+                panic!("{label}: expected Text outcome for a readable presentation");
             };
-            assert_eq!(text, "Slide 1:\n  Slide text");
-            assert_eq!(notes, ["slide 1 comments could not be read"]);
+            assert_eq!(
+                text, expected,
+                "{label}: the comments printed under the slide"
+            );
+            assert!(
+                notes.is_empty(),
+                "{label}: the comments are shown: {notes:?}"
+            );
         }
     }
 
-    /// A slide's own title placeholder is marked and its text appears exactly
-    /// once; a shape without a `<p:ph>` is ordinary text, an empty title adds no
-    /// mark, and a slide holding only its title does not read as one with no
-    /// text.
-    #[test]
-    fn pptx_marks_the_title_placeholder_the_slide_declares() {
-        let bytes = zip_fixture(&[
+    /// A deck whose four slides declare their own title placeholders: an own
+    /// `type="title"` beside a plain text box, a `ctrTitle`, an empty one, and
+    /// one whose title is all the slide holds.
+    fn own_title_placeholders() -> Vec<u8> {
+        zip_fixture(&[
             (
                 "ppt/presentation.xml",
                 br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/><p:sldId r:id="rId4"/></p:sldIdLst></p:presentation>"#,
@@ -2200,31 +2171,13 @@ mod tests {
                 "ppt/slides/slide4.xml",
                 br#"<p:sld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Title only</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
             ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  (title) Quarterly review\n  Heading as a text box\n\n\
-             Slide 2:\n  (title) Centred title\n\n\
-             Slide 3:\n  Only body\n\n\
-             Slide 4:\n  (title) Title only"
-        );
+        ])
     }
 
-    /// A title the slide leaves to its layout: the slide's `<p:ph idx="10"/>`
-    /// carries no type, and the layout part its own relationship names declares
-    /// that `idx` a title. The layout's text never enters the answer, the
-    /// layout's body placeholder stays body text, and the answer is the layout's
-    /// alone — a slide of another layout, whose title sits at another `idx`, is
-    /// left unmarked even though its own placeholder carries the same `idx`. A
-    /// placeholder naming neither type nor `idx` takes the schema's defaults,
-    /// which the layout is consulted for like any other `idx`.
-    #[test]
-    fn pptx_marks_a_title_inherited_from_the_layout() {
-        let bytes = zip_fixture(&[
+    /// A deck whose five slides inherit their titles from the layout parts their
+    /// own relationships name.
+    fn layout_inherited_titles() -> Vec<u8> {
+        zip_fixture(&[
             (
                 "ppt/presentation.xml",
                 br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/><p:sldId r:id="rId4"/><p:sldId r:id="rId5"/></p:sldIdLst></p:presentation>"#,
@@ -2292,66 +2245,58 @@ mod tests {
                 "ppt/slideLayouts/slideLayout3.xml",
                 br#"<p:sldLayout><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>DEFAULTED LAYOUT TITLE</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>LAYOUT BODY</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sldLayout>"#,
             ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  (title) Inherited title\n  Body\n\n\
-             Slide 2:\n  Not a title here\n\n\
-             Slide 3:\n  (title) Shared layout title\n\n\
-             Slide 4:\n  (title) Defaulted title\n\n\
-             Slide 5:\n  Defaulted body"
-        );
+        ])
     }
 
-    /// A hidden slide is marked, keeps its number, and still says it is hidden
-    /// when it holds nothing; `showMasterSp` is not the slide's own show flag.
+    /// A slide's own title placeholder is marked and its text appears exactly
+    /// once — an own `type="title"` or `ctrTitle` alike, a shape without a
+    /// `<p:ph>` is ordinary text, an empty title adds no mark, and a slide
+    /// holding only its title does not read as one with no text. A title the
+    /// slide leaves to its layout is marked through the layout part its own
+    /// relationship names: the layout's text never enters the answer, a
+    /// placeholder of another layout is left unmarked even where it carries the
+    /// same `idx`, and a placeholder naming neither type nor `idx` takes the
+    /// schema's defaults, which the layout is consulted for like any other `idx`.
     #[test]
-    fn pptx_marks_a_hidden_slide_and_keeps_its_number() {
-        let bytes = zip_fixture(&[
+    fn pptx_marks_a_title_from_the_slide_or_its_layout() {
+        for (label, fixture, expected) in [
             (
-                "ppt/presentation.xml",
-                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/></p:sldIdLst></p:presentation>"#,
+                "titles the slide itself declares",
+                own_title_placeholders(),
+                "Slide 1:\n  (title) Quarterly review\n  Heading as a text box\n\n\
+                 Slide 2:\n  (title) Centred title\n\n\
+                 Slide 3:\n  Only body\n\n\
+                 Slide 4:\n  (title) Title only",
             ),
             (
-                "ppt/_rels/presentation.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/><Relationship Id="rId3" Target="slides/slide3.xml"/></Relationships>"#,
+                "titles inherited from the slide's layout",
+                layout_inherited_titles(),
+                "Slide 1:\n  (title) Inherited title\n  Body\n\n\
+                 Slide 2:\n  Not a title here\n\n\
+                 Slide 3:\n  (title) Shared layout title\n\n\
+                 Slide 4:\n  (title) Defaulted title\n\n\
+                 Slide 5:\n  Defaulted body",
             ),
-            (
-                "ppt/slides/slide1.xml",
-                br#"<p:sld show="0"><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Hidden</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
-            ),
-            (
-                "ppt/slides/slide2.xml",
-                br#"<p:sld showMasterSp="0"><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Shown</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>"#,
-            ),
-            (
-                "ppt/slides/slide3.xml",
-                br#"<p:sld show="0"><p:spTree/></p:sld>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1: (hidden slide)\n  Hidden\n\n\
-             Slide 2:\n  Shown\n\n\
-             Slide 3: (hidden slide) (no text)"
-        );
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let DocOutcome::Text { text, .. } = convert_pptx(&fixture, dir.path()) else {
+                panic!("{label}: expected Text outcome for a readable presentation");
+            };
+            assert_eq!(text, expected, "{label}: the title marks printed");
+        }
     }
 
     /// A `dgm:relIds` shape reads its data part's point text under a
-    /// `(diagram text)` line, every point type read but the points the diagram
-    /// flags as its own editor placeholders, and the slide does not read as one
-    /// with no text — a diagram that carries none included.
+    /// `(diagram text)` line, in the order the slide's shapes present them and
+    /// each data part once per slide however often it is referenced (again on
+    /// every other slide that shows it). Every point type is read but the points
+    /// the diagram flags as its own editor placeholders — an `phldrT` hint rides
+    /// on points carrying text of their own, so only `phldr` hides a point — a
+    /// point's field text is not its run text, and a slide whose diagram shows
+    /// no text still does not read as one with no text at all.
     #[test]
     fn pptx_reads_diagram_text_from_the_data_model() {
-        let bytes = zip_fixture(&[
+        let points = zip_fixture(&[
             (
                 "ppt/presentation.xml",
                 br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>"#,
@@ -2391,23 +2336,7 @@ mod tests {
                 br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="doc"><dgm:prSet phldr="1"/><dgm:t><a:p><a:r><a:t>Hint</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
             ),
         ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  (diagram text)\n    North\n    Assistant\n    South\n\n\
-             Slide 2:\n  (diagram text)"
-        );
-    }
-
-    /// Diagrams read in the order the slide's shapes present them, each data
-    /// part read once on a slide however often it is referenced, and again on
-    /// every other slide that shows it.
-    #[test]
-    fn pptx_reads_each_diagram_once_per_slide() {
-        let bytes = zip_fixture(&[
+        let once_per_slide = zip_fixture(&[
             (
                 "ppt/presentation.xml",
                 br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>"#,
@@ -2444,15 +2373,26 @@ mod tests {
                 br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="node"><dgm:t><a:p><a:r><a:t>Alpha</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
             ),
         ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  (diagram text)\n    North\n    South\n  (diagram text)\n    Alpha\n\n\
-             Slide 2:\n  (diagram text)\n    North\n    South"
-        );
+        for (label, fixture, expected) in [
+            (
+                "points, their types and the placeholders among them",
+                points,
+                "Slide 1:\n  (diagram text)\n    North\n    Assistant\n    South\n\n\
+                 Slide 2:\n  (diagram text)",
+            ),
+            (
+                "each diagram once per slide, in shape order",
+                once_per_slide,
+                "Slide 1:\n  (diagram text)\n    North\n    South\n  (diagram text)\n    Alpha\n\n\
+                 Slide 2:\n  (diagram text)\n    North\n    South",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let DocOutcome::Text { text, .. } = convert_pptx(&fixture, dir.path()) else {
+                panic!("{label}: expected Text outcome for a readable presentation");
+            };
+            assert_eq!(text, expected, "{label}: the diagram text printed");
+        }
     }
 
     /// A diagram whose data cannot be read says so rather than letting the slide
@@ -2535,52 +2475,6 @@ mod tests {
              Slide 4:\n  (diagram text could not be read)\n\n\
              Slide 5:\n  Plain\n\n\
              Slide 6:\n  (diagram text could not be read)"
-        );
-    }
-
-    /// A self-closing `<dgm:dataModel/>` is a data model that shows no text, so
-    /// its slide reads `(diagram text)`; a data part the package left with zero
-    /// bytes declares no data model, so its slide reads
-    /// `(diagram text could not be read)`.
-    #[test]
-    fn pptx_reads_a_self_closing_data_model_and_reports_an_empty_one() {
-        let bytes = zip_fixture(&[
-            (
-                "ppt/presentation.xml",
-                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>"#,
-            ),
-            (
-                "ppt/_rels/presentation.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/></Relationships>"#,
-            ),
-            (
-                "ppt/slides/slide1.xml",
-                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
-            ),
-            (
-                "ppt/slides/_rels/slide1.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/></Relationships>"#,
-            ),
-            ("ppt/diagrams/data1.xml", br"<dgm:dataModel/>"),
-            (
-                "ppt/slides/slide2.xml",
-                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
-            ),
-            (
-                "ppt/slides/_rels/slide2.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data2.xml"/></Relationships>"#,
-            ),
-            // Zero bytes: an entry the package left empty, which a diagram
-            // reads as data absent rather than as a data model with no text.
-            ("ppt/diagrams/data2.xml", b""),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  (diagram text)\n\nSlide 2:\n  (diagram text could not be read)"
         );
     }
 
@@ -2667,31 +2561,6 @@ mod tests {
         assert!(pptx_diagram_text(&zip_fixture(&[("word/document.xml", DOCX_BODY)])).is_empty());
     }
 
-    /// A table cell's `<a:t>` is body text: the slide walk reads it like any
-    /// other run, not as a diagram's.
-    #[test]
-    fn pptx_reads_table_cells_as_body_text() {
-        let bytes = zip_fixture(&[
-            (
-                "ppt/presentation.xml",
-                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>"#,
-            ),
-            (
-                "ppt/_rels/presentation.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
-            ),
-            (
-                "ppt/slides/slide1.xml",
-                br"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>Cell one</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>Cell two</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>",
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(text, "Slide 1:\n  Cell one\n  Cell two");
-    }
-
     // ── Word ────────────────────────────────────────────────────
 
     /// A media entry name carrying a bracket would close the `[File ...]` note
@@ -2707,25 +2576,5 @@ mod tests {
             panic!("expected Text outcome for a well-formed docx");
         };
         assert_eq!(images, vec![dir.path().join("a_b.png")]);
-    }
-
-    /// Two entries can share a base name under different directories, and only
-    /// the base name survives into `out_dir`: each must get its own file, or one
-    /// is silently overwritten and the survivor ingested twice.
-    #[test]
-    fn docx_duplicate_media_base_names_get_distinct_files() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/media/pic.png", b"\x89PNG\r\n\x1a\nfirst"),
-            ("word/media/sub/pic.png", b"\x89PNG\r\n\x1a\nsecond"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, .. } = convert_docx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(
-            images,
-            vec![dir.path().join("pic.png"), dir.path().join("pic_2.png")]
-        );
     }
 }
