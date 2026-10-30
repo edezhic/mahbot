@@ -977,482 +977,50 @@ mod tests {
         }
     }
 
+    /// The picture row a resolved image path draws, named by its file name.
+    fn img(path: &str) -> MediaAttachment {
+        picture(Some(path), &format!("🖼️ {}", file_name_or_path(path)))
+    }
+
+    /// The audio row for a path.
+    fn snd(path: &str) -> MediaAttachment {
+        named(&format!("🎵 {}", file_name_or_path(path)), None)
+    }
+
+    /// The video clip row for a path.
+    fn clip(path: &str) -> MediaAttachment {
+        named(&format!("🎬 Video: {}", file_name_or_path(path)), None)
+    }
+
+    /// The document row for a path, revealed at `reveal`.
+    fn doc(path: &str, reveal: &str) -> MediaAttachment {
+        named(&format!("📄 {}", file_name_or_path(path)), Some(reveal))
+    }
+
     /// All paragraph text a parsed body carries, flattened.
     fn paragraph_text(items: &[markdown::Item]) -> String {
         let style = crate::gui::theme::markdown_settings().style;
         items
             .iter()
             .filter_map(|item| match item {
-                markdown::Item::Paragraph(text) => Some(
-                    text.spans(style)
-                        .iter()
-                        .map(|span| span.text.to_string())
-                        .collect::<String>(),
-                ),
+                markdown::Item::Paragraph(text) => Some(text.spans(style)),
                 _ => None,
             })
+            .map(|spans| spans.iter().map(|s| s.text.to_string()).collect::<String>())
             .collect()
     }
 
-    #[expect(clippy::too_many_lines)] // large table-driven fixture
-    #[test]
-    fn preprocess_table() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let photo = root.join("photo.png");
-        let spaced = root.join("my file.png");
-        let recording = root.join("recording.ogg");
-        let nested = root.join("dir/subdir/rec.ogg");
-        let clip = root.join("video.mp4");
-        let report = root.join("generated/report.pdf");
-        let readme = root.join("README");
-        std::fs::write(&photo, tiny_png(2, 1)).unwrap();
-        std::fs::write(&spaced, tiny_png(2, 1)).unwrap();
-        std::fs::write(&recording, b"ogg").unwrap();
-        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
-        std::fs::write(&nested, b"ogg").unwrap();
-        std::fs::write(&clip, b"mp4").unwrap();
-        std::fs::create_dir_all(report.parent().unwrap()).unwrap();
-        std::fs::write(&report, b"pdf").unwrap();
-        std::fs::write(&readme, b"readme").unwrap();
-        let photo_str = photo.to_string_lossy().into_owned();
-        let spaced_str = spaced.to_string_lossy().into_owned();
-        let report_str = report.to_string_lossy().into_owned();
-        let readme_str = readme.to_string_lossy().into_owned();
-        let valid_uri = data_uri(&tiny_png(2, 1));
-        let gone = root.join("cleaned_up.png");
-        let gone_str = gone.to_string_lossy().into_owned();
-        let not_an_image = root.join("notes.txt");
-        std::fs::write(&not_an_image, b"not an image").unwrap();
-        let not_an_image_str = not_an_image.to_string_lossy().into_owned();
-
-        let cases: Vec<(&str, String, String, Vec<MediaAttachment>)> = vec![
-            (
-                // A relative target resolves against the workspace, an absolute
-                // one is taken as written: the same row either way.
-                "resolves a workspace-relative image marker and takes an absolute one as it is",
-                format!("Look [IMAGE:photo.png] and [IMAGE:{photo_str}] here"),
-                "Look and here".into(),
-                vec![
-                    picture(Some(&photo_str), "🖼️ photo.png"),
-                    picture(Some(&photo_str), "🖼️ photo.png"),
-                ],
-            ),
-            (
-                "delivers markers written in lowercase",
-                "img [image:photo.png] hear [audio:recording.ogg]".into(),
-                "img hear".into(),
-                vec![
-                    picture(Some(&photo_str), "🖼️ photo.png"),
-                    named("🎵 recording.ogg", None),
-                ],
-            ),
-            (
-                // Casing, a relative and an absolute target: all three are
-                // references, so all three draw even with no file behind them.
-                "draws markers whose file is gone like any missing file",
-                format!("see [image:cleaned_up.png] and [IMAGE:{gone_str}] here"),
-                "see and here".into(),
-                vec![
-                    picture(Some(gone_str.as_str()), "🖼️ cleaned_up.png"),
-                    picture(Some(gone_str.as_str()), "🖼️ cleaned_up.png"),
-                ],
-            ),
-            (
-                "resolves a relative image marker with spaces in the path",
-                "img [IMAGE:my file.png]".into(),
-                "img".into(),
-                vec![picture(Some(&spaced_str), "🖼️ my file.png")],
-            ),
-            (
-                "draws a target that is not an image, letting the viewer show its placeholder",
-                format!("[IMAGE:{not_an_image_str}]"),
-                String::new(),
-                vec![picture(Some(not_an_image_str.as_str()), "🖼️ notes.txt")],
-            ),
-            (
-                // Neither a malformed address nor one of a scheme the product
-                // has no way to show is a reference: the words stay exactly as
-                // written, with no notice.
-                "keeps an address it cannot show as written",
-                "see [IMAGE:https://exa mple.com/x.png], [FILE:https://exa mple.com/a.pdf] \
-                 and [FILE:ftp://example.com/a.pdf] here"
-                    .into(),
-                "see [IMAGE:https://exa mple.com/x.png], [FILE:https://exa mple.com/a.pdf] \
-                 and [FILE:ftp://example.com/a.pdf] here"
-                    .into(),
-                Vec::new(),
-            ),
-            (
-                // An address is one in any scheme casing: the same row as the
-                // canonical form, never a local path.
-                "reads an address in a non-canonical scheme casing",
-                "see [IMAGE:HTTPS://Example.com/x.png] here".into(),
-                "see here".into(),
-                vec![picture(Some("https://Example.com/x.png"), "🖼️ x.png")],
-            ),
-            (
-                "names the stripped-data-URI placeholder generically and draws nothing",
-                format!("Look [IMAGE:{DATA_URI_OMITTED_PREFIX} (35 bytes)>] here"),
-                "Look here".into(),
-                vec![picture(None, "🖼️ image")],
-            ),
-            (
-                "draws an inline image payload",
-                format!("Look [IMAGE:{valid_uri}] here"),
-                "Look here".into(),
-                vec![picture(Some(&valid_uri), "🖼️ image")],
-            ),
-            (
-                // A payload is a value whatever its body carries, so the `://`
-                // inside a hand-written one never makes it look like an address.
-                "draws an inline payload whose body holds an address",
-                r#"Look [IMAGE:data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>] here"#
-                    .into(),
-                "Look here".into(),
-                vec![picture(
-                    Some(r#"data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>"#),
-                    "🖼️ image",
-                )],
-            ),
-            (
-                // The role prompt's own examples, plus prose beside a real clip:
-                // the text is untouched, the reference draws.
-                "keeps prose marker examples as written, beside a reference that draws",
-                "send with [IMAGE:path], [VIDEO:path] or [FILE:<path in your workspace>]; \
-                 then [VIDEO:video.mp4]"
-                    .into(),
-                "send with [IMAGE:path], [VIDEO:path] or [FILE:<path in your workspace>]; \
-                 then"
-                    .into(),
-                vec![named("🎬 Video: video.mp4", None)],
-            ),
-            (
-                "keeps an empty marker target as written",
-                "an empty [FILE: ] names nothing".into(),
-                "an empty [FILE: ] names nothing".into(),
-                Vec::new(),
-            ),
-            (
-                "resolves a relative audio marker",
-                "Listen [AUDIO:recording.ogg]".into(),
-                "Listen".into(),
-                vec![named("🎵 recording.ogg", None)],
-            ),
-            (
-                "resolves a relative audio marker in a nested path",
-                "hear [AUDIO:dir/subdir/rec.ogg]".into(),
-                "hear".into(),
-                vec![named("🎵 rec.ogg", None)],
-            ),
-            (
-                "draws a missing audio marker like any missing file",
-                "Listen [AUDIO:gone.ogg]".into(),
-                "Listen".into(),
-                vec![named("🎵 gone.ogg", None)],
-            ),
-            (
-                "resolves a relative video marker",
-                "Watch [VIDEO:video.mp4]".into(),
-                "Watch".into(),
-                vec![named("🎬 Video: video.mp4", None)],
-            ),
-            (
-                "names a file marker's resolved target",
-                "Get [FILE:generated/report.pdf]".into(),
-                "Get".into(),
-                vec![named("📄 report.pdf", Some(&report_str))],
-            ),
-            (
-                "delivers a workspace file whose name is a bare word",
-                "Get [FILE:README]".into(),
-                "Get".into(),
-                vec![named("📄 README", Some(&readme_str))],
-            ),
-            (
-                "draws a file marker whose file is gone, revealing where it was",
-                "Get [FILE:generated/gone.pdf]".into(),
-                "Get".into(),
-                vec![named(
-                    "📄 gone.pdf",
-                    Some(&root.join("generated/gone.pdf").to_string_lossy()),
-                )],
-            ),
-            (
-                "reports a file marker that names an address",
-                "Get [FILE:https://example.com/a.pdf]".into(),
-                "Get Could not send \"a.pdf\": an address is not a local file.".into(),
-                Vec::new(),
-            ),
-            (
-                "refuses a file marker's inline payload, which cannot become a file row",
-                "Get [FILE:data:text/plain;base64,aGVsbG8=]".into(),
-                "Get Could not send \"file\": it carries an inline payload, not a file.".into(),
-                Vec::new(),
-            ),
-            (
-                "replaces an audio transcription block",
-                "[Audio transcription of recording.ogg]: Hello world".into(),
-                "🔊 Hello world".into(),
-                Vec::new(),
-            ),
-            (
-                "renders every line of a multiline audio transcription under 🔊",
-                "[Audio transcription of voice.ogg]: Line one\nLine two".into(),
-                "🔊 Line one\nLine two".into(),
-                Vec::new(),
-            ),
-            (
-                "renders every line of a multiline video transcription under 🎬 and leaves following message content untouched",
-                "[Video transcription of clip.mp4]: Line one\nLine two\n\nEdit this".into(),
-                "🎬 Line one\nLine two\n\nEdit this".into(),
-                Vec::new(),
-            ),
-            (
-                "video-transcription format contains Video and is handled before the [VIDEO:...] pattern",
-                "[Video transcription of clip.mp4]: hi there [VIDEO:video.mp4]".into(),
-                "🎬 hi there".into(),
-                vec![named("🎬 Video: video.mp4", None)],
-            ),
-            (
-                "audio-transcription format contains Audio and is handled before the [AUDIO:...] pattern",
-                "[Audio transcription of msg.ogg]: hi there [AUDIO:recording.ogg]".into(),
-                "🔊 hi there".into(),
-                vec![named("🎵 recording.ogg", None)],
-            ),
-            (
-                "separates mixed image/audio/video markers from the text around them",
-                "![]() [IMAGE:photo.png] and [AUDIO:recording.ogg] end [VIDEO:video.mp4]".into(),
-                "and end".into(),
-                vec![
-                    picture(Some(&photo_str), "🖼️ photo.png"),
-                    named("🎵 recording.ogg", None),
-                    named("🎬 Video: video.mp4", None),
-                ],
-            ),
-            (
-                "drops a bullet whose only content was the picture",
-                "- [IMAGE:photo.png]".into(),
-                String::new(),
-                vec![picture(Some(&photo_str), "🖼️ photo.png")],
-            ),
-            (
-                "keeps the rest of a list whose first bullet was a picture",
-                "1. [IMAGE:photo.png]\n2. the rest".into(),
-                "2. the rest".into(),
-                vec![picture(Some(&photo_str), "🖼️ photo.png")],
-            ),
-            (
-                "leaves content without markers unchanged",
-                "Hello world".into(),
-                "Hello world".into(),
-                Vec::new(),
-            ),
-            (
-                "returns the empty string unchanged",
-                String::new(),
-                String::new(),
-                Vec::new(),
-            ),
-            (
-                "strips a saved image annotation and its blank-line separator",
-                format!("[IMAGE:{valid_uri}]\n\n[Saved image: /uploads/img.png]"),
-                String::new(),
-                vec![picture(Some(&valid_uri), "🖼️ image")],
-            ),
-            (
-                "strips a saved image annotation at the start with no preceding separator",
-                "[Saved image: /uploads/img.png]".into(),
-                String::new(),
-                Vec::new(),
-            ),
-            (
-                "turns a saved video annotation into a visible clip label",
-                "Clip [Saved video: /uploads/clip.mp4] here".into(),
-                "Clip 🎬 Video: clip.mp4 here".into(),
-                Vec::new(),
-            ),
-            (
-                "keeps the saved video clip visible alongside its transcription",
-                "[Video transcription of clip.mp4]: Line one\n\n[Saved video: /uploads/clip.mp4]"
-                    .into(),
-                "🎬 Line one\n\n🎬 Video: clip.mp4".into(),
-                Vec::new(),
-            ),
-        ];
-
-        for (i, (name, input, expected_text, expected_attachments)) in cases.iter().enumerate() {
-            let rendered = preprocess(input, Some(root));
-            assert_eq!(rendered.text, *expected_text, "case {i} ({name}) text");
-            assert_eq!(
-                rendered.attachments, *expected_attachments,
-                "case {i} ({name}) attachments"
-            );
-        }
-    }
-
-    // ── Extracted pictures ───────────────────────────────────────
-
-    #[test]
-    fn text_beside_a_picture_survives_the_parse() {
-        // The mechanism: the markdown parser drains every span collected
-        // before an image into its `alt`, so the words before the picture were
-        // never drawn. Extraction leaves them in the body.
-        let tmp = tempfile::tempdir().unwrap();
-        let uri = data_uri(&tiny_png(2, 1));
-        let rendered = preprocess(&format!("8. the body [IMAGE:{uri}]"), Some(tmp.path()));
-        assert_eq!(rendered.attachments, vec![picture(Some(&uri), "🖼️ image")]);
-
-        let items: Vec<_> = markdown::parse(&rendered.text).collect();
-        let [markdown::Item::List { bullets, .. }] = items.as_slice() else {
-            panic!("expected the list to survive, got {items:?}");
+    /// The text of the single bullet a parsed body renders the picture into.
+    fn only_bullet(name: &str, items: &[markdown::Item]) -> String {
+        let [markdown::Item::List { bullets, .. }] = items else {
+            panic!("case {name}: expected the list to survive, got {items:?}");
         };
         let [markdown::Bullet::Point { items }] = bullets.as_slice() else {
-            panic!("expected one bullet, got {bullets:?}");
+            panic!("case {name}: expected one bullet, got {bullets:?}");
         };
-        assert_eq!(paragraph_text(items), "the body");
+        paragraph_text(items)
     }
 
-    #[test]
-    fn a_literal_markdown_image_is_extracted() {
-        // An agent writes markdown itself; the same extraction keeps the words
-        // around its picture.
-        let tmp = tempfile::tempdir().unwrap();
-        let rendered = preprocess("Look ![shot](url) here", Some(tmp.path()));
-        assert_eq!(rendered.text, "Look here");
-        assert_eq!(rendered.attachments, vec![picture(Some("url"), "🖼️ url")]);
-        assert!(!rendered.text.contains("!["));
-    }
-
-    #[test]
-    fn a_picture_on_its_own_line_keeps_the_paragraph() {
-        // The picture sits on a line of its own between two lines of one
-        // paragraph: taking that line with it leaves the one line break the
-        // body had, so the text stays a single paragraph.
-        let tmp = tempfile::tempdir().unwrap();
-        let rendered = preprocess("before\n![shot](url)\nafter", Some(tmp.path()));
-        assert_eq!(rendered.text, "before\nafter");
-        assert_eq!(rendered.attachments, vec![picture(Some("url"), "🖼️ url")]);
-        let items: Vec<_> = markdown::parse(&rendered.text).collect();
-        assert!(
-            matches!(items.as_slice(), [markdown::Item::Paragraph(_)]),
-            "one paragraph, not two: {items:?}"
-        );
-
-        // A blank line on either side is a paragraph gap and stays one.
-        let rendered = preprocess("before\n\n![shot](url)\n\nafter", Some(tmp.path()));
-        assert_eq!(rendered.text, "before\n\nafter");
-    }
-
-    #[test]
-    fn code_keeps_its_marker_and_image_source() {
-        // Inside code the syntax is the subject, so it stays byte for byte:
-        // marker and markdown picture alike, in a fenced block, an indented
-        // block and an inline span.
-        let tmp = tempfile::tempdir().unwrap();
-        let img = tmp.path().join("shot.png");
-        std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
-        let img_str = img.to_string_lossy().into_owned();
-
-        for body in [
-            format!("```\n[IMAGE:{img_str}]\n![x](y)\n```"),
-            format!("    [IMAGE:{img_str}]\n    ![x](y)"),
-            format!("use `[IMAGE:{img_str}]` and `![x](y)` here"),
-        ] {
-            let rendered = preprocess(&body, Some(tmp.path()));
-            assert!(rendered.attachments.is_empty(), "nothing is extracted");
-            assert_eq!(rendered.text, body);
-        }
-    }
-
-    #[test]
-    fn attachments_keep_body_order_across_both_sources() {
-        // Both sources rewrite the one body, so the walk order is the body
-        // order — no source's attachments are grouped ahead of the other's.
-        let tmp = tempfile::tempdir().unwrap();
-        let img = tmp.path().join("shot.png");
-        std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
-        let img_str = img.to_string_lossy().into_owned();
-
-        for (body, second_first) in [
-            (
-                format!("[IMAGE:{img_str}] and ![second](second.png)"),
-                false,
-            ),
-            (format!("![second](second.png) and [IMAGE:{img_str}]"), true),
-        ] {
-            let rendered = preprocess(&body, Some(tmp.path()));
-            let marker = picture(Some(&img_str), "🖼️ shot.png");
-            let literal = picture(Some("second.png"), "🖼️ second.png");
-            let expected = if second_first {
-                vec![literal, marker]
-            } else {
-                vec![marker, literal]
-            };
-            assert_eq!(rendered.attachments, expected, "body order: {body}");
-        }
-    }
-
-    // ── Clickable file markers ────────────────────────────────────
-
-    #[test]
-    fn file_marker_targets_resolve_against_the_workspace() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-
-        assert_eq!(
-            resolve_file_marker_target("generated/report.pdf", Some(root)).unwrap(),
-            root.join("generated/report.pdf"),
-            "a relative target resolves against the conversation's workspace"
-        );
-        let absolute = root.join("elsewhere/report.pdf");
-        assert_eq!(
-            resolve_file_marker_target(&absolute.to_string_lossy(), Some(root)).unwrap(),
-            absolute,
-            "an absolute target is used as it is"
-        );
-        assert_eq!(
-            resolve_file_marker_target("report.pdf", None).unwrap_err(),
-            "Cannot open 'report.pdf': the conversation's workspace is unknown."
-        );
-    }
-
-    #[test]
-    fn reveal_file_marker_refuses_a_target_that_is_not_a_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-
-        let missing = root.join("generated/report.pdf");
-        assert_eq!(
-            reveal_file_marker("generated/report.pdf", Some(root)).unwrap_err(),
-            format!("File not found: {}", missing.display()),
-            "a relative target must resolve against the workspace"
-        );
-
-        std::fs::create_dir(root.join("folder")).unwrap();
-        assert_eq!(
-            reveal_file_marker("folder", Some(root)).unwrap_err(),
-            format!("Not a file: {}", root.join("folder").display())
-        );
-    }
-
-    #[test]
-    fn file_name_or_path_table() {
-        // On Unix `file_name()` additionally normalizes a trailing slash.
-        let cases: &[(&str, &str, &str)] = &[
-            ("unix path", "/foo/bar.txt", "bar.txt"),
-            ("nested path", "/foo/bar/doc.txt", "doc.txt"),
-            ("no directory component", "bar.txt", "bar.txt"),
-            ("trailing slash is normalized on Unix", "/foo/bar/", "bar"),
-        ];
-        for (i, (name, input, expected)) in cases.iter().enumerate() {
-            assert_eq!(file_name_or_path(input), *expected, "case {i} ({name})");
-        }
-    }
-
-    // ── Data-URI image helpers ────────────────────────────────────
-
-    /// Encode a solid-red PNG of the given dimensions (test helper).
     fn tiny_png(width: u32, height: u32) -> Vec<u8> {
         let img = ::image::RgbaImage::from_pixel(width, height, ::image::Rgba([255, 0, 0, 255]));
         let mut buf = Vec::new();
@@ -1465,67 +1033,448 @@ mod tests {
         format!("data:image/png;base64,{}", STANDARD.encode(png))
     }
 
+    #[expect(clippy::too_many_lines)] // one table over every preprocessing case
+    #[test]
+    fn preprocess_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("photo.png"), tiny_png(2, 1)).unwrap();
+        std::fs::write(root.join("my file.png"), tiny_png(2, 1)).unwrap();
+        std::fs::write(root.join("recording.ogg"), b"ogg").unwrap();
+        std::fs::create_dir_all(root.join("dir/subdir")).unwrap();
+        std::fs::write(root.join("dir/subdir/rec.ogg"), b"ogg").unwrap();
+        std::fs::write(root.join("video.mp4"), b"mp4").unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        std::fs::write(root.join("generated/report.pdf"), b"pdf").unwrap();
+        std::fs::write(root.join("README"), b"readme").unwrap();
+        std::fs::write(root.join("notes.txt"), b"not an image").unwrap();
+        let abs = |path: &str| root.join(path).to_string_lossy().into_owned();
+        let (photo_str, spaced_str) = (abs("photo.png"), abs("my file.png"));
+        let (report_str, readme_str) = (abs("generated/report.pdf"), abs("README"));
+        let (gone_str, gone_file_str) = (abs("cleaned_up.png"), abs("generated/gone.pdf"));
+        let not_an_image_str = abs("notes.txt");
+        let valid_uri = data_uri(&tiny_png(2, 1));
+
+        let cases: Vec<(&str, String, &str, Vec<MediaAttachment>)> = vec![
+            (
+                "resolves a workspace-relative image marker and takes an absolute one as it is",
+                format!("Look [IMAGE:photo.png] and [IMAGE:{photo_str}] here"),
+                "Look and here",
+                vec![img(&photo_str), img(&photo_str)],
+            ),
+            (
+                "delivers markers written in lowercase",
+                "img [image:photo.png] hear [audio:recording.ogg]".into(),
+                "img hear",
+                vec![img(&photo_str), snd("recording.ogg")],
+            ),
+            (
+                "draws markers whose file is gone like any missing file",
+                format!("see [image:cleaned_up.png] and [IMAGE:{gone_str}] here"),
+                "see and here",
+                vec![img(&gone_str), img(&gone_str)],
+            ),
+            (
+                "resolves a relative image marker with spaces in the path",
+                "img [IMAGE:my file.png]".into(),
+                "img",
+                vec![img(&spaced_str)],
+            ),
+            (
+                "draws a target that is not an image, letting the viewer show its placeholder",
+                format!("[IMAGE:{not_an_image_str}]"),
+                "",
+                vec![img(&not_an_image_str)],
+            ),
+            (
+                "keeps an address it cannot show as written",
+                "see [IMAGE:https://exa mple.com/x.png], [FILE:https://exa mple.com/a.pdf] \
+                 and [FILE:ftp://example.com/a.pdf] here"
+                    .into(),
+                "see [IMAGE:https://exa mple.com/x.png], [FILE:https://exa mple.com/a.pdf] \
+                 and [FILE:ftp://example.com/a.pdf] here",
+                Vec::new(),
+            ),
+            (
+                "reads an address in a non-canonical scheme casing",
+                "see [IMAGE:HTTPS://Example.com/x.png] here".into(),
+                "see here",
+                vec![img("https://Example.com/x.png")],
+            ),
+            (
+                "names the stripped-data-URI placeholder generically and draws nothing",
+                format!("Look [IMAGE:{DATA_URI_OMITTED_PREFIX} (35 bytes)>] here"),
+                "Look here",
+                vec![picture(None, "🖼️ image")],
+            ),
+            (
+                "draws an inline image payload",
+                format!("Look [IMAGE:{valid_uri}] here"),
+                "Look here",
+                vec![picture(Some(&valid_uri), "🖼️ image")],
+            ),
+            (
+                "draws an inline payload whose body holds an address",
+                r#"Look [IMAGE:data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>] here"#
+                    .into(),
+                "Look here",
+                vec![picture(
+                    Some(r#"data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>"#),
+                    "🖼️ image",
+                )],
+            ),
+            (
+                "keeps prose marker examples as written, beside a reference that draws",
+                "send with [IMAGE:path], [VIDEO:path] or [FILE:<path in your workspace>]; \
+                 then [VIDEO:video.mp4]"
+                    .into(),
+                "send with [IMAGE:path], [VIDEO:path] or [FILE:<path in your workspace>]; then",
+                vec![clip("video.mp4")],
+            ),
+            (
+                "keeps an empty marker target as written",
+                "an empty [FILE: ] names nothing".into(),
+                "an empty [FILE: ] names nothing",
+                Vec::new(),
+            ),
+            (
+                "resolves a relative audio marker",
+                "Listen [AUDIO:recording.ogg]".into(),
+                "Listen",
+                vec![snd("recording.ogg")],
+            ),
+            (
+                "resolves a relative audio marker in a nested path",
+                "hear [AUDIO:dir/subdir/rec.ogg]".into(),
+                "hear",
+                vec![snd("dir/subdir/rec.ogg")],
+            ),
+            (
+                "draws a missing audio marker like any missing file",
+                "Listen [AUDIO:gone.ogg]".into(),
+                "Listen",
+                vec![snd("gone.ogg")],
+            ),
+            (
+                "resolves a relative video marker",
+                "Watch [VIDEO:video.mp4]".into(),
+                "Watch",
+                vec![clip("video.mp4")],
+            ),
+            (
+                "names a file marker's resolved target",
+                "Get [FILE:generated/report.pdf]".into(),
+                "Get",
+                vec![doc("generated/report.pdf", &report_str)],
+            ),
+            (
+                "delivers a workspace file whose name is a bare word",
+                "Get [FILE:README]".into(),
+                "Get",
+                vec![doc("README", &readme_str)],
+            ),
+            (
+                "draws a file marker whose file is gone, revealing where it was",
+                "Get [FILE:generated/gone.pdf]".into(),
+                "Get",
+                vec![doc("generated/gone.pdf", &gone_file_str)],
+            ),
+            (
+                "reports a file marker that names an address",
+                "Get [FILE:https://example.com/a.pdf]".into(),
+                "Get Could not send \"a.pdf\": an address is not a local file.",
+                Vec::new(),
+            ),
+            (
+                "refuses a file marker's inline payload, which cannot become a file row",
+                "Get [FILE:data:text/plain;base64,aGVsbG8=]".into(),
+                "Get Could not send \"file\": it carries an inline payload, not a file.",
+                Vec::new(),
+            ),
+            (
+                "replaces an audio transcription block",
+                "[Audio transcription of recording.ogg]: Hello world".into(),
+                "🔊 Hello world",
+                Vec::new(),
+            ),
+            (
+                "renders every line of a multiline audio transcription under 🔊",
+                "[Audio transcription of voice.ogg]: Line one\nLine two".into(),
+                "🔊 Line one\nLine two",
+                Vec::new(),
+            ),
+            (
+                "renders every line of a multiline video transcription under 🎬 and leaves following message content untouched",
+                "[Video transcription of clip.mp4]: Line one\nLine two\n\nEdit this".into(),
+                "🎬 Line one\nLine two\n\nEdit this",
+                Vec::new(),
+            ),
+            (
+                "video-transcription format contains Video and is handled before the [VIDEO:...] pattern",
+                "[Video transcription of clip.mp4]: hi there [VIDEO:video.mp4]".into(),
+                "🎬 hi there",
+                vec![clip("video.mp4")],
+            ),
+            (
+                "audio-transcription format contains Audio and is handled before the [AUDIO:...] pattern",
+                "[Audio transcription of msg.ogg]: hi there [AUDIO:recording.ogg]".into(),
+                "🔊 hi there",
+                vec![snd("recording.ogg")],
+            ),
+            (
+                "separates mixed image/audio/video markers from the text around them",
+                "![]() [IMAGE:photo.png] and [AUDIO:recording.ogg] end [VIDEO:video.mp4]".into(),
+                "and end",
+                vec![img(&photo_str), snd("recording.ogg"), clip("video.mp4")],
+            ),
+            (
+                "drops a bullet whose only content was the picture",
+                "- [IMAGE:photo.png]".into(),
+                "",
+                vec![img(&photo_str)],
+            ),
+            (
+                "keeps the rest of a list whose first bullet was a picture",
+                "1. [IMAGE:photo.png]\n2. the rest".into(),
+                "2. the rest",
+                vec![img(&photo_str)],
+            ),
+            (
+                "leaves content without markers unchanged",
+                "Hello world".into(),
+                "Hello world",
+                Vec::new(),
+            ),
+            (
+                "returns the empty string unchanged",
+                String::new(),
+                "",
+                Vec::new(),
+            ),
+            (
+                "strips a saved image annotation and its blank-line separator",
+                format!("[IMAGE:{valid_uri}]\n\n[Saved image: /uploads/img.png]"),
+                "",
+                vec![picture(Some(&valid_uri), "🖼️ image")],
+            ),
+            (
+                "strips a saved image annotation at the start with no preceding separator",
+                "[Saved image: /uploads/img.png]".into(),
+                "",
+                Vec::new(),
+            ),
+            (
+                "turns a saved video annotation into a visible clip label",
+                "Clip [Saved video: /uploads/clip.mp4] here".into(),
+                "Clip 🎬 Video: clip.mp4 here",
+                Vec::new(),
+            ),
+            (
+                "keeps the saved video clip visible alongside its transcription",
+                "[Video transcription of clip.mp4]: Line one\n\n[Saved video: /uploads/clip.mp4]"
+                    .into(),
+                "🎬 Line one\n\n🎬 Video: clip.mp4",
+                Vec::new(),
+            ),
+        ];
+
+        for (name, input, text, attachments) in &cases {
+            let rendered = preprocess(input, Some(root));
+            assert_eq!(rendered.text, *text, "case {name}: text");
+            assert_eq!(rendered.attachments, *attachments, "case {name}: files");
+        }
+    }
+
+    #[test]
+    fn pictures_are_extracted_from_the_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let img = tmp.path().join("shot.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
+        let img_str = img.to_string_lossy().into_owned();
+        let uri = data_uri(&tiny_png(2, 1));
+        let marker = picture(Some(&img_str), "🖼️ shot.png");
+        let literal = picture(Some("second.png"), "🖼️ second.png");
+
+        // (case, body, text, attachments, (parsed items, the single bullet's text))
+        let cases = vec![
+            (
+                "literal markdown image is extracted",
+                "Look ![shot](url) here".to_string(),
+                "Look here".to_string(),
+                vec![picture(Some("url"), "🖼️ url")],
+                (1, None),
+            ),
+            (
+                "picture on its own line keeps the paragraph",
+                "before\n![shot](url)\nafter".to_string(),
+                "before\nafter".to_string(),
+                vec![picture(Some("url"), "🖼️ url")],
+                (1, None),
+            ),
+            (
+                "blank lines on either side stay a paragraph gap",
+                "before\n\n![shot](url)\n\nafter".to_string(),
+                "before\n\nafter".to_string(),
+                vec![picture(Some("url"), "🖼️ url")],
+                (2, None),
+            ),
+            (
+                "text beside a picture survives the parse",
+                format!("8. the body [IMAGE:{uri}]"),
+                "8. the body".to_string(),
+                vec![picture(Some(&uri), "🖼️ image")],
+                (1, Some("the body")),
+            ),
+            (
+                "fenced code keeps its marker and image source",
+                format!("```\n[IMAGE:{img_str}]\n![x](y)\n```"),
+                format!("```\n[IMAGE:{img_str}]\n![x](y)\n```"),
+                Vec::new(),
+                (1, None),
+            ),
+            (
+                "indented code keeps its marker and image source",
+                format!("    [IMAGE:{img_str}]\n    ![x](y)"),
+                format!("    [IMAGE:{img_str}]\n    ![x](y)"),
+                Vec::new(),
+                (1, None),
+            ),
+            (
+                "inline code span keeps its marker and image source",
+                format!("use `[IMAGE:{img_str}]` and `![x](y)` here"),
+                format!("use `[IMAGE:{img_str}]` and `![x](y)` here"),
+                Vec::new(),
+                (1, None),
+            ),
+            (
+                "body order: marker before literal picture",
+                format!("[IMAGE:{img_str}] and ![second](second.png)"),
+                "and".to_string(),
+                vec![marker.clone(), literal.clone()],
+                (1, None),
+            ),
+            (
+                "body order: literal picture before marker",
+                format!("![second](second.png) and [IMAGE:{img_str}]"),
+                "and".to_string(),
+                vec![literal, marker],
+                (1, None),
+            ),
+        ];
+
+        for (name, body, text, attachments, (items_expected, bullet)) in cases {
+            let rendered = preprocess(&body, Some(tmp.path()));
+            assert_eq!(rendered.text, text, "case {name}: text");
+            assert_eq!(rendered.attachments, attachments, "case {name}: files");
+            if !attachments.is_empty() {
+                let survived = rendered.text.contains("![") || rendered.text.contains("[IMAGE:");
+                assert!(!survived, "case {name}: marker survived");
+            }
+            let items: Vec<_> = markdown::parse(&rendered.text).collect();
+            assert_eq!(items.len(), items_expected, "case {name}: items {items:?}");
+            if let Some(expected) = bullet {
+                let bullet_text = only_bullet(name, &items);
+                assert_eq!(bullet_text, expected, "case {name}: bullet text");
+            }
+        }
+    }
+
+    #[test]
+    fn file_marker_targets_resolve_against_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let relative = resolve_file_marker_target("generated/report.pdf", Some(root)).unwrap();
+        let expected = root.join("generated/report.pdf");
+        assert_eq!(
+            relative, expected,
+            "a relative target resolves against the workspace"
+        );
+        let absolute = root.join("elsewhere/report.pdf");
+        let resolved = resolve_file_marker_target(&absolute.to_string_lossy(), Some(root));
+        assert_eq!(
+            resolved.unwrap(),
+            absolute,
+            "an absolute target is used as it is"
+        );
+        let error = resolve_file_marker_target("report.pdf", None).unwrap_err();
+        let expected = "Cannot open 'report.pdf': the conversation's workspace is unknown.";
+        assert_eq!(error, expected);
+    }
+
+    #[test]
+    fn reveal_file_marker_refuses_a_target_that_is_not_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let missing = root.join("generated/report.pdf");
+        let error = reveal_file_marker("generated/report.pdf", Some(root)).unwrap_err();
+        let expected = format!("File not found: {}", missing.display());
+        assert_eq!(
+            error, expected,
+            "a relative target must resolve against the workspace"
+        );
+
+        std::fs::create_dir(root.join("folder")).unwrap();
+        let error = reveal_file_marker("folder", Some(root)).unwrap_err();
+        let expected = format!("Not a file: {}", root.join("folder").display());
+        assert_eq!(error, expected);
+    }
+
+    #[test]
+    fn file_name_or_path_table() {
+        // On Unix `file_name()` additionally normalizes a trailing slash.
+        let cases: &[(&str, &str, &str)] = &[
+            ("unix path", "/foo/bar.txt", "bar.txt"),
+            ("nested path", "/foo/bar/doc.txt", "doc.txt"),
+            ("no directory component", "bar.txt", "bar.txt"),
+            ("trailing slash", "/foo/bar/", "bar"),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(file_name_or_path(input), expected, "case {name}");
+        }
+    }
+
     #[test]
     fn decode_data_uri_image_table() {
-        // URIs are built before the table: the success case needs a real
-        // encoded PNG, and the two over-cap cases need a payload/dimension
-        // past their cap.
+        // URIs are built before the table: a success case needs a real encoded
+        // PNG, and the two over-cap cases a payload/dimension past their cap.
         let valid_uri = data_uri(&tiny_png(2, 1));
         let invalid_base64 = "data:image/png;base64,%%%not-base64%%%".to_string();
         let non_image = format!("data:text/plain;base64,{}", STANDARD.encode(b"hello world"));
-        let oversized_payload = format!(
+        let huge_payload = format!(
             "data:image/png;base64,{}",
             "A".repeat(media_target::MAX_DATA_URI_ENCODED_BYTES + 1)
         );
-        let oversized_dimensions = data_uri(&tiny_png(MAX_IMAGE_LONGEST_SIDE_PX + 1, 1));
+        let oversized = data_uri(&tiny_png(MAX_IMAGE_LONGEST_SIDE_PX + 1, 1));
         let missing_marker = "data:image/png,AAAA".to_string();
         let mut jbuf = Vec::new();
         ::image::RgbImage::from_pixel(1, 1, ::image::Rgb([255, 0, 0]))
             .write_to(&mut Cursor::new(&mut jbuf), ::image::ImageFormat::Jpeg)
             .expect("test JPEG must encode");
-        let mismatched_uri = format!("data:image/png;base64,{}", STANDARD.encode(&jbuf));
+        let mismatched = format!("data:image/png;base64,{}", STANDARD.encode(&jbuf));
 
-        #[expect(clippy::type_complexity)] // one-off test table tuple
-        let cases: &[(&str, String, Option<(u32, u32, Vec<u8>)>)] = &[
-            (
-                "decodes a solid-red 2×1 PNG",
-                valid_uri,
-                Some((2, 1, vec![255, 0, 0, 255, 255, 0, 0, 255])),
-            ),
-            ("rejects invalid base64", invalid_base64, None),
-            ("rejects non-image bytes", non_image, None),
-            (
-                "rejects an oversized payload by a pure length check before any base64 work",
-                oversized_payload,
-                None,
-            ),
-            (
-                "downscales a valid but over-display-cap raster to the render cap",
-                oversized_dimensions,
-                Some((
-                    MAX_IMAGE_LONGEST_SIDE_PX,
-                    1,
-                    [255, 0, 0, 255].repeat(MAX_IMAGE_LONGEST_SIDE_PX as usize),
-                )),
-            ),
-            (
-                "rejects a data URI missing the base64 marker",
-                missing_marker,
-                None,
-            ),
-            (
-                "rejects a data URI whose declared subtype mismatches the actual bytes",
-                mismatched_uri,
-                None,
-            ),
+        // (case, uri) — every one of these is refused with no raster at all.
+        let rejects: &[(&str, String)] = &[
+            ("invalid base64", invalid_base64),
+            ("non-image bytes", non_image),
+            ("oversized payload length", huge_payload),
+            ("missing base64 marker", missing_marker),
+            ("subtype mismatches bytes", mismatched),
         ];
-        for (i, (name, uri, expected)) in cases.iter().enumerate() {
-            assert_eq!(
-                decode_data_uri_image(uri).as_ref(),
-                expected.as_ref(),
-                "case {i} ({name})"
-            );
+        for (name, uri) in rejects {
+            assert_eq!(decode_data_uri_image(uri), None, "case {name}");
         }
+
+        let png = decode_data_uri_image(&valid_uri);
+        let red = vec![255, 0, 0, 255, 255, 0, 0, 255];
+        assert_eq!(png, Some((2, 1, red)), "case decodes a solid-red 2×1 PNG");
+
+        // A valid but over-display-cap raster is downscaled to the render cap.
+        let downscaled = decode_data_uri_image(&oversized);
+        let cap = [255, 0, 0, 255].repeat(MAX_IMAGE_LONGEST_SIDE_PX as usize);
+        let expected = Some((MAX_IMAGE_LONGEST_SIDE_PX, 1, cap));
+        assert_eq!(downscaled, expected, "case downscales to the cap");
     }
 
     #[test]
@@ -1533,48 +1482,53 @@ mod tests {
         let uri = data_uri(&tiny_png(3, 2));
         let first = data_uri_image_handle(&uri).expect("valid data URI decodes");
         let second = data_uri_image_handle(&uri).expect("cached hit still decodes");
-        // iced Handle::from_rgba assigns a unique Id per construction; a
-        // stable cache must return the same Id so the wgpu worker doesn't
-        // re-decode and re-upload on every frame.
+        // iced Handle::from_rgba assigns a unique Id per construction; a stable
+        // cache must return the same Id so the wgpu worker doesn't re-decode and
+        // re-upload on every frame.
         assert_eq!(first.id(), second.id());
     }
 
     #[test]
-    fn data_uri_image_handle_caches_failures() {
-        let uri = "data:image/png;base64,%%%not-base64%%%";
-        // A decode failure is cached so corrupt payloads aren't re-decoded on
-        // every frame; the placeholder is returned on every call.
-        assert_eq!(data_uri_image_handle(uri), None);
-        {
-            let cache = DATA_URI_IMAGE_CACHE.lock().unwrap_poison();
-            assert!(
-                matches!(cache.entries.get(uri), Some(CachedImage::Failed)),
-                "failed decode must be cached, got {:?}",
-                cache.entries.get(uri)
+    fn data_uri_image_handle_caches_failures_and_skips_oversized() {
+        let huge = "A".repeat(media_target::MAX_DATA_URI_ENCODED_BYTES + 1);
+        // (case, uri, cached as a failure) — a decode failure is cached so a
+        // corrupt payload is not re-decoded every frame, while an over-cap
+        // payload is refused by the length check before the cache is consulted.
+        let cases: &[(&str, String, bool)] = &[
+            (
+                "decode failure cached",
+                "data:image/png;base64,%%%not-base64%%%".to_string(),
+                true,
+            ),
+            (
+                "oversized payload not cached",
+                format!("data:image/png;base64,{huge}"),
+                false,
+            ),
+        ];
+        for (name, uri, failure) in cases {
+            assert_eq!(data_uri_image_handle(uri), None, "case {name}: handle");
+            let (cached, failed) = {
+                let cache = DATA_URI_IMAGE_CACHE.lock().unwrap_poison();
+                let failed = matches!(cache.entries.get(uri), Some(CachedImage::Failed));
+                (cache.entries.contains_key(uri), failed)
+            };
+            if *failure {
+                assert!(failed, "case {name}: failed decode must be cached");
+            } else {
+                assert!(!cached, "case {name}: over-cap payload must not be cached");
+            }
+            assert_eq!(
+                data_uri_image_handle(uri),
+                None,
+                "case {name}: answer is stable"
             );
         }
-        assert_eq!(data_uri_image_handle(uri), None);
     }
 
-    #[test]
-    fn data_uri_image_handle_rejects_oversized_payload_without_caching() {
-        // Over-cap payloads are refused by the pure length check before the
-        // cache is consulted — a ~20 MiB key must never be retained.
-        let huge = "A".repeat(media_target::MAX_DATA_URI_ENCODED_BYTES + 1);
-        let uri = format!("data:image/png;base64,{huge}");
-        assert_eq!(data_uri_image_handle(&uri), None);
-        let cache = DATA_URI_IMAGE_CACHE.lock().unwrap_poison();
-        assert!(
-            !cache.entries.contains_key(&uri),
-            "over-cap payload must not be cached"
-        );
-    }
-
+    /// A concurrent same-key re-insert leaves no duplicate for eviction to trip on.
     #[test]
     fn bounded_cache_duplicate_insert_keeps_eviction_exact() {
-        // Two concurrent render passes decoding the same key and both reaching the
-        // check→decode→insert path must not leave a duplicate in the LRU order, or
-        // eviction could drop a live entry ahead of a stale copy.
         let mut cache = BoundedLruCache::with_capacity(2);
         cache.insert(1, "a");
         cache.insert(1, "a2"); // same-key re-insert (concurrent check→decode→insert)
@@ -1590,35 +1544,26 @@ mod tests {
         assert_eq!(cache.get(&3), Some(&"c"));
     }
 
+    /// A cached failure is a hit (no re-decode) and a decode runs without the lock.
     #[test]
-    fn cached_image_returns_a_cached_failure_without_decoding() {
+    fn cached_image_hits_cached_failures_and_decodes_outside_the_lock() {
         let cache = Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES));
         cache
             .lock()
             .unwrap_poison()
             .insert(String::from("bad"), CachedImage::Failed);
-        // A cached failure is a hit: the decode must not run (a miss would
-        // re-decode a corrupt payload on every frame).
         let handle = cached_image(&cache, "bad", || {
             panic!("a cached failure must not be decoded again")
         });
-        assert!(handle.is_none());
-    }
+        assert!(handle.is_none(), "a cached failure yields no handle");
 
-    #[test]
-    fn cached_image_decodes_without_holding_the_cache_lock() {
-        let cache = Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES));
-        // The decode runs with the cache lock released so a raster decode never
-        // blocks a concurrent frame; `try_lock` fails — rather than hanging — if
-        // the guard is still held here.
+        // `try_lock` fails rather than hanging if the decode still held the lock.
         let handle = cached_image(&cache, "raster", || {
             assert!(cache.try_lock().is_ok(), "decode must run unlocked");
             Some((1, 1, vec![0, 0, 0, 0]))
         });
         assert!(handle.is_some(), "the decoded handle is returned");
-        assert!(matches!(
-            cache.lock().unwrap_poison().get("raster"),
-            Some(CachedImage::Decoded(_))
-        ));
+        let mut guard = cache.lock().unwrap_poison();
+        assert!(matches!(guard.get("raster"), Some(CachedImage::Decoded(_))));
     }
 }

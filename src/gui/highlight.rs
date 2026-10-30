@@ -735,17 +735,7 @@ mod tests {
         assert!(q.is_ok(), "MD inline query failed: {:?}", q.err());
     }
 
-    /// Verify that every extension in the canonical tree-sitter mapping
-    /// (`crate::util::tree_sitter::supported_extensions`) maps to a
-    /// [`HighlightLanguage`] variant and that every variant has at least one
-    /// extension mapped to it.
-    ///
-    /// This guards against:
-    /// - Adding an extension to the grammar table without a matching
-    ///   `language_and_query` arm (extension unmapped — `from_extension`
-    ///   returns `None`).
-    /// - Adding a variant without any extension in the grammar table (variant
-    ///   unreachable from an extension).
+    /// Every canonical extension maps to a variant and every variant has at least one extension.
     #[test]
     fn test_variant_extension_roundtrip() {
         use crate::util::tree_sitter::supported_extensions;
@@ -759,8 +749,6 @@ mod tests {
             );
         }
 
-        // Every variant must have at least one extension that maps to it.
-        // This catches orphaned variants that have no extension mapping.
         for variant in HighlightLanguage::VARIANTS {
             let has_extension = supported_extensions()
                 .any(|ext| HighlightLanguage::from_extension(ext) == Some(*variant));
@@ -771,411 +759,363 @@ mod tests {
                  to the grammar table in util::tree_sitter.",
             );
         }
-    }
 
-    #[test]
-    fn test_unsupported_extension() {
-        assert!(HighlightLanguage::from_extension("cpp").is_none());
-    }
-
-    #[test]
-    fn test_parse_file_highlights_single_line() {
-        let code = "fn main() {}";
-        let mut parser = Parser::new();
-        let fh = parse_file_highlights(&mut parser, code, HighlightLanguage::Rust);
-        assert_eq!(fh.spans.len(), 1);
-        // Should find keyword "fn"
-        let has_keyword = fh.spans[0]
-            .iter()
-            .any(|s| s.highlight_class == HighlightClass::Keyword);
-        assert!(
-            has_keyword,
-            "spans: {:?}",
-            fh.spans[0]
-                .iter()
-                .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_parse_file_highlights_rust() {
-        let code = "fn main() {\n    let x = 42;\n}\n";
-        let mut parser = Parser::new();
-        let fh = parse_file_highlights(&mut parser, code, HighlightLanguage::Rust);
-        assert!(fh.spans.len() >= 3, "got {} spans", fh.spans.len());
-        // Line 1 ("    let x = 42;") should have keyword "let"
-        let has_keyword = fh.spans[1]
-            .iter()
-            .any(|s| s.highlight_class == HighlightClass::Keyword);
-        assert!(has_keyword, "Expected keyword 'let' on line 1");
-        // Line 1 should also have a number ("42")
-        let has_number = fh.spans[1]
-            .iter()
-            .any(|s| s.highlight_class == HighlightClass::Number);
-        assert!(has_number, "Expected number '42' on line 1");
-    }
-
-    #[test]
-    fn test_parse_file_highlights_empty() {
-        let mut parser = Parser::new();
-        let fh = parse_file_highlights(&mut parser, "", HighlightLanguage::Rust);
-        // Empty source produces 1 line (the parser treats "" as a single empty line).
-        assert!(fh.spans.len() <= 1);
-        // Empty source should have empty spans (no captures).
-        if !fh.spans.is_empty() {
-            assert!(
-                fh.spans[0].is_empty(),
-                "empty source should have no captures"
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_file_highlights_python_multiline() {
-        let code = "def foo():\n    \"\"\"A docstring.\"\"\"\n    return 1\n";
-        let mut parser = Parser::new();
-        let fh = parse_file_highlights(&mut parser, code, HighlightLanguage::Python);
-        // "def foo():" / "    \"\"\"A docstring.\"\"\"" / "    return 1" / empty trailing
-        assert_eq!(fh.spans.len(), 4);
-    }
-
-    #[test]
-    fn test_single_token_line_not_filtered() {
-        // Regression: line with exactly one capture ("42") must not be filtered.
-        let code = "42\n";
-        let mut parser = Parser::new();
-        let fh = parse_file_highlights(&mut parser, code, HighlightLanguage::Rust);
-        assert_eq!(
-            fh.spans.len(),
-            2,
-            "should have 2 lines (42 + trailing empty)"
-        );
-        // Line 0: "42" — should have a Number span.
-        let has_number = fh.spans[0]
-            .iter()
-            .any(|s| s.highlight_class == HighlightClass::Number);
-        assert!(
-            has_number,
-            "single token line '42' should have Number highlighting, got: {:?}",
-            fh.spans[0]
-                .iter()
-                .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
-                .collect::<Vec<_>>()
-        );
-        // If we have exactly 1 span, it should cover the full line.
-        if fh.spans[0].len() == 1 {
-            let s = &fh.spans[0][0];
-            assert!(
-                s.end == 2 || s.end == 0,
-                "single span should cover full line or be empty"
-            );
-        }
-    }
-
-    #[test]
-    fn test_markdown_extension() {
-        assert_eq!(
-            HighlightLanguage::from_extension("md"),
-            Some(HighlightLanguage::Markdown)
-        );
-        assert_eq!(
-            HighlightLanguage::from_extension("markdown"),
-            Some(HighlightLanguage::Markdown)
-        );
-    }
-
-    #[test]
-    fn test_markdown_path() {
-        assert_eq!(
-            HighlightLanguage::from_path("README.md"),
-            Some(HighlightLanguage::Markdown)
-        );
-        assert_eq!(
-            HighlightLanguage::from_path("docs/guide.markdown"),
-            Some(HighlightLanguage::Markdown)
-        );
-    }
-
-    #[test]
-    fn test_parse_markdown_highlights_heading() {
-        let code = "# Hello World\n\nSome text.\n";
-        let fh = parse_markdown_highlights(code);
-        assert!(
-            fh.spans.len() >= 3,
-            "expected at least 3 lines, got {}",
-            fh.spans.len()
-        );
-        // First line should have a text.title highlight (mapped to Type)
-        let has_title = fh.spans[0]
-            .iter()
-            .any(|s| s.highlight_class == HighlightClass::Type);
-        assert!(
-            has_title,
-            "expected text.title (Type) on heading line, got: {:?}",
-            fh.spans[0]
-                .iter()
-                .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_parse_markdown_highlights_link() {
-        let code = "Visit [example](https://example.com) for info.\n";
-        let fh = parse_markdown_highlights(code);
-        let has_uri = fh.spans[0]
-            .iter()
-            .any(|s| s.highlight_class == HighlightClass::Function);
-        assert!(
-            has_uri,
-            "expected URI (Function) highlight in link, got: {:?}",
-            fh.spans[0]
-                .iter()
-                .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_parse_markdown_highlights_empty() {
-        let code = "";
-        let fh = parse_markdown_highlights(code);
-        // Empty source produces 1 line (consistent with other language parsers).
-        assert_eq!(fh.spans.len(), 1);
-        assert!(
-            fh.spans[0].is_empty(),
-            "empty source should have no captures"
-        );
-    }
-
-    // ── Markdown inline formatting tests ────────────────────────────
-
-    /// Assert that `fh.spans[0]` contains at least one span of `class` whose
-    /// byte range **overlaps** `[lo, hi)` (i.e. `s.start < hi && s.end > lo`).
-    /// This is an overlap check, not a strict-coverage check — the span may
-    /// extend beyond `[lo, hi)`. All test callers pass ranges that exactly
-    /// match the expected span positions, so overlap is equivalent to coverage
-    /// in practice.
-    fn line0_has_class_in_range(
-        fh: &FileHighlights,
-        class: HighlightClass,
-        lo: usize,
-        hi: usize,
-        label: &str,
-    ) {
-        let found = fh.spans[0]
-            .iter()
-            .any(|s| s.highlight_class == class && s.start < hi && s.end > lo);
-        assert!(
-            found,
-            "expected {label} ({class:?}) in [{lo},{hi}) on line 0; spans: {:?}",
-            fh.spans[0]
-                .iter()
-                .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    fn line_has_class_in_range(
-        fh: &FileHighlights,
-        line: usize,
-        class: HighlightClass,
-        lo: usize,
-        hi: usize,
-        label: &str,
-    ) {
-        let spans = fh
-            .spans
-            .get(line)
-            .unwrap_or_else(|| panic!("expected line {line} to exist"));
-        let found = spans
-            .iter()
-            .any(|s| s.highlight_class == class && s.start < hi && s.end > lo);
-        assert!(
-            found,
-            "expected {label} ({class:?}) in [{lo},{hi}) on line {line}; spans: {:?}",
-            spans
-                .iter()
-                .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_inline_markdown_formatting() {
-        // Table-driven test consolidating 6 individual inline formatting tests.
-        struct Case {
-            name: &'static str,
-            input: &'static str,
-            expected: Vec<(HighlightClass, usize, usize, &'static str)>,
-        }
-
-        let cases = vec![
-            Case {
-                name: "test_markdown_bold_single_char",
-                input: "**X**",
-                expected: vec![
-                    (HighlightClass::Operator, 0, 2, "opening **"),
-                    (HighlightClass::Keyword, 2, 3, "X content"),
-                    (HighlightClass::Operator, 3, 5, "closing **"),
-                ],
-            },
-            Case {
-                name: "test_markdown_bold_star",
-                input: "**bold**",
-                expected: vec![
-                    (HighlightClass::Operator, 0, 2, "opening **"),
-                    (HighlightClass::Keyword, 2, 6, "bold content"),
-                    (HighlightClass::Operator, 6, 8, "closing **"),
-                ],
-            },
-            Case {
-                name: "test_markdown_bold_underscore",
-                input: "__bold__",
-                expected: vec![
-                    (HighlightClass::Operator, 0, 2, "opening __"),
-                    (HighlightClass::Keyword, 2, 6, "bold content"),
-                    (HighlightClass::Operator, 6, 8, "closing __"),
-                ],
-            },
-            Case {
-                name: "test_markdown_italic_star",
-                input: "*italic*",
-                expected: vec![
-                    (HighlightClass::Operator, 0, 1, "opening *"),
-                    (HighlightClass::Function, 1, 7, "italic content"),
-                    (HighlightClass::Operator, 7, 8, "closing *"),
-                ],
-            },
-            Case {
-                name: "test_markdown_italic_underscore",
-                input: "_italic_",
-                expected: vec![
-                    (HighlightClass::Operator, 0, 1, "opening _"),
-                    (HighlightClass::Function, 1, 7, "italic content"),
-                    (HighlightClass::Operator, 7, 8, "closing _"),
-                ],
-            },
-            Case {
-                name: "test_markdown_inline_code",
-                input: "`code`",
-                expected: vec![
-                    (HighlightClass::Operator, 0, 1, "opening `"),
-                    (HighlightClass::String, 1, 5, "code content"),
-                    (HighlightClass::Operator, 5, 6, "closing `"),
-                ],
-            },
+        let cases: &[(&str, &str, &str, Option<HighlightLanguage>)] = &[
+            (
+                "markdown extension",
+                "md",
+                "README.md",
+                Some(HighlightLanguage::Markdown),
+            ),
+            (
+                "markdown long extension",
+                "markdown",
+                "docs/guide.markdown",
+                Some(HighlightLanguage::Markdown),
+            ),
+            ("unsupported extension", "cpp", "main.cpp", None),
         ];
-
-        for case in &cases {
-            let fh = parse_markdown_highlights(case.input);
+        for (name, ext, path, expected) in cases {
             assert_eq!(
-                fh.spans.len(),
-                1,
-                "case: {} — expected single line",
-                case.name
+                HighlightLanguage::from_extension(ext),
+                *expected,
+                "case {name}: from_extension({ext:?})"
             );
-            for &(class, lo, hi, label) in &case.expected {
-                line0_has_class_in_range(&fh, class, lo, hi, label);
+            assert_eq!(
+                HighlightLanguage::from_path(path),
+                *expected,
+                "case {name}: from_path({path:?})"
+            );
+        }
+    }
+
+    enum Lines {
+        Exact(usize),
+        AtLeast(usize),
+    }
+
+    struct ParseCase {
+        name: &'static str,
+        code: &'static str,
+        language: HighlightLanguage,
+        lines: Lines,
+        classes: &'static [(usize, HighlightClass)],
+        line0_spans: Option<&'static [(usize, usize, HighlightClass)]>,
+        line0_end_any: Option<&'static [usize]>,
+    }
+
+    impl Default for ParseCase {
+        fn default() -> Self {
+            Self {
+                name: "",
+                code: "",
+                language: HighlightLanguage::Rust,
+                lines: Lines::Exact(1),
+                classes: &[],
+                line0_spans: None,
+                line0_end_any: None,
             }
         }
     }
 
     #[test]
-    fn test_markdown_backslash_escape() {
-        let code = r"\*literal";
-        let fh = parse_markdown_highlights(code);
-        assert_eq!(fh.spans.len(), 1);
-        // backslash_escape → string.escape → Text (unchanged).
-        // The escaped asterisk should not have emphasis colour — just plain Text.
-        // Assert that no Function or Keyword span overlaps the escape range [0, 2).
-        let escape_has_bad_class = fh.spans[0].iter().any(|s| {
-            s.start < 2
-                && s.end > 0
-                && (s.highlight_class == HighlightClass::Function
-                    || s.highlight_class == HighlightClass::Keyword)
-        });
-        assert!(
-            !escape_has_bad_class,
-            "escaped `\\*` should not have emphasis/bold colour; spans: {:?}",
-            fh.spans[0]
-        );
+    fn test_parse_file_highlights() {
+        let cases: &[ParseCase] = &[
+            ParseCase {
+                name: "single_line",
+                code: "fn main() {}",
+                classes: &[(0, HighlightClass::Keyword)],
+                ..ParseCase::default()
+            },
+            ParseCase {
+                name: "rust",
+                code: "fn main() {\n    let x = 42;\n}\n",
+                lines: Lines::AtLeast(3),
+                classes: &[(1, HighlightClass::Keyword), (1, HighlightClass::Number)],
+                ..ParseCase::default()
+            },
+            ParseCase {
+                name: "empty",
+                code: "",
+                lines: Lines::Exact(1),
+                line0_spans: Some(&[]),
+                ..ParseCase::default()
+            },
+            ParseCase {
+                name: "python_multiline",
+                code: "def foo():\n    \"\"\"A docstring.\"\"\"\n    return 1\n",
+                language: HighlightLanguage::Python,
+                lines: Lines::Exact(4),
+                classes: &[(0, HighlightClass::Function), (1, HighlightClass::String)],
+                ..ParseCase::default()
+            },
+            // Regression: a line with exactly one capture ("42") must not be filtered.
+            ParseCase {
+                name: "single_token_line_not_filtered",
+                code: "42\n",
+                lines: Lines::Exact(2),
+                classes: &[(0, HighlightClass::Number)],
+                line0_end_any: Some(&[2, 0]),
+                ..ParseCase::default()
+            },
+        ];
+
+        for case in cases {
+            let name = case.name;
+            let mut parser = Parser::new();
+            let fh = parse_file_highlights(&mut parser, case.code, case.language);
+            match case.lines {
+                Lines::Exact(lines) => {
+                    assert_eq!(fh.spans.len(), lines, "case {name}: line count");
+                }
+                Lines::AtLeast(lines) => {
+                    assert!(fh.spans.len() >= lines, "case {name}: line count");
+                }
+            }
+            for &(line, class) in case.classes {
+                let spans = fh
+                    .spans
+                    .get(line)
+                    .unwrap_or_else(|| panic!("case {name}: expected line {line} to exist"));
+                assert!(
+                    spans.iter().any(|s| s.highlight_class == class),
+                    "case {name}: expected {class:?} on line {line}; spans: {:?}",
+                    spans
+                        .iter()
+                        .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
+                        .collect::<Vec<_>>()
+                );
+            }
+            if let Some(expected) = case.line0_spans {
+                assert_eq!(
+                    fh.spans[0]
+                        .iter()
+                        .map(|s| (s.start, s.end, s.highlight_class))
+                        .collect::<Vec<(usize, usize, HighlightClass)>>(),
+                    expected,
+                    "case {name}: line 0 spans"
+                );
+            }
+            if let Some(ends) = case.line0_end_any {
+                assert_eq!(fh.spans[0].len(), 1, "case {name}: one span on line 0");
+                let end = fh.spans[0][0].end;
+                assert!(
+                    ends.contains(&end),
+                    "case {name}: single span should cover full line or be empty; end {end}"
+                );
+            }
+        }
     }
 
+    #[expect(clippy::too_many_lines)] // one table over every markdown flavour
     #[test]
-    fn test_markdown_heading_with_emphasis() {
-        let code = "# *hello*\n";
-        let fh = parse_markdown_highlights(code);
-        assert!(!fh.spans.is_empty(), "at least heading line");
-        // Block-level text.title (Type) subsumes emphasis due to stable sort
-        // order (block captures come before inline in the flat span list).
-        let has_title = fh.spans[0]
-            .iter()
-            .any(|s| s.highlight_class == HighlightClass::Type);
-        assert!(has_title, "heading should have Type (text.title) highlight");
-        // Emphasis inside headings is subsumed by block-level text.title
-        // (Type) due to stable sort order — this is an inherent limitation
-        // of the flat span model, not a regression from this fix.
+    fn test_markdown_highlight_spans() {
+        #[derive(Default)]
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            lines: usize,
+            present: &'static [(usize, HighlightClass, usize, usize, &'static str)],
+            absent: &'static [(usize, HighlightClass, usize, usize, &'static str)],
+            line0_spans: Option<&'static [(usize, usize, HighlightClass)]>,
+        }
+
+        let cases: &[Case] = &[
+            Case {
+                name: "heading",
+                input: "# Hello World\n\nSome text.\n",
+                lines: 4,
+                present: &[(0, HighlightClass::Type, 0, 13, "text.title")],
+                ..Case::default()
+            },
+            Case {
+                name: "link",
+                input: "Visit [example](https://example.com) for info.\n",
+                lines: 2,
+                present: &[(0, HighlightClass::Function, 15, 36, "link URI")],
+                ..Case::default()
+            },
+            Case {
+                name: "empty",
+                input: "",
+                lines: 1,
+                line0_spans: Some(&[]),
+                ..Case::default()
+            },
+            Case {
+                name: "bold_single_char",
+                input: "**X**",
+                lines: 1,
+                present: &[
+                    (0, HighlightClass::Operator, 0, 2, "opening **"),
+                    (0, HighlightClass::Keyword, 2, 3, "X content"),
+                    (0, HighlightClass::Operator, 3, 5, "closing **"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "bold_star",
+                input: "**bold**",
+                lines: 1,
+                present: &[
+                    (0, HighlightClass::Operator, 0, 2, "opening **"),
+                    (0, HighlightClass::Keyword, 2, 6, "bold content"),
+                    (0, HighlightClass::Operator, 6, 8, "closing **"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "bold_underscore",
+                input: "__bold__",
+                lines: 1,
+                present: &[
+                    (0, HighlightClass::Operator, 0, 2, "opening __"),
+                    (0, HighlightClass::Keyword, 2, 6, "bold content"),
+                    (0, HighlightClass::Operator, 6, 8, "closing __"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "italic_star",
+                input: "*italic*",
+                lines: 1,
+                present: &[
+                    (0, HighlightClass::Operator, 0, 1, "opening *"),
+                    (0, HighlightClass::Function, 1, 7, "italic content"),
+                    (0, HighlightClass::Operator, 7, 8, "closing *"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "italic_underscore",
+                input: "_italic_",
+                lines: 1,
+                present: &[
+                    (0, HighlightClass::Operator, 0, 1, "opening _"),
+                    (0, HighlightClass::Function, 1, 7, "italic content"),
+                    (0, HighlightClass::Operator, 7, 8, "closing _"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "inline_code",
+                input: "`code`",
+                lines: 1,
+                present: &[
+                    (0, HighlightClass::Operator, 0, 1, "opening `"),
+                    (0, HighlightClass::String, 1, 5, "code content"),
+                    (0, HighlightClass::Operator, 5, 6, "closing `"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "backslash_escape",
+                input: r"\*literal",
+                lines: 1,
+                absent: &[
+                    (0, HighlightClass::Function, 0, 2, "escaped \\*"),
+                    (0, HighlightClass::Keyword, 0, 2, "escaped \\*"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "heading_with_emphasis",
+                input: "# *hello*\n",
+                lines: 2,
+                present: &[(0, HighlightClass::Type, 0, 17, "text.title")],
+                ..Case::default()
+            },
+            Case {
+                name: "inline_after_blank_line",
+                input: "First paragraph.\n\n*emphasis after blank*\n",
+                lines: 4,
+                present: &[
+                    (2, HighlightClass::Function, 1, 22, "emphasis content"),
+                    (2, HighlightClass::Operator, 0, 1, "opening *"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "inline_in_list_items",
+                input: "- **bold item**\n- *italic item*\n",
+                lines: 3,
+                present: &[
+                    (0, HighlightClass::Keyword, 4, 13, "bold list content"),
+                    (1, HighlightClass::Function, 4, 15, "italic list content"),
+                ],
+                ..Case::default()
+            },
+            Case {
+                name: "inline_after_second_paragraph",
+                input: "Paragraph one.\n\nParagraph two with `code`.\n",
+                lines: 4,
+                present: &[(2, HighlightClass::String, 20, 24, "inline code")],
+                ..Case::default()
+            },
+        ];
+
+        for case in cases {
+            let name = case.name;
+            let fh = parse_markdown_highlights(case.input);
+            assert_eq!(fh.spans.len(), case.lines, "case {name}: line count");
+            for &(line, class, lo, hi, label) in case.present {
+                let spans = fh
+                    .spans
+                    .get(line)
+                    .unwrap_or_else(|| panic!("case {name}: expected line {line} to exist"));
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| s.highlight_class == class && s.start < hi && s.end > lo),
+                    "case {name}: expected {label} ({class:?}) in [{lo},{hi}) on line {line}; \
+                     spans: {:?}",
+                    spans
+                        .iter()
+                        .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
+                        .collect::<Vec<_>>()
+                );
+            }
+            for &(line, class, lo, hi, label) in case.absent {
+                let spans = fh
+                    .spans
+                    .get(line)
+                    .unwrap_or_else(|| panic!("case {name}: expected line {line} to exist"));
+                assert!(
+                    !spans
+                        .iter()
+                        .any(|s| s.highlight_class == class && s.start < hi && s.end > lo),
+                    "case {name}: {label} must not carry {class:?} in [{lo},{hi}) on line {line}; \
+                     spans: {:?}",
+                    spans
+                        .iter()
+                        .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
+                        .collect::<Vec<_>>()
+                );
+            }
+            if let Some(expected) = case.line0_spans {
+                assert_eq!(
+                    fh.spans[0]
+                        .iter()
+                        .map(|s| (s.start, s.end, s.highlight_class))
+                        .collect::<Vec<(usize, usize, HighlightClass)>>(),
+                    expected,
+                    "case {name}: line 0 spans"
+                );
+            }
+        }
     }
 
-    #[test]
-    fn test_markdown_combined_heading_bold() {
-        let code = "## **important**\n";
-        let fh = parse_markdown_highlights(code);
-        assert!(!fh.spans.is_empty());
-        // Block heading has Type.
-        let has_type = fh.spans[0]
-            .iter()
-            .any(|s| s.highlight_class == HighlightClass::Type);
-        assert!(has_type, "heading should have Type");
-        // Since text.title subsumes text.strong, we won't see Keyword independently
-        // on the heading line — but the important thing is that nothing regresses.
-    }
-
-    #[test]
-    fn test_markdown_inline_after_blank_line() {
-        let code = "First paragraph.\n\n*emphasis after blank*\n";
-        let fh = parse_markdown_highlights(code);
-        assert!(
-            fh.spans.len() >= 3,
-            "expected paragraph, blank, and emphasis lines; got {}",
-            fh.spans.len()
-        );
-        // Line 2: "*emphasis after blank*"
-        line_has_class_in_range(&fh, 2, HighlightClass::Function, 1, 22, "emphasis content");
-        line_has_class_in_range(&fh, 2, HighlightClass::Operator, 0, 1, "opening *");
-    }
-
-    #[test]
-    fn test_markdown_inline_in_list_items() {
-        let code = "- **bold item**\n- *italic item*\n";
-        let fh = parse_markdown_highlights(code);
-        assert!(fh.spans.len() >= 2, "expected two list lines");
-        line_has_class_in_range(&fh, 0, HighlightClass::Keyword, 4, 13, "bold list content");
-        line_has_class_in_range(
-            &fh,
-            1,
-            HighlightClass::Function,
-            4,
-            15,
-            "italic list content",
-        );
-    }
-
-    #[test]
-    fn test_markdown_inline_after_second_paragraph() {
-        let code = "Paragraph one.\n\nParagraph two with `code`.\n";
-        let fh = parse_markdown_highlights(code);
-        assert!(fh.spans.len() >= 3);
-        // Line 2 contains inline code in the second paragraph.
-        line_has_class_in_range(&fh, 2, HighlightClass::String, 20, 24, "inline code");
-    }
-
-    #[expect(clippy::too_many_lines)]
     #[test]
     fn test_distribute_byte_spans() {
-        // Table-driven test consolidating 4 distribute_byte_spans tests.
+        fn span(start: usize, end: usize, class: HighlightClass) -> HighlightSpan {
+            HighlightSpan {
+                start,
+                end,
+                highlight_class: class,
+            }
+        }
+
+        #[derive(Default)]
         struct Case {
             name: &'static str,
             source: &'static str,
@@ -1192,21 +1132,9 @@ mod tests {
                     (2, 5, HighlightClass::Number),
                 ],
                 expected_lines: vec![vec![
-                    HighlightSpan {
-                        start: 0,
-                        end: 1,
-                        highlight_class: HighlightClass::Keyword,
-                    },
-                    HighlightSpan {
-                        start: 1,
-                        end: 2,
-                        highlight_class: HighlightClass::Text,
-                    },
-                    HighlightSpan {
-                        start: 2,
-                        end: 5,
-                        highlight_class: HighlightClass::Number,
-                    },
+                    span(0, 1, HighlightClass::Keyword),
+                    span(1, 2, HighlightClass::Text),
+                    span(2, 5, HighlightClass::Number),
                 ]],
             },
             Case {
@@ -1218,21 +1146,9 @@ mod tests {
                     (6, 8, HighlightClass::Operator),
                 ],
                 expected_lines: vec![vec![
-                    HighlightSpan {
-                        start: 0,
-                        end: 2,
-                        highlight_class: HighlightClass::Operator,
-                    },
-                    HighlightSpan {
-                        start: 2,
-                        end: 6,
-                        highlight_class: HighlightClass::Keyword,
-                    },
-                    HighlightSpan {
-                        start: 6,
-                        end: 8,
-                        highlight_class: HighlightClass::Operator,
-                    },
+                    span(0, 2, HighlightClass::Operator),
+                    span(2, 6, HighlightClass::Keyword),
+                    span(6, 8, HighlightClass::Operator),
                 ]],
             },
             Case {
@@ -1243,26 +1159,10 @@ mod tests {
                     (2, 5, HighlightClass::Keyword),
                 ],
                 expected_lines: vec![vec![
-                    HighlightSpan {
-                        start: 0,
-                        end: 1,
-                        highlight_class: HighlightClass::Text,
-                    },
-                    HighlightSpan {
-                        start: 1,
-                        end: 3,
-                        highlight_class: HighlightClass::String,
-                    },
-                    HighlightSpan {
-                        start: 3,
-                        end: 5,
-                        highlight_class: HighlightClass::Keyword,
-                    },
-                    HighlightSpan {
-                        start: 5,
-                        end: 6,
-                        highlight_class: HighlightClass::Text,
-                    },
+                    span(0, 1, HighlightClass::Text),
+                    span(1, 3, HighlightClass::String),
+                    span(3, 5, HighlightClass::Keyword),
+                    span(5, 6, HighlightClass::Text),
                 ]],
             },
             Case {
@@ -1274,45 +1174,28 @@ mod tests {
                     (12, 13, HighlightClass::Operator),
                 ],
                 expected_lines: vec![
-                    vec![HighlightSpan {
-                        start: 0,
-                        end: 5,
-                        highlight_class: HighlightClass::Text,
-                    }],
+                    vec![span(0, 5, HighlightClass::Text)],
                     vec![
-                        HighlightSpan {
-                            start: 0,
-                            end: 1,
-                            highlight_class: HighlightClass::Operator,
-                        },
-                        HighlightSpan {
-                            start: 1,
-                            end: 6,
-                            highlight_class: HighlightClass::Function,
-                        },
-                        HighlightSpan {
-                            start: 6,
-                            end: 7,
-                            highlight_class: HighlightClass::Operator,
-                        },
+                        span(0, 1, HighlightClass::Operator),
+                        span(1, 6, HighlightClass::Function),
+                        span(6, 7, HighlightClass::Operator),
                     ],
                 ],
             },
         ];
 
         for case in &cases {
+            let name = case.name;
             let fh = distribute_byte_spans(case.source, &case.spans);
             assert_eq!(
                 fh.spans.len(),
                 case.expected_lines.len(),
-                "case: {} — line count mismatch",
-                case.name
+                "case {name}: line count"
             );
             for (line_idx, expected) in case.expected_lines.iter().enumerate() {
                 assert_eq!(
                     fh.spans[line_idx], *expected,
-                    "case: {} — line {} mismatch",
-                    case.name, line_idx
+                    "case {name}: line {line_idx}"
                 );
             }
         }

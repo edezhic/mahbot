@@ -4847,25 +4847,62 @@ mod tests {
     use crate::pipeline::board::TicketPhase;
     use crate::util::test::TicketFixture;
 
-    /// Build a minimal [`Workspace`] with a name + derived path for map fixtures.
-    fn ws(name: &str) -> Workspace {
+    fn ws_at(name: &str, path: &str) -> Workspace {
         Workspace {
             name: name.to_string(),
-            path: format!("/p/{name}"),
+            path: path.to_string(),
             ..Default::default()
         }
     }
 
-    /// A ready dashboard so post-ready handlers (e.g. `WorkspacesReloaded`)
-    /// run instead of the `!ready` guard.
+    /// The map a workspace read reports for a comma-separated `names` list.
+    fn ws_map(names: &str) -> HashMap<String, Workspace> {
+        let mut map = HashMap::new();
+        for name in names.split(',').filter(|name| !name.is_empty()) {
+            map.insert(name.to_string(), ws_at(name, &format!("/p/{name}")));
+        }
+        map
+    }
+
+    /// A ready dashboard, so the post-ready handlers run instead of the `!ready` guard.
     fn ready_dashboard() -> Dashboard {
         let mut dash = Dashboard::loading(&WindowState::default());
         dash.ready = true;
         dash
     }
 
-    /// The board's read outcome for a board with no ticket, as the refresh the
-    /// dashboard dispatched would report it.
+    fn map_keys(dash: &Dashboard) -> Vec<&str> {
+        let mut keys: Vec<&str> = dash.workspaces.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn resolved_pair(dash: &Dashboard) -> Option<(String, String)> {
+        dash.resolved_workspace()
+            .map(|(name, path)| (name.to_string(), path.to_string()))
+    }
+
+    fn assert_workspace_state(
+        dash: &Dashboard,
+        selection: Option<&str>,
+        workspaces: &str,
+        name: &str,
+    ) {
+        let selected = dash.selected_workspace_name.as_deref();
+        assert_eq!(selected, selection, "case {name}");
+        let keys = map_keys(dash);
+        assert_eq!(keys.join(","), workspaces, "case {name}");
+        let resolved = selection
+            .filter(|selected| keys.contains(selected))
+            .map(|selected| (selected.to_string(), format!("/p/{selected}")));
+        assert_eq!(resolved_pair(dash), resolved, "case {name}");
+        assert_eq!(dash.pushed_workspace, resolved, "case {name}");
+        let options = managed_workspace_options(&dash.workspaces);
+        let error = dash.workspaces_error.as_deref();
+        let picker = options.is_empty().then_some(error).flatten();
+        assert_eq!(dash.picker_failure(&options), picker, "case {name}");
+    }
+
     fn empty_board() -> board::BoardMessage {
         board::BoardMessage::Refreshed {
             tickets: Vec::new(),
@@ -4873,10 +4910,16 @@ mod tests {
         }
     }
 
-    /// The board's read outcome for a board holding one ticket.
     fn board_with_a_ticket() -> board::BoardMessage {
         board::BoardMessage::Refreshed {
             tickets: vec![TicketFixture::new("T-1", TicketPhase::Backlog).build()],
+            generation: 0,
+        }
+    }
+
+    fn failed_board() -> board::BoardMessage {
+        board::BoardMessage::RefreshError {
+            error: "db down".to_string(),
             generation: 0,
         }
     }
@@ -4888,148 +4931,64 @@ mod tests {
         )
     }
 
-    /// A fresh window opens at the width the chat needs: the area the chat gets
-    /// without the ticket column is the area it has beside the column in the
-    /// default window, and it is never a window below the minimum.
-    #[test]
-    fn a_fresh_window_opens_without_the_ticket_column() {
-        let fresh = WindowState::default().opening_size();
-        let beside_column =
-            DEFAULT_WINDOW_WIDTH - SIDEBAR_RAIL_WIDTH - ticket_column_share(DEFAULT_WINDOW_WIDTH);
-        let without_column = fresh.width - SIDEBAR_RAIL_WIDTH;
-        assert!(
-            (without_column - beside_column).abs() < 0.01,
-            "{without_column} vs {beside_column}"
-        );
-        assert!(fresh.width >= MIN_WINDOW_WIDTH && fresh.height >= MIN_WINDOW_HEIGHT);
-    }
-
-    /// The width the first board read resolves the window to: a board with
-    /// nothing to show leaves the narrow opening as it is, one that draws the
-    /// column takes the default width back, a failed read keeps both the column
-    /// and the width, and the decision is taken once.
-    #[test]
-    fn the_start_up_width_follows_the_board() {
-        let default_window = Some(iced::Size::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT));
-
-        let mut dash = ready_dashboard();
-        let _ = dash.board_state.update(empty_board());
-        assert_eq!(dash.take_startup_width(), None, "the narrow opening fits");
-
-        let mut dash = ready_dashboard();
-        let _ = dash.board_state.update(board_with_a_ticket());
-        assert_eq!(dash.take_startup_width(), default_window);
-        assert_eq!(
-            dash.take_startup_width(),
-            None,
-            "the decision is taken once"
-        );
-
-        let mut dash = ready_dashboard();
-        let _ = dash.board_state.update(board::BoardMessage::RefreshError {
-            error: "db down".to_string(),
-            generation: 0,
-        });
-        assert_eq!(
-            dash.take_startup_width(),
-            default_window,
-            "a failed read keeps the column, and the width with it"
-        );
-    }
-
-    /// The dashboard takes the decision on a board read that applied; an outcome
-    /// the board dropped as stale decides nothing — a newer read is still on its
-    /// way.
-    #[test]
-    fn only_an_applied_board_read_settles_the_start_up_width() {
-        let mut dash = ready_dashboard();
-        let _ = dash.update(Message::Board(empty_board()));
-        assert!(matches!(dash.startup_width, StartupWidth::Settled));
-
-        let mut dash = ready_dashboard();
-        let _ = dash.board_state.refresh(); // a newer read is in flight
-        let _ = dash.update(Message::Board(empty_board()));
-        assert!(matches!(dash.startup_width, StartupWidth::AwaitingReport));
-    }
-
-    /// The decision survives the platform's own reports of the size it gave the
-    /// window — the requested width rounded to its pixel grid, then the same
-    /// size again — and yields to a width the user drags before the first read.
-    /// A height-only drag decides nothing: the decision is about the width.
-    #[test]
-    fn the_start_up_width_survives_the_creation_reports() {
-        let mut dash = Dashboard::loading(&WindowState::default());
-        let _ = dash.update(resize(1067.0, 800.0));
-        let _ = dash.update(resize(1067.0, 800.0));
-        assert!(
-            matches!(dash.startup_width, StartupWidth::Owed),
-            "still owed"
-        );
-
-        let mut dash = Dashboard::loading(&WindowState::default());
-        let _ = dash.update(resize(1067.0, 800.0));
-        let _ = dash.update(resize(1067.0, 700.0));
-        assert!(
-            matches!(dash.startup_width, StartupWidth::Owed),
-            "a height-only drag is not a width"
-        );
-
-        let mut dash = Dashboard::loading(&WindowState::default());
-        let _ = dash.update(resize(1067.0, 800.0));
-        let _ = dash.update(resize(900.0, 800.0));
-        assert!(
-            matches!(dash.startup_width, StartupWidth::Settled),
-            "the drag is the user's"
-        );
-    }
-
-    /// The shape of a widget tree: every node's tag with its children's. iced
-    /// reconciles positionally, so a node keeps its state across a redraw only
-    /// while the subtrees under it keep this shape.
-    fn tree_shape(tree: &iced::advanced::widget::tree::Tree) -> Shape {
-        Shape {
-            tag: tree.tag,
-            children: tree.children.iter().map(tree_shape).collect(),
+    fn reloaded(names: &str, generation: u64) -> Message {
+        Message::WorkspacesReloaded {
+            workspaces: ws_map(names),
+            generation,
         }
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    struct Shape {
-        tag: iced::advanced::widget::tree::Tag,
-        children: Vec<Shape>,
+    fn reload_failed(error: &str, generation: u64) -> Message {
+        Message::WorkspacesReloadFailed {
+            error: error.to_string(),
+            generation,
+        }
     }
 
-    /// The Home page keeps its shape when the ticket column comes and goes: the
-    /// column is pushed after the chat, never around it, so the chat's subtree is
-    /// identical either way and iced reconciles it in place — its scroll
-    /// position and the composer's caret and draft survive the flip.
-    #[test]
-    fn the_ticket_column_does_not_reshape_the_home_page() {
-        // The composer draws the voice status, which a started instance has.
-        #[cfg(target_os = "macos")]
-        let _ = crate::audio::voice::init_global();
-
-        let mut dash = ready_dashboard();
-        let _ = dash.update(Message::Board(empty_board()));
-        let without = dash.home_page();
-        assert_eq!(without.as_widget().children().len(), 1, "the chat alone");
-        let chat = tree_shape(&without.as_widget().children()[0]);
-        drop(without);
-
-        let _ = dash.update(Message::Board(board_with_a_ticket()));
-        let with = dash.home_page();
-        assert_eq!(
-            with.as_widget().children().len(),
-            2,
-            "the chat and the column"
-        );
-        assert_eq!(tree_shape(&with.as_widget().children()[0]), chat);
+    fn workspace_deleted(removed: &str, moved_to: Option<&str>) -> Message {
+        let done = (removed.to_string(), moved_to.map(str::to_string));
+        let result = workspaces::WorkspacesMessage::DeleteResult(Ok(done));
+        Message::Settings(settings::SettingsMessage::WorkspaceMsg(result))
     }
 
-    /// A saved geometry is its own answer: nothing is owed, so no board read
-    /// resizes the window.
+    fn assert_surfaces(dash: &mut Dashboard, shown: bool, name: &str) {
+        if shown {
+            assert!(dash.resolved_workspace().is_some(), "case {name}");
+            assert!(dash.render_git_block().is_some(), "case {name}");
+            assert!(dash.page_available(Page::Editor), "case {name}");
+            assert!(dash.page_available(Page::Shell), "case {name}");
+            let _ = dash.open_diff_modal(None);
+            assert!(dash.show_diff_modal, "case {name}");
+            return;
+        }
+        assert_eq!(dash.resolved_workspace(), None, "case {name}");
+        assert!(!dash.page_available(Page::Editor), "case {name}");
+        assert!(!dash.page_available(Page::Shell), "case {name}");
+        assert!(dash.page_available(Page::Home), "case {name}");
+        assert_eq!(dash.page, Page::Home, "case {name}: left for Home");
+        let _ = dash.navigate_to(Page::Editor);
+        assert_eq!(dash.page, Page::Home, "case {name}: and stays");
+        assert!(dash.render_git_block().is_none(), "case {name}");
+        assert_eq!(dash.pushed_workspace, None, "case {name}");
+        let _ = dash.open_diff_modal(None);
+        assert!(!dash.show_diff_modal, "case {name}: no change view");
+    }
+
+    /// The start-up width: settled once, and only by a board read that applied.
     #[test]
-    fn a_saved_geometry_opens_as_saved() {
+    fn start_up_width_cases() {
+        enum Drive {
+            /// The outcome reaches the board state alone, as a dispatched read's does.
+            Direct(board::BoardMessage),
+            /// A board read delivered through the dashboard.
+            Outcome(board::BoardMessage),
+            /// A resize delivered through the dashboard.
+            Resize(f32, f32),
+            /// A newer read is dispatched, so the outcome that follows is stale.
+            Refresh,
+        }
+        use Drive::*;
+        let default = Some(iced::Size::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT));
         let saved = WindowState {
             width: 1000.0,
             height: 700.0,
@@ -5037,15 +4996,86 @@ mod tests {
             y: 10,
             restored: true,
         };
-        let mut dash = Dashboard::loading(&saved);
-        assert_eq!(dash.last_size, iced::Size::new(1000.0, 700.0));
-        let _ = dash.update(Message::Board(board_with_a_ticket()));
-        assert_eq!(dash.take_startup_width(), None);
+        for (name, window, steps, expected) in [
+            (
+                "an empty board fits the narrow opening",
+                None,
+                vec![Direct(empty_board())],
+                ("awaiting", None),
+            ),
+            (
+                "a drawn column takes the width back",
+                None,
+                vec![Direct(board_with_a_ticket())],
+                ("awaiting", default),
+            ),
+            (
+                "a failed read keeps the width",
+                None,
+                vec![Direct(failed_board())],
+                ("awaiting", default),
+            ),
+            (
+                "a read that applied settles it",
+                None,
+                vec![Outcome(empty_board())],
+                ("settled", None),
+            ),
+            (
+                "a stale outcome decides nothing",
+                None,
+                vec![Refresh, Outcome(empty_board())],
+                ("awaiting", default),
+            ),
+            (
+                "the rounded width stays owed",
+                None,
+                vec![Resize(1067.0, 800.0), Resize(1067.0, 800.0)],
+                ("owed", default),
+            ),
+            (
+                "a height-only drag is not a width",
+                None,
+                vec![Resize(1067.0, 800.0), Resize(1067.0, 700.0)],
+                ("owed", Some(iced::Size::new(DEFAULT_WINDOW_WIDTH, 700.0))),
+            ),
+            (
+                "a width the user drags is the user's",
+                None,
+                vec![Resize(1067.0, 800.0), Resize(900.0, 800.0)],
+                ("settled", None),
+            ),
+            (
+                "a saved geometry is its own answer",
+                Some(saved),
+                vec![Outcome(board_with_a_ticket())],
+                ("settled", None),
+            ),
+        ] {
+            let window = window.unwrap_or_default();
+            let mut dash = Dashboard::loading(&window);
+            dash.ready = true;
+            assert_eq!(dash.last_size, window.opening_size(), "case {name}");
+            for step in steps {
+                match step {
+                    Direct(read) => drop(dash.board_state.update(read)),
+                    Outcome(read) => drop(dash.update(Message::Board(read))),
+                    Resize(width, height) => drop(dash.update(resize(width, height))),
+                    Refresh => drop(dash.board_state.refresh()),
+                }
+            }
+            let state = match dash.startup_width {
+                StartupWidth::Settled => "settled",
+                StartupWidth::AwaitingReport => "awaiting",
+                StartupWidth::Owed => "owed",
+            };
+            let taken = dash.take_startup_width();
+            assert_eq!((state, taken), expected, "case {name}");
+            assert_eq!(dash.take_startup_width(), None, "case {name}: once");
+        }
     }
 
-    /// The conversation's first load is dispatched by the app opening — it hangs
-    /// off the screen opening, never off a workspace selection (the other routes
-    /// are a session reset and a stream-lag re-sync).
+    /// The conversation's first load hangs off the app opening, never off a workspace selection.
     #[tokio::test]
     async fn the_app_opening_loads_the_conversation() {
         let (log_store, _logs_dir) = crate::open_test_store!(LogStore, "logs");
@@ -5060,446 +5090,491 @@ mod tests {
         );
     }
 
-    /// A `WorkspacesReloaded` for generation 0 — the generation a dashboard that
-    /// has not reloaded yet carries (the reload guard drops anything older).
-    fn reloaded(map: HashMap<String, Workspace>) -> Message {
-        Message::WorkspacesReloaded {
-            workspaces: map,
-            generation: 0,
-        }
+    enum ReloadStep {
+        Booting,
+        /// The map a read already left in the state.
+        Map(&'static str),
+        Select(&'static str),
+        /// A newer reload is in flight: the generation the next outcome is measured against.
+        Bump(u64),
+        /// A reload outcome, through the dashboard.
+        Read(Result<&'static str, &'static str>, u64),
+        /// The boot read's outcome, applied directly.
+        Boot(Result<&'static str, &'static str>, &'static str, bool, u64),
     }
 
-    /// [`reloaded`]'s failure counterpart.
-    fn reload_failed(error: &str) -> Message {
-        Message::WorkspacesReloadFailed {
-            error: error.to_string(),
-            generation: 0,
-        }
-    }
-
+    /// The reload state machine: a read replaces the map and the Settings list, never the live selection.
     #[test]
-    fn workspaces_reloaded_replaces_map_and_defers_an_unknown_selection() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([
-            ("ws1".to_string(), ws("ws1")),
-            ("ws2".to_string(), ws("ws2")),
-        ]);
-        dash.selected_workspace_name = Some("ws2".to_string());
-        let _ = dash.apply_workspace_selection("ws2");
-        assert_eq!(dash.resolved_workspace(), Some(("ws2", "/p/ws2")));
-
-        // A reload whose map lacks ws2 replaces the map, but leaves the live
-        // selection standing — never substituted with the admin's Personal
-        // workspace — and the now-unresolved surfaces are dropped with it: the
-        // DB read-back, not this map, decides whether the selection survives.
-        let new_map = HashMap::from([
-            ("ws1".to_string(), ws("ws1")),
-            ("ws3".to_string(), ws("ws3")),
-        ]);
-        let _ = dash.update(reloaded(new_map));
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws2"));
-        assert_eq!(dash.resolved_workspace(), None);
-        assert_eq!(dash.pushed_workspace, None);
-        assert!(dash.workspaces.contains_key("ws1"));
-        assert!(dash.workspaces.contains_key("ws3"));
-        assert!(!dash.workspaces.contains_key("ws2"));
-
-        // A reload whose map still contains the selection → unchanged. The map is
-        // never consulted for the selection, so it survives whatever the
-        // trigger-time snapshot was — the boot-race regression where a reload
-        // triggered while the selection was still None must not reset it.
-        dash.selected_workspace_name = Some("ws3".to_string());
-        let new_map2 = HashMap::from([("ws3".to_string(), ws("ws3"))]);
-        let _ = dash.update(reloaded(new_map2));
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws3"));
-    }
-
-    /// A switch made elsewhere (the `workspace` tool's `add`) reaches a running
-    /// dashboard: the read-back applies the stored choice in memory, an
-    /// unchanged value is a no-op, and a read superseded by a local pick or by a
-    /// newer read is dropped — the two surfaces are one choice, and the running
-    /// app follows it. A personal answer stands only when the map carries no
-    /// project to show.
-    #[test]
-    fn active_workspace_sync_follows_an_external_switch_and_drops_a_superseded_read() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([
-            ("ws1".to_string(), ws("ws1")),
-            ("ws2".to_string(), ws("ws2")),
-        ]);
-        dash.selected_workspace_name = Some("ws1".to_string());
-
-        // A switch made elsewhere — the `workspace` tool's `add` — is adopted
-        // as soon as it is read back.
-        let _ = dash.update(Message::ActiveWorkspaceSynced {
-            generation: 0,
-            name: Some("ws2".to_string()),
-        });
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws2"));
-
-        // A pick made here issues a write of its own, so a read dispatched
-        // before it is stale by construction and must not revert the pick.
-        let _ = dash.select_workspace("ws1");
-        assert_eq!(dash.active_workspace_gen, 1);
-        let _ = dash.update(Message::ActiveWorkspaceSynced {
-            generation: 0,
-            name: Some("ws2".to_string()),
-        });
-        assert_eq!(
-            dash.selected_workspace_name.as_deref(),
-            Some("ws1"),
-            "a superseded read must not revert the live selection"
-        );
-
-        // A failed read changes nothing, and an unchanged value is a no-op
-        // rather than a re-run of the propagate's pushes.
-        let _ = dash.update(Message::ActiveWorkspaceSynced {
-            generation: 1,
-            name: None,
-        });
-        let _ = dash.update(Message::ActiveWorkspaceSynced {
-            generation: 1,
-            name: Some("ws1".to_string()),
-        });
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-
-        // Two reads in flight: the one dispatched first cannot land last and
-        // revert the newer answer, because the newer dispatch bumped the guard.
-        let stale = dash.active_workspace_gen;
-        dash.active_workspace_gen += 1; // a newer read is dispatched
-        let _ = dash.update(Message::ActiveWorkspaceSynced {
-            generation: stale,
-            name: Some("ws2".to_string()),
-        });
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-
-        // A stored managed name the loaded map does not hold is still adopted:
-        // the map can simply be a reload behind (a workspace added and
-        // selected at once) and the DB is authoritative about the choice, so the
-        // read-back must not pin Personal here.
-        assert!(!dash.workspaces.contains_key("late"));
-        let _ = dash.update(Message::ActiveWorkspaceSynced {
-            generation: dash.active_workspace_gen,
-            name: Some("late".to_string()),
-        });
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
-
-        // And a reload whose map read predates that workspace must not settle the
-        // desktop on Personal either — the two surfaces stay one choice until the
-        // DB says otherwise.
-        let _ = dash.update(reloaded(HashMap::from([("ws1".to_string(), ws("ws1"))])));
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
-
-        // A personal answer while the map carries a project is the residue of a
-        // failed start-up read, which writes nothing on purpose: adopting it would
-        // drop the desktop outside every project, so the live pick stands.
-        let _ = dash.update(Message::ActiveWorkspaceSynced {
-            generation: dash.active_workspace_gen,
-            name: Some("personal:admin".to_string()),
-        });
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
-
-        // With no project left to show, the personal answer is the right one.
-        dash.workspaces.clear();
-        let _ = dash.update(Message::ActiveWorkspaceSynced {
-            generation: dash.active_workspace_gen,
-            name: Some("personal:admin".to_string()),
-        });
-        assert_eq!(
-            dash.selected_workspace_name.as_deref(),
-            Some("personal:admin")
-        );
-    }
-
-    /// The add form's activation: a pick applies in memory at once — superseding
-    /// any in-flight read-back — while a name the loaded map does not carry still
-    /// applies but is not persisted.
-    #[test]
-    fn activate_workspace_applies_at_once_and_skips_a_name_the_map_lacks() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([
-            ("ws1".to_string(), ws("ws1")),
-            ("ws2".to_string(), ws("ws2")),
-        ]);
-        dash.selected_workspace_name = Some("ws1".to_string());
-
-        let generation = dash.active_workspace_gen;
-        let _ = dash.activate_workspace("ws2");
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws2"));
-        assert_eq!(dash.active_workspace_gen, generation + 1);
-
-        // Not in the map: applied in memory (the DB read-back decides), nothing
-        // is written.
-        let _ = dash.activate_workspace("late");
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("late"));
-        assert_eq!(dash.active_workspace_gen, generation + 2);
-
-        // What may be written: a managed name only when the map carries it, a
-        // personal space always (the map never carries one, and it is stored as
-        // NULL — the product's own "no managed workspace selected").
-        assert!(dash.selection_persistable("personal:admin"));
-        assert!(dash.selection_persistable("ws2"));
-        assert!(!dash.selection_persistable("late"));
-    }
-
-    #[test]
-    fn workspaces_reloaded_keeps_the_boot_restored_selection() {
-        // Models the boot race: a CDC baseline reload was triggered while the
-        // selection was still None, but lands after `finish_boot` applied the
-        // DB-restored selection ("mahbot"). The map is never consulted for the
-        // selection, so it stands instead of being wiped to Personal.
-        let mut dash = ready_dashboard();
-        dash.selected_workspace_name = Some("mahbot".to_string());
-        let map = HashMap::from([("mahbot".to_string(), ws("mahbot"))]);
-        let _ = dash.update(reloaded(map));
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("mahbot"));
-    }
-
-    /// A boot pick that is written back supersedes any read-back already in
-    /// flight, as a pick does. A pick produced by a failed read is written by
-    /// nobody, so it supersedes none — an in-flight read may still correct it.
-    #[test]
-    fn a_boot_pick_supersedes_a_read_back_in_flight() {
-        let mut dash = ready_dashboard();
-        let map = HashMap::from([("ws1".to_string(), ws("ws1"))]);
-        let before = dash.active_workspace_gen;
-
-        let _ = dash.apply_boot_workspaces(Ok(map.clone()), "ws1", false, 0);
-        assert_eq!(
-            dash.active_workspace_gen, before,
-            "nothing was written, so a read-back may still correct the pick"
-        );
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-
-        let _ = dash.apply_boot_workspaces(Ok(map), "ws1", true, 0);
-        assert_eq!(
-            dash.active_workspace_gen,
-            before + 1,
-            "the write must supersede a read-back in flight"
-        );
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-    }
-
-    /// The boot race: the map read during boot is dropped as stale while the
-    /// restored selection is applied, so the selection is resolved against an
-    /// empty map. The workspace-scoped surfaces must stay empty — never the
-    /// admin's Personal workspace — and must come back by
-    /// themselves once the map arrives, with the selected NAME unchanged
-    /// throughout.
-    #[test]
-    fn boot_without_the_workspace_map_pushes_nothing_then_recovers() {
-        let mut dash = ready_dashboard();
-
-        let _ = dash.apply_boot_workspaces(Ok(HashMap::new()), "ws1", false, 0);
-
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-        assert_eq!(dash.resolved_workspace(), None);
-        assert_eq!(
-            dash.pushed_workspace, None,
-            "an unresolvable selection must not be substituted with a workspace"
-        );
-
-        let _ = dash.update(reloaded(HashMap::from([("ws1".to_string(), ws("ws1"))])));
-
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-        assert_eq!(dash.resolved_workspace(), Some(("ws1", "/p/ws1")));
-        assert_eq!(
-            dash.pushed_workspace
-                .as_ref()
-                .map(|(name, path)| (name.as_str(), path.as_str())),
-            Some(("ws1", "/p/ws1")),
-            "the reload that made the unchanged selection resolvable must re-push it"
-        );
-    }
-
-    /// Only a managed workspace present in the loaded map with a usable path
-    /// resolves; everything else — a personal selection however it arose, a
-    /// name missing from the map, an entry without a path, no selection —
-    /// resolves to nothing.
-    #[test]
-    fn only_a_managed_workspace_with_a_path_resolves() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([
-            ("ws1".to_string(), ws("ws1")),
-            (
-                "pathless".to_string(),
-                Workspace {
-                    name: "pathless".to_string(),
-                    ..Default::default()
-                },
-            ),
-        ]);
-
-        dash.selected_workspace_name = Some("personal:admin".to_string());
-        assert_eq!(dash.resolved_workspace(), None);
-        dash.selected_workspace_name = Some("gone".to_string());
-        assert_eq!(dash.resolved_workspace(), None);
-        dash.selected_workspace_name = Some("pathless".to_string());
-        assert_eq!(dash.resolved_workspace(), None);
-        dash.selected_workspace_name = Some(String::new());
-        assert_eq!(dash.resolved_workspace(), None);
-        dash.selected_workspace_name = None;
-        assert_eq!(dash.resolved_workspace(), None);
-
-        dash.selected_workspace_name = Some("ws1".to_string());
-        assert_eq!(dash.resolved_workspace(), Some(("ws1", "/p/ws1")));
-    }
-
-    /// The editor page, the shell page, the footer git status and the diff view
-    /// follow the resolution: gone while nothing resolves, back by themselves
-    /// once it does — and a workspace-scoped page that stops resolving leaves
-    /// the desktop on Home. Every step goes through the real selection entry
-    /// point (the single push point for all of them), so what the dashboard
-    /// derives from that push is asserted here.
-    #[test]
-    fn unresolved_selection_hides_the_workspace_scoped_surfaces() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
-
-        let _ = dash.apply_workspace_selection("ws1");
-        assert!(dash.resolved_workspace().is_some());
-        assert!(dash.render_git_block().is_some());
-        let _ = dash.navigate_to(Page::Editor);
-
-        // A personal selection never resolves.
-        let _ = dash.apply_workspace_selection("personal:admin");
-        assert_eq!(dash.resolved_workspace(), None);
-        assert!(!dash.page_available(Page::Editor));
-        assert!(!dash.page_available(Page::Shell));
-        assert_eq!(
-            dash.page,
-            Page::Home,
-            "a page nothing can navigate to is left for Home"
-        );
-        let _ = dash.navigate_to(Page::Editor);
-        assert_eq!(dash.page, Page::Home, "and cannot be navigated back to");
-        assert!(
-            dash.page_available(Page::Home),
-            "other pages stay available"
-        );
-        assert!(dash.render_git_block().is_none());
-        let _ = dash.open_diff_modal(None);
-        assert!(!dash.show_diff_modal, "the diff view must not open");
-
-        // Neither does a selected name missing from the loaded map — the toggles
-        // included: a stored selection naming a project that no longer exists
-        // counts as no project.
-        let _ = dash.apply_workspace_selection("gone");
-        assert_eq!(dash.resolved_workspace(), None);
-        assert!(!dash.page_available(Page::Editor));
-        assert!(dash.render_git_block().is_none());
-
-        // Nothing is offered for it either: the toggle has no write to make and
-        // reports nothing.
-        let toasts = dash.toasts.len();
-        let _ = dash.update(Message::Toggle(ToggleKind::Pause));
-        assert_eq!(dash.toasts.len(), toasts);
-
-        let _ = dash.apply_workspace_selection("ws1");
-        assert!(dash.resolved_workspace().is_some());
-        assert!(dash.page_available(Page::Editor));
-        assert!(dash.page_available(Page::Shell));
-        assert!(dash.render_git_block().is_some());
-        let _ = dash.open_diff_modal(None);
-        assert!(dash.show_diff_modal);
-    }
-
-    /// Deleting a project reports where the desktop moved — or that it left every
-    /// project — whenever it moved at all, whichever project was deleted; changed
-    /// tabs, git state and toggles are otherwise the only sign of it.
-    #[test]
-    fn deleting_a_project_reports_where_the_desktop_moved() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([
-            ("ws1".to_string(), ws("ws1")),
-            ("ws2".to_string(), ws("ws2")),
-            ("ws3".to_string(), ws("ws3")),
-        ]);
-        let _ = dash.apply_workspace_selection("ws1");
-        let delete_result = |removed: &str, moved_to: Option<&str>| {
-            Message::Settings(settings::SettingsMessage::WorkspaceMsg(
-                workspaces::WorkspacesMessage::DeleteResult(Ok((
-                    removed.to_string(),
-                    moved_to.map(str::to_string),
-                ))),
-            ))
+    fn workspace_reload_cases() {
+        use ReloadStep::*;
+        let read = |names: &'static str, dispatched: u64| Read(Ok(names), dispatched);
+        let failed = |error: &'static str, dispatched: u64| Read(Err(error), dispatched);
+        let boot_failed = |error: &'static str, restored, remember, dispatched| {
+            Boot(Err(error), restored, remember, dispatched)
         };
-
-        // The store left the selection where the desktop already is: silent.
-        let _ = dash.update(delete_result("ws2", Some("ws1")));
-        assert!(dash.toasts.is_empty(), "no move, nothing to report");
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-
-        // The store moved it elsewhere: the desktop follows at once and says where,
-        // whichever project was deleted.
-        let _ = dash.update(delete_result("ws2", Some("ws3")));
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws3"));
-        assert_eq!(dash.resolved_workspace(), Some(("ws3", "/p/ws3")));
-        assert!(matches!(
-            dash.toasts.as_slice(),
-            [Toast { message, kind: ToastKind::Success, .. }]
-                if message == "Project ws2 removed — ws3 is active"
-        ));
-
-        // The same for the active project's own deletion, applied at once so the
-        // desktop never passes through the no-project state while the map reload
-        // and the read-back catch up.
-        let _ = dash.update(delete_result("ws3", Some("ws1")));
-        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws1"));
-        assert!(matches!(
-            dash.toasts.as_slice(),
-            [.., Toast { message, .. }] if message == "Project ws3 removed — ws1 is active"
-        ));
-
-        // The last project leaves the desktop outside any workspace.
-        let _ = dash.update(delete_result("ws1", None));
-        assert_eq!(
-            dash.selected_workspace_name.as_deref(),
-            Some("personal:admin")
-        );
-        assert_eq!(dash.resolved_workspace(), None);
-        assert!(matches!(
-            dash.toasts.as_slice(),
-            [.., Toast { message, .. }] if message == "Project ws1 removed — the personal folder is active"
-        ));
+        for (name, steps, (selection, error, workspaces, settings)) in [
+            (
+                "a known selection resolves",
+                vec![Map("ws1,ws2"), Select("ws2")],
+                (Some("ws2"), None, "ws1,ws2", ""),
+            ),
+            (
+                "a reload replaces the map and leaves an unknown name standing",
+                vec![Map("ws1,ws2"), Select("ws2"), read("ws1,ws3", 0)],
+                (Some("ws2"), None, "ws1,ws3", "ws1,ws3"),
+            ),
+            (
+                "a reload whose map holds the selection leaves it",
+                vec![Map("ws3"), Select("ws3"), read("ws3", 0)],
+                (Some("ws3"), None, "ws3", "ws3"),
+            ),
+            (
+                "a boot-restored selection stands",
+                vec![Select("mahbot"), read("mahbot", 0)],
+                (Some("mahbot"), None, "mahbot", "mahbot"),
+            ),
+            (
+                "a reload syncs the Settings list",
+                vec![read("beta,alpha", 0)],
+                (Some("personal:admin"), None, "alpha,beta", "alpha,beta"),
+            ),
+            (
+                "a superseded failure and map change nothing",
+                vec![Bump(2), failed("db down", 1), read("ws2", 1)],
+                (None, None, "ws1", ""),
+            ),
+            (
+                "a failed reload keeps the map and says why",
+                vec![failed("db down", 0)],
+                (None, Some("db down"), "ws1", "ws1"),
+            ),
+            (
+                "a reload after a failure clears it",
+                vec![failed("db down", 0), read("ws2", 0)],
+                (Some("personal:admin"), None, "ws2", "ws2"),
+            ),
+            (
+                "a failed boot read completes",
+                vec![
+                    Booting,
+                    boot_failed("boot read failed", "personal:admin", false, 0),
+                ],
+                (Some("personal:admin"), Some("boot read failed"), "", ""),
+            ),
+            (
+                "a late boot read is dropped",
+                vec![
+                    Booting,
+                    Map("ws1"),
+                    Bump(1),
+                    boot_failed("boot read failed", "personal:admin", false, 0),
+                ],
+                (Some("personal:admin"), None, "ws1", ""),
+            ),
+        ] {
+            let mut dash = ready_dashboard();
+            dash.workspaces = ws_map("ws1");
+            for step in steps {
+                match step {
+                    Booting => dash = Dashboard::loading(&WindowState::default()),
+                    Map(names) => dash.workspaces = ws_map(names),
+                    Select(selected) => drop(dash.apply_workspace_selection(selected)),
+                    Bump(generation) => dash.workspaces_reload_gen = generation,
+                    Read(Ok(names), dispatched) => drop(dash.update(reloaded(names, dispatched))),
+                    Read(Err(error), dispatched) => {
+                        drop(dash.update(reload_failed(error, dispatched)));
+                    }
+                    Boot(Ok(names), restored, remember, dispatched) => {
+                        let map = ws_map(names);
+                        drop(dash.apply_boot_workspaces(Ok(map), restored, remember, dispatched));
+                    }
+                    Boot(Err(error), restored, remember, dispatched) => {
+                        let failure = Err(error.to_string());
+                        drop(dash.apply_boot_workspaces(failure, restored, remember, dispatched));
+                    }
+                }
+            }
+            assert_workspace_state(&dash, selection, workspaces, name);
+            assert_eq!(dash.workspaces_error.as_deref(), error, "case {name}");
+            let listed = dash.settings_state.workspaces_state.workspaces.iter();
+            let synced: Vec<&str> = listed.map(|ws| ws.name.as_str()).collect();
+            assert_eq!(synced.join(","), settings, "case {name}: settings");
+        }
     }
 
-    /// An open diff view is closed when the resolution is lost — from then on
-    /// nothing of that workspace may be displayed.
+    #[derive(Clone, Copy)]
+    enum SelectionStep {
+        /// Another map than the family's two projects.
+        Map(&'static str),
+        Select(&'static str),
+        /// A pick in the footer, which writes the choice back.
+        Switch(&'static str),
+        /// A pick that applies at once, superseding any read-back.
+        Activate(&'static str),
+        /// A read-back, at the generation it was dispatched at.
+        Sync(u64, Option<&'static str>),
+        /// A newer read is dispatched.
+        Bump(u64),
+        /// The boot read's map, its restored name and whether that pick is written back.
+        Boot(&'static str, &'static str, bool, u64),
+        /// A reload whose map arrives after the selection.
+        Reload(&'static str, u64),
+    }
+
+    type SelectionExpected<'a> = (Option<&'a str>, u64, &'a str);
+    type SelectionCase<'a> = (&'a str, &'a [SelectionStep], SelectionExpected<'a>);
+    use SelectionStep::*;
+
+    const SELECTION_CASES: &[SelectionCase<'static>] = &[
+        (
+            "an external switch is adopted",
+            &[Select("ws1"), Sync(0, Some("ws2"))],
+            (Some("ws2"), 0, "ws1,ws2"),
+        ),
+        (
+            "a pick supersedes a read dispatched before it",
+            &[Select("ws1"), Switch("ws1"), Sync(0, Some("ws2"))],
+            (Some("ws1"), 1, "ws1,ws2"),
+        ),
+        (
+            "a failed read changes nothing and a stale one cannot land last",
+            &[
+                Select("ws1"),
+                Sync(0, None),
+                Sync(0, Some("ws1")),
+                Bump(1),
+                Sync(0, Some("ws2")),
+            ],
+            (Some("ws1"), 1, "ws1,ws2"),
+        ),
+        (
+            "a stored name the map lacks is adopted, and a reload does not settle it",
+            &[Select("ws1"), Sync(0, Some("late")), Reload("ws1", 0)],
+            (Some("late"), 0, "ws1"),
+        ),
+        (
+            "a personal answer does not displace a project",
+            &[
+                Select("ws1"),
+                Sync(0, Some("late")),
+                Sync(0, Some("personal:admin")),
+            ],
+            (Some("late"), 0, "ws1,ws2"),
+        ),
+        (
+            "with no project left the personal answer stands",
+            &[
+                Select("ws1"),
+                Sync(0, Some("late")),
+                Map(""),
+                Sync(0, Some("personal:admin")),
+            ],
+            (Some("personal:admin"), 0, ""),
+        ),
+        (
+            "activate applies at once and supersedes a read-back",
+            &[Select("ws1"), Activate("ws2")],
+            (Some("ws2"), 1, "ws1,ws2"),
+        ),
+        (
+            "activate skips a name the map lacks",
+            &[Select("ws1"), Activate("late")],
+            (Some("late"), 1, "ws1,ws2"),
+        ),
+        (
+            "a boot pick that is not written back supersedes nothing",
+            &[Boot("ws1", "ws1", false, 0)],
+            (Some("ws1"), 0, "ws1"),
+        ),
+        (
+            "a written-back boot pick supersedes a read-back in flight",
+            &[Boot("ws1", "ws1", true, 0)],
+            (Some("ws1"), 1, "ws1"),
+        ),
+        (
+            "boot without the workspace map pushes nothing",
+            &[Boot("", "ws1", false, 0)],
+            (Some("ws1"), 0, ""),
+        ),
+        (
+            "the reload that resolves the unchanged selection re-pushes it",
+            &[Boot("", "ws1", false, 0), Reload("ws1", 0)],
+            (Some("ws1"), 0, "ws1"),
+        ),
+    ];
+
+    /// Only the selection's own entry points change it, and a superseded read-back never reverts a pick.
     #[test]
-    fn losing_the_resolution_closes_the_diff_view() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
-        let _ = dash.apply_workspace_selection("ws1");
-        let _ = dash.open_diff_modal(None);
-        assert!(dash.show_diff_modal);
-
-        let _ = dash.apply_workspace_selection("personal:admin");
-
-        assert!(!dash.show_diff_modal);
-        assert_eq!(dash.resolved_workspace(), None);
-        assert_eq!(dash.pushed_workspace, None);
+    fn workspace_selection_cases() {
+        use SelectionStep::*;
+        for &(name, steps, (selection, generation, workspaces)) in SELECTION_CASES {
+            let mut dash = ready_dashboard();
+            dash.workspaces = ws_map("ws1,ws2");
+            for &step in steps {
+                match step {
+                    Map(names) => dash.workspaces = ws_map(names),
+                    Select(selected) => drop(dash.apply_workspace_selection(selected)),
+                    Switch(name) => drop(dash.select_workspace(name)),
+                    Activate(name) => drop(dash.activate_workspace(name)),
+                    Sync(dispatched, name) => drop(dash.update(Message::ActiveWorkspaceSynced {
+                        generation: dispatched,
+                        name: name.map(str::to_string),
+                    })),
+                    Bump(dispatched) => dash.active_workspace_gen = dispatched,
+                    Boot(names, restored, remember, dispatched) => {
+                        let map = ws_map(names);
+                        drop(dash.apply_boot_workspaces(Ok(map), restored, remember, dispatched));
+                    }
+                    Reload(names, dispatched) => drop(dash.update(reloaded(names, dispatched))),
+                }
+            }
+            assert_workspace_state(&dash, selection, workspaces, name);
+            assert_eq!(dash.active_workspace_gen, generation, "case {name}");
+            let resolved = dash.resolved_workspace().is_some();
+            let personal = selection.is_some_and(|s| s.starts_with("personal:"));
+            let written = selection.is_some_and(|s| dash.selection_persistable(s));
+            assert_eq!(written, resolved || personal, "case {name}: writable");
+        }
     }
 
-    /// A sidebar ticket of another project opens its commit read-only and named,
-    /// without re-pointing the picked workspace's own change view; the ticket's
-    /// own project uses the ordinary view, and a project that no longer resolves
-    /// is reported instead of falling back to another project's history.
+    /// A selection resolves only to a managed workspace present in the loaded map with a usable path.
+    #[test]
+    fn workspace_resolution_cases() {
+        enum Probe {
+            /// What the footer resolves one selection to.
+            Dash(Option<&'static str>),
+            /// What the fallback resolves a stored name to while `personal:alice` exists.
+            Fallback(Option<&'static str>),
+            /// What the picker is offered.
+            Options,
+        }
+        use Probe::*;
+        let map = &[("ws1", "/p/ws1"), ("pathless", "")][..];
+        let projects = &[
+            ("ws1", "/p/ws1"),
+            ("ws2", "/p/ws2"),
+            ("personal:alice", "/p/personal:alice"),
+        ][..];
+        let mixed = &[
+            ("personal:admin", "/p/personal:admin"),
+            ("ws1", "/p/ws1"),
+            ("ws2", "/p/ws2"),
+        ][..];
+        for (name, workspaces, probe, expected) in [
+            (
+                "a personal selection resolves nothing",
+                map,
+                Dash(Some("personal:admin")),
+                "",
+            ),
+            (
+                "a name missing from the map resolves nothing",
+                map,
+                Dash(Some("gone")),
+                "",
+            ),
+            (
+                "an entry without a path resolves nothing",
+                map,
+                Dash(Some("pathless")),
+                "",
+            ),
+            ("an empty name resolves nothing", map, Dash(Some("")), ""),
+            ("no selection resolves nothing", map, Dash(None), ""),
+            (
+                "a managed workspace with a path resolves",
+                map,
+                Dash(Some("ws1")),
+                "ws1 /p/ws1",
+            ),
+            (
+                "a stored project stands",
+                projects,
+                Fallback(Some("ws2")),
+                "ws2",
+            ),
+            (
+                "a dangling name lands on the first project",
+                projects,
+                Fallback(Some("gone")),
+                "ws1",
+            ),
+            (
+                "no stored name lands on the first project",
+                projects,
+                Fallback(None),
+                "ws1",
+            ),
+            (
+                "with no project at all it is personal",
+                &[],
+                Fallback(Some("gone")),
+                "personal:alice",
+            ),
+            (
+                "a personal row is never offered",
+                mixed,
+                Options,
+                "ws1, ws2",
+            ),
+        ] {
+            let mut map: HashMap<String, Workspace> = HashMap::new();
+            for (name, path) in workspaces {
+                map.insert((*name).to_string(), ws_at(name, path));
+            }
+            let observed = match probe {
+                Dash(selection) => {
+                    let mut dash = ready_dashboard();
+                    dash.workspaces = map;
+                    dash.selected_workspace_name = selection.map(str::to_string);
+                    let pair = resolved_pair(&dash);
+                    pair.map_or_else(String::new, |(name, path)| format!("{name} {path}"))
+                }
+                Fallback(selection) => {
+                    let selected = resolve_workspace_selection(&map, selection, "personal:alice");
+                    selected.clone()
+                }
+                Options => {
+                    let options = managed_workspace_options(&map);
+                    let offered: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+                    offered.join(", ")
+                }
+            };
+            assert_eq!(observed, expected, "case {name}");
+        }
+    }
+
+    enum SurfaceStep {
+        /// Another map than the family's one project.
+        Map(&'static str),
+        Select(&'static str),
+        Navigate(Page),
+        /// A deleted project and where the store moved the selection to.
+        Delete(&'static str, Option<&'static str>),
+        Toggle,
+        OpenDiff,
+    }
+
+    enum SurfaceSee {
+        Shown,
+        Hidden,
+        /// A deletion: where the desktop moved and what it said.
+        Moved(Option<&'static str>, Option<&'static str>),
+    }
+
+    /// The workspace-scoped surfaces follow the resolution, and a deleted project says where the desktop moved.
+    #[test]
+    fn workspace_scoped_surface_cases() {
+        use SurfaceSee as See;
+        use SurfaceStep::*;
+        for (name, steps, see) in [
+            (
+                "a resolved selection shows the surfaces",
+                vec![Select("ws1")],
+                See::Shown,
+            ),
+            (
+                "a personal selection hides them",
+                vec![
+                    Select("ws1"),
+                    Navigate(Page::Editor),
+                    Select("personal:admin"),
+                ],
+                See::Hidden,
+            ),
+            (
+                "a name missing from the map hides them, the toggle included",
+                vec![Select("ws1"), Select("gone"), Toggle],
+                See::Hidden,
+            ),
+            (
+                "a resolved selection brings them back",
+                vec![Select("personal:admin"), Select("ws1")],
+                See::Shown,
+            ),
+            (
+                "a delete that left the desktop where it is says nothing",
+                vec![
+                    Map("ws1,ws2,ws3"),
+                    Select("ws1"),
+                    Delete("ws2", Some("ws1")),
+                ],
+                See::Moved(Some("ws1"), None),
+            ),
+            (
+                "a delete that moved it says where",
+                vec![
+                    Map("ws1,ws2,ws3"),
+                    Select("ws1"),
+                    Delete("ws2", Some("ws3")),
+                ],
+                See::Moved(Some("ws3"), Some("Project ws2 removed — ws3 is active")),
+            ),
+            (
+                "the active project's own deletion applies at once",
+                vec![
+                    Map("ws1,ws2,ws3"),
+                    Select("ws1"),
+                    Delete("ws2", Some("ws3")),
+                    Delete("ws3", Some("ws1")),
+                ],
+                See::Moved(Some("ws1"), Some("Project ws3 removed — ws1 is active")),
+            ),
+            (
+                "the last project leaves the desktop personal",
+                vec![Map("ws1,ws2,ws3"), Select("ws1"), Delete("ws1", None)],
+                See::Moved(
+                    Some("personal:admin"),
+                    Some("Project ws1 removed — the personal folder is active"),
+                ),
+            ),
+            (
+                "losing the resolution closes the change view",
+                vec![Select("ws1"), OpenDiff, Select("personal:admin")],
+                See::Hidden,
+            ),
+        ] {
+            let mut dash = ready_dashboard();
+            dash.workspaces = ws_map("ws1");
+            for step in steps {
+                match step {
+                    Map(names) => dash.workspaces = ws_map(names),
+                    Select(selected) => drop(dash.apply_workspace_selection(selected)),
+                    Navigate(page) => drop(dash.navigate_to(page)),
+                    Toggle => drop(dash.update(Message::Toggle(ToggleKind::Pause))),
+                    OpenDiff => drop(dash.open_diff_modal(None)),
+                    Delete(removed, moved_to) => {
+                        drop(dash.update(workspace_deleted(removed, moved_to)));
+                    }
+                }
+            }
+            let said = match see {
+                See::Moved(selection, message) => {
+                    assert_eq!(dash.selected_workspace_name.as_deref(), selection, "{name}");
+                    let moved = selection.filter(|name| dash.workspaces.contains_key(*name));
+                    let resolved = dash.resolved_workspace().map(|(name, _)| name);
+                    assert_eq!(resolved, moved, "case {name}: resolved");
+                    message.map(|m| (m, ToastKind::Success))
+                }
+                see => {
+                    assert_surfaces(&mut dash, matches!(see, See::Shown), name);
+                    None
+                }
+            };
+            let last = dash.toasts.last().map(|t| (t.message.as_str(), t.kind));
+            assert_eq!(last, said, "case {name}");
+        }
+    }
+
+    /// A foreign project's commit opens read-only without re-pointing the picked workspace's own change view.
     #[test]
     fn foreign_ticket_commit_diff_keeps_the_picked_view() {
         let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([
-            ("ws1".to_string(), ws("ws1")),
-            ("ws2".to_string(), ws("ws2")),
-        ]);
+        dash.workspaces = ws_map("ws1,ws2");
         let _ = dash.apply_workspace_selection("ws1");
 
         let _ = dash.open_ticket_commit_diff("ws2", "abc1234".to_string());
         assert_eq!(dash.foreign_workspace.as_deref(), Some("ws2"));
-        // The dashboard's own foreign state is the one that loaded: a state
-        // rebuilt per open would be a different one, and its generation would
-        // restart at 1 — a load left in flight from a previous view could then
-        // land in this one.
         assert!(
             dash.foreign_diff_state.is_viewing_commit(),
             "the foreign view shows ws2's commit"
@@ -5509,9 +5584,6 @@ mod tests {
             "the picked workspace's view must not be the one showing"
         );
 
-        // A picker-driven workspace push is the picked view's own message: the
-        // foreign view keeps the other project's commit on screen, and the
-        // picked state — not the foreign one — is the one re-pointed.
         let _ = dash.update(Message::DiffModal(diff::DiffMessage::WorkspaceSelected(
             "/p/ws3".to_string(),
         )));
@@ -5521,20 +5593,14 @@ mod tests {
             "the foreign view must not be re-pointed at the picked workspace"
         );
 
-        // "Back to working tree" in a foreign view returns to the picked
-        // workspace, never to the other project's working tree.
         let _ = dash.update(Message::ForeignDiff(diff::DiffMessage::BackToWorkingTree));
         assert!(dash.foreign_workspace.is_none());
         assert!(dash.show_diff_modal);
 
-        // A ticket of the picked workspace takes the ordinary view.
         let _ = dash.open_ticket_commit_diff("ws1", "abc1234".to_string());
         assert!(dash.foreign_workspace.is_none());
         assert!(dash.show_diff_modal);
 
-        // A project the map does not know is looked up in the store, and
-        // reported when it is gone — never substituted with another project's
-        // history. The ordinary view that was open stands untouched.
         let _ = dash.open_ticket_commit_diff("gone", "abc1234".to_string());
         assert!(dash.foreign_workspace.is_none());
         assert!(
@@ -5556,13 +5622,11 @@ mod tests {
         ));
     }
 
-    /// A workspace switch must not touch the ticket sidebar: it lists every
-    /// workspace's tickets, so its load failure and an in-progress search — the
-    /// query and the results it produced — must survive a switch untouched.
+    /// A workspace switch never touches the ticket sidebar's load failure or in-progress search.
     #[test]
     fn workspace_switch_leaves_the_ticket_sidebar_untouched() {
         let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+        dash.workspaces = ws_map("ws1");
         dash.board_state.load_state.fail("db down".to_string());
         let _ = dash.update(Message::Board(board::BoardMessage::SearchInputChanged(
             editor_widget::EditorAction::Paste("foo".into()),
@@ -5575,179 +5639,6 @@ mod tests {
         assert_eq!(dash.board_state.load_state.error(), Some("db down"));
         assert_eq!(dash.board_state.search_query.text(), "foo");
         assert_eq!(dash.board_state.search_results.len(), 1);
-    }
-
-    /// A reload that lands after a newer one has answered is dropped: its
-    /// failure must not re-set the error over the map the newer read produced
-    /// (the reload retries for a second, so this window is real).
-    #[test]
-    fn stale_workspace_reload_outcomes_are_dropped() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
-        dash.workspaces_reload_gen = 2;
-
-        let _ = dash.update(Message::WorkspacesReloadFailed {
-            error: "db down".to_string(),
-            generation: 1,
-        });
-        assert!(
-            dash.workspaces_error.is_none(),
-            "a stale failure must not re-set the error"
-        );
-
-        let _ = dash.update(Message::WorkspacesReloaded {
-            workspaces: HashMap::from([("ws2".to_string(), ws("ws2"))]),
-            generation: 1,
-        });
-        assert!(
-            dash.workspaces.contains_key("ws1"),
-            "a stale map must not replace the newer one"
-        );
-    }
-
-    /// The boot resolution: an existing stored project is kept, while a stored
-    /// value naming no existing project — including a failed read — lands on the
-    /// project the desktop falls back to. The personal name is the answer only
-    /// when the map carries no project at all.
-    #[test]
-    fn resolve_workspace_selection_keeps_a_project_and_never_lands_on_personal_while_one_exists() {
-        let map = HashMap::from([
-            ("ws1".to_string(), ws("ws1")),
-            ("ws2".to_string(), ws("ws2")),
-            ("personal:alice".to_string(), ws("personal:alice")),
-        ]);
-        let personal = "personal:alice";
-        assert_eq!(
-            resolve_workspace_selection(&map, Some("ws2"), personal),
-            "ws2"
-        );
-        // A dangling selection and a failed read both land on the first project
-        // in the footer switcher's order; a personal row is no candidate.
-        assert_eq!(
-            resolve_workspace_selection(&map, Some("gone"), personal),
-            "ws1"
-        );
-        assert_eq!(resolve_workspace_selection(&map, None, personal), "ws1");
-        assert_eq!(
-            resolve_workspace_selection(&HashMap::new(), Some("gone"), personal),
-            personal,
-            "with no project at all the desktop is outside any workspace"
-        );
-    }
-
-    /// A personal workspace is never a picker option — a lingering
-    /// `personal:{user}` row in the map is filtered out.
-    #[test]
-    fn managed_workspace_options_never_offer_a_personal_workspace() {
-        let map = HashMap::from([
-            ("personal:admin".to_string(), ws("personal:admin")),
-            ("ws2".to_string(), ws("ws2")),
-            ("ws1".to_string(), ws("ws1")),
-        ]);
-
-        let options = managed_workspace_options(&map);
-
-        assert_eq!(
-            options.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
-            vec!["ws1", "ws2"],
-            "managed workspaces only, ordered by name"
-        );
-    }
-
-    #[test]
-    fn workspaces_reloaded_syncs_settings_lists() {
-        let mut dash = ready_dashboard();
-        let map = HashMap::from([
-            ("beta".to_string(), ws("beta")),
-            ("alpha".to_string(), ws("alpha")),
-        ]);
-        let _ = dash.update(reloaded(map));
-
-        // Settings workspace list = map values sorted by name.
-        let ws_names: Vec<&str> = dash
-            .settings_state
-            .workspaces_state
-            .workspaces
-            .iter()
-            .map(|w| w.name.as_str())
-            .collect();
-        assert_eq!(ws_names, vec!["alpha", "beta"]);
-    }
-
-    /// A failed workspace-map read is a persistent, visible state: the current
-    /// map is preserved, the failure stays on the Dashboard for the picker and
-    /// the Settings list, and a later successful reload clears it.
-    #[test]
-    fn workspaces_reload_failure_sets_and_clears_error() {
-        let mut dash = ready_dashboard();
-        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
-
-        let _ = dash.update(reload_failed("db down"));
-
-        assert_eq!(dash.workspaces_error.as_deref(), Some("db down"));
-        assert!(
-            dash.workspaces.contains_key("ws1"),
-            "a failed reload must preserve the current map"
-        );
-        assert!(
-            dash.picker_failure(&managed_workspace_options(&dash.workspaces))
-                .is_none(),
-            "a preserved map keeps the picker working — the pill is for a read that left nothing to pick"
-        );
-
-        let new_map = HashMap::from([("ws2".to_string(), ws("ws2"))]);
-        let _ = dash.update(reloaded(new_map));
-
-        assert!(dash.workspaces_error.is_none());
-    }
-
-    /// A failed boot read still completes boot: the map stays empty and the
-    /// failure is carried so the picker / Settings list can render it.
-    #[test]
-    fn boot_workspace_read_failure_completes_with_error_state() {
-        let mut dash = Dashboard::loading(&WindowState::default());
-
-        let _ = dash.apply_boot_workspaces(
-            Err("boot read failed".to_string()),
-            "personal:admin",
-            false,
-            0,
-        );
-
-        assert_eq!(dash.workspaces_error.as_deref(), Some("boot read failed"));
-        assert!(dash.workspaces.is_empty());
-        assert_eq!(
-            dash.picker_failure(&managed_workspace_options(&dash.workspaces)),
-            Some("boot read failed"),
-            "a read that left nothing to pick must show the failure in the picker"
-        );
-    }
-
-    /// A reload that answered while the boot read was in flight read the same
-    /// table later: its map (and its cleared failure) stands, and the boot read's
-    /// outcome is dropped.
-    #[test]
-    fn late_boot_read_does_not_replace_a_newer_reload() {
-        let mut dash = Dashboard::loading(&WindowState::default());
-        let read_generation = dash.workspaces_reload_gen;
-        dash.workspaces = HashMap::from([("ws1".to_string(), ws("ws1"))]);
-        dash.workspaces_reload_gen = read_generation + 1; // a reload answered
-
-        let _ = dash.apply_boot_workspaces(
-            Err("boot read failed".to_string()),
-            "personal:admin",
-            false,
-            read_generation,
-        );
-
-        assert!(
-            dash.workspaces_error.is_none(),
-            "the superseded boot read must not set the failure over the newer read"
-        );
-        assert!(
-            dash.workspaces.contains_key("ws1"),
-            "the superseded boot read must not clear the newer map"
-        );
     }
 
     /// The DB-sourced boot resolution: the seeded admin with a managed stored

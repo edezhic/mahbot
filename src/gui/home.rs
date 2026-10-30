@@ -2410,14 +2410,14 @@ mod tests {
     use super::super::highlight::HighlightLanguage;
     use super::*;
 
-    /// A voice message leads with its dictated part, then the attachments, then
-    /// the typed text — and an ordinary send keeps its markers-then-text shape.
     #[test]
     fn a_sent_message_orders_its_dictated_part_first() {
-        assert_eq!(compose_content(Some("🔊✍️ spoken"), "", ""), "🔊✍️ spoken");
+        let spoken = "🔊✍️ spoken";
+        assert_eq!(compose_content(Some(spoken), "", ""), spoken);
+        let ordered = "🔊✍️ spoken\n\n[IMAGE:/a.png]\n\ntyped";
         assert_eq!(
-            compose_content(Some("🔊✍️ spoken"), "[IMAGE:/a.png]", "typed"),
-            "🔊✍️ spoken\n\n[IMAGE:/a.png]\n\ntyped"
+            compose_content(Some(spoken), "[IMAGE:/a.png]", "typed"),
+            ordered
         );
         assert_eq!(
             compose_content(None, "[IMAGE:/a.png]", "typed"),
@@ -2425,9 +2425,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
+    // ── Helpers ──────────────────────────────────────────────────────
 
     fn make_home_state(workspace: &str) -> HomeState {
         let mut state = HomeState::new();
@@ -2452,6 +2450,17 @@ mod tests {
         }
     }
 
+    fn timestamped_entry(
+        id: i64,
+        message_id: &str,
+        content: &str,
+        timestamp: &str,
+    ) -> ChatHistoryEntry {
+        let mut entry = stored_entry(id, message_id, content);
+        entry.timestamp = Some(timestamp.to_string());
+        entry
+    }
+
     /// A draft store backed by a unique throwaway file under one shared test
     /// temp dir, so tests never touch the real draft file.
     fn hermetic_draft_store() -> Arc<crate::channels::chat_draft::DraftStore> {
@@ -2464,53 +2473,55 @@ mod tests {
         ))
     }
 
+    /// The message a chat row of `text` renders to.
+    fn said(text: &str, direction: ChatDirection) -> DisplayMessage {
+        display_message(
+            None,
+            "m1".into(),
+            text.into(),
+            direction,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
     #[test]
     fn a_marker_naming_a_file_is_an_attachment_in_every_message() {
-        // The desktop resolves a relative target against the conversation's own
-        // workspace — Home shows the admin's personal one — and both directions
-        // follow the same rule: a file-shaped target leaves the text as a row.
-        for direction in [ChatDirection::Agent, ChatDirection::User] {
-            let message = display_message(
+        // Both directions follow one rule: a file-shaped target is a row.
+        // (case, the message, the attachment label it becomes, if any)
+        let cases = [
+            (
+                "a marker naming a file is an attachment",
+                "see [IMAGE:generated/poster.png]",
+                Some("🖼️ poster.png"),
+            ),
+            (
+                // A marker naming nothing is prose in both, and is never rewritten —
+                // the whole example, angle brackets included, reaches the parser as
+                // text. (`<path in your workspace>` is shape-unambiguously not a
+                // path, unlike a bare word that a workspace file could match.)
+                "a marker naming nothing stays prose",
+                "reference the output with [FILE:<path in your workspace>]",
                 None,
-                "m1".to_string(),
-                "see [IMAGE:generated/poster.png]".to_string(),
-                direction,
-                None,
-                None,
-                None,
-                false,
-            );
-            let text = rendered_text(&message.md_items);
-            assert!(!text.contains("[IMAGE:"), "got: {text:?}");
-            assert_eq!(
-                message.attachments.len(),
-                1,
-                "the picture is a row, not prose: got {text:?}"
-            );
-            assert_eq!(message.attachments[0].label, "🖼️ poster.png");
-        }
-
-        // A marker naming nothing is prose in both, and is never rewritten —
-        // the whole example, angle brackets included, reaches the parser as
-        // text. (`<path in your workspace>` is shape-unambiguously not a path,
-        // unlike a bare word that a workspace file could happen to match.)
-        for direction in [ChatDirection::Agent, ChatDirection::User] {
-            let message = display_message(
-                None,
-                "m2".to_string(),
-                "reference the output with [FILE:<path in your workspace>]".to_string(),
-                direction,
-                None,
-                None,
-                None,
-                false,
-            );
-            let text = rendered_text(&message.md_items);
-            assert!(
-                text.contains("[FILE:<path in your workspace>]"),
-                "an example stays text: {text:?}"
-            );
-            assert!(message.attachments.is_empty());
+            ),
+        ];
+        for (name, text, attachment) in cases {
+            for direction in [ChatDirection::Agent, ChatDirection::User] {
+                let message = said(text, direction);
+                let rendered = rendered_text(&message.md_items);
+                let rows: Vec<&str> = message
+                    .attachments
+                    .iter()
+                    .map(|a| a.label.as_str())
+                    .collect();
+                let wanted: Vec<&str> = attachment.into_iter().collect();
+                assert_eq!(rows, wanted, "case {name}: the rows");
+                assert!(!rendered.contains("[IMAGE:"), "case {name}: {rendered:?}");
+                let kept = rendered.contains(text);
+                assert_eq!(kept, attachment.is_none(), "case {name}: text stays");
+            }
         }
     }
 
@@ -2518,15 +2529,16 @@ mod tests {
     /// what the user reads.
     fn rendered_text(items: &[iced::widget::markdown::Item]) -> String {
         let style = crate::gui::theme::markdown_settings().style;
+        let paragraph = |text: &iced::widget::markdown::Text| -> String {
+            text.spans(style)
+                .iter()
+                .map(|span| span.text.to_string())
+                .collect()
+        };
         items
             .iter()
             .filter_map(|item| match item {
-                iced::widget::markdown::Item::Paragraph(text) => Some(
-                    text.spans(style)
-                        .iter()
-                        .map(|span| span.text.to_string())
-                        .collect::<String>(),
-                ),
+                iced::widget::markdown::Item::Paragraph(text) => Some(paragraph(text)),
                 _ => None,
             })
             .collect()
@@ -2535,18 +2547,17 @@ mod tests {
     #[test]
     fn the_chat_has_one_draft_and_a_workspace_switch_leaves_it_alone() {
         let mut state = make_home_state("ws1");
-
         // Typing captures synchronously into the one draft.
         let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('h')));
         assert_eq!(state.drafts.get().text, "h");
 
         // The workspace swap does not touch the composer: the text stays, and
         // the draft is still the same single draft.
-        let _ = state.update(HomeMessage::WorkspaceChanged("ws2".to_string()));
-        assert_eq!(state.editor_content.text(), "h");
-        let _ = state.update(HomeMessage::WorkspaceChanged("ws1".to_string()));
-        assert_eq!(state.editor_content.text(), "h");
-        assert_eq!(state.drafts.get().text, "h");
+        for picker in ["ws2", "ws1"] {
+            let _ = state.update(HomeMessage::WorkspaceChanged(picker.to_string()));
+            assert_eq!(state.editor_content.text(), "h", "case {picker}: text kept");
+            assert_eq!(state.drafts.get().text, "h", "case {picker}: one draft");
+        }
     }
 
     #[test]
@@ -2572,63 +2583,43 @@ mod tests {
     #[test]
     fn failed_reads_stay_set_until_a_successful_load() {
         let mut state = HomeState::new();
-        let generation = state.history_gen;
-
-        // A failed read of the current load is retained.
-        let _ = state.update(HomeMessage::HistoryLoadError {
+        let g = state.history_gen;
+        let error = |error: &str, generation: u64| HomeMessage::HistoryLoadError {
             generation,
-            error: "db down".to_string(),
-        });
+            error: error.to_string(),
+        };
+        let loaded = |entries: Vec<ChatHistoryEntry>, generation: u64| HomeMessage::HistoryLoaded {
+            entries,
+            generation,
+        };
+
+        // A failed read of the current load is retained; a failure from a
+        // superseded load is dropped.
+        let _ = state.update(error("db down", g));
+        assert_eq!(state.history_error.as_deref(), Some("db down"));
+        let _ = state.update(error("stale", g.wrapping_sub(1)));
         assert_eq!(state.history_error.as_deref(), Some("db down"));
 
-        // A failure from a superseded load is dropped.
-        let _ = state.update(HomeMessage::HistoryLoadError {
-            generation: generation.wrapping_sub(1),
-            error: "stale".to_string(),
-        });
+        // A superseded load replaces nothing and keeps the current failure.
+        let _ = state.update(loaded(Vec::new(), g.wrapping_sub(1)));
         assert_eq!(state.history_error.as_deref(), Some("db down"));
-
-        // A superseded successful load must not replace the window nor clear
-        // the current failure.
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: Vec::new(),
-            generation: generation.wrapping_sub(1),
-        });
-        assert_eq!(
-            state.history_error.as_deref(),
-            Some("db down"),
-            "a superseded successful load must not clear the current failure"
-        );
         assert!(
             state.messages.is_empty(),
-            "a superseded load must not replace the window"
+            "a superseded load replaces nothing"
         );
 
         // A successful load of the current generation clears it.
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: Vec::new(),
-            generation,
-        });
+        let _ = state.update(loaded(Vec::new(), g));
         assert!(state.history_error.is_none());
 
-        // A clear drops the failure with the transcript it described.
-        let _ = state.update(HomeMessage::HistoryLoadError {
-            generation,
-            error: "db down".to_string(),
-        });
+        // A clear drops the failure and supersedes a load still in flight.
+        let _ = state.update(error("db down", g));
         assert!(state.history_error.is_some());
-        // ...and supersedes a load still in flight, so nothing lands behind it.
         let in_flight = state.history_gen;
         let _ = state.update(HomeMessage::ClearChat);
         assert!(state.history_error.is_none());
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: vec![stored_entry(1, "old-1", "old")],
-            generation: in_flight,
-        });
-        assert!(
-            state.messages.is_empty(),
-            "a pre-clear load must not land behind the clear"
-        );
+        let _ = state.update(loaded(vec![stored_entry(1, "old-1", "old")], in_flight));
+        assert!(state.messages.is_empty(), "a pre-clear load lands nowhere");
     }
 
     fn make_msg(
@@ -2652,16 +2643,32 @@ mod tests {
         }
     }
 
+    /// A message the page keeps but the store does not: a live arrival, a
+    /// pending send or the scripted introduction, with its own instant and id.
+    fn seed_msg(
+        message_id: &str,
+        content: &str,
+        direction: ChatDirection,
+        timestamp: Option<&str>,
+        is_optimistic: bool,
+        db_id: Option<i64>,
+    ) -> DisplayMessage {
+        let mut message = make_msg(message_id, content, direction, None, is_optimistic);
+        message.timestamp = timestamp.map(str::to_string);
+        message.id = db_id;
+        message
+    }
+
     /// The admin's own message as the live stream delivers it: the confirmation
     /// of a composer send (`optimistic_id`) or a plain echo.
     fn own_message(message_id: &str, optimistic_id: Option<&str>) -> HomeMessage {
         HomeMessage::ChatEvent(crate::ChatEvent::Message {
-            message_id: message_id.to_string(),
-            user_name: crate::users::ADMIN_USER_NAME.to_string(),
-            content: "hello".to_string(),
+            message_id: message_id.into(),
+            user_name: crate::users::ADMIN_USER_NAME.into(),
+            content: "hello".into(),
             direction: ChatDirection::User,
             timestamp: crate::db::now(),
-            channel: "gui".to_string(),
+            channel: "gui".into(),
             agent_role: None,
             workspace: HomeState::conversation_workspace(),
             optimistic_id: optimistic_id.map(std::string::ToString::to_string),
@@ -2670,314 +2677,374 @@ mod tests {
         })
     }
 
-    // ------------------------------------------------------------------
-    // replace_optimistic
-    // ------------------------------------------------------------------
+    // ── replace_optimistic ───────────────────────────────────────────
 
-    #[test]
-    fn test_replace_optimistic_found() {
-        let mut state = make_home_state("ws1");
-        state.messages.push(make_msg(
-            "opt-1",
-            "(placeholder)",
-            ChatDirection::User,
-            None,
-            true,
-        ));
-
-        let task = state.replace_optimistic(
-            Some("opt-1"),
-            "real-42",
-            "Hello!",
-            ChatDirection::User,
-            None,
-            None,
-            None,
-        );
-
-        assert!(task.is_some(), "expected Some(task) for found optimistic");
-        assert_eq!(state.messages.len(), 1);
-        let replaced = &state.messages[0];
-        assert_eq!(replaced.message_id, "real-42");
-        assert_eq!(replaced.content, "Hello!");
-        assert!(!replaced.is_optimistic, "should no longer be optimistic");
-        assert!(
-            state.seen_ids.contains("real-42"),
-            "seen_ids should track canonical ID"
-        );
-        assert!(!state.sending, "sending should be cleared");
+    /// An optimistic composer bubble waiting for its confirmation.
+    fn bubble(id: &str, content: &str) -> DisplayMessage {
+        make_msg(id, content, ChatDirection::User, None, true)
     }
 
-    #[test]
-    fn test_replace_optimistic_not_found() {
-        let mut state = make_home_state("ws1");
-        state.messages.push(make_msg(
-            "opt-1",
-            "(placeholder)",
-            ChatDirection::User,
-            None,
-            true,
-        ));
-
-        // optimistic_id does not match any message
-        let task = state.replace_optimistic(
-            Some("wrong-opt"),
-            "real-42",
-            "Hello!",
-            ChatDirection::User,
-            None,
-            None,
-            None,
-        );
-
-        assert!(task.is_none(), "expected None when no optimistic match");
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(
-            state.messages[0].message_id, "opt-1",
-            "original should be untouched"
-        );
+    /// A message the pipeline delivered, already on screen.
+    fn live(id: &str, content: &str, direction: ChatDirection) -> DisplayMessage {
+        make_msg(id, content, direction, None, false)
     }
 
-    #[test]
-    fn test_replace_optimistic_no_opt_id() {
-        let mut state = make_home_state("ws1");
-
-        let task = state.replace_optimistic(
-            None,
-            "real-42",
-            "Hello!",
-            ChatDirection::User,
-            None,
-            None,
-            None,
-        );
-
-        assert!(task.is_none(), "expected None when optimistic_id is None");
-    }
-
-    #[test]
-    fn test_replace_optimistic_drops_a_bubble_the_page_already_carries() {
-        let mut state = make_home_state("ws1");
-        let mut row = make_msg("pipeline-9", "hello", ChatDirection::User, None, false);
-        row.id = Some(9);
-        state.messages.push(row);
-        state
-            .messages
-            .push(make_msg("opt-1", "hello", ChatDirection::User, None, true));
-        state.seen_ids.insert("pipeline-9".to_string());
-        state.sending = true;
-
-        let task = state.replace_optimistic(
-            Some("opt-1"),
-            "pipeline-9",
-            "hello",
-            ChatDirection::User,
-            None,
-            None,
-            None,
-        );
-
-        assert!(task.is_some(), "the removal still snaps to the end");
-        assert_eq!(state.messages.len(), 1, "one message, not two");
-        assert_eq!(state.messages[0].message_id, "pipeline-9");
-        assert!(!state.sending, "sending should be cleared");
-    }
-
-    // ------------------------------------------------------------------
-    // try_dedup
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn test_try_dedup_fresh() {
-        let mut state = make_home_state("ws1");
-        assert!(!state.try_dedup("msg-1"), "fresh ID should return false");
-        assert!(state.seen_ids.contains("msg-1"), "fresh ID should be added");
-    }
-
-    #[test]
-    fn test_try_dedup_duplicate() {
-        let mut state = make_home_state("ws1");
-        state.seen_ids.insert("msg-1".to_string());
-        assert!(state.try_dedup("msg-1"), "duplicate should return true");
-    }
-
-    #[test]
-    fn test_try_dedup_pruning() {
-        let mut state = make_home_state("ws1");
-        // Add 500 IDs.
-        for i in 0..DEDUP_PRUNE_THRESHOLD {
-            state.seen_ids.insert(format!("old-{i}"));
+    /// A quoted reply the composer or the pipeline attached to a message.
+    fn reply(author: &str, snippet: &str) -> ReplyReference {
+        ReplyReference {
+            author: author.to_string(),
+            snippet: snippet.to_string(),
         }
-        // Push 200 messages so there is a retain pool.
-        for i in 0..200u32 {
-            state.messages.push(make_msg(
-                &format!("old-{i}"),
-                "",
-                ChatDirection::User,
+    }
+
+    /// An optimistic bubble carrying a quoted reply.
+    fn quoting(id: &str, author: &str, snippet: &str) -> DisplayMessage {
+        DisplayMessage {
+            reply_reference: Some(reply(author, snippet)),
+            ..bubble(id, "(placeholder)")
+        }
+    }
+
+    struct SwapCase {
+        name: &'static str,
+        on_screen: Vec<DisplayMessage>,
+        seen: &'static [&'static str],
+        sending: bool,
+        optimistic_id: Option<&'static str>,
+        confirmed_id: &'static str,
+        content: &'static str,
+        reply: Option<ReplyReference>,
+        expect_swapped: bool,
+        expect_page: &'static [(&'static str, &'static str, bool)],
+        expect_reply_author: Option<&'static str>,
+        expect_seen: Option<&'static str>,
+    }
+
+    #[expect(clippy::too_many_lines)] // one table over every swap case
+    #[test]
+    fn replace_optimistic_swaps_only_the_matching_bubble() {
+        use ChatDirection::User;
+        let cases = [
+            SwapCase {
+                name: "a matching bubble is swapped for the confirmed message",
+                on_screen: vec![bubble("opt-1", "(placeholder)")],
+                seen: &[],
+                sending: false,
+                optimistic_id: Some("opt-1"),
+                confirmed_id: "real-42",
+                content: "Hello!",
+                reply: None,
+                expect_swapped: true,
+                expect_page: &[("real-42", "Hello!", false)],
+                expect_reply_author: None,
+                expect_seen: Some("real-42"),
+            },
+            SwapCase {
+                name: "no matching bubble leaves the original untouched",
+                on_screen: vec![bubble("opt-1", "(placeholder)")],
+                seen: &[],
+                sending: false,
+                optimistic_id: Some("wrong-opt"),
+                confirmed_id: "real-42",
+                content: "Hello!",
+                reply: None,
+                expect_swapped: false,
+                expect_page: &[("opt-1", "(placeholder)", true)],
+                expect_reply_author: None,
+                expect_seen: None,
+            },
+            SwapCase {
+                name: "no optimistic id is no replacement",
+                on_screen: vec![],
+                seen: &[],
+                sending: false,
+                optimistic_id: None,
+                confirmed_id: "real-42",
+                content: "Hello!",
+                reply: None,
+                expect_swapped: false,
+                expect_page: &[],
+                expect_reply_author: None,
+                expect_seen: None,
+            },
+            SwapCase {
+                name: "a bubble the page already carries is only dropped",
+                on_screen: vec![live("pipeline-9", "hello", User), bubble("opt-1", "hello")],
+                seen: &["pipeline-9"],
+                sending: true,
+                optimistic_id: Some("opt-1"),
+                confirmed_id: "pipeline-9",
+                content: "hello",
+                reply: None,
+                expect_swapped: true,
+                expect_page: &[("pipeline-9", "hello", false)],
+                expect_reply_author: None,
+                expect_seen: None,
+            },
+            SwapCase {
+                name: "a confirmed event with no reference keeps the bubble's own",
+                on_screen: vec![quoting("opt-9", "bob", "original quote")],
+                seen: &[],
+                sending: false,
+                optimistic_id: Some("opt-9"),
+                confirmed_id: "real-9",
+                content: "Hello!",
+                reply: None,
+                expect_swapped: true,
+                expect_page: &[("real-9", "Hello!", false)],
+                expect_reply_author: Some("bob"),
+                expect_seen: None,
+            },
+            SwapCase {
+                name: "a confirmed reference wins over the optimistic one",
+                on_screen: vec![bubble("opt-10", "(placeholder)")],
+                seen: &[],
+                sending: false,
+                optimistic_id: Some("opt-10"),
+                confirmed_id: "real-10",
+                content: "Hi",
+                reply: Some(reply("carol", "ok")),
+                expect_swapped: true,
+                expect_page: &[("real-10", "Hi", false)],
+                expect_reply_author: Some("carol"),
+                expect_seen: None,
+            },
+        ];
+        for case in cases {
+            let name = case.name;
+            let mut state = make_home_state("ws1");
+            state.messages = case.on_screen;
+            state.seen_ids = case.seen.iter().copied().map(str::to_string).collect();
+            state.sending = case.sending;
+            let task = state.replace_optimistic(
+                case.optimistic_id,
+                case.confirmed_id,
+                case.content,
+                User,
                 None,
-                false,
-            ));
+                None,
+                case.reply,
+            );
+            assert_eq!(
+                task.is_some(),
+                case.expect_swapped,
+                "case {name}: a replacement ran"
+            );
+            assert!(!state.sending, "case {name}: sending should be cleared");
+            assert_eq!(
+                state
+                    .messages
+                    .iter()
+                    .map(|m| (m.message_id.as_str(), m.content.as_str(), m.is_optimistic))
+                    .collect::<Vec<_>>(),
+                case.expect_page,
+                "case {name}: the page"
+            );
+            if let Some(author) = case.expect_reply_author {
+                let kept = state.messages[0].reply_reference.as_ref();
+                let kept_author = kept.map(|r| r.author.as_str());
+                assert_eq!(kept_author, Some(author), "case {name}: reply");
+            }
+            if let Some(seen) = case.expect_seen {
+                assert!(state.seen_ids.contains(seen), "case {name}: canonical id");
+            }
         }
-        // Add one more (breaches the threshold).
-        state.seen_ids.insert("extra".to_string());
-        assert_eq!(state.seen_ids.len(), 501);
-
-        // Calling try_dedup on a fresh ID triggers pruning.
-        assert!(!state.try_dedup("fresh"));
-
-        // After pruning, seen_ids only has the 200 message IDs.
-        // "fresh" and "extra" are dropped because they are not in messages.
-        assert_eq!(state.seen_ids.len(), 200);
-        assert!(!state.seen_ids.contains("fresh"));
-        assert!(!state.seen_ids.contains("extra"));
-        // An ID that is in messages is retained.
-        assert!(state.seen_ids.contains("old-0"));
-        assert!(state.seen_ids.contains("old-199"));
     }
 
-    // ------------------------------------------------------------------
-    // update_sending_state
-    // ------------------------------------------------------------------
+    // ── try_dedup ────────────────────────────────────────────────────
+
+    enum DedupSetup {
+        Empty,
+        Seen(&'static [&'static str]),
+        /// The dedup set at its prune threshold, with a page to retain from.
+        PrunePool,
+    }
+
+    #[test]
+    fn try_dedup_admits_a_fresh_id_once_and_prunes_the_set() {
+        // (case, the dedup set before, the arriving id, (deduped, set size,
+        // retained ids, dropped ids))
+        let cases = [
+            (
+                "a fresh id is admitted",
+                DedupSetup::Empty,
+                "msg-1",
+                (false, 1, &["msg-1"][..], &[][..]),
+            ),
+            (
+                "a duplicate id is rejected",
+                DedupSetup::Seen(&["msg-1"]),
+                "msg-1",
+                (true, 1, &["msg-1"][..], &[][..]),
+            ),
+            (
+                "a breached threshold prunes to the messages on the page",
+                DedupSetup::PrunePool,
+                "fresh",
+                (
+                    false,
+                    DEDUP_RETAIN,
+                    &["old-0", "old-199"][..],
+                    &["fresh", "extra"][..],
+                ),
+            ),
+        ];
+        for (name, setup, message_id, expected) in cases {
+            let (deduped, len, present, absent) = expected;
+            let mut state = make_home_state("ws1");
+            match setup {
+                DedupSetup::Empty => {}
+                DedupSetup::Seen(ids) => {
+                    state.seen_ids = ids.iter().map(|id| (*id).to_string()).collect();
+                }
+                DedupSetup::PrunePool => {
+                    for i in 0..DEDUP_PRUNE_THRESHOLD {
+                        state.seen_ids.insert(format!("old-{i}"));
+                    }
+                    // Push messages so there is a retain pool.
+                    for i in 0..DEDUP_RETAIN {
+                        let message =
+                            make_msg(&format!("old-{i}"), "", ChatDirection::User, None, false);
+                        state.messages.push(message);
+                    }
+                    // One more id breaches the threshold.
+                    state.seen_ids.insert("extra".to_string());
+                }
+            }
+            let verdict = state.try_dedup(message_id);
+            assert_eq!(verdict, deduped, "case {name}: dedup verdict");
+            assert_eq!(state.seen_ids.len(), len, "case {name}: dedup set size");
+            for id in present {
+                assert!(state.seen_ids.contains(*id), "case {name}: {id} retained");
+            }
+            for id in absent {
+                assert!(!state.seen_ids.contains(*id), "case {name}: {id} dropped");
+            }
+        }
+    }
+
+    // ── update_sending_state ─────────────────────────────────────────
+
+    struct SendingStateCase<'a> {
+        name: &'static str,
+        direction: ChatDirection,
+        user: &'a str,
+        workspace: &'a str,
+        sending: bool,
+        typing: bool,
+    }
 
     #[test]
     fn test_update_sending_state() {
         let personal = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let admin = crate::users::ADMIN_USER_NAME;
         let cases = [
-            (
-                "agent in the conversation",
-                ChatDirection::Agent,
-                crate::users::ADMIN_USER_NAME,
-                personal.as_str(),
-                false,
-                false,
-            ),
-            (
-                "user echo in the conversation",
-                ChatDirection::User,
-                crate::users::ADMIN_USER_NAME,
-                personal.as_str(),
-                false,
-                true,
-            ),
-            (
-                "another user",
-                ChatDirection::Agent,
-                "bob",
-                personal.as_str(),
-                true,
-                true,
-            ),
-            (
-                "a managed workspace",
-                ChatDirection::Agent,
-                crate::users::ADMIN_USER_NAME,
-                "ws1",
-                true,
-                true,
-            ),
+            SendingStateCase {
+                name: "agent in the conversation",
+                direction: ChatDirection::Agent,
+                user: admin,
+                workspace: personal.as_str(),
+                sending: false,
+                typing: false,
+            },
+            SendingStateCase {
+                name: "user echo in the conversation",
+                direction: ChatDirection::User,
+                user: admin,
+                workspace: personal.as_str(),
+                sending: false,
+                typing: true,
+            },
+            SendingStateCase {
+                name: "another user",
+                direction: ChatDirection::Agent,
+                user: "bob",
+                workspace: personal.as_str(),
+                sending: true,
+                typing: true,
+            },
+            SendingStateCase {
+                name: "a managed workspace",
+                direction: ChatDirection::Agent,
+                user: admin,
+                workspace: "ws1",
+                sending: true,
+                typing: true,
+            },
         ];
-        for (name, direction, user, workspace, exp_sending, exp_typing) in cases {
+        for case in cases {
+            let name = case.name;
             let mut state = make_home_state("ws1");
             state.sending = true;
             state.typing = true;
-            state.update_sending_state(direction, user, workspace);
-            assert_eq!(state.sending, exp_sending, "{name}: sending");
-            assert_eq!(state.typing, exp_typing, "{name}: typing");
+            state.update_sending_state(case.direction, case.user, case.workspace);
+            assert_eq!(state.sending, case.sending, "case {name}: sending");
+            assert_eq!(state.typing, case.typing, "case {name}: typing");
         }
     }
 
-    // ------------------------------------------------------------------
-    // append_message
-    // ------------------------------------------------------------------
+    // ── append_message ───────────────────────────────────────────────
 
     #[test]
-    fn test_append_message_match() {
-        let mut state = make_home_state("ws1");
-        assert_eq!(state.messages.len(), 0);
-
-        state.append_message(
-            crate::users::ADMIN_USER_NAME,
-            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-            "msg-1".to_string(),
-            "Hello!".to_string(),
-            ChatDirection::User,
-            None,
-            None,
-            None,
-        );
-
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].message_id, "msg-1");
-        assert_eq!(state.messages[0].content, "Hello!");
+    fn append_message_takes_only_the_conversations_own_messages() {
+        let admin = crate::users::ADMIN_USER_NAME;
+        // (case, (user, workspace or `None` for the conversation's own,
+        // direction, agent role), what the page holds afterwards)
+        let cases = [
+            (
+                "the admin's own message is appended",
+                (admin, None, ChatDirection::User, None),
+                Some(("msg-1", "Hello!", None)),
+            ),
+            (
+                "another user's message is filtered out",
+                ("bob", Some("ws1"), ChatDirection::User, None),
+                None,
+            ),
+            (
+                "a managed workspace's message is never the conversation's",
+                (admin, Some("ws2"), ChatDirection::User, None),
+                None,
+            ),
+            (
+                "an agent response carries its role",
+                (admin, None, ChatDirection::Agent, Some("engineer")),
+                Some(("msg-agent", "Agent answer", Some("engineer"))),
+            ),
+        ];
+        for (name, setup, expected) in cases {
+            let (user, workspace, direction, role) = setup;
+            let mut state = make_home_state("ws1");
+            let workspace = workspace.map_or_else(
+                || crate::users::personal_workspace_name(admin),
+                str::to_string,
+            );
+            let (id, content) = expected.map_or(("msg-1", "Hello!"), |(id, text, _)| (id, text));
+            state.append_message(
+                user,
+                &workspace,
+                id.to_string(),
+                content.to_string(),
+                direction,
+                role.map(str::to_string),
+                None,
+                None,
+            );
+            assert_eq!(
+                state.messages.len(),
+                usize::from(expected.is_some()),
+                "case {name}: appended"
+            );
+            if let (Some(message), Some((id, text, role))) = (state.messages.first(), expected) {
+                assert_eq!(message.message_id, id, "case {name}: id");
+                assert_eq!(message.content, text, "case {name}: content");
+                assert_eq!(message.direction, direction, "case {name}: direction");
+                assert_eq!(message.agent_role.as_deref(), role, "case {name}: role");
+            }
+        }
     }
 
-    #[test]
-    fn test_append_message_no_match_user() {
-        let mut state = make_home_state("ws1");
-
-        state.append_message(
-            "bob",
-            "ws1",
-            "msg-1".to_string(),
-            "Hello!".to_string(),
-            ChatDirection::User,
-            None,
-            None,
-            None,
-        );
-
-        assert_eq!(
-            state.messages.len(),
-            0,
-            "bob's message should be filtered out"
-        );
-    }
-
-    #[test]
-    fn test_append_message_no_match_workspace() {
-        let mut state = make_home_state("ws1");
-
-        state.append_message(
-            crate::users::ADMIN_USER_NAME,
-            "ws2",
-            "msg-1".to_string(),
-            "Hello!".to_string(),
-            ChatDirection::User,
-            None,
-            None,
-            None,
-        );
-
-        assert_eq!(
-            state.messages.len(),
-            0,
-            "a managed workspace's message is not the conversation's and must never be appended"
-        );
-    }
-
-    #[test]
-    fn test_append_message_agent_response() {
-        let mut state = make_home_state("ws1");
-
-        state.append_message(
-            crate::users::ADMIN_USER_NAME,
-            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-            "msg-agent".to_string(),
-            "Agent answer".to_string(),
-            ChatDirection::Agent,
-            Some("engineer".to_string()),
-            None,
-            None,
-        );
-
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].direction, ChatDirection::Agent);
-        assert_eq!(state.messages[0].agent_role.as_deref(), Some("engineer"),);
-    }
-
-    // ------------------------------------------------------------------
-    // one conversation, scoped to the admin's personal workspace
-    // ------------------------------------------------------------------
+    // ── one conversation, scoped to the admin's personal workspace ───
 
     #[test]
     fn a_selection_change_leaves_the_conversation_alone() {
@@ -2985,13 +3052,9 @@ mod tests {
         state
             .messages
             .push(make_msg("m1", "one", ChatDirection::User, None, false));
-        state.messages.push(make_msg(
-            "m2",
-            "two",
-            ChatDirection::Agent,
-            Some("assistant"),
-            false,
-        ));
+        state
+            .messages
+            .push(make_msg("m2", "two", ChatDirection::Agent, None, false));
         state.seen_ids = state
             .messages
             .iter()
@@ -3009,20 +3072,14 @@ mod tests {
             assert_eq!(task.units(), 0, "a selection change must issue no read");
             assert_eq!(state.selected_workspace.as_deref(), Some(picker));
             assert_eq!(generation, state.history_gen, "no load was issued");
-            let ids_and_contents: Vec<(&str, &str)> = state
+            let shown: Vec<(&str, &str)> = state
                 .messages
                 .iter()
                 .map(|m| (m.message_id.as_str(), m.content.as_str()))
                 .collect();
-            assert_eq!(ids_and_contents, [("m1", "one"), ("m2", "two")]);
-            assert!(
-                state.sending && state.typing,
-                "live-work state is not the selection's to reset"
-            );
-            assert!(
-                !state.auto_scroll_enabled,
-                "a scrolled-up view must not be snapped back"
-            );
+            assert_eq!(shown, [("m1", "one"), ("m2", "two")]);
+            assert!(state.sending && state.typing, "live work is not reset");
+            assert!(!state.auto_scroll_enabled, "a scrolled-up view stays");
         }
     }
 
@@ -3058,176 +3115,140 @@ mod tests {
         state.sending = true;
         let _ = state.update(message("ws1", "project-1"));
         let _ = state.update(typing("ws1"));
-        assert!(
-            state.messages.is_empty(),
-            "a project's message is never the conversation's"
-        );
-        assert!(
-            !state.typing && state.sending,
-            "a project's live work is not the conversation's cue either"
-        );
-
+        assert!(state.messages.is_empty(), "a project's message is filtered");
+        assert!(!state.typing && state.sending, "nor is its typing cue");
         let _ = state.update(message(&personal, "own-1"));
         let _ = state.update(typing(&personal));
-        assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].message_id, "own-1");
         assert!(state.typing, "the conversation's own typing cue is shown");
         assert!(!state.sending, "its own live traffic clears the send");
     }
 
-    #[test]
-    fn a_reload_replaces_the_stored_history_and_keeps_what_is_not_stored() {
-        let mut state = HomeState::new();
-        let mut old = make_msg("old-1", "old", ChatDirection::User, None, false);
-        old.id = Some(1);
-        state.messages.push(make_msg(
-            "live-1",
-            "live",
-            ChatDirection::Agent,
-            Some("assistant"),
-            false,
-        ));
-        state.messages.push(old);
-        state.messages.push(make_msg(
-            "opt-1",
-            "optimistic",
-            ChatDirection::User,
-            None,
-            true,
-        ));
-        state.seen_ids = state
-            .messages
-            .iter()
-            .map(|m| m.message_id.clone())
-            .collect();
+    // ── History reload reconciliation ────────────────────────────────
 
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: vec![
-                stored_entry(1, "old-1", "old"),
-                stored_entry(2, "new-2", "new"),
-            ],
-            generation: state.history_gen,
-        });
-
-        // The stored page in chronological order, then what was kept, in its
-        // previous order.
-        let ids_and_contents: Vec<(&str, &str)> = state
-            .messages
-            .iter()
-            .map(|m| (m.message_id.as_str(), m.content.as_str()))
-            .collect();
-        assert_eq!(
-            ids_and_contents,
-            [
-                ("old-1", "old"),
-                ("new-2", "new"),
-                ("live-1", "live"),
-                ("opt-1", "optimistic"),
-            ]
-        );
-        assert_eq!(state.messages[0].id, Some(1));
-        assert_eq!(state.messages[1].id, Some(2));
-        assert!(state.messages[2].id.is_none());
-        assert!(state.messages[3].id.is_none() && state.messages[3].is_optimistic);
-        let unique: HashSet<&str> = state
-            .messages
-            .iter()
-            .map(|m| m.message_id.as_str())
-            .collect();
-        assert_eq!(unique.len(), state.messages.len(), "no duplicated ids");
+    /// A stored message the page already shows, with its row id.
+    fn stored(id: &str, content: &str, db_id: i64) -> DisplayMessage {
+        seed_msg(id, content, ChatDirection::User, None, false, Some(db_id))
     }
 
-    #[test]
-    fn a_reload_puts_a_kept_transient_message_back_among_the_stored_ones() {
-        let mut state = HomeState::new();
-        // The scripted onboarding exchange is transient — never stored — and
-        // carries the timestamp of the event that produced it.
-        let mut transient = make_msg(
-            "intro-1",
-            "intro",
-            ChatDirection::Agent,
-            Some("assistant"),
-            false,
-        );
-        transient.timestamp = Some("2026-01-01T10:00:00.000000000+00:00".to_string());
-        state.messages.push(transient);
-
-        let mut reply = stored_entry(5, "reply", "the reply");
-        reply.timestamp = Some("2026-01-01T10:00:05.000000000+00:00".to_string());
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: vec![reply],
-            generation: state.history_gen,
-        });
-
-        let ids: Vec<&str> = state
-            .messages
-            .iter()
-            .map(|m| m.message_id.as_str())
-            .collect();
-        assert_eq!(
-            ids,
-            ["intro-1", "reply"],
-            "a kept message stays in front of the stored one it preceded"
-        );
+    /// A transient message the page keeps: never stored, carrying its instant.
+    fn transient(id: &str, content: &str, at: &str) -> DisplayMessage {
+        seed_msg(id, content, ChatDirection::Agent, Some(at), false, None)
     }
 
+    /// A pending send whose confirmation has not arrived.
+    fn pending(id: &str, content: &str, at: &str) -> DisplayMessage {
+        seed_msg(id, content, ChatDirection::User, Some(at), true, None)
+    }
+
+    struct ReloadCase {
+        name: &'static str,
+        on_screen: Vec<DisplayMessage>,
+        seen: &'static [&'static str],
+        stored: &'static [(i64, &'static str, &'static str, Option<&'static str>)],
+        page: &'static [(&'static str, &'static str)],
+        stored_ids: Option<&'static [Option<i64>]>,
+        optimistic: Option<&'static [bool]>,
+    }
     #[test]
-    fn a_lost_confirmation_does_not_double_a_pending_send() {
-        let sent = "2026-01-01T10:00:00.000000000+00:00";
-        let mut confirmed = stored_entry(9, "pipeline-9", "hello");
-        confirmed.timestamp = Some("2026-01-01T10:00:01.000000000+00:00".to_string());
-
-        let mut state = HomeState::new();
-        let mut bubble = make_msg("opt-1", "hello", ChatDirection::User, None, true);
-        bubble.timestamp = Some(sent.to_string());
-        state.messages.push(bubble);
-        state.messages.push(make_msg(
-            "live-1",
-            "later",
-            ChatDirection::Agent,
-            Some("assistant"),
-            false,
-        ));
-
-        // The resync page brings the pending send back under the pipeline's own
-        // id — its confirmation was dropped with the lag.
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: vec![confirmed],
-            generation: state.history_gen,
-        });
-        let ids: Vec<&str> = state
-            .messages
-            .iter()
-            .map(|m| m.message_id.as_str())
-            .collect();
-        assert_eq!(
-            ids,
-            ["pipeline-9", "live-1"],
-            "the pending send appears once, as the stored row"
-        );
-
-        // A row of the same text written before the send is a message of its
-        // own, so the pending send is not swallowed by it.
-        let mut state = HomeState::new();
-        let mut bubble = make_msg("opt-2", "hello", ChatDirection::User, None, true);
-        bubble.timestamp = Some(sent.to_string());
-        state.messages.push(bubble);
-        let mut older_row = stored_entry(1, "old-1", "hello");
-        older_row.timestamp = Some("2026-01-01T09:00:00.000000000+00:00".to_string());
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: vec![older_row],
-            generation: state.history_gen,
-        });
-        let ids: Vec<&str> = state
-            .messages
-            .iter()
-            .map(|m| m.message_id.as_str())
-            .collect();
-        assert_eq!(
-            ids,
-            ["old-1", "opt-2"],
-            "an older row of the same text is not the pending send's copy"
-        );
+    fn a_reload_reconciles_the_stored_history_with_what_is_on_screen() {
+        use ChatDirection::Agent;
+        const SENT: &str = "2026-01-01T10:00:00.000000000+00:00";
+        const LATER: &str = "2026-01-01T10:00:05.000000000+00:00";
+        const EARLIER: &str = "2026-01-01T09:00:00.000000000+00:00";
+        let cases = [
+            ReloadCase {
+                name: "the stored page replaces the stored and keeps the rest",
+                on_screen: vec![
+                    live("live-1", "live", Agent),
+                    stored("old-1", "old", 1),
+                    bubble("opt-1", "optimistic"),
+                ],
+                seen: &["live-1", "old-1", "opt-1"],
+                stored: &[(1, "old-1", "old", None), (2, "new-2", "new", None)],
+                page: &[
+                    ("old-1", "old"),
+                    ("new-2", "new"),
+                    ("live-1", "live"),
+                    ("opt-1", "optimistic"),
+                ],
+                stored_ids: Some(&[Some(1), Some(2), None, None]),
+                optimistic: Some(&[false, false, false, true]),
+            },
+            ReloadCase {
+                name: "a kept transient message goes back among the stored ones",
+                // The scripted onboarding exchange is transient — never stored —
+                // and carries the timestamp of the event that produced it.
+                on_screen: vec![transient("intro-1", "intro", SENT)],
+                seen: &[],
+                stored: &[(5, "reply", "the reply", Some(LATER))],
+                page: &[("intro-1", "intro"), ("reply", "the reply")],
+                stored_ids: None,
+                optimistic: None,
+            },
+            ReloadCase {
+                name: "a lost confirmation does not double a pending send",
+                on_screen: vec![
+                    pending("opt-1", "hello", SENT),
+                    live("live-1", "later", Agent),
+                ],
+                seen: &[],
+                stored: &[(9, "pipeline-9", "hello", Some(SENT))],
+                page: &[("pipeline-9", "hello"), ("live-1", "later")],
+                stored_ids: None,
+                optimistic: None,
+            },
+            ReloadCase {
+                name: "an older row of the same text is not the pending send's copy",
+                on_screen: vec![pending("opt-2", "hello", SENT)],
+                seen: &[],
+                stored: &[(1, "old-1", "hello", Some(EARLIER))],
+                page: &[("old-1", "hello"), ("opt-2", "hello")],
+                stored_ids: None,
+                optimistic: None,
+            },
+            ReloadCase {
+                name: "a reload never doubles history",
+                on_screen: vec![live("in-flight", "text", Agent)],
+                seen: &["in-flight"],
+                stored: &[(5, "in-flight", "text", None)],
+                page: &[("in-flight", "text")],
+                stored_ids: Some(&[Some(5)]),
+                optimistic: None,
+            },
+        ];
+        for case in cases {
+            let name = case.name;
+            let entries = case.stored.iter().map(|(id, mid, content, at)| match at {
+                Some(at) => timestamped_entry(*id, mid, content, at),
+                None => stored_entry(*id, mid, content),
+            });
+            let mut state = HomeState::new();
+            state.messages = case.on_screen;
+            state.seen_ids = case.seen.iter().map(|id| (*id).to_string()).collect();
+            let g = state.history_gen;
+            let loaded = HomeMessage::HistoryLoaded {
+                entries: entries.collect(),
+                generation: g,
+            };
+            let _ = state.update(loaded);
+            let got: Vec<(&str, &str)> = state
+                .messages
+                .iter()
+                .map(|m| (m.message_id.as_str(), m.content.as_str()))
+                .collect();
+            assert_eq!(got, case.page, "case {name}: the page");
+            let ids: HashSet<&str> = got.iter().map(|(id, _)| *id).collect();
+            assert_eq!(ids.len(), got.len(), "case {name}: no duplicated ids");
+            if let Some(stored_ids) = case.stored_ids {
+                let got: Vec<Option<i64>> = state.messages.iter().map(|m| m.id).collect();
+                assert_eq!(got, stored_ids, "case {name}: stored row ids");
+            }
+            if let Some(optimistic) = case.optimistic {
+                let got: Vec<bool> = state.messages.iter().map(|m| m.is_optimistic).collect();
+                assert_eq!(got, optimistic, "case {name}: optimistic flags");
+            }
+        }
     }
 
     #[test]
@@ -3241,305 +3262,177 @@ mod tests {
         row.id = Some(9);
         state.messages.push(row);
         state.seen_ids.insert("pipeline-9".to_string());
-
         let _ = state.update(own_message("pipeline-9", None));
-        assert_eq!(state.messages.len(), 1);
-        assert!(
-            !state.sending,
-            "a deduplicated confirmation must not block the composer"
-        );
+        assert_eq!(state.messages.len(), 1, "it adds nothing");
+        assert!(!state.sending, "it still frees the composer");
     }
 
-    #[test]
-    fn a_reload_never_doubles_history() {
-        let mut state = HomeState::new();
-        state.messages.push(make_msg(
-            "in-flight",
-            "text",
-            ChatDirection::Agent,
-            Some("assistant"),
-            false,
-        ));
-        state.seen_ids.insert("in-flight".to_string());
-
-        // A live arrival whose copy the loaded page also carries appears
-        // exactly once — the stored copy, not the live one.
-        let _ = state.update(HomeMessage::HistoryLoaded {
-            entries: vec![stored_entry(5, "in-flight", "text")],
-            generation: state.history_gen,
-        });
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].id, Some(5));
-    }
-
-    // ------------------------------------------------------------------
-    // entry_to_display_message
-    // ------------------------------------------------------------------
+    // ── A stored row becomes a display message ────────────────────
 
     #[test]
-    fn test_display_message_from_user() {
-        let entry = ChatHistoryEntry {
-            id: 1,
-            message_id: "msg-1".to_string(),
-            content: "Hello **world**".to_string(),
-            direction: ChatDirection::User,
+    fn a_stored_entry_becomes_a_display_message() {
+        use ChatDirection::{Divider, User};
+        let entry = |id: i64, message_id: &str, content: &str, direction, reply| ChatHistoryEntry {
+            id,
+            message_id: message_id.to_string(),
+            content: content.to_string(),
+            direction,
             agent_role: None,
             timestamp: None,
-            reply_reference: None,
+            reply_reference: reply,
         };
-        let msg = DisplayMessage::from(entry);
+        // (case, the stored row, (directional fields, the markdown it parses to,
+        // its reply reference))
+        let cases = [
+            (
+                "a user row parses its markdown",
+                entry(1, "msg-1", "Hello **world**", User, None),
+                (1, User, false, None),
+            ),
+            (
+                "a divider row produces no markdown",
+                entry(42, "divider-1", "2026-07-17T20:30:00Z", Divider, None),
+                (42, Divider, true, None),
+            ),
+            (
+                "a reply reference is carried over",
+                entry(
+                    7,
+                    "msg-7",
+                    "replied text",
+                    User,
+                    Some(reply("alice", "quote")),
+                ),
+                (7, User, false, Some(("alice", "quote"))),
+            ),
+        ];
+        for (name, row, (id, direction, empty, carried)) in cases {
+            let content = row.content.clone();
+            let message = DisplayMessage::from(row);
+            assert_eq!(message.id, Some(id), "case {name}: stored row id");
+            assert_eq!(message.direction, direction, "case {name}: direction");
+            assert_eq!(message.content, content, "case {name}: content");
+            assert_eq!(message.md_items.is_empty(), empty, "case {name}: markdown");
+            assert!(!message.is_optimistic, "case {name}: not optimistic");
+            if let Some((author, snippet)) = carried {
+                let got = message.reply_reference.as_ref().expect("the entry's reply");
+                assert_eq!(got.author, author, "case {name}: reply author");
+                assert_eq!(got.snippet, snippet, "case {name}: reply snippet");
+            }
+        }
+    }
 
-        assert_eq!(msg.id, Some(1));
-        assert_eq!(msg.direction, ChatDirection::User);
-        assert_eq!(msg.content, "Hello **world**");
-        assert!(
-            !msg.md_items.is_empty(),
-            "user message should produce markdown items"
-        );
-        assert!(!msg.is_optimistic);
+    struct ReplyReferenceCase {
+        name: &'static str,
+        direction: ChatDirection,
+        role: Option<&'static str>,
+        content: String,
+        author: &'static str,
+        snippet: Option<&'static str>,
+        capped: bool,
     }
 
     #[test]
-    fn test_display_message_divider() {
-        let entry = ChatHistoryEntry {
-            id: 42,
-            message_id: "divider-1".to_string(),
-            content: "2026-07-17T20:30:00Z".to_string(),
-            direction: ChatDirection::Divider,
-            agent_role: None,
-            timestamp: None,
-            reply_reference: None,
-        };
-        let msg = DisplayMessage::from(entry);
-
-        assert_eq!(msg.id, Some(42));
-        assert_eq!(msg.direction, ChatDirection::Divider);
-        assert_eq!(msg.content, "2026-07-17T20:30:00Z");
-        // Dividers should produce NO markdown items — they render as rules.
-        assert!(
-            msg.md_items.is_empty(),
-            "divider entry should produce empty markdown items, got {} items",
-            msg.md_items.len()
-        );
-        assert!(!msg.is_optimistic);
+    fn reply_references_derive_their_author_and_normalized_snippet() {
+        use ChatDirection::{Agent, User};
+        let admin = crate::users::ADMIN_USER_NAME;
+        // A user message is normalized: angle brackets stripped, newlines
+        // collapsed (each `\n` becomes a single space, so `\n\n` yields two),
+        // media marker mapped.
+        let cases = [
+            ReplyReferenceCase {
+                name: "a user message is the admin's own",
+                direction: User,
+                role: None,
+                content: "Hello <world>\n\nwith [IMAGE:/tmp/photo.png]".into(),
+                author: admin,
+                snippet: Some("Hello world  with [Photo]"),
+                capped: false,
+            },
+            ReplyReferenceCase {
+                name: "an agent message uses the shared role label",
+                direction: Agent,
+                role: Some("analyst_3"),
+                content: "line one\n<line two> [IMAGE:/tmp/x.png] and a long tail".into(),
+                author: "Analyst",
+                snippet: Some("line one line two [Photo] and a long tail"),
+                capped: false,
+            },
+            ReplyReferenceCase {
+                name: "a long snippet is capped with an ellipsis",
+                direction: User,
+                role: None,
+                content: "a".repeat(150),
+                author: admin,
+                snippet: None,
+                capped: true,
+            },
+        ];
+        for case in cases {
+            let name = case.name;
+            let reply = reply_reference_for(case.direction, case.role, &case.content);
+            assert_eq!(reply.author, case.author, "case {name}: author");
+            if let Some(snippet) = case.snippet {
+                assert_eq!(reply.snippet, snippet, "case {name}: snippet");
+            }
+            if case.capped {
+                let len = reply.snippet.chars().count();
+                let max = crate::channels::reply::REPLY_SNIPPET_MAX_CHARS;
+                assert!(len <= max, "case {name}: capped, got {len}");
+                assert!(reply.snippet.ends_with('…'), "case {name}: ends with …");
+            }
+        }
     }
 
-    #[test]
-    fn test_display_message_from_entry_with_reply_reference() {
-        let entry = ChatHistoryEntry {
-            id: 7,
-            message_id: "msg-7".to_string(),
-            content: "replied text".to_string(),
-            direction: ChatDirection::User,
-            agent_role: None,
-            timestamp: None,
-            reply_reference: Some(crate::channels::ReplyReference {
-                author: "alice".to_string(),
-                snippet: "quote".to_string(),
-            }),
-        };
-        let msg = DisplayMessage::from(entry);
-
-        assert_eq!(
-            msg.reply_reference.as_ref().map(|r| r.author.as_str()),
-            Some("alice"),
-            "From<ChatHistoryEntry> must carry the entry's reply_reference"
-        );
-        assert_eq!(
-            msg.reply_reference.as_ref().map(|r| r.snippet.as_str()),
-            Some("quote")
-        );
-    }
-
-    #[test]
-    fn test_reply_reference_for_user_message() {
-        let reply = reply_reference_for(
-            ChatDirection::User,
-            None,
-            "Hello <world>\n\nwith [IMAGE:/tmp/photo.png]",
-        );
-
-        // A user message is the admin's own; the snippet is normalized (angle
-        // brackets stripped, newlines collapsed — each `\n` becomes a single
-        // space, so `\n\n` yields two — media marker mapped).
-        assert_eq!(reply.author, crate::users::ADMIN_USER_NAME);
-        assert_eq!(reply.snippet, "Hello world  with [Photo]");
-    }
-
-    #[test]
-    fn test_reply_reference_for_agent_message() {
-        let reply = reply_reference_for(
-            ChatDirection::Agent,
-            Some("analyst_3"),
-            "line one\n<line two> [IMAGE:/tmp/x.png] and a long tail",
-        );
-
-        // Agent direction uses the shared author-label derivation (suffix
-        // stripped + role label); snippet normalized the same way.
-        assert_eq!(reply.author, "Analyst");
-        assert_eq!(reply.snippet, "line one line two [Photo] and a long tail");
-    }
-
-    #[test]
-    fn test_reply_reference_snippet_caps_at_100() {
-        let long = "a".repeat(150);
-        let reply = reply_reference_for(ChatDirection::User, None, &long);
-
-        assert!(
-            reply.snippet.chars().count() <= crate::channels::reply::REPLY_SNIPPET_MAX_CHARS,
-            "snippet must be capped at 100 chars, got {}",
-            reply.snippet.chars().count()
-        );
-        assert!(
-            reply.snippet.ends_with('…'),
-            "truncated snippet ends with …"
-        );
-    }
-
-    #[test]
-    fn test_replace_optimistic_reply_reference_fallback() {
-        // A confirmed event carrying no reference falls back to the target
-        // optimistic bubble's own reference.
-        let mut state = make_home_state("ws1");
-        state.messages.push(DisplayMessage {
-            id: None,
-            message_id: "opt-9".to_string(),
-            content: "(placeholder)".to_string(),
-            direction: ChatDirection::User,
-            agent_role: None,
-            timestamp: None,
-            reply_reference: Some(crate::channels::ReplyReference {
-                author: "bob".to_string(),
-                snippet: "original quote".to_string(),
-            }),
-            md_items: Vec::new(),
-            attachments: Vec::new(),
-            is_optimistic: true,
-        });
-
-        let task = state.replace_optimistic(
-            Some("opt-9"),
-            "real-9",
-            "Hello!",
-            ChatDirection::User,
-            None,
-            None,
-            None,
-        );
-        assert!(task.is_some(), "expected replacement");
-        let replaced = &state.messages[0];
-        assert_eq!(
-            replaced.reply_reference.as_ref().map(|r| r.author.as_str()),
-            Some("bob"),
-            "event with no reference must keep the optimistic bubble's"
-        );
-
-        // A confirmed reference wins over the optimistic one.
-        let mut state = make_home_state("ws1");
-        state.messages.push(make_msg(
-            "opt-10",
-            "(placeholder)",
-            ChatDirection::User,
-            None,
-            true,
-        ));
-        let task = state.replace_optimistic(
-            Some("opt-10"),
-            "real-10",
-            "Hi",
-            ChatDirection::User,
-            None,
-            None,
-            Some(crate::channels::ReplyReference {
-                author: "carol".to_string(),
-                snippet: "confirmed".to_string(),
-            }),
-        );
-        assert!(task.is_some(), "expected replacement");
-        let replaced = &state.messages[0];
-        assert_eq!(
-            replaced.reply_reference.as_ref().map(|r| r.author.as_str()),
-            Some("carol")
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Selection (shift+click / drag)
-    // ------------------------------------------------------------------
+    // ── Selection (shift+click / drag) ───────────────────────────────
 
     #[test]
     fn test_select_to_creates_selection() {
         let mut state = make_home_state("ws1");
         state.editor_content =
             EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
+        let move_to = EditorAction::MoveTo { line: 0, col: 0 };
+        let select_to = EditorAction::SelectTo { line: 0, col: 5 };
 
         // Move the cursor away from the anchor, then extend a selection.
-        state
-            .editor_content
-            .perform_action(EditorAction::MoveTo { line: 0, col: 0 });
-        let cursor_before = state.editor_content.cursor();
-        assert!(
-            cursor_before.selection.is_none(),
-            "MoveTo should clear selection"
-        );
+        state.editor_content.perform_action(move_to);
+        assert!(state.editor_content.cursor().selection.is_none(), "MoveTo");
 
         // Dispatch a SelectTo through the page update.
-        let _task = state.update(HomeMessage::InputChanged(EditorAction::SelectTo {
-            line: 0,
-            col: 5,
-        }));
-
-        let cursor_after = state.editor_content.cursor();
+        let _task = state.update(HomeMessage::InputChanged(select_to));
+        let selection = state.editor_content.cursor().selection.clone();
         assert!(
-            cursor_after.selection.is_some(),
-            "SelectTo should create a selection; got selection={:?}",
-            cursor_after.selection
+            selection.is_some(),
+            "SelectTo makes a selection; got {selection:?}"
         );
     }
 
-    // ------------------------------------------------------------------
-    // send_message
-    // ------------------------------------------------------------------
+    // ── send_message ─────────────────────────────────────────────────
 
     #[test]
-    fn test_send_message_empty_is_noop() {
-        let mut state = make_home_state("ws1");
-        // Empty content — should return Task::none() and not change state.
-        state.editor_content.clear();
-        let _task = state.send_message();
-        assert!(!state.sending);
-        assert!(state.editor_content.text().is_empty());
-
-        // Whitespace-only content should also be treated as empty.
-        state.editor_content = EditorBuffer::with_text("   ", Some(HighlightLanguage::Markdown));
-        let _task = state.send_message();
-        assert!(!state.sending);
+    fn send_message_sends_only_non_blank_text_and_returns_an_untaken_send() {
+        // (case, composer text)
+        let cases = [
+            ("empty content", ""),
+            ("whitespace-only content", "   "),
+            (
+                "within limit, nothing takes the send, so it comes back",
+                "hello world",
+            ),
+        ];
+        for (name, text) in cases {
+            let mut state = make_home_state("ws1");
+            let draft = EditorBuffer::with_text(text, Some(HighlightLanguage::Markdown));
+            state.editor_content = draft;
+            let _task = state.send_message();
+            assert!(!state.sending, "case {name}: not left sending");
+            assert_eq!(state.editor_content.text(), text, "case {name}: returned");
+            let optimistic = state.messages.iter().any(|m| m.is_optimistic);
+            assert!(!optimistic, "case {name}: no optimistic bubble");
+        }
     }
 
-    #[test]
-    fn test_send_message_within_limit_keeps_the_text_when_nothing_takes_it() {
-        let mut state = make_home_state("ws1");
-        state.editor_content =
-            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
-        let _task = state.send_message();
-        // Accepted: no length rejection, and the composer was cleared at send
-        // time. With no pipeline in a test the enqueue is refused, so the send
-        // comes back whole — text, and no optimistic bubble left behind.
-        assert_eq!(
-            state.editor_content.text(),
-            "hello world",
-            "an unsent message returns to the composer"
-        );
-        assert!(!state.sending);
-        assert!(
-            !state.messages.iter().any(|m| m.is_optimistic),
-            "a send that never reached the pipeline leaves no optimistic bubble"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Voice recording outcomes
-    // ------------------------------------------------------------------
+    // ── Voice recording outcomes ─────────────────────────────────────
 
     /// Put the composer where a mic press leaves it: a recording owns the field,
     /// which holds `text`. The returned receiver stands in for the pipeline that
@@ -3552,6 +3445,20 @@ mod tests {
         state.editor_content = EditorBuffer::with_text(text, Some(HighlightLanguage::Markdown));
         state.voice_message = Some(VoiceMessage::Recording);
         crate::audio::voice::install_test_command_receiver()
+    }
+
+    /// The page after a press on a recording's field, and the pipeline's end.
+    #[cfg(target_os = "macos")]
+    fn pressed(
+        text: &str,
+    ) -> (
+        HomeState,
+        tokio::sync::mpsc::UnboundedReceiver<crate::audio::voice::VoiceCommand>,
+    ) {
+        let mut state = make_home_state("ws1");
+        let pipeline = a_recording_owns_the_field(&mut state, text);
+        let _press = state.send_message();
+        (state, pipeline)
     }
 
     /// The text the recording's message holds, when the field was committed to it.
@@ -3571,18 +3478,14 @@ mod tests {
         let _pipeline = crate::audio::voice::install_test_command_receiver();
         state.editor_content = EditorBuffer::with_text("hello", Some(HighlightLanguage::Markdown));
 
-        // The pipeline started the recording by voice: no press of ours did.
+        // No press of ours started it: the pipeline did.
         let _started = state.voice_recording(RecordingEvent::Started);
-
-        assert!(
-            matches!(state.voice_message, Some(VoiceMessage::Recording)),
-            "the field belongs to the recording"
-        );
+        let owns = matches!(state.voice_message, Some(VoiceMessage::Recording));
+        assert!(owns, "the field belongs to the recording");
         assert!(!state.editor_content.text().is_empty(), "the field is kept");
 
         // A press belongs to that recording's message, and the field joins it.
         let _press = state.send_message();
-
         assert!(state.editor_content.text().is_empty(), "the field is taken");
         assert_eq!(committed_text(&state), Some("hello"));
         assert!(state.in_flight(), "the message is on its way");
@@ -3592,11 +3495,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_press_commits_the_field_to_the_recording_message() {
-        let mut state = make_home_state("ws1");
-        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
-
-        let _task = state.send_message();
-
+        let (state, _pipeline) = pressed("hello");
         assert!(state.editor_content.text().is_empty(), "the field is taken");
         assert_eq!(committed_text(&state), Some("hello"));
         assert!(state.in_flight(), "the message is on its way");
@@ -3606,14 +3505,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_press_after_the_commit_does_nothing() {
-        let mut state = make_home_state("ws1");
-        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
-        let _first = state.send_message();
-
+        let (mut state, _pipeline) = pressed("hello");
         state.editor_content =
             EditorBuffer::with_text("typed since", Some(HighlightLanguage::Markdown));
         let _second = state.send_message();
-
         assert_eq!(
             committed_text(&state),
             Some("hello"),
@@ -3622,7 +3517,7 @@ mod tests {
         assert_eq!(
             state.editor_content.text(),
             "typed since",
-            "the field keeps what was typed since"
+            "the field keeps it"
         );
     }
 
@@ -3630,16 +3525,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_transcript_completes_the_committed_message() {
-        let mut state = make_home_state("ws1");
-        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
-        let _press = state.send_message();
-
+        let (mut state, _pipeline) = pressed("hello");
         let _task = state.voice_recording(RecordingEvent::Transcript("🔊✍️ spoken".to_string()));
-
         assert!(state.voice_message.is_none(), "the message is resolved");
-        // No pipeline takes a send in a test, so the composed message — the
-        // transcript leading the field's content — comes back, and the voice part
-        // it carried is reported lost.
+        // No pipeline takes the send, so the composed message comes back.
         assert_eq!(state.editor_content.text(), "hello");
         assert!(state.voice_error_at.is_some());
     }
@@ -3648,22 +3537,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_silent_recording_sends_only_what_the_field_held() {
-        let mut state = make_home_state("ws1");
-        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
-        let _press = state.send_message();
-
+        let (mut state, _pipeline) = pressed("hello");
         let _stopped = state.voice_recording(RecordingEvent::Stopped);
         let _task = state.voice_recording(RecordingEvent::NoSpeech);
-
         assert!(state.voice_message.is_none());
-        assert_eq!(
-            state.editor_content.text(),
-            "hello",
-            "the field's own content was the message"
-        );
+        assert_eq!(state.editor_content.text(), "hello", "the field's own text");
         assert!(
             state.voice_notice_at.is_none(),
-            "content went out: no discard notice"
+            "content went out: no notice"
         );
     }
 
@@ -3673,10 +3554,8 @@ mod tests {
     fn a_silent_recording_of_an_empty_field_reports_the_discard() {
         let mut state = make_home_state("ws1");
         let _pipeline = a_recording_owns_the_field(&mut state, "");
-
         let _stopped = state.voice_recording(RecordingEvent::Stopped);
         let _task = state.voice_recording(RecordingEvent::NoSpeech);
-
         assert!(state.voice_message.is_none());
         assert!(state.voice_notice_at.is_some(), "the discard is reported");
     }
@@ -3685,14 +3564,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_lost_recording_gives_the_field_back() {
-        let mut state = make_home_state("ws1");
-        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
-        let _press = state.send_message();
-
+        let (mut state, _pipeline) = pressed("hello");
         let _task = state.voice_recording(RecordingEvent::Failed(
             crate::audio::voice::VOICE_UNSENT_NOTICE,
         ));
-
         assert!(state.voice_message.is_none());
         assert_eq!(state.editor_content.text(), "hello", "the field comes back");
         assert!(!state.sending);
@@ -3705,15 +3580,9 @@ mod tests {
     fn a_recording_that_never_started_closes_its_message() {
         let mut state = make_home_state("ws1");
         let _pipeline = a_recording_owns_the_field(&mut state, "hello");
-
         let _task = state.voice_recording(RecordingEvent::NotStarted);
-
         assert!(state.voice_message.is_none());
-        assert_eq!(
-            state.editor_content.text(),
-            "hello",
-            "the field is untouched"
-        );
+        assert_eq!(state.editor_content.text(), "hello", "the field is kept");
         assert_eq!((state.voice_notice_at, state.voice_error_at), (None, None));
     }
 
@@ -3721,16 +3590,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_press_whose_recording_never_began_sends_the_field_it_committed() {
-        let mut state = make_home_state("ws1");
-        let _pipeline = a_recording_owns_the_field(&mut state, "hello");
-        let _press = state.send_message();
+        let (mut state, _pipeline) = pressed("hello");
         assert!(state.editor_content.text().is_empty(), "the press took it");
 
         // The pipeline never started the recording, so no transcript can join
         // the committed message: the field's own content goes out as any typed
         // message does — and comes back whole, since no pipeline takes the send.
         let _task = state.voice_recording(RecordingEvent::NotStarted);
-
         assert!(state.voice_message.is_none(), "the window is resolved");
         assert_eq!(state.editor_content.text(), "hello");
     }
@@ -3739,26 +3605,16 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_recording_never_shares_a_committed_message() {
-        let mut state = make_home_state("ws1");
-        let mut pipeline = a_recording_owns_the_field(&mut state, "hello");
-        let _press = state.send_message();
+        let (mut state, mut pipeline) = pressed("hello");
         while pipeline.try_recv().is_ok() {}
 
-        // A wake-word recording fires while the earlier message still waits for
-        // its own transcript: it is dropped rather than poured into that message.
+        // A wake-word recording is dropped, not poured into that message.
         let _started = state.voice_recording(RecordingEvent::Started);
-
-        assert_eq!(
-            committed_text(&state),
-            Some("hello"),
-            "the earlier message keeps its window"
+        assert_eq!(committed_text(&state), Some("hello"), "the window is kept");
+        let dropped = matches!(
+            pipeline.try_recv(),
+            Ok(crate::audio::voice::VoiceCommand::StopRecordingDiscard)
         );
-        assert!(
-            matches!(
-                pipeline.try_recv(),
-                Ok(crate::audio::voice::VoiceCommand::StopRecordingDiscard)
-            ),
-            "the second recording is dropped"
-        );
+        assert!(dropped, "the second recording is dropped");
     }
 }

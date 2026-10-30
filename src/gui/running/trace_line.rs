@@ -325,6 +325,12 @@ fn cut_at_word(text: &str) -> String {
 mod tests {
     use super::*;
 
+    const DRIFT: &str = "The parser struct is missing the offset field.";
+    const FIELD: &str = "The parser needs the field.";
+    const EDITING: &str = "Now editing the parser";
+    const SPLIT_HEAD: &str = "I edited src/gui/running/mod.rs and left e.g. the parser.";
+    const TAIL: &str = "Then I ran 0.5 of the tests.";
+
     fn line(narration: &str, reasoning: Option<&str>) -> String {
         line_for_step(narration, reasoning)
             .expect("the step carries text")
@@ -332,202 +338,190 @@ mod tests {
     }
 
     #[test]
-    fn heading_fragment_is_shown_as_is() {
-        // No sentence-ending punctuation, short enough to fit: shown whole,
-        // with the code-span backticks stripped as debris.
-        assert_eq!(line("Now the `Mem` struct:", None), "Now the Mem struct:");
-    }
-
-    #[test]
-    fn bare_acknowledgement_is_skipped() {
-        assert_eq!(
-            line(
+    fn lines_pack_whole_sentences_within_the_budget() {
+        // (case, narration, reasoning, the line it yields)
+        let cases: &[(&str, &str, Option<&str>, &str)] = &[
+            (
+                "heading",
+                "Now the `Mem` struct:",
+                None,
+                "Now the Mem struct:",
+            ),
+            (
+                "bare acknowledgement skipped",
                 "",
-                Some("Good. The parser struct is missing the offset field, so the columns drift.")
+                Some("Good. The parser struct is missing the offset field, so the columns drift."),
+                "The parser struct is missing the offset field, so the columns drift.",
             ),
-            "The parser struct is missing the offset field, so the columns drift.",
-        );
-    }
-
-    #[test]
-    fn whole_sentences_are_packed_up_to_the_budget() {
-        // The fourth sentence does not fit: the line stops at the third, so it
-        // still ends at a sentence boundary instead of a mid-phrase cut.
-        let packed = line(
-            "",
-            Some(
-                "The parser drifts on every column of the offset table. \
-                 I will add the missing offset field to the struct definition. \
-                 Then the whole test suite runs again to prove the columns line up. \
-                 Finally the installer is rebuilt and shipped.",
+            (
+                "whole sentences packed",
+                "",
+                Some(
+                    "The parser drifts on every column of the offset table. I will add the missing \
+                     offset field to the struct definition. Then the whole test suite runs again to \
+                     prove the columns line up. Finally the installer is rebuilt and shipped.",
+                ),
+                "The parser drifts on every column of the offset table. I will add the missing \
+                 offset field to the struct definition. Then the whole test suite runs again to prove \
+                 the columns line up.",
             ),
-        );
-        assert_eq!(
-            packed,
-            "The parser drifts on every column of the offset table. \
-             I will add the missing offset field to the struct definition. \
-             Then the whole test suite runs again to prove the columns line up."
-        );
-    }
+            (
+                "file name ends a sentence",
+                "",
+                Some("All good. See src/gui/running/label.rs."),
+                "See src/gui/running/label.rs.",
+            ),
+        ];
+        for &(name, narration, reasoning, expected) in cases {
+            assert_eq!(line(narration, reasoning), expected, "case {name}");
+        }
 
-    #[test]
-    fn the_budget_is_a_hard_ceiling() {
         // Exactly the budget passes through; one char over costs the ellipsis.
-        assert_eq!(
-            line("", Some(&"a".repeat(MAX_LINE_CHARS))),
-            "a".repeat(MAX_LINE_CHARS)
-        );
-        let over = line("", Some(&"a".repeat(MAX_LINE_CHARS + 1)));
-        assert_eq!(over, format!("{}…", "a".repeat(MAX_LINE_CHARS - 1)));
-        // A long sentence is cut at its last whitespace, so no word is broken
-        // in half and the kept prefix is verbatim.
-        let text = "I'll restructure the installer so the archive is unpacked once and the binaries are proven before the swap, which keeps a failed attempt from leaving a half-installed copy behind, and the previous install stays intact until the new one is proven to run.";
+        let exact = "a".repeat(MAX_LINE_CHARS);
+        assert_eq!(line("", Some(&exact)), exact, "case exactly the budget");
+        let over = "a".repeat(MAX_LINE_CHARS + 1);
+        let clipped = format!("{}…", "a".repeat(MAX_LINE_CHARS - 1));
+        assert_eq!(line("", Some(&over)), clipped, "case one over");
+        // A long sentence is cut at its last whitespace: no word is broken, and the
+        // prefix is verbatim.
+        let text = "I'll restructure the installer so the archive is unpacked once and the binaries \
+            are proven before the swap, which keeps a failed attempt from leaving a half-installed copy \
+            behind, and the previous install stays intact until the new one is proven to run.";
         let cut = line("", Some(text));
         assert!(cut.ends_with('…'));
         assert!(cut.chars().count() <= MAX_LINE_CHARS, "the ellipsis counts");
         let kept = cut.trim_end_matches('…');
-        assert!(text.starts_with(kept), "the kept prefix is verbatim");
-        assert!(
-            text[kept.len()..].starts_with(' '),
-            "the cut lands on a word boundary"
-        );
+        assert!(text.starts_with(kept), "kept prefix verbatim");
+        assert!(text[kept.len()..].starts_with(' '), "cut on a space");
     }
 
     #[test]
-    fn identifiers_and_expressions_keep_their_markers() {
-        assert_eq!(
-            plain_text("Use `snake_case_name` and a * b, not **bold** or _slanted_"),
-            "Use snake_case_name and a * b, not bold or slanted"
-        );
-        // A dunder name is an identifier, not a strong emphasis pair — including
-        // one that opens a block, where a block boundary is pending.
-        assert_eq!(
-            plain_text("Edit __init__.py and `__pycache__` now"),
-            "Edit __init__.py and __pycache__ now"
-        );
-        assert_eq!(
-            plain_text("# __init__\n\n__pycache__ loads it. Then done."),
-            "__init__ __pycache__ loads it. Then done."
-        );
-    }
-
-    #[test]
-    fn literal_bullet_glyphs_are_debris() {
-        assert_eq!(
-            plain_text("• read the table\n• patch the struct\n\nThen done."),
-            "read the table patch the struct Then done."
-        );
-    }
-
-    #[test]
-    fn strong_emphasis_with_spaces_is_still_stripped() {
-        assert_eq!(plain_text("__a bold phrase__ here"), "a bold phrase here");
-    }
-
-    #[test]
-    fn code_blocks_are_source_not_a_status_line() {
-        assert_eq!(
-            plain_text("```rust\nlet field_1 = value_1 + offset;\n```\nThe parser drifts."),
-            "The parser drifts."
-        );
-        assert_eq!(
-            plain_text("    let field = 1;\n\nThe parser drifts."),
-            "The parser drifts."
-        );
-    }
-
-    #[test]
-    fn inline_boundaries_do_not_split_words() {
-        assert_eq!(
-            plain_text("the **parser**'s state and **fast**—always a *b*"),
-            "the parser's state and fast—always a b"
-        );
-    }
-
-    #[test]
-    fn a_file_name_closing_the_block_ends_its_sentence() {
-        // Without the end-of-text rule the second sentence reads as one
-        // unterminated fragment, and only the acknowledgement "All good."
-        // would be left to show.
-        assert_eq!(
-            line("", Some("All good. See src/gui/running/label.rs.")),
-            "See src/gui/running/label.rs."
-        );
-    }
-
-    #[test]
-    fn a_narration_that_strips_to_nothing_falls_through_to_reasoning() {
-        let reasoning = "The parser struct is missing the offset field.";
-        let line = line_for_step("---", Some(reasoning)).expect("the step carries text");
-        assert_eq!(line.text, reasoning);
-        assert_eq!(line.hover, Some(reasoning));
-        // A step with no text at all holds whatever the card already shows.
-        assert!(line_for_step("", None).is_none());
-        assert!(line_for_step("  \n\t", Some("   ")).is_none());
-    }
-
-    #[test]
-    fn heading_list_and_bullet_debris_is_stripped() {
-        assert_eq!(
-            plain_text("## Next\n\n- **first** item\n- second item\n\n1. third"),
-            "Next first item second item third"
-        );
-        // Invisible format characters providers leak never reach the line.
-        assert_eq!(
-            plain_text("The parser drifts.\u{feff} \u{200b}Then the tests."),
-            "The parser drifts. Then the tests."
-        );
-    }
-
-    #[test]
-    fn abbreviations_file_names_and_decimals_do_not_split() {
-        let (sentences, fragment) = split_sentences(
-            "I edited src/gui/running/mod.rs and left e.g. the parser. Then I ran 0.5 of the tests.",
-        );
-        assert_eq!(
-            sentences,
-            vec![
-                "I edited src/gui/running/mod.rs and left e.g. the parser.",
-                "Then I ran 0.5 of the tests."
-            ]
-        );
-        assert_eq!(fragment, "");
-    }
-
-    #[test]
-    fn narration_wins_and_its_step_reasoning_is_the_hover_text() {
-        let line = line_for_step(
-            "Now editing the parser",
-            Some("The parser needs the field."),
-        )
-        .expect("the step carries text");
-        assert_eq!(line.text, "Now editing the parser");
-        assert_eq!(line.hover, Some("The parser needs the field."));
-    }
-
-    #[test]
-    fn the_hover_text_is_the_scanned_prefix_not_the_whole_block() {
-        let reasoning = "The parser struct is missing the offset field. ".repeat(1_000);
-        let line = line_for_step("", Some(&reasoning)).expect("the step carries text");
-        assert!(line.hover.is_some_and(|text| text.len() <= MAX_SCAN_CHARS));
-    }
-
-    #[test]
-    fn block_boundaries_become_single_spaces() {
-        // A heading, a paragraph and a bullet list are separate blocks: their
-        // words never run together, and no doubled space survives the join.
-        assert_eq!(
-            plain_text(
-                "# Fixing the parser\n\nThe struct is missing `offset`, so I'll add it.\n\n\
-                 - read the table\n- patch the struct\n\nDone."
+    fn markdown_markers_are_stripped_from_the_line() {
+        // (case, input, plain text)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "identifiers keep markers",
+                "Use `snake_case_name` and a * b, not **bold** or _slanted_",
+                "Use snake_case_name and a * b, not bold or slanted",
             ),
-            "Fixing the parser The struct is missing offset, so I'll add it. \
-             read the table patch the struct Done."
-        );
-        // A block that opens with punctuation keeps its own word.
-        assert_eq!(
-            plain_text("Done.\n\n.env.example lists them."),
-            "Done. .env.example lists them."
-        );
+            (
+                "dunder is an identifier",
+                "Edit __init__.py and `__pycache__` now",
+                "Edit __init__.py and __pycache__ now",
+            ),
+            (
+                "dunder opens a block",
+                "# __init__\n\n__pycache__ loads it. Then done.",
+                "__init__ __pycache__ loads it. Then done.",
+            ),
+            ("bold", "__a bold phrase__ here", "a bold phrase here"),
+            (
+                "boundaries keep words whole",
+                "the **parser**'s state and **fast**—always a *b*",
+                "the parser's state and fast—always a b",
+            ),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(plain_text(input), expected, "case {name}");
+        }
+    }
+
+    #[test]
+    fn block_debris_is_stripped_from_the_text() {
+        // (case, input, plain text)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "bullet glyphs are debris",
+                "• read the table\n• patch the struct\n\nThen done.",
+                "read the table patch the struct Then done.",
+            ),
+            (
+                "fenced code is source",
+                "```rust\nlet field_1 = value_1 + offset;\n```\nThe parser drifts.",
+                "The parser drifts.",
+            ),
+            (
+                "indented code is source",
+                "    let field = 1;\n\nThe parser drifts.",
+                "The parser drifts.",
+            ),
+            (
+                "heading and list debris",
+                "## Next\n\n- **first** item\n- second item\n\n1. third",
+                "Next first item second item third",
+            ),
+            (
+                "invisible format chars",
+                "The parser drifts.\u{feff} \u{200b}Then the tests.",
+                "The parser drifts. Then the tests.",
+            ),
+            (
+                "block boundaries are spaces",
+                "# Fixing the parser\n\nThe struct is missing `offset`, so I'll add it.\n\n\
+                 - read the table\n- patch the struct\n\nDone.",
+                "Fixing the parser The struct is missing offset, so I'll add it. \
+                 read the table patch the struct Done.",
+            ),
+            (
+                "punctuation keeps its word",
+                "Done.\n\n.env.example lists them.",
+                "Done. .env.example lists them.",
+            ),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(plain_text(input), expected, "case {name}");
+        }
+    }
+
+    type NarrationCase<'a> = (
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
+
+    #[test]
+    fn narration_leads_and_its_step_reasoning_is_the_hover_text() {
+        // (case, narration, reasoning, line text, hover)
+        let cases: &[NarrationCase] = &[
+            (
+                "narration leads",
+                EDITING,
+                Some(FIELD),
+                Some(EDITING),
+                Some(FIELD),
+            ),
+            (
+                "stripped narration falls through",
+                "---",
+                Some(DRIFT),
+                Some(DRIFT),
+                Some(DRIFT),
+            ),
+            ("no text at all", "", None, None, None),
+            ("whitespace only", "  \n\t", Some("   "), None, None),
+        ];
+        for &(name, narration, reasoning, text, hover) in cases {
+            let step = line_for_step(narration, reasoning);
+            let shown = step.as_ref().map(|l| l.text.as_str());
+            assert_eq!(shown, text, "case {name}: text");
+            assert_eq!(
+                step.as_ref().and_then(|l| l.hover),
+                hover,
+                "case {name}: hover"
+            );
+        }
+
+        // The hover is the scanned prefix, not the whole block.
+        let long = DRIFT.to_string().repeat(1_000);
+        let step = line_for_step("", Some(&long)).expect("the step carries text");
+        assert!(step.hover.is_some_and(|t| t.len() <= MAX_SCAN_CHARS));
+
+        // Abbreviations, file names and decimals do not split sentences.
+        let text = format!("{SPLIT_HEAD} {TAIL}");
+        let (sentences, fragment) = split_sentences(&text);
+        assert_eq!(sentences, [SPLIT_HEAD, TAIL]);
+        assert_eq!(fragment, "");
     }
 }

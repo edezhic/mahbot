@@ -1049,167 +1049,75 @@ mod tests {
     use crate::Role;
     use strum::IntoEnumIterator;
 
+    /// `role_badge_color` resolves labels exactly as `role_badge_color_for` resolves roles.
     #[test]
-    fn canonical_names_match() {
-        for role in Role::iter() {
-            let name = role.as_str();
-            assert_eq!(
-                role_badge_color_for(&role),
-                role_badge_color(name),
-                "role_badge_color_for and role_badge_color must agree for {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn derivative_other_role_names_get_correct_color() {
+    fn role_badge_color_cases() {
         for role in Role::iter() {
             let name = role.as_str();
             let expected = role_badge_color_for(&role);
-            assert_eq!(
-                role_badge_color(&format!("{name}_1")),
-                expected,
-                "derivative {name}_1 should match role_badge_color_for"
-            );
-            assert_eq!(
-                role_badge_color(&format!("{name}_42")),
-                expected,
-                "derivative {name}_42 should match role_badge_color_for"
-            );
+            assert_eq!(role_badge_color(name), expected, "case canonical {name}");
+            for suffix in ["_1", "_42", "_"] {
+                assert_eq!(
+                    role_badge_color(&format!("{name}{suffix}")),
+                    expected,
+                    "case derivative {name}{suffix}"
+                );
+            }
         }
-        // A bare trailing `_` strips too, matching the reply author label.
-        assert_eq!(
-            role_badge_color("analyst_"),
-            role_badge_color_for(&Role::Analyst)
-        );
+
+        let muted = (TEXT_MUTED, badge_bg(TEXT_MUTED));
+        let analyst = role_badge_color_for(&Role::Analyst);
+        let cases: &[(&str, &str, (Color, Color))] = &[
+            ("case-insensitive upper", "ANALYST", analyst),
+            ("case-insensitive title", "Analyst", analyst),
+            ("case-insensitive derivative", "ANALYST_1", analyst),
+            ("non-numeric suffix analyst_final", "analyst_final", muted),
+            ("non-numeric suffix worker_abc", "worker_abc", muted),
+            ("llm api role user", "user", muted),
+            ("llm api role system", "system", muted),
+            ("llm api role tool", "tool", muted),
+            ("empty", "", muted),
+            ("garbage", "garbage", muted),
+            ("unknown role", "unknown_role", muted),
+            ("bare suffix only", "_1", muted),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(role_badge_color(input), expected, "case {name}: {input:?}");
+        }
     }
 
-    #[test]
-    fn non_numeric_suffix_is_unknown() {
-        assert_eq!(
-            role_badge_color("analyst_final"),
-            (TEXT_MUTED, badge_bg(TEXT_MUTED))
-        );
-        assert_eq!(
-            role_badge_color("worker_abc"),
-            (TEXT_MUTED, badge_bg(TEXT_MUTED))
-        );
-    }
-
+    /// Compact counts stay raw below 1k and carry one decimal at every k/M/G edge.
     #[test]
     fn compact_token_format_edges() {
         // Raw below 1,000; one decimal in the k-range; one decimal at/above
         // 1M (sessions routinely exceed 200K with context windows up to 1M).
         // Values rounding up past a unit boundary render in the next unit.
-        assert_eq!(format_compact_tokens(0), "0");
-        assert_eq!(format_compact_tokens(500), "500");
-        assert_eq!(format_compact_tokens(999), "999");
-        assert_eq!(format_compact_tokens(1_000), "1.0k");
-        assert_eq!(format_compact_tokens(12_300), "12.3k");
-        assert_eq!(format_compact_tokens(200_000), "200.0k");
-        assert_eq!(format_compact_tokens(999_949), "999.9k");
-        assert_eq!(format_compact_tokens(999_999), "1.0M");
-        assert_eq!(format_compact_tokens(1_000_000), "1.0M");
-        assert_eq!(format_compact_tokens(1_234_567), "1.2M");
-        assert_eq!(format_compact_tokens(999_949_999), "999.9M");
-        assert_eq!(format_compact_tokens(999_950_000), "1.0G");
-        assert_eq!(format_compact_tokens(1_000_000_000), "1.0G");
-    }
-
-    #[test]
-    fn joint_comment_stage_roles_get_their_role_colors() {
-        // The joint-verdict pipeline writes comments with the STAGE NAME as the
-        // comment role ("Analysis"/"Verification"/"Review"/"QA") — they must
-        // render with the corresponding role color, not the muted-grey fallback.
-        assert_eq!(
-            role_badge_color("Analysis"),
-            role_badge_color_for(&crate::Role::Analyst)
-        );
-        assert_eq!(
-            role_badge_color("Verification"),
-            role_badge_color_for(&crate::Role::Qa)
-        );
-        assert_eq!(
-            role_badge_color("Review"),
-            role_badge_color_for(&crate::Role::Reviewer)
-        );
-        assert_eq!(
-            role_badge_color("QA"),
-            role_badge_color_for(&crate::Role::Qa)
-        );
-    }
-
-    #[test]
-    fn llm_api_roles_are_unknown() {
-        assert_eq!(role_badge_color("user"), (TEXT_MUTED, badge_bg(TEXT_MUTED)));
-        assert_eq!(
-            role_badge_color("system"),
-            (TEXT_MUTED, badge_bg(TEXT_MUTED))
-        );
-        assert_eq!(role_badge_color("tool"), (TEXT_MUTED, badge_bg(TEXT_MUTED)));
-    }
-
-    #[test]
-    fn empty_and_garbage_are_unknown() {
-        assert_eq!(role_badge_color(""), (TEXT_MUTED, badge_bg(TEXT_MUTED)));
-        assert_eq!(
-            role_badge_color("garbage"),
-            (TEXT_MUTED, badge_bg(TEXT_MUTED))
-        );
-        assert_eq!(
-            role_badge_color("unknown_role"),
-            (TEXT_MUTED, badge_bg(TEXT_MUTED))
-        );
-        assert_eq!(role_badge_color("_1"), (TEXT_MUTED, badge_bg(TEXT_MUTED)));
-    }
-
-    #[test]
-    fn case_insensitive_parse() {
-        let analyst_color = role_badge_color_for(&crate::Role::Analyst);
-        assert_eq!(role_badge_color("ANALYST"), analyst_color);
-        assert_eq!(role_badge_color("Analyst"), analyst_color);
-        assert_eq!(role_badge_color("ANALYST_1"), analyst_color);
-    }
-
-    /// The badge tuple's background member must always be the foreground at
-    /// 0.1 alpha ([`badge_bg`]). The role pill (`pill_style(colors.1)`) and the
-    /// logs span consume the second member directly, so any divergence — e.g.
-    /// an independent constant like the old `(TEXT_MUTED, HOVER)` fallback —
-    /// would silently change the rendered fallback background.
-    #[test]
-    fn badge_background_is_alpha_scaled_foreground() {
-        for role in Role::iter() {
-            let (fg, bg) = role_badge_color_for(&role);
-            assert_eq!(bg, badge_bg(fg), "canonical role {role:?}");
-        }
-        // Unknown/fallback strings, LLM API roles, and stage-name comment roles
-        // all flow through the same tuple invariant.
-        for name in [
-            "analyst_final",
-            "worker_abc",
-            "user",
-            "assistant",
-            "system",
-            "tool",
-            "Analysis",
-            "Verification",
-            "Review",
-            "QA",
-            "analyst_3",
-            "",
-            "garbage",
-            "unknown_role",
-            "_1",
-        ] {
-            let (fg, bg) = role_badge_color(name);
-            assert_eq!(bg, badge_bg(fg), "fallback/stage/derivative role {name:?}");
+        // (case label, token count, expected label)
+        let cases: &[(&str, u64, &str)] = &[
+            ("zero", 0, "0"),
+            ("hundreds", 500, "500"),
+            ("last raw value", 999, "999"),
+            ("first k", 1_000, "1.0k"),
+            ("k with one decimal", 12_300, "12.3k"),
+            ("two hundred k", 200_000, "200.0k"),
+            ("last k below the rounding edge", 999_949, "999.9k"),
+            ("rounds up to M", 999_999, "1.0M"),
+            ("first M", 1_000_000, "1.0M"),
+            ("M with one decimal", 1_234_567, "1.2M"),
+            ("last M below the rounding edge", 999_949_999, "999.9M"),
+            ("rounds up to G", 999_950_000, "1.0G"),
+            ("first G", 1_000_000_000, "1.0G"),
+        ];
+        for &(name, tokens, expected) in cases {
+            assert_eq!(
+                format_compact_tokens(tokens),
+                expected,
+                "case {name}: {tokens} tokens"
+            );
         }
     }
 
-    /// Locks the pre-consolidation values of the container factories, the
-    /// button_text/button_text_danger pair, the pick_list field/menu styles,
-    /// and the toggler style so parameterization cannot silently change any
-    /// rendered style.
+    /// Locks every pre-consolidation style value so parameterization cannot silently change rendering.
     #[expect(clippy::too_many_lines)] // exhaustive style-lock fixture
     #[test]
     fn style_factory_values_unchanged() {
@@ -1391,77 +1299,88 @@ mod tests {
     }
 
     #[test]
-    fn relative_time_today_yesterday_days_ago() {
-        use chrono::TimeZone;
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 8, 28, 12, 0, 0)
-            .single()
-            .unwrap();
-        let off = *now.offset();
+    fn joint_comment_stage_roles_get_their_role_colors() {
+        // The joint-verdict pipeline writes comments with the STAGE NAME as the
+        // comment role ("Analysis"/"Verification"/"Review"/"QA") — they must
+        // render with the corresponding role color, not the muted-grey fallback.
         assert_eq!(
-            format_relative_time(&format!("2026-08-28T09:15:00{off}"), now),
-            "09:15"
+            role_badge_color("Analysis"),
+            role_badge_color_for(&crate::Role::Analyst)
         );
         assert_eq!(
-            format_relative_time(&format!("2026-08-27T09:15:00{off}"), now),
-            "yesterday"
+            role_badge_color("Verification"),
+            role_badge_color_for(&crate::Role::Qa)
         );
         assert_eq!(
-            format_relative_time(&format!("2026-08-25T09:15:00{off}"), now),
-            "3 days ago"
+            role_badge_color("Review"),
+            role_badge_color_for(&crate::Role::Reviewer)
         );
-    }
-
-    #[test]
-    fn relative_time_future_treated_as_today() {
-        use chrono::TimeZone;
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 8, 28, 12, 0, 0)
-            .single()
-            .unwrap();
-        let off = *now.offset();
         assert_eq!(
-            format_relative_time(&format!("2026-08-29T09:15:00{off}"), now),
-            "09:15"
+            role_badge_color("QA"),
+            role_badge_color_for(&crate::Role::Qa)
         );
     }
 
+    /// The badge tuple's background member must always be the foreground at 0.1 alpha ([`badge_bg`]).
     #[test]
-    fn relative_time_invalid_returns_empty() {
-        assert_eq!(
-            format_relative_time("not-a-timestamp", chrono::Local::now()),
-            ""
-        );
-    }
-
-    #[test]
-    fn comment_author_icons_resolve_exact_pipeline_labels_only() {
-        let (analysis_fg, _) = role_badge_color_for(&crate::Role::Analyst);
-        assert_eq!(
-            comment_author_icon("Analysis").map(|(_, color)| color),
-            Some(analysis_fg)
-        );
-
-        for author in [
+    fn badge_background_is_alpha_scaled_foreground() {
+        for role in Role::iter() {
+            let (fg, bg) = role_badge_color_for(&role);
+            assert_eq!(bg, badge_bg(fg), "canonical role {role:?}");
+        }
+        // Unknown/fallback strings, LLM API roles, and stage-name comment roles
+        // all flow through the same tuple invariant.
+        for name in [
+            "analyst_final",
+            "worker_abc",
+            "user",
+            "assistant",
+            "system",
+            "tool",
             "Analysis",
             "Verification",
             "Review",
             "QA",
-            "engineer",
-            "manager",
-            "sanitation",
-            "assistant",
-            "diagnostics",
+            "analyst_3",
+            "",
+            "garbage",
+            "unknown_role",
+            "_1",
         ] {
-            assert!(
-                comment_author_icon(author).is_some(),
-                "{author} should resolve to an icon"
-            );
+            let (fg, bg) = role_badge_color(name);
+            assert_eq!(bg, badge_bg(fg), "fallback/stage/derivative role {name:?}");
         }
-        for author in ["system", "user:admin", "analyst_1", "worker", ""] {
-            assert!(
-                comment_author_icon(author).is_none(),
-                "{author} must render as plain muted text"
+    }
+
+    #[test]
+    fn relative_time_formats_against_the_local_wall_clock() {
+        use chrono::TimeZone;
+
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 28, 12, 0, 0)
+            .single()
+            .unwrap();
+        let off = *now.offset();
+        // (name, stamp date, expected label); fixed dates, local offset taken
+        // from the fixed `now`, so no wall-clock or DST drift can enter.
+        let cases: &[(&str, &str, &str)] = &[
+            ("earlier today", "2026-08-28", "09:15"),
+            ("yesterday", "2026-08-27", "yesterday"),
+            ("three days ago", "2026-08-25", "3 days ago"),
+            // A future instant is still "today": only the clock is shown.
+            ("future today", "2026-08-29", "09:15"),
+            ("not a timestamp", "", ""),
+        ];
+        for &(name, date, expected) in cases {
+            let stamp = if date.is_empty() {
+                "not-a-timestamp".to_string()
+            } else {
+                format!("{date}T09:15:00{off}")
+            };
+            let actual = format_relative_time(&stamp, now);
+            assert_eq!(
+                actual, expected,
+                "case {name} ({stamp}): expected {expected:?}, got {actual:?}"
             );
         }
     }

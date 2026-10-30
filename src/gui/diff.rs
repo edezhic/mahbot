@@ -1684,6 +1684,10 @@ fn collect_dir_paths(nodes: &[widgets::TreeNode], paths: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::editor_widget::EditorAction;
+    use AutoExpand::{Again, Forget, Switch};
+    use Focus::{At, Clamp, Expand, Focused, Paste, Select, Toggle, ToggleDir, Visible};
+    use Nav::{Count, Enter, ExpandSrc, Expanded, Index, Left, Name, Right, TreeFocused};
 
     fn make_test_file(path: &str, add: usize, remove: usize) -> DiffFile {
         DiffFile {
@@ -1699,56 +1703,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_tree_single_file() {
-        let files = vec![make_test_file("src/main.rs", 3, 1)];
-        let tree = build_tree(&files);
-        assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].name, "src");
-        assert!(tree[0].is_dir);
-        assert_eq!(tree[0].children.len(), 1);
-        assert_eq!(tree[0].children[0].name, "main.rs");
-        assert!(!tree[0].children[0].is_dir);
+    fn render_tree(nodes: &[widgets::TreeNode]) -> String {
+        let mut lines = Vec::new();
+        let mut stack: Vec<(&widgets::TreeNode, usize)> =
+            nodes.iter().rev().map(|node| (node, 0)).collect();
+        while let Some((node, depth)) = stack.pop() {
+            let suffix = if node.is_dir { "/" } else { "" };
+            lines.push(format!("{}{}{suffix}", "  ".repeat(depth), node.name));
+            stack.extend(node.children.iter().rev().map(|child| (child, depth + 1)));
+        }
+        lines.join("\n")
     }
 
     #[test]
-    fn test_build_tree_multiple_files_same_dir() {
-        let files = vec![
-            make_test_file("src/lib.rs", 5, 2),
-            make_test_file("src/main.rs", 3, 1),
+    fn test_build_tree() {
+        // Directories sort before files, alphabetically, at every level.
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("single file", &["src/main.rs"], "src/\n  main.rs"),
+            (
+                "two files",
+                &["src/lib.rs", "src/main.rs"],
+                "src/\n  lib.rs\n  main.rs",
+            ),
+            ("root file", &["README.md"], "README.md"),
+            ("nested", &["src/gui/diff.rs"], "src/\n  gui/\n    diff.rs"),
         ];
-        let tree = build_tree(&files);
-        assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].name, "src");
-        assert!(tree[0].is_dir);
-        assert_eq!(tree[0].children.len(), 2);
-        // Dirs sorted before files, alphabetically
-        assert_eq!(tree[0].children[0].name, "lib.rs");
-        assert_eq!(tree[0].children[1].name, "main.rs");
-    }
 
-    #[test]
-    fn test_build_tree_root_file() {
-        let files = vec![make_test_file("README.md", 0, 0)];
-        let tree = build_tree(&files);
-        assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].name, "README.md");
-        assert!(!tree[0].is_dir);
-    }
-
-    #[test]
-    fn test_build_tree_nested() {
-        let files = vec![make_test_file("src/gui/diff.rs", 10, 5)];
-        let tree = build_tree(&files);
-        assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].name, "src");
-        assert!(tree[0].is_dir);
-        assert_eq!(tree[0].children.len(), 1);
-        assert_eq!(tree[0].children[0].name, "gui");
-        assert!(tree[0].children[0].is_dir);
-        assert_eq!(tree[0].children[0].children.len(), 1);
-        assert_eq!(tree[0].children[0].children[0].name, "diff.rs");
-        assert!(!tree[0].children[0].children[0].is_dir);
+        for &(name, paths, expected) in cases {
+            let files: Vec<DiffFile> = paths
+                .iter()
+                .map(|path| make_test_file(path, 0, 0))
+                .collect();
+            assert_eq!(
+                render_tree(&build_tree(&files)),
+                expected,
+                "case {name}: tree"
+            );
+        }
     }
 
     // ── Tree keyboard navigation focus state tests ──────────────────
@@ -1764,300 +1755,210 @@ mod tests {
         state
     }
 
-    #[test]
-    fn test_diff_rebuild_visible_tree() {
-        let mut state = make_diff_with_tree();
-        // Initially only root nodes visible (directories collapsed).
-        assert!(!state.file_tree.visible_tree_nodes.is_empty());
-        // Expand "src" and rebuild.
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        assert_eq!(
-            state.file_tree.visible_tree_nodes.len(),
-            3,
-            "expected 3 nodes: src, src/main.rs, src/lib.rs"
-        );
+    #[derive(Clone, Copy)]
+    enum Focus {
+        Toggle,
+        Select(&'static str),
+        ToggleDir(&'static str),
+        Expand,
+        Clamp,
+        Paste(&'static str),
+        Focused(bool),
+        Visible(usize),
+        At(&'static str),
     }
 
     #[test]
-    fn test_diff_tree_focus_toggled_sets_focus() {
-        let mut state = make_diff_with_tree();
-        assert!(!state.file_tree.tree_focused);
-        let _ = state.update(DiffMessage::TreeFocusToggled);
-        assert!(state.file_tree.tree_focused);
-        let _ = state.update(DiffMessage::TreeFocusToggled);
-        assert!(!state.file_tree.tree_focused);
+    fn test_diff_tree_focus_state() {
+        const MAIN: &str = "src/main.rs";
+        const TOGGLE: &[Focus] = &[Toggle, Focused(true), Toggle, Focused(false)];
+        const SELECT: &[Focus] = &[Expand, Toggle, Select(MAIN), Focused(true), At(MAIN)];
+        const DIR: &[Focus] = &[ToggleDir("src"), Focused(true), At("src")];
+        const PASTE: &[Focus] = &[Toggle, Focused(true), Paste("fix bug"), Focused(false)];
+        let cases: &[(&str, bool, &[Focus])] = &[
+            ("rebuild", false, &[Expand, Visible(3)]),
+            ("toggle", false, TOGGLE),
+            ("empty tree", true, &[Toggle, Focused(false)]),
+            ("select", false, &[Select(MAIN), Focused(true)]),
+            ("clamp", false, &[Expand, Clamp]),
+            ("toggle dir", false, DIR),
+            ("select index", false, SELECT),
+            ("paste", false, PASTE),
+        ];
+
+        for &(name, empty, steps) in cases {
+            let mut state = if empty {
+                DiffState::new()
+            } else {
+                make_diff_with_tree()
+            };
+            if !empty {
+                assert!(
+                    !state.file_tree.visible_tree_nodes.is_empty(),
+                    "{name}: roots"
+                );
+            }
+            for &step in steps {
+                match step {
+                    Focus::Toggle => {
+                        let _ = state.update(DiffMessage::TreeFocusToggled);
+                    }
+                    Focus::Select(path) => {
+                        let _ = state.update(DiffMessage::SelectFile(path.to_owned()));
+                    }
+                    Focus::ToggleDir(path) => {
+                        let _ = state.update(DiffMessage::ToggleDir(path.to_owned()));
+                    }
+                    Focus::Expand => {
+                        state.file_tree.expanded_dirs.insert("src".to_string());
+                        state.file_tree.nodes = build_tree(&state.diff_files);
+                        state.file_tree.rebuild_visible();
+                    }
+                    Focus::Clamp => {
+                        state.file_tree.tree_focus_index = 999;
+                        state.file_tree.rebuild_visible();
+                        let last = state.file_tree.visible_tree_nodes.len() - 1;
+                        let index = state.file_tree.tree_focus_index;
+                        assert_eq!(index, last, "case {name}: clamped");
+                    }
+                    Focus::Paste(text) => {
+                        let action = EditorAction::Paste(text.to_owned());
+                        let _ = state.update(DiffMessage::CommitMessageChanged(action));
+                    }
+                    Focus::Focused(flag) => {
+                        assert_eq!(state.file_tree.tree_focused, flag, "case {name}: focus");
+                    }
+                    Focus::Visible(count) => {
+                        let visible = state.file_tree.visible_tree_nodes.len();
+                        assert_eq!(visible, count, "case {name}: visible nodes");
+                    }
+                    Focus::At(node) => {
+                        let index = state.file_tree.tree_focus_index;
+                        let shown = &state.file_tree.visible_tree_nodes[index].0;
+                        assert_eq!(shown, node, "case {name}: focused node");
+                    }
+                }
+            }
+        }
     }
 
-    #[test]
-    fn test_diff_tree_focus_toggled_empty_tree_stays_off() {
-        let mut state = DiffState::new();
-        let _ = state.update(DiffMessage::TreeFocusToggled);
-        assert!(!state.file_tree.tree_focused);
+    #[derive(Clone, Copy)]
+    enum Nav {
+        ExpandSrc,
+        Left,
+        Right,
+        Enter,
+        Index(usize),
+        Name(&'static str),
+        Expanded(bool),
+        Count(usize),
+        TreeFocused(bool),
     }
 
-    #[test]
-    fn test_diff_select_file_sets_tree_focused_when_not_focused() {
-        // When tree_focused starts false, clicking a file should set it true.
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = false;
-        let _ = state.update(DiffMessage::SelectFile("src/main.rs".to_owned()));
-        assert!(
-            state.file_tree.tree_focused,
-            "SelectFile should set tree_focused to true",
-        );
+    /// Drive `state` through `steps`, asserting what each check finds.
+    fn run_nav(state: &mut DiffState, steps: &[Nav], name: &str) {
+        for &step in steps {
+            match step {
+                Nav::ExpandSrc => {
+                    state.file_tree.expanded_dirs.insert("src".to_string());
+                    state.file_tree.nodes = build_tree(&state.diff_files);
+                    state.file_tree.rebuild_visible();
+                }
+                Nav::Left => {
+                    let _ = state.update(DiffMessage::TreeNavLeft);
+                }
+                Nav::Right => {
+                    let _ = state.update(DiffMessage::TreeNavRight);
+                }
+                Nav::Enter => {
+                    let _ = state.update(DiffMessage::TreeNavEnter);
+                }
+                Nav::Index(index) => {
+                    let focused = state.file_tree.tree_focus_index;
+                    assert_eq!(focused, index, "case {name}: index");
+                }
+                Nav::Name(node) => {
+                    let at = state.file_tree.tree_focus_index;
+                    let shown = &state.file_tree.visible_tree_nodes[at].0;
+                    assert_eq!(shown, node, "case {name}: node");
+                }
+                Nav::Expanded(flag) => {
+                    let open = state.file_tree.expanded_dirs.contains("src");
+                    assert_eq!(open, flag, "case {name}: src expanded");
+                }
+                Nav::Count(count) => {
+                    let visible = state.file_tree.visible_tree_nodes.len();
+                    assert_eq!(visible, count, "case {name}: visible nodes");
+                }
+                Nav::TreeFocused(flag) => {
+                    assert_eq!(state.file_tree.tree_focused, flag, "case {name}: focus");
+                }
+            }
+        }
     }
-
-    #[test]
-    fn test_diff_visible_tree_clamps_focus() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focus_index = 999;
-        state.file_tree.rebuild_visible();
-        assert_eq!(
-            state.file_tree.tree_focus_index,
-            state.file_tree.visible_tree_nodes.len() - 1
-        );
-    }
-
-    // ── Tree arrow-key navigation tests ─────────────────────────────
 
     #[test]
     fn test_tree_nav_left_right() {
-        struct Case {
-            name: &'static str,
-            start_idx: usize,
-            /// Pre-expand "src" before the message
-            pre_expand_src: bool,
-            msg: DiffMessage,
-            expected_idx: usize,
-            /// Additional per-case assertions
-            check: Option<fn(&DiffState, name: &str)>,
-        }
-        let cases: &[Case] = &[
-            Case {
-                name: "left_on_expanded_dir_collapses",
-                start_idx: 0,
-                pre_expand_src: true,
-                msg: DiffMessage::TreeNavLeft,
-                expected_idx: 0,
-                check: Some(|s, name| {
-                    assert!(!s.file_tree.expanded_dirs.contains("src"), "case: {name}");
-                }),
-            },
-            Case {
-                name: "left_on_file_navigates_to_parent",
-                start_idx: 1,
-                pre_expand_src: true,
-                msg: DiffMessage::TreeNavLeft,
-                expected_idx: 0,
-                check: Some(|s, name| {
-                    assert_eq!(s.file_tree.visible_tree_nodes[0].0, "src", "case: {name}");
-                }),
-            },
-            Case {
-                name: "left_on_root_item_noop",
-                start_idx: 0,
-                pre_expand_src: false,
-                msg: DiffMessage::TreeNavLeft,
-                expected_idx: 0,
-                check: None,
-            },
-            Case {
-                name: "right_on_collapsed_dir_expands_and_advances",
-                start_idx: 0,
-                pre_expand_src: false,
-                msg: DiffMessage::TreeNavRight,
-                expected_idx: 1,
-                check: Some(|s, name| {
-                    assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
-                    assert_eq!(
-                        s.file_tree.visible_tree_nodes[1].0, "src/lib.rs",
-                        "case: {name}",
-                    );
-                }),
-            },
-            Case {
-                name: "right_on_expanded_dir_moves_to_first_child",
-                start_idx: 0,
-                pre_expand_src: true,
-                msg: DiffMessage::TreeNavRight,
-                expected_idx: 1,
-                check: Some(|s, name| {
-                    assert_eq!(
-                        s.file_tree.visible_tree_nodes[1].0, "src/lib.rs",
-                        "case: {name}",
-                    );
-                }),
-            },
-            Case {
-                name: "right_on_file_noop",
-                start_idx: 1,
-                pre_expand_src: true,
-                msg: DiffMessage::TreeNavRight,
-                expected_idx: 1,
-                check: None,
-            },
+        const LEFT_DIR: &[Nav] = &[ExpandSrc, Left, Index(0), Expanded(false)];
+        const LEFT_FILE: &[Nav] = &[ExpandSrc, Left, Index(0), Name("src")];
+        const RIGHT_DIR: &[Nav] = &[Right, Index(1), Expanded(true), Name("src/lib.rs")];
+        const RIGHT_OPEN: &[Nav] = &[ExpandSrc, Right, Index(1), Name("src/lib.rs")];
+        let cases: &[(&str, usize, &[Nav])] = &[
+            ("left collapses an expanded dir", 0, LEFT_DIR),
+            ("left goes to the parent", 1, LEFT_FILE),
+            ("left at the root is a noop", 0, &[Left, Index(0)]),
+            ("right expands a collapsed dir", 0, RIGHT_DIR),
+            ("right to the first child", 0, RIGHT_OPEN),
+            (
+                "right on a file is a noop",
+                1,
+                &[ExpandSrc, Right, Index(1)],
+            ),
         ];
-        for case in cases {
+
+        for &(name, start, steps) in cases {
             let mut state = make_diff_with_tree();
-            if case.pre_expand_src {
-                state.file_tree.expanded_dirs.insert("src".to_string());
-                state.file_tree.nodes = build_tree(&state.diff_files);
-                state.file_tree.rebuild_visible();
-            }
             state.file_tree.tree_focused = true;
-            state.file_tree.tree_focus_index = case.start_idx;
-            let _ = state.update(case.msg.clone());
-            assert_eq!(
-                state.file_tree.tree_focus_index, case.expected_idx,
-                "case: {}",
-                case.name
-            );
-            if let Some(check) = case.check {
-                check(&state, case.name);
-            }
+            state.file_tree.tree_focus_index = start;
+            run_nav(&mut state, steps, name);
         }
     }
-
-    // ── TreeNavEnter tests ──────────────────────────────────────────
 
     #[test]
     fn test_tree_nav_enter() {
-        struct Case {
-            name: &'static str,
-            focused: bool,
-            start_idx: usize,
-            /// Use DiffState::new() instead of make_diff_with_tree()
-            empty_tree: bool,
-            /// Pre-expand "src" before the message
-            pre_expand_src: bool,
-            expected_idx: usize,
-            /// Additional per-case assertions
-            check: Option<fn(&DiffState, name: &str)>,
-        }
-        let cases: &[Case] = &[
-            Case {
-                name: "on_collapsed_dir_expands_and_advances",
-                focused: true,
-                start_idx: 0,
-                empty_tree: false,
-                pre_expand_src: false,
-                expected_idx: 1,
-                check: Some(|s, name| {
-                    assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
-                    assert_eq!(
-                        s.file_tree.visible_tree_nodes[s.file_tree.tree_focus_index].0,
-                        "src/lib.rs",
-                        "case: {name}",
-                    );
-                }),
-            },
-            Case {
-                name: "on_expanded_dir_collapses_and_keeps_focus",
-                focused: true,
-                start_idx: 0,
-                empty_tree: false,
-                pre_expand_src: true,
-                expected_idx: 0,
-                check: Some(|s, name| {
-                    assert!(!s.file_tree.expanded_dirs.contains("src"), "case: {name}");
-                    assert_eq!(s.file_tree.visible_tree_nodes[0].0, "src", "case: {name}");
-                }),
-            },
-            Case {
-                name: "on_file_does_not_expand_or_collapse",
-                focused: true,
-                start_idx: 1,
-                empty_tree: false,
-                pre_expand_src: true,
-                expected_idx: 1,
-                check: Some(|s, name| {
-                    assert_eq!(s.file_tree.expanded_dirs.len(), 1, "case: {name}");
-                    assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
-                    assert!(s.file_tree.tree_focused, "case: {name}");
-                }),
-            },
-            Case {
-                name: "not_focused_noop",
-                focused: false,
-                start_idx: 0,
-                empty_tree: false,
-                pre_expand_src: false,
-                expected_idx: 0,
-                check: Some(|s, name| {
-                    assert!(!s.file_tree.tree_focused, "case: {name}");
-                }),
-            },
-            Case {
-                name: "empty_tree_noop",
-                focused: true,
-                start_idx: 0,
-                empty_tree: true,
-                pre_expand_src: false,
-                expected_idx: 0,
-                check: Some(|s, name| {
-                    assert!(s.file_tree.visible_tree_nodes.is_empty(), "case: {name}");
-                    assert!(s.file_tree.tree_focused, "case: {name}");
-                }),
-            },
+        const OPEN_DIR: &[Nav] = &[Enter, Index(1), Expanded(true), Name("src/lib.rs")];
+        const CLOSE_DIR: &[Nav] = &[ExpandSrc, Enter, Index(0), Expanded(false)];
+        const FILE: &[Nav] = &[
+            ExpandSrc,
+            Enter,
+            Index(1),
+            Expanded(true),
+            TreeFocused(true),
         ];
-        for case in cases {
-            let mut state = if case.empty_tree {
+        let cases: &[(&str, bool, usize, bool, &[Nav])] = &[
+            ("on a collapsed dir", true, 0, false, OPEN_DIR),
+            ("on an expanded dir", true, 0, false, CLOSE_DIR),
+            ("on a file", true, 1, false, FILE),
+            (
+                "not focused",
+                false,
+                0,
+                false,
+                &[Enter, Index(0), TreeFocused(false)],
+            ),
+            ("an empty tree", true, 0, true, &[Enter, Index(0), Count(0)]),
+        ];
+
+        for &(name, focused, start, empty, steps) in cases {
+            let mut state = if empty {
                 DiffState::new()
             } else {
-                let mut s = make_diff_with_tree();
-                if case.pre_expand_src {
-                    s.file_tree.expanded_dirs.insert("src".to_string());
-                    s.file_tree.nodes = build_tree(&s.diff_files);
-                    s.file_tree.rebuild_visible();
-                }
-                s
+                make_diff_with_tree()
             };
-            state.file_tree.tree_focused = case.focused;
-            state.file_tree.tree_focus_index = case.start_idx;
-            let _ = state.update(DiffMessage::TreeNavEnter);
-            assert_eq!(
-                state.file_tree.tree_focus_index, case.expected_idx,
-                "case: {}",
-                case.name
-            );
-            if let Some(check) = case.check {
-                check(&state, case.name);
-            }
+            state.file_tree.tree_focused = focused;
+            state.file_tree.tree_focus_index = start;
+            run_nav(&mut state, steps, name);
         }
-    }
-
-    // ── Click-to-select focus index tests ────────────────────────────
-
-    #[test]
-    fn test_diff_toggle_dir_sets_tree_focus_index() {
-        let mut state = make_diff_with_tree();
-        let _ = state.update(DiffMessage::ToggleDir("src".to_owned()));
-        assert!(state.file_tree.tree_focused);
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
-    }
-
-    #[test]
-    fn test_diff_select_file_sets_tree_focus_index() {
-        let mut state = make_diff_with_tree();
-        // Expand "src" so "src/main.rs" is visible in the flat list.
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        let _ = state.update(DiffMessage::SelectFile("src/main.rs".to_owned()));
-        // SelectFile keeps tree_focused and remembers focus index.
-        assert!(state.file_tree.tree_focused);
-        // tree_focus_index should point to "src/main.rs" for Ctrl+B re-focus.
-        assert_eq!(
-            state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,
-            "src/main.rs"
-        );
     }
 
     // ── Discard changes tests ──────────────────────────────────────
@@ -2085,7 +1986,7 @@ mod tests {
                     s.current_commit_ref = Some("abc1234".to_owned());
                 },
                 msg: DiffMessage::DiscardPath("src/main.rs".to_owned(), DiscardTarget::File),
-                check: |s, name| assert!(!s.diff_loading, "case: {name}"),
+                check: |s, name| assert!(!s.diff_loading, "case {name}: diff_loading"),
             },
             Case {
                 name: "discard_path_noop_without_workspace",
@@ -2095,13 +1996,13 @@ mod tests {
                     s.resolved_workspace_path = None;
                 },
                 msg: DiffMessage::DiscardPath("src/main.rs".to_owned(), DiscardTarget::File),
-                check: |s, name| assert!(!s.diff_loading, "case: {name}"),
+                check: |s, name| assert!(!s.diff_loading, "case {name}: diff_loading"),
             },
             Case {
                 name: "discard_path_sets_loading",
                 setup: mark_workspace_resolved,
                 msg: DiffMessage::DiscardPath("src/main.rs".to_owned(), DiscardTarget::File),
-                check: |s, name| assert!(s.diff_loading, "case: {name}"),
+                check: |s, name| assert!(s.diff_loading, "case {name}: diff_loading"),
             },
             Case {
                 name: "discard_result_success_no_workspace_resets_loading",
@@ -2112,7 +2013,7 @@ mod tests {
                     s.diff_loading = true;
                 },
                 msg: DiffMessage::DiscardResult(Ok(())),
-                check: |s, name| assert!(!s.diff_loading, "case: {name}"),
+                check: |s, name| assert!(!s.diff_loading, "case {name}: diff_loading"),
             },
             Case {
                 name: "discard_result_success_with_workspace_keeps_loading_for_refresh",
@@ -2124,7 +2025,7 @@ mod tests {
                     s.diff_loading = true;
                 },
                 msg: DiffMessage::DiscardResult(Ok(())),
-                check: |s, name| assert!(s.diff_loading, "case: {name}"),
+                check: |s, name| assert!(s.diff_loading, "case {name}: diff_loading"),
             },
             Case {
                 name: "discard_result_error_resets_loading",
@@ -2133,28 +2034,25 @@ mod tests {
                     s.diff_loading = true;
                 },
                 msg: DiffMessage::DiscardResult(Err("something went wrong".to_owned())),
-                check: |s, name| assert!(!s.diff_loading, "case: {name}"),
+                check: |s, name| assert!(!s.diff_loading, "case {name}: diff_loading"),
             },
             Case {
                 name: "discard_path_file_target_vs_dir_target",
                 setup: mark_workspace_resolved,
                 msg: DiffMessage::DiscardPath("src".to_owned(), DiscardTarget::Directory),
-                check: |s, name| assert!(s.diff_loading, "case: {name}"),
+                check: |s, name| assert!(s.diff_loading, "case {name}: diff_loading"),
             },
         ];
 
         for case in cases {
+            let name = case.name;
             let mut state = make_diff_with_tree();
             // All cases build from scratch with make_diff_with_tree, which
             // starts with diff_loading = false.
-            assert!(
-                !state.diff_loading,
-                "case: {} — expected clean state",
-                case.name
-            );
+            assert!(!state.diff_loading, "case {name}: expected clean state");
             (case.setup)(&mut state);
             let _ = state.update(case.msg.clone());
-            (case.check)(&state, case.name);
+            (case.check)(&state, name);
         }
     }
 
@@ -2171,53 +2069,61 @@ mod tests {
         state
     }
 
+    #[derive(Clone, Copy)]
+    enum AutoExpand {
+        Again,
+        Forget,
+        Switch,
+    }
+
+    type ExpandCase<'a> = (
+        &'a str,
+        &'a [&'a str],
+        &'a [AutoExpand],
+        &'a [&'a str],
+        bool,
+    );
+    /// First-load auto-expansion of nested directories, and which handlers leave it alone.
     #[test]
-    fn test_tree_auto_expand_nested_on_first_load() {
-        let files = vec![
-            make_test_file("src/gui/diff.rs", 1, 0),
-            make_test_file("src/lib.rs", 0, 1),
+    fn test_tree_auto_expand_state() {
+        const NESTED: &[&str] = &["src/gui/diff.rs", "src/lib.rs"];
+        const MAIN: &[&str] = &["src/main.rs"];
+        let cases: &[ExpandCase] = &[
+            ("first load", NESTED, &[], &["src", "src/gui"], false),
+            ("refresh", MAIN, &[Forget, Again], &[], false),
+            ("switch", MAIN, &[Forget, Switch], &[], true),
         ];
-        let state = make_diff_loaded(files);
-        assert!(state.file_tree.expanded_dirs.contains("src"));
-        assert!(state.file_tree.expanded_dirs.contains("src/gui"));
-        assert!(!state.tree_auto_expand_pending);
-    }
 
-    #[test]
-    fn test_collapsed_tree_preserved_on_refresh() {
-        let files = vec![make_test_file("src/main.rs", 1, 0)];
-        let mut state = make_diff_loaded(files);
-        state.file_tree.expanded_dirs.clear();
-        state.tree_auto_expand_pending = false;
-
-        let _ = state.update(DiffMessage::DiffLoaded(
-            state.generation,
-            Ok(LoadedDiff {
-                files: vec![make_test_file("src/main.rs", 2, 0)],
-                omitted_note: None,
-            }),
-        ));
-
-        assert!(state.file_tree.expanded_dirs.is_empty());
-    }
-
-    #[test]
-    fn test_workspace_switch_resets_auto_expand() {
-        let mut state = DiffState::new();
-        state.tree_auto_expand_pending = false;
-        let _ = state.update(DiffMessage::WorkspaceSelected("/tmp/ws".to_owned()));
-        assert!(state.tree_auto_expand_pending);
-        assert!(state.file_tree.expanded_dirs.is_empty());
-    }
-
-    #[test]
-    fn test_commit_message_clears_tree_focus() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = true;
-        let _ = state.update(DiffMessage::CommitMessageChanged(
-            crate::gui::editor_widget::EditorAction::Paste("fix bug".to_owned()),
-        ));
-        assert!(!state.file_tree.tree_focused);
+        for &(name, paths, steps, expanded, pending) in cases {
+            let files = paths.iter().map(|path| make_test_file(path, 1, 0));
+            let mut state = make_diff_loaded(files.collect());
+            for &step in steps {
+                match step {
+                    AutoExpand::Again => {
+                        let files = paths.iter().map(|path| make_test_file(path, 1, 0));
+                        let omitted_note = None;
+                        let diff = LoadedDiff {
+                            files: files.collect(),
+                            omitted_note,
+                        };
+                        let _ = state.update(DiffMessage::DiffLoaded(state.generation, Ok(diff)));
+                    }
+                    AutoExpand::Forget => {
+                        state.file_tree.expanded_dirs.clear();
+                        state.tree_auto_expand_pending = false;
+                    }
+                    AutoExpand::Switch => {
+                        let _ = state.update(DiffMessage::WorkspaceSelected("/tmp/ws".into()));
+                    }
+                }
+            }
+            let dirs = state.file_tree.expanded_dirs.iter().map(String::as_str);
+            let mut dirs: Vec<&str> = dirs.collect();
+            dirs.sort_unstable();
+            assert_eq!(dirs, expanded, "case {name}: expanded dirs");
+            let flag = state.tree_auto_expand_pending;
+            assert_eq!(flag, pending, "case {name}: pending");
+        }
     }
 
     // ── compute_truncation_index tests ─────────────────────────────
@@ -2376,11 +2282,11 @@ mod tests {
         ];
 
         for case in cases {
+            let name = case.name;
             assert_eq!(
                 compute_truncation_index(&case.files, case.selected_file, case.limits),
                 case.expected,
-                "case: {}",
-                case.name,
+                "case {name}: truncation index",
             );
         }
     }
@@ -2391,49 +2297,21 @@ mod tests {
     // synchronously (before the async load task runs), preventing stale data
     // from rendering during the loading transition.
 
-    /// Shared helper: verify that all fields managed by [`DiffState::clear_diff_state`]
-    /// have been reset to their cleared values.
+    /// Shared helper: verify every field [`DiffState::clear_diff_state`] manages was reset.
     fn assert_clear_diff_state(state: &DiffState) {
-        assert!(
-            state.diff_files.is_empty(),
-            "diff_files should be cleared synchronously to avoid stale data"
-        );
-        assert!(
-            state.error.is_none(),
-            "error should be cleared to prevent stale error banner"
-        );
-        assert!(
-            state.status_message.is_none(),
-            "status_message should be cleared to prevent stale status text"
-        );
-        assert!(
-            state.commit_message.text().is_empty(),
-            "commit_message should be cleared to prevent stale typed text"
-        );
-        assert!(!state.committing, "committing should be reset to false");
-        assert!(
-            state.file_tree.nodes.is_empty(),
-            "file_tree.nodes should be cleared to prevent stale tree entries"
-        );
-        assert!(
-            state.file_tree.expanded_dirs.is_empty(),
-            "file_tree.expanded_dirs should be cleared"
-        );
-        assert!(
-            state.selected_file.is_none(),
-            "selected_file should be cleared to prevent stale file filter"
-        );
-        assert!(
-            state.file_buffers.is_empty(),
-            "file_buffers should be cleared to prevent stale buffer data"
-        );
-        assert!(
-            state.tree_auto_expand_pending,
-            "tree_auto_expand_pending should be true to trigger expansion on next DiffLoaded"
-        );
+        assert!(state.diff_files.is_empty(), "diff_files");
+        assert!(state.error.is_none(), "error");
+        assert!(state.status_message.is_none(), "status_message");
+        assert!(state.commit_message.text().is_empty(), "commit_message");
+        assert!(!state.committing, "committing");
+        assert!(state.file_tree.nodes.is_empty(), "file_tree.nodes");
+        assert!(state.file_tree.expanded_dirs.is_empty(), "expanded_dirs");
+        assert!(state.selected_file.is_none(), "selected_file");
+        assert!(state.file_buffers.is_empty(), "file_buffers");
+        assert!(state.tree_auto_expand_pending, "tree_auto_expand_pending");
         assert!(
             state.current_commit_message.is_none(),
-            "current_commit_message should be cleared to prevent stale commit message"
+            "current commit message"
         );
     }
 

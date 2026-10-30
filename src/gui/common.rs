@@ -774,130 +774,149 @@ pub(crate) fn send_guard<M: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use SendRules::Board;
+    use Step::{Insert, Move, Redo, RedoSnapshot, Restore, Set, Snap, Text, Undo};
     use std::cell::Cell;
 
-    /// Stack with one snapshot of `text` taken before any edit.
-    fn stack_with_snapshot(text: &str) -> UndoStack {
+    /// A step through an [`UndoStack`]-backed buffer: edits, undo/redo, and setup.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Set(&'static str),
+        Move(usize, usize),
+        Snap,
+        Insert(char),
+        Undo,
+        Redo,
+        /// Restore a snapshot holding this text, cursor at `(line, column)`.
+        Restore(&'static str, usize, usize),
+        /// Call [`UndoStack::redo`] itself: the snapshot it hands back, or
+        /// `None` when the redo stack is empty.
+        RedoSnapshot(Option<&'static str>),
+        /// The buffer must hold exactly this text at this point in the sequence.
+        Text(&'static str),
+    }
+
+    const OLD: &str = "original";
+    const NEW: &str = "modified";
+    const LINES: &str = "line1\nline2\nline3";
+
+    fn restore(buffer: &mut EditorBuffer, text: &str, line: usize, column: usize) {
+        let source = EditorBuffer::with_text(text, None);
+        source.move_to(line, column);
         let mut stack = UndoStack::new();
-        let content = EditorBuffer::with_text(text, None);
-        stack.snap_before_edit(&content);
-        stack
+        stack.snap_before_edit(&source);
+        restore_undo_snapshot(buffer, stack.undo(&source));
     }
 
+    type UndoCase<'a> = (&'a str, &'a [Step], (&'a str, usize, usize));
+    /// The undo stack preserves the cursor, restores text, and drops invalidated redo.
     #[test]
-    fn undo_restores_snapshot() {
-        let mut stack = stack_with_snapshot("original");
-        let modified = EditorBuffer::with_text("modified", None);
-        let snapshot = stack.undo(&modified).unwrap();
-        assert_eq!(snapshot.text, "original");
+    fn undo_stack_cases() {
+        const EDITED: &[Step] = &[Set(OLD), Snap, Set(NEW), Undo, Redo];
+        const NEW_EDIT: &[Step] = &[Set("v1"), Snap, Set("v2"), Undo, Set("v3"), Snap, Redo];
+        const CURSOR: &[Step] = &[Set(LINES), Move(1, 2), Snap, Undo];
+        const ACTION: &[Step] = &[Set("hi"), Move(0, 2), Insert('!'), Text("hi!"), Undo];
+        const REDO_RESTORES: &[Step] = &[Set(OLD), Snap, Set(NEW), Undo, RedoSnapshot(Some(NEW))];
+        const REDO_CLEARED: &[Step] = &[
+            Set("v1"),
+            Snap,
+            Set("v2"),
+            Undo,
+            Set("v3"),
+            Snap,
+            RedoSnapshot(None),
+        ];
+        let cases: &[UndoCase] = &[
+            ("undo", &[Set(OLD), Snap, Set(NEW), Undo], (OLD, 0, 0)),
+            ("redo", EDITED, (NEW, 0, 0)),
+            ("new edit", NEW_EDIT, ("v3", 0, 0)),
+            (
+                "redo returns the undone snapshot and keeps the buffer",
+                REDO_RESTORES,
+                (OLD, 0, 0),
+            ),
+            (
+                "a new edit after an undo clears redo",
+                REDO_CLEARED,
+                ("v3", 0, 0),
+            ),
+            ("cursor", CURSOR, (LINES, 1, 2)),
+            ("action", ACTION, ("hi", 0, 2)),
+            ("restore", &[Set("x"), Restore(LINES, 1, 3)], (LINES, 1, 3)),
+        ];
+
+        for &(name, steps, (text, line, column)) in cases {
+            let mut buf = EditorBuffer::with_text("", None);
+            let mut stack = UndoStack::new();
+            for &step in steps {
+                match step {
+                    Step::Set(text) => buf.set_text(text),
+                    Step::Move(line, column) => buf.move_to(line, column),
+                    Step::Snap => stack.snap_before_edit(&buf),
+                    Step::Insert(c) => {
+                        apply_editor_action(&mut buf, &mut stack, EditorAction::Insert(c));
+                    }
+                    Step::Undo => apply_editor_action(&mut buf, &mut stack, EditorAction::Undo),
+                    Step::Redo => apply_editor_action(&mut buf, &mut stack, EditorAction::Redo),
+                    Step::Restore(text, line, column) => restore(&mut buf, text, line, column),
+                    Step::Text(expected) => {
+                        assert_eq!(buf.text(), *expected, "case {name}: text");
+                    }
+                    Step::RedoSnapshot(expected) => {
+                        let snapshot = stack.redo(&buf).map(|undone| undone.text);
+                        assert_eq!(snapshot.as_deref(), expected, "case {name}: redo");
+                    }
+                }
+            }
+            assert_eq!(buf.text(), text, "case {name}: text");
+            let cursor = buf.cursor();
+            let at = (cursor.line, cursor.column);
+            assert_eq!(at, (line, column), "case {name}: cursor");
+        }
     }
 
+    const OVER: usize = MAX_INPUT_CHARS + 1;
+    const CHAT: SendRules = SendRules::Chat { has_content: true };
+    const CHAT_IDLE: SendRules = SendRules::Chat { has_content: false };
+
+    type GuardCase<'a> = (
+        &'a str,
+        &'a str,
+        bool,
+        SendRules,
+        Result<Option<&'a str>, bool>,
+    );
     #[test]
-    fn redo_restores_undone_state() {
-        let mut stack = stack_with_snapshot("original");
-        let modified = EditorBuffer::with_text("modified", None);
-        let _ = stack.undo(&modified);
-
-        let snapshot = stack.redo(&modified).unwrap();
-        assert_eq!(snapshot.text, "modified");
-    }
-
-    #[test]
-    fn new_edit_clears_redo() {
-        let mut stack = stack_with_snapshot("v1");
-        let v2 = EditorBuffer::with_text("v2", None);
-        let _ = stack.undo(&v2);
-
-        // New edit after undo should clear redo.
-        let v3 = EditorBuffer::with_text("v3", None);
-        stack.snap_before_edit(&v3);
-
-        assert!(stack.redo(&v3).is_none());
-    }
-
-    #[test]
-    fn snapshot_preserves_cursor() {
-        let content = EditorBuffer::with_text("line1\nline2\nline3", None);
-        content.move_to(1, 2);
-        let mut stack = UndoStack::new();
-        stack.snap_before_edit(&content);
-
-        let modified = EditorBuffer::with_text("changed", None);
-        let snapshot = stack.undo(&modified).unwrap();
-        assert_eq!(snapshot.cursor.line, 1);
-        assert_eq!(snapshot.cursor.column, 2);
-    }
-
-    #[test]
-    fn apply_editor_action_snapshots_edits() {
-        let mut buffer = EditorBuffer::with_text("hello", None);
-        buffer.move_to(0, 5);
-        let mut stack = UndoStack::new();
-        apply_editor_action(&mut buffer, &mut stack, EditorAction::Insert('!'));
-        assert_eq!(buffer.text(), "hello!");
-        // The edit was snapshotted before it happened.
-        assert_eq!(stack.undo(&buffer).unwrap().text, "hello");
-    }
-
-    #[test]
-    fn restore_undo_snapshot_restores_text_and_cursor() {
-        let mut buffer = EditorBuffer::with_text("changed", None);
-        let snapshot = Some(UndoSnapshot {
-            text: "line1\nline2\nline3".to_string(),
-            cursor: CursorState {
-                line: 1,
-                column: 3,
-                selection: None,
-            },
-        });
-        restore_undo_snapshot(&mut buffer, snapshot);
-        assert_eq!(buffer.text(), "line1\nline2\nline3");
-        let cursor = buffer.cursor();
-        assert_eq!(cursor.line, 1);
-        assert_eq!(cursor.column, 3);
-    }
-
-    /// Run `send_guard`, recording whether `over_limit` fired (task never run).
-    fn run_guard(text: &str, sending: bool, rules: SendRules) -> (bool, Result<&str, Task<()>>) {
-        let fired = Cell::new(false);
-        let result = send_guard(text, sending, rules, |_| {
-            fired.set(true);
-            Task::none()
-        });
-        (fired.get(), result)
-    }
-
-    #[test]
-    fn send_guard_rejects_empty_and_trims() {
-        let (fired, result) = run_guard(" \t ", false, SendRules::Board);
-        assert!(result.is_err() && !fired, "empty input is a silent noop");
-        let (_, result) = run_guard("  hello  ", false, SendRules::Board);
-        assert_eq!(result.unwrap(), "hello");
-        let (_, result) = run_guard("  ", false, SendRules::Chat { has_content: true });
-        assert_eq!(
-            result.expect("attachment-only send"),
-            "",
-            "attachments allow an empty text"
-        );
-    }
-
-    #[test]
-    fn send_guard_limit_boundary() {
+    fn send_guard_cases() {
         let at_limit = "a".repeat(MAX_INPUT_CHARS);
-        let (fired, result) = run_guard(&at_limit, false, SendRules::Board);
-        assert!(result.is_ok() && !fired, "at-limit text is accepted");
-        let over_limit = "a".repeat(MAX_INPUT_CHARS + 1);
-        let (fired, result) = run_guard(&over_limit, false, SendRules::Board);
-        assert!(result.is_err() && fired, "over-limit text is rejected");
-    }
+        let over_limit = "a".repeat(OVER);
+        let cases: &[GuardCase] = &[
+            ("empty noop", " \t ", false, Board, Err(false)),
+            ("trimmed", " hello ", false, Board, Ok(Some("hello"))),
+            ("attachment", "  ", false, CHAT, Ok(Some(""))),
+            ("at limit", &at_limit, false, Board, Ok(None)),
+            ("over limit", &over_limit, false, Board, Err(true)),
+            ("chat inflight", &over_limit, true, CHAT_IDLE, Err(false)),
+            ("board inflight", &over_limit, true, Board, Err(true)),
+        ];
 
-    #[test]
-    fn send_guard_combined_in_flight_and_over_limit() {
-        let text = "a".repeat(MAX_INPUT_CHARS + 1);
-        let (fired, result) = run_guard(&text, true, SendRules::Chat { has_content: false });
-        assert!(result.is_err() && !fired, "in-flight first: silent noop");
-        let (fired, result) = run_guard(&text, true, SendRules::Board);
-        assert!(result.is_err() && fired, "toast fires over-limit first");
+        for (name, input, sending, rules, expect) in cases {
+            let fired = Cell::new(false);
+            let result: Result<&str, Task<()>> = send_guard(input, *sending, *rules, |_| {
+                fired.set(true);
+                Task::none()
+            });
+            match *expect {
+                Ok(trimmed) => {
+                    let expected = trimmed.unwrap_or(input);
+                    assert_eq!(result.ok(), Some(expected), "case {name}: accepted");
+                }
+                Err(toast) => {
+                    assert!(result.is_err(), "case {name}: refused");
+                    assert_eq!(fired.get(), toast, "case {name}: over-limit toast");
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -909,7 +928,6 @@ mod tests {
         let window = Duration::from_millis(50);
         let handle = tokio::spawn(coalesce_loop(rx, out_tx, window, || 1u32));
 
-        // A burst of 5 events within one window collapses to a single message.
         for _ in 0..5 {
             let _ = tx.send(());
         }
@@ -926,7 +944,6 @@ mod tests {
             .expect("trailing event should flush within the timeout");
         assert_eq!(second, Some(1));
 
-        // Drop the only source to close the channel; the loop then ends.
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(1), handle)
             .await

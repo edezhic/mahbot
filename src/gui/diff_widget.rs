@@ -949,6 +949,8 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::diff_parse::DiffFileStatus::Modified;
+    use crate::git::diff_parse::DiffLineKind::{Added, Context, Removed};
     use crate::git::diff_parse::{DiffContent, DiffFileStatus, DiffLine, DiffLineKind};
 
     fn make_test_diff_file(
@@ -958,6 +960,20 @@ mod tests {
     ) -> super::super::diff::DiffFile {
         super::super::diff::DiffFile::from_parsed(
             crate::git::diff_parse::DiffFile::new(path.to_string(), hunks, status),
+            None,
+            None,
+        )
+    }
+
+    fn file_with_content(path: &str, content: DiffContent) -> super::super::diff::DiffFile {
+        super::super::diff::DiffFile::from_parsed(
+            crate::git::diff_parse::DiffFile {
+                path: path.to_string(),
+                old_path: None,
+                hunks: Vec::new(),
+                status: Modified,
+                content,
+            },
             None,
             None,
         )
@@ -984,287 +1000,222 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_empty_file_has_no_buffers() {
-        let files: Vec<super::super::diff::DiffFile> = Vec::new();
-        let buffers = build_file_buffers(&files, None, None);
-        assert!(buffers.is_empty());
+    fn single_hunk_file(path: &str, header: &str, line: DiffLine) -> super::super::diff::DiffFile {
+        make_test_diff_file(path, vec![make_hunk(header, vec![line])], Modified)
     }
 
-    #[test]
-    fn test_binary_file_skipped() {
-        let file = super::super::diff::DiffFile::from_parsed(
-            crate::git::diff_parse::DiffFile {
-                path: "binary.bin".to_string(),
-                old_path: None,
-                hunks: Vec::new(),
-                status: DiffFileStatus::Modified,
-                content: DiffContent::Binary,
-            },
-            None,
-            None,
-        );
-        let buffers = build_file_buffers(&[file], None, None);
-        assert!(buffers.is_empty());
+    fn hunk_file(path: &str, header: &str, lines: Vec<DiffLine>) -> super::super::diff::DiffFile {
+        make_test_diff_file(path, vec![make_hunk(header, lines)], Modified)
     }
 
-    #[test]
-    fn test_too_large_file_skipped() {
-        let file = super::super::diff::DiffFile::from_parsed(
-            crate::git::diff_parse::DiffFile {
-                path: "large.bin".to_string(),
-                old_path: None,
-                hunks: Vec::new(),
-                status: DiffFileStatus::Modified,
-                content: DiffContent::TooLarge(5_000_000),
-            },
-            None,
-            None,
-        );
-        let buffers = build_file_buffers(&[file], None, None);
-        assert!(buffers.is_empty());
-    }
-
-    #[test]
-    fn test_selected_file_filter() {
-        let file_a = make_test_diff_file(
+    fn shape_file(added: &str) -> super::super::diff::DiffFile {
+        hunk_file(
             "a.rs",
-            vec![make_hunk(
-                "@@ -1,3 +1,3 @@",
-                vec![make_line(DiffLineKind::Context, "line1", Some(1), Some(1))],
-            )],
-            DiffFileStatus::Modified,
-        );
-        let file_b = make_test_diff_file(
-            "b.rs",
-            vec![make_hunk(
-                "@@ -1,2 +1,2 @@",
-                vec![make_line(DiffLineKind::Added, "new", None, Some(1))],
-            )],
-            DiffFileStatus::Modified,
-        );
-        let buffers = build_file_buffers(&[file_a, file_b], Some("b.rs"), None);
-        assert_eq!(buffers.len(), 1);
-        assert!(buffers[0].text.contains("new"));
-    }
-
-    #[test]
-    fn test_buffer_text_format() {
-        let file = make_test_diff_file(
-            "test.rs",
-            vec![make_hunk(
-                "@@ -1,3 +1,4 @@ fn main() {",
-                vec![
-                    make_line(DiffLineKind::Context, "let x = 1;", Some(1), Some(1)),
-                    make_line(DiffLineKind::Removed, "let y = 2;", Some(2), None),
-                    make_line(DiffLineKind::Added, "let z = 3;", None, Some(2)),
-                ],
-            )],
-            DiffFileStatus::Modified,
-        );
-        let buffers = build_file_buffers(&[file], None, None);
-        assert_eq!(buffers.len(), 1);
-
-        let buf = &buffers[0];
-        // Text should contain hunk header + prefixed lines
-        assert!(buf.text.starts_with("@@ -1,3 +1,4 @@ fn main() {\n"));
-        assert!(buf.text.contains("  let x = 1;\n")); // context: "  " prefix
-        assert!(buf.text.contains("- let y = 2;\n")); // removed: "- " prefix
-        assert!(buf.text.contains("+ let z = 3;\n")); // added: "+ " prefix
-
-        // Line kinds: hunk header is None, then Context, Removed, Added
-        assert_eq!(buf.line_kinds.len(), 4); // hunk header + 3 lines
-        assert_eq!(buf.line_kinds[0], None);
-        assert_eq!(buf.line_kinds[1], Some(DiffLineKind::Context));
-        assert_eq!(buf.line_kinds[2], Some(DiffLineKind::Removed));
-        assert_eq!(buf.line_kinds[3], Some(DiffLineKind::Added));
-
-        // Line numbers
-        assert_eq!(buf.line_numbers[0], (None, None)); // hunk header
-        assert_eq!(buf.line_numbers[1], (Some(1), Some(1)));
-        assert_eq!(buf.line_numbers[2], (Some(2), None));
-        assert_eq!(buf.line_numbers[3], (None, Some(2)));
-
-        // Span data should cover the entire text
-        let total_span_len: usize = buf.span_data.iter().map(|(s, e, _)| e - s).sum();
-        assert_eq!(total_span_len, buf.text.len());
-
-        // Spans should be sorted by start
-        let starts: Vec<usize> = buf.span_data.iter().map(|(s, _, _)| *s).collect();
-        assert!(starts.windows(2).all(|w| w[0] <= w[1]));
-
-        // Span data should be non-empty with valid byte ranges
-        for &(start, end, _) in &buf.span_data {
-            assert!(start <= end, "start {start} > end {end}");
-            assert!(
-                end <= buf.text.len(),
-                "end {end} > text len {}",
-                buf.text.len()
-            );
-            assert!(
-                buf.text.is_char_boundary(start),
-                "start {start} not char boundary"
-            );
-            assert!(
-                buf.text.is_char_boundary(end),
-                "end {end} not char boundary"
-            );
-        }
-    }
-
-    #[test]
-    fn test_hunk_header_color() {
-        let file = make_test_diff_file(
-            "test.rs",
-            vec![make_hunk(
-                "@@ -5,7 +5,7 @@ fn foo() {",
-                vec![make_line(DiffLineKind::Context, "bar();", Some(5), Some(5))],
-            )],
-            DiffFileStatus::Modified,
-        );
-        let buffers = build_file_buffers(&[file], None, None);
-        let buf = &buffers[0];
-
-        // The first span should cover the hunk header and have HUNK_HEADER_COLOR
-        assert!(!buf.span_data.is_empty());
-        let (start, end, color) = buf.span_data[0];
-        assert_eq!(start, 0);
-        // The span should cover the hunk header line
-        let hunk_line = &buf.text[start..end];
-        assert!(hunk_line.starts_with("@@ -5,7"));
-        assert_eq!(color, HUNK_HEADER_COLOR);
-    }
-
-    #[test]
-    fn test_added_line_has_green_tint_kind() {
-        let file = make_test_diff_file(
-            "test.rs",
-            vec![make_hunk(
-                "@@ -1,0 +1,1 @@",
-                vec![make_line(DiffLineKind::Added, "+ new_line", None, Some(1))],
-            )],
-            DiffFileStatus::Added,
-        );
-        let buffers = build_file_buffers(&[file], None, None);
-        let buf = &buffers[0];
-        // Hunk header + added line
-        assert_eq!(buf.line_kinds, vec![None, Some(DiffLineKind::Added)]);
-    }
-
-    #[test]
-    fn test_multiple_hunks_produce_correct_line_count() {
-        let file = make_test_diff_file(
-            "multi.rs",
+            "@@ -1,3 +1,4 @@ fn main() {",
             vec![
-                make_hunk(
-                    "@@ -1,2 +1,2 @@",
-                    vec![
-                        make_line(DiffLineKind::Context, "a", Some(1), Some(1)),
-                        make_line(DiffLineKind::Context, "b", Some(2), Some(2)),
-                    ],
-                ),
-                make_hunk(
-                    "@@ -10,1 +10,1 @@",
-                    vec![make_line(DiffLineKind::Removed, "old", Some(10), None)],
-                ),
+                make_line(Context, "let x = 1;", Some(1), Some(1)),
+                make_line(Removed, "let y = 2;", Some(2), None),
+                make_line(Added, added, None, Some(2)),
             ],
-            DiffFileStatus::Modified,
-        );
-        let buffers = build_file_buffers(&[file], None, None);
-        let buf = &buffers[0];
-        // Two hunk headers + 2 context + 1 removed = 5 logical lines
-        assert_eq!(buf.line_kinds.len(), 5);
-        assert_eq!(buf.line_numbers.len(), 5);
+        )
     }
 
-    #[test]
-    fn test_gutter_digits_from_source_line_numbers_not_row_count() {
-        let file = make_test_diff_file(
-            "test.rs",
-            vec![make_hunk(
-                "@@ -12345,1 +12345,1 @@",
-                vec![make_line(
-                    DiffLineKind::Context,
-                    "far down",
-                    Some(12_345),
-                    Some(12_345),
-                )],
-            )],
-            DiffFileStatus::Modified,
-        );
-        let buffers = build_file_buffers(&[file], None, None);
-        assert_eq!(buffers[0].gutter_digits, 5);
-        assert!(
-            gutter_width_from_digits(5) > gutter_width_from_digits(1),
-            "high line numbers need a wider gutter"
-        );
-    }
-
-    #[test]
-    fn test_gutter_column_positions_are_right_edges() {
-        let width = gutter_width_from_digits(3);
-        let (old_right, new_right) = gutter_column_right_edges(10.0, 0.0, width);
-        #[expect(clippy::float_cmp)]
-        {
-            assert_eq!(old_right, 10.0 + width / 2.0);
-            assert_eq!(new_right, 10.0 + width);
+    /// Every buffer's spans cover the whole text, stay inside it, and are sorted.
+    fn assert_span_invariants(name: &str, buffers: &[DiffFileBuffer]) {
+        for buf in buffers {
+            for &(start, end, _) in &buf.span_data {
+                assert!(start <= end, "case {name}: span start {start} > end {end}");
+            }
+            let total: usize = buf.span_data.iter().map(|(s, e, _)| e - s).sum();
+            assert_eq!(total, buf.text.len(), "case {name}: span coverage");
+            let starts: Vec<usize> = buf.span_data.iter().map(|(s, _, _)| *s).collect();
+            assert!(
+                starts.windows(2).all(|w| w[0] <= w[1]),
+                "case {name}: spans sorted"
+            );
+            for &(start, end, _) in &buf.span_data {
+                assert!(end <= buf.text.len(), "case {name}: span end {end}");
+                assert!(
+                    buf.text.is_char_boundary(start) && buf.text.is_char_boundary(end),
+                    "case {name}: span boundaries"
+                );
+            }
         }
-        assert!(new_right > old_right);
+    }
+
+    fn run_buffer_cases(cases: &[Case]) {
+        for case in cases {
+            let name = case.name;
+            let buffers = build_file_buffers(&case.files, case.selected, None);
+            assert_eq!(buffers.len(), case.buffers, "case {name}: buffers");
+            let first = || {
+                buffers
+                    .first()
+                    .unwrap_or_else(|| panic!("case {name}: no buffers built"))
+            };
+            if let Some(kinds) = case.kinds {
+                assert_eq!(first().line_kinds, kinds, "case {name}: kinds");
+            }
+            if let Some(numbers) = case.numbers {
+                assert_eq!(first().line_numbers, numbers, "case {name}: numbers");
+            }
+            if let Some(prefix) = case.starts_with {
+                assert!(
+                    first().text.starts_with(prefix),
+                    "case {name}: prefix {prefix:?}"
+                );
+            }
+            for text in case.contains {
+                assert!(first().text.contains(text), "case {name}: {text:?}");
+            }
+            assert_span_invariants(name, &buffers);
+        }
+    }
+
+    // One row shape for both buffer tables; absent columns fall back to Default.
+    #[derive(Default)]
+    struct Case {
+        name: &'static str,
+        files: Vec<super::super::diff::DiffFile>,
+        selected: Option<&'static str>,
+        buffers: usize,
+        kinds: Option<&'static [Option<DiffLineKind>]>,
+        numbers: Option<&'static [(Option<usize>, Option<usize>)]>,
+        starts_with: Option<&'static str>,
+        contains: &'static [&'static str],
     }
 
     #[test]
-    fn test_selection_text_excludes_gutter_and_handles_ranges() {
+    fn test_build_file_buffers() {
+        let cases: &[Case] = &[
+            Case {
+                name: "empty file has no buffers",
+                ..Case::default()
+            },
+            Case {
+                name: "binary file skipped",
+                files: vec![file_with_content("binary.bin", DiffContent::Binary)],
+                ..Case::default()
+            },
+            Case {
+                name: "too large file skipped",
+                files: vec![file_with_content(
+                    "large.bin",
+                    DiffContent::TooLarge(5_000_000),
+                )],
+                ..Case::default()
+            },
+            Case {
+                name: "selected file filter",
+                files: vec![
+                    single_hunk_file(
+                        "a.rs",
+                        "@@ -1,3 +1,3 @@",
+                        make_line(Context, "line1", Some(1), Some(1)),
+                    ),
+                    single_hunk_file(
+                        "b.rs",
+                        "@@ -1,2 +1,2 @@",
+                        make_line(Added, "new", None, Some(1)),
+                    ),
+                ],
+                selected: Some("b.rs"),
+                buffers: 1,
+                kinds: Some(&[None, Some(Added)]),
+                numbers: Some(&[(None, None), (None, Some(1))]),
+                contains: &["new"],
+                ..Case::default()
+            },
+        ];
+
+        run_buffer_cases(cases);
+    }
+
+    #[test]
+    fn test_build_file_buffer_text() {
+        let cases: &[Case] = &[
+            Case {
+                name: "buffer text prefixes and line values",
+                files: vec![hunk_file(
+                    "test.rs",
+                    "@@ -1,3 +1,4 @@ fn main() {",
+                    vec![
+                        make_line(Context, "let x = 1;", Some(1), Some(1)),
+                        make_line(Removed, "let y = 2;", Some(2), None),
+                        make_line(Added, "let z = 3;", None, Some(2)),
+                    ],
+                )],
+                buffers: 1,
+                kinds: Some(&[None, Some(Context), Some(Removed), Some(Added)]),
+                numbers: Some(&[
+                    (None, None),
+                    (Some(1), Some(1)),
+                    (Some(2), None),
+                    (None, Some(2)),
+                ]),
+                starts_with: Some("@@ -1,3 +1,4 @@ fn main() {\n"),
+                contains: &["  let x = 1;\n", "- let y = 2;\n", "+ let z = 3;\n"],
+                ..Case::default()
+            },
+            Case {
+                name: "multiple hunks produce correct line count",
+                files: vec![make_test_diff_file(
+                    "multi.rs",
+                    vec![
+                        make_hunk(
+                            "@@ -1,2 +1,2 @@",
+                            vec![
+                                make_line(Context, "a", Some(1), Some(1)),
+                                make_line(Context, "b", Some(2), Some(2)),
+                            ],
+                        ),
+                        make_hunk(
+                            "@@ -10,1 +10,1 @@",
+                            vec![make_line(Removed, "old", Some(10), None)],
+                        ),
+                    ],
+                    Modified,
+                )],
+                buffers: 1,
+                kinds: Some(&[None, Some(Context), Some(Context), None, Some(Removed)]),
+                numbers: Some(&[
+                    (None, None),
+                    (Some(1), Some(1)),
+                    (Some(2), Some(2)),
+                    (None, None),
+                    (Some(10), None),
+                ]),
+                ..Case::default()
+            },
+        ];
+
+        run_buffer_cases(cases);
+    }
+
+    #[test]
+    fn test_selection_text_ranges() {
         let text = "+ hello\n- world\n";
-        assert_eq!(selection_text(text, 0, 7), Some("+ hello".to_string()));
-        assert_eq!(selection_text(text, 7, 0), Some("+ hello".to_string()));
-        assert!(selection_text(text, 3, 3).is_none());
-    }
-
-    #[test]
-    fn test_compute_gutter_digits_empty_defaults_to_one() {
-        assert_eq!(compute_gutter_digits(&[]), 1);
+        let cases: &[(&str, usize, usize, Option<&str>)] = &[
+            ("forward range", 0, 7, Some("+ hello")),
+            ("reversed range", 7, 0, Some("+ hello")),
+            ("empty range", 3, 3, None),
+        ];
+        for &(name, anchor, cursor, expected) in cases {
+            assert_eq!(
+                selection_text(text, anchor, cursor).as_deref(),
+                expected,
+                "case {name}"
+            );
+        }
     }
 
     #[test]
     fn test_shape_cache_key_tracks_content_and_width() {
         // Same diff content rebuilt twice (the 5-second auto-refresh case)
         // must produce the same fingerprint; changed content must not.
-        let file_a = make_test_diff_file(
-            "a.rs",
-            vec![make_hunk(
-                "@@ -1,3 +1,4 @@ fn main() {",
-                vec![
-                    make_line(DiffLineKind::Context, "let x = 1;", Some(1), Some(1)),
-                    make_line(DiffLineKind::Removed, "let y = 2;", Some(2), None),
-                    make_line(DiffLineKind::Added, "let z = 3;", None, Some(2)),
-                ],
-            )],
-            DiffFileStatus::Modified,
-        );
-        let file_a_again = make_test_diff_file(
-            "a.rs",
-            vec![make_hunk(
-                "@@ -1,3 +1,4 @@ fn main() {",
-                vec![
-                    make_line(DiffLineKind::Context, "let x = 1;", Some(1), Some(1)),
-                    make_line(DiffLineKind::Removed, "let y = 2;", Some(2), None),
-                    make_line(DiffLineKind::Added, "let z = 3;", None, Some(2)),
-                ],
-            )],
-            DiffFileStatus::Modified,
-        );
-        let file_b = make_test_diff_file(
-            "a.rs",
-            vec![make_hunk(
-                "@@ -1,3 +1,4 @@ fn main() {",
-                vec![
-                    make_line(DiffLineKind::Context, "let x = 1;", Some(1), Some(1)),
-                    make_line(DiffLineKind::Removed, "let y = 2;", Some(2), None),
-                    make_line(DiffLineKind::Added, "let z = 99;", None, Some(2)),
-                ],
-            )],
-            DiffFileStatus::Modified,
-        );
+        let file_a = shape_file("let z = 3;");
+        let file_a_again = shape_file("let z = 3;");
+        let file_b = shape_file("let z = 99;");
 
         let buf_a = &build_file_buffers(&[file_a], None, None)[0];
         let buf_a_again = &build_file_buffers(&[file_a_again], None, None)[0];

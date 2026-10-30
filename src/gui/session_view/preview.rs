@@ -550,10 +550,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::sync::OnceLock;
 
-    /// Ensure JetBrains Mono is loaded into the global font system so wrap
-    /// counts are deterministic (the app loads it at startup via
-    /// `iced::application::font`, which tests do not run). `OnceLock`
-    /// guarantees a single load; the font-system RwLock serializes access.
+    /// Load JetBrains Mono into the global font system so wrap counts are deterministic.
     fn ensure_fonts_loaded() {
         static ONCE: OnceLock<()> = OnceLock::new();
         ONCE.get_or_init(|| {
@@ -569,8 +566,7 @@ mod tests {
         });
     }
 
-    /// Test width: 500px → ~464px after the safety margin → ~59 body chars
-    /// per wrapped line at 13px JetBrains Mono (0.6em advance = 7.8px/char).
+    /// Test width: 500px → ~59 body chars per wrapped line at 13px JetBrains Mono.
     const TEST_WIDTH: f32 = 500.0;
 
     fn measure(text: &str) -> MessageMeasure {
@@ -591,225 +587,129 @@ mod tests {
         );
     }
 
-    #[test]
-    fn short_message_stays_expanded() {
-        let m = measure("hello");
-        assert_eq!(m.wrapped_lines, 1);
-        assert!(m.preview.is_none());
+    enum Preview {
+        Expanded,
+        Shown,
+        Prefix,
+        Text(&'static str),
     }
 
-    #[test]
-    fn exactly_three_short_lines_stay_expanded() {
-        let m = measure("one\ntwo\nthree");
-        assert_eq!(m.wrapped_lines, 3);
-        assert!(m.preview.is_none());
-    }
-
-    #[test]
-    fn four_short_lines_collapse() {
-        let m = measure("one\ntwo\nthree\nfour");
-        assert_eq!(m.wrapped_lines, 4);
-        let preview = m.preview.expect("4-line message must collapse");
-        assert_preview_lines(&preview, 3);
-        assert_eq!(preview, "one\ntwo\nthree");
-    }
-
-    #[test]
-    fn long_prose_paragraph_wraps_and_collapses() {
-        // ~180 chars of prose — at ~59 chars/line this wraps to 4 lines.
-        let text = "The quick brown fox jumps over the lazy dog. ".repeat(4);
-        let m = measure(&text);
-        assert!(
-            m.wrapped_lines > 3,
-            "long paragraph must wrap past the budget ({} lines)",
-            m.wrapped_lines
-        );
-        let preview = m.preview.expect("long paragraph must collapse");
-        assert_preview_lines(&preview, 3);
-        // The preview is the first 3 wrapped lines — flat-whitespace-stripped
-        // it must be a prefix of the flat source text (no source newlines
-        // introduced beyond the wrap points).
-        let flat_preview: String = preview.chars().filter(|c| !c.is_whitespace()).collect();
-        let flat_text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(
-            flat_text.starts_with(&flat_preview),
-            "preview must be the start of the wrapped text: {preview:?}"
-        );
-    }
-
-    #[test]
-    fn blank_lines_are_measured_where_the_body_has_them() {
-        // Blank source lines are rendered lines, and nothing trims them before
-        // measuring: they count toward the budget and preview as the blank
-        // lines they are, leading and trailing ones included.
-        for (text, preview) in [
-            ("a\n\nb\nc", "a\n\nb"),
-            ("a\n\nb\nc\nd", "a\n\nb"),
-            ("\n\na\n\nb", "\n\na"),
-            ("a\n\nb\n", "a\n\nb"),
-        ] {
+    fn run_measure_cases(cases: &[(&str, String, Option<usize>, Preview)]) {
+        for (name, text, lines, preview) in cases {
             let m = measure(text);
-            assert!(m.wrapped_lines > 3, "{text:?}: {} lines", m.wrapped_lines);
-            let shown = m.preview.expect("the message must collapse");
-            assert_eq!(shown, preview, "{text:?}");
-            assert_preview_lines(&shown, 3);
+            match lines {
+                Some(expected) => assert_eq!(
+                    m.wrapped_lines,
+                    u32::try_from(*expected).expect("preview sizes fit u32"),
+                    "case {name}: wrapped lines"
+                ),
+                None => assert!(
+                    m.wrapped_lines > MAX_PREVIEW_LINES,
+                    "case {name}: {} lines, expected past the budget",
+                    m.wrapped_lines
+                ),
+            }
+            match preview {
+                Preview::Expanded => {
+                    assert!(m.preview.is_none(), "case {name}: must stay expanded");
+                }
+                Preview::Shown => assert_preview_lines(
+                    &m.preview.expect("the message must collapse"),
+                    MAX_PREVIEW_LINES as usize,
+                ),
+                Preview::Prefix => {
+                    let preview = m.preview.as_deref().expect("a prefix case must collapse");
+                    assert_preview_lines(preview, MAX_PREVIEW_LINES as usize);
+                    let flat_preview: String =
+                        preview.chars().filter(|c| !c.is_whitespace()).collect();
+                    let flat_text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                    assert!(
+                        flat_text.starts_with(&flat_preview),
+                        "case {name}: the preview must be the start of the wrapped text: {preview:?}"
+                    );
+                }
+                Preview::Text(expected) => {
+                    let preview = m.preview.expect("the message must collapse");
+                    assert_eq!(preview, *expected, "case {name}: preview");
+                    assert_preview_lines(&preview, MAX_PREVIEW_LINES as usize);
+                }
+            }
         }
     }
 
+    /// Collapsing is the bias: past the budget a message collapses to its first lines, within it stays whole.
     #[test]
-    fn code_fence_lines_count_as_source_lines() {
-        // 2 fences + 2 code lines = 4 lines → collapses (the count is a
-        // lower bound past the budget due to early exit).
-        let text = "```\nline1\nline2\n```";
-        let m = measure(text);
-        assert!(m.wrapped_lines > 3, "{} lines", m.wrapped_lines);
-        let preview = m.preview.expect("4-line message must collapse");
-        assert_preview_lines(&preview, 3);
-        assert_eq!(preview, "```\nline1\nline2");
-    }
+    fn wrapping_and_collapsing_cases() {
+        run_measure_cases(&[
+            (
+                "short message stays expanded",
+                "hello".to_string(),
+                Some(1),
+                Preview::Expanded,
+            ),
+            (
+                "exactly three short lines stay expanded",
+                "one\ntwo\nthree".to_string(),
+                Some(3),
+                Preview::Expanded,
+            ),
+            (
+                "four short lines collapse",
+                "one\ntwo\nthree\nfour".to_string(),
+                Some(4),
+                Preview::Text("one\ntwo\nthree"),
+            ),
+            (
+                "long prose paragraph wraps and collapses",
+                "The quick brown fox jumps over the lazy dog. ".repeat(4),
+                None,
+                Preview::Prefix,
+            ),
+            (
+                "blank line between lines",
+                "a\n\nb\nc".to_string(),
+                None,
+                Preview::Text("a\n\nb"),
+            ),
+            (
+                "blank lines with more after them",
+                "a\n\nb\nc\nd".to_string(),
+                None,
+                Preview::Text("a\n\nb"),
+            ),
+            (
+                "leading blank lines",
+                "\n\na\n\nb".to_string(),
+                None,
+                Preview::Text("\n\na"),
+            ),
+            (
+                "trailing blank line",
+                "a\n\nb\n".to_string(),
+                None,
+                Preview::Text("a\n\nb"),
+            ),
+            (
+                "code fence lines count as source lines",
+                "```\nline1\nline2\n```".to_string(),
+                None,
+                Preview::Text("```\nline1\nline2"),
+            ),
+            (
+                "short code fence stays expanded",
+                "```\nline1\n```".to_string(),
+                Some(3),
+                Preview::Expanded,
+            ),
+            (
+                "long code line does not wrap",
+                format!("```\n{}\n```", "x".repeat(300)),
+                Some(3),
+                Preview::Expanded,
+            ),
+        ]);
 
-    #[test]
-    fn short_code_fence_stays_expanded() {
-        // 2 fences + 1 code line = 3 lines, none wrapping → no collapse.
-        let text = "```\nline1\n```";
-        let m = measure(text);
-        assert_eq!(m.wrapped_lines, 3);
-        assert!(m.preview.is_none());
-    }
-
-    #[test]
-    fn long_code_line_does_not_wrap() {
-        // A 300-char single code line must count as exactly 1 line (the
-        // renderer scrolls code blocks horizontally).
-        let text = format!("```\n{}\n```", "x".repeat(300));
-        let m = measure(&text);
-        assert_eq!(m.wrapped_lines, 3);
-        assert!(m.preview.is_none());
-    }
-
-    #[test]
-    fn heading_lines_measured_at_heading_size() {
-        // ~120 chars of spaced H1 text: at 26px (~15.6px/char, ~29 chars/line
-        // at 464px) it wraps to 5 lines — must collapse. A flat body-size
-        // measurement would count only ~3 lines and leave it expanded.
-        let text = format!("# {}", "heading ".repeat(15));
-        let m = measure(&text);
-        assert!(
-            m.wrapped_lines > 3,
-            "long heading must wrap past the budget ({} lines)",
-            m.wrapped_lines
-        );
-        assert!(m.preview.is_some());
-    }
-
-    #[test]
-    fn indented_atx_heading_measured_at_heading_size() {
-        // CommonMark allows up to 3 spaces of indentation before an ATX
-        // heading; a long indented heading must be measured at heading size
-        // (a body-size count would under-collapse — the forbidden direction).
-        let text = format!("  # {}", "heading ".repeat(15));
-        let m = measure(&text);
-        assert!(
-            m.wrapped_lines > 3,
-            "long indented heading must wrap past the budget ({} lines)",
-            m.wrapped_lines
-        );
-        assert!(m.preview.is_some());
-        // 4+ spaces of indent is not an ATX heading — body-size measurement
-        // (and the heading text fits on one line even at 26px, so no wrap).
-        let m = measure(&format!("    # {}", "h".repeat(5)));
-        assert_eq!(m.wrapped_lines, 1);
-        assert!(m.preview.is_none());
-    }
-
-    #[test]
-    fn body_sized_heading_stays_short() {
-        // H5 (13px): a 30-char heading fits on one line.
-        let m = measure(&format!("##### {}", "h".repeat(20)));
-        assert_eq!(m.wrapped_lines, 1);
-        assert!(m.preview.is_none());
-    }
-
-    #[test]
-    fn setext_heading_measured_at_heading_size() {
-        // A long setext title (paragraph line + "===" underline) renders at
-        // H1 (26px); a flat body-size measurement would count it as ~2 lines
-        // plus the underline (3, expanded) and leave it expanded — the one
-        // direction the collapse bias forbids. At 26px it wraps to 4+ lines
-        // and must collapse.
-        let text = format!("{}\n===", "setext heading title ".repeat(5));
-        let m = measure(&text);
-        assert!(m.wrapped_lines > 3, "{} lines", m.wrapped_lines);
-        assert!(m.preview.is_some());
-        // A short setext title stays expanded: 1 H1 line + underline = 2.
-        let m = measure("short title\n===");
-        assert_eq!(m.wrapped_lines, 2);
-        assert!(m.preview.is_none());
-    }
-
-    #[test]
-    fn setext_heading_size_maps_equals_to_h1_and_dash_to_h2() {
-        // CommonMark (and pulldown-cmark's scan_setext_heading): "=" → H1
-        // (2.0×), "-" → H2 (1.75×). An inverted mapping under-counts a long
-        // "=" title at H2 size and can leave an over-budget message expanded
-        // — the forbidden direction — so pin the mapping directly (no font
-        // system needed; the sizes are derived from `MARKDOWN_TEXT_SIZE`).
-        let sizes = heading_sizes(MARKDOWN_TEXT_SIZE);
-        assert_eq!(
-            setext_heading_size("title", Some("==="), MARKDOWN_TEXT_SIZE),
-            Some(sizes[0])
-        );
-        assert_eq!(
-            setext_heading_size("title", Some("---"), MARKDOWN_TEXT_SIZE),
-            Some(sizes[1])
-        );
-        // Up to three leading spaces are allowed on the underline (symmetric
-        // with the ATX rule); 4+ is not a setext underline.
-        assert_eq!(
-            setext_heading_size("title", Some("  ==="), MARKDOWN_TEXT_SIZE),
-            Some(sizes[0])
-        );
-        assert_eq!(
-            setext_heading_size("title", Some("    ==="), MARKDOWN_TEXT_SIZE),
-            None
-        );
-        // Trailing whitespace after the run is fine; mixed characters, a
-        // blank underline, or a blank title are not.
-        assert_eq!(
-            setext_heading_size("title", Some("---  "), MARKDOWN_TEXT_SIZE),
-            Some(sizes[1])
-        );
-        assert_eq!(
-            setext_heading_size("title", Some("=-="), MARKDOWN_TEXT_SIZE),
-            None
-        );
-        assert_eq!(
-            setext_heading_size("title", Some(""), MARKDOWN_TEXT_SIZE),
-            None
-        );
-        assert_eq!(
-            setext_heading_size("", Some("==="), MARKDOWN_TEXT_SIZE),
-            None
-        );
-    }
-
-    #[test]
-    fn setext_title_boundary_pins_h1_vs_h2_mapping() {
-        // A ~65-char "=" title: measured at H1 (2.0×) the title wraps to 3
-        // lines plus the underline = 4 → collapse. The inverted H2 mapping
-        // would count 2 title lines plus the underline = 3 → expanded, the
-        // forbidden direction. This boundary distinguishes the two mappings;
-        // the 105-char title above wraps past 3 at both sizes.
-        let text = format!("{}\n===", "setext title ".repeat(5));
-        let m = measure(&text);
-        assert!(m.wrapped_lines > 3, "{} lines", m.wrapped_lines);
-        assert!(m.preview.is_some());
-    }
-
-    #[test]
-    fn a_picture_measures_as_its_label_not_its_payload() {
-        // An extracted picture contributes one label line to the measured
-        // text — never its base64 payload, which would skew the count.
+        // An extracted picture contributes one label line, never its base64 payload.
         let png = {
             let img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
             let mut buf = Vec::new();
@@ -820,29 +720,185 @@ mod tests {
         let uri = format!("data:image/png;base64,{}", STANDARD.encode(&png));
         let text = format!("before [IMAGE:{uri}] after");
         let m = measure(&text);
-        // Two short words plus the label — fits within the budget.
-        assert!(m.wrapped_lines <= 3, "{} lines", m.wrapped_lines);
+        assert!(
+            m.wrapped_lines <= MAX_PREVIEW_LINES,
+            "{} lines",
+            m.wrapped_lines
+        );
         assert!(m.preview.is_none());
         let measured = media_markers::preprocess(&text, None).display_text();
         assert!(!measured.contains("base64"), "got: {measured:?}");
         assert_eq!(measured, "🖼️ image\nbefore after");
     }
 
+    /// Headings are measured at their own size: a flat body-size count under-counts a long heading.
     #[test]
-    fn preview_is_bounded_for_huge_messages() {
-        // A huge message (system-prompt sized) must collapse with a bounded
-        // preview, and the measurement must stop early (asserted implicitly
-        // by the preview length).
-        let text = format!("{}\n{}", "p ".repeat(50_000), "q ".repeat(50_000));
-        let m = measure(&text);
-        assert!(m.wrapped_lines > 3);
-        let preview = m.preview.expect("huge message must collapse");
-        assert_preview_lines(&preview, 3);
-        assert!(
-            preview.len() < 2_000,
-            "preview too large: {}",
-            preview.len()
+    fn heading_measurement_cases() {
+        run_measure_cases(&[
+            (
+                "long ATX heading wraps past the budget",
+                format!("# {}", "heading ".repeat(15)),
+                None,
+                Preview::Shown,
+            ),
+            (
+                "long indented ATX heading",
+                format!("  # {}", "heading ".repeat(15)),
+                None,
+                Preview::Shown,
+            ),
+            (
+                "4+ spaces of indent is not a heading",
+                format!("    # {}", "h".repeat(5)),
+                Some(1),
+                Preview::Expanded,
+            ),
+            (
+                "body-sized H5 stays short",
+                format!("##### {}", "h".repeat(20)),
+                Some(1),
+                Preview::Expanded,
+            ),
+            (
+                "long setext title measured at heading size",
+                format!("{}\n===", "setext heading title ".repeat(5)),
+                None,
+                Preview::Shown,
+            ),
+            (
+                "short setext title stays expanded",
+                "short title\n===".to_string(),
+                Some(2),
+                Preview::Expanded,
+            ),
+            (
+                "setext title boundary pins H1 vs H2",
+                format!("{}\n===", "setext title ".repeat(5)),
+                None,
+                Preview::Shown,
+            ),
+        ]);
+
+        let sizes = heading_sizes(MARKDOWN_TEXT_SIZE);
+        let mapping: &[(&str, Option<&str>, Option<f32>)] = &[
+            ("= is H1", Some("==="), Some(sizes[0])),
+            ("- is H2", Some("---"), Some(sizes[1])),
+            ("up to three leading spaces", Some("  ==="), Some(sizes[0])),
+            ("4+ leading spaces is no underline", Some("    ==="), None),
+            ("trailing whitespace is fine", Some("---  "), Some(sizes[1])),
+            ("mixed characters are no underline", Some("=-="), None),
+            ("a blank underline is none", Some(""), None),
+        ];
+        for &(name, underline, expected) in mapping {
+            assert_eq!(
+                setext_heading_size("title", underline, MARKDOWN_TEXT_SIZE),
+                expected,
+                "case {name}: heading size"
+            );
+        }
+        assert_eq!(
+            setext_heading_size("", Some("==="), MARKDOWN_TEXT_SIZE),
+            None,
+            "case blank title: none"
         );
+    }
+
+    /// Huge inputs: the measurement stops early and the preview stays bounded.
+    #[test]
+    fn bounded_preview_cases() {
+        #[derive(Default)]
+        struct Case {
+            name: &'static str,
+            text: String,
+            preview_lines: Option<usize>,
+            first_preview_line: Option<&'static str>,
+            second_line_max: Option<usize>,
+            max_preview_chars: Option<usize>,
+            is_prefix: bool,
+        }
+
+        let cases: &[Case] = &[
+            Case {
+                name: "huge two-line message",
+                text: format!("{}\n{}", "p ".repeat(50_000), "q ".repeat(50_000)),
+                preview_lines: Some(MAX_PREVIEW_LINES as usize),
+                max_preview_chars: Some(2_000),
+                ..Case::default()
+            },
+            Case {
+                name: "huge single-line message",
+                text: format!("{} end", "word ".repeat(20_000)),
+                preview_lines: Some(MAX_PREVIEW_LINES as usize),
+                is_prefix: true,
+                ..Case::default()
+            },
+            Case {
+                name: "unbreakable word",
+                text: format!("{} tail", "x".repeat(200_000)),
+                ..Case::default()
+            },
+            Case {
+                name: "code block",
+                text: format!("```\n{}\n```\nafter", "code ".repeat(200)),
+                preview_lines: Some(MAX_PREVIEW_LINES as usize),
+                first_preview_line: Some("```"),
+                second_line_max: Some(64),
+                ..Case::default()
+            },
+        ];
+
+        for case in cases {
+            let name = case.name;
+            let m = measure(&case.text);
+            assert!(
+                m.wrapped_lines > MAX_PREVIEW_LINES,
+                "case {name}: {} lines, expected past the budget",
+                m.wrapped_lines
+            );
+            let Some(preview) = m.preview.as_deref() else {
+                panic!("case {name}: the message must collapse");
+            };
+            if let Some(lines) = case.preview_lines {
+                assert_eq!(
+                    preview.split('\n').count(),
+                    lines,
+                    "case {name}: {preview:?}"
+                );
+            }
+            if let Some(first) = case.first_preview_line {
+                assert_eq!(
+                    preview.lines().next(),
+                    Some(first),
+                    "case {name}: first line"
+                );
+            }
+            if let Some(max) = case.second_line_max {
+                let second = preview
+                    .lines()
+                    .nth(1)
+                    .expect("second preview line is the code line");
+                assert!(
+                    second.chars().count() <= max,
+                    "case {name}: second line too long: {} chars",
+                    second.chars().count()
+                );
+            }
+            if let Some(max) = case.max_preview_chars {
+                assert!(
+                    preview.chars().count() < max,
+                    "case {name}: preview too large: {} chars",
+                    preview.chars().count()
+                );
+            }
+            if case.is_prefix {
+                let flat_preview: String = preview.chars().filter(|c| !c.is_whitespace()).collect();
+                let flat_text: String = case.text.chars().filter(|c| !c.is_whitespace()).collect();
+                assert!(
+                    flat_text.starts_with(&flat_preview),
+                    "case {name}: preview must be the start of the wrapped line: {preview:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -855,59 +911,6 @@ mod tests {
         assert_eq!(width_bucket(500.0), 31);
         assert_eq!(width_bucket(508.0), 31);
         assert_eq!(width_bucket(540.0), 33);
-    }
-
-    #[test]
-    fn huge_single_line_message_is_bounded() {
-        // A single source line of ~120KB with word breaks: the bounded-prefix
-        // shape must prove the collapse and produce the first 3 lines at
-        // their true wrap points without shaping the whole line.
-        let text = format!("{} end", "word ".repeat(20_000));
-        let m = measure(&text);
-        assert!(m.wrapped_lines > 3, "{} lines", m.wrapped_lines);
-        let preview = m.preview.expect("huge single-line message must collapse");
-        assert_preview_lines(&preview, 3);
-        let flat_preview: String = preview.chars().filter(|c| !c.is_whitespace()).collect();
-        let flat_text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(
-            flat_text.starts_with(&flat_preview),
-            "preview must be the start of the wrapped line: {preview:?}"
-        );
-    }
-
-    #[test]
-    fn huge_unbroken_word_line_errs_toward_collapse() {
-        // A 200KB unbroken word renders as one overflowing line; the bounded
-        // prefix cannot see past it, so the measurement errs toward
-        // collapsing (the safe direction) instead of shaping the whole line on
-        // the UI thread.
-        let text = format!("{} tail", "x".repeat(200_000));
-        let m = measure(&text);
-        assert!(m.wrapped_lines > 3, "{} lines", m.wrapped_lines);
-        assert!(m.preview.is_some());
-    }
-
-    #[test]
-    fn long_code_line_preview_capped_to_width() {
-        // A collapsing message whose first lines are code: the preview line
-        // must be capped to what fits the transcript width (it renders in
-        // the same font), not a generous fixed cap — otherwise the
-        // "3-line preview" would render as many wrapping visual lines.
-        let text = format!("```\n{}\n```\nafter", "code ".repeat(200));
-        let m = measure(&text);
-        assert!(m.wrapped_lines > 3, "{} lines", m.wrapped_lines);
-        let preview = m.preview.expect("must collapse");
-        assert_preview_lines(&preview, 3);
-        let mut lines = preview.lines();
-        assert_eq!(lines.next(), Some("```"));
-        let code_line = lines.next().expect("second preview line is the code line");
-        // ~59 body chars fit at the test width; the code line is truncated
-        // (with "…") far below the old 600-char cap.
-        assert!(
-            code_line.chars().count() <= 64,
-            "code preview line too long: {} chars",
-            code_line.chars().count()
-        );
     }
 
     #[test]
@@ -928,11 +931,7 @@ mod tests {
 
     #[test]
     fn mixed_direction_collapsing_message_preview_keeps_logical_order() {
-        // Truncation regression: a mixed-direction line ending or starting
-        // with a reversed RTL run sliced the visual-order glyph range,
-        // truncating the phrase at its first letter ("...ש"). A collapsing
-        // message's preview must keep every Hebrew char in logical order
-        // (the phrase may straddle a wrap, so newlines/spaces are ignored).
+        // Truncation regression: slicing visual-order glyphs dropped the first RTL letters.
         for n in 45..70 {
             let text = format!("{} שלום עולם {}", "x".repeat(n), "pad ".repeat(50));
             let m = measure(&text);

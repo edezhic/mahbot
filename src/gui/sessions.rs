@@ -1658,6 +1658,7 @@ mod tests {
     use super::*;
     use crate::ChatRole;
     use crate::agent::registry::RunningTool;
+    use SessionActivity::{Paused, Working};
 
     fn msg(role: ChatRole, content: Option<&str>) -> SessionEntry {
         SessionEntry::Message {
@@ -1747,58 +1748,62 @@ mod tests {
         assert_eq!(rendered, [true, true, true, false, true]);
     }
 
+    const STORED: &[(&str, i64)] = &[("a", 10), ("b", 5), ("c", 0)];
+    const PAUSED_STORED: &[(&str, i64)] = &[("a", 10), ("b", 0)];
+    const RUNNING: &[(&str, &str, i64, bool)] =
+        &[("a", "engineer", 1, false), ("zz", "analyst", 0, false)];
+    const PAUSED_RUNNING: &[(&str, &str, i64, bool)] = &[("a", "engineer", 0, true)];
+
+    type ProjRow<'a> = (&'a str, i64);
+    type RunRow<'a> = (&'a str, &'a str, i64, bool);
+    type OrderCase<'a> = (&'a str, &'a [ProjRow<'a>], &'a [RunRow<'a>], &'a [&'a str]);
+    /// Running sessions are pinned on top in start order; everything else follows by last activity.
     #[test]
-    fn running_sessions_are_pinned_above_last_activity_order() {
-        let now = chrono::Utc::now();
-        let mut state = SessionsState::new();
-        state.sessions.settle(Ok(vec![
-            metadata("a", now - chrono::Duration::minutes(10)),
-            metadata("b", now - chrono::Duration::minutes(5)),
-            metadata("c", now),
-        ]));
-
-        let rows = session_rows(
-            state.sessions.entries(),
-            &[
-                agent("a", "engineer", "ws", now - chrono::Duration::minutes(1)),
-                // Started while the page was open, before its first message
-                // landed: registered, but with no stored row of its own.
-                agent("zz", "analyst", "ws", now),
-            ],
-            now.into(),
-        );
-
-        let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
-        // Running rows on top (oldest run first), then the rest by last
-        // activity.
-        assert_eq!(ids, ["a", "zz", "c", "b"]);
-        assert_eq!(rows[1].msg_count_label, None, "no stored row, no count");
-        assert_eq!(
-            rows[1].title, "ws",
-            "a synthesised row is titled by project"
-        );
-        assert_eq!(
-            rows[1].role,
-            "analyst".parse::<crate::Role>().ok(),
-            "and carries its role"
-        );
-    }
-
-    #[test]
-    fn a_paused_agent_keeps_its_last_activity_place() {
-        let now = chrono::Utc::now();
-        let sessions = [
-            metadata("a", now - chrono::Duration::minutes(10)),
-            metadata("b", now),
+    fn test_session_row_ordering() {
+        let cases: &[OrderCase] = &[
+            ("running", STORED, RUNNING, &["a", "zz", "c", "b"]),
+            ("paused", PAUSED_STORED, PAUSED_RUNNING, &["b", "a"]),
         ];
-        let mut paused = agent("a", "engineer", "ws", now);
-        paused.paused = true;
 
-        let rows = session_rows(&sessions, &[paused], now.into());
-        let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
+        for &(name, sessions, running, order) in cases {
+            let now = chrono::Utc::now();
+            let started = |minutes: i64| now - chrono::Duration::minutes(minutes);
+            let stored: Vec<_> = sessions
+                .iter()
+                .map(|&(id, m)| metadata(id, started(m)))
+                .collect();
+            let agents: Vec<_> = running
+                .iter()
+                .map(|&(id, role, minutes, paused)| {
+                    let mut handle = agent(id, role, "ws", started(minutes));
+                    handle.paused = paused;
+                    handle
+                })
+                .collect();
+            let rows = session_rows(&stored, &agents, now.into());
+            let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
+            assert_eq!(ids, order, "case {name}: order");
 
-        assert_eq!(ids, ["b", "a"], "a frozen run is not pinned");
-        assert_eq!(rows[1].activity, SessionActivity::Paused);
+            for &(id, role, _, paused) in running {
+                let row = rows
+                    .iter()
+                    .find(|r| r.agent_id == id)
+                    .expect("a running row");
+                let listed = if paused { Paused } else { Working };
+                assert_eq!(row.activity, listed, "case {name}: {id} activity");
+                if sessions.iter().any(|&(stored, _)| stored == id) {
+                    continue;
+                }
+                // A running agent with no stored row is synthesised from the registry.
+                assert_eq!(row.msg_count_label, None, "case {name}: no count");
+                assert_eq!(row.title, "ws", "case {name}: titled by project");
+                assert_eq!(
+                    row.role,
+                    role.parse::<crate::Role>().ok(),
+                    "case {name}: role"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1874,99 +1879,80 @@ mod tests {
         );
     }
 
+    /// The common prefix is the count of leading entries the two ledgers share.
     #[test]
-    fn common_entry_prefix_empty_vs_empty() {
-        assert_eq!(common_entry_prefix(&[], &[]), 0);
-    }
+    fn test_common_entry_prefix() {
+        use ChatRole::{Assistant, User};
+        use Ledger::{Msg, Tool};
 
-    #[test]
-    fn common_entry_prefix_identical() {
-        let old = vec![msg(ChatRole::User, Some("hi")), tool_round()];
-        let new = old.clone();
-        assert_eq!(common_entry_prefix(&old, &new), old.len());
-    }
+        /// One entry of a ledger: a message, or the tool-round fixture.
+        enum Ledger {
+            Msg(ChatRole, Option<&'static str>),
+            Tool,
+        }
 
-    #[test]
-    fn common_entry_prefix_pure_append() {
-        let old = vec![msg(ChatRole::User, Some("hi"))];
-        let mut new = old.clone();
-        new.push(msg(ChatRole::Assistant, Some("hello")));
-        new.push(tool_round());
-        assert_eq!(common_entry_prefix(&old, &new), old.len());
-    }
-
-    #[test]
-    fn common_entry_prefix_in_place_edit() {
-        let old = vec![
-            msg(ChatRole::User, Some("a")),
-            msg(ChatRole::Assistant, Some("b")),
-            msg(ChatRole::User, Some("c")),
-            msg(ChatRole::Assistant, Some("d")),
+        const HI: &[Ledger] = &[Msg(User, Some("hi")), Tool];
+        const HI_YO: &[Ledger] = &[Msg(User, Some("hi")), Msg(Assistant, Some("yo"))];
+        const A_B: &[Ledger] = &[Msg(User, Some("a")), Msg(Assistant, Some("b"))];
+        const A_C: &[Ledger] = &[Msg(User, Some("a")), Msg(Assistant, Some("c"))];
+        let cases: &[(&str, &[Ledger], &[Ledger], usize)] = &[
+            ("empty", &[], &[], 0),
+            ("same", HI, HI, 2),
+            ("appended", &[Msg(User, Some("hi"))], HI_YO, 1),
+            ("edited", A_B, A_C, 1),
+            ("longer old", A_B, &[Msg(User, Some("a"))], 1),
         ];
-        let mut new = old.clone();
-        new[2] = msg(ChatRole::User, Some("edited"));
-        assert_eq!(common_entry_prefix(&old, &new), 2);
+
+        for &(name, old, new, shared) in cases {
+            let ledger = |entries: &[Ledger]| -> Vec<SessionEntry> {
+                entries
+                    .iter()
+                    .map(|entry| match *entry {
+                        Msg(role, body) => msg(role, body),
+                        Tool => tool_round(),
+                    })
+                    .collect()
+            };
+            let prefix = common_entry_prefix(&ledger(old), &ledger(new));
+            assert_eq!(prefix, shared, "case {name}: shared entries");
+        }
     }
 
+    /// A transcript failure stays in the selected session's pane; a successful load clears it.
     #[test]
-    fn common_entry_prefix_differing_lengths() {
-        let old = vec![
-            msg(ChatRole::User, Some("a")),
-            msg(ChatRole::Assistant, Some("b")),
+    fn test_transcript_load_errors() {
+        /// A transcript result for one session key.
+        #[derive(Clone, Copy)]
+        enum Load {
+            Failed(&'static str),
+            Loaded(&'static str),
+        }
+        use Load::{Failed, Loaded};
+        type LoadCase<'a> = (&'a str, Option<&'a str>, Load, Option<&'a str>, bool);
+        let cases: &[LoadCase] = &[
+            ("stays", None, Failed("s1"), Some("read failed"), false),
+            ("left", None, Failed("s2"), None, true),
+            ("clears", Some("old"), Loaded("s1"), None, false),
         ];
-        let new = vec![msg(ChatRole::User, Some("a"))];
-        assert_eq!(common_entry_prefix(&old, &new), 1);
-    }
 
-    #[test]
-    fn transcript_error_stays_out_of_the_list_banner() {
-        let mut state = SessionsState::new();
-        state.selected_session = Some("s1".to_string());
-        state.selected_loading = true;
-
-        let _ = state.update(
-            SessionsMessage::SessionError {
-                key: "s1".to_string(),
-                error: "read failed".to_string(),
-            },
-            &HashMap::new(),
-        );
-
-        assert_eq!(state.selected_error.as_deref(), Some("read failed"));
-        assert!(!state.selected_loading);
-        assert!(
-            state.sessions.error().is_none(),
-            "a transcript failure must not surface in the session-list banner"
-        );
-
-        // An error for a session the user has since left is ignored.
-        state.selected_error = None;
-        state.selected_loading = true;
-        let _ = state.update(
-            SessionsMessage::SessionError {
-                key: "s2".to_string(),
-                error: "stale failure".to_string(),
-            },
-            &HashMap::new(),
-        );
-        assert!(state.selected_error.is_none());
-        assert!(state.selected_loading);
-    }
-
-    #[test]
-    fn successful_transcript_load_clears_the_error() {
-        let mut state = SessionsState::new();
-        state.selected_session = Some("s1".to_string());
-        state.selected_error = Some("old failure".to_string());
-        state.selected_loading = true;
-
-        let _ = state.update(
-            SessionsMessage::SessionMessages("s1".to_string(), vec![]),
-            &HashMap::new(),
-        );
-
-        assert!(state.selected_error.is_none());
-        assert!(!state.selected_loading);
+        for &(name, error, msg, expected, loading) in cases {
+            let mut state = SessionsState::new();
+            state.selected_session = Some("s1".to_string());
+            state.selected_loading = true;
+            state.selected_error = error.map(str::to_string);
+            let message = match msg {
+                Failed(key) => SessionsMessage::SessionError {
+                    key: key.to_string(),
+                    error: "read failed".to_string(),
+                },
+                Loaded(key) => SessionsMessage::SessionMessages(key.to_string(), vec![]),
+            };
+            let _ = state.update(message, &HashMap::new());
+            let error = state.selected_error.as_deref();
+            assert_eq!(error, expected, "case {name}: error");
+            assert_eq!(state.selected_loading, loading, "case {name}: loading");
+            assert!(state.sessions.error().is_none(), "case {name}: list banner");
+        }
     }
 
     fn cached_item(
@@ -2003,56 +1989,46 @@ mod tests {
             .collect()
     }
 
+    /// A stored workspace name resolves a session's media root and titles workspace-scoped cards.
     #[test]
-    fn workspace_root_for_resolves_every_stored_name_shape() {
+    fn test_workspace_root_and_card_titles() {
+        use crate::Role;
         let admin = crate::users::ADMIN_USER_NAME;
-        assert_eq!(
-            workspace_root_for(&format!("personal:{admin}"), &HashMap::new()),
-            Some(crate::users::personal_workspace_path(admin)),
-            "a personal workspace is synthetic, so it resolves by name"
-        );
-
-        let mut map = workspace_map(&["mahbot_rlx"]);
-        map.get_mut("mahbot_rlx").unwrap().path = "/tmp/ws/mahbot_rlx".to_string();
-        assert_eq!(
-            workspace_root_for("mahbot_rlx", &map),
-            Some(PathBuf::from("/tmp/ws/mahbot_rlx")),
-            "a managed workspace resolves to its path"
-        );
-        assert_eq!(
-            workspace_root_for("/tmp/ws/stored", &map),
-            Some(PathBuf::from("/tmp/ws/stored")),
-            "an absolute stored name is its own root"
-        );
-        assert_eq!(
-            workspace_root_for("gone", &map),
-            None,
-            "an unknown relative name has no root"
-        );
-    }
-
-    #[test]
-    fn workspace_scoped_cards_are_titled_by_their_managed_workspace() {
-        let map = workspace_map(&["mahbot_rlx"]);
-
-        for role in [crate::Role::Manager, crate::Role::Maintainer] {
-            let scoped = cached_item(role, Some("admin"), Some("mahbot_rlx"));
-            assert_eq!(scoped.display_title(&map), "mahbot_rlx");
-            // The last turn's user never decides a workspace-scoped title.
-            let no_user = cached_item(role, None, Some("mahbot_rlx"));
-            assert_eq!(no_user.display_title(&map), "mahbot_rlx");
-            // A workspace no longer in the managed set leaves the role alone.
-            let orphaned = cached_item(role, Some("admin"), Some("deleted_ws"));
-            assert_eq!(orphaned.display_title(&map), role.display_label());
-            // A session with no recorded workspace is equally "not known".
-            let no_workspace = cached_item(role, Some("admin"), None);
-            assert_eq!(no_workspace.display_title(&map), role.display_label());
+        let personal = format!("personal:{admin}");
+        let mut map = workspace_map(&["ws"]);
+        map.get_mut("ws").unwrap().path = "/tmp/ws".to_string();
+        let roots = [
+            (
+                personal.as_str(),
+                Some(crate::users::personal_workspace_path(admin)),
+            ),
+            ("ws", Some(PathBuf::from("/tmp/ws"))),
+            ("/tmp/ws/stored", Some(PathBuf::from("/tmp/ws/stored"))),
+            ("gone", None),
+        ];
+        for (stored, root) in roots {
+            let resolved = workspace_root_for(stored, &map);
+            assert_eq!(resolved, root, "case {stored}: stored name shape");
         }
 
-        // Every other role keeps the user name it shows today.
-        let assistant = cached_item(crate::Role::Assistant, Some("admin"), Some("mahbot_rlx"));
-        assert_eq!(assistant.display_title(&map), "admin");
-        let engineer = cached_item(crate::Role::Engineer, Some("alice"), Some("mahbot_rlx"));
-        assert_eq!(engineer.display_title(&map), "alice");
+        let titles = [
+            (Role::Manager, Some("admin"), Some("ws"), Some("ws")),
+            (Role::Manager, None, Some("ws"), Some("ws")),
+            (Role::Manager, Some("admin"), Some("gone"), None),
+            (Role::Manager, Some("admin"), None, None),
+            (Role::Maintainer, Some("admin"), Some("ws"), Some("ws")),
+            (Role::Maintainer, None, Some("ws"), Some("ws")),
+            (Role::Maintainer, Some("admin"), Some("gone"), None),
+            (Role::Maintainer, Some("admin"), None, None),
+            (Role::Assistant, Some("admin"), Some("ws"), Some("admin")),
+            (Role::Engineer, Some("alice"), Some("ws"), Some("alice")),
+        ];
+        for (role, user, workspace, expected) in titles {
+            let item = cached_item(role, user, workspace);
+            let label = role.display_label();
+            let title = expected.map_or_else(|| label.to_string(), str::to_string);
+            let shown = item.display_title(&map);
+            assert_eq!(shown, title, "case {role:?}: a card title");
+        }
     }
 }

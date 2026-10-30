@@ -245,146 +245,116 @@ pub(crate) fn tool_block<Message: 'static>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn truncate_at_boundary_cuts_at_word_and_path_delimiters() {
-        // Cut at a word boundary rather than mid-word.
-        assert_eq!(truncate_at_boundary("abc def ghi", 5), "abc…");
-        // When the cap lands exactly before a delimiter, keep the full words.
-        assert_eq!(truncate_at_boundary("abc def ghi", 7), "abc def…");
-        // Paths break at a `/` segment boundary.
-        assert_eq!(
-            truncate_at_boundary("/Users/egordezic/Desktop/foo.rs", 26),
-            "/Users/egordezic/Desktop/…"
-        );
-        // An unbroken token falls back to a hard char cut at the cap.
-        assert_eq!(truncate_at_boundary("aaaaaaaa", 4), "aaaa…");
-        // Under the cap: unchanged.
-        assert_eq!(truncate_at_boundary("short", 10), "short");
+    fn read_tool(args: Vec<(String, String)>) -> RunningTool {
+        RunningTool {
+            name: "read_file".to_string(),
+            args,
+        }
     }
 
+    /// Every cut happens at the last delimiter at or before the cap, falls back to a hard char cut, and reports omission.
     #[test]
-    fn value_display_truncates_at_delimiter_boundary() {
-        // A path under the cap is unchanged (and not flagged as cut).
-        assert_eq!(
-            value_display("/Users/egordezic/Desktop/foo.rs"),
-            ("/Users/egordezic/Desktop/foo.rs".to_string(), false)
-        );
-        // Control chars collapse to spaces.
-        assert_eq!(value_display("a\nb"), ("a b".to_string(), false));
-        // Unbroken long token hard-cuts at [`MAX_TOOL_VALUE_CHARS`].
-        assert_eq!(
-            value_display(&"a".repeat(110)),
-            (format!("{}…", "a".repeat(MAX_TOOL_VALUE_CHARS)), true)
-        );
-        // A value over the cap cuts at a `/` delimiter boundary.
-        let long_path = format!("{}/{}", "a".repeat(60), "b".repeat(60));
-        assert_eq!(
-            value_display(&long_path),
-            (format!("{}…", "a".repeat(60) + "/"), true)
-        );
-    }
+    fn truncation_cases() {
+        let boundary: &[(&str, &str, usize, &str)] = &[
+            (
+                "cut at a word boundary rather than mid-word",
+                "abc def ghi",
+                5,
+                "abc…",
+            ),
+            (
+                "a cap landing exactly before a delimiter keeps the full words",
+                "abc def ghi",
+                7,
+                "abc def…",
+            ),
+            (
+                "paths break at a `/` segment boundary",
+                "/Users/egordezic/Desktop/foo.rs",
+                26,
+                "/Users/egordezic/Desktop/…",
+            ),
+            (
+                "an unbroken token falls back to a hard char cut at the cap",
+                "aaaaaaaa",
+                4,
+                "aaaa…",
+            ),
+            ("under the cap: unchanged", "short", 10, "short"),
+        ];
+        for &(name, input, cap, expected) in boundary {
+            assert_eq!(
+                truncate_at_boundary(input, cap),
+                expected,
+                "case {name}: truncation"
+            );
+        }
 
-    #[test]
-    fn tool_pairs_summary_truncates_at_pair_boundary() {
-        // Under the line cap: returned verbatim, nothing omitted.
-        let short = RunningTool {
-            name: "read_file".to_string(),
-            args: vec![("path".to_string(), "a.rs".to_string())],
-        };
-        assert_eq!(
-            tool_pairs_summary(&short, ToolBlockView::Full),
-            ("path: a.rs".to_string(), false)
-        );
+        let values: Vec<(&str, String, String, bool)> = vec![
+            (
+                "a path under the cap is unchanged",
+                "/Users/egordezic/Desktop/foo.rs".to_string(),
+                "/Users/egordezic/Desktop/foo.rs".to_string(),
+                false,
+            ),
+            (
+                "control chars collapse to spaces",
+                "a\nb".to_string(),
+                "a b".to_string(),
+                false,
+            ),
+            (
+                "an unbroken long token hard-cuts at MAX_TOOL_VALUE_CHARS",
+                "a".repeat(110),
+                format!("{}…", "a".repeat(MAX_TOOL_VALUE_CHARS)),
+                true,
+            ),
+            (
+                "a value over the cap cuts at a `/` delimiter boundary",
+                format!("{}/{}", "a".repeat(60), "b".repeat(60)),
+                format!("{}…", "a".repeat(60) + "/"),
+                true,
+            ),
+        ];
+        for (name, input, expected, expected_omits) in values {
+            assert_eq!(
+                value_display(&input),
+                (expected, expected_omits),
+                "case {name}: value display"
+            );
+        }
 
-        // Over the line cap: whole pairs kept while they fit, then a trailing
-        // "…" marks the cut; the excluded final pair never appears.
-        let tool = RunningTool {
-            name: "read_file".to_string(),
-            args: vec![
-                (
-                    "path".to_string(),
-                    "/Users/egordezic/Desktop/project/aaa/foo_long.rs".to_string(),
-                ),
-                (
-                    "offset".to_string(),
-                    "/Users/egordezic/Desktop/project/bbb/bar_long.rs".to_string(),
-                ),
-                (
-                    "limit".to_string(),
-                    "/Users/egordezic/Desktop/project/ccc/baz_long.rs".to_string(),
-                ),
-                (
-                    "query".to_string(),
-                    "/Users/egordezic/Desktop/project/ddd/qux_long.rs".to_string(),
-                ),
-                (
-                    "sort".to_string(),
-                    "/Users/egordezic/Desktop/project/eee/quux_long.rs".to_string(),
-                ),
-                (
-                    "desc".to_string(),
-                    "/Users/egordezic/Desktop/project/fff/corge_long.rs".to_string(),
-                ),
-            ],
-        };
-        let (line, omits) = tool_pairs_summary(&tool, ToolBlockView::Full);
-        assert!(line.chars().count() <= MAX_TOOL_PAIRS_LINE_CHARS);
-        assert!(line.ends_with('…'));
-        assert!(line.contains("path"));
-        assert!(!line.contains("desc"), "excluded pair must not appear");
-        assert!(omits, "line cut must report omission");
-    }
+        let short = read_tool(vec![("path".to_string(), "a.rs".to_string())]);
+        let full = tool_pairs_summary(&short, ToolBlockView::Full);
+        assert_eq!(full, ("path: a.rs".to_string(), false));
+        let compact = tool_pairs_summary(&short, ToolBlockView::Compact);
+        assert_eq!(compact, ("a.rs".to_string(), true));
 
-    #[test]
-    fn tool_pairs_summary_fallback_truncates_first_pair_at_boundary() {
-        // A single pair longer than the line cap: when the first pair contains
-        // no delimiter it is hard-cut exactly at the cap (with "…"), never left
-        // overflowing the line.
-        let tool = RunningTool {
-            name: "read_file".to_string(),
-            args: vec![("k".repeat(220), "v".to_string())],
-        };
-        let (line, omits) = tool_pairs_summary(&tool, ToolBlockView::Full);
-        assert_eq!(line, format!("{}…", "k".repeat(MAX_TOOL_PAIRS_LINE_CHARS)));
-        assert!(omits, "line cut must report omission");
-    }
-
-    #[test]
-    fn tool_pairs_summary_omits_only_when_information_is_hidden() {
-        // (a) Compact single short arg → omits true, text is just the value
-        // (the argument name is hidden).
-        let single = RunningTool {
-            name: "read_file".to_string(),
-            args: vec![("path".to_string(), "a.rs".to_string())],
-        };
-        assert_eq!(
-            tool_pairs_summary(&single, ToolBlockView::Compact),
-            ("a.rs".to_string(), true)
-        );
-
-        // (b) Full view short args → omits false (nothing hidden).
-        assert_eq!(
-            tool_pairs_summary(&single, ToolBlockView::Full),
-            ("path: a.rs".to_string(), false)
-        );
-
-        // (c) Full view with one over-cap value → omits true (per-value cut).
-        let over_cap = RunningTool {
-            name: "read_file".to_string(),
-            args: vec![("path".to_string(), "a".repeat(120))],
-        };
+        let over_cap = read_tool(vec![("path".to_string(), "a".repeat(120))]);
         let (line, omits) = tool_pairs_summary(&over_cap, ToolBlockView::Full);
         assert!(omits);
         assert!(line.ends_with('…'));
 
-        // (d) Empty args → omits false, empty text.
-        let empty = RunningTool {
-            name: "read_file".to_string(),
-            args: Vec::new(),
-        };
-        assert_eq!(
-            tool_pairs_summary(&empty, ToolBlockView::Full),
-            (String::new(), false)
-        );
+        let empty = read_tool(Vec::new());
+        let nothing = (String::new(), false);
+        assert_eq!(tool_pairs_summary(&empty, ToolBlockView::Full), nothing);
+
+        let mut args = Vec::new();
+        for seg in ["aaa", "bbb", "ccc", "ddd", "eee", "fff"] {
+            let path = format!("/Users/egordezic/Desktop/project/{seg}/foo_long.rs");
+            args.push((format!("{seg}_key"), path));
+        }
+        let tool = read_tool(args);
+        let (line, omits) = tool_pairs_summary(&tool, ToolBlockView::Full);
+        assert!(line.chars().count() <= MAX_TOOL_PAIRS_LINE_CHARS);
+        assert!(line.ends_with('…'));
+        assert!(line.contains("aaa_key"));
+        assert!(!line.contains("fff"), "excluded pair must not appear");
+        assert!(omits, "line cut must report omission");
+
+        let long_pair = read_tool(vec![("k".repeat(220), "v".to_string())]);
+        let (line, omits) = tool_pairs_summary(&long_pair, ToolBlockView::Full);
+        assert_eq!(line, format!("{}…", "k".repeat(MAX_TOOL_PAIRS_LINE_CHARS)));
+        assert!(omits, "line cut must report omission");
     }
 }

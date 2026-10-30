@@ -152,36 +152,37 @@ mod tests {
     use super::hard_breaks;
 
     #[test]
-    fn hard_breaks_converts_prose_soft_breaks() {
-        assert_eq!(hard_breaks("foo\nbar").as_ref(), "foo  \nbar");
-        assert_eq!(hard_breaks("a\nb\nc").as_ref(), "a  \nb  \nc");
-    }
-
-    #[test]
-    fn hard_breaks_preserves_paragraph_gaps() {
-        assert_eq!(hard_breaks("foo\n\nbar").as_ref(), "foo\n\nbar");
-        assert_eq!(hard_breaks("a\nb\n\npara2").as_ref(), "a  \nb\n\npara2");
-    }
-
-    #[test]
-    fn hard_breaks_leaves_code_untouched() {
-        // fenced code block (incl. a blank line inside it)
-        assert_eq!(
-            hard_breaks("x\n```\ncode\n\nnext\n```\ny").as_ref(),
-            "x\n```\ncode\n\nnext\n```\ny"
-        );
-        // indented code block
-        assert_eq!(
-            hard_breaks("    code\n    line2\nplain").as_ref(),
-            "    code\n    line2\nplain"
-        );
-        // inline code span
-        assert_eq!(hard_breaks("foo `a\nb` bar").as_ref(), "foo `a\nb` bar");
-    }
-
-    #[test]
-    fn hard_breaks_normalizes_crlf_and_cr() {
-        assert_eq!(hard_breaks("foo\r\nbar").as_ref(), "foo  \nbar");
-        assert_eq!(hard_breaks("foo\rbar").as_ref(), "foo  \nbar");
+    fn hard_breaks_cases() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("prose soft break", "foo\nbar", "foo  \nbar"),
+            ("several prose soft breaks", "a\nb\nc", "a  \nb  \nc"),
+            ("paragraph gap preserved", "foo\n\nbar", "foo\n\nbar"),
+            (
+                "soft break before a paragraph gap",
+                "a\nb\n\npara2",
+                "a  \nb\n\npara2",
+            ),
+            // fenced code block (incl. a blank line inside it)
+            (
+                "fenced code untouched",
+                "x\n```\ncode\n\nnext\n```\ny",
+                "x\n```\ncode\n\nnext\n```\ny",
+            ),
+            (
+                "indented code untouched",
+                "    code\n    line2\nplain",
+                "    code\n    line2\nplain",
+            ),
+            (
+                "inline code span untouched",
+                "foo `a\nb` bar",
+                "foo `a\nb` bar",
+            ),
+            ("crlf normalized", "foo\r\nbar", "foo  \nbar"),
+            ("cr normalized", "foo\rbar", "foo  \nbar"),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(hard_breaks(input).as_ref(), expected, "case {name}");
+        }
     }
 }

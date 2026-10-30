@@ -4,100 +4,56 @@
 use super::*;
 use crate::gui::editor_widget::{EditorAction, EditorBuffer};
 
-// ── compute_text_matches ────────────────────────────────────
+fn fs_entry(name: &str, full_path: &str, is_dir: bool) -> FsEntry {
+    FsEntry {
+        name: name.to_string(),
+        full_path: full_path.to_string(),
+        is_dir,
+        error: None,
+    }
+}
+
+type MatchCase<'a> = (&'a str, &'a str, &'a str, bool, &'a [(usize, usize)]);
 
 #[test]
 fn test_compute_text_matches() {
-    struct Case {
-        text: &'static str,
-        query: &'static str,
-        sensitive: bool,
-        expected: &'static [(usize, usize)],
-    }
-    let cases: &[Case] = &[
-        // Empty query
-        Case {
-            text: "hello",
-            query: "",
-            sensitive: true,
-            expected: &[],
-        },
-        // Basic match
-        Case {
-            text: "hello world hello",
-            query: "hello",
-            sensitive: true,
-            expected: &[(0, 5), (12, 17)],
-        },
-        // No match
-        Case {
-            text: "hello world",
-            query: "xyz",
-            sensitive: true,
-            expected: &[],
-        },
-        // Non-overlapping
-        Case {
-            text: "aaaaa",
-            query: "aa",
-            sensitive: true,
-            expected: &[(0, 2), (2, 4)],
-        },
-        // Case-insensitive
-        Case {
-            text: "Hello World hello",
-            query: "hello",
-            sensitive: false,
-            expected: &[(0, 5), (12, 17)],
-        },
-        // Case-insensitive no match
-        Case {
-            text: "Hello World",
-            query: "xyz",
-            sensitive: false,
-            expected: &[],
-        },
-        // Single-char queries return empty (2-char min enforcement)
-        Case {
-            text: "hello",
-            query: "h",
-            sensitive: true,
-            expected: &[],
-        },
-        // Boundary: shortest possible match
-        Case {
-            text: "ab",
-            query: "ab",
-            sensitive: true,
-            expected: &[(0, 2)],
-        },
-        // Boundary: consecutive matches
-        Case {
-            text: "abab",
-            query: "ab",
-            sensitive: true,
-            expected: &[(0, 2), (2, 4)],
-        },
+    // (name, text, query, case-sensitive, expected match ranges)
+    let cases: &[MatchCase] = &[
+        ("empty_query", "hello", "", true, &[]),
+        (
+            "basic",
+            "hello world hello",
+            "hello",
+            true,
+            &[(0, 5), (12, 17)],
+        ),
+        ("no_match", "hello world", "xyz", true, &[]),
+        // Non-overlapping matches.
+        ("non_overlapping", "aaaaa", "aa", true, &[(0, 2), (2, 4)]),
+        (
+            "case_insensitive",
+            "Hello World hello",
+            "hello",
+            false,
+            &[(0, 5), (12, 17)],
+        ),
+        (
+            "case_insensitive_no_match",
+            "Hello World",
+            "xyz",
+            false,
+            &[],
+        ),
+        // Single-char queries return empty (2-char min enforcement).
+        ("single_char", "hello", "h", true, &[]),
+        ("shortest_match", "ab", "ab", true, &[(0, 2)]),
+        ("consecutive", "abab", "ab", true, &[(0, 2), (2, 4)]),
     ];
-    for case in cases {
-        let result = compute_text_matches(case.text, case.query, case.sensitive);
-        assert_eq!(
-            result.len(),
-            case.expected.len(),
-            "text={:?} query={:?} sensitive={}",
-            case.text,
-            case.query,
-            case.sensitive
-        );
-        for (i, &(start, end)) in case.expected.iter().enumerate() {
-            assert_eq!(
-                result[i],
-                start..end,
-                "match[{i}] text={:?} query={:?} sensitive={}",
-                case.text,
-                case.query,
-                case.sensitive
-            );
+    for &(name, text, query, sensitive, expected) in cases {
+        let result = compute_text_matches(text, query, sensitive);
+        assert_eq!(result.len(), expected.len(), "case {name}: match count");
+        for (i, &(start, end)) in expected.iter().enumerate() {
+            assert_eq!(result[i], start..end, "case {name}: match {i}");
         }
     }
 }
@@ -143,13 +99,15 @@ fn test_byte_offset_to_line_byte_col_unicode() {
 }
 
 #[test]
-fn test_build_tab_records_persists_dirty_content() {
-    let tabs = vec![Tab {
-        path: "/tmp/foo.md".to_string(),
-        file_name: "foo.md".to_string(),
-        is_dirty: true,
-        line_ending: LineEnding::Lf,
-    }];
+fn test_build_tab_records_dirty_content() {
+    let tabs = |is_dirty: bool| {
+        vec![Tab {
+            path: "/tmp/foo.md".to_string(),
+            file_name: "foo.md".to_string(),
+            is_dirty,
+            line_ending: LineEnding::Lf,
+        }]
+    };
     let mut tab_contents = HashMap::new();
     let buffer = EditorBuffer::with_text("unsaved edits", None);
     tab_contents.insert(
@@ -161,22 +119,20 @@ fn test_build_tab_records_persists_dirty_content() {
             saved_text_hash: 0,
         },
     );
-    let records = build_tab_records(&tabs, 0, &tab_contents);
-    assert_eq!(records.len(), 1);
-    assert!(records[0].is_dirty);
-    assert_eq!(records[0].dirty_content.as_deref(), Some("unsaved edits"));
-}
+    let records = build_tab_records(&tabs(true), 0, &tab_contents);
+    assert_eq!(records.len(), 1, "dirty tab: record count");
+    assert!(records[0].is_dirty, "dirty tab: flag kept");
+    assert_eq!(
+        records[0].dirty_content.as_deref(),
+        Some("unsaved edits"),
+        "dirty tab: unsaved content persisted"
+    );
 
-#[test]
-fn test_build_tab_records_clears_dirty_content_when_clean() {
-    let tabs = vec![Tab {
-        path: "/tmp/foo.md".to_string(),
-        file_name: "foo.md".to_string(),
-        is_dirty: false,
-        line_ending: LineEnding::Lf,
-    }];
-    let records = build_tab_records(&tabs, 0, &HashMap::new());
-    assert!(records[0].dirty_content.is_none());
+    let records = build_tab_records(&tabs(false), 0, &HashMap::new());
+    assert!(
+        records[0].dirty_content.is_none(),
+        "clean tab: no content stored"
+    );
 }
 
 #[test]
@@ -243,67 +199,28 @@ fn test_failed_saved_tabs_restore_blocks_persistence() {
 
 #[test]
 fn test_byte_offset_to_line_col() {
-    struct Case {
-        text: &'static str,
-        byte_offset: usize,
-        expected: (usize, usize),
-    }
-    let cases: &[Case] = &[
-        // Unicode multi-byte chars
-        Case {
-            text: "Привет мир",
-            byte_offset: 13, // start of "м"
-            expected: (0, 7),
-        },
-        // Start of content
-        Case {
-            text: "hello\nworld",
-            byte_offset: 0,
-            expected: (0, 0),
-        },
-        // Second line
-        Case {
-            text: "hello\nworld",
-            byte_offset: 6, // after "hello\n"
-            expected: (1, 0),
-        },
-        // Middle of a line
-        Case {
-            text: "hello\nworld",
-            byte_offset: 8, // "wo"
-            expected: (1, 2),
-        },
-        // Beyond text length — clamps to end
-        Case {
-            text: "hello",
-            byte_offset: 100,
-            expected: (0, 5),
-        },
-        // Empty content
-        Case {
-            text: "",
-            byte_offset: 0,
-            expected: (0, 0),
-        },
-        // Empty content with out-of-bounds offset — clamps to start
-        Case {
-            text: "",
-            byte_offset: 100,
-            expected: (0, 0),
-        },
+    // (name, text, byte offset, expected (line, column))
+    let cases = [
+        ("unicode_multibyte", "Привет мир", 13, (0, 7)),
+        ("start", "hello\nworld", 0, (0, 0)),
+        ("second_line", "hello\nworld", 6, (1, 0)),
+        ("middle_of_line", "hello\nworld", 8, (1, 2)),
+        // Beyond the text length clamps to the end.
+        ("beyond_end", "hello", 100, (0, 5)),
+        ("empty", "", 0, (0, 0)),
+        // Empty content with an out-of-bounds offset clamps to the start.
+        ("empty_beyond_end", "", 100, (0, 0)),
     ];
-    for case in cases {
-        let pos = byte_offset_to_line_col(case.text, case.byte_offset);
+    for &(name, text, byte_offset, expected) in &cases {
         assert_eq!(
-            pos, case.expected,
-            "text={:?} offset={}",
-            case.text, case.byte_offset
+            byte_offset_to_line_col(text, byte_offset),
+            expected,
+            "case {name}: (line, column)"
         );
     }
 }
 
-/// Fluent builder for an [`EditorState`] with tab fixtures; modifiers
-/// apply to the tab just added.
+/// Fluent builder for an [`EditorState`] with tab fixtures.
 struct EditorFixture(EditorState);
 
 impl EditorFixture {
@@ -375,128 +292,62 @@ impl EditorFixture {
 
 // ── Tree keyboard navigation focus state tests ──────────────────
 
-/// Helper to create a minimal EditorState with a simple tree.
 fn make_editor_with_tree() -> EditorState {
     let mut state = EditorState::new();
     state.selected_workspace_path = Some("/tmp".to_string());
-    // Populate root dir_entries so build_hierarchical_tree works.
+    // Root entries, plus "src" children so they show when expanded.
     state.dir_entries.insert(
         String::new(),
         vec![
-            FsEntry {
-                name: "src".to_string(),
-                full_path: "src".to_string(),
-                is_dir: true,
-                error: None,
-            },
-            FsEntry {
-                name: "Cargo.toml".to_string(),
-                full_path: "Cargo.toml".to_string(),
-                is_dir: false,
-                error: None,
-            },
+            fs_entry("src", "src", true),
+            fs_entry("Cargo.toml", "Cargo.toml", false),
         ],
     );
-    // Populate "src" dir_entries so children show when expanded.
     state.dir_entries.insert(
         "src".to_string(),
-        vec![FsEntry {
-            name: "main.rs".to_string(),
-            full_path: "src/main.rs".to_string(),
-            is_dir: false,
-            error: None,
-        }],
+        vec![fs_entry("main.rs", "src/main.rs", false)],
     );
-    // Build the tree from dir_entries (consistent with real behavior).
     state.rebuild_tree();
     state
 }
 
 #[test]
-fn test_rebuild_visible_tree_flattens_nodes() {
-    let state = make_editor_with_tree();
-    assert_eq!(state.file_tree.visible_tree_nodes.len(), 2);
-    assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
-    assert!(state.file_tree.visible_tree_nodes[0].1); // is_dir
-    assert_eq!(state.file_tree.visible_tree_nodes[1].0, "Cargo.toml");
-    assert!(!state.file_tree.visible_tree_nodes[1].1); // not is_dir
-}
-
-#[test]
-fn test_rebuild_visible_tree_with_expanded_dir() {
-    let mut state = make_editor_with_tree();
-    state.file_tree.expanded_dirs.insert("src".to_string());
-    // Rebuild tree from dir_entries with expanded state, then flatten.
-    state.file_tree.nodes =
-        build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-    state.file_tree.rebuild_visible();
-    assert_eq!(state.file_tree.visible_tree_nodes.len(), 3);
-    assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
-    assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
-    assert_eq!(state.file_tree.visible_tree_nodes[2].0, "Cargo.toml");
-}
-
-#[test]
-fn test_tree_focus_toggled_sets_focus() {
-    let mut state = make_editor_with_tree();
-    assert!(!state.file_tree.tree_focused);
-
-    // Toggle on
-    let _ = state.update(EditorMessage::TreeFocusToggled);
-    assert!(state.file_tree.tree_focused);
-
-    // Toggle off
-    let _ = state.update(EditorMessage::TreeFocusToggled);
-    assert!(!state.file_tree.tree_focused);
-}
-
-#[test]
-fn test_tree_focus_toggled_empty_tree_stays_off() {
-    let mut state = EditorState::new();
-    assert!(!state.file_tree.tree_focused);
-
-    let _ = state.update(EditorMessage::TreeFocusToggled);
-    assert!(!state.file_tree.tree_focused); // No visible nodes, focus rejected
-}
-
-#[test]
 fn test_misc_focus_actions() {
-    struct Case {
-        name: &'static str,
-        msg: EditorMessage,
-        setup: fn(&mut EditorState),
-        check: fn(&EditorState, name: &str),
-    }
-    let cases: &[Case] = &[
-        Case {
-            name: "escape_clears_tree_focus",
-            msg: EditorMessage::Escape,
-            setup: |s| s.file_tree.tree_focused = true,
-            check: |s, name| assert!(!s.file_tree.tree_focused, "case: {name}"),
-        },
-        Case {
-            name: "toggle_dir_sets_tree_focus",
-            msg: EditorMessage::ToggleDir("src".to_string()),
-            setup: |s| {
+    type Setup = fn(&mut EditorState);
+    type Check = fn(&EditorState) -> Option<&'static str>;
+    // (name, message, setup, check)
+    let cases: &[(&str, EditorMessage, Setup, Check)] = &[
+        (
+            "escape_clears_tree_focus",
+            EditorMessage::Escape,
+            |s| s.file_tree.tree_focused = true,
+            |s| s.file_tree.tree_focused.then_some("tree focus not cleared"),
+        ),
+        (
+            "toggle_dir_sets_tree_focus",
+            EditorMessage::ToggleDir("src".to_string()),
+            |s| {
                 s.selected_file = Some("Cargo.toml".to_string());
             },
-            check: |s, name| {
-                assert!(s.file_tree.tree_focused, "case: {name}");
-                assert!(s.selected_file.is_none(), "case: {name}");
+            |s| {
+                if !s.file_tree.tree_focused {
+                    return Some("tree focus not set");
+                }
+                s.selected_file.is_some().then_some("selection not cleared")
             },
-        },
-        Case {
-            name: "select_file_keeps_tree_focus",
-            msg: EditorMessage::SelectFile("src/main.rs".to_string()),
-            setup: |s| s.file_tree.tree_focused = true,
-            check: |s, name| assert!(s.file_tree.tree_focused, "case: {name}"),
-        },
+        ),
+        (
+            "select_file_keeps_tree_focus",
+            EditorMessage::SelectFile("src/main.rs".to_string()),
+            |s| s.file_tree.tree_focused = true,
+            |s| (!s.file_tree.tree_focused).then_some("tree focus not kept"),
+        ),
         // A mouse-originated EditorAction (like MoveTo from a click)
         // should transfer focus from the file tree to the editor.
-        Case {
-            name: "editor_action_clears_tree_focus",
-            msg: EditorMessage::EditorAction(EditorAction::MoveTo { line: 0, col: 0 }),
-            setup: |s| {
+        (
+            "editor_action_clears_tree_focus",
+            EditorMessage::EditorAction(EditorAction::MoveTo { line: 0, col: 0 }),
+            |s| {
                 s.file_tree.tree_focused = true;
                 s.pending_enter_dir = Some("src".to_string());
                 s.active_modal = Some(ModalKind::Rename(RenameTarget {
@@ -508,927 +359,658 @@ fn test_misc_focus_actions() {
                     error: None,
                 }));
             },
-            check: |s, name| {
-                assert!(!s.file_tree.tree_focused, "case: {name}");
-                assert_eq!(s.pending_enter_dir, None, "case: {name}");
-                assert!(s.active_modal.is_none(), "case: {name}");
+            |s| {
+                if s.file_tree.tree_focused {
+                    return Some("tree focus not cleared");
+                }
+                if s.pending_enter_dir.is_some() {
+                    return Some("pending enter dir not cleared");
+                }
+                s.active_modal.is_some().then_some("modal not closed")
             },
-        },
+        ),
     ];
-    for case in cases {
+    for &(name, ref msg, setup, check) in cases {
         let mut state = make_editor_with_tree();
-        (case.setup)(&mut state);
-        let _ = state.update(case.msg.clone());
-        (case.check)(&state, case.name);
+        setup(&mut state);
+        let _ = state.update(msg.clone());
+        if let Some(what) = check(&state) {
+            panic!("case {name}: {what}");
+        }
     }
 }
 
 #[test]
-fn test_tree_nav_enter() {
-    struct Case {
-        name: &'static str,
-        focused: bool,
-        start_idx: usize,
-        /// Set selected_file before the message
-        pre_select_file: bool,
-        /// Expected tree_focused after
-        expect_focused: bool,
-        /// Expected focus index after (None = skip check)
-        expected_idx: Option<usize>,
-        /// Additional per-case assertions
-        check: Option<fn(&EditorState, name: &str)>,
+fn test_async_dir_load_flow() {
+    use EditorMessage::{DirExpanded, ToggleDir, TreeNavEnter};
+    type Build = fn() -> EditorState;
+    type Check = fn(&mut EditorState) -> Option<&'static str>;
+    fn check(ok: bool, what: &'static str) -> Option<&'static str> {
+        (!ok).then_some(what)
     }
-    let cases: &[Case] = &[
-        // TreeNavEnter on a file dispatches an async load task, but
-        // tree_focused stays true in the same-turn state update.
-        Case {
-            name: "on_file_dispatches_task",
-            focused: true,
-            start_idx: 1,
-            pre_select_file: false,
-            expect_focused: true,
-            expected_idx: None,
-            check: None,
-        },
-        Case {
-            name: "not_focused_ignored",
-            focused: false,
-            start_idx: 1,
-            pre_select_file: false,
-            expect_focused: false,
-            expected_idx: Some(1),
-            check: None,
-        },
-        Case {
-            name: "on_dir_expands_and_advances",
-            focused: true,
-            start_idx: 0,
-            pre_select_file: true,
-            expect_focused: true,
-            expected_idx: Some(1),
-            check: Some(|s, name| {
-                assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
-                assert!(s.selected_file.is_none(), "case: {name}");
-                assert_eq!(s.file_tree.visible_tree_nodes[1].0, "src/main.rs");
-            }),
-        },
+    fn focused_src_state() -> EditorState {
+        let mut state = EditorState::new();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        state
+            .dir_entries
+            .insert(String::new(), vec![fs_entry("src", "src", true)]);
+        state.rebuild_tree();
+        state.file_tree.tree_focused = true;
+        state
+    }
+    fn expanded(generation: u64) -> EditorMessage {
+        DirExpanded {
+            dir_path: "src".to_string(),
+            r#gen: generation,
+            entries: Ok(vec![fs_entry("main.rs", "src/main.rs", false)]),
+            quiet: false,
+        }
+    }
+    // (name, fixture, check)
+    let cases: &[(&str, Build, Check)] = &[
+        (
+            "async_enter_dir_pending_then_advances",
+            focused_src_state,
+            |s| {
+                let _ = s.update(TreeNavEnter);
+                let pending = s.pending_enter_dir.as_deref();
+                check(pending == Some("src"), "pending enter dir not recorded")?;
+                check(
+                    s.file_tree.expanded_dirs.contains("src"),
+                    "dir not expanded by the toggle",
+                )?;
+                check(
+                    s.file_tree.tree_focus_index == 0,
+                    "focus moved before the listing arrived",
+                )?;
+                let _ = s.update(expanded(s.generation));
+                check(s.pending_enter_dir.is_none(), "pending not cleared")?;
+                check(s.file_tree.tree_focus_index == 1, "focus not advanced")
+            },
+        ),
+        ("toggle_dir_loads_and_completes", focused_src_state, |s| {
+            let _ = s.update(ToggleDir("src".to_string()));
+            check(s.loading_dirs.contains("src"), "load not started")?;
+            check(
+                s.dir_generations.contains_key("src"),
+                "generation not registered",
+            )?;
+            check(s.pending_enter_dir.is_none(), "pending set by a toggle")?;
+            check(s.file_tree.tree_focused, "tree not focused")?;
+            check(s.file_tree.tree_focus_index == 0, "focus not on src")?;
+            let _ = s.update(expanded(s.dir_generations["src"]));
+            check(s.dir_entries.contains_key("src"), "listing not cached")?;
+            check(s.dir_entries["src"].len() == 1, "unexpected listing length")?;
+            check(!s.loading_dirs.contains("src"), "loading not cleared")?;
+            check(s.pending_enter_dir.is_none(), "pending left behind")?;
+            let nodes = &s.file_tree.visible_tree_nodes;
+            check(nodes.len() >= 2, "tree not rebuilt")?;
+            check(nodes[0].0.as_str() == "src", "first node is not src")?;
+            check(nodes[1].0.as_str() == "src/main.rs", "not src/main.rs")
+        }),
+        ("toggle_dir_without_workspace", EditorState::new, |s| {
+            let tree = &s.file_tree;
+            check(!tree.expanded_dirs.contains("src"), "already expanded")?;
+            let _ = s.update(ToggleDir("src".to_string()));
+            check(
+                s.file_tree.expanded_dirs.contains("src"),
+                "dir not expanded by the toggle",
+            )?;
+            check(s.generation == 0, "generation bumped without a workspace")?;
+            check(s.loading_dirs.is_empty(), "load started, no workspace")?;
+            check(
+                s.dir_generations.is_empty(),
+                "generation registered without a workspace",
+            )
+        }),
     ];
-    for case in cases {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = case.focused;
-        state.file_tree.tree_focus_index = case.start_idx;
-        if case.pre_select_file {
-            state.selected_file = Some("Cargo.toml".to_string());
-        }
-        let _ = state.update(EditorMessage::TreeNavEnter);
-        assert_eq!(
-            state.file_tree.tree_focused, case.expect_focused,
-            "case: {}",
-            case.name
-        );
-        if let Some(idx) = case.expected_idx {
-            assert_eq!(state.file_tree.tree_focus_index, idx, "case: {}", case.name);
-        }
-        if let Some(check) = case.check {
-            check(&state, case.name);
+    for &(name, build, check) in cases {
+        let mut state = build();
+        if let Some(what) = check(&mut state) {
+            panic!("case {name}: {what}");
         }
     }
-}
-
-#[test]
-fn test_visible_tree_clamps_focus_on_rebuild() {
-    let mut state = make_editor_with_tree();
-    state.file_tree.tree_focus_index = 999; // Way out of range
-    state.file_tree.rebuild_visible();
-    assert_eq!(
-        state.file_tree.tree_focus_index,
-        state.file_tree.visible_tree_nodes.len() - 1
-    );
-}
-
-#[test]
-fn test_async_enter_dir_sets_pending_then_advances() {
-    let mut state = EditorState::new();
-    state.selected_workspace_path = Some("/tmp".to_string());
-    // Set up a tree where "src" dir_entries are empty (needs async load).
-    state.dir_entries.insert(
-        String::new(),
-        vec![FsEntry {
-            name: "src".to_string(),
-            full_path: "src".to_string(),
-            is_dir: true,
-            error: None,
-        }],
-    );
-    state.rebuild_tree();
-    state.file_tree.tree_focused = true;
-    state.file_tree.tree_focus_index = 0; // "src"
-
-    let _task = state.update(EditorMessage::TreeNavEnter);
-    // "src" needs async loading — pending_enter_dir is set.
-    assert_eq!(state.pending_enter_dir.as_deref(), Some("src"));
-    assert!(state.file_tree.expanded_dirs.contains("src"));
-    // Focus stays on "src" until children load.
-    assert_eq!(state.file_tree.tree_focus_index, 0);
-
-    // Simulate DirExpanded completing with children.
-    let entries = vec![FsEntry {
-        name: "main.rs".to_string(),
-        full_path: "src/main.rs".to_string(),
-        is_dir: false,
-        error: None,
-    }];
-    let dir_gen = state.generation;
-    let _task = state.update(EditorMessage::DirExpanded {
-        dir_path: "src".to_string(),
-        r#gen: dir_gen,
-        entries: Ok(entries),
-        quiet: false,
-    });
-    // Focus should have advanced to the first child.
-    assert_eq!(state.pending_enter_dir, None);
-    assert_eq!(state.file_tree.tree_focus_index, 1); // "src/main.rs"
-}
-
-#[test]
-fn test_toggle_dir_async_load_and_complete() {
-    let mut state = EditorState::new();
-    state.selected_workspace_path = Some("/tmp".to_string());
-    // "src" dir has no cached entries → needs async load.
-    state.dir_entries.insert(
-        String::new(),
-        vec![FsEntry {
-            name: "src".to_string(),
-            full_path: "src".to_string(),
-            is_dir: true,
-            error: None,
-        }],
-    );
-    state.rebuild_tree();
-    state.file_tree.tree_focused = true;
-    state.file_tree.tree_focus_index = 0; // "src"
-
-    let _task = state.update(EditorMessage::ToggleDir("src".to_string()));
-    // ToggleDir sets loading_dirs and dir_generations.
-    assert!(state.loading_dirs.contains("src"));
-    assert!(state.dir_generations.contains_key("src"));
-    // ToggleDir does NOT set pending_enter_dir.
-    assert_eq!(state.pending_enter_dir, None);
-    // Focus is on "src".
-    assert!(state.file_tree.tree_focused);
-    assert_eq!(state.file_tree.tree_focus_index, 0);
-
-    // Simulate DirExpanded completing with children.
-    let dir_gen = *state.dir_generations.get("src").unwrap();
-    let entries = vec![FsEntry {
-        name: "main.rs".to_string(),
-        full_path: "src/main.rs".to_string(),
-        is_dir: false,
-        error: None,
-    }];
-    let _task = state.update(EditorMessage::DirExpanded {
-        dir_path: "src".to_string(),
-        r#gen: dir_gen,
-        entries: Ok(entries),
-        quiet: false,
-    });
-    // Entries are now cached.
-    assert!(state.dir_entries.contains_key("src"));
-    assert_eq!(state.dir_entries["src"].len(), 1);
-    // loading_dirs is cleared.
-    assert!(!state.loading_dirs.contains("src"));
-    // pending_enter_dir was never set.
-    assert_eq!(state.pending_enter_dir, None);
-    // visible_tree_nodes is correctly rebuilt (rebuild_tree was called).
-    assert!(state.file_tree.visible_tree_nodes.len() >= 2);
-    assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
-    assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
-}
-
-#[test]
-fn test_toggle_dir_no_workspace_returns_none() {
-    let mut state = EditorState::new();
-    // Precondition: "src" is not yet in expanded_dirs before the call.
-    assert!(!state.file_tree.expanded_dirs.contains("src"));
-    // No workspace set — async load should return None (early return).
-    let _task = state.update(EditorMessage::ToggleDir("src".to_string()));
-    // expanded_dirs is modified (insert happens before the workspace guard),
-    // but no async load was spawned since there's no workspace path.
-    assert!(state.file_tree.expanded_dirs.contains("src"));
-    assert_eq!(state.generation, 0);
-    assert!(state.loading_dirs.is_empty());
-    assert!(state.dir_generations.is_empty());
 }
 
 // ── Find/Replace tests ───────────────────────────────────────────
 
 #[test]
-fn test_is_find_bar_open() {
-    let state = EditorFixture::new()
-        .tab("/test.rs", "fn hello() {}")
-        .unsaved()
-        .find_replace("hello", std::iter::once(4..9).collect(), 0)
-        .build();
-    assert!(state.is_find_bar_open());
-    let state = EditorFixture::new()
-        .tab("/test.rs", "fn hello() {}")
-        .build();
-    assert!(!state.is_find_bar_open());
-    let state = EditorState::new();
-    assert!(!state.is_find_bar_open());
+fn test_find_bar_and_match_navigation() {
+    type Build = fn() -> EditorState;
+    type Check = fn(&mut EditorState) -> Option<&'static str>;
+    fn with_find(text: &str, query: &str, matches: &[Range<usize>]) -> EditorState {
+        let fixture = EditorFixture::new().tab("/test.rs", text).unsaved();
+        fixture.find_replace(query, matches.to_vec(), 0).build()
+    }
+    /// The same tab, opened with no find state at all.
+    fn find_closed() -> EditorState {
+        EditorFixture::new()
+            .tab("/test.rs", "fn hello() {}")
+            .build()
+    }
+    /// Two space matches, the second one current.
+    fn two_matches() -> EditorState {
+        with_find("a b c", " ", &[1..2, 3..4])
+    }
+    fn match_idx(state: &EditorState) -> usize {
+        let frs = state.tab_contents["/test.rs"].find_replace_state.as_ref();
+        frs.unwrap().current_match_idx
+    }
+    const SOLE_MATCH: Range<usize> = 4..9;
+    // (name, fixture, check)
+    let cases: &[(&str, Build, Check)] = &[
+        (
+            "find_bar_open",
+            || with_find("fn hello() {}", "hello", &[SOLE_MATCH]),
+            |s| (!s.is_find_bar_open()).then_some("find bar not open"),
+        ),
+        ("find_bar_closed_without_find_state", find_closed, |s| {
+            s.is_find_bar_open().then_some("find bar open")
+        }),
+        ("find_bar_closed_without_tabs", EditorState::new, |s| {
+            s.is_find_bar_open().then_some("find bar open")
+        }),
+        ("navigate_wraps_next", two_matches, |s| {
+            for (want, what) in [(1, "Next did not advance"), (0, "Next did not wrap")] {
+                let _ = s.navigate_find_match(FindDirection::Next);
+                if match_idx(s) != want {
+                    return Some(what);
+                }
+            }
+            None
+        }),
+        ("navigate_wraps_prev", two_matches, |s| {
+            for (want, what) in [(1, "Prev did not advance"), (0, "Prev did not wrap")] {
+                let _ = s.navigate_find_match(FindDirection::Prev);
+                if match_idx(s) != want {
+                    return Some(what);
+                }
+            }
+            None
+        }),
+        (
+            "navigate_no_matches",
+            || with_find("no matches", "zzz", &[]),
+            |s| {
+                let _ = s.navigate_find_match(FindDirection::Next);
+                let _ = s.navigate_find_match(FindDirection::Prev);
+                (match_idx(s) != 0).then_some("index moved without matches")
+            },
+        ),
+        ("navigate_without_find_state", find_closed, |s| {
+            let _ = s.navigate_find_match(FindDirection::Next);
+            let _ = s.navigate_find_match(FindDirection::Prev);
+            let find = &s.tab_contents["/test.rs"].find_replace_state;
+            find.is_some().then_some("find state created")
+        }),
+        (
+            "replace_all_preserves_cursor",
+            || {
+                let mut state = EditorFixture::new().tab("/test.rs", "ab cd ab").build();
+                let tab = state.tab_contents.get_mut("/test.rs").unwrap();
+                tab.content.move_to(0, 5);
+                tab.find_replace_state = Some(FindReplaceState {
+                    query: crate::gui::common::SingleLineEditorState::new("ab"),
+                    replace: crate::gui::common::SingleLineEditorState::new("xy"),
+                    matches: vec![0..2, 6..8],
+                    current_match_idx: 0,
+                    case_sensitive: true,
+                });
+                state
+            },
+            |s| {
+                let _ = s.update(EditorMessage::FindReplaceAll);
+                let cursor = s.tab_contents["/test.rs"].content.cursor();
+                if cursor.line != 0 {
+                    return Some("cursor line moved");
+                }
+                (cursor.column != 5).then_some("cursor column moved")
+            },
+        ),
+    ];
+    for &(name, build, check) in cases {
+        let mut state = build();
+        if let Some(what) = check(&mut state) {
+            panic!("case {name}: {what}");
+        }
+    }
 }
 
-#[expect(clippy::too_many_lines)]
+type ReplaceCase<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a [(usize, usize)],
+);
+
 #[test]
 fn test_find_replace_auto_advance() {
-    // Verifies cursor auto-advance after find_replace across five scenarios:
-    // same-length replacement, shorter replacement, adjacent matches,
-    // longer replacement (wrap-around), and no remaining matches.
-    struct Case {
-        name: &'static str,
-        /// Initial buffer text.
-        text: &'static str,
-        /// Search query.
-        query: &'static str,
-        /// Replacement text.
-        replace: &'static str,
-        /// Pre-seeded match byte-range pairs.
-        initial_matches: &'static [(usize, usize)],
-        /// Expected text after replacement.
-        expected_text: &'static str,
-        /// Expected remaining match byte-range pairs.
-        expected_matches: &'static [(usize, usize)],
-        /// Expected cursor line after replacement.
-        expected_cursor_line: usize,
-        /// Expected cursor column after replacement.
-        expected_cursor_col: usize,
-        /// Expected current_match_idx after replacement.
-        expected_current_match_idx: usize,
-    }
-
-    let cases: &[Case] = &[
-        // Same-length replacement: "ab cd ab" → "xy cd ab".
-        // After replacing first "ab" (0..2) with "xy" (len=2), remaining "ab"
-        // at 6..8 is found by advancing past replace_end (= 0 + 2 = 2).
-        Case {
-            name: "same_length",
-            text: "ab cd ab",
-            query: "ab",
-            replace: "xy",
-            initial_matches: &[(0, 2), (6, 8)],
-            expected_text: "xy cd ab",
-            expected_matches: &[(6, 8)],
-            expected_cursor_line: 0,
-            expected_cursor_col: 6,
-            expected_current_match_idx: 0,
-        },
-        // replace_end = 0 + 1 = 1. Remaining "aaa" at byte 6 in new text.
-        Case {
-            name: "shorter_replacement",
-            text: "aaa bbb aaa",
-            query: "aaa",
-            replace: "a",
-            initial_matches: &[(0, 3), (8, 11)],
-            expected_text: "a bbb aaa",
-            expected_matches: &[(6, 9)],
-            expected_cursor_line: 0,
-            expected_cursor_col: 6,
-            expected_current_match_idx: 0,
-        },
-        // Adjacent matches: "aaaa" → "xaa".
-        // Using range.end (= 2) as the advance point would incorrectly skip
-        // the remaining match at 1..3 (1 >= 2 is false, so position() returns
-        // None → wraps to 0, not 1). Using replace_end (= 1) correctly finds
-        // the match at position 1.
-        Case {
-            name: "adjacent_matches",
-            text: "aaaa",
-            query: "aa",
-            replace: "x",
-            initial_matches: &[(0, 2), (2, 4)],
-            expected_text: "xaa",
-            expected_matches: &[(1, 3)],
-            expected_cursor_line: 0,
-            expected_cursor_col: 1,
-            expected_current_match_idx: 0,
-        },
-        // Longer replacement: "ab" → "abc".
-        // replace_end = 0 + 3 = 3. Remaining "ab" at 0..2 has start=0 < 3,
-        // so position() returns None → wraps to index 0.
-        Case {
-            name: "longer_replacement",
-            text: "ab",
-            query: "ab",
-            replace: "abc",
-            initial_matches: &[(0, 2)],
-            expected_text: "abc",
-            expected_matches: &[(0, 2)],
-            expected_cursor_line: 0,
-            expected_cursor_col: 0,
-            expected_current_match_idx: 0,
-        },
-        // No remaining matches: "ab" → "xy".
-        // Matches is empty, current_match_idx resets to 0, cursor moves to
-        // the end of the replacement (replace_end = 0 + 2 = 2).
-        Case {
-            name: "no_more_matches",
-            text: "ab",
-            query: "ab",
-            replace: "xy",
-            initial_matches: &[(0, 2)],
-            expected_text: "xy",
-            expected_matches: &[],
-            expected_cursor_line: 0,
-            expected_cursor_col: 2,
-            expected_current_match_idx: 0,
-        },
+    // (name, text, query, replace, expected text, expected matches)
+    let cases: &[ReplaceCase] = &[
+        // Same-length replacement: remaining "ab" at 6..8 is found by advancing
+        // past replace_end (= 0 + 2 = 2).
+        ("same_length", "ab cd ab", "ab", "xy", "xy cd ab", &[(6, 8)]),
+        // replace_end = 0 + 1 = 1. Remaining "aaa" at byte 6 in the new text.
+        (
+            "shorter_replacement",
+            "aaa bbb aaa",
+            "aaa",
+            "a",
+            "a bbb aaa",
+            &[(6, 9)],
+        ),
+        // Using range.end (= 2) as the advance point would skip the remaining
+        // match at 1..3, replace_end (= 1) finds it.
+        ("adjacent_matches", "aaaa", "aa", "x", "xaa", &[(1, 3)]),
+        // Longer replacement: replace_end = 3, so the remaining "ab" wraps to 0.
+        ("longer_replacement", "ab", "ab", "abc", "abc", &[(0, 2)]),
+        // No remaining matches: matches reset to empty, cursor at replace_end.
+        ("no_more_matches", "ab", "ab", "xy", "xy", &[]),
     ];
-
-    let path = "/test.rs".to_string();
-    for c in cases {
-        let mut state = EditorFixture::new().tab("/test.rs", c.text).build();
-        if let Some(tab) = state.tab_contents.get_mut(&path) {
-            tab.find_replace_state = Some(FindReplaceState {
-                query: crate::gui::common::SingleLineEditorState::new(c.query),
-                replace: crate::gui::common::SingleLineEditorState::new(c.replace),
-                matches: c.initial_matches.iter().map(|&(s, e)| s..e).collect(),
-                current_match_idx: 0,
-                case_sensitive: true,
-            });
-        }
-        let _ = state.update(EditorMessage::FindReplace);
-        let tab = state.tab_contents.get(&path).unwrap();
-        let frs = tab.find_replace_state.as_ref().unwrap();
-
-        assert_eq!(tab.content.text(), c.expected_text, "{}: text", c.name);
-        assert_eq!(
-            frs.matches.len(),
-            c.expected_matches.len(),
-            "{}: match count",
-            c.name,
-        );
-        for (i, &(s, e)) in c.expected_matches.iter().enumerate() {
-            assert_eq!(frs.matches[i], s..e, "{}: match {i} range", c.name);
-        }
-        let cursor = tab.content.cursor();
-        assert_eq!(
-            cursor.line, c.expected_cursor_line,
-            "{}: cursor line",
-            c.name
-        );
-        assert_eq!(
-            cursor.column, c.expected_cursor_col,
-            "{}: cursor col",
-            c.name
-        );
-        assert_eq!(
-            frs.current_match_idx, c.expected_current_match_idx,
-            "{}: current_match_idx",
-            c.name,
-        );
-    }
-}
-
-#[test]
-fn test_navigate_find_match_wraps() {
-    for direction in [FindDirection::Next, FindDirection::Prev] {
-        let mut state = EditorFixture::new()
-            .tab("/test.rs", "a b c")
-            .unsaved()
-            .find_replace(" ", vec![1..2, 3..4], 0)
-            .build();
-        for want in [1, 0] {
-            let _ = state.navigate_find_match(direction);
-            let s = state.tab_contents.get("/test.rs").unwrap();
-            let s = s.find_replace_state.as_ref().unwrap();
-            assert_eq!(s.current_match_idx, want, "{direction:?}");
-        }
-    }
-}
-
-#[test]
-fn test_navigate_find_match_no_matches() {
-    let mut state = EditorFixture::new()
-        .tab("/test.rs", "no matches")
-        .unsaved()
-        .find_replace("zzz", vec![], 0)
-        .build();
-
-    // Navigating with no matches should not crash.
-    let _ = state.navigate_find_match(FindDirection::Next);
-    let _ = state.navigate_find_match(FindDirection::Prev);
-    let s = state.tab_contents.get("/test.rs").unwrap();
-    let s = s.find_replace_state.as_ref().unwrap();
-    assert_eq!(s.current_match_idx, 0);
-}
-
-#[test]
-fn test_navigate_find_match_only_affects_find_tab() {
-    // Tab without find state should not be affected.
-    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
-
-    // Should not panic.
-    let _ = state.navigate_find_match(FindDirection::Next);
-    let _ = state.navigate_find_match(FindDirection::Prev);
-}
-
-// ── Tree arrow-key navigation tests ─────────────────────────────
-
-#[expect(clippy::too_many_lines)]
-#[test]
-fn test_tree_nav_left_right() {
-    struct Case {
-        name: &'static str,
-        msg: EditorMessage,
-        start_idx: usize,
-        /// Pre-expand "src" before sending the message
-        pre_expand_src: bool,
-        /// Set selected_file to Some("Cargo.toml") before sending the message
-        pre_select_file: bool,
-        /// Expected focus index after the message
-        expected_idx: usize,
-        /// Additional per-case assertions beyond focus index
-        check: Option<fn(&EditorState, name: &str)>,
-    }
-    let cases: &[Case] = &[
-        Case {
-            name: "left_on_expanded_dir_collapses",
-            msg: EditorMessage::TreeNavLeft,
-            start_idx: 0,
-            pre_expand_src: true,
-            pre_select_file: false,
-            expected_idx: 0,
-            check: Some(|s, name| {
-                assert!(!s.file_tree.expanded_dirs.contains("src"), "case: {name}");
-            }),
-        },
-        Case {
-            name: "left_on_file_navigates_to_parent",
-            msg: EditorMessage::TreeNavLeft,
-            start_idx: 1,
-            pre_expand_src: true,
-            pre_select_file: false,
-            expected_idx: 0,
-            check: Some(|s, name| {
-                assert_eq!(s.file_tree.visible_tree_nodes[0].0, "src", "case: {name}");
-            }),
-        },
-        Case {
-            name: "left_on_root_collapsed_dir_noop",
-            msg: EditorMessage::TreeNavLeft,
-            start_idx: 0,
-            pre_expand_src: false,
-            pre_select_file: false,
-            expected_idx: 0,
-            check: None,
-        },
-        Case {
-            name: "left_on_root_file_noop",
-            msg: EditorMessage::TreeNavLeft,
-            start_idx: 1,
-            pre_expand_src: false,
-            pre_select_file: false,
-            expected_idx: 1,
-            check: None,
-        },
-        Case {
-            name: "right_on_collapsed_dir_expands_and_advances",
-            msg: EditorMessage::TreeNavRight,
-            start_idx: 0,
-            pre_expand_src: false,
-            pre_select_file: true,
-            expected_idx: 1,
-            check: Some(|s, name| {
-                assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
-                assert!(s.selected_file.is_none(), "case: {name}");
-                assert_eq!(s.file_tree.visible_tree_nodes[1].0, "src/main.rs");
-            }),
-        },
-        Case {
-            name: "right_on_expanded_dir_moves_to_first_child",
-            msg: EditorMessage::TreeNavRight,
-            start_idx: 0,
-            pre_expand_src: true,
-            pre_select_file: false,
-            expected_idx: 1,
-            check: Some(|s, name| {
-                assert_eq!(
-                    s.file_tree.visible_tree_nodes[1].0, "src/main.rs",
-                    "case: {name}"
-                );
-            }),
-        },
-        Case {
-            name: "right_on_file_noop",
-            msg: EditorMessage::TreeNavRight,
-            start_idx: 1,
-            pre_expand_src: false,
-            pre_select_file: false,
-            expected_idx: 1,
-            check: None,
-        },
-    ];
-    for case in cases {
-        let mut state = make_editor_with_tree();
-        if case.pre_expand_src {
-            state.file_tree.expanded_dirs.insert("src".to_string());
-            state.file_tree.nodes =
-                build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-            state.file_tree.rebuild_visible();
-        }
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = case.start_idx;
-        if case.pre_select_file {
-            state.selected_file = Some("Cargo.toml".to_string());
-        }
-        let _ = state.update(case.msg.clone());
-        assert_eq!(
-            state.file_tree.tree_focus_index, case.expected_idx,
-            "case: {}",
-            case.name
-        );
-        if let Some(check) = case.check {
-            check(&state, case.name);
-        }
-    }
-}
-
-// ── Click-to-select focus index tests ────────────────────────────
-
-#[test]
-fn test_toggle_dir_sets_tree_focus_index() {
-    let mut state = make_editor_with_tree();
-    // Select a file first so we can verify it gets cleared.
-    state.selected_file = Some("Cargo.toml".to_string());
-    let _ = state.update(EditorMessage::ToggleDir("src".to_string()));
-    // ToggleDir should set tree_focus_index to "src"'s position
-    assert!(state.file_tree.tree_focused);
-    assert_eq!(state.file_tree.tree_focus_index, 0);
-    assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
-    assert!(
-        state.selected_file.is_none(),
-        "ToggleDir should clear selected_file"
-    );
-}
-
-#[test]
-fn test_select_file_sets_tree_focus_index() {
-    let mut state = make_editor_with_tree();
-    // Expand "src" so "src/main.rs" is visible in the flat list.
-    state.file_tree.expanded_dirs.insert("src".to_string());
-    state.file_tree.nodes =
-        build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-    state.file_tree.rebuild_visible();
-    state.file_tree.tree_focused = true;
-    let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
-    // SelectFile keeps tree_focused and remembers focus index.
-    assert!(state.file_tree.tree_focused);
-    // tree_focus_index should point to "src/main.rs" for Ctrl+B re-focus.
-    assert_eq!(
-        state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,
-        "src/main.rs"
-    );
-}
-
-#[test]
-fn test_select_file_sets_tree_focused_when_not_focused() {
-    // When tree_focused starts false, clicking a file should set it true.
-    let mut state = make_editor_with_tree();
-    state.file_tree.expanded_dirs.insert("src".to_string());
-    state.file_tree.nodes =
-        build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-    state.file_tree.rebuild_visible();
-    state.file_tree.tree_focused = false;
-    let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
-    assert!(
-        state.file_tree.tree_focused,
-        "SelectFile should set tree_focused to true"
-    );
-}
-
-// ── Focus gating and find/replace cursor tests ───────────────────
-
-#[test]
-fn test_undo_noop_when_quick_open_active() {
-    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
-    let path = "/test.rs".to_string();
-    if let Some(tab_data) = state.tab_contents.get_mut(&path) {
-        tab_data
-            .undo_stack
-            .borrow_mut()
-            .snap_before_edit(&tab_data.content);
-        tab_data.content.perform_action(EditorAction::Insert('!'));
-    }
-    state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: crate::gui::common::SingleLineEditorState::new(""),
-        selected_index: 0,
-        results: Vec::new(),
-    }));
-    let _ = state.update(EditorMessage::Undo);
-    assert_eq!(
-        state.tab_contents.get(&path).unwrap().content.text(),
-        "!hello"
-    );
-}
-
-#[test]
-fn test_refresh_file_tree_noop_when_quick_open_active() {
-    let mut state = make_editor_with_tree();
-    // Pre-populate dir_generations so we can detect new entries.
-    let initial_gen_count = state.dir_generations.len();
-    assert!(state.selected_workspace_path.is_some());
-
-    // Activate a modal overlay (QuickOpen).
-    state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: crate::gui::common::SingleLineEditorState::new(""),
-        selected_index: 0,
-        results: Vec::new(),
-    }));
-
-    // RefreshFileTree should be suppressed — no new dir generations added.
-    let _ = state.update(EditorMessage::RefreshFileTree);
-    assert_eq!(
-        state.dir_generations.len(),
-        initial_gen_count,
-        "RefreshFileTree must not spawn directory refreshes when a modal overlay is active"
-    );
-}
-
-#[test]
-fn test_tree_focus_toggled_noop_during_modal_overlay() {
-    let mut state = make_editor_with_tree();
-    // First toggle tree focus ON.
-    let _ = state.update(EditorMessage::TreeFocusToggled);
-    assert!(state.file_tree.tree_focused);
-
-    // Activate a modal overlay (QuickOpen).
-    state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: crate::gui::common::SingleLineEditorState::new(""),
-        selected_index: 0,
-        results: Vec::new(),
-    }));
-
-    // TreeFocusToggled should be suppressed — focus stays ON.
-    let _ = state.update(EditorMessage::TreeFocusToggled);
-    assert!(
-        state.file_tree.tree_focused,
-        "TreeFocusToggled must not toggle focus when a modal overlay is active"
-    );
-}
-
-#[test]
-fn test_tree_nav_suppressed_during_goto_line_overlay() {
-    let mut state = make_editor_with_tree();
-    state.file_tree.expanded_dirs.insert("src".to_string());
-    state.file_tree.nodes =
-        build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-    state.file_tree.rebuild_visible();
-    state.file_tree.tree_focused = true;
-    state.file_tree.tree_focus_index = 0; // "src"
-
-    // Activate a non-search modal overlay (GotoLine).
-    state.active_modal = Some(ModalKind::GotoLine);
-
-    let prev_focus = state.file_tree.tree_focus_index;
-    // Up/Down/Enter/Left/Right — assert tree_focus_index unchanged.
-    let nav_msgs: &[EditorMessage] = &[
-        EditorMessage::TreeNavUp,
-        EditorMessage::TreeNavDown,
-        EditorMessage::TreeNavEnter,
-        EditorMessage::TreeNavLeft,
-        EditorMessage::TreeNavRight,
-    ];
-    for msg in nav_msgs {
-        let _ = state.update(msg.clone());
-        assert_eq!(
-            state.file_tree.tree_focus_index, prev_focus,
-            "{msg:?} should be suppressed during GotoLine overlay"
-        );
-    }
-
-    // TreeFocusToggled is handled separately because it toggles
-    // tree_focused, not tree_focus_index.
-    let _ = state.update(EditorMessage::TreeFocusToggled);
-    assert!(
-        state.file_tree.tree_focused,
-        "TreeFocusToggled should be suppressed during GotoLine overlay"
-    );
-}
-
-#[test]
-fn test_find_replace_all_preserves_cursor() {
-    let mut state = EditorFixture::new().tab("/test.rs", "ab cd ab").build();
-    let path = "/test.rs".to_string();
-    if let Some(tab_data) = state.tab_contents.get_mut(&path) {
-        tab_data.content.move_to(0, 5);
-        tab_data.find_replace_state = Some(FindReplaceState {
-            query: crate::gui::common::SingleLineEditorState::new("ab"),
-            replace: crate::gui::common::SingleLineEditorState::new("xy"),
-            matches: vec![0..2, 6..8],
+    let path = "/test.rs";
+    for &(name, text, query, replace, expected_text, expected_matches) in cases {
+        let mut state = EditorFixture::new().tab(path, text).build();
+        let tab = state.tab_contents.get_mut(path).unwrap();
+        // The state before the replace holds every match the query has.
+        tab.find_replace_state = Some(FindReplaceState {
+            query: crate::gui::common::SingleLineEditorState::new(query),
+            replace: crate::gui::common::SingleLineEditorState::new(replace),
+            matches: compute_text_matches(text, query, true),
             current_match_idx: 0,
             case_sensitive: true,
         });
+        let _ = state.update(EditorMessage::FindReplace);
+        let tab = state.tab_contents.get(path).unwrap();
+        let frs = tab.find_replace_state.as_ref().unwrap();
+        assert_eq!(tab.content.text(), expected_text, "case {name}: text");
+        assert_eq!(
+            frs.matches.len(),
+            expected_matches.len(),
+            "case {name}: match count"
+        );
+        for (i, &(s, e)) in expected_matches.iter().enumerate() {
+            assert_eq!(frs.matches[i], s..e, "case {name}: match {i} range");
+        }
+        // The cursor lands on the next match, or right after the replacement
+        // when none is left.
+        let (line, col) = expected_matches
+            .first()
+            .map_or((0, replace.chars().count()), |&(start, _)| (0, start));
+        let cursor = tab.content.cursor();
+        assert_eq!(cursor.line, line, "case {name}: cursor line");
+        assert_eq!(cursor.column, col, "case {name}: cursor col");
+        assert_eq!(frs.current_match_idx, 0, "case {name}: current_match_idx");
     }
-    let _ = state.update(EditorMessage::FindReplaceAll);
-    let cursor = state.tab_contents.get(&path).unwrap().content.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 5);
 }
 
-#[test]
-fn test_quick_open_toggle_blocked_when_goto_line_open() {
-    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
-    state.active_modal = Some(ModalKind::GotoLine);
-    let _ = state.update(EditorMessage::QuickOpenToggle);
-    assert!(!matches!(state.active_modal, Some(ModalKind::QuickOpen(_))));
-}
+// ── Modal / overlay gating ───────────────────────────────────────
 
+#[expect(clippy::too_many_lines)]
 #[test]
-fn test_quick_open_toggle_closes_when_already_open() {
-    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
-    state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: crate::gui::common::SingleLineEditorState::new("foo"),
-        selected_index: 0,
-        results: Vec::new(),
-    }));
-    let _ = state.update(EditorMessage::QuickOpenToggle);
-    assert!(state.active_modal.is_none());
-}
+fn test_overlay_gates_editor_shortcuts() {
+    fn quick_open() -> ModalKind {
+        ModalKind::QuickOpen(QuickOpenState {
+            filter: crate::gui::common::SingleLineEditorState::new(""),
+            selected_index: 0,
+            results: Vec::new(),
+        })
+    }
 
-#[test]
-fn test_global_search_toggle_blocked_when_quick_open_open() {
-    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
-    state.selected_workspace_name = Some("ws".to_string());
-    state.selected_workspace_path = Some("/tmp/ws".to_string());
-    state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: crate::gui::common::SingleLineEditorState::new(""),
-        selected_index: 0,
-        results: Vec::new(),
-    }));
-    let _ = state.update(EditorMessage::GlobalSearchToggle);
-    assert!(!matches!(
-        state.active_modal,
-        Some(ModalKind::GlobalSearch(_))
-    ));
+    fn tab_state() -> EditorState {
+        EditorFixture::new().tab("/test.rs", "hello").build()
+    }
+
+    fn undoable() -> EditorState {
+        let mut state = tab_state();
+        let tab = state.tab_contents.get_mut("/test.rs").unwrap();
+        tab.undo_stack.borrow_mut().snap_before_edit(&tab.content);
+        tab.content.perform_action(EditorAction::Insert('!'));
+        state
+    }
+
+    fn focusable_tree() -> EditorState {
+        let mut state = make_editor_with_tree();
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        state
+    }
+
+    type Build = fn() -> EditorState;
+    type Check = fn(&mut EditorState) -> Result<(), String>;
+    // (name, fixture, check)
+    let cases: &[(&str, Build, Check)] = &[
+        ("undo_noop_when_quick_open_active", undoable, |s| {
+            s.active_modal = Some(quick_open());
+            let _ = s.update(EditorMessage::Undo);
+            let text = s.tab_contents["/test.rs"].content.text();
+            if text != "!hello" {
+                return Err(format!("undo applied under a modal: {text:?}"));
+            }
+            Ok(())
+        }),
+        (
+            "refresh_file_tree_noop_when_quick_open_active",
+            make_editor_with_tree,
+            |s| {
+                if s.selected_workspace_path.is_none() {
+                    return Err("no workspace selected".to_string());
+                }
+                let gen_count = s.dir_generations.len();
+                s.active_modal = Some(quick_open());
+                let _ = s.update(EditorMessage::RefreshFileTree);
+                if s.dir_generations.len() != gen_count {
+                    return Err("directory refreshed under a modal".to_string());
+                }
+                Ok(())
+            },
+        ),
+        (
+            "tree_focus_toggled_noop_during_modal_overlay",
+            make_editor_with_tree,
+            |s| {
+                let _ = s.update(EditorMessage::TreeFocusToggled);
+                if !s.file_tree.tree_focused {
+                    return Err("first toggle did not focus the tree".to_string());
+                }
+                s.active_modal = Some(quick_open());
+                let _ = s.update(EditorMessage::TreeFocusToggled);
+                if !s.file_tree.tree_focused {
+                    return Err("toggle applied under a modal".to_string());
+                }
+                Ok(())
+            },
+        ),
+        (
+            "tree_nav_suppressed_during_goto_line_overlay",
+            focusable_tree,
+            |s| {
+                s.file_tree.tree_focused = true;
+                s.file_tree.tree_focus_index = 0; // "src"
+                s.active_modal = Some(ModalKind::GotoLine);
+                let prev_focus = s.file_tree.tree_focus_index;
+                for msg in [
+                    EditorMessage::TreeNavUp,
+                    EditorMessage::TreeNavDown,
+                    EditorMessage::TreeNavEnter,
+                    EditorMessage::TreeNavLeft,
+                    EditorMessage::TreeNavRight,
+                ] {
+                    let _ = s.update(msg.clone());
+                    if s.file_tree.tree_focus_index != prev_focus {
+                        return Err(format!("{msg:?} moved the focus"));
+                    }
+                }
+                let _ = s.update(EditorMessage::TreeFocusToggled);
+                if !s.file_tree.tree_focused {
+                    return Err("TreeFocusToggled cleared the focus".to_string());
+                }
+                Ok(())
+            },
+        ),
+        ("tree_nav_suppressed_during_rename", focusable_tree, |s| {
+            s.selected_workspace_path = Some("/tmp".to_string());
+            s.file_tree.tree_focused = true;
+            s.file_tree.tree_focus_index = 0; // "src"
+            let _ = s.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+            let prev_focus = s.file_tree.tree_focus_index;
+            for msg in [
+                EditorMessage::TreeNavUp,
+                EditorMessage::TreeNavDown,
+                EditorMessage::TreeNavEnter,
+                EditorMessage::TreeNavLeft,
+                EditorMessage::TreeNavRight,
+                EditorMessage::TreeFocusToggled,
+            ] {
+                let _ = s.update(msg.clone());
+                if s.file_tree.tree_focus_index != prev_focus {
+                    return Err(format!("{msg:?} moved the focus"));
+                }
+            }
+            let _ = s.update(EditorMessage::RenameCancel);
+            let _ = s.update(EditorMessage::TreeNavDown);
+            if s.file_tree.tree_focus_index == prev_focus {
+                return Err("navigation did not resume after cancel".to_string());
+            }
+            Ok(())
+        }),
+        (
+            "quick_open_toggle_blocked_when_goto_line_open",
+            tab_state,
+            |s| {
+                s.active_modal = Some(ModalKind::GotoLine);
+                let _ = s.update(EditorMessage::QuickOpenToggle);
+                if matches!(s.active_modal, Some(ModalKind::QuickOpen(_))) {
+                    return Err("quick open replaced the goto-line overlay".to_string());
+                }
+                Ok(())
+            },
+        ),
+        (
+            "quick_open_toggle_closes_when_already_open",
+            tab_state,
+            |s| {
+                s.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
+                    filter: crate::gui::common::SingleLineEditorState::new("foo"),
+                    selected_index: 0,
+                    results: Vec::new(),
+                }));
+                let _ = s.update(EditorMessage::QuickOpenToggle);
+                if s.active_modal.is_some() {
+                    return Err("quick open not closed".to_string());
+                }
+                Ok(())
+            },
+        ),
+        (
+            "global_search_toggle_blocked_when_quick_open_open",
+            tab_state,
+            |s| {
+                s.selected_workspace_name = Some("ws".to_string());
+                s.selected_workspace_path = Some("/tmp/ws".to_string());
+                s.active_modal = Some(quick_open());
+                let _ = s.update(EditorMessage::GlobalSearchToggle);
+                if matches!(s.active_modal, Some(ModalKind::GlobalSearch(_))) {
+                    return Err("global search opened under quick open".to_string());
+                }
+                Ok(())
+            },
+        ),
+    ];
+    for &(name, build, check) in cases {
+        let mut state = build();
+        if let Err(what) = check(&mut state) {
+            panic!("case {name}: {what}");
+        }
+    }
 }
 
 // ── Inline rename tests ────────────────────────────────────
 
 #[test]
-fn test_rename_request_sets_target() {
-    let mut state = make_editor_with_tree();
-    state.selected_workspace_path = Some("/tmp".to_string());
-    let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-    assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
-    let Some(ModalKind::Rename(rt)) = state.active_modal else {
-        panic!("expected Rename modal")
-    };
-    assert_eq!(rt.path, "Cargo.toml");
-    assert_eq!(rt.input_text.text(), "Cargo.toml");
-    assert!(!rt.is_dir);
-}
-
-#[test]
-fn test_rename_request_on_directory_sets_is_dir() {
-    // Use a real temp directory so Path::is_dir() returns true.
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let dir_path = tmp_dir.path().join("src");
-    std::fs::create_dir(&dir_path).unwrap();
-    let mut state = EditorState::new();
-    state.selected_workspace_path = Some(tmp_dir.path().to_string_lossy().to_string());
-    state.dir_entries.insert(
-        String::new(),
-        vec![FsEntry {
-            name: "src".to_string(),
-            full_path: "src".to_string(),
-            is_dir: true,
-            error: None,
-        }],
-    );
-    let _ = state.update(EditorMessage::RenameRequested("src".into()));
-    assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
-    let Some(ModalKind::Rename(rt)) = state.active_modal else {
-        panic!("expected Rename modal")
-    };
-    assert_eq!(rt.path, "src");
-    assert_eq!(rt.input_text.text(), "src");
-    assert!(rt.is_dir);
-}
-
-#[test]
-fn test_rename_request_on_root_dir_rejected() {
-    let mut state = make_editor_with_tree();
-    state.selected_workspace_path = Some("/tmp".to_string());
-    let _ = state.update(EditorMessage::RenameRequested(String::new()));
-    assert!(
-        state.active_modal.is_none() || !matches!(state.active_modal, Some(ModalKind::Rename(_)))
-    );
-}
-
-#[test]
-fn test_rename_input_updates_text_and_clears_error() {
-    let mut state = make_editor_with_tree();
-    state.selected_workspace_path = Some("/tmp".to_string());
-    let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-    // Simulate a validation error
-    if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
-        rt.error = Some("bad".into());
-    }
-    // The buffer pre-fills with the file name; model clearing it before typing.
-    if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
-        rt.input_text.set_text("");
-    }
-    // Type new text
-    let _ = state.update(EditorMessage::RenameInput(EditorAction::Paste(
-        "new_name".into(),
-    )));
-    if let Some(ModalKind::Rename(ref rt)) = state.active_modal {
-        assert_eq!(rt.input_text.text(), "new_name");
-        // Error should be cleared when user types
-        assert!(rt.error.is_none());
-    } else {
-        panic!("expected Rename modal");
-    }
-}
-
-#[test]
-fn test_rename_cancel_and_escape() {
-    for msg in [EditorMessage::RenameCancel, EditorMessage::Escape] {
+fn test_rename_request_and_input() {
+    fn tree_state() -> EditorState {
         let mut state = make_editor_with_tree();
         state.selected_workspace_path = Some("/tmp".to_string());
-        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
-        let _ = state.update(msg.clone());
-        assert!(
-            state.active_modal.is_none(),
-            "{msg:?} must close the Rename modal"
-        );
+        state
     }
-}
 
-#[test]
-fn test_tree_nav_suppressed_during_rename() {
-    let mut state = make_editor_with_tree();
-    state.selected_workspace_path = Some("/tmp".to_string());
-    // Expand "src" so TreeNavEnter/TreeNavLeft/TreeNavRight have targets.
-    state.file_tree.expanded_dirs.insert("src".to_string());
-    state.file_tree.nodes =
-        build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-    state.file_tree.rebuild_visible();
-    state.file_tree.tree_focused = true;
-    // Focus on "src" so TreeNavLeft (collapse) and TreeNavRight (expand)
-    // have an effect when not suppressed.
-    state.file_tree.tree_focus_index = 0; // "src"
-
-    let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-    let prev_focus = state.file_tree.tree_focus_index;
-    // All 6 tree-navigation messages must be suppressed during rename.
-    let nav_msgs: &[EditorMessage] = &[
-        EditorMessage::TreeNavUp,
-        EditorMessage::TreeNavDown,
-        EditorMessage::TreeNavEnter,
-        EditorMessage::TreeNavLeft,
-        EditorMessage::TreeNavRight,
-        EditorMessage::TreeFocusToggled,
+    type Build = fn() -> EditorState;
+    type Check = fn(&mut EditorState) -> Option<&'static str>;
+    // (name, fixture, check)
+    let cases: &[(&str, Build, Check)] = &[
+        ("rename_request_sets_target", tree_state, |s| {
+            let _ = s.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+            let Some(ModalKind::Rename(rt)) = &s.active_modal else {
+                return Some("expected Rename modal");
+            };
+            if rt.path != "Cargo.toml" {
+                return Some("wrong path");
+            }
+            if rt.input_text.text() != "Cargo.toml" {
+                return Some("wrong prefilled name");
+            }
+            rt.is_dir.then_some("marked as a directory")
+        }),
+        (
+            "rename_request_on_directory_sets_is_dir",
+            EditorState::new,
+            |s| {
+                // A real temp directory so Path::is_dir() returns true.
+                let tmp_dir = tempfile::tempdir().unwrap();
+                std::fs::create_dir(tmp_dir.path().join("src")).unwrap();
+                s.selected_workspace_path = Some(tmp_dir.path().to_string_lossy().to_string());
+                s.dir_entries
+                    .insert(String::new(), vec![fs_entry("src", "src", true)]);
+                let _ = s.update(EditorMessage::RenameRequested("src".into()));
+                let Some(ModalKind::Rename(rt)) = &s.active_modal else {
+                    return Some("expected Rename modal");
+                };
+                if rt.path != "src" {
+                    return Some("wrong path");
+                }
+                if rt.input_text.text() != "src" {
+                    return Some("wrong prefilled name");
+                }
+                (!rt.is_dir).then_some("not marked as a directory")
+            },
+        ),
+        ("rename_request_on_root_dir_rejected", tree_state, |s| {
+            let _ = s.update(EditorMessage::RenameRequested(String::new()));
+            matches!(s.active_modal, Some(ModalKind::Rename(_)))
+                .then_some("root accepted as a rename target")
+        }),
+        (
+            "rename_input_updates_text_and_clears_error",
+            tree_state,
+            |s| {
+                let _ = s.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+                if let Some(ModalKind::Rename(rt)) = s.active_modal.as_mut() {
+                    rt.error = Some("bad".into());
+                    // The buffer pre-fills with the file name; clear it before typing.
+                    rt.input_text.set_text("");
+                }
+                let _ = s.update(EditorMessage::RenameInput(EditorAction::Paste(
+                    "new_name".into(),
+                )));
+                match &s.active_modal {
+                    Some(ModalKind::Rename(rt)) => {
+                        if rt.input_text.text() != "new_name" {
+                            return Some("typed text lost");
+                        }
+                        rt.error.is_some().then_some("error not cleared")
+                    }
+                    _ => Some("expected Rename modal"),
+                }
+            },
+        ),
     ];
-    for msg in nav_msgs {
-        let _ = state.update(msg.clone());
-        assert_eq!(
-            state.file_tree.tree_focus_index, prev_focus,
-            "{msg:?} should be suppressed during rename"
-        );
+    for &(name, build, check) in cases {
+        let mut state = build();
+        if let Some(what) = check(&mut state) {
+            panic!("case {name}: {what}");
+        }
     }
-    // After the rename is cancelled, navigation should work again.
-    let _ = state.update(EditorMessage::RenameCancel);
-    let _ = state.update(EditorMessage::TreeNavDown);
-    // Focus should have moved now that rename is gone.
-    assert_ne!(state.file_tree.tree_focus_index, prev_focus);
 }
 
 #[test]
-fn test_rename_mutual_exclusion_with_new_item() {
-    let mut state = make_editor_with_tree();
-    state.selected_workspace_path = Some("/tmp".to_string());
-
-    // Start rename, then NewFileRequested should cancel it.
-    let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-    assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
-    let _ = state.update(EditorMessage::NewFileRequested("src".into()));
-    assert!(
-        state.active_modal.is_none() || !matches!(state.active_modal, Some(ModalKind::Rename(_)))
-    );
-    assert!(matches!(state.active_modal, Some(ModalKind::NewItem(_))));
-
-    // Start new item again — and confirm rename cancels new_item.
-    let _ = state.update(EditorMessage::NewFileRequested(String::new()));
-    assert!(matches!(state.active_modal, Some(ModalKind::NewItem(_))));
-    let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-    assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
+fn test_rename_cancel_and_mutual_exclusion() {
+    fn rename_state() -> EditorState {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        state
+    }
+    fn start(state: &mut EditorState) {
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        assert!(
+            matches!(state.active_modal, Some(ModalKind::Rename(_))),
+            "rename starts"
+        );
+    }
+    fn no_rename(state: &EditorState) -> Option<&'static str> {
+        matches!(state.active_modal, Some(ModalKind::Rename(_))).then_some("rename not cancelled")
+    }
+    type Run = fn(&mut EditorState) -> Option<&'static str>;
+    // (name, run after a rename was started)
+    let cases: &[(&str, Run)] = &[
+        ("rename_cancel_and_escape", |s| {
+            for msg in [EditorMessage::RenameCancel, EditorMessage::Escape] {
+                start(s);
+                let _ = s.update(msg.clone());
+                if s.active_modal.is_some() {
+                    return Some("modal not closed");
+                }
+            }
+            None
+        }),
+        ("rename_mutual_exclusion_with_new_item", |s| {
+            let _ = s.update(EditorMessage::NewFileRequested("src".into()));
+            no_rename(s)?;
+            if !matches!(s.active_modal, Some(ModalKind::NewItem(_))) {
+                return Some("new item modal not opened");
+            }
+            let _ = s.update(EditorMessage::NewFileRequested(String::new()));
+            if !matches!(s.active_modal, Some(ModalKind::NewItem(_))) {
+                return Some("new item modal not reopened");
+            }
+            let _ = s.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+            (!matches!(s.active_modal, Some(ModalKind::Rename(_)))).then_some("rename lost")
+        }),
+        ("rename_cancelled_by_toggle_dir_click", |s| {
+            let _ = s.update(EditorMessage::ToggleDir("src".into()));
+            no_rename(s)
+        }),
+        ("rename_cancelled_by_select_file_click", |s| {
+            let _ = s.update(EditorMessage::SelectFile("src/main.rs".into()));
+            no_rename(s)
+        }),
+        ("rename_mutual_exclusion_cancelled_by_new_file", |s| {
+            let _ = s.update(EditorMessage::NewFileRequested("src".into()));
+            no_rename(s)?;
+            (!matches!(s.active_modal, Some(ModalKind::NewItem(_))))
+                .then_some("new item modal missing")
+        }),
+        ("rename_mutual_exclusion_cancelled_by_new_directory", |s| {
+            let _ = s.update(EditorMessage::NewDirectoryRequested("src".into()));
+            no_rename(s)?;
+            (!matches!(s.active_modal, Some(ModalKind::NewItem(_))))
+                .then_some("new item modal missing")
+        }),
+        ("rename_mutual_exclusion_cancelled_by_delete_file", |s| {
+            let _ = s.update(EditorMessage::DeleteFileRequested("other.rs".into()));
+            no_rename(s)?;
+            match &s.active_modal {
+                Some(ModalKind::DeleteConfirm(target)) => {
+                    (target.path != "other.rs").then_some("wrong delete target")
+                }
+                _ => Some("delete confirmation missing"),
+            }
+        }),
+        ("rename_mutual_exclusion_cancelled_by_delete_dir", |s| {
+            let _ = s.update(EditorMessage::DeleteDirectoryRequested("src".into()));
+            no_rename(s)?;
+            match &s.active_modal {
+                Some(ModalKind::DeleteConfirm(target)) => {
+                    (target.path != "src").then_some("wrong delete target")
+                }
+                _ => Some("delete confirmation missing"),
+            }
+        }),
+    ];
+    for &(name, run) in cases {
+        let mut state = rename_state();
+        start(&mut state);
+        if let Some(what) = run(&mut state) {
+            panic!("case {name}: {what}");
+        }
+    }
 }
 
 // ── Rename validation tests ────────────────────────────────
 
-/// Helper: set up state for rename validation tests.
 fn setup_rename_state(state: &mut EditorState, input_text: &str) {
     state.selected_workspace_path = Some("/tmp".to_string());
     let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
@@ -1437,9 +1019,8 @@ fn setup_rename_state(state: &mut EditorState, input_text: &str) {
     }
 }
 
-/// Helper: set up a rename with `input`, submit it, and assert that
-/// the resulting error equals `expected`.
-fn assert_rename_rejects(input: &str, expected: Option<&'static str>) {
+/// Helper: set up a rename with `input`, submit it, and assert the error.
+fn assert_rename_rejects(name: &str, input: &str, expected: Option<&'static str>) {
     let mut state = make_editor_with_tree();
     setup_rename_state(&mut state, input);
     let _ = state.update(EditorMessage::RenameSubmit);
@@ -1447,46 +1028,23 @@ fn assert_rename_rejects(input: &str, expected: Option<&'static str>) {
         Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
         _ => None,
     };
-    assert_eq!(err, expected, "rejection of {input:?}");
+    assert_eq!(err, expected, "case {name}: rejection of {input:?}");
 }
 
 #[test]
 fn test_rename_validation() {
-    struct Case {
-        input: &'static str,
-        expected: Option<&'static str>,
-    }
-    let cases: &[Case] = &[
-        // Empty / whitespace-only
-        Case {
-            input: "   ",
-            expected: Some("Name cannot be empty"),
-        },
-        // Path separators
-        Case {
-            input: "foo/bar.rs",
-            expected: Some("Name cannot contain path separators"),
-        },
-        Case {
-            input: "foo\\bar.rs",
-            expected: Some("Name cannot contain path separators"),
-        },
-        Case {
-            input: "foo\0bar.rs",
-            expected: Some("Name cannot contain path separators"),
-        },
-        // Dot / dot-dot
-        Case {
-            input: ".",
-            expected: Some("Invalid name"),
-        },
-        Case {
-            input: "..",
-            expected: Some("Invalid name"),
-        },
+    const SEPARATOR: &str = "Name cannot contain path separators";
+    // (name, input, expected rejection)
+    let cases = [
+        ("empty", "   ", Some("Name cannot be empty")),
+        ("slash", "foo/bar.rs", Some(SEPARATOR)),
+        ("backslash", "foo\\bar.rs", Some(SEPARATOR)),
+        ("nul", "foo\0bar.rs", Some(SEPARATOR)),
+        ("dot", ".", Some("Invalid name")),
+        ("dot_dot", "..", Some("Invalid name")),
     ];
-    for case in cases {
-        assert_rename_rejects(case.input, case.expected);
+    for &(name, input, expected) in &cases {
+        assert_rename_rejects(name, input, expected);
     }
 }
 
@@ -1495,7 +1053,7 @@ fn test_rename_validation() {
 fn test_rename_validation_os_reserved_names() {
     let reserved = ["con", "NUL", "prn", "AUX", "com1", "lpt3"];
     for name in &reserved {
-        assert_rename_rejects(name, Some("Name is reserved by the operating system"));
+        assert_rename_rejects(name, name, Some("Name is reserved by the operating system"));
     }
 }
 
@@ -1572,101 +1130,20 @@ fn test_rename_stale_generation_discarded() {
     assert_eq!(state.selected_file, None);
 }
 
-// ── Click-outside cancel tests (consolidated) ───────────────
-
-#[test]
-fn test_rename_cancelled_by_tree_click() {
-    // Both ToggleDir and SelectFile should cancel a pending rename.
-    let triggers: &[EditorMessage] = &[
-        EditorMessage::ToggleDir("src".into()),
-        EditorMessage::SelectFile("src/main.rs".into()),
-    ];
-    for trigger in triggers {
-        let mut state = make_editor_with_tree();
-        state.selected_workspace_path = Some("/tmp".to_string());
-        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        assert!(
-            matches!(state.active_modal, Some(ModalKind::Rename(_))),
-            "rename should be active before {trigger:?}"
-        );
-        let _ = state.update(trigger.clone());
-        assert!(
-            state.active_modal.is_none()
-                || !matches!(state.active_modal, Some(ModalKind::Rename(_))),
-            "rename should be cancelled by {trigger:?}"
-        );
-    }
-}
-
-#[test]
-fn test_rename_mutual_exclusion_cancelled_by_other_modals() {
-    // Starting a different modal operation should cancel an active rename.
-    // Each test case carries a message to dispatch and a check closure
-    // that verifies the expected modal state after the message fires.
-    struct Case {
-        msg: EditorMessage,
-        /// Assert the expected modal state after the message fires.
-        check: fn(&EditorState),
-    }
-    let cases: &[Case] = &[
-        Case {
-            msg: EditorMessage::NewFileRequested("src".into()),
-            check: |s| assert!(matches!(s.active_modal, Some(ModalKind::NewItem(_)))),
-        },
-        Case {
-            msg: EditorMessage::NewDirectoryRequested("src".into()),
-            check: |s| assert!(matches!(s.active_modal, Some(ModalKind::NewItem(_)))),
-        },
-        Case {
-            msg: EditorMessage::DeleteFileRequested("other.rs".into()),
-            check: |s| {
-                assert!(matches!(s.active_modal, Some(ModalKind::DeleteConfirm(_))));
-                if let Some(ModalKind::DeleteConfirm(ref target)) = s.active_modal {
-                    assert_eq!(target.path, "other.rs");
-                }
-            },
-        },
-        Case {
-            msg: EditorMessage::DeleteDirectoryRequested("src".into()),
-            check: |s| {
-                assert!(matches!(s.active_modal, Some(ModalKind::DeleteConfirm(_))));
-                if let Some(ModalKind::DeleteConfirm(ref target)) = s.active_modal {
-                    assert_eq!(target.path, "src");
-                }
-            },
-        },
-    ];
-    for case in cases {
-        let mut state = make_editor_with_tree();
-        state.selected_workspace_path = Some("/tmp".to_string());
-
-        // Start rename.
-        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        assert!(
-            matches!(state.active_modal, Some(ModalKind::Rename(_))),
-            "case {:?}",
-            case.msg
-        );
-
-        // Fire the competing modal message.
-        let _ = state.update(case.msg.clone());
-        assert!(
-            !matches!(state.active_modal, Some(ModalKind::Rename(_))),
-            "rename should be cancelled by {:?}",
-            case.msg
-        );
-        (case.check)(&state);
-    }
-}
-
 // ── rekey helpers ──────────────────────────────────────────
+
+type RebaseCase<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a [&'a str],
+    &'a [(&'a str, &'a str)],
+);
 
 #[test]
 fn test_rebase_tree_key() {
-    // (name, old_prefix, new_prefix, keys, expected rebased keys)
-    #[rustfmt::skip]
-    #[expect(clippy::type_complexity)]
-    let cases: &[(&str, &str, &str, &[&str], &[(&str, &str)])] = &[
+    // (name, old prefix, new prefix, keys, expected rebased keys)
+    let cases: &[RebaseCase] = &[
         ("empty", "old/", "new/", &[], &[]),
         ("no_match", "old/", "new/", &["a", "b"], &[]),
         (
@@ -1676,7 +1153,13 @@ fn test_rebase_tree_key() {
             &["old/foo", "other", "old/bar/baz"],
             &[("old/bar/baz", "new/bar/baz"), ("old/foo", "new/foo")],
         ),
-        ("exact_prefix", "dir", "newdir", &["dir"], &[("dir", "newdir")]),
+        (
+            "exact_prefix",
+            "dir",
+            "newdir",
+            &["dir"],
+            &[("dir", "newdir")],
+        ),
     ];
     for &(name, old_prefix, new_prefix, keys, expected) in cases {
         let mut pairs: Vec<(&str, String)> = keys
@@ -1684,15 +1167,18 @@ fn test_rebase_tree_key() {
             .filter_map(|k| Some((*k, rebase_tree_key(k, old_prefix, new_prefix)?)))
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(b.0));
-        let got: Vec<(&str, &str)> = pairs.iter().map(|(a, b)| (*a, b.as_str())).collect();
-        assert_eq!(got, expected, "case: {name}");
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|(a, b)| (*a, b.as_str()))
+                .collect::<Vec<_>>(),
+            expected,
+            "case {name}: rebased keys"
+        );
     }
 }
 
-/// The absolute helpers split paths into components, so a base carrying the
-/// trailing separator a stored workspace root comes with still contains its own
-/// files. Cases use forward slashes so they read the same on every host;
-/// expectations go through the same `join` that inserts the native separator.
+/// The absolute helpers split paths into components, so a trailing base separator still matches.
 #[test]
 fn test_abs_path_helpers_are_component_wise() {
     assert!(is_within_abs("C:/ws/a.txt", "C:/ws/"));
@@ -1797,12 +1283,7 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
     // Add a subdirectory entry for recursive testing.
     state.dir_entries.insert(
         "src/subdir".to_string(),
-        vec![FsEntry {
-            name: "helper.rs".to_string(),
-            full_path: "src/subdir/helper.rs".to_string(),
-            is_dir: false,
-            error: None,
-        }],
+        vec![fs_entry("helper.rs", "src/subdir/helper.rs", false)],
     );
 
     // Simulate a rename of "src" -> "lib" completing successfully.
@@ -1815,12 +1296,7 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
         new_path: "lib".into(),
         is_dir: true,
         result: Ok(()),
-        dir_entries: Ok(vec![FsEntry {
-            name: "lib".to_string(),
-            full_path: "lib".to_string(),
-            is_dir: true,
-            error: None,
-        }]),
+        dir_entries: Ok(vec![fs_entry("lib", "lib", true)]),
         rename_gen: 0,
     });
 
@@ -1868,76 +1344,24 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
 
 #[test]
 fn test_switch_tab_relative() {
-    struct Case {
-        name: &'static str,
-        tabs: usize,
-        start: usize,
-        direction: TabDirection,
-        expected: usize,
-    }
-    let cases: &[Case] = &[
-        Case {
-            name: "single tab next",
-            tabs: 1,
-            start: 0,
-            direction: TabDirection::Next,
-            expected: 0,
-        },
-        Case {
-            name: "single tab prev",
-            tabs: 1,
-            start: 0,
-            direction: TabDirection::Prev,
-            expected: 0,
-        },
-        Case {
-            name: "next wraps to first",
-            tabs: 3,
-            start: 2,
-            direction: TabDirection::Next,
-            expected: 0,
-        },
-        Case {
-            name: "prev wraps to last",
-            tabs: 3,
-            start: 0,
-            direction: TabDirection::Prev,
-            expected: 2,
-        },
-        Case {
-            name: "middle next",
-            tabs: 3,
-            start: 1,
-            direction: TabDirection::Next,
-            expected: 2,
-        },
-        Case {
-            name: "middle prev",
-            tabs: 3,
-            start: 1,
-            direction: TabDirection::Prev,
-            expected: 0,
-        },
+    // (name, tabs, start, direction, expected active index)
+    let cases: &[(&str, usize, usize, TabDirection, usize)] = &[
+        ("single tab next", 1, 0, TabDirection::Next, 0),
+        ("single tab prev", 1, 0, TabDirection::Prev, 0),
+        ("next wraps to first", 3, 2, TabDirection::Next, 0),
+        ("prev wraps to last", 3, 0, TabDirection::Prev, 2),
+        ("middle next", 3, 1, TabDirection::Next, 2),
+        ("middle prev", 3, 1, TabDirection::Prev, 0),
+        // With exactly two tabs, Next and Prev toggle between them.
+        ("two tabs next from first", 2, 0, TabDirection::Next, 1),
+        ("two tabs next from second", 2, 1, TabDirection::Next, 0),
+        ("two tabs prev from first", 2, 0, TabDirection::Prev, 1),
     ];
-    for case in cases {
-        let mut state = EditorFixture::new().tabs(case.tabs, case.start).build();
-        let _ = state.switch_tab_relative(case.direction);
-        assert_eq!(state.active_tab_index, case.expected, "{}", case.name);
+    for &(name, tabs, start, direction, expected) in cases {
+        let mut state = EditorFixture::new().tabs(tabs, start).build();
+        let _ = state.switch_tab_relative(direction);
+        assert_eq!(state.active_tab_index, expected, "case {name}: active tab");
     }
-}
-
-#[test]
-fn test_switch_tab_relative_two_tabs() {
-    // With exactly two tabs, Next and Prev toggle between them.
-    let mut state = EditorFixture::new().tabs(2, 0).build();
-    let _ = state.switch_tab_relative(TabDirection::Next);
-    assert_eq!(state.active_tab_index, 1);
-
-    let _ = state.switch_tab_relative(TabDirection::Next);
-    assert_eq!(state.active_tab_index, 0);
-
-    let _ = state.switch_tab_relative(TabDirection::Prev);
-    assert_eq!(state.active_tab_index, 1);
 }
 
 // ── Directory forgetting (deleted directories) ─────────────────
@@ -1963,28 +1387,19 @@ fn test_classify_read_dir_error_not_found_vs_other() {
     ));
 }
 
-/// Set up an EditorState with "src" and "src/sub" expanded, a cached
-/// quick-open file list, and per-file absolute-path caches, so a
-/// directory-forget can be asserted against all of them.
 fn make_editor_with_expanded_subdir() -> EditorState {
     let mut state = make_editor_with_tree();
     state.file_tree.expanded_dirs.insert("src".to_string());
     state.file_tree.expanded_dirs.insert("src/sub".to_string());
     state.dir_entries.insert(
         "src/sub".to_string(),
-        vec![FsEntry {
-            name: "deep.rs".to_string(),
-            full_path: "src/sub/deep.rs".to_string(),
-            is_dir: false,
-            error: None,
-        }],
+        vec![fs_entry("deep.rs", "src/sub/deep.rs", false)],
     );
-    state.dir_entries.get_mut("src").unwrap().push(FsEntry {
-        name: "sub".to_string(),
-        full_path: "src/sub".to_string(),
-        is_dir: true,
-        error: None,
-    });
+    state
+        .dir_entries
+        .get_mut("src")
+        .unwrap()
+        .push(fs_entry("sub", "src/sub", true));
     state.loading_dirs.insert("src/sub".to_string());
     state.dir_generations.insert("src".to_string(), 3);
     state.dir_generations.insert("src/sub".to_string(), 7);
@@ -2008,74 +1423,87 @@ fn make_editor_with_expanded_subdir() -> EditorState {
 }
 
 #[test]
-fn test_dir_expanded_not_found_forgets_silently() {
-    // A missing directory must be forgotten regardless of the quiet flag:
-    // no toast and no warning, whether the deletion came from the GUI,
-    // external tooling, or a script.
-    for quiet in [true, false] {
+fn test_dir_expanded_error_cases() {
+    fn forgotten(state: &EditorState) -> Result<(), String> {
+        let tree = &state.file_tree;
+        let root_entries = state.dir_entries.get("").unwrap();
+        for (what, present) in [
+            ("src", tree.expanded_dirs.contains("src")),
+            ("src/sub", tree.expanded_dirs.contains("src/sub")),
+            ("src listing", state.dir_entries.contains_key("src")),
+            ("src/sub listing", state.dir_entries.contains_key("src/sub")),
+            ("src gen", state.dir_generations.contains_key("src")),
+            ("src/sub gen", state.dir_generations.contains_key("src/sub")),
+        ] {
+            if present {
+                return Err(format!("{what} not forgotten"));
+            }
+        }
+        if state.loading_dirs.contains("src/sub") {
+            return Err("load flag not dropped".to_string());
+        }
+        if state.selected_file.is_some() {
+            return Err("selection not cleared".to_string());
+        }
+        if state
+            .all_workspace_files
+            .iter()
+            .any(|p| p.starts_with("src/"))
+        {
+            return Err("quick-open not pruned".to_string());
+        }
+        if root_entries.iter().any(|e| e.full_path == "src") {
+            return Err("root entry not pruned".to_string());
+        }
+        if tree.visible_tree_nodes.iter().any(|(p, _)| p == "src") {
+            return Err("visible node not pruned".to_string());
+        }
+        Ok(())
+    }
+    fn kept(state: &EditorState) -> Result<(), String> {
+        let tree = &state.file_tree;
+        for (what, present) in [
+            ("src", tree.expanded_dirs.contains("src")),
+            ("src/sub", tree.expanded_dirs.contains("src/sub")),
+            ("src listing", state.dir_entries.contains_key("src")),
+            ("src/sub listing", state.dir_entries.contains_key("src/sub")),
+        ] {
+            if !present {
+                return Err(format!("{what} dropped"));
+            }
+        }
+        if state.selected_file.as_deref() != Some("src/sub/deep.rs") {
+            return Err("selection lost".to_string());
+        }
+        if !state.all_workspace_files.iter().any(|p| p == "src/main.rs") {
+            return Err("quick-open pruned".to_string());
+        }
+        Ok(())
+    }
+    type Check = fn(&EditorState) -> Result<(), String>;
+    // (name, error, quiet, check)
+    let cases: &[(&str, ReadDirError, bool, Check)] = &[
+        ("not_found_quiet", ReadDirError::NotFound, true, forgotten),
+        ("not_found_loud", ReadDirError::NotFound, false, forgotten),
+        (
+            "other_error_keeps_path",
+            ReadDirError::Other("Permission denied".to_string()),
+            true,
+            kept,
+        ),
+    ];
+    for &(name, ref error, quiet, check) in cases {
         let mut state = make_editor_with_expanded_subdir();
         let r#gen = state.bump_generation();
         state.dir_generations.insert("src".to_string(), r#gen);
         let _ = state.update(EditorMessage::DirExpanded {
             dir_path: "src".to_string(),
             r#gen,
-            entries: Err(ReadDirError::NotFound),
+            entries: Err(error.clone()),
             quiet,
         });
-
-        // The deleted directory and its descendants are forgotten from the
-        // expanded set, the cached listings, in-flight loads/generations,
-        // the quick-open cache, and the selection.
-        assert!(!state.file_tree.expanded_dirs.contains("src"));
-        assert!(!state.file_tree.expanded_dirs.contains("src/sub"));
-        assert!(!state.dir_entries.contains_key("src"));
-        assert!(!state.dir_entries.contains_key("src/sub"));
-        assert!(!state.loading_dirs.contains("src/sub"));
-        assert!(!state.dir_generations.contains_key("src"));
-        assert!(!state.dir_generations.contains_key("src/sub"));
-        assert_eq!(state.selected_file, None);
-        assert!(
-            !state
-                .all_workspace_files
-                .iter()
-                .any(|p| p.starts_with("src/"))
-        );
-
-        // The stale node is pruned from the parent's listing too, so the
-        // tree no longer shows the deleted directory.
-        let root_entries = state.dir_entries.get("").unwrap();
-        assert!(!root_entries.iter().any(|e| e.full_path == "src"));
-        assert!(
-            !state
-                .file_tree
-                .visible_tree_nodes
-                .iter()
-                .any(|(p, _)| p == "src")
-        );
+        assert_eq!(check(&state), Ok(()), "case {name}");
     }
-}
-
-#[test]
-fn test_dir_expanded_other_error_keeps_path() {
-    // A directory that still exists but cannot be read must NOT be
-    // forgotten — it stays in the refresh/cache state so the problem
-    // keeps surfacing as a warning.
-    let mut state = make_editor_with_expanded_subdir();
-    let r#gen = state.bump_generation();
-    state.dir_generations.insert("src".to_string(), r#gen);
-    let _ = state.update(EditorMessage::DirExpanded {
-        dir_path: "src".to_string(),
-        r#gen,
-        entries: Err(ReadDirError::Other("Permission denied".to_string())),
-        quiet: true,
-    });
-
-    assert!(state.file_tree.expanded_dirs.contains("src"));
-    assert!(state.file_tree.expanded_dirs.contains("src/sub"));
-    assert!(state.dir_entries.contains_key("src"));
-    assert!(state.dir_entries.contains_key("src/sub"));
-    assert_eq!(state.selected_file.as_deref(), Some("src/sub/deep.rs"));
-    assert!(state.all_workspace_files.iter().any(|p| p == "src/main.rs"));
 }
 
 #[test]
@@ -2145,64 +1573,94 @@ fn test_forget_directory_prunes_path_descendants_and_root() {
 }
 
 #[test]
-fn test_dir_deleted_prunes_and_refreshes_parent() {
-    // The DirDeleted message is emitted by the GUI-delete success path: it
-    // must prune the deleted directory (and descendants) from the tree state
-    // and register a parent re-read generation so the tree refreshes.
-    let mut state = make_editor_with_expanded_subdir();
-    let _ = state.update(EditorMessage::DirDeleted {
-        dir_path: "src".to_string(),
-        workspace_path: "/tmp".to_string(),
-    });
+fn test_dir_deleted_cases() {
+    type Check = fn(&EditorState) -> Result<(), String>;
 
-    assert!(!state.file_tree.expanded_dirs.contains("src"));
-    assert!(!state.file_tree.expanded_dirs.contains("src/sub"));
-    assert!(!state.dir_entries.contains_key("src"));
-    assert!(!state.dir_entries.contains_key("src/sub"));
-    assert_eq!(state.selected_file, None);
-    assert!(
-        !state
+    /// The GUI-delete success path prunes the directory and registers a re-read.
+    fn pruned_and_refreshed(state: &EditorState) -> Result<(), String> {
+        let tree = &state.file_tree;
+        for (what, kept) in [
+            ("src", tree.expanded_dirs.contains("src")),
+            ("src/sub", tree.expanded_dirs.contains("src/sub")),
+            ("src listing", state.dir_entries.contains_key("src")),
+            ("src/sub listing", state.dir_entries.contains_key("src/sub")),
+        ] {
+            if kept {
+                return Err(format!("{what} not pruned"));
+            }
+        }
+        if state.selected_file.is_some() {
+            return Err("selection not cleared".to_string());
+        }
+        if state
             .all_workspace_files
             .iter()
             .any(|p| p.starts_with("src/"))
-    );
+        {
+            return Err("quick-open not pruned".to_string());
+        }
 
-    // The parent (root) listing survives but no longer shows the deleted dir.
-    let root_entries = state.dir_entries.get("").unwrap();
-    assert!(!root_entries.iter().any(|e| e.full_path == "src"));
-    assert_eq!(root_entries.len(), 1);
-    assert_eq!(root_entries[0].full_path, "Cargo.toml");
+        // The parent (root) listing survives but no longer shows the deleted dir.
+        let root_entries = state.dir_entries.get("").unwrap();
+        if root_entries.iter().any(|e| e.full_path == "src") {
+            return Err("root still lists src".to_string());
+        }
+        if root_entries.len() != 1 {
+            return Err("root listing size".to_string());
+        }
+        if root_entries[0].full_path != "Cargo.toml" {
+            return Err("root survivor".to_string());
+        }
 
-    // A fresh generation slot for the parent re-read task was registered.
-    assert!(state.dir_generations.contains_key(""));
-}
+        // A fresh generation slot for the parent re-read task was registered.
+        if !state.dir_generations.contains_key("") {
+            return Err("parent re-read not registered".to_string());
+        }
+        Ok(())
+    }
 
-#[test]
-fn test_dir_deleted_stale_workspace_guard() {
-    // The delete was started in another workspace: the completion must not
-    // prune the currently selected workspace's state at the same relative
-    // path (the user switched workspaces while remove_dir_all was running).
-    let mut state = make_editor_with_expanded_subdir();
-    let _ = state.update(EditorMessage::DirDeleted {
-        dir_path: "src".to_string(),
-        workspace_path: "/some/other/workspace".to_string(),
-    });
+    /// A completion from another workspace must not prune this workspace.
+    fn untouched(state: &EditorState) -> Result<(), String> {
+        let tree = &state.file_tree;
+        for (what, kept) in [
+            ("src", tree.expanded_dirs.contains("src")),
+            ("src/sub", tree.expanded_dirs.contains("src/sub")),
+            ("src listing", state.dir_entries.contains_key("src")),
+            ("src/sub listing", state.dir_entries.contains_key("src/sub")),
+        ] {
+            if !kept {
+                return Err(format!("{what} dropped"));
+            }
+        }
+        if state.selected_file.as_deref() != Some("src/sub/deep.rs") {
+            return Err("selection changed".to_string());
+        }
+        if state.all_workspace_files.len() != 3 {
+            return Err("quick-open changed".to_string());
+        }
+        if state.dir_generations.contains_key("") {
+            return Err("parent re-read registered".to_string());
+        }
+        if !tree.visible_tree_nodes.iter().any(|(p, _)| p == "src") {
+            return Err("visible src dropped".to_string());
+        }
+        Ok(())
+    }
 
-    // Everything stays intact: no prune, no parent re-read registration.
-    assert!(state.file_tree.expanded_dirs.contains("src"));
-    assert!(state.file_tree.expanded_dirs.contains("src/sub"));
-    assert!(state.dir_entries.contains_key("src"));
-    assert!(state.dir_entries.contains_key("src/sub"));
-    assert_eq!(state.selected_file.as_deref(), Some("src/sub/deep.rs"));
-    assert_eq!(state.all_workspace_files.len(), 3);
-    assert!(!state.dir_generations.contains_key(""));
-    assert!(
-        state
-            .file_tree
-            .visible_tree_nodes
-            .iter()
-            .any(|(p, _)| p == "src")
-    );
+    let elsewhere = "/some/other/workspace";
+    // (name, workspace path reported by the completion, check)
+    let cases: &[(&str, &str, Check)] = &[
+        ("matching_workspace_prunes", "/tmp", pruned_and_refreshed),
+        ("stale_workspace_ignored", elsewhere, untouched),
+    ];
+    for &(name, workspace_path, check) in cases {
+        let mut state = make_editor_with_expanded_subdir();
+        let _ = state.update(EditorMessage::DirDeleted {
+            dir_path: "src".to_string(),
+            workspace_path: workspace_path.to_string(),
+        });
+        assert_eq!(check(&state), Ok(()), "case {name}");
+    }
 }
 
 #[test]
@@ -2242,12 +1700,10 @@ fn test_confirm_delete_dir_defers_prune_until_success() {
 
 // ── Gitignore dimming (in-process matcher) ──────────────────────
 
-/// Find a tree node by workspace-relative path (depth-first through children).
 fn find_node<'a>(nodes: &'a [widgets::TreeNode], path: &str) -> &'a widgets::TreeNode {
     find_in_tree(nodes, path).unwrap_or_else(|| panic!("node not found in tree: {path}"))
 }
 
-/// Depth-first search for a tree node; returns `None` when absent.
 fn find_in_tree<'a>(nodes: &'a [widgets::TreeNode], path: &str) -> Option<&'a widgets::TreeNode> {
     for node in nodes {
         if node.full_path == path {
@@ -2278,28 +1734,13 @@ fn test_ignore_dimming_survives_collapse_and_expand() {
     dir_entries.insert(
         String::new(),
         vec![
-            FsEntry {
-                name: "secret".into(),
-                full_path: "secret".into(),
-                is_dir: true,
-                error: None,
-            },
-            FsEntry {
-                name: "visible.txt".into(),
-                full_path: "visible.txt".into(),
-                is_dir: false,
-                error: None,
-            },
+            fs_entry("secret", "secret", true),
+            fs_entry("visible.txt", "visible.txt", false),
         ],
     );
     dir_entries.insert(
         "secret".into(),
-        vec![FsEntry {
-            name: "hidden.txt".into(),
-            full_path: "secret/hidden.txt".into(),
-            is_dir: false,
-            error: None,
-        }],
+        vec![fs_entry("hidden.txt", "secret/hidden.txt", false)],
     );
 
     // Expanded tree: secret dir fully populated and stamped.
@@ -2341,30 +1782,12 @@ fn test_negated_patterns_do_not_dim() {
     assert!(matcher.is_some());
 
     let mut dir_entries = HashMap::new();
-    dir_entries.insert(
-        String::new(),
-        vec![FsEntry {
-            name: "build".into(),
-            full_path: "build".into(),
-            is_dir: true,
-            error: None,
-        }],
-    );
+    dir_entries.insert(String::new(), vec![fs_entry("build", "build", true)]);
     dir_entries.insert(
         "build".into(),
         vec![
-            FsEntry {
-                name: "keep.txt".into(),
-                full_path: "build/keep.txt".into(),
-                is_dir: false,
-                error: None,
-            },
-            FsEntry {
-                name: "other.txt".into(),
-                full_path: "build/other.txt".into(),
-                is_dir: false,
-                error: None,
-            },
+            fs_entry("keep.txt", "build/keep.txt", false),
+            fs_entry("other.txt", "build/other.txt", false),
         ],
     );
 
@@ -2421,17 +1844,12 @@ fn test_matcher_covers_subdirectory_of_repo() {
 
 // ── Commit/staging mtime detector ───────────────────────────────
 
-/// Bump a file's mtime deterministically: sleep past any coarse timestamp
-/// granularity, then rewrite the file so the OS assigns a strictly newer mtime
-/// (`std::fs::File::set_times` is a no-op on this macOS/APFS setup, so a real
-/// write is the reliable way to force a detectable mtime change).
+/// Bump a file's mtime by rewriting it after a pause for coarse timestamps.
 fn bump_file_mtime(path: &Path) {
     std::thread::sleep(Duration::from_millis(20));
     std::fs::write(path, "changed\n").unwrap();
 }
 
-/// Build an editor state pointed at a temp `ws/` containing a `.git/` dir with
-/// `index` and `logs/HEAD` files, with `git_dir` resolved via `find_git_dir`.
 fn make_editor_with_git_ws() -> (tempfile::TempDir, EditorState) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let ws = dir.path();

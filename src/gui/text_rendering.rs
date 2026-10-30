@@ -460,157 +460,147 @@ pub(crate) fn fill_rich_spans<'a>(
 mod tests {
     use super::*;
 
-    // ── push_or_merge tests ────────────────────────────────────────────
+    /// `push_or_merge` row: case, text, span pushed first, span appended, appended colored, slices out.
+    type MergeRow = (
+        &'static str,
+        &'static str,
+        Option<(usize, usize)>,
+        (usize, usize),
+        bool,
+        &'static [&'static str],
+    );
 
-    #[test]
-    fn push_or_merge_contiguous_same_attrs_merges() {
-        let text = "hello world";
-        let attrs = cosmic_text::Attrs::new();
-        let mut result = Vec::new();
-        result.push((&text[0..5], attrs.clone()));
-        push_or_merge(text, &mut result, &text[5..11], attrs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "hello world");
+    fn red() -> cosmic_text::Attrs<'static> {
+        cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0))
     }
 
-    #[test]
-    fn push_or_merge_non_contiguous_same_attrs_pushes_separately() {
-        let text = "hello---world";
-        let attrs = cosmic_text::Attrs::new();
-        let mut result = Vec::new();
-        result.push((&text[0..5], attrs.clone()));
-        // "world" starts at byte 8, not immediately after "hello" (5..8 is "---")
-        push_or_merge(text, &mut result, &text[8..13], attrs);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0, "hello");
-        assert_eq!(result[1].0, "world");
+    fn spans(
+        ranges: &[(usize, usize)],
+        attrs: &cosmic_text::Attrs<'static>,
+    ) -> Vec<(usize, usize, cosmic_text::Attrs<'static>)> {
+        ranges
+            .iter()
+            .map(|&(lo, hi)| (lo, hi, attrs.clone()))
+            .collect()
     }
 
-    #[test]
-    fn push_or_merge_contiguous_different_attrs_pushes_separately() {
-        let text = "hello world";
-        let attrs1 = cosmic_text::Attrs::new();
-        let attrs2 = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
-        let mut result = Vec::new();
-        result.push((&text[0..5], attrs1));
-        push_or_merge(text, &mut result, &text[5..11], attrs2);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn push_or_merge_empty_result_pushes() {
-        let text = "hello";
-        let attrs = cosmic_text::Attrs::new();
-        let mut result = Vec::new();
-        push_or_merge(text, &mut result, &text[0..5], attrs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "hello");
-    }
-
-    // ── fill_rich_spans tests ──────────────────────────────────────────
-
-    /// Assert that `out` covers `text` contiguously with no gaps or overlaps
-    /// and that every emitted span starts/ends on a UTF-8 char boundary.
-    /// This is the exact contract [`cosmic_text::Buffer::set_rich_text`]
-    /// relies on: it rebuilds the buffer by concatenating the span slices.
-    fn assert_rich_spans_cover(text: &str, out: &[(&str, cosmic_text::Attrs)]) {
-        let mut byte_cursor = 0usize;
+    /// `out` covers `text` contiguously on UTF-8 char boundaries, as
+    /// [`cosmic_text::Buffer::set_rich_text`] requires.
+    fn assert_rich_spans_cover(case: &str, text: &str, out: &[(&str, cosmic_text::Attrs)]) {
+        let mut cursor = 0usize;
         for (slice, _) in out {
             let start = (slice.as_ptr() as usize) - (text.as_ptr() as usize);
             let end = start + slice.len();
-            assert_eq!(
-                start, byte_cursor,
-                "gap or overlap before byte {byte_cursor}"
-            );
-            assert!(
-                text.is_char_boundary(start),
-                "start {start} is not a char boundary"
-            );
-            assert!(
-                text.is_char_boundary(end),
-                "end {end} is not a char boundary"
-            );
-            byte_cursor = end;
+            assert_eq!(start, cursor, "case {case}: gap before byte {cursor}");
+            assert!(text.is_char_boundary(start), "case {case}: start {start}");
+            assert!(text.is_char_boundary(end), "case {case}: end {end}");
+            cursor = end;
         }
-        assert_eq!(byte_cursor, text.len(), "spans do not cover all bytes");
+        assert_eq!(cursor, text.len(), "case {case}: spans cover all bytes");
     }
 
     #[test]
-    fn fill_rich_spans_handles_spans_inside_multibyte_char() {
-        // "—" is 3 UTF-8 bytes; "é" is 2. Spans land inside both.
-        let text = "ab—cdé";
-        let base = cosmic_text::Attrs::new();
-        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
-        let spans = vec![
-            (3, 6, colored.clone()), // start inside em-dash (bytes 2..5)
-            (8, 9, colored.clone()), // start inside é (bytes 7..9)
+    fn push_or_merge_merges_only_contiguous_spans_with_equal_attrs() {
+        let cases: &[MergeRow] = &[
+            (
+                "merge contiguous",
+                "hello world",
+                Some((0, 5)),
+                (5, 11),
+                false,
+                &["hello world"],
+            ),
+            (
+                "split on gap",
+                "hello---world",
+                Some((0, 5)),
+                (8, 13),
+                false,
+                &["hello", "world"],
+            ),
+            (
+                "split on attrs",
+                "hello world",
+                Some((0, 5)),
+                (5, 11),
+                true,
+                &["hello", " world"],
+            ),
+            ("push into empty", "hello", None, (0, 5), false, &["hello"]),
         ];
-        let out = fill_rich_spans(text, spans, &base);
-        assert_rich_spans_cover(text, &out);
+        for &(name, text, first, second, colored, expected) in cases {
+            let base = cosmic_text::Attrs::new();
+            let attrs = if colored { red() } else { base.clone() };
+            let mut result = Vec::new();
+            if let Some((lo, hi)) = first {
+                result.push((&text[lo..hi], base.clone()));
+            }
+            let (lo, hi) = second;
+            push_or_merge(text, &mut result, &text[lo..hi], attrs);
+            let slices: Vec<&str> = result.iter().map(|(slice, _)| *slice).collect();
+            assert_eq!(slices, expected, "case {name}");
+        }
     }
 
-    #[test]
-    fn fill_rich_spans_collapsed_multibyte_span_keeps_coverage() {
-        // A span fully inside the em-dash collapses to zero width after
-        // alignment; coverage must still be complete with no gap.
-        let text = "ab—cd";
-        let base = cosmic_text::Attrs::new();
-        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
-        let spans = vec![(3, 4, colored)]; // bytes 3..4 are interior of em-dash 2..5
-        let out = fill_rich_spans(text, spans, &base);
-        assert_rich_spans_cover(text, &out);
-    }
+    type CoverCase<'a> = (&'a str, &'a str, &'a [(usize, usize)]);
 
     #[test]
-    fn fill_rich_spans_clamps_out_of_range_spans() {
-        let text = "a—b";
-        let base = cosmic_text::Attrs::new();
-        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
-        let spans = vec![
-            (2, 100, colored.clone()),   // end clamped to text.len
-            (200, 300, colored.clone()), // entirely out of range
+    fn fill_rich_spans_keeps_multibyte_coverage() {
+        // "—" is 3 UTF-8 bytes and "é" is 2, so spans land inside and across them.
+        let cases: &[CoverCase] = &[
+            ("spans inside a multibyte char", "ab—cdé", &[(3, 6), (8, 9)]),
+            (
+                "collapsed multibyte span keeps coverage",
+                "ab—cd",
+                &[(3, 4)],
+            ),
+            // Mirrors the reported crash: "end byte index ... is not a char boundary".
+            ("end inside a multibyte char", "a—", &[(0, 3)]),
+            (
+                "fills leading and trailing multibyte gaps",
+                "—x—",
+                &[(1, 4)],
+            ),
         ];
-        let out = fill_rich_spans(text, spans, &base);
-        assert_rich_spans_cover(text, &out);
+        let base = cosmic_text::Attrs::new();
+        for &(name, text, ranges) in cases {
+            let out = fill_rich_spans(text, spans(ranges, &red()), &base);
+            assert_rich_spans_cover(name, text, &out);
+        }
     }
 
-    #[test]
-    fn fill_rich_spans_does_not_change_ascii_behaviour() {
-        let text = "hello world";
-        let base = cosmic_text::Attrs::new();
-        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
-        let spans = vec![(0, 5, colored.clone()), (6, 11, colored)];
-        let out = fill_rich_spans(text, spans, &base);
-        assert_rich_spans_cover(text, &out);
-        // The space at byte 5 is a base-attr gap; the rest is coloured.
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0].0, "hello");
-        assert_eq!(out[1].0, " ");
-        assert_eq!(out[2].0, "world");
-    }
+    type ClampCase<'a> = (
+        &'a str,
+        &'a str,
+        &'a [(usize, usize)],
+        Option<&'a [&'a str]>,
+    );
 
     #[test]
-    fn fill_rich_spans_end_inside_multibyte_char() {
-        // Mirrors the reported crash: "end byte index ... is not a char
-        // boundary; it is inside —". Here end=3 is inside the em-dash
-        // occupying bytes 1..4.
-        let text = "a—";
+    fn fill_rich_spans_clamps_out_of_range_spans_and_leaves_ascii_untouched() {
+        // (case, text, spans, emitted slices when the whole output is pinned)
+        let cases: &[ClampCase] = &[
+            (
+                "clamps out of range spans",
+                "a—b",
+                &[(2, 100), (200, 300)],
+                None,
+            ),
+            (
+                "does not change ascii behaviour",
+                "hello world",
+                &[(0, 5), (6, 11)],
+                Some(&["hello", " ", "world"]),
+            ),
+        ];
         let base = cosmic_text::Attrs::new();
-        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
-        let spans = vec![(0, 3, colored)];
-        let out = fill_rich_spans(text, spans, &base);
-        assert_rich_spans_cover(text, &out);
-    }
-
-    #[test]
-    fn fill_rich_spans_fills_leading_and_trailing_multibyte_gaps() {
-        // Highlight starts mid-char and there is a multi-byte char at a span
-        // boundary; the emitted list must remain contiguous and complete.
-        let text = "—x—";
-        let base = cosmic_text::Attrs::new();
-        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
-        let spans = vec![(1, 4, colored)]; // start inside first em-dash, end inside second
-        let out = fill_rich_spans(text, spans, &base);
-        assert_rich_spans_cover(text, &out);
+        for &(name, text, ranges, expected) in cases {
+            let out = fill_rich_spans(text, spans(ranges, &red()), &base);
+            assert_rich_spans_cover(name, text, &out);
+            if let Some(expected) = expected {
+                let slices: Vec<&str> = out.iter().map(|(slice, _)| *slice).collect();
+                assert_eq!(slices, expected, "case {name}");
+            }
+        }
     }
 }

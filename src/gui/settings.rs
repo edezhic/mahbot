@@ -4802,199 +4802,103 @@ fn modal_dialog<'a>(
 mod tests {
     use super::*;
 
-    // ── parse_models ─────────────────────────────────────────
+    // ── Model list editing: parse_models / add_model_to_list / remove_model_from_list ──
 
+    /// Parsing trims every line and skips blank or whitespace-only ones.
     #[test]
     fn parse_models_cases() {
-        struct Case {
-            name: &'static str,
-            input: Option<&'static str>,
-            expected: &'static [&'static str],
-        }
-
-        let cases = [
-            Case {
-                name: "None returns empty",
-                input: None,
-                expected: &[],
-            },
-            Case {
-                name: "empty string returns empty",
-                input: Some(""),
-                expected: &[],
-            },
-            Case {
-                name: "single line",
-                input: Some("google/gemini-3.1-flash-image-preview"),
-                expected: &["google/gemini-3.1-flash-image-preview"],
-            },
-            Case {
-                name: "multiple lines",
-                input: Some("model-a\nmodel-b\nmodel-c"),
-                expected: &["model-a", "model-b", "model-c"],
-            },
-            Case {
-                name: "trims whitespace",
-                input: Some("  model-a  \n  model-b  "),
-                expected: &["model-a", "model-b"],
-            },
-            Case {
-                name: "skips empty lines",
-                input: Some("model-a\n\n\nmodel-b"),
-                expected: &["model-a", "model-b"],
-            },
-            Case {
-                name: "skips whitespace-only lines",
-                input: Some("model-a\n   \nmodel-b"),
-                expected: &["model-a", "model-b"],
-            },
+        let cases: &[(&str, Option<&str>, &[&str])] = &[
+            ("None returns empty", None, &[]),
+            ("empty string returns empty", Some(""), &[]),
+            (
+                "single line",
+                Some("google/gemini-3.1-flash-image-preview"),
+                &["google/gemini-3.1-flash-image-preview"],
+            ),
+            ("multiple lines", Some("m1\nm2\nm3"), &["m1", "m2", "m3"]),
+            ("trims whitespace", Some("  m1  \n  m2  "), &["m1", "m2"]),
+            ("skips empty lines", Some("m1\n\n\nm2"), &["m1", "m2"]),
+            (
+                "skips whitespace-only lines",
+                Some("m1\n   \nm2"),
+                &["m1", "m2"],
+            ),
         ];
-
-        for case in &cases {
-            let result = parse_models(case.input);
-            let expected: Vec<String> = case.expected.iter().map(ToString::to_string).collect();
-            assert_eq!(result, expected, "case: {}", case.name);
+        for &(name, raw, expected) in cases {
+            let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+            assert_eq!(parse_models(raw), expected, "case {name}");
         }
     }
 
-    // ── add_model_to_list ────────────────────────────────────
-
+    /// Adding trims its input and clears the buffer — a blank input does nothing at all —
+    /// and a duplicate never lands twice.
     #[test]
     fn add_model_to_list_cases() {
-        struct Case {
-            name: &'static str,
-            input: &'static str,
-            initial_list: Option<&'static str>,
-            expected_list: Option<&'static str>,
-            expect_input_cleared: bool,
-        }
-
-        let cases = [
-            Case {
-                name: "empty input does nothing",
-                input: "",
-                initial_list: None,
-                expected_list: None,
-                expect_input_cleared: false,
-            },
-            Case {
-                name: "whitespace input does nothing",
-                input: "  ",
-                initial_list: None,
-                expected_list: None,
-                expect_input_cleared: false,
-            },
-            Case {
-                name: "adds to empty list",
-                input: "model-a",
-                initial_list: None,
-                expected_list: Some("model-a"),
-                expect_input_cleared: true,
-            },
-            Case {
-                name: "adds to existing list",
-                input: "model-c",
-                initial_list: Some("model-a\nmodel-b"),
-                expected_list: Some("model-a\nmodel-b\nmodel-c"),
-                expect_input_cleared: true,
-            },
-            Case {
-                name: "skips duplicates",
-                input: "model-a",
-                initial_list: Some("model-a\nmodel-b"),
-                expected_list: Some("model-a\nmodel-b"),
-                expect_input_cleared: true,
-            },
-            Case {
-                name: "trims input",
-                input: "  model-a  ",
-                initial_list: Some("model-b"),
-                expected_list: Some("model-b\nmodel-a"),
-                expect_input_cleared: true,
-            },
+        let cases: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+            ("empty input does nothing", "", None, None),
+            ("whitespace input does nothing", "  ", None, None),
+            ("adds to empty list", "model-a", None, Some("model-a")),
+            (
+                "adds to existing list",
+                "model-c",
+                Some("model-a\nmodel-b"),
+                Some("model-a\nmodel-b\nmodel-c"),
+            ),
+            (
+                "skips duplicates",
+                "model-a",
+                Some("model-a\nmodel-b"),
+                Some("model-a\nmodel-b"),
+            ),
+            (
+                "trims input",
+                "  model-a  ",
+                Some("model-b"),
+                Some("model-b\nmodel-a"),
+            ),
         ];
-
-        for case in &cases {
-            let mut input = SingleLineEditorState::new(case.input);
-            let mut list = case.initial_list.map(String::from);
+        for &(name, raw, initial, expected) in cases {
+            let mut input = SingleLineEditorState::new(raw);
+            let mut list = initial.map(String::from);
             add_model_to_list(&mut input, &mut list);
-            assert_eq!(
-                list,
-                case.expected_list.map(String::from),
-                "case: {} — list mismatch",
-                case.name
-            );
-            if case.expect_input_cleared {
-                assert!(
-                    input.text().is_empty(),
-                    "case: {} — input buffer should be cleared",
-                    case.name
-                );
+            assert_eq!(list, expected.map(String::from), "case {name}: list");
+            if raw.trim().is_empty() {
+                assert_eq!(input.text(), raw, "case {name}: input kept as typed");
             } else {
-                assert_eq!(
-                    input.text(),
-                    case.input,
-                    "case: {} — input should remain unchanged",
-                    case.name
-                );
+                assert!(input.text().is_empty(), "case {name}: input cleared");
             }
         }
     }
 
-    // ── remove_model_from_list ───────────────────────────────
-
+    /// Removing drops the matching entry; an emptied list becomes `None`.
     #[test]
     fn remove_model_from_list_cases() {
-        struct Case {
-            name: &'static str,
-            model: &'static str,
-            initial_list: Option<&'static str>,
-            expected_list: Option<&'static str>,
-        }
-
-        let cases = [
-            Case {
-                name: "removes matching model",
-                model: "model-b",
-                initial_list: Some("model-a\nmodel-b\nmodel-c"),
-                expected_list: Some("model-a\nmodel-c"),
-            },
-            Case {
-                name: "non-matching removal keeps list",
-                model: "model-d",
-                initial_list: Some("model-a\nmodel-b\nmodel-c"),
-                expected_list: Some("model-a\nmodel-b\nmodel-c"),
-            },
-            Case {
-                name: "last entry clears list",
-                model: "model-a",
-                initial_list: Some("model-a"),
-                expected_list: None,
-            },
-            Case {
-                name: "empty list stays empty",
-                model: "model-a",
-                initial_list: None,
-                expected_list: None,
-            },
+        let cases: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+            (
+                "removes matching model",
+                "model-b",
+                Some("model-a\nmodel-b\nmodel-c"),
+                Some("model-a\nmodel-c"),
+            ),
+            (
+                "non-matching removal keeps list",
+                "model-d",
+                Some("model-a\nmodel-b\nmodel-c"),
+                Some("model-a\nmodel-b\nmodel-c"),
+            ),
+            ("last entry clears list", "model-a", Some("model-a"), None),
+            ("empty list stays empty", "model-a", None, None),
         ];
-
-        for case in &cases {
-            let mut list = case.initial_list.map(String::from);
-            remove_model_from_list(case.model, &mut list);
-            assert_eq!(
-                list,
-                case.expected_list.map(String::from),
-                "case: {} — list mismatch",
-                case.name
-            );
+        for &(name, model, initial, expected) in cases {
+            let mut list = initial.map(String::from);
+            remove_model_from_list(model, &mut list);
+            assert_eq!(list, expected.map(String::from), "case {name}: list");
         }
     }
 
     // ── Toggle generation counter & rollback (shared) ──────────────
     // macOS-only: both toggles drive the audio pipeline.
 
-    /// Shared helper for toggle generation-counter and rollback tests.
     /// Parameterised by message constructors and field accessors so the
     /// same 7-scenario sequence (toggle ON, stale result, DB error revert,
     /// re-toggle, successful persist, stale-old-gen, toggle OFF + revert)
@@ -5188,409 +5092,234 @@ mod tests {
         assert_eq!(state.error.as_deref(), Some("denied"));
     }
 
-    // ── Per-field autosave: settle generations ──────────────────────
+    // ── Per-field autosave ────────────────────────────────────────
     //
-    // The safety requirement "no per-keystroke writes, no out-of-order async
-    // writes" is enforced by the per-field generation counter: a settle whose
-    // generation no longer matches the current counter is dropped, and so is
-    // a persist result from a superseded settle. These tests pin that guard
-    // (they never await the spawned tasks — dropped tasks never run, so no
-    // store is needed; state transitions are the observable surface).
+    // A dropped task never runs; no store is needed, so the state is the surface.
 
-    #[test]
-    fn text_field_keystrokes_arm_debounced_settles_with_generations() {
-        let mut state = SettingsState::new();
-
-        // Keystroke stages the value and arms a debounced settle (gen 1).
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "exa_key",
-            value: "key-a".into(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:exa_key").copied(),
-            Some(1),
-            "first keystroke bumps gen to 1"
-        );
-        assert_eq!(
-            state.config.exa_key.as_deref(),
-            Some("key-a"),
-            "value staged in the editable snapshot"
-        );
-
-        // Continued typing bumps the generation and re-stages the value.
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "exa_key",
-            value: "key-ab".into(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:exa_key").copied(),
-            Some(2),
-            "second keystroke bumps gen to 2"
-        );
+    /// One per-field autosave case: the field, the steps on it, and what it must show.
+    struct AutosaveCase {
+        name: &'static str,
+        key: &'static str,
+        steps: &'static [Act],
+        see: See,
     }
 
-    #[test]
-    fn stale_settle_is_dropped_never_staging_the_old_value() {
-        let mut state = SettingsState::new();
-        let _ = state.update(SettingsMessage::ConfigField {
-            key: "exa_key",
-            value: "key-a".into(),
-        });
-        let _ = state.update(SettingsMessage::ConfigField {
-            key: "exa_key",
-            value: "key-ab".into(),
-        });
-
-        // The stale settle (gen 1) is dropped: no persist is spawned, the
-        // staged value does not regress, and the generation is not consumed.
-        let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:exa_key".into(),
-            value: "key-a".into(),
-            generation: 1,
-        });
-        assert_eq!(
-            state.field_gen.get("config:exa_key").copied(),
-            Some(2),
-            "stale settle must not consume the generation"
-        );
-        assert_eq!(
-            state.config.exa_key.as_deref(),
-            Some("key-ab"),
-            "stale settle must not stage the stale value"
-        );
-
-        // A stale RESULT is dropped too — its error must not surface.
-        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:exa_key".into(),
-            generation: 1,
-            result: Err("stale failure".into()),
-        });
-        assert!(
-            !state.field_errors.contains_key("config:exa_key"),
-            "stale result must not surface its error"
-        );
+    /// One step applied to the case's own field before it is inspected.
+    enum Act {
+        /// A value staged in the field: a keystroke, or an immediate control's pick.
+        Typed(&'static str),
+        /// The field's settle fires at this generation.
+        Settled(&'static str, u64),
+        /// A persist result lands for this generation: `Ok` echoes the value.
+        Saved(&'static str, u64),
+        /// A persist failure lands for this generation.
+        Failed(u64),
+        /// Enter: the staged value settles at once.
+        Enter,
+        /// A value parked in the field's editor, the caret at its end.
+        Edit(&'static str),
+        /// One editor action on the field: a keystroke or an undo.
+        Editor(EditorAction),
     }
 
-    #[test]
-    fn stale_result_does_not_apply_stale_value() {
-        let mut state = SettingsState::new();
-        let _ = state.update(SettingsMessage::ConfigField {
-            key: "manager_model",
-            value: "model-a".into(),
-        });
-        let _ = state.update(SettingsMessage::ConfigField {
-            key: "manager_model",
-            value: "model-b".into(),
-        });
-
-        // A stale SUCCESS result (gen 1) must not overwrite the staged value.
-        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:manager_model".into(),
-            generation: 1,
-            result: Ok(crate::config::PersistOutcome {
-                value: "model-a".into(),
-                warning: None,
-            }),
-        });
-        assert_eq!(
-            state.config.manager_model.as_deref(),
-            Some("model-b"),
-            "stale success must not overwrite the newer staged value"
-        );
+    /// What the case's field must show once its steps have run.
+    enum See {
+        /// Generation, staged value, in flight, pending value, surfaced error.
+        Field(
+            Option<u64>,
+            Option<&'static str>,
+            bool,
+            Option<(&'static str, u64)>,
+            Option<&'static str>,
+        ),
+        /// The field's editor: its text and, where the case pins it, the caret.
+        Editor(&'static str, Option<usize>),
     }
 
+    /// One settle generation guards every field's autosave: only the current one may stage a
+    /// value or land a persist, and a stale result never lands.
+    #[expect(clippy::too_many_lines)] // one row per autosave transition
     #[test]
-    fn in_flight_persist_queues_newer_settle_and_flushes_on_result() {
-        let mut state = SettingsState::new();
-
-        // First settle spawns a persist (field marked in flight).
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "web_search_provider",
-            value: "exa".into(),
-        });
-        let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:web_search_provider".into(),
-            value: "exa".into(),
-            generation: 1,
-        });
-        assert!(
-            state
-                .in_flight_persists
-                .contains("config:web_search_provider"),
-            "fresh settle marks the field in flight"
-        );
-
-        // A second toggle while the first persist runs must not spawn a
-        // second persist — it queues the newest value instead, so the last
-        // settle always lands last in the DB.
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "web_search_provider",
-            value: String::new(), // toggled back to Auto
-        });
-        let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:web_search_provider".into(),
-            value: String::new(),
-            generation: 2,
-        });
-        assert_eq!(
-            state.pending_persists.get("config:web_search_provider"),
-            Some(&(String::new(), 2)),
-            "newer settle queued with the generation it was queued at"
-        );
-
-        // The in-flight persist's (stale) result frees the field and flushes
-        // the pending value into a fresh persist — the latest edit wins.
-        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:web_search_provider".into(),
-            generation: 1,
-            result: Ok(crate::config::PersistOutcome {
-                value: "exa".into(),
-                warning: None,
-            }),
-        });
-        assert!(
-            !state
-                .pending_persists
-                .contains_key("config:web_search_provider"),
-            "pending value flushed"
-        );
-        assert!(
-            state
-                .in_flight_persists
-                .contains("config:web_search_provider"),
-            "flushed persist re-marks the field in flight"
-        );
-    }
-
-    #[test]
-    fn identical_persist_echo_preserves_caret_and_undo() {
-        let mut state = SettingsState::new();
-        let field = "config:manager_model";
-        let typed = "deepseek/deepseek-chat";
-        // An editor holding the typed text with the caret parked at the end,
-        // as it sits while the user pauses between keystrokes.
-        let editor = SingleLineEditorState::new(typed);
-        editor.buffer.move_to(0, typed.chars().count());
-        state.field_editors.insert(field.to_string(), editor);
-
-        // One more keystroke right as the typing pause ends...
-        state
-            .field_editors
-            .get_mut(field)
-            .unwrap()
-            .apply_action(EditorAction::Insert('2'));
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "manager_model",
-            value: "deepseek/deepseek-chat2".into(),
-        });
-        let generation = state.field_gen.get(field).copied().unwrap_or(0);
-
-        // ...and the debounced settle completes, echoing the identical value.
-        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: field.into(),
-            generation,
-            result: Ok(crate::config::PersistOutcome {
-                value: "deepseek/deepseek-chat2".into(),
-                warning: None,
-            }),
-        });
-
-        {
-            let editor = state.field_editor(field);
-            assert_eq!(editor.text(), "deepseek/deepseek-chat2");
-            assert_eq!(
-                editor.buffer.cursor().column,
-                "deepseek/deepseek-chat2".chars().count(),
-                "identical-value persist echo must not reset the caret to 0"
-            );
+    fn per_field_autosave_cases() {
+        use Act::{Edit, Editor, Enter, Failed, Saved, Settled, Typed};
+        let cases = [
+            AutosaveCase {
+                name: "a text field keystroke arms a debounced settle",
+                key: "exa_key",
+                steps: &[Typed("key-a"), Typed("key-ab")],
+                see: See::Field(Some(2), Some("key-ab"), false, None, None),
+            },
+            AutosaveCase {
+                name: "a stale settle is dropped, never staging the old value",
+                key: "exa_key",
+                steps: &[
+                    Typed("key-a"),
+                    Typed("key-ab"),
+                    Settled("key-a", 1),
+                    Failed(1),
+                ],
+                see: See::Field(Some(2), Some("key-ab"), false, None, None),
+            },
+            AutosaveCase {
+                name: "a stale result does not apply the stale value",
+                key: "manager_model",
+                steps: &[Typed("model-a"), Typed("model-b"), Saved("model-a", 1)],
+                see: See::Field(Some(2), Some("model-b"), false, None, None),
+            },
+            AutosaveCase {
+                name: "Enter settles the staged value at once",
+                key: "manager_model",
+                steps: &[Typed("model-c"), Enter],
+                see: See::Field(Some(2), Some("model-c"), false, None, None),
+            },
+            AutosaveCase {
+                name: "Enter settles the second text field's staged value too",
+                key: "worker_model",
+                steps: &[Typed("worker-d"), Enter],
+                see: See::Field(Some(2), Some("worker-d"), false, None, None),
+            },
+            AutosaveCase {
+                name: "an immediate toggle arms a zero-delay settle",
+                key: "web_search_provider",
+                steps: &[Typed("firecrawl")],
+                see: See::Field(Some(1), Some("firecrawl"), false, None, None),
+            },
+            AutosaveCase {
+                name: "a model slot keystroke arms a debounced settle",
+                key: "manager_model",
+                steps: &[Typed("test-model")],
+                see: See::Field(Some(1), Some("test-model"), false, None, None),
+            },
+            AutosaveCase {
+                name: "an in-flight persist queues a newer settle and flushes on result",
+                key: "web_search_provider",
+                steps: &[
+                    Typed("exa"),
+                    Settled("exa", 1),
+                    Typed(""),
+                    Settled("", 2),
+                    Saved("exa", 1),
+                ],
+                see: See::Field(Some(2), Some(""), true, None, None),
+            },
+            AutosaveCase {
+                name: "a stale pending flush never clobbers a newer staged edit",
+                key: "web_search_provider",
+                steps: &[
+                    Typed("exa"),
+                    Settled("exa", 1),
+                    Typed(""),
+                    Settled("", 2),
+                    Typed("exa"),
+                    Saved("exa", 1),
+                    Saved("", 2),
+                ],
+                see: See::Field(Some(3), Some("exa"), false, None, None),
+            },
+            AutosaveCase {
+                name: "an identical echo preserves the caret",
+                key: "manager_model",
+                steps: &[
+                    Edit("deepseek/deepseek-chat"),
+                    Editor(EditorAction::Insert('2')),
+                    Typed("deepseek/deepseek-chat2"),
+                    Saved("deepseek/deepseek-chat2", 1),
+                ],
+                see: See::Editor("deepseek/deepseek-chat2", Some(23)),
+            },
+            AutosaveCase {
+                name: "an identical echo keeps the undo stack",
+                key: "manager_model",
+                steps: &[
+                    Edit("deepseek/deepseek-chat"),
+                    Editor(EditorAction::Insert('2')),
+                    Typed("deepseek/deepseek-chat2"),
+                    Saved("deepseek/deepseek-chat2", 1),
+                    Editor(EditorAction::Undo),
+                ],
+                see: See::Editor("deepseek/deepseek-chat", None),
+            },
+            AutosaveCase {
+                name: "a different canonical value rewrites the editor",
+                key: "manager_model",
+                steps: &[Typed("openai/gpt-4o"), Saved("openai/gpt-4o", 1)],
+                see: See::Editor("openai/gpt-4o", None),
+            },
+        ];
+        for case in cases {
+            let AutosaveCase {
+                name,
+                key,
+                steps,
+                see,
+            } = case;
+            let mut state = SettingsState::new();
+            let field = format!("config:{key}");
+            for step in steps {
+                let message = match step {
+                    Typed(value) => SettingsMessage::ConfigField {
+                        key,
+                        value: value.to_string(),
+                    },
+                    Settled(value, generation) => SettingsMessage::ConfigFieldSettled {
+                        field: field.clone(),
+                        value: value.to_string(),
+                        generation: *generation,
+                    },
+                    Saved(value, generation) => SettingsMessage::ConfigFieldSaveResult {
+                        field: field.clone(),
+                        generation: *generation,
+                        result: Ok(crate::config::PersistOutcome {
+                            value: value.to_string(),
+                            warning: None,
+                        }),
+                    },
+                    Failed(generation) => SettingsMessage::ConfigFieldSaveResult {
+                        field: field.clone(),
+                        generation: *generation,
+                        result: Err("stale failure".into()),
+                    },
+                    Enter => SettingsMessage::ConfigFieldSettleNow {
+                        field: field.clone(),
+                    },
+                    Edit(text) => {
+                        let editor = SingleLineEditorState::new(text);
+                        editor.buffer.move_to(0, text.chars().count());
+                        state.field_editors.insert(field.clone(), editor);
+                        continue;
+                    }
+                    Editor(action) => {
+                        let editor = state.field_editors.get_mut(&field).unwrap();
+                        editor.apply_action(action.clone());
+                        continue;
+                    }
+                };
+                drop(state.update(message));
+            }
+            match see {
+                See::Field(generation, value, in_flight, queued, error) => {
+                    let bumped = state.field_gen.get(&field).copied();
+                    assert_eq!(bumped, generation, "case {name}: generation");
+                    let staged = state.config.get_string_field(key);
+                    assert_eq!(staged, value, "case {name}: staged value");
+                    let flying = state.in_flight_persists.contains(&field);
+                    assert_eq!(flying, in_flight, "case {name}: in flight");
+                    let pending = state.pending_persists.get(&field);
+                    let pending = pending.map(|(value, bumped)| (value.as_str(), *bumped));
+                    assert_eq!(pending, queued, "case {name}: pending");
+                    let failure = state.field_errors.get(&field).map(String::as_str);
+                    assert_eq!(failure, error, "case {name}: error");
+                }
+                See::Editor(text, column) => {
+                    let editor = state.field_editor(&field);
+                    assert_eq!(editor.text(), text, "case {name}: text");
+                    if let Some(column) = column {
+                        let caret = editor.buffer.cursor().column;
+                        assert_eq!(caret, column, "case {name}: caret");
+                    }
+                }
+            }
         }
-
-        // The undo stack survived the echo too: undo still reverts the last
-        // keystroke.
-        state
-            .field_editors
-            .get_mut(field)
-            .unwrap()
-            .apply_action(EditorAction::Undo);
-        assert_eq!(
-            state.field_editor(field).text(),
-            "deepseek/deepseek-chat",
-            "identical-value echo must not clear the undo stack"
-        );
-
-        // A genuinely different canonical value still rewrites the editor.
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "manager_model",
-            value: "openai/gpt-4o".into(),
-        });
-        let generation = state.field_gen.get(field).copied().unwrap_or(0);
-        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: field.into(),
-            generation,
-            result: Ok(crate::config::PersistOutcome {
-                value: "openai/gpt-4o".into(),
-                warning: None,
-            }),
-        });
-        assert_eq!(state.field_editor(field).text(), "openai/gpt-4o");
-    }
-
-    #[test]
-    fn stale_pending_flush_never_clobbers_a_newer_staged_edit() {
-        let mut state = SettingsState::new();
-
-        // Settle #1 spawns a persist (field in flight, gen 1).
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "web_search_provider",
-            value: "exa".into(),
-        });
-        let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:web_search_provider".into(),
-            value: "exa".into(),
-            generation: 1,
-        });
-
-        // Settle #2 while the first persist runs queues a pending value.
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "web_search_provider",
-            value: String::new(), // toggled back to Auto
-        });
-        let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:web_search_provider".into(),
-            value: String::new(),
-            generation: 2,
-        });
-        assert_eq!(
-            state.pending_persists.get("config:web_search_provider"),
-            Some(&(String::new(), 2)),
-            "pending value queued with its own generation"
-        );
-
-        // The user stages a THIRD edit (gen 3) before the first persist
-        // completes — its debounce is armed and the snapshot holds it.
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "web_search_provider",
-            value: "exa".into(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:web_search_provider").copied(),
-            Some(3),
-            "third edit bumped the generation"
-        );
-
-        // The first persist's result frees the field and flushes the pending
-        // value with ITS OWN generation (2) — never the current one (3).
-        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:web_search_provider".into(),
-            generation: 1,
-            result: Ok(crate::config::PersistOutcome {
-                value: "exa".into(),
-                warning: None,
-            }),
-        });
-        assert!(
-            !state
-                .pending_persists
-                .contains_key("config:web_search_provider"),
-            "pending value flushed"
-        );
-        assert!(
-            state
-                .in_flight_persists
-                .contains("config:web_search_provider"),
-            "flush re-marks the field in flight"
-        );
-
-        // The flushed persist's result carries gen 2 — stale against the
-        // newer staged edit (gen 3) — so it must NOT overwrite the snapshot.
-        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:web_search_provider".into(),
-            generation: 2,
-            result: Ok(crate::config::PersistOutcome {
-                value: String::new(), // the flushed (older) value's canonical
-                warning: None,
-            }),
-        });
-        assert_eq!(
-            state.config.web_search_provider.as_deref(),
-            Some("exa"),
-            "stale flushed result must not clobber the newer staged value"
-        );
-        assert!(
-            !state
-                .field_errors
-                .contains_key("config:web_search_provider"),
-            "stale result must not surface anything either"
-        );
-    }
-
-    #[test]
-    fn settle_now_uses_the_staged_value_on_enter() {
-        let mut state = SettingsState::new();
-
-        // Enter on a text field settles the staged value immediately.
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "manager_model",
-            value: "model-c".into(),
-        });
-        let _task = state.update(SettingsMessage::ConfigFieldSettleNow {
-            field: "config:manager_model".into(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:manager_model").copied(),
-            Some(2),
-            "Enter settles the staged value with a fresh generation"
-        );
-
-        // Same for a second text field: the staged value is read from the
-        // editable snapshot at settle time.
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "worker_model",
-            value: "worker-d".into(),
-        });
-        let _task = state.update(SettingsMessage::ConfigFieldSettleNow {
-            field: "config:worker_model".into(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:worker_model").copied(),
-            Some(2),
-            "Enter settles the second text field's staged value too"
-        );
-    }
-
-    #[test]
-    fn immediate_toggle_arms_a_zero_delay_settle() {
-        let mut state = SettingsState::new();
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "web_search_provider",
-            value: "firecrawl".into(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:web_search_provider").copied(),
-            Some(1),
-            "immediate toggle arms a zero-delay settle"
-        );
-    }
-
-    #[test]
-    fn model_slot_keystroke_arms_debounced_settle() {
-        let mut state = SettingsState::new();
-
-        // Model slots are text inputs → debounced settle (700 ms).
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "manager_model",
-            value: "test-model".to_string(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:manager_model").copied(),
-            Some(1),
-            "model slot keystroke arms a debounced settle"
-        );
-        assert_eq!(
-            state.config.manager_model.as_deref(),
-            Some("test-model"),
-            "model slot staged in the editable snapshot"
-        );
     }
 
     /// Every config key rendered by the Settings page must be a real config
@@ -5768,121 +5497,87 @@ mod tests {
         let _ = state.routing_section(); // must not panic
     }
 
-    /// Custom-endpoint toggle state machine: ON reveals the
-    /// endpoint fields only — nothing is staged, persisted, or settle-armed;
-    /// OFF closes the section and clears both endpoint fields from the
-    /// editable snapshot (the async persist path then removes the persisted
-    /// rows). A failed endpoint save re-closes the revealed section. The
-    /// returned Tasks are dropped — the async persist never runs here
-    /// (matching the other settings tests).
+    /// The toggle only reveals the custom endpoint; what is staged and gated on it follows the
+    /// snapshot, and a failed save closes the section again.
     #[test]
-    fn custom_endpoint_toggle_state_machine() {
-        let mut state = SettingsState::new();
-        assert!(
-            state.config.provider_endpoint.is_none(),
-            "precondition: no custom endpoint staged"
-        );
-        assert!(
-            !state.custom_revealed,
-            "precondition: custom section closed"
-        );
+    fn custom_endpoint_cases() {
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            (
+                "the toggle reveals, closes and re-closes on a failed save",
+                None,
+                None,
+            ),
+            (
+                "the routing section hides while a custom endpoint is staged",
+                Some("http://localhost:11434/v1"),
+                None,
+            ),
+            (
+                "OFF clears a staged endpoint key as well as the URL",
+                Some("http://localhost:11434/v1"),
+                Some("sk-local"),
+            ),
+        ];
+        let ep = CONFIG_FIELD_PROVIDER_ENDPOINT;
+        let kp = CONFIG_FIELD_PROVIDER_ENDPOINT_KEY;
+        let url_key = CONFIG_KEY_PROVIDER_ENDPOINT;
+        let key_key = CONFIG_KEY_PROVIDER_ENDPOINT_KEY;
+        for &(name, staged, staged_key) in cases {
+            let mut state = SettingsState::new();
+            assert_eq!(state.config.provider_endpoint, None, "case {name}: unset");
+            assert!(!state.custom_revealed, "case {name}: closed");
+            assert!(!state.custom_endpoint_active_ui(), "case {name}: routing");
 
-        // ON: reveal only — nothing persisted, no settle armed, the editable
-        // snapshot is untouched (an endpoint becomes active only once the
-        // user settles a genuinely non-default URL).
-        let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
-        assert!(
-            state.custom_revealed,
-            "ON reveals the custom-endpoint fields"
-        );
-        assert!(
-            state.config.provider_endpoint.is_none(),
-            "ON must not stage or persist an endpoint — a reveal alone must not configure one"
-        );
-        assert!(
-            !state.field_gen.contains_key(CONFIG_FIELD_PROVIDER_ENDPOINT),
-            "ON must not arm a settle — no spurious persisted row"
-        );
+            // ON reveals only: nothing persisted, no settle armed, the snapshot untouched.
+            let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
+            assert!(state.custom_revealed, "case {name}: ON reveals");
+            assert_eq!(state.config.provider_endpoint, None, "case {name}: ON");
+            assert!(!state.field_gen.contains_key(ep), "case {name}: no settle");
 
-        // OFF: revert to OpenRouter, close the section, clear both fields,
-        // drop pending settles.
-        let _task = state.update(SettingsMessage::CustomEndpointToggle(false));
-        assert!(!state.custom_revealed, "OFF closes the section");
-        assert!(
-            state.config.provider_endpoint.is_none(),
-            "OFF clears the endpoint field"
-        );
-        assert!(
-            state.config.provider_endpoint_key.is_none(),
-            "OFF clears the endpoint key field"
-        );
-        assert!(
-            state
-                .field_gen
-                .contains_key(CONFIG_FIELD_PROVIDER_ENDPOINT_KEY),
-            "OFF bumps the key field's generation (drops pending settles/results)"
-        );
+            if let Some(url) = staged {
+                let _ = state.update(SettingsMessage::ConfigField {
+                    key: url_key,
+                    value: url.into(),
+                });
+                assert!(state.custom_endpoint_active_ui(), "case {name}: staged");
+            }
+            if let Some(key) = staged_key {
+                let _ = state.update(SettingsMessage::ConfigField {
+                    key: key_key,
+                    value: key.into(),
+                });
+                assert_eq!(
+                    state.config.provider_endpoint_key.as_deref(),
+                    Some(key),
+                    "case {name}: key staged"
+                );
+            }
 
-        // A failed endpoint save re-closes the revealed section: the toggle
-        // must not show ON while the runtime stays on OpenRouter, and the
-        // error surfaces in the bottom banner (the inline row hides with the
-        // section).
-        let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
-        assert!(state.custom_revealed, "re-reveal opens the section");
-        let endpoint_generation = state
-            .field_gen
-            .get(CONFIG_FIELD_PROVIDER_ENDPOINT)
-            .copied()
-            .unwrap_or(0);
-        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: CONFIG_FIELD_PROVIDER_ENDPOINT.into(),
-            generation: endpoint_generation,
-            result: Err("invalid endpoint URL".into()),
-        });
-        assert!(
-            !state.custom_revealed,
-            "failed endpoint save closes the revealed section"
-        );
-        assert!(
-            state.error.is_some(),
-            "failed endpoint save surfaces in the bottom banner"
-        );
-    }
+            // OFF reverts to OpenRouter: the section closes, both fields clear, pending settles drop.
+            let _task = state.update(SettingsMessage::CustomEndpointToggle(false));
+            assert!(!state.custom_revealed, "case {name}: OFF closes");
+            assert_eq!(state.config.provider_endpoint, None, "case {name}: cleared");
+            assert_eq!(
+                state.config.provider_endpoint_key, None,
+                "case {name}: key cleared"
+            );
+            assert!(state.field_gen.contains_key(kp), "case {name}: armed");
+            assert!(!state.custom_endpoint_active_ui(), "case {name}: back");
 
-    /// Provider round-trip: the Provider Routing section is visible on
-    /// OpenRouter, hidden while a custom endpoint is staged (routing is a
-    /// no-op there), and visible again after toggling back. `view()` gates
-    /// the section on `custom_endpoint_active_ui()`, which is asserted
-    /// directly — rendering the full view needs the audio globals that
-    /// tests don't initialize.
-    #[test]
-    fn routing_section_visibility_round_trip() {
-        let mut state = SettingsState::new();
-        assert!(
-            !state.custom_endpoint_active_ui(),
-            "OpenRouter default: routing section visible"
-        );
-
-        // Reveal the custom-endpoint fields and stage a non-default URL
-        // (keystroke staging is enough to flip the predicate, matching the
-        // live debounced view).
-        let _ = state.update(SettingsMessage::CustomEndpointToggle(true));
-        let _ = state.update(SettingsMessage::ConfigField {
-            key: CONFIG_KEY_PROVIDER_ENDPOINT,
-            value: "http://localhost:11434/v1".into(),
-        });
-        assert!(
-            state.custom_endpoint_active_ui(),
-            "staged custom endpoint: routing section hidden"
-        );
-
-        // Toggle back to OpenRouter: the staged endpoint is cleared and the
-        // section reappears.
-        let _ = state.update(SettingsMessage::CustomEndpointToggle(false));
-        assert!(
-            !state.custom_endpoint_active_ui(),
-            "back on OpenRouter: routing section visible"
-        );
+            // A failed endpoint save re-closes the section and surfaces in the bottom banner.
+            let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
+            assert!(state.custom_revealed, "case {name}: re-revealed");
+            let generation = state.field_gen.get(ep).copied().unwrap_or(0);
+            let result = Err("invalid endpoint URL".into());
+            let save = SettingsMessage::ConfigFieldSaveResult {
+                field: ep.into(),
+                generation,
+                result,
+            };
+            let _task = state.update(save);
+            assert!(!state.custom_revealed, "case {name}: failure closes");
+            assert!(state.error.is_some(), "case {name}: failure surfaces");
+        }
     }
 
     /// A status for the mode-line tests: every field the line reads, and nothing
@@ -5906,106 +5601,143 @@ mod tests {
         }
     }
 
-    /// The mode line: silence for a working local server, progress while it is not
-    /// yet serving, the reason on a failure, and the cloud's own words.
-    #[test]
-    fn telegram_line_speaks_only_when_there_is_something_to_say() {
-        let (l, c) = (Mode::Local, Mode::Cloud);
-
-        // Installed and answering: nothing at all. Quietness is not an input here,
-        // so no amount of it can produce a word.
-        assert_eq!(
-            telegram_line(&telegram_status(l, l, Health::Running, false, None)),
-            None
-        );
-        // A switch that already cut over is still progress, not silence.
-        let starting = Some("Local server · installing or starting…".to_string());
-        assert_eq!(
-            telegram_line(&telegram_status(l, l, Health::Running, true, None)),
-            starting
-        );
-        assert_eq!(
-            telegram_line(&telegram_status(l, l, Health::Starting, false, None)),
-            starting
-        );
-        assert_eq!(
-            telegram_line(&telegram_status(l, l, Health::Down, false, None)),
-            Some("Local server · not running".to_string())
-        );
-        // A failure is the reason, with no state word beside it — a server that
-        // answers but refuses the bot is not "not running".
-        assert_eq!(
-            telegram_line(&telegram_status(
-                l,
-                l,
-                Health::Down,
-                false,
-                Some("the local server refused the bot: Unauthorized")
-            )),
-            Some("Local server — the local server refused the bot: Unauthorized".to_string())
-        );
-        // A switch in flight keeps reporting where it is going, and a failure that
-        // stops it keeps its reason.
-        assert_eq!(
-            telegram_line(&telegram_status(c, l, Health::Starting, true, None)),
-            Some("Cloud · switching to Local server…".to_string())
-        );
-        assert_eq!(
-            telegram_line(&telegram_status(l, c, Health::Running, true, None)),
-            Some("Local server · switching to Cloud…".to_string())
-        );
-        assert_eq!(
-            telegram_line(&telegram_status(
-                c,
-                l,
-                Health::Starting,
-                true,
-                Some("the install failed")
-            )),
-            Some("Cloud · switching to Local server… — the install failed".to_string())
-        );
-        // The cloud keeps its own line and its way in; a failure there is its
-        // reason alone, because nothing is served while its listener is missing.
-        assert_eq!(
-            telegram_line(&telegram_status(c, c, Health::Cloud, false, None)),
-            Some("Cloud · served by Telegram".to_string())
-        );
-        assert_eq!(
-            telegram_line(&telegram_status(
-                c,
-                c,
-                Health::Cloud,
-                true,
-                Some("the cloud Bot API has not taken the bot back yet")
-            )),
-            Some("Cloud — the cloud Bot API has not taken the bot back yet".to_string())
-        );
-    }
-
-    /// The way back to the cloud: a failure of the local server earns it, a quiet
-    /// bot and a switch back never do.
-    #[test]
-    fn the_way_back_to_the_cloud_needs_a_failure() {
-        assert!(!telegram_escape(&telegram_status(
+    // (name, stored mode, health mode, health, never-configured, error, warning)
+    #[expect(clippy::type_complexity)]
+    const MODE_LINES: &[(&str, Mode, Mode, Health, bool, Option<&str>, Option<&str>)] = &[
+        (
+            "installed and answering: nothing at all",
             Mode::Local,
             Mode::Local,
             Health::Running,
             false,
-            None
-        )));
-        assert!(telegram_escape(&telegram_status(
+            None,
+            None,
+        ),
+        (
+            "a switch that already cut over is still progress",
+            Mode::Local,
+            Mode::Local,
+            Health::Running,
+            true,
+            None,
+            Some("Local server · installing or starting…"),
+        ),
+        (
+            "not yet serving is progress",
+            Mode::Local,
+            Mode::Local,
+            Health::Starting,
+            false,
+            None,
+            Some("Local server · installing or starting…"),
+        ),
+        (
+            "not running is said",
             Mode::Local,
             Mode::Local,
             Health::Down,
             false,
-            Some("the install failed")
-        )));
-        assert!(!telegram_escape(&telegram_status(
+            None,
+            Some("Local server · not running"),
+        ),
+        (
+            "a failure is the reason, with no state word beside it",
+            Mode::Local,
+            Mode::Local,
+            Health::Down,
+            false,
+            Some("the local server refused the bot: Unauthorized"),
+            Some("Local server — the local server refused the bot: Unauthorized"),
+        ),
+        (
+            "a switch in flight reports where it is going",
+            Mode::Cloud,
+            Mode::Local,
+            Health::Starting,
+            true,
+            None,
+            Some("Cloud · switching to Local server…"),
+        ),
+        (
+            "a switch back reports where it is going",
+            Mode::Local,
+            Mode::Cloud,
+            Health::Running,
+            true,
+            None,
+            Some("Local server · switching to Cloud…"),
+        ),
+        (
+            "a failure that stops a switch keeps its reason",
+            Mode::Cloud,
+            Mode::Local,
+            Health::Starting,
+            true,
+            Some("the install failed"),
+            Some("Cloud · switching to Local server… — the install failed"),
+        ),
+        (
+            "the cloud keeps its own line and its way in",
+            Mode::Cloud,
+            Mode::Cloud,
+            Health::Cloud,
+            false,
+            None,
+            Some("Cloud · served by Telegram"),
+        ),
+        (
+            "a cloud failure is its reason alone",
             Mode::Cloud,
             Mode::Cloud,
             Health::Cloud,
             true,
-            Some("the cloud Bot API has not taken the bot back yet")
-        )));
+            Some("the cloud Bot API has not taken the bot back yet"),
+            Some("Cloud — the cloud Bot API has not taken the bot back yet"),
+        ),
+    ];
+
+    /// The mode line: silence while it works, progress while it does not, the reason on a failure.
+    #[test]
+    fn telegram_mode_line_cases() {
+        for &(name, serving, target, health, migrating, error, expected) in MODE_LINES {
+            let line = telegram_line(&telegram_status(serving, target, health, migrating, error));
+            assert_eq!(line.as_deref(), expected, "case {name}");
+        }
+
+        // (name, serving, target, health, migrating, error, expected escape).
+        #[expect(clippy::type_complexity)] // case table
+        let escapes: &[(&str, Mode, Mode, Health, bool, Option<&str>, bool)] = &[
+            (
+                "a working local server earns nothing",
+                Mode::Local,
+                Mode::Local,
+                Health::Running,
+                false,
+                None,
+                false,
+            ),
+            (
+                "a local failure earns the way back",
+                Mode::Local,
+                Mode::Local,
+                Health::Down,
+                false,
+                Some("the install failed"),
+                true,
+            ),
+            (
+                "a cloud failure earns nothing",
+                Mode::Cloud,
+                Mode::Cloud,
+                Health::Cloud,
+                true,
+                Some("the cloud Bot API has not taken the bot back yet"),
+                false,
+            ),
+        ];
+        for &(name, serving, target, health, migrating, error, expected) in escapes {
+            let status = telegram_status(serving, target, health, migrating, error);
+            assert_eq!(telegram_escape(&status), expected, "case {name}");
+        }
     }
 }

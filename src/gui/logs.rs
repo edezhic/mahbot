@@ -972,34 +972,35 @@ mod tests {
     }
 
     #[test]
-    fn format_log_entry_full_layout() {
-        let out = format_log_entry(&entry());
-        assert_eq!(
-            out,
-            "2026-08-17T20:15:44.581360Z  ERROR\n\
-             role: engineer  agent: ticket_42_engineer  target: run_agent  ticket: mahbot-42  workspace: mahbot\n\
-             \n\
-             Agent failed\n\
-             attempt: 3\n\
-             error_chain: crate::foo at src/foo.rs:42"
-        );
-    }
-
-    #[test]
-    fn format_log_entry_minimal_omits_header_and_empty_fields() {
-        let entry = LogEntry {
-            timestamp: "2026-08-17T20:15:44.581360Z".to_string(),
-            level: "INFO".to_string(),
-            target: String::new(),
-            message: "plain message".to_string(),
-            ..Default::default()
-        };
-        let out = format_log_entry(&entry);
-        assert_eq!(
-            out,
-            "2026-08-17T20:15:44.581360Z  INFO\n\
-             \n\
-             plain message"
-        );
+    fn format_log_entry_cases() {
+        let cases: Vec<(&str, LogEntry, &str)> = vec![
+            (
+                "full layout",
+                entry(),
+                "2026-08-17T20:15:44.581360Z  ERROR\n\
+                 role: engineer  agent: ticket_42_engineer  target: run_agent  ticket: mahbot-42  workspace: mahbot\n\
+                 \n\
+                 Agent failed\n\
+                 attempt: 3\n\
+                 error_chain: crate::foo at src/foo.rs:42",
+            ),
+            (
+                // A minimal entry omits the header line and empty fields.
+                "minimal entry",
+                LogEntry {
+                    timestamp: "2026-08-17T20:15:44.581360Z".to_string(),
+                    level: "INFO".to_string(),
+                    target: String::new(),
+                    message: "plain message".to_string(),
+                    ..Default::default()
+                },
+                "2026-08-17T20:15:44.581360Z  INFO\n\
+                 \n\
+                 plain message",
+            ),
+        ];
+        for (name, entry, expected) in &cases {
+            assert_eq!(format_log_entry(entry), *expected, "case {name}");
+        }
     }
 }

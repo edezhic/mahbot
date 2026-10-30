@@ -1208,20 +1208,27 @@ mod tests {
     use crate::agent::registry::{AgentHandle, RunningTool};
     use crate::gui::session_view::build_ledger;
 
-    fn agent_handle(
-        id: &str,
-        role: &str,
-        ticket_id: Option<String>,
-        workspace: &str,
-        parent: Option<ParentKey>,
-    ) -> AgentHandle {
+    /// A parent key from its spec: `""` for none, otherwise `t:<id>`, `a:<key>`,
+    /// `r:<key>` or `l:<id>`.
+    fn parent(spec: &str) -> Option<ParentKey> {
+        let (kind, key) = spec.split_once(':')?;
+        let key = key.to_string();
+        Some(match kind {
+            "t" => ParentKey::Ticket(key),
+            "a" => ParentKey::AnalyzeRound(key),
+            "r" => ParentKey::Research(key),
+            _ => ParentKey::Launch(key),
+        })
+    }
+
+    fn agent(id: &str, role: &str, workspace: &str, parent_spec: &str) -> AgentHandle {
         AgentHandle {
             agent_id: id.to_string(),
             role: role.to_string(),
-            ticket_id,
+            ticket_id: None,
             workspace_path: format!("/ws/{workspace}"),
             workspace_name: workspace.to_string(),
-            parent_key: parent,
+            parent_key: parent(parent_spec),
             parent_label: None,
             started_at: Utc::now(),
             generation: 0,
@@ -1230,358 +1237,267 @@ mod tests {
         }
     }
 
-    fn call_handle(
+    fn call(
         kind: &'static str,
         workspace: &str,
-        parent: Option<ParentKey>,
+        parent_spec: &str,
         run_lifetime: bool,
     ) -> NonAgentCallHandle {
         NonAgentCallHandle {
             kind,
             workspace: workspace.to_string(),
             started_at: Utc::now(),
-            parent_key: parent,
+            parent_key: parent(parent_spec),
             parent_label: None,
             run_lifetime,
         }
     }
 
-    #[test]
-    fn groups_ticket_agents_and_synthesis_together() {
-        let agents = vec![
-            agent_handle(
-                "a1",
-                "analyst",
-                Some("T1".to_string()),
-                "ws1",
-                Some(ParentKey::Ticket("T1".to_string())),
-            ),
-            agent_handle("mgr", "manager", None, "ws1", None),
-        ];
-        let calls = vec![call_handle(
-            "synthesis",
-            "ws1",
-            Some(ParentKey::Ticket("T1".to_string())),
-            false,
-        )];
-        let groups = build_groups(&agents, &calls);
-        assert_eq!(groups.len(), 2, "ticket group + singleton group");
-        let ticket = &groups[0];
-        assert_eq!(ticket.kind, GroupKind::Ticket);
-        assert_eq!(ticket.key, "T1");
-        assert_eq!(ticket.items.len(), 2, "analyst agent + synthesis call");
+    /// An agent row: id, role, workspace, parent spec.
+    type AgentRow = (&'static str, &'static str, &'static str, &'static str);
+    /// A call row: kind, workspace, parent spec, run lifetime.
+    type CallRow = (&'static str, &'static str, &'static str, bool);
+    /// An expected group: kind, key, member count, workspace when claimed, run lifetime.
+    type GroupRow = (GroupKind, &'static str, usize, Option<&'static str>, bool);
+
+    struct GroupCase {
+        name: &'static str,
+        agents: &'static [AgentRow],
+        calls: &'static [CallRow],
+        total: usize,
+        groups: &'static [GroupRow],
     }
 
-    #[test]
-    fn two_analyze_rounds_never_mix_members() {
-        let agents = vec![
-            agent_handle(
-                "analyze_ws_AAA_0_analyst",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::AnalyzeRound("roundA".to_string())),
-            ),
-            agent_handle(
-                "analyze_ws_AAA_1_analyst",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::AnalyzeRound("roundA".to_string())),
-            ),
-            agent_handle(
-                "analyze_ws_BBB_0_analyst",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::AnalyzeRound("roundB".to_string())),
-            ),
-        ];
-        let calls = vec![call_handle(
-            "consolidate",
-            "ws1",
-            Some(ParentKey::AnalyzeRound("roundA".to_string())),
-            false,
-        )];
-        let groups = build_groups(&agents, &calls);
-        let analyze_groups: Vec<_> = groups
-            .iter()
-            .filter(|g| g.kind == GroupKind::AnalyzeRound)
-            .collect();
-        assert_eq!(analyze_groups.len(), 2, "two distinct analyze round groups");
-        let round_a = analyze_groups
-            .iter()
-            .find(|g| g.key == "roundA")
-            .expect("round A exists");
-        assert_eq!(round_a.items.len(), 3, "2 analysts + consolidation call");
-        let round_b = analyze_groups
-            .iter()
-            .find(|g| g.key == "roundB")
-            .expect("round B exists");
-        assert_eq!(round_b.items.len(), 1, "only its own analyst");
-    }
-
-    #[test]
-    fn research_run_members_share_one_key_across_phases() {
-        // Two concurrent research runs in one workspace must never mix
-        // members even though every spawn carries a unique agent-id suffix.
-        let agents = vec![
-            agent_handle(
-                "research_ws_x1_decompose_0",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::Research("run1".to_string())),
-            ),
-            agent_handle(
-                "research_ws_x2_r1_0",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::Research("run1".to_string())),
-            ),
-            agent_handle(
-                "research_ws_y1_decompose_0",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::Research("run2".to_string())),
-            ),
-        ];
-        let calls = vec![
-            call_handle(
-                "synthesize",
-                "ws1",
-                Some(ParentKey::Research("run1".to_string())),
-                false,
-            ),
-            call_handle(
-                "research_orchestrator",
-                "ws1",
-                Some(ParentKey::Research("run1".to_string())),
-                true,
-            ),
-        ];
-        let groups = build_groups(&agents, &calls);
-        let research_groups: Vec<_> = groups
-            .iter()
-            .filter(|g| g.kind == GroupKind::Research)
-            .collect();
-        assert_eq!(research_groups.len(), 2);
-        let run1 = research_groups
-            .iter()
-            .find(|g| g.key == "run1")
-            .expect("run 1 exists");
-        assert_eq!(run1.items.len(), 3, "2 analysts + synthesize call");
-        assert!(
-            run1.run_lifetime,
-            "run-lifetime orchestrator marker attached"
-        );
-        let run2 = research_groups
-            .iter()
-            .find(|g| g.key == "run2")
-            .expect("run 2 exists");
-        assert_eq!(run2.items.len(), 1, "only its own member");
-        assert!(!run2.run_lifetime);
-    }
-
-    #[test]
-    fn singletons_and_unattributed_calls_group_by_workspace() {
-        let agents = vec![
-            agent_handle("manager_ws1", "manager", None, "ws1", None),
-            agent_handle("maintainer_ws2_abc", "maintainer", None, "ws2", None),
-        ];
-        let calls = vec![call_handle("some_orchestrator_call", "ws1", None, false)];
-        let groups = build_groups(&agents, &calls);
-        let singleton: Vec<_> = groups
-            .iter()
-            .filter(|g| g.kind == GroupKind::Singleton)
-            .collect();
-        assert_eq!(singleton.len(), 2, "one per workspace");
-        let unattributed: Vec<_> = groups
-            .iter()
-            .filter(|g| g.kind == GroupKind::Unattributed)
-            .collect();
-        assert_eq!(unattributed.len(), 1);
-        assert_eq!(unattributed[0].workspace, "ws1");
-    }
-
-    #[test]
-    fn sort_key_orders_groups_by_kind() {
-        let mut groups = [
-            DisplayGroup {
-                kind: GroupKind::Unattributed,
-                key: "ws".to_string(),
-                workspace: "ws".to_string(),
-                label: None,
-                items: Vec::new(),
-                run_lifetime: false,
-            },
-            DisplayGroup {
-                kind: GroupKind::Ticket,
-                key: "T1".to_string(),
-                workspace: "ws".to_string(),
-                label: None,
-                items: Vec::new(),
-                run_lifetime: false,
-            },
-            DisplayGroup {
-                kind: GroupKind::Research,
-                key: "r".to_string(),
-                workspace: "ws".to_string(),
-                label: None,
-                items: Vec::new(),
-                run_lifetime: false,
-            },
-        ];
-        groups.sort_by_key(DisplayGroup::sort_key);
-        assert_eq!(groups[0].kind, GroupKind::Ticket);
-        assert_eq!(groups[1].kind, GroupKind::Research);
-        assert_eq!(groups[2].kind, GroupKind::Unattributed);
-    }
-
-    #[test]
-    fn research_groups_resolve_workspace_across_ephemeral_worker_members() {
-        // A run's worker round executes in an ephemeral per-run workspace whose
-        // name IS the run key (job_id), while its analysts and orchestrator
-        // calls run in the real workspace. The group must resolve to the REAL
-        // workspace whether the worker registers before or after the run's
-        // real-workspace members, and two concurrent runs must never mix.
-        let agents = vec![
-            // run1: ephemeral worker registers first, then a real-workspace
-            // analyst.
-            agent_handle(
-                "research_ws1_run1_worker0",
-                "worker",
-                None,
-                "run1",
-                Some(ParentKey::Research("run1".to_string())),
-            ),
-            agent_handle(
-                "research_ws1_run1_r1_0",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::Research("run1".to_string())),
-            ),
-            // run2: real-workspace analyst registers first, then the
-            // ephemeral worker.
-            agent_handle(
-                "research_ws1_run2_r1_0",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::Research("run2".to_string())),
-            ),
-            agent_handle(
-                "research_ws1_run2_worker0",
-                "worker",
-                None,
-                "run2",
-                Some(ParentKey::Research("run2".to_string())),
-            ),
-        ];
-        let groups = build_groups(&agents, &[]);
-        let runs: Vec<_> = groups
-            .iter()
-            .filter(|g| g.kind == GroupKind::Research)
-            .collect();
-        assert_eq!(runs.len(), 2, "two concurrent runs never mix members");
-        for run in runs {
-            assert_eq!(
-                run.workspace, "ws1",
-                "the real workspace wins over the ephemeral per-run workspace"
-            );
-            assert_eq!(run.items.len(), 2, "worker + analyst in one group");
+    fn case(
+        name: &'static str,
+        agents: &'static [AgentRow],
+        calls: &'static [CallRow],
+        total: usize,
+        groups: &'static [GroupRow],
+    ) -> GroupCase {
+        GroupCase {
+            name,
+            agents,
+            calls,
+            total,
+            groups,
         }
     }
 
     #[test]
-    fn cross_workspace_round_keys_never_merge_groups() {
-        // Two concurrent sync analyze rounds in DIFFERENT workspaces could draw
-        // the same short NanoID suffix — the workspace component of the group
-        // identity must keep their groups separate.
-        let agents = vec![
-            agent_handle(
-                "analyze_ws_AAA_0_analyst",
-                "analyst",
-                None,
-                "ws1",
-                Some(ParentKey::AnalyzeRound("abc123".to_string())),
+    fn build_groups_keeps_runs_and_rounds_apart() {
+        let cases = [
+            case(
+                "ticket agents and synthesis share the ticket group",
+                &[
+                    ("a1", "analyst", "ws1", "t:T1"),
+                    ("mgr", "manager", "ws1", ""),
+                ],
+                &[("synthesis", "ws1", "t:T1", false)],
+                2,
+                &[(GroupKind::Ticket, "T1", 2, None, false)],
             ),
-            agent_handle(
-                "analyze_ws_BBB_0_analyst",
-                "analyst",
-                None,
-                "ws2",
-                Some(ParentKey::AnalyzeRound("abc123".to_string())),
+            case(
+                "two analyze rounds never mix members",
+                &[
+                    ("a1", "analyst", "ws1", "a:roundA"),
+                    ("a2", "analyst", "ws1", "a:roundA"),
+                    ("b1", "analyst", "ws1", "a:roundB"),
+                ],
+                &[("consolidate", "ws1", "a:roundA", false)],
+                2,
+                &[
+                    (GroupKind::AnalyzeRound, "roundA", 3, None, false),
+                    (GroupKind::AnalyzeRound, "roundB", 1, None, false),
+                ],
+            ),
+            case(
+                "research run members share one key across phases",
+                &[
+                    ("x1", "analyst", "ws1", "r:run1"),
+                    ("x2", "analyst", "ws1", "r:run1"),
+                    ("y1", "analyst", "ws1", "r:run2"),
+                ],
+                &[
+                    ("synthesize", "ws1", "r:run1", false),
+                    ("research_orchestrator", "ws1", "r:run1", true),
+                ],
+                2,
+                &[
+                    (GroupKind::Research, "run1", 3, None, true),
+                    (GroupKind::Research, "run2", 1, None, false),
+                ],
+            ),
+            case(
+                "a run resolves to the real workspace across ephemeral workers",
+                &[
+                    ("w1", "worker", "run1", "r:run1"),
+                    ("r1", "analyst", "ws1", "r:run1"),
+                    ("r2", "analyst", "ws1", "r:run2"),
+                    ("w2", "worker", "run2", "r:run2"),
+                ],
+                &[],
+                2,
+                &[
+                    (GroupKind::Research, "run1", 2, Some("ws1"), false),
+                    (GroupKind::Research, "run2", 2, Some("ws1"), false),
+                ],
+            ),
+            case(
+                "cross-workspace round keys never merge groups",
+                &[
+                    ("a1", "analyst", "ws1", "a:abc123"),
+                    ("b1", "analyst", "ws2", "a:abc123"),
+                ],
+                &[],
+                2,
+                &[
+                    (GroupKind::AnalyzeRound, "abc123", 1, Some("ws1"), false),
+                    (GroupKind::AnalyzeRound, "abc123", 1, Some("ws2"), false),
+                ],
             ),
         ];
-        let groups = build_groups(&agents, &[]);
-        let analyze_groups: Vec<_> = groups
-            .iter()
-            .filter(|g| g.kind == GroupKind::AnalyzeRound)
-            .collect();
-        assert_eq!(
-            analyze_groups.len(),
-            2,
-            "same round key in two workspaces stays separate"
-        );
+
+        for case in cases {
+            let agents: Vec<_> = case
+                .agents
+                .iter()
+                .map(|&(id, role, ws, p)| agent(id, role, ws, p))
+                .collect();
+            let calls: Vec<_> = case
+                .calls
+                .iter()
+                .map(|&(k, ws, p, run)| call(k, ws, p, run))
+                .collect();
+            let groups = build_groups(&agents, &calls);
+            assert_case(&case, &groups);
+        }
     }
 
-    /// Build a handle with a parent label (the display-level label captured
-    /// at spawn — ticket title / question text).
-    fn agent_handle_labeled(
-        id: &str,
-        role: &str,
-        workspace: &str,
-        parent: Option<ParentKey>,
-        parent_label: Option<&str>,
-    ) -> AgentHandle {
-        let mut h = agent_handle(id, role, None, workspace, parent);
-        h.parent_label = parent_label.map(ToString::to_string);
-        h
+    fn assert_case(case: &GroupCase, groups: &[DisplayGroup]) {
+        let name = case.name;
+        assert_eq!(groups.len(), case.total, "case {name}: group count");
+        for row in case.groups {
+            let (kind, key, items) = (&row.0, row.1, row.2);
+            let (workspace, run_lifetime) = (row.3, row.4);
+            let found = groups.iter().find(|group| {
+                &group.kind == kind
+                    && group.key == key
+                    && workspace.is_none_or(|ws| group.workspace == ws)
+            });
+            let group = found.unwrap_or_else(|| panic!("case {name}: no {kind:?} group {key:?}"));
+            assert_eq!(group.items.len(), items, "case {name}: {key} members");
+            if let Some(ws) = workspace {
+                assert_eq!(group.workspace, ws, "case {name}: {key} workspace");
+            }
+            assert_eq!(
+                group.run_lifetime, run_lifetime,
+                "case {name}: {key} run lifetime"
+            );
+        }
     }
 
-    fn call_handle_labeled(
-        kind: &'static str,
-        workspace: &str,
-        parent: Option<ParentKey>,
-        parent_label: Option<&str>,
-    ) -> NonAgentCallHandle {
-        let mut h = call_handle(kind, workspace, parent, false);
-        h.parent_label = parent_label.map(ToString::to_string);
-        h
+    #[test]
+    fn singleton_and_unattributed_groups_stay_generic_per_workspace() {
+        // (case, agents, calls, singleton groups)
+        let cases: &[(&str, &[AgentRow], &[CallRow], usize)] = &[
+            (
+                "one singleton group per workspace",
+                &[
+                    ("mgr_ws1", "manager", "ws1", ""),
+                    ("mnt_ws2", "maintainer", "ws2", ""),
+                ],
+                &[("some_orchestrator_call", "ws1", "", false)],
+                2,
+            ),
+            (
+                "group headers never repeat the workspace",
+                &[("mgr", "manager", "ws1", "")],
+                &[("some_orchestrator_call", "ws1", "", false)],
+                1,
+            ),
+        ];
+
+        for &(name, agent_rows, call_rows, singletons) in cases {
+            let agents: Vec<_> = agent_rows
+                .iter()
+                .map(|&(id, role, ws, p)| agent(id, role, ws, p))
+                .collect();
+            let calls: Vec<_> = call_rows
+                .iter()
+                .map(|&(k, ws, p, run)| call(k, ws, p, run))
+                .collect();
+            let groups = build_groups(&agents, &calls);
+            let count = |kind: &GroupKind| groups.iter().filter(|g| &g.kind == kind).count();
+            assert_eq!(
+                count(&GroupKind::Singleton),
+                singletons,
+                "case {name}: singletons"
+            );
+            assert_eq!(
+                count(&GroupKind::Unattributed),
+                1,
+                "case {name}: unattributed"
+            );
+            let unattributed = groups.iter().find(|g| g.kind == GroupKind::Unattributed);
+            assert_eq!(
+                unattributed.unwrap().workspace,
+                "ws1",
+                "case {name}: workspace"
+            );
+            // Inside a workspace section the group headers must not repeat the
+            // workspace name — the section's order already names it.
+            for group in &groups {
+                let (title, _) = group_title(group);
+                assert!(
+                    !title.contains("ws1"),
+                    "case {name}: no workspace in {title}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sort_key_orders_groups_by_kind() {
+        let group = |kind: GroupKind| DisplayGroup {
+            kind,
+            key: "ws".to_string(),
+            workspace: "ws".to_string(),
+            label: None,
+            items: Vec::new(),
+            run_lifetime: false,
+        };
+        let mut groups = [
+            group(GroupKind::Unattributed),
+            group(GroupKind::Ticket),
+            group(GroupKind::Research),
+        ];
+        groups.sort_by_key(DisplayGroup::sort_key);
+        let kinds: Vec<_> = groups.iter().map(|group| group.kind.clone()).collect();
+        let expected = [
+            GroupKind::Ticket,
+            GroupKind::Research,
+            GroupKind::Unattributed,
+        ];
+        assert_eq!(kinds, expected);
     }
 
     #[test]
     fn ticket_group_label_comes_from_members_not_the_key() {
-        // Ticket title is captured observationally at spawn (agents via
-        // Agent::new's ticket, the synthesis call via the joint-verdict
-        // threading). A group must carry the title even when only the
-        // synthesis call remains — never degrade to an ID-only header.
-        let agents = vec![agent_handle_labeled(
-            "a1",
-            "analyst",
-            "ws1",
-            Some(ParentKey::Ticket("T1".to_string())),
-            Some("Fix the login flow"),
-        )];
-        let calls = vec![call_handle_labeled(
-            "synthesis",
-            "ws1",
-            Some(ParentKey::Ticket("T1".to_string())),
-            Some("Fix the login flow"),
-        )];
-        let groups = build_groups(&agents, &calls);
-        let ticket = groups
-            .iter()
-            .find(|g| g.kind == GroupKind::Ticket)
-            .expect("ticket group exists");
+        // The title is captured observationally at spawn (agents via their
+        // ticket, the synthesis call via the joint verdict), so a group carries
+        // it even when only the synthesis call remains.
+        let mut analyst = agent("a1", "analyst", "ws1", "t:T1");
+        analyst.parent_label = Some("Fix the login flow".to_string());
+        let mut synthesis = call("synthesis", "ws1", "t:T1", false);
+        synthesis.parent_label = Some("Fix the login flow".to_string());
+        let groups = build_groups(&[analyst], &[synthesis]);
+        let ticket = groups.iter().find(|g| g.kind == GroupKind::Ticket);
+        let ticket = ticket.expect("ticket group exists");
         assert_eq!(
             ticket.label.as_deref(),
             Some("Fix the login flow"),
-            "group label adopted from a member's parent label"
+            "label from a member"
         );
         // group_title preserves (title, id); render_group composes `[id] title`.
         let (title, secondary) = group_title(ticket);
@@ -1591,88 +1507,52 @@ mod tests {
 
     #[test]
     fn analyze_and_research_groups_render_question_not_raw_key() {
-        // Analyze/research headers show the question text; the raw NanoID key
-        // is never rendered. A missing label degrades to a generic label,
-        // never the key.
-        let agents = vec![agent_handle_labeled(
-            "a1",
-            "analyst",
-            "ws1",
-            Some(ParentKey::AnalyzeRound("job_abc".to_string())),
-            Some("Why is CI flaky?"),
-        )];
-        let groups = build_groups(&agents, &[]);
-        let analyze = groups
-            .iter()
-            .find(|g| g.kind == GroupKind::AnalyzeRound)
-            .expect("analyze group exists");
+        // Analyze/research headers show the question text; the raw NanoID key is
+        // never rendered, and a missing label degrades to a generic one.
+        let mut analyst = agent("a1", "analyst", "ws1", "a:job_abc");
+        analyst.parent_label = Some("Why is CI flaky?".to_string());
+        let groups = build_groups(&[analyst], &[]);
+        let analyze = groups.iter().find(|g| g.kind == GroupKind::AnalyzeRound);
+        let analyze = analyze.expect("analyze group exists");
         let (title, secondary) = group_title(analyze);
         assert_eq!(title, "Why is CI flaky?");
         assert!(secondary.is_none(), "no id secondary for analyze groups");
         assert!(!title.contains("job_abc"), "raw key never leaks");
 
-        let mut no_label = analyze.clone();
-        no_label.label = None;
-        let (fallback, _) = group_title(&no_label);
+        let mut bare = analyze.clone();
+        bare.label = None;
+        let (fallback, _) = group_title(&bare);
         assert_eq!(fallback, "Analyze round");
         assert!(!fallback.contains("job_abc"), "generic fallback, no key");
     }
 
     #[test]
     fn sections_group_by_workspace_and_keep_kind_order() {
-        // Workspace-first layout. Sections are alphabetical; within a section,
-        // groups keep the canonical kind order. Singleton groups are keyed by
-        // workspace, so they land in their own workspace's section.
-        let mut ws_map = std::collections::HashMap::new();
-        ws_map.insert(
+        // Workspace-first layout: sections sort alphabetically, groups keep the
+        // canonical kind order inside one, and a singleton lands in its own
+        // workspace's section.
+        let mut workspaces = std::collections::HashMap::new();
+        workspaces.insert(
             "ws2".to_string(),
             Workspace {
                 path: "/ws/ws2".to_string(),
-                paused: false,
-                maintenance_enabled: false,
                 ..Default::default()
             },
         );
         let agents = vec![
-            agent_handle(
-                "t_agent",
-                "engineer",
-                Some("T1".to_string()),
-                "ws1",
-                Some(ParentKey::Ticket("T1".to_string())),
-            ),
-            agent_handle("mgr_ws2", "manager", None, "ws2", None),
-            agent_handle("mgr_ws1", "manager", None, "ws1", None),
+            agent("t_agent", "engineer", "ws1", "t:T1"),
+            agent("mgr_ws2", "manager", "ws2", ""),
+            agent("mgr_ws1", "manager", "ws1", ""),
         ];
-        let groups = build_groups(&agents, &[]);
-        let sections = build_sections(groups, &ws_map);
+        let sections = build_sections(build_groups(&agents, &[]), &workspaces);
         assert_eq!(sections.len(), 2, "one section per workspace");
         assert_eq!(sections[0].workspace, "ws1");
         assert_eq!(sections[1].workspace, "ws2");
-        // ws1: ticket group before singleton (kind order).
         assert_eq!(sections[0].groups[0].kind, GroupKind::Ticket);
         assert_eq!(sections[0].groups[1].kind, GroupKind::Singleton);
-        // ws2 is a managed workspace → bare name; ws1 is outside the managed set → "(external)".
+        // ws2 is managed → bare name; ws1 is outside the managed set → "(external)".
         assert_eq!(sections[1].label, "ws2");
         assert_eq!(sections[0].label, "ws1 (external)");
-    }
-
-    #[test]
-    fn singleton_and_unattributed_headers_are_generic_not_workspace_titled() {
-        // Inside a workspace section the singleton/unattributed group headers
-        // must NOT repeat the workspace name — the workspace grouping already
-        // names it.
-        let agents = vec![agent_handle("mgr", "manager", None, "ws1", None)];
-        let calls = vec![call_handle("some_orchestrator_call", "ws1", None, false)];
-        let groups = build_groups(&agents, &calls);
-        for group in &groups {
-            let (title, _) = group_title(group);
-            assert_ne!(title, "ws1", "group header must not duplicate the section");
-            assert!(
-                !title.contains("ws1"),
-                "no workspace name in group headers: {title}"
-            );
-        }
     }
 
     // ── Trace-group derivation ──────────────────────────────────────
@@ -1681,8 +1561,8 @@ mod tests {
         assistant_tool_call_reasoning(narration, calls, None)
     }
 
-    /// Like [`assistant_tool_call`] but with an optional decoded `reasoning`
-    /// field, so the ledger's `ToolRound.reasoning` is populated.
+    /// A tool-call round carrying `reasoning`, so the ledger's
+    /// `ToolRound.reasoning` is populated.
     fn assistant_tool_call_reasoning(
         narration: &str,
         calls: &[(&str, serde_json::Value)],
@@ -1710,117 +1590,107 @@ mod tests {
         ChatMessage::assistant(body.to_string())
     }
 
-    #[test]
-    fn empty_and_non_tool_history_produce_no_groups() {
-        assert!(derive_trace_groups(&[]).is_empty());
-        // A content-only assistant message (final answer) is NOT a group.
-        let history = vec![
-            ChatMessage::user("hello\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
-            ChatMessage::assistant("Final answer here."),
-        ];
-        assert!(derive_trace_groups(&build_ledger(&history)).is_empty());
+    /// One tool-call round with a single `read`, as the agent's turns look.
+    fn round(narration: &str) -> ChatMessage {
+        assistant_tool_call(narration, &[("read", serde_json::json!({"path": "a.rs"}))])
     }
 
+    /// A tool-call round whose step carries `reasoning` (the line's hover text).
+    fn thinking(narration: &str, reasoning: &str) -> ChatMessage {
+        assistant_tool_call_reasoning(
+            narration,
+            &[("read", serde_json::json!({"path": "a.rs"}))],
+            Some(reasoning),
+        )
+    }
+
+    fn user_turn(text: &str) -> ChatMessage {
+        ChatMessage::user(format!(
+            "{text}\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"
+        ))
+    }
+
+    fn injected_image() -> ChatMessage {
+        let marker = "data:image/png;base64,xxx".to_string();
+        ChatMessage::user(crate::util::injected_image_user_message(&[marker]))
+    }
+
+    fn assert_trace_groups(name: &str, groups: &[TraceGroup<'_>], expected: &[&[&str]]) {
+        assert_eq!(groups.len(), expected.len(), "case {name}: group count");
+        for (group, steps) in groups.iter().zip(expected) {
+            assert_eq!(
+                group.steps.len(),
+                steps.len(),
+                "case {name}: steps in group"
+            );
+            for (step, wanted) in group.steps.iter().zip(*steps) {
+                assert_eq!(step.narration, *wanted, "case {name}: step narration");
+            }
+        }
+    }
+
+    type TurnCase<'a> = (&'a str, Vec<ChatMessage>, Vec<Vec<&'a str>>);
+
     #[test]
-    fn narration_starts_and_boundary_groups() {
-        let history = vec![
-            assistant_tool_call(
-                "Reading the file",
-                &[("read", serde_json::json!({"path": "a.rs"}))],
+    fn narration_and_turn_boundaries_derive_groups() {
+        // (case, history, the narration of every step of every group it derives)
+        let cases: &[TurnCase] = &[
+            ("empty history produces no groups", Vec::new(), Vec::new()),
+            (
+                "a content-only assistant message is not a group",
+                vec![
+                    user_turn("hello"),
+                    ChatMessage::assistant("Final answer here."),
+                ],
+                Vec::new(),
             ),
-            assistant_tool_call(
-                "Editing it",
-                &[("edit", serde_json::json!({"path": "b.rs"}))],
+            (
+                "a new narration starts a new group",
+                vec![round("Reading the file"), round("Editing it")],
+                vec![vec!["Reading the file"], vec!["Editing it"]],
+            ),
+            (
+                "consecutive no-narration rounds accumulate",
+                vec![round(""), round("")],
+                vec![vec!["", ""]],
+            ),
+            (
+                "a real user turn resets the group",
+                vec![round("Narration"), user_turn("ok now fix it"), round("")],
+                vec![vec!["Narration"], vec![""]],
+            ),
+            (
+                "an injected image user message does not reset the group",
+                vec![round(""), injected_image(), round("")],
+                vec![vec!["", ""]],
+            ),
+            (
+                "an empty user message is not a turn boundary",
+                vec![round(""), ChatMessage::user(""), round("")],
+                vec![vec!["", ""]],
             ),
         ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 2, "new narration starts a new group");
-        assert_eq!(groups[0].steps[0].narration, "Reading the file");
-        assert_eq!(groups[1].steps[0].narration, "Editing it");
-    }
 
-    #[test]
-    fn consecutive_no_narration_rounds_accumulate() {
-        let history = vec![
-            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            assistant_tool_call("", &[("list", serde_json::json!({"path": "."}))]),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 1, "no narration → same group");
-        assert_eq!(groups[0].steps.len(), 2);
-        assert!(groups[0].steps.iter().all(|s| s.narration.is_empty()));
-    }
-
-    #[test]
-    fn real_user_turn_resets_group() {
-        let history = vec![
-            assistant_tool_call(
-                "Narration",
-                &[("read", serde_json::json!({"path": "a.rs"}))],
-            ),
-            ChatMessage::user("ok now fix it\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
-            assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 2, "user turn closes the group");
-        assert_eq!(groups[0].steps[0].narration, "Narration");
-        // The post-reset empty-narration round starts a fresh group.
-        assert_eq!(groups[1].steps.len(), 1);
-    }
-
-    #[test]
-    fn injected_image_user_message_does_not_reset_group() {
-        let history = vec![
-            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            ChatMessage::user(crate::util::injected_image_user_message(&[
-                "data:image/png;base64,xxx".to_string(),
-            ])),
-            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 1, "synthetic image stays in the same group");
-        assert_eq!(groups[0].steps.len(), 2);
-    }
-
-    #[test]
-    fn empty_user_message_is_not_a_turn_boundary() {
-        // An empty User message (resume signal) is NOT a real turn boundary:
-        // tool rounds on both sides still form ONE group.
-        let history = vec![
-            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            ChatMessage::user(""),
-            assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 1, "empty user message is not a boundary");
-        assert_eq!(groups[0].steps.len(), 2);
+        for (name, history, expected) in cases {
+            let ledger = build_ledger(history);
+            let groups = derive_trace_groups(&ledger);
+            let expected: Vec<&[&str]> = expected.iter().map(Vec::as_slice).collect();
+            assert_trace_groups(name, &groups, &expected);
+        }
     }
 
     #[test]
     fn every_step_keeps_its_own_reasoning() {
-        // Each round keeps its own reasoning, so the label can follow the
-        // newest step instead of latching onto the group's first one.
+        // Each round keeps its own reasoning, so the label can follow the newest
+        // step instead of latching onto the group's first one.
         let history = vec![
             assistant_tool_call_reasoning(
                 "",
                 &[("read", serde_json::json!({"path": "a.rs"}))],
                 None,
             ),
-            assistant_tool_call_reasoning(
-                "",
-                &[("edit", serde_json::json!({"path": "b.rs"}))],
-                Some("first"),
-            ),
-            assistant_tool_call_reasoning(
-                "",
-                &[("list", serde_json::json!({"path": "."}))],
-                Some("second"),
-            ),
+            thinking("", "first"),
+            thinking("", "second"),
         ];
         let ledger = build_ledger(&history);
         let groups = derive_trace_groups(&ledger);
@@ -1829,8 +1699,8 @@ mod tests {
         assert_eq!(reasoning, vec![None, Some("first"), Some("second")]);
     }
 
-    /// Build a ledger tool-call entry for the collapsed/in-flight projection
-    /// tests: `result: None` marks the call in-flight.
+    /// A ledger tool-call entry for the collapsed/in-flight projection tests;
+    /// `result: None` marks the call in-flight.
     fn entry(name: &str, args: serde_json::Value, result: Option<&str>) -> ToolCallEntry {
         ToolCallEntry {
             tool_call_id: String::new(),
@@ -1843,7 +1713,6 @@ mod tests {
         }
     }
 
-    /// A bare trace step carrying only tool calls, for the collapsed-line test.
     fn step(calls: &[ToolCallEntry]) -> TraceStep<'_> {
         TraceStep {
             narration: "",
@@ -1863,79 +1732,57 @@ mod tests {
             entry("read_file", serde_json::json!({"path": "c.rs"}), None),
         ];
         let steps = vec![step(&read_calls), step(&edit_calls)];
+        // Underscores become spaces; settled names stay exact, an in-flight call
+        // gets a running suffix; `xN` counts collapsed repetitions; first-seen order.
         assert_eq!(
             collapsed_calls_line(&steps),
-            "read file x2, list files, read file …",
-            "underscores become spaces; settled names stay exact, an in-flight call gets a running suffix; `xN` counts collapsed repetitions; first-appearance order"
+            "read file x2, list files, read file …"
         );
     }
 
     #[test]
-    fn card_shows_only_current_turn_groups() {
-        // The card shows only the CURRENT user turn: the pre-turn group is gone.
-        let history = vec![
-            assistant_tool_call("First", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            ChatMessage::user("ok now do it\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
-            assistant_tool_call("Second", &[("edit", serde_json::json!({"path": "b.rs"}))]),
+    fn the_card_shows_only_the_current_turn() {
+        // (case, history, the narration of every step of the current turn's groups)
+        let cases: &[TurnCase] = &[
+            (
+                "the pre-turn group is gone",
+                vec![round("First"), user_turn("ok now do it"), round("Second")],
+                vec![vec!["Second"]],
+            ),
+            (
+                "no user turn shows the whole history",
+                vec![round("A"), round("B")],
+                vec![vec!["A"], vec!["B"]],
+            ),
+            (
+                "a turn without tool rounds is empty",
+                vec![round("A"), user_turn("stop now")],
+                Vec::new(),
+            ),
+            (
+                "injected and empty user messages do not start a turn",
+                vec![
+                    round(""),
+                    injected_image(),
+                    ChatMessage::user(""),
+                    round(""),
+                ],
+                vec![vec!["", ""]],
+            ),
         ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(current_turn_entries(&ledger));
-        assert_eq!(groups.len(), 1, "only the post-turn group is shown");
-        assert_eq!(groups[0].steps[0].narration, "Second");
-    }
 
-    #[test]
-    fn no_user_turn_shows_whole_history() {
-        let history = vec![
-            assistant_tool_call("A", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            assistant_tool_call("B", &[("edit", serde_json::json!({"path": "b.rs"}))]),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(current_turn_entries(&ledger));
-        assert_eq!(groups.len(), 2, "no boundary → whole ledger is current");
-        assert_eq!(groups[0].steps[0].narration, "A");
-        assert_eq!(groups[1].steps[0].narration, "B");
-    }
-
-    #[test]
-    fn current_turn_without_tool_rounds_is_empty() {
-        let history = vec![
-            assistant_tool_call("A", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            ChatMessage::user("stop now\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(current_turn_entries(&ledger));
-        assert!(
-            groups.is_empty(),
-            "no tool rounds after the last user turn → empty (clanking placeholder)"
-        );
-    }
-
-    #[test]
-    fn injected_image_and_empty_user_do_not_start_a_turn() {
-        let history = vec![
-            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            ChatMessage::user(crate::util::injected_image_user_message(&[
-                "data:image/png;base64,xxx".to_string(),
-            ])),
-            ChatMessage::user(""),
-            assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(current_turn_entries(&ledger));
-        assert_eq!(
-            groups.len(),
-            1,
-            "injected + empty user messages are not boundaries"
-        );
-        assert_eq!(groups[0].steps.len(), 2);
+        for (name, history, expected) in cases {
+            let ledger = build_ledger(history);
+            let groups = derive_trace_groups(current_turn_entries(&ledger));
+            let expected: Vec<&[&str]> = expected.iter().map(Vec::as_slice).collect();
+            assert_trace_groups(name, &groups, &expected);
+        }
     }
 
     #[test]
     fn rounds_carry_results_for_in_flight_distinction() {
-        // One assistant tool-call round with two calls; a tool result arrives
-        // for only one of the two ids. After the ledger, one call is settled
-        // and the other in-flight — both preserved in the group's round.
+        // One round with two calls, only one of which got a result: after the
+        // ledger one call is settled and the other in-flight, both preserved.
         let calls_json = serde_json::json!([
             {"id": "call_a", "name": "read", "arguments": "{\"path\": \"a.rs\"}"},
             {"id": "call_b", "name": "edit", "arguments": "{\"path\": \"b.rs\"}"},
@@ -1953,7 +1800,7 @@ mod tests {
         let settled = round
             .iter()
             .find(|c| c.tool_call_id == "call_a")
-            .expect("call_a present");
+            .expect("call_a");
         assert_eq!(
             settled.result.as_deref(),
             Some("contents of a.rs"),
@@ -1962,69 +1809,15 @@ mod tests {
         let in_flight = round
             .iter()
             .find(|c| c.tool_call_id == "call_b")
-            .expect("call_b present");
+            .expect("call_b");
         assert_eq!(
             in_flight.result, None,
             "call_b has no result yet → in-flight"
         );
     }
 
-    #[test]
-    fn line_follows_the_newest_step() {
-        let history = vec![
-            assistant_tool_call_reasoning(
-                "Now editing the parser",
-                &[("edit", serde_json::json!({"path": "b.rs"}))],
-                Some("Reading the whole file first."),
-            ),
-            assistant_tool_call_reasoning(
-                "",
-                &[("read", serde_json::json!({"path": "a.rs"}))],
-                Some("The parser struct is missing the offset field, so the columns drift."),
-            ),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 1, "a silent round stays in the same group");
-        let line = group_line(&groups[0]).expect("the group carries text");
-        assert_eq!(
-            line.text, "The parser struct is missing the offset field, so the columns drift.",
-            "the line comes from the newest step, not the group's first one"
-        );
-        assert_eq!(
-            line.hover,
-            Some("The parser struct is missing the offset field, so the columns drift."),
-            "hover text is the reasoning of the step the line came from"
-        );
-    }
-
-    #[test]
-    fn silent_step_keeps_the_previous_line() {
-        // A step with no text and a step narrated with whitespace only both
-        // keep the line already on screen, and neither starts a new group.
-        for narration in ["", " "] {
-            let history = vec![
-                assistant_tool_call_reasoning(
-                    "",
-                    &[("read", serde_json::json!({"path": "a.rs"}))],
-                    Some("Checking the whole file first."),
-                ),
-                assistant_tool_call(narration, &[("edit", serde_json::json!({"path": "b.rs"}))]),
-            ];
-            let ledger = build_ledger(&history);
-            let groups = derive_trace_groups(&ledger);
-            assert_eq!(groups.len(), 1, "a blank narration is not a boundary");
-            assert_eq!(
-                group_line(&groups[0]).map(|line| line.text),
-                Some("Checking the whole file first.".to_string()),
-                "narration {narration:?} keeps the line already on screen"
-            );
-        }
-    }
-
-    /// What each visible line row shows, for assertions: the text itself, or
-    /// `<blank>` where the group renders no line (no text to show, or a newer
-    /// group already shows the same line).
+    /// What each visible line row shows: the text itself, or `<blank>` where the
+    /// group renders no line (no text to show, or a newer group shows it).
     fn shown_lines(groups: &[TraceGroup<'_>], expanded: bool) -> Vec<String> {
         visible_lines(groups, expanded)
             .into_iter()
@@ -2036,129 +1829,141 @@ mod tests {
     }
 
     #[test]
-    fn textless_group_holds_the_previous_groups_line() {
-        // A new group whose only step narrates a bare rule (no text) has
-        // nothing of its own: the card keeps the last line it showed instead of
-        // swapping to the placeholder, and a turn's first group — with no
-        // previous group to hold — still shows the placeholder.
-        let history = vec![
-            assistant_tool_call_reasoning(
-                "",
-                &[("read", serde_json::json!({"path": "a.rs"}))],
-                Some("Checking the whole file first."),
+    fn the_line_follows_the_newest_step_and_holds_the_previous_one() {
+        const DRIFT: &str = "The parser struct is missing the offset field, so the columns drift.";
+        const CHECKED: &str = "Checking the whole file first.";
+        // (case, history, the line, its hover text when the case claims it)
+        let cases: &[(&str, Vec<ChatMessage>, &str, Option<&str>)] = &[
+            (
+                "the line follows the newest step",
+                vec![
+                    thinking("Now editing the parser", "Reading the whole file first."),
+                    thinking("", DRIFT),
+                ],
+                DRIFT,
+                Some(DRIFT),
             ),
-            assistant_tool_call("---", &[("edit", serde_json::json!({"path": "b.rs"}))]),
+            (
+                "a silent step keeps the previous line",
+                vec![thinking("", CHECKED), round("")],
+                CHECKED,
+                None,
+            ),
+            (
+                "a whitespace-only narration keeps it too",
+                vec![thinking("", CHECKED), round(" ")],
+                CHECKED,
+                None,
+            ),
         ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 2, "a rule-only narration starts a group");
-        assert!(
-            group_line(&groups[1]).is_none(),
-            "the new group has no text"
-        );
-        assert_eq!(
-            shown_lines(&groups, false),
-            vec!["Checking the whole file first."],
-            "the card holds the previous line"
-        );
-        // A turn whose first group is textless has no earlier line to hold.
-        let textless = vec![assistant_tool_call(
-            "---",
-            &[("read", serde_json::json!({"path": "a.rs"}))],
-        )];
-        let textless_ledger = build_ledger(&textless);
-        let textless_groups = derive_trace_groups(&textless_ledger);
-        assert_eq!(
-            shown_lines(&textless_groups, false),
-            vec!["<blank>"],
-            "no line exists yet → the card renders its placeholder instead"
-        );
+
+        for (name, history, text, hover) in cases {
+            let ledger = build_ledger(history);
+            let groups = derive_trace_groups(&ledger);
+            assert_eq!(groups.len(), 1, "case {name}: one group");
+            let line = group_line(&groups[0])
+                .unwrap_or_else(|| panic!("case {name}: the group carries text"));
+            assert_eq!(line.text, *text, "case {name}: line text");
+            if let Some(hover) = hover {
+                assert_eq!(line.hover, Some(*hover), "case {name}: hover");
+            }
+        }
     }
 
-    #[test]
-    fn a_held_line_is_not_shown_twice_in_the_previous_groups_list() {
-        // The current group holds an earlier group's line; that earlier group
-        // must not render the same sentence again above it.
-        let history = vec![
-            assistant_tool_call_reasoning(
-                "",
-                &[("read", serde_json::json!({"path": "a.rs"}))],
-                Some("Checking the whole file first."),
-            ),
-            assistant_tool_call("---", &[("edit", serde_json::json!({"path": "b.rs"}))]),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(
-            shown_lines(&groups, true),
-            vec!["<blank>", "Checking the whole file first."],
-            "the phrase appears once, on the newest group"
-        );
-        assert_eq!(
-            shown_lines(&groups, false),
-            vec!["Checking the whole file first."],
-            "the collapsed card never had a second copy either"
-        );
-    }
+    type TextlessCase<'a> = (
+        &'a str,
+        Vec<ChatMessage>,
+        usize,
+        bool,
+        Option<&'a [&'a str]>,
+        Option<&'a [&'a str]>,
+    );
 
     #[test]
-    fn a_repeated_line_is_dropped_even_when_older_groups_sit_between() {
-        // Two groups that narrate the same sentence are not adjacent: the older
-        // copy goes, not just a repeat of the newest line.
-        let history = vec![
-            assistant_tool_call_reasoning(
-                "",
-                &[("read", serde_json::json!({"path": "a.rs"}))],
-                Some("The same line here."),
+    fn textless_groups_hold_or_drop_the_line() {
+        const CHECKED: &str = "Checking the whole file first.";
+        // (case, history, groups, newest group is textless, collapsed card, expanded card)
+        let cases: &[TextlessCase] = &[
+            (
+                "a textless group holds the previous group's line",
+                vec![thinking("", CHECKED), round("---")],
+                2,
+                true,
+                Some(&[CHECKED]),
+                None,
             ),
-            ChatMessage::user("go on\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
-            assistant_tool_call(
-                "Something else.",
-                &[("edit", serde_json::json!({"path": "b.rs"}))],
+            (
+                "a turn's first group falls back to the placeholder",
+                vec![round("---")],
+                1,
+                true,
+                Some(&["<blank>"]),
+                None,
             ),
-            ChatMessage::user("now the rest\n\n<timestamp>2026-01-01 00:00:01 (UTC)</timestamp>"),
-            assistant_tool_call_reasoning(
-                "",
-                &[("list", serde_json::json!({"path": "."}))],
-                Some("The same line here."),
+            (
+                "a held line is not shown twice in the previous group's list",
+                vec![thinking("", CHECKED), round("---")],
+                2,
+                false,
+                Some(&[CHECKED]),
+                Some(&["<blank>", CHECKED]),
+            ),
+            (
+                "a repeated line is dropped even when older groups sit between",
+                vec![
+                    thinking("", "The same line here."),
+                    user_turn("go on"),
+                    round("Something else."),
+                    user_turn("now the rest"),
+                    thinking("", "The same line here."),
+                ],
+                3,
+                false,
+                None,
+                Some(&["<blank>", "Something else.", "The same line here."]),
+            ),
+            (
+                "a textless previous group renders no line rather than a placeholder",
+                vec![round("---"), round("Now editing.")],
+                2,
+                false,
+                None,
+                Some(&["<blank>", "Now editing."]),
             ),
         ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 3);
-        assert_eq!(
-            shown_lines(&groups, true),
-            vec!["<blank>", "Something else.", "The same line here."],
-            "one phrase never appears twice on the card"
-        );
-    }
 
-    #[test]
-    fn a_textless_previous_group_renders_no_line_rather_than_a_placeholder() {
-        // Only the current group holds an earlier line; an older group with no
-        // text of its own shows no line row, and never a second punctuation.
-        let history = vec![
-            assistant_tool_call("---", &[("read", serde_json::json!({"path": "a.rs"}))]),
-            assistant_tool_call(
-                "Now editing.",
-                &[("edit", serde_json::json!({"path": "b.rs"}))],
-            ),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(
-            shown_lines(&groups, true),
-            vec!["<blank>", "Now editing."],
-            "a textless previous group has nothing to show"
-        );
+        for (name, history, count, textless, collapsed, expanded) in cases {
+            let ledger = build_ledger(history);
+            let groups = derive_trace_groups(&ledger);
+            assert_eq!(groups.len(), *count, "case {name}: group count");
+            if *textless {
+                assert!(
+                    group_line(&groups[groups.len() - 1]).is_none(),
+                    "case {name}: the new group has no text"
+                );
+            }
+            if let Some(collapsed) = collapsed {
+                assert_eq!(
+                    shown_lines(&groups, false),
+                    *collapsed,
+                    "case {name}: collapsed"
+                );
+            }
+            if let Some(expanded) = expanded {
+                assert_eq!(
+                    shown_lines(&groups, true),
+                    *expanded,
+                    "case {name}: expanded"
+                );
+            }
+        }
     }
 
     #[test]
     fn prune_expanded_drops_stale_keys() {
         let mut expanded: HashSet<(String, u64)> =
             HashSet::from([("a".to_string(), 0), ("b".to_string(), 2)]);
-        let agents = vec![agent_handle("a", "analyst", None, "ws1", None)];
+        let agents = vec![agent("a", "analyst", "ws1", "")];
         prune_expanded(&mut expanded, &agents);
         assert_eq!(expanded.len(), 1);
         assert!(

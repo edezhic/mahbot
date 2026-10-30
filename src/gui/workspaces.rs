@@ -542,19 +542,23 @@ mod tests {
         state
     }
 
+    /// `ShowDiagnostics` parses the stored blob: unparsable content surfaces an
+    /// error, an absent or blank blob reads as empty.
     #[test]
-    fn show_diagnostics_surfaces_unparsable_blob() {
-        let mut state = state_with_diagnostics(Some("{not json".to_string()));
-        let _ = state.update(WorkspacesMessage::ShowDiagnostics("ws".to_string()));
-        assert!(state.diagnostics_error.is_some());
-    }
-
-    #[test]
-    fn show_diagnostics_treats_absent_or_empty_blob_as_empty() {
-        for diagnostics in [None, Some(String::new()), Some("  ".to_string())] {
-            let mut state = state_with_diagnostics(diagnostics);
+    fn show_diagnostics_reads_the_stored_blob() {
+        for (blob, expect_error) in [
+            (None, false),
+            (Some(String::new()), false),
+            (Some("  ".to_string()), false),
+            (Some("{not json".to_string()), true),
+        ] {
+            let mut state = state_with_diagnostics(blob.clone());
             let _ = state.update(WorkspacesMessage::ShowDiagnostics("ws".to_string()));
-            assert!(state.diagnostics_error.is_none());
+            assert_eq!(
+                state.diagnostics_error.is_some(),
+                expect_error,
+                "blob: {blob:?}"
+            );
         }
     }
 

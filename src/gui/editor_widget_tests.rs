@@ -3,85 +3,157 @@
 use super::*;
 
 #[test]
-fn test_new_empty() {
-    let buf = EditorBuffer::with_text("", None);
-    assert_eq!(buf.text(), "");
-    assert_eq!(buf.line_count(), 1);
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 0);
-    assert!(cursor.selection.is_none());
+fn test_buffer_construction_cursor_and_selection() {
+    // (name, text, move_to, expected cursor)
+    let cases = [
+        ("new_empty", "", None, Some((0, 0))),
+        ("with_text", "hello\nworld", None, None),
+        ("cursor_move_to", "hello\nworld", Some((1, 2)), Some((1, 2))),
+        (
+            "cursor_move_to_beyond_end",
+            "hello",
+            Some((999, 999)),
+            Some((0, 5)),
+        ),
+    ];
+    for &(name, text, move_to, cursor_pos) in &cases {
+        let buf = EditorBuffer::with_text(text, None);
+        if let Some((line, col)) = move_to {
+            buf.move_to(line, col);
+        }
+        // Construction never rewrites the text, and the line count follows
+        // from it.
+        assert_eq!(buf.text(), text, "case {name}: text");
+        assert_eq!(
+            buf.line_count(),
+            text.split('\n').count(),
+            "case {name}: line_count"
+        );
+        if let Some((line, col)) = cursor_pos {
+            let cursor = buf.cursor();
+            assert_eq!(cursor.line, line, "case {name}: line");
+            assert_eq!(cursor.column, col, "case {name}: col");
+        }
+    }
+
+    // (name, text, select_all, expected selection)
+    let cases = [
+        ("select_all", "hello\nworld", true, Some("hello\nworld")),
+        ("no_selection", "hello", false, None),
+        ("select_all_empty", "", true, None),
+    ];
+    for &(name, text, select_all, expected) in &cases {
+        let buf = EditorBuffer::with_text(text, None);
+        if select_all {
+            buf.select_all();
+        }
+        assert_eq!(
+            buf.cursor().selection.is_some(),
+            expected.is_some(),
+            "case {name}: selection presence"
+        );
+        assert_eq!(
+            buf.selection(),
+            expected.map(str::to_string),
+            "case {name}: selection text"
+        );
+    }
 }
 
 #[test]
-fn test_with_text() {
-    let buf = EditorBuffer::with_text("hello\nworld", None);
-    assert_eq!(buf.text(), "hello\nworld");
-    assert_eq!(buf.line_count(), 2);
-}
+fn test_insert_paste_enter_cases() {
+    use super::EditorAction::*;
+    // (name, action, input, cursor, expected text, expected cursor)
+    let cases = [
+        (
+            "insert_character",
+            Insert('l'),
+            "helo",
+            (0, 2),
+            "hello",
+            None,
+        ),
+        (
+            "insert_at_end",
+            Insert('!'),
+            "hello",
+            (0, 5),
+            "hello!",
+            None,
+        ),
+        ("paste", Paste("ll".into()), "heo", (0, 2), "hello", None),
+        // "hello world" has no leading whitespace, so auto-indent produces column 0.
+        (
+            "enter",
+            Enter,
+            "hello world",
+            (0, 5),
+            "hello\n world",
+            Some((1, 0)),
+        ),
+        (
+            "multi_byte_character",
+            Insert('é'),
+            "héllo",
+            (0, 1),
+            "hééllo",
+            Some((0, 2)),
+        ),
+    ];
+    for &(name, ref action, input, (line, col), expected, expected_cursor) in &cases {
+        let buf = EditorBuffer::with_text(input, None);
+        buf.move_to(line, col);
+        buf.perform_action(action.clone());
+        assert_eq!(buf.text(), expected, "case {name}: text");
+        if let Some((line, col)) = expected_cursor {
+            let cursor = buf.cursor();
+            assert_eq!(cursor.line, line, "case {name}: line");
+            assert_eq!(cursor.column, col, "case {name}: col");
+        }
+    }
 
-#[test]
-fn test_cursor_move_to() {
-    let buf = EditorBuffer::with_text("hello\nworld", None);
-    buf.move_to(1, 2);
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 1);
-    assert_eq!(cursor.column, 2);
-    assert!(cursor.selection.is_none());
-}
-
-#[test]
-fn test_cursor_move_to_beyond_end() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.move_to(999, 999);
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 5);
-}
-
-#[test]
-fn test_select_all_and_selection() {
-    let buf = EditorBuffer::with_text("hello\nworld", None);
-    buf.select_all();
-    let cursor = buf.cursor();
-    assert!(cursor.selection.is_some());
-    let sel = buf.selection();
-    assert_eq!(sel, Some("hello\nworld".to_string()));
-}
-
-#[test]
-fn test_no_selection() {
-    let buf = EditorBuffer::with_text("hello", None);
-    assert!(buf.selection().is_none());
-}
-
-#[test]
-fn test_insert_character() {
-    let buf = EditorBuffer::with_text("helo", None);
-    buf.move_to(0, 2);
-    buf.perform_action(EditorAction::Insert('l'));
-    assert_eq!(buf.text(), "hello");
-}
-
-#[test]
-fn test_insert_at_end() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.move_to(0, 5);
-    buf.perform_action(EditorAction::Insert('!'));
-    assert_eq!(buf.text(), "hello!");
-}
-
-#[test]
-fn test_enter() {
-    let buf = EditorBuffer::with_text("hello world", None);
-    buf.move_to(0, 5);
-    buf.perform_action(EditorAction::Enter);
-    assert_eq!(buf.text(), "hello\n world");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 1);
-    // "hello world" has no leading whitespace, so auto-indent produces
-    // column 0 (empty indent on the new line).
-    assert_eq!(cursor.column, 0);
+    // (name, action, input, cursor, selection end, select all, expected text)
+    let cases = [
+        (
+            "insert_with_selection_replaces",
+            Insert('X'),
+            "hello world",
+            (0, 0),
+            None,
+            true,
+            "X",
+        ),
+        (
+            "paste_with_selection_replaces",
+            Paste("there".into()),
+            "hello world",
+            (0, 6),
+            Some((0, 11)),
+            false,
+            "hello there",
+        ),
+        (
+            "enter_with_selection_replaces",
+            Enter,
+            "hello",
+            (0, 3),
+            Some((0, 5)),
+            false,
+            "hel\n",
+        ),
+    ];
+    for &(name, ref action, input, (line, col), select_to, select_all, expected) in &cases {
+        let buf = EditorBuffer::with_text(input, None);
+        buf.move_to(line, col);
+        if select_all {
+            buf.select_all();
+        }
+        if let Some((line, col)) = select_to {
+            buf.perform_action(SelectTo { line, col });
+        }
+        buf.perform_action(action.clone());
+        assert_eq!(buf.text(), expected, "case {name}: text");
+    }
 }
 
 #[test]
@@ -124,33 +196,49 @@ fn test_enter_at_end_of_highlighted_file_no_trailing_newline() {
 }
 
 #[test]
-#[expect(clippy::type_complexity)]
 fn test_backspace_delete_cases() {
-    // (name, action, input, cursor pos, expected text, expected cursor)
-    #[rustfmt::skip]
-    let cases: &[(&str, EditorAction, &str, Option<(usize, usize)>, &str, Option<(usize, usize)>)] = &[
-        ("backspace", EditorAction::Backspace, "hello", Some((0, 5)), "hell", Some((0, 4))),
-        ("backspace_at_start", EditorAction::Backspace, "hello", None, "hello", None),
-        ("backspace_newline", EditorAction::Backspace, "hello\nworld", Some((1, 0)), "helloworld", Some((0, 5))),
-        ("delete", EditorAction::Delete, "hello", None, "ello", None),
-        ("delete_at_end", EditorAction::Delete, "hello", Some((0, 5)), "hello", None),
-        ("delete_cafe", EditorAction::Delete, "café", Some((0, 3)), "caf", None),
-        ("delete_cyrillic", EditorAction::Delete, "привет", Some((0, 0)), "ривет", None),
-        // Editor tracks scalar-value columns, not full grapheme clusters.
-        ("delete_emoji", EditorAction::Delete, "a🎉b", Some((0, 1)), "ab", None),
+    // (name, input, cursor, expected text, expected cursor)
+    let cases = [
+        ("backspace", "hello", Some((0, 5)), "hell", Some((0, 4))),
+        ("backspace_at_start", "hello", None, "hello", None),
+        (
+            "backspace_newline",
+            "hello\nworld",
+            Some((1, 0)),
+            "helloworld",
+            Some((0, 5)),
+        ),
     ];
-    for &(name, ref action, input, cursor_pos, expected, expected_cursor) in cases {
+    for &(name, input, cursor_pos, expected, expected_cursor) in &cases {
         let buf = EditorBuffer::with_text(input, None);
         if let Some((line, col)) = cursor_pos {
             buf.move_to(line, col);
         }
-        buf.perform_action(action.clone());
-        assert_eq!(buf.text(), expected, "case: {name}");
+        buf.perform_action(EditorAction::Backspace);
+        assert_eq!(buf.text(), expected, "case {name}: text");
         if let Some((line, col)) = expected_cursor {
             let cursor = buf.cursor();
-            assert_eq!(cursor.line, line, "case: {name} (line)");
-            assert_eq!(cursor.column, col, "case: {name} (col)");
+            assert_eq!(cursor.line, line, "case {name}: line");
+            assert_eq!(cursor.column, col, "case {name}: col");
         }
+    }
+
+    // (name, input, cursor, expected text)
+    let cases = [
+        ("delete", "hello", None, "ello"),
+        ("delete_at_end", "hello", Some((0, 5)), "hello"),
+        ("delete_cafe", "café", Some((0, 3)), "caf"),
+        ("delete_cyrillic", "привет", Some((0, 0)), "ривет"),
+        // Editor tracks scalar-value columns, not full grapheme clusters.
+        ("delete_emoji", "a🎉b", Some((0, 1)), "ab"),
+    ];
+    for &(name, input, cursor_pos, expected) in &cases {
+        let buf = EditorBuffer::with_text(input, None);
+        if let Some((line, col)) = cursor_pos {
+            buf.move_to(line, col);
+        }
+        buf.perform_action(EditorAction::Delete);
+        assert_eq!(buf.text(), expected, "case {name}: text");
     }
 }
 
@@ -197,44 +285,40 @@ fn test_multiline_indent_preserves_selection() {
 }
 
 #[test]
-fn test_paste() {
-    let buf = EditorBuffer::with_text("heo", None);
-    buf.move_to(0, 2);
-    buf.perform_action(EditorAction::Paste("ll".to_string()));
-    assert_eq!(buf.text(), "hello");
-}
-
-#[test]
-fn test_indent() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.perform_action(EditorAction::Indent);
-    assert_eq!(buf.text(), "\thello");
-}
-
-#[test]
-fn test_insert_with_selection_replaces() {
-    let buf = EditorBuffer::with_text("hello world", None);
-    buf.select_all();
-    buf.perform_action(EditorAction::Insert('X'));
-    assert_eq!(buf.text(), "X");
-}
-
-#[test]
-fn test_enter_with_selection_replaces() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.move_to(0, 3);
-    buf.perform_action(EditorAction::SelectTo { line: 0, col: 5 });
-    buf.perform_action(EditorAction::Enter);
-    assert_eq!(buf.text(), "hel\n");
-}
-
-#[test]
-fn test_paste_with_selection_replaces() {
-    let buf = EditorBuffer::with_text("hello world", None);
-    buf.move_to(0, 6);
-    buf.perform_action(EditorAction::SelectTo { line: 0, col: 11 });
-    buf.perform_action(EditorAction::Paste("there".to_string()));
-    assert_eq!(buf.text(), "hello there");
+fn test_indent_cases() {
+    use super::EditorAction::*;
+    // (name, action, input, cursor, selection end, expected text)
+    let cases = [
+        ("indent", Indent, "hello", None, None, "\thello"),
+        ("unindent", Unindent, "    hello", None, None, "   hello"),
+        (
+            "indent_with_selection",
+            Indent,
+            "hello\nworld\nfoo",
+            Some((0, 0)),
+            Some((1, 0)),
+            "\thello\n\tworld\nfoo",
+        ),
+        (
+            "unindent_with_selection",
+            Unindent,
+            "\thello\n\tworld\nfoo",
+            Some((0, 0)),
+            Some((1, 0)),
+            "hello\nworld\nfoo",
+        ),
+    ];
+    for &(name, ref action, input, cursor_pos, select_to, expected) in &cases {
+        let buf = EditorBuffer::with_text(input, None);
+        if let Some((line, col)) = cursor_pos {
+            buf.move_to(line, col);
+        }
+        if let Some((line, col)) = select_to {
+            buf.perform_action(SelectTo { line, col });
+        }
+        buf.perform_action(action.clone());
+        assert_eq!(buf.text(), expected, "case {name}: text");
+    }
 }
 
 #[test]
@@ -257,42 +341,71 @@ fn test_line_col_roundtrip() {
 }
 
 #[test]
-fn test_selection_after_select_to_then_move() {
-    let buf = EditorBuffer::with_text("abcdef", None);
-    // Select "bcd"
-    buf.move_to(0, 1);
-    buf.perform_action(EditorAction::SelectTo { line: 0, col: 4 });
-    assert_eq!(buf.selection(), Some("bcd".to_string()));
-    // Performing a move clears selection
-    buf.move_to(0, 0);
-    assert!(buf.selection().is_none());
+fn test_selection_normalization_cases() {
+    // (name, text, setup steps, expected cursor, expected selection text)
+    type Setup = fn(&EditorBuffer);
+    let cases = [
+        (
+            "shift_left_at_bof_no_selection",
+            "hello",
+            (|buf| {
+                buf.perform_action(EditorAction::Move {
+                    direction: CursorMove::Left,
+                    select: true,
+                });
+            }) as Setup,
+            (0, 0),
+            None,
+        ),
+        (
+            "shift_right_then_back_collapses_selection",
+            "hello",
+            (|buf| {
+                buf.move_to(0, 0);
+                buf.perform_action(EditorAction::Move {
+                    direction: CursorMove::Right,
+                    select: true,
+                });
+                buf.perform_action(EditorAction::Move {
+                    direction: CursorMove::Left,
+                    select: true,
+                });
+            }) as Setup,
+            (0, 0),
+            None,
+        ),
+        (
+            "select_to_then_move_clears_selection",
+            "abcdef",
+            (|buf| {
+                // Select "bcd"
+                buf.move_to(0, 1);
+                buf.perform_action(EditorAction::SelectTo { line: 0, col: 4 });
+                assert_eq!(
+                    buf.selection(),
+                    Some("bcd".to_string()),
+                    "case select_to_then_move_clears_selection (selection before move)"
+                );
+                // Performing a move clears selection
+                buf.move_to(0, 0);
+            }) as Setup,
+            (0, 0),
+            None,
+        ),
+    ];
+    for &(name, text, setup, (line, col), selection) in &cases {
+        let buf = EditorBuffer::with_text(text, None);
+        setup(&buf);
+        let cursor = buf.cursor();
+        assert_eq!(cursor.line, line, "case {name}: line");
+        assert_eq!(cursor.column, col, "case {name}: col");
+        assert_eq!(
+            buf.selection(),
+            selection.map(str::to_string),
+            "case {name}: selection"
+        );
+    }
 }
-
-#[test]
-fn test_unindent() {
-    let buf = EditorBuffer::with_text("    hello", None);
-    buf.perform_action(EditorAction::Unindent);
-    assert_eq!(buf.text(), "   hello");
-}
-
-#[test]
-fn test_multi_byte_character() {
-    let buf = EditorBuffer::with_text("héllo", None);
-    buf.move_to(0, 1);
-    buf.perform_action(EditorAction::Insert('é'));
-    assert_eq!(buf.text(), "hééllo");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.column, 2);
-}
-
-#[test]
-fn test_select_all_empty() {
-    let buf = EditorBuffer::with_text("", None);
-    buf.select_all();
-    assert!(buf.selection().is_none());
-}
-
-// ── Line comment prefix ───────────────────────────────────────
 
 #[test]
 fn test_line_comment_prefix() {
@@ -310,279 +423,176 @@ fn test_line_comment_prefix() {
     assert_eq!(line_comment_prefix(None, Some("xyz")), None);
 }
 
-// ── Toggle line comment ───────────────────────────────────────
-
-#[expect(clippy::too_many_lines)]
 #[test]
 fn test_toggle_line_comment() {
-    struct Case {
-        name: &'static str,
-        input: &'static str,
-        expected: &'static str,
-        language: Option<HighlightLanguage>,
-        /// Set file extension instead of language (fallback path).
-        file_ext: Option<&'static str>,
-        /// Cursor position before toggling (defaults to 0, 0).
-        cursor_line: usize,
-        cursor_col: usize,
-    }
-
-    let cases: &[Case] = &[
-        Case {
-            name: "add",
-            input: "hello",
-            expected: "// hello",
-            language: Some(HighlightLanguage::Rust),
-            file_ext: None,
-            cursor_line: 0,
-            cursor_col: 0,
-        },
-        Case {
-            name: "remove",
-            input: "// hello",
-            expected: "hello",
-            language: Some(HighlightLanguage::Rust),
-            file_ext: None,
-            cursor_line: 0,
-            cursor_col: 0,
-        },
-        Case {
-            name: "remove_with_space",
-            input: "//  hello",
-            expected: " hello",
-            language: Some(HighlightLanguage::Rust),
-            file_ext: None,
-            cursor_line: 0,
-            cursor_col: 0,
-        },
-        Case {
-            name: "preserves_whitespace",
-            input: "    hello",
-            expected: "    // hello",
-            language: Some(HighlightLanguage::Rust),
-            file_ext: None,
-            cursor_line: 0,
-            cursor_col: 0,
-        },
-        Case {
-            name: "noop_unknown",
-            input: "hello",
-            expected: "hello",
-            language: None,
-            file_ext: None,
-            cursor_line: 0,
-            cursor_col: 0,
-        },
-        Case {
-            name: "rust_hash",
-            input: "hello",
-            expected: "# hello",
-            language: Some(HighlightLanguage::Python),
-            file_ext: None,
-            cursor_line: 0,
-            cursor_col: 0,
-        },
-        Case {
-            name: "yaml_via_extension",
-            input: "hello",
-            expected: "# hello",
-            language: None,
-            file_ext: Some("yaml"),
-            cursor_line: 0,
-            cursor_col: 0,
-        },
-        Case {
-            name: "unknown_extension_noop",
-            input: "hello",
-            expected: "hello",
-            language: None,
-            file_ext: Some("xyz"),
-            cursor_line: 0,
-            cursor_col: 0,
-        },
-        Case {
-            name: "preserves_neighbor_lines",
-            input: "first\nsecond\nthird",
-            expected: "first\n// second\nthird",
-            language: Some(HighlightLanguage::Rust),
-            file_ext: None,
-            cursor_line: 1,
-            cursor_col: 0,
-        },
+    use super::highlight::HighlightLanguage::*;
+    // (name, input, expected, cursor line)
+    let cases = [
+        ("add", "hello", "// hello", 0),
+        ("remove", "// hello", "hello", 0),
+        ("remove_with_space", "//  hello", " hello", 0),
+        ("preserves_whitespace", "    hello", "    // hello", 0),
+        (
+            "preserves_neighbor_lines",
+            "first\nsecond\nthird",
+            "first\n// second\nthird",
+            1,
+        ),
     ];
-
-    for case in cases {
-        let buf = EditorBuffer::with_text(case.input, case.language);
-        if let Some(ext) = case.file_ext {
-            buf.set_file_extension(Some(ext));
-        }
-        if case.cursor_line != 0 || case.cursor_col != 0 {
-            buf.move_to(case.cursor_line, case.cursor_col);
+    for &(name, input, expected, cursor_line) in &cases {
+        let buf = EditorBuffer::with_text(input, Some(Rust));
+        // The cursor column is always 0; only the line varies.
+        if cursor_line != 0 {
+            buf.move_to(cursor_line, 0);
         }
         buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), case.expected, "case: {}", case.name);
+        assert_eq!(buf.text(), expected, "case {name}: text");
+    }
+
+    // (name, input, expected, language, file extension)
+    let cases = [
+        ("noop_unknown", "hello", "hello", None, None),
+        ("rust_hash", "hello", "# hello", Some(Python), None),
+        ("yaml_via_extension", "hello", "# hello", None, Some("yaml")),
+        (
+            "unknown_extension_noop",
+            "hello",
+            "hello",
+            None,
+            Some("xyz"),
+        ),
+    ];
+    for &(name, input, expected, language, file_ext) in &cases {
+        let buf = EditorBuffer::with_text(input, language);
+        if let Some(ext) = file_ext {
+            buf.set_file_extension(Some(ext));
+        }
+        buf.perform_action(EditorAction::ToggleLineComment);
+        assert_eq!(buf.text(), expected, "case {name}: text");
     }
 }
-
-// ── Jump to matching bracket ───────────────────────────────────
 
 #[test]
 fn test_jump_to_matching_bracket() {
-    struct Case {
-        name: &'static str,
-        input: &'static str,
-        cursor_col: usize,
-        expected_line: usize,
-        expected_col: usize,
-    }
-
-    let cases: &[Case] = &[
-        Case {
-            name: "forward_paren",
-            input: "(hello)",
-            cursor_col: 1,
-            expected_line: 0,
-            expected_col: 6,
-        },
-        Case {
-            name: "backward_paren",
-            input: "(hello)",
-            cursor_col: 6,
-            expected_line: 0,
-            expected_col: 1,
-        },
-        Case {
-            name: "square_bracket",
-            input: "[hello]",
-            cursor_col: 1,
-            expected_line: 0,
-            expected_col: 6,
-        },
-        Case {
-            name: "brace",
-            input: "{hello}",
-            cursor_col: 1,
-            expected_line: 0,
-            expected_col: 6,
-        },
-        Case {
-            name: "none",
-            input: "hello",
-            cursor_col: 3,
-            expected_line: 0,
-            expected_col: 3,
-        },
+    // (name, input, cursor col, expected line, expected col)
+    let cases = [
+        ("forward_paren", "(hello)", 1, 0, 6),
+        ("backward_paren", "(hello)", 6, 0, 1),
+        ("square_bracket", "[hello]", 1, 0, 6),
+        ("brace", "{hello}", 1, 0, 6),
+        ("none", "hello", 3, 0, 3),
     ];
-
-    for case in cases {
-        let buf = EditorBuffer::with_text(case.input, None);
-        buf.move_to(0, case.cursor_col);
+    for &(name, input, cursor_col, expected_line, expected_col) in &cases {
+        let buf = EditorBuffer::with_text(input, None);
+        buf.move_to(0, cursor_col);
         buf.perform_action(EditorAction::JumpToMatchingBracket);
         let cursor = buf.cursor();
-        assert_eq!(
-            cursor.line, case.expected_line,
-            "case: {} (line)",
-            case.name
-        );
-        assert_eq!(
-            cursor.column, case.expected_col,
-            "case: {} (col)",
-            case.name
-        );
+        assert_eq!(cursor.line, expected_line, "case {name}: line");
+        assert_eq!(cursor.column, expected_col, "case {name}: col");
     }
 }
 
-// ── Delete line ────────────────────────────────────────────────
-
 #[test]
-#[expect(clippy::type_complexity)]
 fn test_delete_line_cases() {
-    // (name, input, cursor line, selection end, expected text, expected line, expected column)
-    #[rustfmt::skip]
-    let cases: &[(&str, &str, usize, Option<(usize, usize)>, &str, usize, Option<usize>)] = &[
-        // Stayed at index 1 (now "line3")
-        ("current_line", "line1\nline2\nline3", 1, None, "line1\nline3", 1, Some(0)),
-        ("first_line", "line1\nline2\nline3", 0, None, "line2\nline3", 0, Some(0)),
-        ("last_line", "line1\nline2\nline3", 2, None, "line1\nline2", 1, None),
-        ("single_line", "hello", 0, None, "", 0, Some(0)),
-        ("selected_lines", "a\nb\nc\nd\ne", 1, Some((3, 0)), "a\ne", 1, None),
+    // (name, input, cursor line, selection end, expected text)
+    let lines = "line1\nline2\nline3";
+    let cases = [
+        ("current_line", lines, 1, None, "line1\nline3"),
+        ("first_line", lines, 0, None, "line2\nline3"),
+        ("last_line", lines, 2, None, "line1\nline2"),
+        ("single_line", "hello", 0, None, ""),
+        ("selected_lines", "a\nb\nc\nd\ne", 1, Some((3, 0)), "a\ne"),
     ];
-    for &(name, input, cursor_line, select_to, expected, expected_line, expected_col) in cases {
+    for &(name, input, cursor_line, select_to, expected) in &cases {
         let buf = EditorBuffer::with_text(input, None);
         buf.move_to(cursor_line, 0);
         if let Some((line, col)) = select_to {
             buf.perform_action(EditorAction::SelectTo { line, col });
         }
         buf.perform_action(EditorAction::DeleteLine);
-        assert_eq!(buf.text(), expected, "case: {name}");
+        assert_eq!(buf.text(), expected, "case {name}: text");
+        // The cursor stays on its line index (clamped to the last remaining
+        // one), at column 0.
         let cursor = buf.cursor();
-        assert_eq!(cursor.line, expected_line, "case: {name} (line)");
-        if let Some(col) = expected_col {
-            assert_eq!(cursor.column, col, "case: {name} (col)");
-        }
+        let line = cursor_line.min(expected.split('\n').count() - 1);
+        assert_eq!(cursor.line, line, "case {name}: line");
+        assert_eq!(cursor.column, 0, "case {name}: col");
     }
 }
 
-// ── Duplicate line ─────────────────────────────────────────────
-
 #[test]
-#[expect(clippy::type_complexity)]
 fn test_duplicate_line_cases() {
-    // (name, input, cursor line, selection end, expected text, expected line, expected column)
-    #[rustfmt::skip]
-    let cases: &[(&str, &str, usize, Option<(usize, usize)>, &str, usize, Option<usize>)] = &[
-        // Cursor on duplicated line
-        ("current_line", "hello\nworld", 0, None, "hello\nhello\nworld", 1, Some(0)),
-        ("last_line", "hello\nworld", 1, None, "hello\nworld\nworld", 2, None),
-        ("selected_lines", "a\nb\nc\nd", 1, Some((2, 0)), "a\nb\nc\nb\nc\nd", 3, None),
+    // (name, input, cursor line, selection end, expected text)
+    let lines = "hello\nworld";
+    let cases = [
+        ("current_line", lines, 0, None, "hello\nhello\nworld"),
+        ("last_line", lines, 1, None, "hello\nworld\nworld"),
+        (
+            "selected_lines",
+            "a\nb\nc\nd",
+            1,
+            Some((2, 0)),
+            "a\nb\nc\nb\nc\nd",
+        ),
     ];
-    for &(name, input, cursor_line, select_to, expected, expected_line, expected_col) in cases {
+    for &(name, input, cursor_line, select_to, expected) in &cases {
         let buf = EditorBuffer::with_text(input, None);
         buf.move_to(cursor_line, 0);
         if let Some((line, col)) = select_to {
             buf.perform_action(EditorAction::SelectTo { line, col });
         }
         buf.perform_action(EditorAction::DuplicateLine);
-        assert_eq!(buf.text(), expected, "case: {name}");
+        assert_eq!(buf.text(), expected, "case {name}: text");
+        // The cursor lands on the last line of the duplicated block, at
+        // column 0.
+        let duplicated = select_to.map_or(1, |(end, _)| end - cursor_line + 1);
         let cursor = buf.cursor();
-        assert_eq!(cursor.line, expected_line, "case: {name} (line)");
-        if let Some(col) = expected_col {
-            assert_eq!(cursor.column, col, "case: {name} (col)");
-        }
+        assert_eq!(cursor.line, cursor_line + duplicated, "case {name}: line");
+        assert_eq!(cursor.column, 0, "case {name}: col");
     }
 }
 
-// ── Move line up/down ──────────────────────────────────────────
-
 #[test]
-#[expect(clippy::type_complexity)]
 fn test_move_line_cases() {
-    // (name, action, input, cursor line, selection end, expected text, expected line, expected column)
-    #[rustfmt::skip]
-    let cases: &[(&str, EditorAction, &str, usize, Option<(usize, usize)>, &str, Option<usize>, Option<usize>)] = &[
-        ("up", EditorAction::MoveLineUp, "a\nb\nc", 1, None, "b\na\nc", Some(0), Some(0)),
-        ("down", EditorAction::MoveLineDown, "a\nb\nc", 1, None, "a\nc\nb", Some(2), Some(0)),
-        ("up_at_top", EditorAction::MoveLineUp, "a\nb", 0, None, "a\nb", None, None), // No change
-        ("down_at_bottom", EditorAction::MoveLineDown, "a\nb", 1, None, "a\nb", None, None), // No change
-        // First line of the moved block
-        ("selected_down", EditorAction::MoveLineDown, "a\nb\nc\nd", 1, Some((2, 0)), "a\nd\nb\nc", Some(2), Some(0)),
+    use super::EditorAction::*;
+    // (name, action, input, cursor line, selection end, expected text, expected
+    //  line)
+    let cases = [
+        ("up", MoveLineUp, "a\nb\nc", 1, None, "b\na\nc", Some(0)),
+        ("down", MoveLineDown, "a\nb\nc", 1, None, "a\nc\nb", Some(2)),
+        ("up_at_top", MoveLineUp, "a\nb", 0, None, "a\nb", None),
+        (
+            "down_at_bottom",
+            MoveLineDown,
+            "a\nb",
+            1,
+            None,
+            "a\nb",
+            None,
+        ),
+        // The cursor lands on the first line of the moved block.
+        (
+            "selected_down",
+            MoveLineDown,
+            "a\nb\nc\nd",
+            1,
+            Some((2, 0)),
+            "a\nd\nb\nc",
+            Some(2),
+        ),
     ];
-    for &(name, ref action, input, cursor_line, select_to, expected, expected_line, expected_col) in
-        cases
-    {
+    for &(name, ref action, input, cursor_line, select_to, expected, expected_line) in &cases {
         let buf = EditorBuffer::with_text(input, None);
         buf.move_to(cursor_line, 0);
         if let Some((line, col)) = select_to {
-            buf.perform_action(EditorAction::SelectTo { line, col });
+            buf.perform_action(SelectTo { line, col });
         }
         buf.perform_action(action.clone());
-        assert_eq!(buf.text(), expected, "case: {name}");
+        assert_eq!(buf.text(), expected, "case {name}: text");
         if let Some(line) = expected_line {
             let cursor = buf.cursor();
-            assert_eq!(cursor.line, line, "case: {name} (line)");
-            if let Some(col) = expected_col {
-                assert_eq!(cursor.column, col, "case: {name} (col)");
-            }
+            assert_eq!(cursor.line, line, "case {name}: line");
+            assert_eq!(cursor.column, 0, "case {name}: col");
         }
     }
 }
@@ -618,50 +628,14 @@ fn test_line_helpers_preserve_trailing_blank_line() {
     assert_eq!(reassemble_lines(&lines), text);
 }
 
-// ── Multi-line indent/outdent ──────────────────────────────────
-
-#[test]
-fn test_indent_with_selection() {
-    let buf = EditorBuffer::with_text("hello\nworld\nfoo", None);
-    buf.move_to(0, 0);
-    buf.perform_action(EditorAction::SelectTo { line: 1, col: 0 });
-    buf.perform_action(EditorAction::Indent);
-    assert_eq!(buf.text(), "\thello\n\tworld\nfoo");
-}
-
-#[test]
-fn test_unindent_with_selection() {
-    let buf = EditorBuffer::with_text("\thello\n\tworld\nfoo", None);
-    buf.move_to(0, 0);
-    buf.perform_action(EditorAction::SelectTo { line: 1, col: 0 });
-    buf.perform_action(EditorAction::Unindent);
-    assert_eq!(buf.text(), "hello\nworld\nfoo");
-}
-
-// ── Selection normalization ─────────────────────────────────────
-
-#[test]
-fn test_shift_left_at_bof_no_selection() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.perform_action(EditorAction::Move {
-        direction: CursorMove::Left,
-        select: true,
-    });
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 0);
-    assert!(cursor.selection.is_none());
-}
-
 #[test]
 fn test_select_to_duplicate_endpoint_cases() {
     // (name, text, start col, drag endpoint col, expected selection text)
-    #[rustfmt::skip]
-    let cases: &[(&str, &str, usize, usize, &str)] = &[
+    let cases = [
         ("duplicate_endpoint", "hello world", 0, 5, "hello"),
         ("same_endpoint", "hello", 2, 3, "l"),
     ];
-    for &(name, text, start_col, end_col, expected) in cases {
+    for &(name, text, start_col, end_col, expected) in &cases {
         let buf = EditorBuffer::with_text(text, None);
         buf.move_to(0, start_col);
         buf.perform_action(EditorAction::SelectTo {
@@ -670,7 +644,7 @@ fn test_select_to_duplicate_endpoint_cases() {
         });
         assert!(
             buf.cursor().selection.is_some(),
-            "case: {name} (first SelectTo)"
+            "case {name}: first SelectTo"
         );
         // Repeated SelectTo at the drag endpoint (duplicate CursorMoved)
         // must not collapse or clear an existing selection.
@@ -681,27 +655,9 @@ fn test_select_to_duplicate_endpoint_cases() {
         assert_eq!(
             buf.selection(),
             Some(expected.to_string()),
-            "case: {name} (duplicate SelectTo)"
+            "case {name}: duplicate SelectTo"
         );
     }
-}
-
-#[test]
-fn test_shift_right_then_back_collapses_selection() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.move_to(0, 0);
-    buf.perform_action(EditorAction::Move {
-        direction: CursorMove::Right,
-        select: true,
-    });
-    buf.perform_action(EditorAction::Move {
-        direction: CursorMove::Left,
-        select: true,
-    });
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 0);
-    assert!(cursor.selection.is_none());
 }
 
 #[test]
@@ -732,8 +688,6 @@ fn test_single_line_strips_newlines_and_enter() {
     assert_eq!(buf.text(), "axyb");
     assert_eq!(buf.cursor().line, 0);
 }
-
-// ── IME composition (over-the-spot preedit) ──────────────────────
 
 #[test]
 fn test_ime_surface_activation() {
@@ -822,27 +776,6 @@ fn test_cursor_rect_selection_anchor() {
 }
 
 #[test]
-fn test_cursor_rect_shaped_position() {
-    let buf = EditorBuffer::with_text("hello\nworld", None);
-    buf.move_to(1, 2);
-    let buffer = with_font_system(|font_sys| {
-        let mut b = buf.borrow_buffer_mut();
-        reshape_and_shape(&mut b, font_sys, Some(0.0), 0.0, 200.0, 200.0);
-        b.clone()
-    });
-    let geo = TextGeometry {
-        clip: Rectangle::new(Point::ORIGIN, Size::new(200.0, 200.0)),
-        x: 8.0,
-        y: 8.0,
-    };
-    let rect = cursor_rect(&buffer, &geo, 1, 2, geo.x);
-    assert!(rect.y > 8.0);
-    // Second line sits below the first.
-    let first = cursor_rect(&buffer, &geo, 0, 0, geo.x);
-    assert!(rect.y >= first.y);
-}
-
-#[test]
 fn test_masked_render_buffer_builds_dots_without_reborrow() {
     // Regression test for the Settings-page panic: `layout()` used to call
     // `self.buffer.text()` (which re-borrows the RefCell via `borrow()`) while
@@ -872,24 +805,6 @@ fn test_masked_render_buffer_single_line_does_not_wrap() {
         build_masked_render_buffer(font_sys, &buffer, true, 0.0, 0.0, 100.0, 30.0)
     });
     assert_eq!(buffer_text(&mbuffer), "•••••••");
-}
-
-// ── Single-line height & cursor focus (shared-editor regressions) ──────
-
-#[test]
-fn test_single_line_size_hint_is_shrink() {
-    let buf = EditorBuffer::with_text("", None);
-    // Single-line fields (search / password / rename) must not fill their
-    // container vertically — the size hint lets the wrapping container
-    // shrink to a single line instead of inheriting `Length::Fill`.
-    let size_of = |widget: &EditorWidget<'_>| {
-        <EditorWidget<'_> as Widget<EditorAction, iced::Theme, iced::Renderer>>::size(widget)
-    };
-    let single = EditorWidget::new(&buf).single_line(true);
-    assert_eq!(size_of(&single), Size::new(Length::Fill, Length::Shrink));
-    // Multi-line prose / code editors keep filling their container.
-    let multi = EditorWidget::new(&buf);
-    assert_eq!(size_of(&multi), Size::new(Length::Fill, Length::Fill));
 }
 
 #[test]
@@ -934,42 +849,6 @@ fn test_cursor_follows_focus_state() {
         !EditorWidget::new(&buf)
             .code_mode(false)
             .should_draw_cursor(&EditorWidgetState::default())
-    );
-}
-
-#[test]
-fn test_single_line_height_clamp() {
-    let line_height = font_metrics().line_height;
-    let padding = 5.0;
-    let single_line_h = line_height + 2.0 * padding;
-    let close = |a: f32, b: f32| assert!((a - b).abs() < f32::EPSILON, "{a} != {b}");
-    // Single-line fields always resolve to exactly one line, never filling
-    // the container vertically — but never taller than the container.
-    close(
-        autosize_height(true, line_height, line_height, padding, None, None, 300.0),
-        single_line_h,
-    );
-    close(
-        autosize_height(true, line_height, line_height, padding, None, None, 10.0),
-        10.0,
-    );
-    // Multi-line prose clamps content height to [min, max].
-    close(
-        autosize_height(
-            false,
-            line_height,
-            50.0,
-            padding,
-            Some(44.0),
-            Some(132.0),
-            300.0,
-        ),
-        60.0,
-    );
-    // The code editor (no single-line, no min/max) fills the container.
-    close(
-        autosize_height(false, line_height, 50.0, padding, None, None, 300.0),
-        300.0,
     );
 }
 

@@ -321,6 +321,12 @@ impl CustomRolesState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use CustomRolesMessage::{
+        CloseEditor, OpenCreate, OpenEdit, SubmitEditor, SubmitResult, ToggleTool, ToggleToolKind,
+    };
+
+    const ANALYST: &str = "analyst";
+    const ANALYZE: &str = "analyze";
 
     fn role(name: &str) -> CustomRole {
         CustomRole {
@@ -331,131 +337,134 @@ mod tests {
         }
     }
 
-    fn loaded_state() -> CustomRolesState {
-        let mut state = CustomRolesState::new();
-        let _ = state.update(CustomRolesMessage::Refreshed(Ok(vec![role("analyst")])));
-        state
-    }
+    const AFTER_DEEP: &[&str] = &["analyze:quick,deep", "web_search"];
+    const AFTER_QUICK: &[&str] = &["analyze:deep", "web_search"];
+    const BARE: &[&str] = &["web_search", "analyze"];
+    const GONE: &[&str] = &["web_search"];
 
-    /// A state loaded with one role whose tool marks are `tools`.
-    fn state_with_tools(name: &str, tools: &[&str]) -> CustomRolesState {
-        let mut state = CustomRolesState::new();
-        let mut role = role(name);
-        role.tools = tools.iter().map(|s| (*s).to_string()).collect();
-        let _ = state.update(CustomRolesMessage::Refreshed(Ok(vec![role])));
-        state
-    }
-
-    /// The kind picker reads and writes the stored grant grammar: a bare
-    /// `analyze` shows the kind it implies, a kind toggles on and off, the entry
-    /// drops when its last kind goes, and a plain `ToggleTool` on the bare entry
-    /// still behaves as it always has.
+    /// The kind picker reads and writes the stored grant grammar.
     #[test]
     fn kind_marks_track_the_stored_entries() {
-        let mut state = state_with_tools("analyst", &["analyze", "web_search"]);
-        let _ = state.update(CustomRolesMessage::OpenEdit("analyst".to_string()));
+        struct Case {
+            name: &'static str,
+            kind: Option<&'static str>,
+            tools: &'static [&'static str],
+            held_kinds: &'static str,
+        }
 
+        let mut state = CustomRolesState::new();
+        let mut analyst = role(ANALYST);
+        analyst.tools = ["analyze", "web_search"].map(String::from).to_vec();
+        let _ = state.update(CustomRolesMessage::Refreshed(Ok(vec![analyst])));
+        let _ = state.update(OpenEdit(ANALYST.to_string()));
+
+        let opened: &[(&str, &str, &str)] = &[
+            ("the stored entry", "analyze", "quick"),
+            ("a kindless tool", "web_search", ""),
+            ("an unheld tool", "read", ""),
+        ];
         let editor = state.editor.as_ref().expect("the window is open");
-        assert_eq!(editor.held_kinds("analyze"), vec!["quick".to_string()]);
-        assert!(
-            editor.held_kinds("web_search").is_empty(),
-            "a kindless tool holds no kinds"
-        );
-        assert!(
-            editor.held_kinds("read").is_empty(),
-            "an unheld tool holds no kinds"
-        );
+        for &(name, tool, kinds) in opened {
+            assert_eq!(
+                editor.held_kinds(tool).join(","),
+                kinds,
+                "case {name}: held kinds"
+            );
+        }
 
-        // Marking the second kind spells the entry out.
-        let _ = state.update(CustomRolesMessage::ToggleToolKind {
-            tool: "analyze".to_string(),
-            kind: "deep".to_string(),
-        });
-        assert_eq!(
-            state.editor.as_ref().unwrap().tools,
-            vec!["analyze:quick,deep".to_string(), "web_search".to_string()]
-        );
+        let cases: &[Case] = &[
+            Case {
+                name: "second kind",
+                kind: Some("deep"),
+                tools: AFTER_DEEP,
+                held_kinds: "quick,deep",
+            },
+            Case {
+                name: "implied kind",
+                kind: Some("quick"),
+                tools: AFTER_QUICK,
+                held_kinds: "deep",
+            },
+            Case {
+                name: "last kind",
+                kind: Some("deep"),
+                tools: GONE,
+                held_kinds: "",
+            },
+            Case {
+                name: "absent entry",
+                kind: None,
+                tools: BARE,
+                held_kinds: "quick",
+            },
+            Case {
+                name: "bare leaves",
+                kind: None,
+                tools: GONE,
+                held_kinds: "",
+            },
+        ];
 
-        // Unmarking the implied kind leaves the one still held.
-        let _ = state.update(CustomRolesMessage::ToggleToolKind {
-            tool: "analyze".to_string(),
-            kind: "quick".to_string(),
-        });
-        assert_eq!(
-            state.editor.as_ref().unwrap().tools,
-            vec!["analyze:deep".to_string(), "web_search".to_string()]
-        );
-        assert_eq!(
-            state.editor.as_ref().unwrap().held_kinds("analyze"),
-            vec!["deep".to_string()]
-        );
-
-        // The last kind leaving drops the entry from the record.
-        let _ = state.update(CustomRolesMessage::ToggleToolKind {
-            tool: "analyze".to_string(),
-            kind: "deep".to_string(),
-        });
-        assert_eq!(
-            state.editor.as_ref().unwrap().tools,
-            vec!["web_search".to_string()]
-        );
-
-        // `ToggleTool` on the (now absent) bare entry behaves as today: it adds
-        // the name plainly, and the implied kind shows again.
-        let _ = state.update(CustomRolesMessage::ToggleTool("analyze".to_string()));
-        assert_eq!(
-            state.editor.as_ref().unwrap().tools,
-            vec!["web_search".to_string(), "analyze".to_string()]
-        );
-        assert_eq!(
-            state.editor.as_ref().unwrap().held_kinds("analyze"),
-            vec!["quick".to_string()]
-        );
-        let _ = state.update(CustomRolesMessage::ToggleTool("analyze".to_string()));
-        assert_eq!(
-            state.editor.as_ref().unwrap().tools,
-            vec!["web_search".to_string()]
-        );
+        for case in cases {
+            let name = case.name;
+            let msg = match case.kind {
+                Some(kind) => ToggleToolKind {
+                    tool: ANALYZE.to_string(),
+                    kind: kind.to_string(),
+                },
+                None => ToggleTool(ANALYZE.to_string()),
+            };
+            let _ = state.update(msg);
+            let editor = state.editor.as_ref().expect("the window is open");
+            assert_eq!(editor.tools, case.tools, "case {name}: entries");
+            assert_eq!(
+                editor.held_kinds(ANALYZE).join(","),
+                case.held_kinds,
+                "case {name}"
+            );
+        }
     }
 
-    /// The window is filled from the record the list holds — including the
-    /// behaviour and the marks — and a mark toggles in and out.
     #[test]
-    fn editing_fills_the_window_and_marks_toggle() {
-        let mut state = loaded_state();
-        let _ = state.update(CustomRolesMessage::OpenEdit("analyst".to_string()));
-
-        let editor = state.editor.as_ref().expect("the window is open");
-        assert_eq!(editor.original.as_deref(), Some("analyst"));
-        assert_eq!(editor.name.text(), "analyst");
-        assert_eq!(editor.prompt.text(), "prompt of analyst");
-        assert_eq!(editor.behavior, CustomRoleBehavior::OneOff);
-        assert_eq!(editor.tools, vec!["web_search".to_string()]);
-
-        let _ = state.update(CustomRolesMessage::ToggleTool("web_search".to_string()));
-        let _ = state.update(CustomRolesMessage::ToggleTool("read".to_string()));
+    fn test_editor_window_transitions() {
+        let mut state = CustomRolesState::new();
+        let _ = state.update(CustomRolesMessage::Refreshed(Ok(vec![role(ANALYST)])));
+        let _ = state.update(OpenEdit(ANALYST.to_string()));
+        let opened = state.editor.as_ref().expect("the window is open");
         assert_eq!(
-            state.editor.as_ref().expect("the window is open").tools,
-            vec!["read".to_string()]
+            opened.original.as_deref(),
+            Some(ANALYST),
+            "opening: original"
         );
+        assert_eq!(opened.name.text(), ANALYST, "opening: name");
+        assert_eq!(opened.prompt.text(), "prompt of analyst", "opening: prompt");
+        assert_eq!(
+            opened.behavior,
+            CustomRoleBehavior::OneOff,
+            "opening: behaviour"
+        );
+        // The marks come from the stored record before any toggle.
+        assert_eq!(opened.tools, ["web_search"], "opening: stored marks");
+        let _ = state.update(ToggleTool("web_search".to_string()));
+        let _ = state.update(ToggleTool("read".to_string()));
+        let tools = &state.editor.as_ref().expect("the window stays open").tools;
+        assert_eq!(tools, &["read"], "opening: marks after toggles");
+        let _ = state.update(CloseEditor);
+        assert!(state.editor.is_none(), "opening: window closed");
 
-        let _ = state.update(CustomRolesMessage::CloseEditor);
-        assert!(state.editor.is_none());
-    }
-
-    /// A submit in flight is never doubled, and an error keeps the window open
-    /// with its own line.
-    #[test]
-    fn a_submit_in_flight_is_not_doubled_and_an_error_keeps_the_window() {
-        let mut state = loaded_state();
-        let _ = state.update(CustomRolesMessage::OpenCreate);
+        let mut state = CustomRolesState::new();
+        let _ = state.update(CustomRolesMessage::Refreshed(Ok(vec![role(ANALYST)])));
+        let _ = state.update(OpenCreate);
         state.editor.as_mut().expect("the window is open").in_flight = true;
-        let _ = state.update(CustomRolesMessage::SubmitEditor);
-        assert!(state.editor.as_ref().expect("the window is open").in_flight);
-
-        let _ = state.update(CustomRolesMessage::SubmitResult(Err("nope".to_string())));
-        let editor = state.editor.as_ref().expect("the window stays open");
-        assert!(!editor.in_flight);
-        assert_eq!(editor.error.as_deref(), Some("nope"));
+        let _ = state.update(SubmitEditor);
+        let pending = state.editor.as_ref().expect("the window stays open");
+        assert!(pending.in_flight, "submit: a submit is not doubled");
+        let _ = state.update(SubmitResult(Err("nope".to_string())));
+        let failed = state
+            .editor
+            .as_ref()
+            .expect("the window stays open after a failed submit");
+        assert!(!failed.in_flight, "submit: in flight");
+        assert_eq!(failed.error.as_deref(), Some("nope"), "submit: error");
     }
 }

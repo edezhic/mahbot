@@ -300,9 +300,8 @@ fn format_next_fire(next_fire_at: &str, now: DateTime<Local>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use chrono::{Duration, TimeZone as _};
 
-    /// The local wall clock the countdown is rendered against.
     fn local_now() -> DateTime<Local> {
         Local
             .with_ymd_and_hms(2026, 9, 17, 12, 0, 0)
@@ -310,7 +309,6 @@ mod tests {
             .expect("a valid local time")
     }
 
-    /// The stored form of a local instant (the column is RFC3339 UTC).
     fn stored(at: DateTime<Local>) -> String {
         at.with_timezone(&Utc).to_rfc3339()
     }
@@ -318,30 +316,18 @@ mod tests {
     #[test]
     fn format_next_fire_covers_due_countdown_other_day_and_junk() {
         let now = local_now();
-        // Overdue (and exactly due) read as due.
-        assert_eq!(
-            format_next_fire(&stored(now - chrono::Duration::minutes(1)), now),
-            "now"
-        );
-        assert_eq!(format_next_fire(&stored(now), now), "now");
-        // Later the same day: always all three units.
-        assert_eq!(
-            format_next_fire(&stored(now + chrono::Duration::seconds(30)), now),
-            "0h 0m 30s"
-        );
-        assert_eq!(
-            format_next_fire(
-                &stored(now + chrono::Duration::seconds(2 * 3600 + 5 * 60 + 3)),
-                now
-            ),
-            "2h 5m 3s"
-        );
-        // Another day: the absolute local time.
-        assert_eq!(
-            format_next_fire(&stored(now + chrono::Duration::days(1)), now),
-            "at 12:00 18.09"
-        );
-        // A value that is not a timestamp is shown as stored.
+        let at = |offset: Duration| stored(now + offset);
+        let hms = Duration::seconds(2 * 3600 + 5 * 60 + 3);
+        let cases: &[(&str, Duration, &str)] = &[
+            ("overdue", Duration::minutes(-1), "now"),
+            ("exactly due", Duration::zero(), "now"),
+            ("seconds later", Duration::seconds(30), "0h 0m 30s"),
+            ("hours minutes seconds", hms, "2h 5m 3s"),
+            ("another day", Duration::days(1), "at 12:00 18.09"),
+        ];
+        for &(name, offset, expected) in cases {
+            assert_eq!(format_next_fire(&at(offset), now), expected, "case {name}");
+        }
         assert_eq!(format_next_fire("not a timestamp", now), "not a timestamp");
     }
 
@@ -362,39 +348,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_args_formats_pairs_and_hides_none() {
-        let trigger = |args: serde_json::Value| {
-            let serde_json::Value::Object(args) = args else {
-                unreachable!("test arguments are an object")
-            };
-            StoredTrigger::Tool(crate::automations::Trigger {
-                tool: "wait".to_string(),
-                args,
-            })
+    fn trigger(args: serde_json::Value) -> StoredTrigger {
+        let serde_json::Value::Object(args) = args else {
+            unreachable!("test arguments are an object")
         };
-        assert_eq!(render_args(&StoredTrigger::Unreadable), None);
-        assert_eq!(render_args(&trigger(serde_json::json!({}))), None);
-        // The map's own (sorted) key order; string values are bare and anything
-        // else keeps its compact JSON.
-        assert_eq!(
-            render_args(&trigger(serde_json::json!({
-                "action": "night",
-                "dry_run": true,
-                "probe_seconds": 120,
-                "window": {"from": "09:00"},
-            }))),
-            Some(
-                "action: night, dry_run: true, probe_seconds: 120, window: {\"from\":\"09:00\"}"
-                    .to_string()
-            )
-        );
+        StoredTrigger::Tool(crate::automations::Trigger {
+            tool: "wait".to_string(),
+            args,
+        })
+    }
+
+    #[test]
+    fn render_args_cases() {
+        let cases: &[(&str, StoredTrigger, Option<&str>)] = &[
+            ("unreadable trigger", StoredTrigger::Unreadable, None),
+            ("no arguments", trigger(serde_json::json!({})), None),
+            (
+                "every value kind",
+                trigger(serde_json::json!({
+                    "action": "night",
+                    "dry_run": true,
+                    "probe_seconds": 120,
+                    "window": {"from": "09:00"},
+                })),
+                Some(
+                    "action: night, dry_run: true, probe_seconds: 120, window: {\"from\":\"09:00\"}",
+                ),
+            ),
+        ];
+        for (name, stored, expected) in cases {
+            assert_eq!(
+                render_args(stored),
+                expected.map(str::to_string),
+                "case {name}: rendered arguments"
+            );
+        }
     }
 
     #[test]
     fn group_by_owner_orders_by_owner_and_keeps_members() {
-        // Owner order is the grouping's own, not the store's: rows of one owner
-        // are merged even when they are not adjacent.
         let automations = [
             automation("bob", "two"),
             automation("alice", "one"),

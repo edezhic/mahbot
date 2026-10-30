@@ -2186,164 +2186,276 @@ mod tests {
         state
     }
 
-    // ── SendComment: accepted-send smoke ──────────────────────────
-
-    #[test]
-    fn test_comment_within_limit_clears_input() {
-        let mut state = make_board_state();
-        state.comment_input =
-            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
-        let _task = state.update(BoardMessage::SendComment);
-        // Editor must be cleared on accepted message.
-        assert!(
-            state.comment_input.text().is_empty(),
-            "input should be cleared after accepting a within-limit comment"
-        );
-        // Optimistic push + sending_comment are synchronous — no tx dependency.
-        assert!(
-            state.sending_comment,
-            "sending_comment should be set after accept"
-        );
-        assert_eq!(
-            state
-                .selected_ticket
-                .as_ref()
-                .map_or(0, |t| t.comments.len()),
-            1,
-            "comment should be optimistically pushed to the selected ticket"
-        );
-    }
-
-    // ── SendComment: no ticket selected ───────────────────────────
-
-    #[test]
-    fn test_comment_no_ticket_is_noop() {
-        let mut state = make_board_state();
-        state.selected_ticket = None;
-        state.comment_input = EditorBuffer::with_text("hello", Some(HighlightLanguage::Markdown));
-        let _task = state.update(BoardMessage::SendComment);
-        assert!(!state.sending_comment);
-        assert_eq!(
-            state.comment_input.text(),
-            "hello",
-            "input should not be cleared when no ticket is selected"
-        );
-    }
-
-    // ── CommentInputChanged: cursor actions pass through ──────────
-
-    #[test]
-    fn test_comment_input_changed_non_edit_passes_through() {
-        let mut state = make_board_state();
-        state.comment_input =
-            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
-
-        // Cursor movement (non-edit action) must be passed to perform_action().
-        // After a MoveTo, the content is unchanged.
-        let _ = state.update(BoardMessage::CommentInputChanged(EditorAction::MoveTo {
-            line: 0,
-            col: 0,
-        }));
-        assert_eq!(state.comment_input.text(), "hello world");
-        assert!(
-            state.comment_focused,
-            "comment_focused should be set to true on any input action"
-        );
-    }
-
-    // ── CommentInputChanged: selection creation ───────────────────
-
-    #[test]
-    fn test_comment_select_to_creates_selection() {
-        let mut state = make_board_state();
-        state.comment_input =
-            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
-
-        // Move the cursor away, then extend a selection via SelectTo.
-        state
-            .comment_input
-            .perform_action(EditorAction::MoveTo { line: 0, col: 0 });
-        let _ = state.update(BoardMessage::CommentInputChanged(EditorAction::SelectTo {
-            line: 0,
-            col: 5,
-        }));
-
-        let cursor = state.comment_input.cursor();
-        assert!(
-            cursor.selection.is_some(),
-            "SelectTo should create a selection; got selection={:?}",
-            cursor.selection
-        );
-    }
-
-    // ── CommentInputChanged: plain cursor move keeps content ──────
-
-    #[test]
-    fn test_comment_move_to_keeps_content() {
-        let mut state = make_board_state();
-        state.comment_input =
-            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
-
-        let _ = state.update(BoardMessage::CommentInputChanged(EditorAction::MoveTo {
-            line: 0,
-            col: 3,
-        }));
-        // No crash — content unchanged.
-        assert_eq!(state.comment_input.text(), "hello world");
-    }
-
-    // ── OpenModal bumps generation ────────────────────────────────
-
-    #[test]
-    fn test_open_modal_bumps_comment_generation() {
-        let mut state = make_board_state();
-        let gen_before = state.comment_generation;
-        let _task = state.update(BoardMessage::OpenModal("T-2".into()));
-        assert!(
-            state.comment_generation > gen_before,
-            "comment_generation should be bumped on OpenModal"
-        );
-    }
-
-    // ── TicketDetails bumps generation and clears input ───────────
-
-    #[test]
-    fn test_ticket_details_clears_comment_input() {
-        let mut state = make_board_state();
-        state.comment_input =
-            EditorBuffer::with_text("draft comment", Some(HighlightLanguage::Markdown));
-        state.sending_comment = true;
-        state.comment_focused = true;
-
-        let gen_before = state.comment_generation;
-        let ticket = TicketFixture::new("T-2", TicketPhase::Backlog)
-            .title("New ticket")
-            .build();
-        let _task = state.update(BoardMessage::TicketDetails(Box::new(ticket)));
-
-        assert!(
-            state.comment_input.text().is_empty(),
-            "comment input should be cleared when switching tickets"
-        );
-        assert!(
-            !state.sending_comment,
-            "sending_comment should be reset when switching tickets"
-        );
-        assert!(
-            !state.comment_focused,
-            "comment_focused should be reset when switching tickets"
-        );
-        assert!(
-            state.comment_generation > gen_before,
-            "comment_generation should be bumped on ticket switch"
-        );
-    }
-
-    // ── TicketDetailsRefreshed (periodic refresh of the open modal) ─
-
     fn make_ticket(id: &str, phase: TicketPhase) -> Ticket {
         TicketFixture::new(id, phase).build()
     }
+
+    /// Build a ticket for the pause-helper tests in `workspace`, optionally
+    /// archived.
+    fn ticket_in(workspace: &str, id: &str, phase: TicketPhase, archived: bool) -> Ticket {
+        TicketFixture::new(id, phase)
+            .workspace(workspace)
+            .archived(archived)
+            .build()
+    }
+
+    fn draft(text: &str) -> EditorBuffer {
+        EditorBuffer::with_text(text, Some(HighlightLanguage::Markdown))
+    }
+
+    // ── Comment input: cursor actions, editing and undo/redo ──────
+
+    fn mv(line: usize, col: usize) -> EditorAction {
+        EditorAction::MoveTo { line, col }
+    }
+
+    fn sel(line: usize, col: usize) -> EditorAction {
+        EditorAction::SelectTo { line, col }
+    }
+
+    /// Typing `text` into the field, one insert per character.
+    fn typed(text: &str) -> Vec<EditorAction> {
+        text.chars().map(EditorAction::Insert).collect()
+    }
+
+    /// How a case ends the modal session, if at all.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Close {
+        /// The modal stays open.
+        None,
+        /// The `CloseModal` message (backdrop click or close button).
+        Message,
+        /// `reset_modal()` itself: the clear the message funnels through.
+        Reset,
+    }
+
+    struct CursorUndoCase {
+        name: &'static str,
+        initial: &'static str,
+        actions: Vec<EditorAction>,
+        expected_text: &'static str,
+        selection: bool,
+        undoes: bool,
+        close: Close,
+    }
+
+    #[test]
+    fn test_comment_input_cursor_actions_and_undo_edits() {
+        let text = "hello world";
+        let cases = [
+            CursorUndoCase {
+                name: "a non-edit cursor move passes through",
+                initial: text,
+                actions: vec![mv(0, 0)],
+                expected_text: text,
+                selection: false,
+                undoes: false,
+                close: Close::None,
+            },
+            CursorUndoCase {
+                name: "SelectTo creates a selection",
+                initial: text,
+                actions: vec![mv(0, 0), sel(0, 5)],
+                expected_text: text,
+                selection: true,
+                undoes: false,
+                close: Close::None,
+            },
+            CursorUndoCase {
+                name: "a plain MoveTo keeps the content",
+                initial: text,
+                actions: vec![mv(0, 3)],
+                expected_text: text,
+                selection: false,
+                undoes: false,
+                close: Close::None,
+            },
+            CursorUndoCase {
+                name: "undo restores content and redo restores the undone state",
+                initial: "",
+                actions: typed("abc"),
+                expected_text: "abc",
+                selection: false,
+                undoes: true,
+                close: Close::None,
+            },
+            CursorUndoCase {
+                name: "redo with no undo history is a no-op",
+                initial: "",
+                actions: vec![EditorAction::Redo],
+                expected_text: "",
+                selection: false,
+                undoes: false,
+                close: Close::None,
+            },
+            CursorUndoCase {
+                name: "undo is a no-op after a modal reset",
+                initial: "",
+                actions: typed("hel"),
+                expected_text: "",
+                selection: false,
+                undoes: false,
+                close: Close::Message,
+            },
+            CursorUndoCase {
+                name: "reset_modal clears the undo history",
+                initial: "",
+                actions: typed("hel"),
+                expected_text: "",
+                selection: false,
+                undoes: false,
+                close: Close::Reset,
+            },
+        ];
+
+        for case in cases {
+            let name = case.name;
+            let expected = case.expected_text;
+            let mut state = make_board_state();
+            state.comment_input = draft(case.initial);
+            for action in case.actions {
+                let _task = state.update(BoardMessage::CommentInputChanged(action));
+                // Any interaction means the input is focused.
+                assert!(state.comment_focused, "case {name}: comment_focused is set");
+            }
+            if case.undoes {
+                // An undo with history must restore the content, and redo the undo.
+                let before = state.comment_input.text();
+                let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Undo));
+                let changed = state.comment_input.text() != before;
+                assert!(changed, "case {name}: undo should change the content");
+                let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Redo));
+            }
+            // Closing the modal clears the field and its undo history.
+            if case.close == Close::Reset {
+                state.reset_modal();
+            } else if case.close == Close::Message {
+                let _task = state.update(BoardMessage::CloseModal);
+            }
+            if case.close != Close::None {
+                assert_eq!(state.comment_input.text(), "", "case {name}: closed");
+                let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Undo));
+            }
+            assert_eq!(state.comment_input.text(), expected, "case {name}: content");
+            let selected = state.comment_input.cursor().selection.is_some();
+            assert_eq!(selected, case.selection, "case {name}: selection");
+        }
+    }
+
+    // ── SendComment: accept, no ticket, stale callback ────────────
+
+    struct SendCommentCase {
+        name: &'static str,
+        send: bool,
+        ticket_open: bool,
+        draft: &'static str,
+        expected_draft: &'static str,
+        sending: bool,
+        comments: usize,
+    }
+
+    /// A comment send needs a ticket, and a stale completion only drops the guard.
+    #[test]
+    fn test_comment_send_accepts_only_with_a_ticket_and_drops_stale_callbacks() {
+        let cases = [
+            SendCommentCase {
+                name: "a within-limit comment is accepted and clears the input",
+                send: true,
+                ticket_open: true,
+                draft: "hello world",
+                expected_draft: "",
+                sending: true,
+                comments: 1,
+            },
+            SendCommentCase {
+                name: "no selected ticket leaves the draft and sends nothing",
+                send: true,
+                ticket_open: false,
+                draft: "hello",
+                expected_draft: "hello",
+                sending: false,
+                comments: 0,
+            },
+            SendCommentCase {
+                name: "a stale completion only releases the send guard",
+                send: false,
+                ticket_open: true,
+                draft: "hello",
+                expected_draft: "hello",
+                sending: false,
+                comments: 0,
+            },
+        ];
+
+        for case in cases {
+            let name = case.name;
+            let mut state = make_board_state();
+            if !case.ticket_open {
+                state.selected_ticket = None;
+            }
+            state.comment_input = draft(case.draft);
+            if case.send {
+                let _task = state.update(BoardMessage::SendComment);
+            } else {
+                state.sending_comment = true;
+                state.comment_generation = 42;
+                // The stale guard fires before the Ok/Err branch, so one
+                // completion covers both variants.
+                let _task = state.update(BoardMessage::CommentSent(0, Ok(())));
+            }
+            assert_eq!(
+                state.comment_input.text(),
+                case.expected_draft,
+                "case {name}: comment input"
+            );
+            assert_eq!(
+                state.sending_comment, case.sending,
+                "case {name}: sending_comment"
+            );
+            let optimistic = state
+                .selected_ticket
+                .as_ref()
+                .map_or(0, |t| t.comments.len());
+            assert_eq!(optimistic, case.comments, "case {name}: optimistic comment");
+        }
+    }
+
+    // ── A new modal context invalidates the comment draft ─────────
+
+    #[test]
+    fn a_new_modal_context_bumps_the_comment_generation_and_clears_the_draft() {
+        // (case, the context switch is a ticket switch rather than a fresh open)
+        let cases = [
+            ("opening the modal", false),
+            ("switching to another ticket", true),
+        ];
+        for (name, switch_ticket) in cases {
+            let mut state = make_board_state();
+            state.comment_input = draft("draft comment");
+            let before = state.comment_generation;
+            let _task = if switch_ticket {
+                state.sending_comment = true;
+                state.comment_focused = true;
+                let ticket = TicketFixture::new("T-2", TicketPhase::Backlog);
+                state.update(BoardMessage::TicketDetails(Box::new(
+                    ticket.title("New").build(),
+                )))
+            } else {
+                state.update(BoardMessage::OpenModal("T-2".into()))
+            };
+            assert!(state.comment_generation > before, "case {name}: bumped");
+            if switch_ticket {
+                assert!(
+                    state.comment_input.text().is_empty(),
+                    "case {name}: cleared"
+                );
+                assert!(!state.sending_comment, "case {name}: send reset");
+                assert!(!state.comment_focused, "case {name}: focus reset");
+            }
+        }
+    }
+
+    // ── TicketDetailsRefreshed (periodic refresh of the open modal) ─
 
     /// Same-ticket refresh carrying a new phase plus an engineer comment.
     fn refreshed_ticket(phase: TicketPhase) -> Ticket {
@@ -2351,104 +2463,111 @@ mod tests {
             .comment("engineer", "fixed the flaky test", "2026-01-01T00:00:05Z")
             .build()
     }
-
-    #[test]
-    fn test_ticket_details_refreshed_updates_and_preserves_draft() {
-        let mut state = make_board_state(); // selected_ticket: T-1, Backlog
-        state.comment_input =
-            EditorBuffer::with_text("draft comment", Some(HighlightLanguage::Markdown));
-        let gen_before = state.comment_generation;
-
-        // The periodic refresh delivers the same ticket with a new phase
-        // and a new engineer comment — the exact staleness the feature fixes.
-        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
-            gen_before,
-            Box::new(refreshed_ticket(TicketPhase::Verification)),
-        ));
-
-        let ticket = state.selected_ticket.as_ref().expect("modal still open");
-        assert_eq!(
-            ticket.phase,
-            TicketPhase::Verification,
-            "phase should update to the latest state"
-        );
-        assert_eq!(
-            ticket.comments.len(),
-            1,
-            "comments should include the engineer comment"
-        );
-        assert_eq!(
-            state.comment_input.text(),
-            "draft comment",
-            "an in-progress comment draft must survive the refresh"
-        );
-        assert_eq!(
-            state.comment_generation, gen_before,
-            "the refresh must not bump the generation (would invalidate in-flight callbacks)"
-        );
-        assert!(!state.sending_comment);
-        assert!(!state.commit_stats_loading);
+    struct TicketDetailsRefreshCase {
+        name: &'static str,
+        generation: u64,
+        sending: bool,
+        callback_generation: u64,
+        phase: TicketPhase,
+        comments: usize,
+        applied: bool,
     }
 
     #[test]
-    fn test_ticket_details_refreshed_stale_generation_dropped() {
-        let mut state = make_board_state();
-        state.comment_generation = 42;
-        // Stale callback (generation 0 < 42): the modal closed or the user
-        // switched tickets while the fetch was in flight — must be dropped.
-        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
-            0,
-            Box::new(refreshed_ticket(TicketPhase::Verification)),
-        ));
+    fn ticket_details_refresh_applies_only_when_fresh_and_idle() {
+        let (backlog, verification) = (TicketPhase::Backlog, TicketPhase::Verification);
+        let cases = [
+            TicketDetailsRefreshCase {
+                name: "a same-ticket refresh updates the detail and keeps the draft",
+                generation: 0,
+                sending: false,
+                callback_generation: 0,
+                phase: verification,
+                comments: 1,
+                applied: true,
+            },
+            TicketDetailsRefreshCase {
+                name: "a stale-generation callback is dropped",
+                generation: 42,
+                sending: false,
+                callback_generation: 0,
+                phase: backlog,
+                comments: 0,
+                applied: false,
+            },
+            TicketDetailsRefreshCase {
+                name: "a refresh never clobbers an optimistic comment send",
+                generation: 7,
+                sending: true,
+                callback_generation: 7,
+                phase: backlog,
+                comments: 0,
+                applied: false,
+            },
+        ];
 
-        let ticket = state.selected_ticket.as_ref().expect("modal still open");
-        assert_eq!(
-            ticket.phase,
-            TicketPhase::Backlog,
-            "stale data must not apply"
-        );
-        assert!(ticket.comments.is_empty(), "stale comments must not apply");
-        assert!(
-            !state.detail_refresh_in_flight,
-            "the completed fetch must clear the in-flight flag even when stale"
-        );
-    }
+        for case in cases {
+            let name = case.name;
+            let mut state = make_board_state(); // selected_ticket: T-1, Backlog
+            state.comment_input = draft("draft comment");
+            state.comment_generation = case.generation;
+            state.sending_comment = case.sending;
+            let gen_before = state.comment_generation;
 
-    #[test]
-    fn test_ticket_details_refreshed_skipped_while_sending_comment() {
-        let mut state = make_board_state();
-        state.sending_comment = true;
-        let generation = state.comment_generation;
-        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
-            generation,
-            Box::new(refreshed_ticket(TicketPhase::Verification)),
-        ));
+            // The periodic refresh delivers the same ticket with a new phase
+            // and a new engineer comment — the exact staleness the feature fixes.
+            let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+                case.callback_generation,
+                Box::new(refreshed_ticket(verification)),
+            ));
 
-        let ticket = state.selected_ticket.as_ref().expect("modal still open");
-        assert_eq!(
-            ticket.phase,
-            TicketPhase::Backlog,
-            "refresh must not clobber the optimistic comment send"
-        );
+            let ticket = state.selected_ticket.as_ref().expect("modal still open");
+            assert_eq!(ticket.phase, case.phase, "case {name}: phase");
+            assert_eq!(
+                ticket.comments.len(),
+                case.comments,
+                "case {name}: comments"
+            );
+            assert!(
+                !state.detail_refresh_in_flight,
+                "case {name}: the completed fetch must clear the in-flight flag"
+            );
+            if case.applied {
+                assert_eq!(
+                    state.comment_input.text(),
+                    "draft comment",
+                    "case {name}: an in-progress comment draft must survive the refresh"
+                );
+                assert_eq!(
+                    state.comment_generation, gen_before,
+                    "case {name}: the refresh must not bump the generation (would invalidate in-flight callbacks)"
+                );
+                assert!(!state.sending_comment, "case {name}: no send in flight");
+                assert!(
+                    !state.commit_stats_loading,
+                    "case {name}: no stats fetch is started"
+                );
+            }
+        }
     }
 
     #[test]
     fn test_ticket_details_refreshed_stats_reconciliation() {
         const HASH: &str = "abcdef0123456789abcdef0123456789abcdef01";
+        let hashed = || {
+            let mut ticket = make_ticket("T-1", TicketPhase::Done);
+            ticket.commit_hash = Some(HASH.into());
+            ticket
+        };
 
         // Hash appeared → fresh stats fetch dispatched.
         let mut state = make_board_state();
-        let mut with_hash = make_ticket("T-1", TicketPhase::Done);
-        with_hash.commit_hash = Some(HASH.into());
-        let stats_gen_before = state.commit_stats_generation;
-        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
-            state.comment_generation,
-            Box::new(with_hash),
-        ));
+        let (g, stats_gen) = (state.comment_generation, state.commit_stats_generation);
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(g, Box::new(hashed())));
         assert!(state.commit_stats_loading, "new hash should fetch stats");
         assert!(
-            state.commit_stats_generation > stats_gen_before,
-            "stats generation should bump for the new fetch"
+            state.commit_stats_generation > stats_gen,
+            "stats generation bumps"
         );
 
         // Unchanged project + hash → keep the loaded stats, no refetch.
@@ -2456,20 +2575,10 @@ mod tests {
         state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
         state.commit_stats = Some(CommitStats { files: Vec::new() });
         state.commit_stats_generation = 5;
-        let mut same_hash = make_ticket("T-1", TicketPhase::Done);
-        same_hash.commit_hash = Some(HASH.into());
-        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
-            state.comment_generation,
-            Box::new(same_hash),
-        ));
-        assert_eq!(
-            state.commit_stats_generation, 5,
-            "unchanged hash must not re-run git numstat every tick"
-        );
-        assert!(
-            state.commit_stats.is_some(),
-            "already-loaded stats should be kept"
-        );
+        let g = state.comment_generation;
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(g, Box::new(hashed())));
+        assert_eq!(state.commit_stats_generation, 5, "no refetch");
+        assert!(state.commit_stats.is_some(), "the loaded stats are kept");
 
         // The same hash in another project is a different (project, commit):
         // the stats loaded for the first one say nothing about the second, so
@@ -2478,51 +2587,44 @@ mod tests {
         state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
         state.commit_stats = Some(CommitStats { files: Vec::new() });
         state.commit_stats_error = Some("Workspace 'first' not found".into());
-        let mut elsewhere = make_ticket("T-1", TicketPhase::Done);
-        elsewhere.commit_hash = Some(HASH.into());
+        let mut elsewhere = hashed();
         elsewhere.workspace_name = "other_ws".into();
-        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
-            state.comment_generation,
-            Box::new(elsewhere),
-        ));
+        let g = state.comment_generation;
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(g, Box::new(elsewhere)));
         assert!(state.commit_stats_loading, "another project refetches");
         assert!(state.commit_stats.is_none());
         assert!(
             state.commit_stats_error.is_none(),
-            "the first project's failure must not follow the hash"
+            "the first failure is gone"
         );
 
         // Hash vanished (latent) → loading must not stay stuck.
         let mut state = make_board_state();
         state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
         state.commit_stats_loading = true;
-        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
-            state.comment_generation,
-            Box::new(make_ticket("T-1", TicketPhase::Done)),
-        ));
+        let bare = make_ticket("T-1", TicketPhase::Done);
+        let g = state.comment_generation;
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(g, Box::new(bare)));
         assert!(
             !state.commit_stats_loading,
-            "a hash-less ticket must clear the stats loading state"
+            "a hash-less ticket clears loading"
         );
     }
 
     #[test]
     fn test_ticket_details_refresh_error_is_non_destructive() {
         let mut state = make_board_state();
-        let generation = state.comment_generation;
+        let g = state.comment_generation;
 
-        // A refresh error keeps the last known good detail visible and
-        // must not clear the modal loading state (that is `DetailError`'s
-        // job, for the initial modal load).
+        // A refresh error keeps the last known good detail visible and must not
+        // clear the modal loading state (that is `DetailError`'s job, for the
+        // initial modal load).
         let _task = state.update(BoardMessage::TicketDetailsRefreshError(
-            generation,
+            g,
             "db hiccup".into(),
         ));
-        assert_eq!(
-            state.selected_ticket.as_ref().unwrap().phase,
-            TicketPhase::Backlog,
-            "the displayed ticket must survive a refresh error"
-        );
+        let shown = state.selected_ticket.as_ref().unwrap();
+        assert_eq!(shown.phase, TicketPhase::Backlog, "the detail survives");
         assert_eq!(state.detail_error.as_deref(), Some("db hiccup"));
         assert!(!state.detail_refresh_in_flight);
 
@@ -2532,7 +2634,7 @@ mod tests {
         assert_eq!(
             state.detail_error.as_deref(),
             Some("db hiccup"),
-            "stale error must not overwrite the current error"
+            "stale error"
         );
     }
 
@@ -2553,11 +2655,9 @@ mod tests {
         assert!(state.detail_refresh_in_flight);
 
         // In-flight flag cleared on completion.
-        let generation = state.comment_generation;
-        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
-            generation,
-            Box::new(make_ticket("T-1", TicketPhase::Backlog)),
-        ));
+        let g = state.comment_generation;
+        let ticket = make_ticket("T-1", TicketPhase::Backlog);
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(g, Box::new(ticket)));
         assert!(!state.detail_refresh_in_flight);
 
         // Initial modal load in flight → no refresh dispatched.
@@ -2579,123 +2679,121 @@ mod tests {
     fn test_escape_first_blurs_then_closes() {
         let mut state = make_board_state();
         state.comment_focused = true;
-        state.selected_ticket = Some(
-            TicketFixture::new("T-1", TicketPhase::Backlog)
-                .title("Test")
-                .build(),
-        );
 
-        // First Escape: focused → blur (clear flag), modal stays open
+        // First Escape: focused → blur (clear flag), modal stays open.
         let _task = state.update(BoardMessage::Escape);
-        assert!(
-            !state.comment_focused,
-            "comment_focused should be cleared on first Escape"
-        );
-        assert!(
-            state.selected_ticket.is_some(),
-            "modal should remain open on first Escape"
-        );
+        assert!(!state.comment_focused, "the first Escape blurs the input");
+        assert!(state.selected_ticket.is_some(), "the modal stays open");
 
-        // Second Escape: not focused → close modal
+        // Second Escape: not focused → close modal.
         let _task = state.update(BoardMessage::Escape);
         assert!(
             state.selected_ticket.is_none(),
-            "modal should close on second Escape"
+            "the second Escape closes it"
         );
     }
 
     // ── CDC change-stream delta application ───────────────────────
 
-    #[test]
-    fn refreshed_stale_generation_is_dropped() {
-        let mut state = BoardState::new();
-        state.board_generation = 2;
-        let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![make_ticket("T-1", TicketPhase::Backlog)],
-            generation: 1,
-        });
-        assert!(
-            state.tickets.is_empty(),
-            "a stale-generation snapshot must not clobber the current list"
-        );
+    fn page(id: &str, phase: TicketPhase) -> Vec<Ticket> {
+        vec![make_ticket(id, phase)]
     }
 
     #[test]
-    fn refreshed_current_generation_applies_and_finishes_loading() {
-        let mut state = BoardState::new();
-        state.board_generation = 2;
-        state.load_state.start_loading();
-        let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![make_ticket("T-1", TicketPhase::Backlog)],
-            generation: 2,
-        });
-        assert_eq!(state.tickets.len(), 1);
-        assert!(state.load_state.has_loaded());
-    }
+    fn snapshots_follow_their_generation_and_lag_recovery_replaces() {
+        // (case, (board generation, loading, replace on refresh, listed tickets),
+        // a `Refreshed` payload or `None` for the lag-recovery marker,
+        // (expected ids, expected replace flag, expected load state))
+        let cases = [
+            (
+                "a stale-generation snapshot is dropped",
+                (2, false, false, vec![]),
+                Some((1, page("T-1", TicketPhase::Backlog))),
+                (&[][..], false, None),
+            ),
+            (
+                "a current-generation snapshot applies and finishes loading",
+                (2, true, false, vec![]),
+                Some((2, page("T-1", TicketPhase::Backlog))),
+                (&["T-1"][..], false, Some(true)),
+            ),
+            (
+                "a lag-recovery snapshot drops a lost ticket",
+                (0, false, true, page("T-old", TicketPhase::Backlog)),
+                Some((0, page("T-new", TicketPhase::Analysis))),
+                (&["T-new"][..], false, None),
+            ),
+            (
+                // A ticket a delta updated, later removed by a delta the lagged
+                // broadcast dropped: the recovery snapshot must be able to drop it.
+                "a lag recovery marks the next snapshot as authoritative",
+                (0, false, false, page("T-1", TicketPhase::Done)),
+                None,
+                (&["T-1"][..], true, None),
+            ),
+        ];
 
-    #[test]
-    fn refreshed_replace_on_lag_recovery_drops_lost_tickets() {
-        let mut state = BoardState::new();
-        state.replace_on_refresh = true;
-        state.tickets = vec![make_ticket("T-old", TicketPhase::Backlog)];
-        let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![make_ticket("T-new", TicketPhase::Analysis)],
-            generation: 0,
-        });
-        assert_eq!(
-            state.tickets.len(),
-            1,
-            "replace must drop the pre-recovery tickets"
-        );
-        assert_eq!(state.tickets[0].id, "T-new");
-        assert!(!state.replace_on_refresh, "replace flag is one-shot");
-    }
-
-    #[test]
-    fn lag_recovery_marks_replace_so_snapshot_drops_resurrected_ticket() {
-        let mut state = BoardState::new();
-        // A ticket a delta updated (would be kept as absent), later removed by a
-        // delta that the lagged broadcast dropped. A lag recovery must replace
-        // the board so the recovered snapshot (which omits it) can drop it.
-        state.tickets = vec![make_ticket("T-1", TicketPhase::Done)];
-        let _task = state.update(BoardMessage::BoardRefreshNeeded);
-        assert!(
-            state.replace_on_refresh,
-            "a lagged stream marks the next snapshot as authoritative"
-        );
+        for (name, setup, snapshot, expected) in cases {
+            let (generation_before, loading, replace, tickets) = setup;
+            let mut state = BoardState::new();
+            state.board_generation = generation_before;
+            if loading {
+                state.load_state.start_loading();
+            }
+            state.replace_on_refresh = replace;
+            state.tickets = tickets;
+            let _task = match snapshot {
+                Some((generation, tickets)) => state.update(BoardMessage::Refreshed {
+                    tickets,
+                    generation,
+                }),
+                None => state.update(BoardMessage::BoardRefreshNeeded),
+            };
+            let (ids, replaces, loaded) = expected;
+            let actual: Vec<&str> = state.tickets.iter().map(|t| t.id.as_str()).collect();
+            assert_eq!(actual, ids, "case {name}: board tickets");
+            assert_eq!(
+                state.replace_on_refresh, replaces,
+                "case {name}: replace flag"
+            );
+            if let Some(loaded) = loaded {
+                assert_eq!(
+                    state.load_state.has_loaded(),
+                    loaded,
+                    "case {name}: load state"
+                );
+            }
+        }
     }
 
     #[test]
     fn refreshed_merge_keeps_newer_updated_at_and_does_not_readd_removed() {
+        const OLD: &str = "2026-08-27T04:00:00.000000+00:00";
+        const NEW: &str = "2026-08-27T04:00:01.000000+00:00";
+        let refresh = |state: &mut BoardState, tickets: Vec<Ticket>| {
+            let _task = state.update(BoardMessage::Refreshed {
+                tickets,
+                generation: 0,
+            });
+        };
         let mut state = BoardState::new();
-        state.replace_on_refresh = true;
+        // A lag recovery already consumed: the next refresh merges.
         let mut ticket = make_ticket("T-1", TicketPhase::Backlog);
-        ticket.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
+        ticket.updated_at = OLD.into();
         state.tickets = vec![ticket];
-        // Simulate a lag recovery already consumed: the next refresh merges.
-        state.replace_on_refresh = false;
+
         // A newer snapshot updates the stale cached ticket.
         let mut newer = make_ticket("T-1", TicketPhase::Analysis);
-        newer.updated_at = "2026-08-27T04:00:01.000000+00:00".into();
-        let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![newer],
-            generation: 0,
-        });
+        newer.updated_at = NEW.into();
+        refresh(&mut state, vec![newer]);
         assert_eq!(state.tickets[0].phase, TicketPhase::Analysis);
-        assert_eq!(
-            state.tickets[0].updated_at,
-            "2026-08-27T04:00:01.000000+00:00"
-        );
+        assert_eq!(state.tickets[0].updated_at, NEW);
 
         // A removed ticket is not re-added by a stale snapshot.
-        state.replace_on_refresh = false;
         state.delta_removed_ids.insert("T-2".into());
         let mut removed = make_ticket("T-2", TicketPhase::Done);
-        removed.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
-        let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![removed],
-            generation: 0,
-        });
+        removed.updated_at = OLD.into();
+        refresh(&mut state, vec![removed]);
         assert!(
             state.tickets.iter().all(|t| t.id != "T-2"),
             "an archived ticket must not be re-added from a stale snapshot"
@@ -2704,19 +2802,11 @@ mod tests {
         // A board ticket absent from a stale snapshot is kept (an omission is
         // ambiguous — the snapshot may predate its creation/delta), so a
         // delta-created ticket survives an older snapshot that omits it.
-        state.replace_on_refresh = false;
         let mut created = make_ticket("T-3", TicketPhase::Backlog);
-        created.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
+        created.updated_at = OLD.into();
         state.tickets = vec![created];
-        let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![],
-            generation: 0,
-        });
-        assert_eq!(
-            state.tickets.len(),
-            1,
-            "a board ticket absent from the snapshot is preserved"
-        );
+        refresh(&mut state, vec![]);
+        assert_eq!(state.tickets.len(), 1, "an omission preserves the ticket");
         assert_eq!(state.tickets[0].id, "T-3");
     }
 
@@ -2775,230 +2865,321 @@ mod tests {
         assert!(state.tickets.iter().all(|t| t.id != "T-1"));
     }
 
-    #[test]
-    fn test_mid_pipeline_cancel_confirmation_cycle() {
-        // A ticket in an implementation phase in the cached board list → the
-        // confirmation modal opens.
-        // (No detail modal open, so the list is the eligibility source.)
-        let mut state = BoardState::new();
-        state.tickets = vec![make_ticket("T-1", TicketPhase::InDevelopment)];
-        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
-        assert_eq!(
-            state.pending_cancel.as_deref(),
-            Some("T-1"),
-            "pipeline-occupied cancel must open the confirmation modal"
-        );
+    // ── Mid-pipeline cancel confirmation ─────────────────────────
 
-        // Dismissal (backdrop / Keep ticket) leaves the ticket untouched.
-        let _task = state.update(BoardMessage::DismissCancel);
-        assert!(state.pending_cancel.is_none());
-
-        // A plain cancel (non-pipeline phase) never opens the modal.
-        state.tickets = vec![make_ticket("T-1", TicketPhase::Backlog)];
-        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
-        assert!(
-            state.pending_cancel.is_none(),
-            "non-pipeline cancel must stay single-click"
-        );
-
-        // Confirming closes the modal (the PerformAction task carries the
-        // actual transition).
-        state.tickets = vec![make_ticket("T-1", TicketPhase::InDevelopment)];
-        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
-        let _task = state.update(BoardMessage::ConfirmCancel("T-1".into()));
-        assert!(state.pending_cancel.is_none());
-
-        // Escape dismisses the confirmation modal first, even when the
-        // comment input is focused — with the detail modal open showing a
-        // pipeline-occupied ticket.
-        let mut state = make_board_state();
-        state.selected_ticket = Some(make_ticket("T-1", TicketPhase::InDevelopment));
-        state.comment_focused = true;
-        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
-        let _task = state.update(BoardMessage::Escape);
-        assert!(
-            state.pending_cancel.is_none(),
-            "Escape must close the cancel-confirmation modal first"
-        );
-        assert!(
-            state.comment_focused,
-            "Escape on the confirm modal must not blur the comment input"
-        );
-        assert!(
-            state.selected_ticket.is_some(),
-            "Escape on the confirm modal must not close the ticket detail modal"
-        );
+    #[derive(Clone, Copy, PartialEq)]
+    enum Follow {
+        None,
+        Dismiss,
+        Confirm,
+        Escape,
     }
 
-    #[test]
-    fn test_request_cancel_eligibility_source_precedence() {
-        // The eligibility check uses the freshest synchronous state:
-        // `selected_ticket` (a fresh fetch, kept current by the CDC-driven
-        // detail refresh even during search), then search results (the exact
-        // cards the user sees while a search is active), then the board list.
-        // A stale lower-priority source must not decide the modal.
-        let mut state = make_board_state(); // selected_ticket: T-1, Backlog, no assignee
-        state.tickets = vec![make_ticket("T-1", TicketPhase::InDevelopment)];
-        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
-        assert!(
-            state.pending_cancel.is_none(),
-            "the fresher open detail (Backlog) must win over a stale list"
-        );
-
-        // Detail says pipeline-occupied while the list is stale → modal opens.
-        let mut state = make_board_state();
-        state.selected_ticket = Some(make_ticket("T-1", TicketPhase::Verification));
-        state.tickets = vec![make_ticket("T-1", TicketPhase::Backlog)];
-        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
-        assert_eq!(
-            state.pending_cancel.as_deref(),
-            Some("T-1"),
-            "pipeline-occupied detail must open the confirmation modal"
-        );
-
-        // During search the visible cards come from search_results (the
-        // list refresh is paused), so they are consulted before the list.
-        let mut state = make_board_state();
-        state.selected_ticket = None;
-        state.search_results = vec![make_ticket("T-1", TicketPhase::Verification)];
-        state.tickets = vec![make_ticket("T-1", TicketPhase::Backlog)];
-        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
-        assert_eq!(
-            state.pending_cancel.as_deref(),
-            Some("T-1"),
-            "search results must be consulted while a search is active"
-        );
-
-        // A ticket in none of the eligibility sources is not treated as
-        // pipeline-occupied, so the cancel stays single-click.
-        let mut state = make_board_state();
-        let _task = state.update(BoardMessage::RequestCancel("T-unknown".into()));
-        assert!(
-            state.pending_cancel.is_none(),
-            "unknown ticket must stay single-click"
-        );
+    struct CancelConfirmCase {
+        name: &'static str,
+        ticket_id: &'static str,
+        detail_phase: Option<TicketPhase>,
+        listed_phase: Option<TicketPhase>,
+        search_phase: Option<TicketPhase>,
+        follow_up: Follow,
+        opens_confirm: bool,
+        stays_pending: bool,
     }
 
-    // ── Undo / Redo for comment input ────────────────────────────
+    const CANCEL_CONFIRM_CASES: &[CancelConfirmCase] = &[
+        CancelConfirmCase {
+            name: "a pipeline-occupied cancel opens the confirmation modal",
+            ticket_id: "T-1",
+            detail_phase: None,
+            listed_phase: Some(TicketPhase::InDevelopment),
+            search_phase: None,
+            follow_up: Follow::None,
+            opens_confirm: true,
+            stays_pending: true,
+        },
+        CancelConfirmCase {
+            name: "dismissal leaves the ticket untouched",
+            ticket_id: "T-1",
+            detail_phase: None,
+            listed_phase: Some(TicketPhase::InDevelopment),
+            search_phase: None,
+            follow_up: Follow::Dismiss,
+            opens_confirm: true,
+            stays_pending: false,
+        },
+        CancelConfirmCase {
+            name: "a non-pipeline cancel stays single-click",
+            ticket_id: "T-1",
+            detail_phase: None,
+            listed_phase: Some(TicketPhase::Backlog),
+            search_phase: None,
+            follow_up: Follow::None,
+            opens_confirm: false,
+            stays_pending: false,
+        },
+        CancelConfirmCase {
+            name: "confirming closes the modal",
+            ticket_id: "T-1",
+            detail_phase: None,
+            listed_phase: Some(TicketPhase::InDevelopment),
+            search_phase: None,
+            follow_up: Follow::Confirm,
+            opens_confirm: true,
+            stays_pending: false,
+        },
+        CancelConfirmCase {
+            name: "Escape dismisses the confirm modal before anything else",
+            ticket_id: "T-1",
+            detail_phase: Some(TicketPhase::InDevelopment),
+            listed_phase: None,
+            search_phase: None,
+            follow_up: Follow::Escape,
+            opens_confirm: true,
+            stays_pending: false,
+        },
+        CancelConfirmCase {
+            name: "the fresher open detail wins over a stale list",
+            ticket_id: "T-1",
+            detail_phase: Some(TicketPhase::Backlog),
+            listed_phase: Some(TicketPhase::InDevelopment),
+            search_phase: None,
+            follow_up: Follow::None,
+            opens_confirm: false,
+            stays_pending: false,
+        },
+        CancelConfirmCase {
+            name: "a pipeline-occupied detail opens the confirmation modal",
+            ticket_id: "T-1",
+            detail_phase: Some(TicketPhase::Verification),
+            listed_phase: Some(TicketPhase::Backlog),
+            search_phase: None,
+            follow_up: Follow::None,
+            opens_confirm: true,
+            stays_pending: true,
+        },
+        CancelConfirmCase {
+            name: "search results are consulted while a search is active",
+            ticket_id: "T-1",
+            detail_phase: None,
+            listed_phase: Some(TicketPhase::Backlog),
+            search_phase: Some(TicketPhase::Verification),
+            follow_up: Follow::None,
+            opens_confirm: true,
+            stays_pending: true,
+        },
+        CancelConfirmCase {
+            name: "an unknown ticket stays single-click",
+            ticket_id: "T-unknown",
+            detail_phase: Some(TicketPhase::Backlog),
+            listed_phase: None,
+            search_phase: None,
+            follow_up: Follow::None,
+            opens_confirm: false,
+            stays_pending: false,
+        },
+    ];
 
+    /// Only a pipeline-occupied ticket asks before cancelling.
     #[test]
-    fn test_comment_undo_restores_content() {
-        let mut state = make_board_state();
-        // Simulate typing "abc" by performing edit actions.
-        for ch in &['a', 'b', 'c'] {
-            let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Insert(*ch)));
+    fn cancel_confirmation_opens_only_for_a_pipeline_occupied_ticket() {
+        for case in CANCEL_CONFIRM_CASES {
+            let name = case.name;
+            let mut state = BoardState::new();
+            state.selected_ticket = case.detail_phase.map(|phase| make_ticket("T-1", phase));
+            state.tickets = case
+                .listed_phase
+                .map(|phase| vec![make_ticket("T-1", phase)])
+                .unwrap_or_default();
+            state.search_results = case
+                .search_phase
+                .map(|phase| vec![make_ticket("T-1", phase)])
+                .unwrap_or_default();
+            if case.follow_up == Follow::Escape {
+                // The comment input is focused with the detail modal open.
+                state.comment_focused = true;
+            }
+
+            let _task = state.update(BoardMessage::RequestCancel(case.ticket_id.into()));
+            let asked = state.pending_cancel.as_deref();
+            assert_eq!(
+                asked,
+                case.opens_confirm.then_some("T-1"),
+                "case {name}: asked"
+            );
+            let _task = match case.follow_up {
+                Follow::None => Task::none(),
+                Follow::Dismiss => state.update(BoardMessage::DismissCancel),
+                Follow::Confirm => state.update(BoardMessage::ConfirmCancel("T-1".into())),
+                Follow::Escape => state.update(BoardMessage::Escape),
+            };
+            let pending_now = state.pending_cancel.as_deref();
+            assert_eq!(
+                pending_now,
+                case.stays_pending.then_some("T-1"),
+                "case {name}: pending"
+            );
+            if case.follow_up == Follow::Escape {
+                assert!(state.comment_focused, "case {name}: Escape must not blur");
+                assert!(state.selected_ticket.is_some(), "case {name}: modal stays");
+            }
         }
-        let text_before = state.comment_input.text();
-        assert_eq!(text_before, "abc", "input should have typed text");
-
-        // Undo restores previous state.
-        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Undo));
-        let text_after_undo = state.comment_input.text();
-        assert_ne!(
-            text_before, text_after_undo,
-            "undo should change the content"
-        );
-        // Redo restores the undone state.
-        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Redo));
-        assert_eq!(
-            state.comment_input.text(),
-            text_before,
-            "redo should restore undone content"
-        );
-    }
-
-    #[test]
-    fn test_comment_redo_no_undo_is_noop() {
-        let mut state = make_board_state();
-        let text = state.comment_input.text();
-        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Redo));
-        assert_eq!(
-            state.comment_input.text(),
-            text,
-            "redo with no undo history should be a no-op"
-        );
-    }
-
-    #[test]
-    fn test_comment_undo_cleared_on_reset_modal() {
-        let mut state = make_board_state();
-        // Build some history
-        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Insert('h')));
-        // Simulate more typing to build real undo history
-        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Insert('e')));
-        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Insert('l')));
-        state.reset_modal();
-        // After reset, undo should be a no-op.
-        let text = state.comment_input.text();
-        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Undo));
-        assert_eq!(
-            state.comment_input.text(),
-            text,
-            "undo should be no-op after modal reset"
-        );
-    }
-
-    // ── CommentSent: stale callback guard ─────────────────────────
-    //
-    // Note: there is only a single stale-callback test because the
-    // generation guard fires *before* the Result branch (Ok vs Err),
-    // so both variants exercise identical code. A single Ok test
-    // covers both.
-
-    #[test]
-    fn test_comment_sent_stale_callback() {
-        let mut state = make_board_state();
-        state.sending_comment = true;
-        state.comment_generation = 42;
-
-        // Callback with wrong generation should be dropped gracefully
-        // regardless of Ok/Err (the stale check fires before the branch).
-        let _task = state.update(BoardMessage::CommentSent(0, Ok(())));
-        assert!(
-            !state.sending_comment,
-            "sending_comment should be reset in stale callback"
-        );
     }
 
     // ── Ticket search (sidebar) ──────────────────────────────────
 
-    #[test]
-    fn test_search_empty_input_clears_results() {
-        let mut state = make_board_state();
-        state.search_results = vec![
-            TicketFixture::new("T-1", TicketPhase::Backlog)
-                .title("Old result")
-                .build(),
-        ];
-        state.search_generation = 5;
-        state.search_error = Some("old failure".to_string());
-
-        let _task = state.update(BoardMessage::SearchInputChanged(EditorAction::Paste(
-            String::new(),
-        )));
-
-        assert!(state.search_query.text().is_empty());
-        assert!(state.search_results.is_empty());
-        assert!(state.search_error.is_none());
-        // Generation bumped even on empty — invalidates any in-flight tasks
-        assert_eq!(state.search_generation, 6);
+    struct SearchInputCase {
+        name: &'static str,
+        query: &'static str,
+        had_results: bool,
+        error: Option<&'static str>,
+        generation: u64,
+        pasted: Option<&'static str>,
+        expected_generation: Option<u64>,
+        drops_error: bool,
     }
 
     #[test]
-    fn test_search_non_empty_stores_query_and_bumps_generation() {
-        let mut state = make_board_state();
-        state.search_generation = 3;
+    fn search_input_updates_query_and_generation() {
+        let cases = [
+            SearchInputCase {
+                name: "an empty input clears the results",
+                query: "",
+                had_results: true,
+                error: Some("stale"),
+                generation: 5,
+                pasted: Some(""),
+                expected_generation: Some(6),
+                drops_error: true,
+            },
+            SearchInputCase {
+                name: "a non-empty input stores the query and bumps the generation",
+                query: "",
+                had_results: false,
+                error: None,
+                generation: 3,
+                pasted: Some("network"),
+                expected_generation: None,
+                drops_error: false,
+            },
+            SearchInputCase {
+                name: "clearing the search resets the query and results",
+                query: "something",
+                had_results: true,
+                error: None,
+                generation: 7,
+                pasted: None,
+                expected_generation: Some(8),
+                drops_error: false,
+            },
+        ];
 
-        let _task = state.update(BoardMessage::SearchInputChanged(EditorAction::Paste(
-            "network".into(),
-        )));
+        for case in cases {
+            let name = case.name;
+            let mut state = make_board_state();
+            state.search_query = super::super::common::SingleLineEditorState::new(case.query);
+            if case.had_results {
+                state.search_results = page("T-1", TicketPhase::Backlog);
+            }
+            state.search_generation = case.generation;
+            state.search_error = case.error.map(str::to_string);
 
-        assert_eq!(state.search_query.text(), "network");
-        // Generation bumped so stale callbacks are discarded
-        assert!(
-            state.search_generation > 3,
-            "generation should be incremented"
-        );
+            match case.pasted {
+                Some(query) => {
+                    let action = EditorAction::Paste(query.to_string());
+                    let _task = state.update(BoardMessage::SearchInputChanged(action));
+                }
+                None => {
+                    let _task = state.update(BoardMessage::SearchCleared);
+                }
+            }
+
+            // The field shows what was typed, and the results are gone.
+            let expected_query = case.pasted.unwrap_or("");
+            assert_eq!(
+                state.search_query.text(),
+                expected_query,
+                "case {name}: query"
+            );
+            assert!(
+                state.search_results.is_empty(),
+                "case {name}: results empty"
+            );
+            // A text change always bumps the generation, so in-flight tasks
+            // for the previous query are discarded.
+            assert!(
+                state.search_generation > case.generation,
+                "case {name}: bumped"
+            );
+            if let Some(expected) = case.expected_generation {
+                assert_eq!(state.search_generation, expected, "case {name}: generation");
+            }
+            assert_eq!(
+                state.search_error.is_some(),
+                case.error.is_some() && !case.drops_error,
+                "case {name}: the previous failure is dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn search_results_and_errors_follow_the_generation() {
+        let bl = TicketPhase::Backlog;
+        // (case, (generation, stale results shown, error shown),
+        // (the callback, expected ids, expected error))
+        let cases = [
+            (
+                "a stale result callback is discarded",
+                (99, false, None),
+                (Ok((page("T-stale", bl), 50)), &[][..], None),
+            ),
+            (
+                "a current result replaces the window and clears the failure",
+                (42, false, Some("previous")),
+                (Ok((page("T-fresh", bl), 42)), &["T-fresh"][..], None),
+            ),
+            (
+                "a current failure clears the stale results",
+                (7, true, None),
+                (
+                    Err(("fts unavailable", 7)),
+                    &[][..],
+                    Some("fts unavailable"),
+                ),
+            ),
+            (
+                "a stale failure is discarded",
+                (9, false, None),
+                (Err(("old failure", 3)), &[][..], None),
+            ),
+        ];
+
+        for (name, before, callback) in cases {
+            let (generation, results, error) = before;
+            let (outcome, ids, wanted) = callback;
+            let mut state = make_board_state();
+            state.search_generation = generation;
+            if results {
+                state.search_results = page("T-stale", bl);
+            }
+            state.search_error = error.map(str::to_string);
+
+            let _task = match outcome {
+                Ok((tickets, generation)) => {
+                    state.update(BoardMessage::SearchResults(tickets, generation))
+                }
+                Err((error, generation)) => {
+                    state.update(BoardMessage::SearchError(error.to_string(), generation))
+                }
+            };
+
+            let actual: Vec<&str> = state
+                .search_results
+                .iter()
+                .map(|ticket| ticket.id.as_str())
+                .collect();
+            assert_eq!(actual, ids, "case {name}: results");
+            assert_eq!(state.search_error.as_deref(), wanted, "case {name}: error");
+        }
     }
 
     /// A failed board list read stays visible until a successful refresh replaces it.
@@ -3028,101 +3209,6 @@ mod tests {
         });
         assert!(state.load_state.error().is_none());
         assert!(state.load_state.has_loaded());
-    }
-
-    #[test]
-    fn test_search_results_stale_callback_discarded() {
-        let mut state = make_board_state();
-        state.search_generation = 99;
-
-        // A stale result (generation 50 < current 99) should be ignored
-        let _task = state.update(BoardMessage::SearchResults(
-            vec![
-                TicketFixture::new("T-stale", TicketPhase::Backlog)
-                    .title("Stale")
-                    .build(),
-            ],
-            50,
-        ));
-
-        assert!(
-            state.search_results.is_empty(),
-            "stale callback should not populate results"
-        );
-    }
-
-    #[test]
-    fn test_search_results_current_generation_accepted() {
-        let mut state = make_board_state();
-        state.search_query.set_text("network");
-        state.search_generation = 42;
-        state.search_error = Some("previous failure".to_string());
-
-        let _task = state.update(BoardMessage::SearchResults(
-            vec![
-                TicketFixture::new("T-fresh", TicketPhase::Backlog)
-                    .title("Fresh result")
-                    .build(),
-            ],
-            42,
-        ));
-
-        assert_eq!(state.search_results.len(), 1);
-        assert_eq!(state.search_results[0].id, "T-fresh");
-        assert!(
-            state.search_error.is_none(),
-            "a successful search must clear the previous failure"
-        );
-    }
-
-    #[test]
-    fn test_search_error_current_generation_sets_error_and_clears_results() {
-        let mut state = make_board_state();
-        state.search_generation = 7;
-        state.search_results = vec![
-            TicketFixture::new("T-stale", TicketPhase::Backlog)
-                .title("Stale result")
-                .build(),
-        ];
-
-        let _task = state.update(BoardMessage::SearchError("fts unavailable".to_string(), 7));
-
-        assert!(
-            state.search_results.is_empty(),
-            "a failed search must not keep rendering stale results"
-        );
-        assert_eq!(state.search_error.as_deref(), Some("fts unavailable"));
-    }
-
-    #[test]
-    fn test_search_error_stale_callback_discarded() {
-        let mut state = make_board_state();
-        state.search_generation = 9;
-
-        let _task = state.update(BoardMessage::SearchError("old failure".to_string(), 3));
-
-        assert!(
-            state.search_error.is_none(),
-            "a stale failure must not replace the current search state"
-        );
-    }
-
-    #[test]
-    fn test_search_cleared_resets_query_and_results() {
-        let mut state = make_board_state();
-        state.search_query.set_text("something");
-        state.search_results = vec![
-            TicketFixture::new("T-1", TicketPhase::Backlog)
-                .title("Result")
-                .build(),
-        ];
-        state.search_generation = 7;
-
-        let _task = state.update(BoardMessage::SearchCleared);
-
-        assert!(state.search_query.text().is_empty());
-        assert!(state.search_results.is_empty());
-        assert_eq!(state.search_generation, 8);
     }
 
     // ── Completed-column ordering ──────────────────────────────────
@@ -3168,57 +3254,55 @@ mod tests {
         assert_eq!(ids, ["d1", "d2", "d3", "c1", "c2", "c3"]);
     }
 
-    // ── Pause-all-queued helper ─────────────────────
-
-    /// Build a ticket for the pause-helper tests in `workspace`, optionally
-    /// archived.
-    fn ticket_in(workspace: &str, id: &str, phase: TicketPhase, archived: bool) -> Ticket {
-        TicketFixture::new(id, phase)
-            .workspace(workspace)
-            .archived(archived)
-            .build()
-    }
+    // ── Pause-all-queued helpers ──────────────────────────────────
 
     #[test]
-    fn has_queued_tickets_true_when_a_queued_ticket_is_listed() {
-        let mut state = make_board_state();
-        state.tickets = vec![
-            ticket_in("ws1", "t1", TicketPhase::Queued, false),
-            ticket_in("ws1", "t2", TicketPhase::Backlog, false),
+    fn has_queued_tickets_reads_the_listed_board() {
+        let cases = [
+            (
+                "true when a queued ticket is listed",
+                vec![
+                    ticket_in("ws1", "t1", TicketPhase::Queued, false),
+                    ticket_in("ws1", "t2", TicketPhase::Backlog, false),
+                ],
+                false,
+                true,
+            ),
+            (
+                "false without a queued ticket",
+                vec![
+                    ticket_in("ws1", "t1", TicketPhase::Backlog, false),
+                    ticket_in("ws1", "t2", TicketPhase::Planning, false),
+                ],
+                false,
+                false,
+            ),
+            (
+                "archived queued tickets do not count",
+                vec![ticket_in("ws1", "t1", TicketPhase::Queued, true)],
+                false,
+                false,
+            ),
+            (
+                "an active search only gates what the sidebar renders",
+                vec![ticket_in("ws1", "t1", TicketPhase::Queued, false)],
+                true,
+                true,
+            ),
         ];
-        assert!(state.has_queued_tickets());
-    }
 
-    #[test]
-    fn has_queued_tickets_false_without_queued() {
-        let mut state = make_board_state();
-        state.tickets = vec![
-            ticket_in("ws1", "t1", TicketPhase::Backlog, false),
-            ticket_in("ws1", "t2", TicketPhase::Planning, false),
-        ];
-        assert!(!state.has_queued_tickets());
+        for (name, tickets, searching, expected) in cases {
+            let mut state = make_board_state();
+            state.tickets = tickets;
+            if searching {
+                // A Queued ticket in the listed board keeps the context-menu
+                // item available even when the search shows none.
+                state.search_query = super::super::common::SingleLineEditorState::new("foo");
+                state.search_results = vec![ticket_in("ws1", "t2", TicketPhase::Backlog, false)];
+            }
+            assert_eq!(state.has_queued_tickets(), expected, "case {name}");
+        }
     }
-
-    #[test]
-    fn has_queued_tickets_ignores_archived_tickets() {
-        let mut state = make_board_state();
-        state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, true)];
-        assert!(!state.has_queued_tickets());
-    }
-
-    #[test]
-    fn has_queued_tickets_ignores_an_active_search() {
-        let mut state = make_board_state();
-        // An active search only gates what the sidebar renders; the bulk gate
-        // still reads the listed board, so a Queued ticket there keeps the
-        // context-menu item available even when the search shows none.
-        state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, false)];
-        state.search_query = super::super::common::SingleLineEditorState::new("foo");
-        state.search_results = vec![ticket_in("ws1", "t2", TicketPhase::Backlog, false)];
-        assert!(state.has_queued_tickets());
-    }
-
-    // ── The ticket column's own presence ─────────────────────────
 
     #[test]
     fn the_ticket_column_is_hidden_only_by_a_loaded_empty_board() {
@@ -3243,40 +3327,47 @@ mod tests {
     }
 
     #[test]
-    fn queued_workspaces_are_derived_from_listed_queued_tickets() {
-        let mut state = make_board_state();
-        state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, false)];
-        assert_eq!(state.queued_workspaces(), vec!["ws1".to_string()]);
-    }
-
-    #[test]
-    fn queued_workspaces_derives_and_dedupes() {
-        let mut state = make_board_state();
-        state.tickets = vec![
-            ticket_in("ws1", "t1", TicketPhase::Queued, false),
-            ticket_in("ws1", "t2", TicketPhase::Queued, false),
-            ticket_in("ws2", "t3", TicketPhase::Queued, false),
-            ticket_in("ws3", "t4", TicketPhase::Planning, false),
+    fn queued_workspaces_come_from_the_listed_board() {
+        let cases = [
+            (
+                "derived from the listed queued tickets",
+                vec![ticket_in("ws1", "t1", TicketPhase::Queued, false)],
+                false,
+                vec!["ws1"],
+            ),
+            (
+                "derived and deduped across workspaces",
+                vec![
+                    ticket_in("ws1", "t1", TicketPhase::Queued, false),
+                    ticket_in("ws1", "t2", TicketPhase::Queued, false),
+                    ticket_in("ws2", "t3", TicketPhase::Queued, false),
+                    ticket_in("ws3", "t4", TicketPhase::Planning, false),
+                ],
+                false,
+                vec!["ws1", "ws2"],
+            ),
+            (
+                "an active search never contributes its workspaces",
+                vec![ticket_in("hidden", "t1", TicketPhase::Queued, false)],
+                true,
+                vec!["hidden"],
+            ),
         ];
-        // Distinct workspaces of the listed non-archived Queued tickets only.
-        assert_eq!(
-            state.queued_workspaces(),
-            vec!["ws1".to_string(), "ws2".to_string()]
-        );
-    }
 
-    #[test]
-    fn queued_workspaces_ignore_an_active_search() {
-        let mut state = make_board_state();
-        // The active search shows tickets in other workspaces, but the bulk
-        // pause covers the listed board: the workspace set comes from
-        // `state.tickets`, never the search results.
-        state.tickets = vec![ticket_in("hidden", "t1", TicketPhase::Queued, false)];
-        state.search_query = super::super::common::SingleLineEditorState::new("foo");
-        state.search_results = vec![
-            ticket_in("ws1", "t2", TicketPhase::Queued, false),
-            ticket_in("ws2", "t3", TicketPhase::Queued, false),
-        ];
-        assert_eq!(state.queued_workspaces(), vec!["hidden".to_string()]);
+        for (name, tickets, searching, expected) in cases {
+            let mut state = make_board_state();
+            state.tickets = tickets;
+            if searching {
+                // The bulk pause covers the listed board: the workspace set
+                // comes from `state.tickets`, never the search results.
+                state.search_query = super::super::common::SingleLineEditorState::new("foo");
+                state.search_results = vec![
+                    ticket_in("ws1", "t2", TicketPhase::Queued, false),
+                    ticket_in("ws2", "t3", TicketPhase::Queued, false),
+                ];
+            }
+            let workspaces: Vec<String> = state.queued_workspaces();
+            assert_eq!(workspaces, expected, "case {name}");
+        }
     }
 }

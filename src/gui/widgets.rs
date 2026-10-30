@@ -2173,373 +2173,350 @@ impl<Message: Clone, Theme, Renderer> ClickToggle<'_, Message, Theme, Renderer> 
 mod tests {
     use super::*;
 
-    #[test]
-    fn git_footer_stats_gating() {
-        // Nothing to show when all stats are zero.
-        assert!(git_footer_stats::<()>(0, 0, 0, 0, 15.0).is_none());
-        // A binary/huge untracked count alone still shows (not silently dropped).
-        assert!(git_footer_stats::<()>(0, 0, 3, 0, 15.0).is_some());
-        // Non-zero line counts show regardless of the file-counts.
-        assert!(git_footer_stats::<()>(1, 0, 0, 0, 15.0).is_some());
-        assert!(git_footer_stats::<()>(0, 1, 2, 0, 15.0).is_some());
-        // Files left out by the worktree read cap alone still show.
-        assert!(git_footer_stats::<()>(0, 0, 0, 5, 15.0).is_some());
-    }
+    /// Visible tree rows: a directory is marked by its trailing `/`.
+    type Nodes = &'static [(&'static str, bool)];
 
-    /// Helper to create a FileTree with known visible_tree_nodes for testing.
-    fn make_tree(nodes: Vec<(&str, bool)>) -> FileTree {
+    const SRC: Nodes = &[("src", true), ("src/main.rs", false), ("Cargo.toml", false)];
+    const AB: Nodes = &[("a", false), ("b", false)];
+
+    const INTO: ScrollMode = ScrollMode::ScrollIntoView;
+    const TOP: ScrollMode = ScrollMode::SnapToTop;
+
+    fn make_tree(nodes: Nodes) -> FileTree {
         let mut tree = FileTree::new(iced::widget::Id::new("test"));
-        tree.visible_tree_nodes = nodes
-            .into_iter()
-            .map(|(p, is_dir)| (p.to_string(), is_dir))
-            .collect();
+        tree.visible_tree_nodes = nodes.iter().map(|&(p, d)| (p.to_string(), d)).collect();
         tree
     }
 
+    fn file(path: &str) -> TreeNode {
+        TreeNode {
+            name: path.rsplit('/').next().unwrap_or(path).into(),
+            full_path: path.into(),
+            is_dir: false,
+            children: vec![],
+            error: None,
+            ignored: false,
+        }
+    }
+
+    fn dir(path: &str, children: Vec<TreeNode>) -> TreeNode {
+        TreeNode {
+            name: path.into(),
+            full_path: path.into(),
+            is_dir: true,
+            children,
+            error: None,
+            ignored: false,
+        }
+    }
+
     #[test]
-    #[expect(clippy::type_complexity)]
+    fn git_footer_stats_gating() {
+        // (added, deleted, untracked, skipped, shown)
+        let cases = [
+            (0, 0, 0, 0, false),
+            (0, 0, 3, 0, true),
+            (1, 0, 0, 0, true),
+            (0, 1, 2, 0, true),
+            (0, 0, 0, 5, true),
+        ];
+        for &(added, deleted, untracked, skipped, shown) in &cases {
+            let stats = git_footer_stats::<()>(added, deleted, untracked, skipped, 15.0);
+            let shown_stats = stats.is_some();
+            assert_eq!(
+                shown_stats, shown,
+                "case {added}/{deleted}/{untracked}/{skipped}"
+            );
+        }
+    }
+
+    type FocusCase<'a> = (&'a str, Nodes, &'a str, (usize, Option<usize>, usize));
+    /// `focus_path` finds a visible node and leaves the index alone when it does not.
+    #[test]
     fn focus_path_cases() {
-        // (name, nodes, path, expected return, expected focus index)
-        #[rustfmt::skip]
-        let cases: &[(&str, &[(&str, bool)], &str, Option<usize>, usize)] = &[
-            ("found", &[("src", true), ("src/main.rs", false), ("Cargo.toml", false)], "src/main.rs", Some(1), 1),
-            ("empty_tree", &[], "anything", None, 0),
-            ("first_node", &[("src", true), ("src/main.rs", false)], "src", Some(0), 0),
+        // (case, nodes, path, (start index, returned index, resulting index))
+        let cases: &[FocusCase] = &[
+            ("found", SRC, "src/main.rs", (0, Some(1), 1)),
+            ("empty tree", &[], "anything", (0, None, 0)),
+            ("first node", SRC, "src", (0, Some(0), 0)),
+            ("last node", SRC, "Cargo.toml", (0, Some(2), 2)),
+            ("invisible keeps index", SRC, "nonexistent", (42, None, 42)),
+            ("refocus", SRC, "src", (2, Some(0), 0)),
         ];
-        for &(name, nodes, path, expected, expected_index) in cases {
-            let mut tree = make_tree(nodes.to_vec());
-            assert_eq!(tree.focus_path(path), expected, "case: {name}");
-            assert_eq!(
-                tree.tree_focus_index, expected_index,
-                "case: {name} (index)"
-            );
+        for &(name, nodes, path, (start, found, index)) in cases {
+            let mut tree = make_tree(nodes);
+            tree.tree_focus_index = start;
+            assert_eq!(tree.focus_path(path), found, "case {name}");
+            assert_eq!(tree.tree_focus_index, index, "case {name}: index");
         }
     }
 
-    #[test]
-    fn focus_path_not_found() {
-        let mut tree = make_tree(vec![("src", true), ("Cargo.toml", false)]);
-        tree.tree_focus_index = 42;
-        assert_eq!(tree.focus_path("nonexistent"), None);
-        assert_eq!(tree.tree_focus_index, 42);
-    }
-
-    #[test]
-    fn focus_path_updates_index_no_residual() {
-        let mut tree = make_tree(vec![("a", false), ("b", false), ("c", false)]);
-        // Focus on "c", then re-focus on "a" — should end up at index 0.
-        tree.focus_path("c");
-        assert_eq!(tree.tree_focus_index, 2);
-        tree.focus_path("a");
-        assert_eq!(tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    #[expect(clippy::type_complexity)]
-    fn focused_tree_node_cases() {
-        // (name, nodes, focused, focus index, expected node)
-        #[rustfmt::skip]
-        let cases: &[(&str, &[(&str, bool)], bool, usize, Option<(usize, &str, bool)>)] = &[
-            // Tree is not focused (default).
-            ("not_focused", &[("src", true), ("src/main.rs", false)], false, 0, None),
-            ("empty_visible_nodes", &[], true, 0, None),
-            // Set index beyond bounds — method should clamp.
-            ("clamps_index", &[("a", false), ("b", false)], true, 10, Some((1, "b", false))),
-            ("returns_correct_node", &[("src", true), ("src/main.rs", false), ("Cargo.toml", false)], true, 1, Some((1, "src/main.rs", false))),
-            ("returns_directory", &[("src", true), ("src/main.rs", false)], true, 0, Some((0, "src", true))),
-        ];
-        for &(name, nodes, focused, focus_index, expected) in cases {
-            let mut tree = make_tree(nodes.to_vec());
-            tree.tree_focused = focused;
-            tree.tree_focus_index = focus_index;
-            assert_eq!(
-                tree.focused_tree_node(),
-                expected.map(|(i, p, d)| (i, p.to_string(), d)),
-                "case: {name}"
-            );
-        }
-    }
-
-    // ── nav_up / nav_down tests ──────────────────────────────────────
-
+    type NavCase = (&'static str, bool, bool, (usize, bool, usize));
+    /// A nav step is clamped at the ends and inert while the tree is not focused.
     #[test]
     fn nav_cases() {
-        // (name, direction, focused, start index, expected moved, expected index)
-        let cases: &[(&str, &str, bool, usize, bool, usize)] = &[
-            ("up_at_top_clamped", "up", true, 0, false, 0),
-            ("down_at_bottom_clamped", "down", true, 1, false, 1),
-            ("up_moves_focus", "up", true, 1, true, 0),
-            ("down_moves_focus", "down", true, 0, true, 1),
-            ("ignored_when_not_focused_up", "up", false, 0, false, 0),
-            ("ignored_when_not_focused_down", "down", false, 0, false, 0),
+        // (case, up?, focused?, (start index, moved, resulting index))
+        let cases: &[NavCase] = &[
+            ("up at top", true, true, (0, false, 0)),
+            ("down at bottom", false, true, (1, false, 1)),
+            ("up moves", true, true, (1, true, 0)),
+            ("down moves", false, true, (0, true, 1)),
+            ("up unfocused", true, false, (0, false, 0)),
+            ("down unfocused", false, false, (0, false, 0)),
         ];
-        for &(name, dir, focused, start, expected_moved, expected_index) in cases {
-            let mut tree = make_tree(vec![("a", false), ("b", false)]);
+        for &(name, up, focused, (start, moved, index)) in cases {
+            let mut tree = make_tree(AB);
             tree.tree_focused = focused;
             tree.tree_focus_index = start;
-            let moved = if dir == "up" {
-                tree.nav_up()
-            } else {
-                tree.nav_down()
-            };
-            assert_eq!(moved, expected_moved, "case: {name}");
-            assert_eq!(
-                tree.tree_focus_index, expected_index,
-                "case: {name} (index)"
-            );
+            let moved_now = if up { tree.nav_up() } else { tree.nav_down() };
+            assert_eq!(moved_now, moved, "case {name}");
+            assert_eq!(tree.tree_focus_index, index, "case {name}: index");
         }
     }
 
-    // ── rebuild_visible clamping tests ────────────────────────────────
-
+    type NodeCase<'a> = (
+        &'a str,
+        Nodes,
+        (bool, usize),
+        Option<(usize, &'a str, bool)>,
+    );
+    type DirCase<'a> = (&'a str, Nodes, (bool, Option<&'a str>), bool);
+    /// The focused row and its parent are clamped and absent while unfocused.
     #[test]
-    fn rebuild_visible_clamps_high_focus_index() {
-        let mut tree = FileTree::new(iced::widget::Id::new("test"));
-        tree.nodes = vec![
-            TreeNode {
-                name: "a".into(),
-                full_path: "a".into(),
-                is_dir: false,
-                children: vec![],
-                error: None,
-                ignored: false,
-            },
-            TreeNode {
-                name: "b".into(),
-                full_path: "b".into(),
-                is_dir: false,
-                children: vec![],
-                error: None,
-                ignored: false,
-            },
-            TreeNode {
-                name: "c".into(),
-                full_path: "c".into(),
-                is_dir: false,
-                children: vec![],
-                error: None,
-                ignored: false,
-            },
+    fn focused_tree_node_cases() {
+        // (case, nodes, (focused, focus index), expected (index, path, is_dir))
+        let node_cases: &[NodeCase] = &[
+            ("not focused", SRC, (false, 0), None),
+            ("empty nodes", &[], (true, 0), None),
+            ("clamps index", AB, (true, 10), Some((1, "b", false))),
+            (
+                "finds node",
+                SRC,
+                (true, 1),
+                Some((1, "src/main.rs", false)),
+            ),
+            ("directory", SRC, (true, 0), Some((0, "src", true))),
         ];
+        for &(name, nodes, (focused, focus_index), expected) in node_cases {
+            let mut tree = make_tree(nodes);
+            tree.tree_focused = focused;
+            tree.tree_focus_index = focus_index;
+            let shown = expected.map(|(i, p, d)| (i, p.to_string(), d));
+            assert_eq!(tree.focused_tree_node(), shown, "case {name}");
+        }
+
+        // (case, nodes, (focused, expanded dir), expected)
+        let dir_cases: &[DirCase] = &[
+            ("not focused", SRC, (false, None), false),
+            ("empty tree", &[], (true, None), false),
+            ("file", &[("main.rs", false)], (true, None), false),
+            ("collapsed dir", &[("src", true)], (true, None), false),
+            ("expanded dir", &[("src", true)], (true, Some("src")), true),
+        ];
+        for &(name, nodes, (focused, expanded), expected) in dir_cases {
+            let mut tree = make_tree(nodes);
+            tree.tree_focused = focused;
+            if let Some(dir) = expanded {
+                tree.expanded_dirs.insert(dir.into());
+            }
+            assert_eq!(tree.focused_is_expanded_dir(), expected, "case {name}");
+        }
+
+        // (case, nodes, focused, parent path)
+        let parent_cases: &[(&str, Nodes, bool, Option<&str>)] = &[
+            ("not focused", &[("src/main.rs", false)], false, None),
+            ("empty tree", &[], true, None),
+            ("root item", &[("src", true)], true, None),
+            ("nested", &[("src/main.rs", false)], true, Some("src")),
+            ("deep", &[("a/b/c/file.rs", false)], true, Some("a/b/c")),
+        ];
+        for &(name, nodes, focused, expected) in parent_cases {
+            let mut tree = make_tree(nodes);
+            tree.tree_focused = focused;
+            let parent = tree.focused_parent_path();
+            assert_eq!(parent.as_deref(), expected, "case {name}");
+        }
+    }
+
+    /// A rebuild keeps the focus index inside the rows it produced; empty resets it.
+    #[test]
+    fn rebuild_visible_cases() {
+        let mut tree = FileTree::new(iced::widget::Id::new("test"));
+        tree.nodes = ["a", "b", "c"].iter().map(|p| file(p)).collect();
         tree.rebuild_visible();
         assert_eq!(tree.visible_tree_nodes.len(), 3);
         tree.tree_focus_index = 999;
         tree.rebuild_visible();
-        assert_eq!(tree.tree_focus_index, 2);
-    }
+        assert_eq!(tree.tree_focus_index, 2, "the high index is clamped");
 
-    #[test]
-    fn rebuild_visible_empty_tree_resets_focus_index() {
-        let mut tree = make_tree(vec![("a", false)]);
+        let mut tree = make_tree(&[("a", false)]);
         tree.tree_focus_index = 0;
         tree.nodes.clear();
         tree.expanded_dirs.clear();
         tree.rebuild_visible();
         assert!(tree.visible_tree_nodes.is_empty());
-        assert_eq!(tree.tree_focus_index, 0);
+        assert_eq!(tree.tree_focus_index, 0, "an empty tree resets the index");
     }
 
-    // ── focused_is_expanded_dir tests ────────────────────────────────
+    /// A `src/` directory holding `lib.rs` and `main.rs`, before any rebuild.
+    fn tree_with_src_dir() -> FileTree {
+        let mut tree = FileTree::new(iced::widget::Id::new("test"));
+        tree.nodes = vec![dir("src", vec![file("src/lib.rs"), file("src/main.rs")])];
+        tree
+    }
 
+    type ExpandDirCase<'a> = (&'a str, bool, (bool, bool), (&'a [&'a str], usize));
+    /// Expanding focuses the first child; collapsing keeps the directory focused.
     #[test]
-    #[expect(clippy::type_complexity)]
-    fn focused_is_expanded_dir_cases() {
-        // (name, nodes, focused, expanded dir, expected)
-        #[rustfmt::skip]
-        let cases: &[(&str, &[(&str, bool)], bool, Option<&str>, bool)] = &[
-            // Tree is not focused.
-            ("not_focused", &[("src", true)], false, None, false),
-            ("empty_tree", &[], true, None, false),
-            ("file", &[("main.rs", false)], true, None, false),
-            // "src" is a directory but not in expanded_dirs.
-            ("collapsed_directory", &[("src", true)], true, None, false),
-            ("expanded_directory", &[("src", true)], true, Some("src"), true),
+    fn expand_collapse_dir_cases() {
+        // (case, expand?, (rebuilt before, children cleared), (visible rows, focus index))
+        let cases: &[ExpandDirCase] = &[
+            (
+                "expand advances",
+                true,
+                (false, false),
+                (&["src", "src/lib.rs", "src/main.rs"], 1),
+            ),
+            ("expand no children", true, (false, true), (&["src"], 0)),
+            (
+                "collapse after rebuild",
+                false,
+                (true, false),
+                (&["src"], 0),
+            ),
+            (
+                "collapse without rebuild",
+                false,
+                (false, false),
+                (&["src"], 0),
+            ),
         ];
-        for &(name, nodes, focused, expanded, expected) in cases {
-            let mut tree = make_tree(nodes.to_vec());
-            tree.tree_focused = focused;
-            if let Some(dir) = expanded {
-                tree.expanded_dirs.insert(dir.into());
+        for &(name, expand, (rebuilt, no_children), (visible, focus)) in cases {
+            let mut tree = tree_with_src_dir();
+            if no_children {
+                tree.nodes[0].children.clear();
             }
-            assert_eq!(tree.focused_is_expanded_dir(), expected, "case: {name}");
+            if expand {
+                tree.expanded_dirs.insert("src".into());
+                assert!(
+                    tree.visible_tree_nodes.is_empty(),
+                    "case {name}: no rows yet"
+                );
+                let _task = tree.expand_dir_and_focus_first_child::<()>("src");
+            } else {
+                if rebuilt {
+                    tree.expanded_dirs.insert("src".into());
+                    tree.rebuild_visible();
+                    assert_eq!(
+                        tree.visible_tree_nodes.len(),
+                        3,
+                        "case {name}: expanded rows"
+                    );
+                    tree.expanded_dirs.remove("src");
+                }
+                let _task = tree.collapse_dir_and_keep_focus::<()>("src");
+            }
+            let rows: Vec<&str> = tree
+                .visible_tree_nodes
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .collect();
+            assert_eq!(rows, visible, "case {name}");
+            assert_eq!(tree.tree_focus_index, focus, "case {name}: focus");
         }
     }
-
-    // ── focused_parent_path tests ────────────────────────────────────
 
     #[test]
-    fn focused_parent_path_cases() {
-        // (name, nodes, focused, expected)
-        #[rustfmt::skip]
-        #[expect(clippy::type_complexity)] // focused_parent_path case table
-        let cases: &[(&str, &[(&str, bool)], bool, Option<&str>)] = &[
-            ("not_focused", &[("src/main.rs", false)], false, None),
-            ("empty_tree", &[], true, None),
-            // Root-level item — no parent.
-            ("root_item", &[("src", true)], true, None),
-            ("nested", &[("src/main.rs", false)], true, Some("src")),
-            ("deep_nested", &[("a/b/c/file.rs", false)], true, Some("a/b/c")),
+    fn expand_dir_not_in_expanded_dirs_panics_in_debug() {
+        let mut tree = tree_with_src_dir();
+        // Deliberately not in expanded_dirs — the debug_assert fires in debug builds.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _task = tree.expand_dir_and_focus_first_child::<()>("src");
+        }));
+        #[cfg(debug_assertions)]
+        assert!(
+            result.is_err(),
+            "debug_assert should fire when path is not expanded"
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(result.is_ok(), "no panic expected in release builds");
+    }
+
+    #[test]
+    fn collapse_dir_still_in_expanded_dirs_panics_in_debug() {
+        let mut tree = tree_with_src_dir();
+        // Still in expanded_dirs — the debug_assert fires in debug builds.
+        tree.expanded_dirs.insert("src".into());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _task = tree.collapse_dir_and_keep_focus::<()>("src");
+        }));
+        #[cfg(debug_assertions)]
+        assert!(
+            result.is_err(),
+            "debug_assert should fire when path is still expanded"
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(result.is_ok(), "no panic expected in release builds");
+    }
+
+    fn tree_with_viewport(n: usize, scroll_y: f32, viewport_h: Option<f32>) -> FileTree {
+        let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
+        tree.visible_tree_nodes = (0..n).map(|i| (format!("file_{i}.rs"), false)).collect();
+        tree.scroll_y = scroll_y;
+        tree.viewport_h = viewport_h;
+        tree
+    }
+
+    type ScrollCase = (&'static str, f32, Option<f32>, usize, ScrollMode, f32);
+    #[test]
+    fn scroll_to_tree_focus_positions_viewport() {
+        // (case, scroll y, viewport height, focus index, mode, expected scroll y)
+        let cases: &[ScrollCase] = &[
+            ("fully visible", 40.0, Some(400.0), 3, INTO, 40.0),
+            ("below viewport", 0.0, Some(200.0), 15, INTO, 19.5),
+            ("above viewport", 100.0, Some(400.0), 3, INTO, 58.5),
+            ("top edge partial", 50.0, Some(400.0), 2, INTO, 50.0),
+            ("no viewport snaps", 10.0, None, 10, INTO, 195.0),
+            ("snap to top", 0.0, Some(400.0), 8, TOP, 156.0),
         ];
-        for &(name, nodes, focused, expected) in cases {
-            let mut tree = make_tree(nodes.to_vec());
-            tree.tree_focused = focused;
-            assert_eq!(
-                tree.focused_parent_path(),
-                expected.map(str::to_string),
-                "case: {name}"
-            );
+        for &(name, scroll_y, viewport_h, focus, mode, expected) in cases {
+            let mut tree = tree_with_viewport(30, scroll_y, viewport_h);
+            tree.tree_focus_index = focus;
+            let _task = scroll_to_tree_focus::<()>(&mut tree, mode);
+            let got = tree.scroll_y;
+            assert!((got - expected).abs() < 0.01, "case {name}: scroll_y {got}");
         }
+
+        // An empty tree early-returns and leaves the offset alone.
+        let mut tree = tree_with_viewport(0, 0.0, Some(400.0));
+        let _task = scroll_to_tree_focus::<()>(&mut tree, INTO);
+        assert!(tree.scroll_y.abs() < f32::EPSILON, "case empty tree");
     }
 
-    // ── tree_guide_prefix tests ────────────────────────────────────────────
-
-    /// A single test case for [`tree_guide_prefix`].
-    struct GuidePrefixCase {
-        /// Human-readable name for failure diagnostics.
-        name: &'static str,
-        /// Which ancestor depths have continuation markers.
-        mask: u64,
-        /// Depth of the current node.
-        depth: usize,
-        /// Whether this is the last child at its depth.
-        is_last: bool,
-        /// Expected guide prefix string.
-        expected: &'static str,
-    }
-
-    #[expect(clippy::too_many_lines)]
     #[test]
     fn tree_guide_prefix_cases() {
-        let cases = [
-            // Root-level nodes have no guide lines regardless of mask or is_last.
-            GuidePrefixCase {
-                name: "root, mask=0, not last",
-                mask: 0,
-                depth: 0,
-                is_last: false,
-                expected: "",
-            },
-            GuidePrefixCase {
-                name: "root, mask=0, last",
-                mask: 0,
-                depth: 0,
-                is_last: true,
-                expected: "",
-            },
-            GuidePrefixCase {
-                name: "root, mask=all, not last",
-                mask: 0b_1111,
-                depth: 0,
-                is_last: false,
-                expected: "",
-            },
-            // Depth 1, no ancestor continuation.
-            GuidePrefixCase {
-                name: "depth 1, mask=0, not last",
-                mask: 0,
-                depth: 1,
-                is_last: false,
-                expected: "├ ",
-            },
-            GuidePrefixCase {
-                name: "depth 1, mask=0, last",
-                mask: 0,
-                depth: 1,
-                is_last: true,
-                expected: "└ ",
-            },
-            // Depth 1, ancestor at depth 0 continues.
-            GuidePrefixCase {
-                name: "depth 1, mask=0b01, not last",
-                mask: 0b_01,
-                depth: 1,
-                is_last: false,
-                expected: "├ ",
-            },
-            GuidePrefixCase {
-                name: "depth 1, mask=0b01, last",
-                mask: 0b_01,
-                depth: 1,
-                is_last: true,
-                expected: "└ ",
-            },
-            // Depth 2: ancestor depth 0 continues, depth 1 does not.
-            GuidePrefixCase {
-                name: "depth 2, mask=0b01, not last",
-                mask: 0b_01,
-                depth: 2,
-                is_last: false,
-                expected: "│ ├ ",
-            },
-            // Depth 2: both ancestors continue.
-            GuidePrefixCase {
-                name: "depth 2, mask=0b11, not last",
-                mask: 0b_11,
-                depth: 2,
-                is_last: false,
-                expected: "│ ├ ",
-            },
-            GuidePrefixCase {
-                name: "depth 2, mask=0b11, last",
-                mask: 0b_11,
-                depth: 2,
-                is_last: true,
-                expected: "│ └ ",
-            },
-            // Depth 2: neither ancestor continues.
-            GuidePrefixCase {
-                name: "depth 2, mask=0, not last",
-                mask: 0,
-                depth: 2,
-                is_last: false,
-                expected: "  ├ ",
-            },
-            GuidePrefixCase {
-                name: "depth 2, mask=0, last",
-                mask: 0,
-                depth: 2,
-                is_last: true,
-                expected: "  └ ",
-            },
-            // Depth 5: ancestors at 0,1,3 continue; 2 does not.
-            GuidePrefixCase {
-                name: "depth 5, mask=0b1011, not last",
-                mask: 0b_1011,
-                depth: 5,
-                is_last: false,
-                expected: "│ │   │ ├ ",
-            },
-            GuidePrefixCase {
-                name: "depth 5, mask=0b1011, last",
-                mask: 0b_1011,
-                depth: 5,
-                is_last: true,
-                expected: "│ │   │ └ ",
-            },
-            // Bits beyond depth should be ignored.
-            GuidePrefixCase {
-                name: "high bits, mask=0x100, not last",
-                mask: 0b1_0000_0000,
-                depth: 1,
-                is_last: false,
-                expected: "├ ",
-            },
-            GuidePrefixCase {
-                name: "high bits, mask=0x100, last",
-                mask: 0b1_0000_0000,
-                depth: 1,
-                is_last: true,
-                expected: "└ ",
-            },
+        // (case, ancestor mask, depth, last child?, guide prefix)
+        let cases: &[(&str, u64, usize, bool, &str)] = &[
+            ("root", 0, 0, false, ""),
+            ("root last", 0, 0, true, ""),
+            ("root mask all", 0b_1111, 0, false, ""),
+            ("depth 1", 0, 1, false, "├ "),
+            ("depth 1 last", 0, 1, true, "└ "),
+            ("depth 1 continuing", 0b_01, 1, false, "├ "),
+            ("depth 1 continuing last", 0b_01, 1, true, "└ "),
+            ("depth 2 one ancestor", 0b_01, 2, false, "│ ├ "),
+            ("depth 2 both ancestors", 0b_11, 2, false, "│ ├ "),
+            ("depth 2 both ancestors last", 0b_11, 2, true, "│ └ "),
+            ("depth 2 no ancestor", 0, 2, false, "  ├ "),
+            ("depth 2 no ancestor last", 0, 2, true, "  └ "),
+            ("depth 5", 0b_1011, 5, false, "│ │   │ ├ "),
+            ("depth 5 last", 0b_1011, 5, true, "│ │   │ └ "),
+            ("high bits", 0b1_0000_0000, 1, false, "├ "),
+            ("high bits last", 0b1_0000_0000, 1, true, "└ "),
         ];
-
-        for case in &cases {
-            assert_eq!(
-                tree_guide_prefix(case.mask, case.depth, case.is_last),
-                case.expected,
-                "case '{}' failed",
-                case.name
-            );
+        for &(name, mask, depth, is_last, expected) in cases {
+            let prefix = tree_guide_prefix(mask, depth, is_last);
+            assert_eq!(prefix, expected, "case {name}");
         }
     }
 
@@ -2555,424 +2532,22 @@ mod tests {
         assert!(result.is_ok(), "no panic expected in release builds");
     }
 
-    // ── Auto-sizing tree panel width tests ───────────────────────────
-    //
-    // These are pure-arithmetic tests of the geometry constants (0.6em mono
-    // advance, 1.0em lucide, 4px gaps, 10px counts, 6px trailing gap) — they
-    // do not touch the global font system, so the expected values are exact.
-
-    #[test]
-    fn tree_row_natural_width_cases() {
-        struct Case {
-            label: &'static str,
-            guide_chars: usize,
-            icon_size: f32,
-            name: &'static str,
-            name_suffix: Option<(&'static str, f32)>,
-            counts: Option<(&'static str, &'static str)>,
-            expected: f32,
-        }
-        #[rustfmt::skip] // compact one-line cases, matching the file's other case tables
-        let cases = [
-            // Depth 1 (guide 2 chars) + 15px icon + 4px gap + 11-char name.
-            Case { label: "plain_file_row", guide_chars: 2, icon_size: TREE_ICON_SIZE, name: "src/main.rs", name_suffix: None, counts: None, expected: 128.2 },
-            // Root dir row: 15px icon + 4px gap + "src  Loading…" (13 glyphs).
-            Case { label: "dir_loading_suffix", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "src  Loading…", name_suffix: None, counts: None, expected: 128.2 },
-            // Error file row: name + 4px gap + "[⚠]" at 11px.
-            Case { label: "error_file_suffix", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "broken.txt", name_suffix: Some(("[⚠]", 11.0)), counts: None, expected: 126.8 },
-            // Diff file row: name + "+123/−45" (U+2212 minus) at 10px + 6px trailing gap.
-            Case { label: "diff_counts", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "lib.rs", name_suffix: None, counts: Some(("+123", "\u{2212}45")), expected: 123.4 },
-            // 8-char name + "binary" at 10px + 6px trailing gap.
-            Case { label: "diff_binary_count", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "data.bin", name_suffix: None, counts: Some(("binary", "")), expected: 128.2 },
-        ];
-        for case in cases {
-            let w = tree_row_natural_width(
-                case.guide_chars,
-                case.icon_size,
-                case.name,
-                TREE_FONT_SIZE,
-                case.name_suffix,
-                case.counts,
-            );
-            assert!(
-                close(w, case.expected),
-                "case {}: expected {}, got {}",
-                case.label,
-                case.expected,
-                w
-            );
-        }
-    }
-
-    /// Epsilon-equality for the pure-arithmetic width tests (0.001px is far
-    /// below any visible difference; the formulas use `f32` accumulation).
-    fn close(a: f32, b: f32) -> bool {
-        (a - b).abs() < 0.001
-    }
-
-    /// Build a FileTree with a known viewport for panel-width tests.
-    fn tree_with_panel_viewport(scroll_y: f32, viewport_h: Option<f32>) -> FileTree {
-        let mut tree = FileTree::new(iced::widget::Id::new("width_test"));
-        tree.scroll_y = scroll_y;
-        tree.viewport_h = viewport_h;
-        tree
-    }
-
-    #[test]
-    fn tree_panel_width_clamps_to_minimum() {
-        // Short rows → widest 100.0 + 16 = 116 < 260 → stays at minimum.
-        let tree = tree_with_panel_viewport(0.0, Some(400.0));
-        let widths = vec![68.4, 100.0, 50.0];
-        assert!(close(tree_panel_width(&tree, &widths), TREE_MIN_WIDTH));
-    }
-
-    #[test]
-    fn tree_panel_width_clamps_to_maximum() {
-        // 50-char name → natural 439 (= 50*14*0.6 + 15 + 4) → clamped to the 400px cap.
-        let tree = tree_with_panel_viewport(0.0, Some(400.0));
-        let long_name = "x".repeat(50);
-        let widths = vec![tree_row_natural_width(
-            0,
-            TREE_ICON_SIZE,
-            &long_name,
-            TREE_FONT_SIZE,
-            None,
-            None,
-        )];
-        assert!(close(tree_panel_width(&tree, &widths), TREE_MAX_WIDTH));
-    }
-
-    #[test]
-    fn tree_panel_width_scales_with_widest_row() {
-        // 29-char name → 279.4 natural → 295.4 panel (within the bounds).
-        let tree = tree_with_panel_viewport(0.0, Some(400.0));
-        let wide = tree_row_natural_width(
-            2,
-            TREE_ICON_SIZE,
-            "some_really_long_file_name.rs",
-            TREE_FONT_SIZE,
-            None,
-            None,
-        );
-        let widths = vec![68.4, wide, 50.0];
-        assert!(close(
-            tree_panel_width(&tree, &widths),
-            wide + 2.0 * SCROLL_H_PAD
-        ));
-    }
-
-    #[test]
-    fn tree_panel_width_measures_all_rows_without_viewport() {
-        // viewport_h None (first frame / non-scrolling fallback): all rows count.
-        let tree = tree_with_panel_viewport(0.0, None);
-        let long_name = "y".repeat(40);
-        let wide =
-            tree_row_natural_width(0, TREE_ICON_SIZE, &long_name, TREE_FONT_SIZE, None, None);
-        let widths = vec![50.0, wide, 60.0];
-        assert!(close(
-            tree_panel_width(&tree, &widths),
-            (wide + 2.0 * SCROLL_H_PAD).clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH)
-        ));
-    }
-
-    #[test]
-    fn tree_panel_width_filters_out_of_viewport_rows() {
-        // Viewport 200px tall at scroll 0 → rows ~0..14 measured.
-        let tree = tree_with_panel_viewport(0.0, Some(200.0));
-        let mut widths = vec![68.4; 50];
-        widths[40] = 500.0; // below the fold → must not inflate the width
-        assert!(close(tree_panel_width(&tree, &widths), TREE_MIN_WIDTH));
-        widths[2] = 500.0; // visible → inflates to the cap
-        assert!(close(tree_panel_width(&tree, &widths), TREE_MAX_WIDTH));
-    }
-
-    #[test]
-    fn tree_panel_width_scrolled_viewport_measures_mid_rows() {
-        // scroll_y 400, viewport 200 → rows ~20..35 measured.
-        let tree = tree_with_panel_viewport(400.0, Some(200.0));
-        let mut widths = vec![68.4; 60];
-        widths[10] = 500.0; // above the fold → ignored
-        assert!(close(tree_panel_width(&tree, &widths), TREE_MIN_WIDTH));
-        widths[30] = 500.0; // visible → inflates to the cap
-        assert!(close(tree_panel_width(&tree, &widths), TREE_MAX_WIDTH));
-    }
-
-    #[test]
-    fn tree_panel_width_empty_tree_stays_at_minimum() {
-        let tree = tree_with_panel_viewport(0.0, None);
-        assert!(close(tree_panel_width(&tree, &[]), TREE_MIN_WIDTH));
-    }
-
-    #[test]
-    #[expect(clippy::cast_precision_loss)] // test-only encoding closure (depth, name length)
-    fn collect_tree_row_widths_mirrors_render_order() {
-        // src (dir, expanded) → src/main.rs, src/lib.rs; Cargo.toml at root.
-        let mut tree = FileTree::new(iced::widget::Id::new("w"));
-        tree.nodes = vec![
-            TreeNode {
-                name: "src".into(),
-                full_path: "src".into(),
-                is_dir: true,
-                children: vec![
-                    TreeNode {
-                        name: "main.rs".into(),
-                        full_path: "src/main.rs".into(),
-                        is_dir: false,
-                        children: vec![],
-                        error: None,
-                        ignored: false,
-                    },
-                    TreeNode {
-                        name: "lib.rs".into(),
-                        full_path: "src/lib.rs".into(),
-                        is_dir: false,
-                        children: vec![],
-                        error: None,
-                        ignored: false,
-                    },
-                ],
-                error: None,
-                ignored: false,
-            },
-            TreeNode {
-                name: "Cargo.toml".into(),
-                full_path: "Cargo.toml".into(),
-                is_dir: false,
-                children: vec![],
-                error: None,
-                ignored: false,
-            },
-        ];
-        tree.expanded_dirs.insert("src".to_string());
-
-        // Closure encodes depth and name length so the order is observable.
-        let widths = collect_tree_row_widths(&tree.nodes, &tree.expanded_dirs, |node, depth| {
-            depth as f32 * 10.0 + node.name.chars().count() as f32
-        });
-        assert_eq!(widths, vec![3.0, 17.0, 16.0, 10.0]);
-
-        // Collapsed src → only the two root rows remain.
-        tree.expanded_dirs.clear();
-        let widths = collect_tree_row_widths(&tree.nodes, &tree.expanded_dirs, |node, depth| {
-            depth as f32 * 10.0 + node.name.chars().count() as f32
-        });
-        assert_eq!(widths, vec![3.0, 10.0]);
-    }
-
-    // ── expand_dir_and_focus_first_child / collapse_dir_and_keep_focus tests ──
-
-    /// Build a `FileTree` with a `src/` directory containing `lib.rs` and `main.rs`.
-    /// The returned tree has `nodes` populated (pre-sorted) and `visible_tree_nodes`
-    /// initially empty. Callers expand/collapse `"src"` as needed and call the helpers.
-    fn tree_with_src_dir() -> FileTree {
-        let mut tree = FileTree::new(iced::widget::Id::new("test"));
-        tree.nodes = vec![TreeNode {
-            name: "src".into(),
-            full_path: "src".into(),
-            is_dir: true,
-            children: vec![
-                TreeNode {
-                    name: "lib.rs".into(),
-                    full_path: "src/lib.rs".into(),
-                    is_dir: false,
-                    children: vec![],
-                    error: None,
-                    ignored: false,
-                },
-                TreeNode {
-                    name: "main.rs".into(),
-                    full_path: "src/main.rs".into(),
-                    is_dir: false,
-                    children: vec![],
-                    error: None,
-                    ignored: false,
-                },
-            ],
-            error: None,
-            ignored: false,
-        }];
-        tree
-    }
-
-    #[test]
-    fn expand_dir_advances_to_first_child() {
-        let mut tree = tree_with_src_dir();
-        tree.expanded_dirs.insert("src".into());
-        // No visible nodes yet — rebuild is part of the helper.
-        assert!(tree.visible_tree_nodes.is_empty());
-
-        let _task = tree.expand_dir_and_focus_first_child::<()>("src");
-
-        // Rebuilt visible tree: src, src/lib.rs, src/main.rs
-        assert_eq!(tree.visible_tree_nodes.len(), 3);
-        assert_eq!(tree.visible_tree_nodes[0].0, "src");
-        assert_eq!(tree.visible_tree_nodes[1].0, "src/lib.rs");
-        assert_eq!(tree.visible_tree_nodes[2].0, "src/main.rs");
-        // Focus advances to the first child (right after "src").
-        assert_eq!(tree.tree_focus_index, 1);
-    }
-
-    #[test]
-    fn expand_dir_no_children_stays_on_dir() {
-        let mut tree = tree_with_src_dir();
-        tree.expanded_dirs.insert("src".into());
-        // Remove children so the directory has no expandable content.
-        tree.nodes[0].children.clear();
-
-        let _task = tree.expand_dir_and_focus_first_child::<()>("src");
-
-        // Only "src" in the visible tree.
-        assert_eq!(tree.visible_tree_nodes.len(), 1);
-        assert_eq!(tree.visible_tree_nodes[0].0, "src");
-        // Focus stays on "src" because there is no child to advance to.
-        assert_eq!(tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn expand_dir_not_in_expanded_dirs_panics_in_debug() {
-        let mut tree = tree_with_src_dir();
-        // Intentionally NOT inserting into expanded_dirs — the debug_assert
-        // should fire. Use a catch_unwind to avoid test failure in release builds.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _task = tree.expand_dir_and_focus_first_child::<()>("src");
-        }));
-        // In debug builds this panics; in release builds it doesn't.
-        #[cfg(debug_assertions)]
-        assert!(
-            result.is_err(),
-            "debug_assert should fire when path not in expanded_dirs"
-        );
-        #[cfg(not(debug_assertions))]
-        assert!(result.is_ok(), "no panic expected in release builds");
-    }
-
-    #[test]
-    fn collapse_dir_keeps_focus_on_directory() {
-        let mut tree = tree_with_src_dir();
-        // Pre-expand so collapsing has an effect.
-        tree.expanded_dirs.insert("src".into());
-        tree.rebuild_visible();
-        assert_eq!(tree.visible_tree_nodes.len(), 3); // src, lib.rs, main.rs
-
-        // Now collapse — remove from expanded_dirs and call the helper.
-        tree.expanded_dirs.remove("src");
-        let _task = tree.collapse_dir_and_keep_focus::<()>("src");
-
-        // Collapsed: only "src" visible.
-        assert_eq!(tree.visible_tree_nodes.len(), 1);
-        assert_eq!(tree.visible_tree_nodes[0].0, "src");
-        // Focus stays on "src".
-        assert_eq!(tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn collapse_dir_not_in_visible_tree_still_finds_it() {
-        let mut tree = tree_with_src_dir();
-        // "src" has been removed from expanded_dirs and visible_tree_nodes is empty.
-        // Even without an explicit rebuild_visible first, the helper should
-        // rebuild and find "src" since it's still in nodes.
-        let _task = tree.collapse_dir_and_keep_focus::<()>("src");
-
-        // After rebuild_visible, "src" should appear (it's in nodes).
-        assert_eq!(tree.visible_tree_nodes.len(), 1);
-        assert_eq!(tree.visible_tree_nodes[0].0, "src");
-        assert_eq!(tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn collapse_dir_still_in_expanded_dirs_panics_in_debug() {
-        let mut tree = tree_with_src_dir();
-        tree.expanded_dirs.insert("src".into());
-        // Call without removing from expanded_dirs first — debug_assert fires.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _task = tree.collapse_dir_and_keep_focus::<()>("src");
-        }));
-        #[cfg(debug_assertions)]
-        assert!(
-            result.is_err(),
-            "debug_assert should fire when path still in expanded_dirs"
-        );
-        #[cfg(not(debug_assertions))]
-        assert!(result.is_ok(), "no panic expected in release builds");
-    }
-
-    // ── scroll_to_tree_focus / ScrollIntoView tests ──────────────────
-
-    /// Helper: build a FileTree with `n` flat file entries, a known viewport
-    /// height, and `scroll_y` set to a given offset.
-    fn tree_with_viewport(n: usize, scroll_y: f32, viewport_h: Option<f32>) -> FileTree {
-        let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
-        tree.visible_tree_nodes = (0..n).map(|i| (format!("file_{i}.rs"), false)).collect();
-        tree.scroll_y = scroll_y;
-        tree.viewport_h = viewport_h;
-        tree
-    }
-
-    #[test]
-    fn scroll_to_tree_focus_positions_viewport() {
-        struct Case {
-            label: &'static str,
-            n: usize,
-            scroll_y: f32,
-            viewport_h: Option<f32>,
-            focus: usize,
-            mode: ScrollMode,
-            expected: f32,
-        }
-        #[rustfmt::skip] // compact one-line cases, matching the file's other case tables
-        let cases = [
-            // Viewport y=40..440, focus idx 3 (row y≈58.5..78) fully within → unchanged.
-            Case { label: "fully_visible", n: 30, scroll_y: 40.0, viewport_h: Some(400.0), focus: 3, mode: ScrollMode::ScrollIntoView, expected: 40.0 },
-            // Viewport 0..200, focus idx 15 (y≈292.5) below bottom → advance one row (~19.5).
-            Case { label: "below_viewport", n: 30, scroll_y: 0.0, viewport_h: Some(200.0), focus: 15, mode: ScrollMode::ScrollIntoView, expected: 19.5 },
-            // Viewport 100..500, focus idx 3 (y≈58.5) above top → scroll_y = focus_y.
-            Case { label: "above_viewport", n: 30, scroll_y: 100.0, viewport_h: Some(400.0), focus: 3, mode: ScrollMode::ScrollIntoView, expected: 58.5 },
-            // Viewport 50..450, focus idx 2 row bottom ≈58.5 straddles top → unchanged.
-            Case { label: "top_edge_partial", n: 30, scroll_y: 50.0, viewport_h: Some(400.0), focus: 2, mode: ScrollMode::ScrollIntoView, expected: 50.0 },
-            // viewport_h None → SnapToTop fallback: scroll_y = focus_y ≈ 195.
-            Case { label: "no_viewport_snap", n: 30, scroll_y: 10.0, viewport_h: None, focus: 10, mode: ScrollMode::ScrollIntoView, expected: 195.0 },
-            // SnapToTop: scroll_y = focus_y (8 * 19.5 ≈ 156.0).
-            Case { label: "snap_to_top", n: 30, scroll_y: 0.0, viewport_h: Some(400.0), focus: 8, mode: ScrollMode::SnapToTop, expected: 156.0 },
-            // Empty tree: early-returns Task::none(); scroll_y unchanged.
-            Case { label: "empty_tree", n: 0, scroll_y: 0.0, viewport_h: Some(400.0), focus: 0, mode: ScrollMode::ScrollIntoView, expected: 0.0 },
-        ];
-        // Must bind (not discard) because iced::Task is #[must_use].
-        for case in cases {
-            let mut tree = tree_with_viewport(case.n, case.scroll_y, case.viewport_h);
-            tree.tree_focus_index = case.focus;
-            let _task = scroll_to_tree_focus::<()>(&mut tree, case.mode);
-            assert!(
-                (tree.scroll_y - case.expected).abs() < 0.01,
-                "case {}: scroll_y expected {}, got {}",
-                case.label,
-                case.expected,
-                tree.scroll_y
-            );
-        }
-    }
-
     #[test]
     fn classify_click_kinds() {
-        // Short press, no previous click.
-        assert_eq!(classify_click(0.0, None), ClickKind::Click);
-        assert_eq!(classify_click(6.0, None), ClickKind::Click);
-        // Big distance is always a drag, regardless of timing.
-        assert_eq!(classify_click(6.1, None), ClickKind::Drag);
-        assert_eq!(classify_click(100.0, Some(Duration::ZERO)), ClickKind::Drag);
-        // Tiny distance within 300ms of the last click.
-        assert_eq!(
-            classify_click(1.0, Some(Duration::from_millis(299))),
-            ClickKind::MultiClick
-        );
-        // Tiny distance with a 301ms gap.
-        assert_eq!(
-            classify_click(1.0, Some(Duration::from_millis(301))),
-            ClickKind::Click
-        );
-        // Exactly at the 300ms boundary is an inclusive MultiClick.
-        assert_eq!(
-            classify_click(1.0, Some(DOUBLE_CLICK_WINDOW)),
-            ClickKind::MultiClick
-        );
+        // (distance, milliseconds since the last click, kind)
+        let cases = [
+            (0.0, None, ClickKind::Click),
+            (6.0, None, ClickKind::Click),
+            (6.1, None, ClickKind::Drag),
+            (100.0, Some(0), ClickKind::Drag),
+            (1.0, Some(299), ClickKind::MultiClick),
+            (1.0, Some(300), ClickKind::MultiClick),
+            (1.0, Some(301), ClickKind::Click),
+        ];
+        for &(distance, gap, kind) in &cases {
+            let since = gap.map(Duration::from_millis);
+            let clicked = classify_click(distance, since);
+            assert_eq!(clicked, kind, "case {distance}/{gap:?}");
+        }
     }
 }

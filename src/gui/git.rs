@@ -1091,6 +1091,7 @@ impl GitState {
 mod tests {
     use super::*;
     use crate::git::commands::{GitPushDestination, GitPushTarget};
+    use Watch::{Failed, Register, Registered};
 
     fn state_with_gen(generation: u64) -> GitState {
         let mut s = GitState::new();
@@ -1125,201 +1126,165 @@ mod tests {
         })
     }
 
+    const FAILED: &str = "spawn failed";
+
+    /// A remote state for `branch` that is `behind` commits.
+    fn remote(branch: &str, behind: usize) -> GitRemoteState {
+        GitRemoteState {
+            branch: branch.into(),
+            behind,
+            push: origin_target(5),
+        }
+    }
+
+    /// The statuses a forwarded snapshot carries, when it has them.
+    fn status_map(statuses: bool) -> HashMap<String, GitFileStatus> {
+        if statuses {
+            HashMap::from([("src/main.rs".to_string(), GitFileStatus::Modified)])
+        } else {
+            HashMap::new()
+        }
+    }
+
+    /// A snapshot with three added lines, one removed line and one modified file.
+    fn changed_snapshot() -> GitWorktreeSnapshot {
+        GitWorktreeSnapshot {
+            file_statuses: status_map(true),
+            ..snapshot(3, 1)
+        }
+    }
+
+    /// A watch registration: a request on the selection, a success, or a failure.
+    #[derive(Clone, Copy)]
+    enum Watch {
+        Register,
+        Registered(u64, u64),
+        Failed(u64),
+    }
+
     // ── Refresh results: last-known-good + generation guard ───────
 
+    /// A refresh result applies at its own generation; a transient failure keeps the last known good values.
     #[test]
-    fn test_refresh_success_applies_current_generation() {
-        let mut s = state_with_gen(7);
-        let state = GitRemoteState {
-            branch: "main".into(),
-            behind: 2,
-            push: origin_target(5),
-        };
-        let _ = s.update(GitMessage::WorktreeSnapshot(7, Ok(snapshot(3, 1))));
-        let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
-        let _ = s.update(GitMessage::RemoteState(7, Ok(Some(state.clone()))));
-        assert_eq!(
-            s.diff_stats(),
-            Some(DiffStats {
-                added: 3,
-                removed: 1,
-                huge_binary_file_count: 0,
-                omitted_file_count: 0,
-            })
-        );
-        assert_eq!(s.current_branch(), Some("main"));
-        assert_eq!(s.remote_state(), Some(&state));
+    fn test_refresh_results_apply_or_keep_last_known_good() {
+        let remote = remote("main", 2);
+
+        for (name, failures) in [
+            ("success_applies_current_generation", false),
+            ("error_keeps_last_known_good", true),
+        ] {
+            let mut s = state_with_gen(7);
+            let _ = s.update(GitMessage::WorktreeSnapshot(7, Ok(snapshot(3, 1))));
+            let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
+            let _ = s.update(GitMessage::RemoteState(7, Ok(Some(remote.clone()))));
+            if failures {
+                // Transient failures — cached values must survive (no flicker).
+                let _ = s.update(GitMessage::WorktreeSnapshot(7, Err("spawn failed".into())));
+                let _ = s.update(GitMessage::CurrentBranch(7, Err("spawn failed".into())));
+                let _ = s.update(GitMessage::RemoteState(7, Err("spawn failed".into())));
+            }
+            let stats = s.diff_stats().map(|d| (d.added, d.removed));
+            assert_eq!(stats, Some((3, 1)), "case {name}: stats");
+            assert_eq!(s.current_branch(), Some("main"), "case {name}: branch");
+            assert_eq!(s.remote_state(), Some(&remote), "case {name}: remote");
+        }
     }
 
+    type GatingCase<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+    /// No branch means no sync control, and a remote result shows only for the branch it describes.
     #[test]
-    fn test_refresh_error_keeps_last_known_good() {
-        let mut s = state_with_gen(7);
-        let state = GitRemoteState {
-            branch: "main".into(),
-            behind: 2,
-            push: origin_target(5),
-        };
-        let _ = s.update(GitMessage::WorktreeSnapshot(7, Ok(snapshot(3, 1))));
-        let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
-        let _ = s.update(GitMessage::RemoteState(7, Ok(Some(state.clone()))));
-        // Transient failures — cached values must survive (no flicker).
-        let _ = s.update(GitMessage::WorktreeSnapshot(7, Err("spawn failed".into())));
-        let _ = s.update(GitMessage::CurrentBranch(7, Err("spawn failed".into())));
-        let _ = s.update(GitMessage::RemoteState(7, Err("spawn failed".into())));
-        assert_eq!(
-            s.diff_stats(),
-            Some(DiffStats {
-                added: 3,
-                removed: 1,
-                huge_binary_file_count: 0,
-                omitted_file_count: 0,
-            })
-        );
-        assert_eq!(s.current_branch(), Some("main"));
-        assert_eq!(s.remote_state(), Some(&state));
+    fn test_remote_state_gating() {
+        let cases: &[GatingCase] = &[
+            ("no branch checked out", None, Some("main"), None),
+            ("nothing to sync with", None, None, None),
+            ("gated by its branch", Some("main"), Some("next"), None),
+            (
+                "shown for its branch",
+                Some("next"),
+                Some("next"),
+                Some("next"),
+            ),
+        ];
+
+        for &(name, checked_out, announced, shown) in cases {
+            let mut s = state_with_gen(7);
+            if announced.is_none() {
+                // A state shown before must be dropped by an empty result.
+                let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
+                let _ = s.update(GitMessage::RemoteState(7, Ok(Some(remote("main", 2)))));
+            }
+            if let Some(branch) = checked_out {
+                let _ = s.update(GitMessage::CurrentBranch(7, Ok(branch.into())));
+            }
+            let result = announced.map(|branch| remote(branch, 2));
+            let _ = s.update(GitMessage::RemoteState(7, Ok(result)));
+            let branch = s.remote_state().map(|r| r.branch.as_str());
+            assert_eq!(branch, shown, "case {name}: the remote state it shows");
+        }
     }
 
+    /// A superseded generation never overwrites newer state, stale by age or by `clear()`.
     #[test]
-    fn test_no_branch_checked_out_clears_remote_state() {
-        let mut s = state_with_gen(7);
-        let _ = s.update(GitMessage::RemoteState(
-            7,
-            Ok(Some(GitRemoteState {
-                branch: "main".into(),
-                behind: 2,
-                push: origin_target(5),
-            })),
-        ));
-        // Detached/unborn HEAD: there is no branch to sync, so the control goes.
-        let _ = s.update(GitMessage::RemoteState(7, Ok(None)));
-        assert_eq!(s.remote_state(), None);
-    }
+    fn test_generation_guards() {
+        let cases: &[(&str, u64, u64, bool)] = &[
+            ("a stale generation", 9, 8, false),
+            ("a cleared state", 3, 3, true),
+        ];
 
-    #[test]
-    fn test_remote_state_is_gated_by_the_branch_it_describes() {
-        let mut s = state_with_gen(7);
-        let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
-        // A remote refresh for the branch just switched to can land before the
-        // local one; the newer state must not be discarded, and the older
-        // branch's state must not be shown as if it were the current one.
-        let _ = s.update(GitMessage::RemoteState(
-            7,
-            Ok(Some(GitRemoteState {
-                branch: "next".into(),
-                behind: 1,
-                push: origin_target(2),
-            })),
-        ));
-        assert_eq!(s.remote_state(), None, "the cached branch is still main");
-        let _ = s.update(GitMessage::CurrentBranch(7, Ok("next".into())));
-        assert_eq!(
-            s.remote_state().map(|state| state.branch.as_str()),
-            Some("next")
-        );
-    }
-
-    #[test]
-    fn test_stale_generation_results_are_dropped() {
-        let mut s = state_with_gen(9);
-        // Results from a superseded generation must not overwrite newer state.
-        let _ = s.update(GitMessage::WorktreeSnapshot(8, Ok(snapshot(99, 99))));
-        let _ = s.update(GitMessage::CurrentBranch(8, Ok("old-branch".into())));
-        let _ = s.update(GitMessage::RemoteState(
-            8,
-            Ok(Some(GitRemoteState {
-                branch: "main".into(),
-                behind: 99,
-                push: origin_target(99),
-            })),
-        ));
-        assert_eq!(s.diff_stats(), None);
-        assert_eq!(s.current_branch(), None);
-        assert_eq!(s.remote_state(), None);
-    }
-
-    #[test]
-    fn test_clear_invalidates_inflight_results() {
-        let mut s = state_with_gen(3);
-        let _ = s.update(GitMessage::WorktreeSnapshot(3, Ok(snapshot(3, 1))));
-        let _ = s.update(GitMessage::CurrentBranch(3, Ok("main".into())));
-        let _ = s.update(GitMessage::RemoteState(
-            3,
-            Ok(Some(GitRemoteState {
-                branch: "main".into(),
-                behind: 2,
-                push: origin_target(5),
-            })),
-        ));
-        s.clear(); // bumps both generations — in-flight results become stale
-        let _ = s.update(GitMessage::WorktreeSnapshot(3, Ok(snapshot(7, 7))));
-        let _ = s.update(GitMessage::RemoteState(
-            3,
-            Ok(Some(GitRemoteState {
-                branch: "main".into(),
-                behind: 9,
-                push: origin_target(9),
-            })),
-        ));
-        assert_eq!(s.diff_stats(), None);
-        assert_eq!(s.remote_state(), None);
+        for &(name, generation, msg_gen, cleared) in cases {
+            let mut s = state_with_gen(generation);
+            if cleared {
+                let _ = s.update(GitMessage::WorktreeSnapshot(generation, Ok(snapshot(3, 1))));
+                let _ = s.update(GitMessage::CurrentBranch(generation, Ok("main".into())));
+                let _ = s.update(GitMessage::RemoteState(
+                    generation,
+                    Ok(Some(remote("main", 2))),
+                ));
+                s.clear();
+            }
+            let _ = s.update(GitMessage::WorktreeSnapshot(msg_gen, Ok(snapshot(99, 99))));
+            let _ = s.update(GitMessage::CurrentBranch(msg_gen, Ok("old".into())));
+            let _ = s.update(GitMessage::RemoteState(
+                msg_gen,
+                Ok(Some(remote("main", 99))),
+            ));
+            assert_eq!(s.diff_stats(), None, "case {name}: stats");
+            assert_eq!(s.current_branch(), None, "case {name}: branch");
+            assert_eq!(s.remote_state(), None, "case {name}: remote");
+        }
     }
 
     // ── Status forwarding to the editor ──────────────────────────
 
+    /// An accepted snapshot forwards its statuses once; a failure forwards too, a stale one nothing.
     #[test]
-    fn test_worktree_snapshot_ok_stores_statuses_and_forwards() {
-        let mut s = state_with_gen(7);
-        s.workspace_name = Some("ws".into());
-        let _ = s.update(GitMessage::WorktreeSnapshot(
-            7,
-            Ok(GitWorktreeSnapshot {
-                stats: DiffStats {
-                    added: 3,
-                    removed: 1,
-                    huge_binary_file_count: 0,
-                    omitted_file_count: 0,
-                },
-                file_statuses: HashMap::from([(
-                    "src/main.rs".to_string(),
-                    GitFileStatus::Modified,
-                )]),
-                unborn_head: false,
-                changes: Vec::new(),
-                repo_root: PathBuf::new(),
-            }),
-        ));
-        // Statuses are stored and the forward is dirty.
-        let forward = s.take_status_forward();
-        assert_eq!(
-            forward,
-            Some((
-                Some("ws".into()),
-                HashMap::from([("src/main.rs".to_string(), GitFileStatus::Modified)]),
-            ))
-        );
-        // Once claimed, a second take is None.
-        assert_eq!(s.take_status_forward(), None);
-    }
+    fn test_worktree_snapshot_forwarding() {
+        let cases: &[(&str, u64, u64, bool, Option<&str>)] = &[
+            ("an accepted snapshot", 7, 7, true, Some("ws")),
+            ("a failure", 7, 7, false, None),
+            ("a stale generation", 9, 8, true, None),
+        ];
 
-    #[test]
-    fn test_worktree_snapshot_err_marks_forward_dirty() {
-        let mut s = state_with_gen(7);
-        s.workspace_name = None;
-        let _ = s.update(GitMessage::WorktreeSnapshot(7, Err("spawn failed".into())));
-        // Err keeps last-known-good (empty) but still forwards so the editor's
-        // in-flight flag clears.
-        assert_eq!(s.diff_stats(), None);
-        assert_eq!(s.take_status_forward(), Some((None, HashMap::new())));
-        assert_eq!(s.take_status_forward(), None);
-    }
-
-    #[test]
-    fn test_worktree_snapshot_stale_generation_forwards_nothing() {
-        let mut s = state_with_gen(9);
-        // A superseded-generation result is dropped entirely — no forward.
-        let _ = s.update(GitMessage::WorktreeSnapshot(8, Ok(snapshot(99, 99))));
-        assert_eq!(s.take_status_forward(), None);
-        assert_eq!(s.diff_stats(), None);
+        for &(name, generation, msg_gen, statuses, workspace) in cases {
+            let mut s = state_with_gen(generation);
+            s.workspace_name = workspace.map(Into::into);
+            let result = if statuses {
+                Ok(changed_snapshot())
+            } else {
+                Err(FAILED.into())
+            };
+            let _ = s.update(GitMessage::WorktreeSnapshot(msg_gen, result));
+            let accepted = msg_gen == generation;
+            let stats = (accepted && statuses).then_some((3, 1));
+            assert_eq!(
+                s.diff_stats().map(|d| (d.added, d.removed)),
+                stats,
+                "case {name}: stats"
+            );
+            let forward = accepted.then(|| (workspace.map(Into::into), status_map(statuses)));
+            assert_eq!(s.take_status_forward(), forward, "case {name}: forward");
+            assert_eq!(s.take_status_forward(), None, "case {name}: claimed once");
+        }
     }
 
     // ── Event-driven local refresh throttle ──────────────────────
@@ -1450,85 +1415,102 @@ mod tests {
 
     // ── Watch registration (single deferred attempt, no retry) ─────
 
+    /// A watch id is stored only for a successful registration at the current generation.
     #[test]
-    fn test_try_register_watch_without_selection_is_noop() {
-        let mut s = GitState::new();
-        // No workspace name / path → no watch task, nothing stored.
-        let _ = s.try_register_watch();
-        assert_eq!(s.watch_id, None);
+    fn test_watch_registration() {
+        let cases: &[(&str, Option<u64>, Watch, Option<u64>)] = &[
+            ("no selection", None, Register, None),
+            ("current generation", Some(7), Registered(7, 42), Some(42)),
+            ("an error", Some(7), Failed(7), None),
+            ("stale generation", Some(9), Registered(8, 99), None),
+        ];
+
+        for &(name, generation, msg, stored) in cases {
+            let mut s = match generation {
+                Some(generation) => state_with_gen(generation),
+                None => GitState::new(),
+            };
+            let _ = match msg {
+                Register => s.try_register_watch(),
+                Registered(generation, id) => {
+                    s.update(GitMessage::WatchRegistered(generation, Ok(WatchId(id))))
+                }
+                Failed(generation) => {
+                    s.update(GitMessage::WatchRegistered(generation, Err(FAILED.into())))
+                }
+            };
+            assert_eq!(s.watch_id, stored.map(WatchId), "case {name}: watch id");
+        }
     }
 
+    /// A commit on the displayed workspace refreshes the footer; another workspace's is ignored.
     #[test]
-    fn test_watch_registered_current_gen_stores_id() {
-        let mut s = state_with_gen(7);
-        let _ = s.update(GitMessage::WatchRegistered(7, Ok(WatchId(42))));
-        assert_eq!(s.watch_id, Some(WatchId(42)));
-    }
+    fn test_commit_refreshes_the_footer() {
+        struct Case {
+            name: &'static str,
+            workspace: &'static str,
+            msg: GitMessage,
+            /// Whether the footer is expected to refresh.
+            refreshed: bool,
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "refresh_after_commit",
+                workspace: "/nonexistent",
+                msg: GitMessage::RefreshAfterCommit,
+                refreshed: true,
+            },
+            Case {
+                name: "pipeline_commit_for_the_displayed_workspace",
+                workspace: "/some/ws",
+                msg: GitMessage::PipelineCommit(PathBuf::from("/some/ws")),
+                refreshed: true,
+            },
+            Case {
+                name: "pipeline_commit_for_another_workspace",
+                workspace: "/some/ws",
+                msg: GitMessage::PipelineCommit(PathBuf::from("/other/ws")),
+                refreshed: false,
+            },
+        ];
 
-    #[test]
-    fn test_watch_registered_error_does_not_store() {
-        let mut s = state_with_gen(7);
-        let before = s.watch_id;
-        let _ = s.update(GitMessage::WatchRegistered(
-            7,
-            Err("watcher not ready within 30s".to_string()),
-        ));
-        // A failed registration never stores a watch id, and there is no
-        // pending state to retry — the workspace stays unwatched.
-        assert_eq!(s.watch_id, before);
-    }
-
-    #[test]
-    fn test_watch_registered_stale_generation_dropped() {
-        let mut s = state_with_gen(9);
-        // A registration from a superseded generation (a workspace switch raced
-        // the deferred registration) is discarded entirely.
-        let _ = s.update(GitMessage::WatchRegistered(8, Ok(WatchId(99))));
-        assert_eq!(s.watch_id, None);
-    }
-
-    #[test]
-    fn test_refresh_after_commit_refreshes_footer() {
-        let mut s = GitState::new();
-        s.workspace_path = Some(PathBuf::from("/nonexistent"));
-        s.local_refresh_pending = true;
-        let before_local = s.local_generation;
-        let before_remote = s.remote_generation;
-        let _ = s.update(GitMessage::RefreshAfterCommit);
-        // A commit is a ref-only change — the footer refreshes promptly (local +
-        // remote state) and the owed file-change refresh is superseded.
-        assert!(s.last_local_refresh.is_some());
-        assert!(!s.local_refresh_pending);
-        assert_eq!(s.local_generation, before_local + 1);
-        assert_eq!(s.remote_generation, before_remote + 1);
-    }
-
-    #[test]
-    fn test_pipeline_commit_refreshes_footer_when_path_matches() {
-        let mut s = GitState::new();
-        let ws = PathBuf::from("/some/ws");
-        s.workspace_path = Some(ws.clone());
-        s.local_refresh_pending = true;
-        let before_local = s.local_generation;
-        let before_remote = s.remote_generation;
-        let _ = s.update(GitMessage::PipelineCommit(ws));
-        // A pipeline commit on the displayed workspace is a ref-only change — the
-        // footer refreshes promptly (local + remote state) and any owed
-        // file-change refresh is superseded.
-        assert!(s.last_local_refresh.is_some());
-        assert!(!s.local_refresh_pending);
-        assert_eq!(s.local_generation, before_local + 1);
-        assert_eq!(s.remote_generation, before_remote + 1);
-    }
-
-    #[test]
-    fn test_pipeline_commit_ignored_for_other_workspace() {
-        let mut s = GitState::new();
-        s.workspace_path = Some(PathBuf::from("/some/ws"));
-        let before_local = s.local_generation;
-        let before_remote = s.remote_generation;
-        let _ = s.update(GitMessage::PipelineCommit(PathBuf::from("/other/ws")));
-        assert_eq!(s.local_generation, before_local);
-        assert_eq!(s.remote_generation, before_remote);
+        for case in cases {
+            let name = case.name;
+            let mut s = GitState::new();
+            s.workspace_path = Some(PathBuf::from(case.workspace));
+            s.local_refresh_pending = true;
+            let before_local = s.local_generation;
+            let before_remote = s.remote_generation;
+            let _ = s.update(case.msg.clone());
+            if case.refreshed {
+                assert!(
+                    s.last_local_refresh.is_some(),
+                    "case {name}: the local refresh was stamped"
+                );
+                assert!(
+                    !s.local_refresh_pending,
+                    "case {name}: the owed refresh was claimed"
+                );
+                assert_eq!(
+                    s.local_generation,
+                    before_local + 1,
+                    "case {name}: the local generation bumped"
+                );
+                assert_eq!(
+                    s.remote_generation,
+                    before_remote + 1,
+                    "case {name}: the remote generation bumped"
+                );
+            } else {
+                assert_eq!(
+                    s.local_generation, before_local,
+                    "case {name}: the local generation is kept"
+                );
+                assert_eq!(
+                    s.remote_generation, before_remote,
+                    "case {name}: the remote generation is kept"
+                );
+            }
+        }
     }
 }

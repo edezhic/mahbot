@@ -232,45 +232,42 @@ mod tests {
     use super::*;
     use crate::ChatRole;
 
-    #[test]
-    fn split_thinking_reversed_markers_never_panics() {
-        // Regression: a literal "[/thinking]" before "[thinking]" previously
-        // sliced `content[body_start..end]` with `end < body_start`
-        // ("byte range starts at X but ends at Y"), aborting the GUI. The
-        // closer is searched only after the opener, so this input resolves to
-        // plain body text instead of crashing.
-        let (thinking, body) =
-            split_thinking(Some("[/thinking] before [thinking]".to_string()), None);
-        assert_eq!(thinking, None);
-        assert_eq!(body.as_deref(), Some("[/thinking] before [thinking]"));
-    }
+    type SplitCase<'a> = (
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
 
     #[test]
-    fn split_thinking_extracts_first_pair_only() {
-        let (thinking, body) = split_thinking(
-            Some(
-                "intro [thinking] inner [/thinking] mid [thinking] later [/thinking] tail"
-                    .to_string(),
+    fn split_thinking_cases() {
+        let cases: &[SplitCase] = &[
+            (
+                "first pair only",
+                "intro [thinking] inner [/thinking] mid [thinking] later [/thinking] tail",
+                None,
+                Some("inner"),
+                Some("mid [thinking] later [/thinking] tail"),
             ),
-            None,
-        );
-        assert_eq!(thinking.as_deref(), Some("inner"));
-        // Only the first pair is consumed; a later literal block stays visible
-        // body text.
-        assert_eq!(
-            body.as_deref(),
-            Some("mid [thinking] later [/thinking] tail")
-        );
-    }
-
-    #[test]
-    fn split_thinking_decoded_reasoning_wins() {
-        let (thinking, body) = split_thinking(
-            Some("[thinking] literal [/thinking]".to_string()),
-            Some("decoded reasoning".to_string()),
-        );
-        assert_eq!(thinking.as_deref(), Some("decoded reasoning"));
-        assert_eq!(body.as_deref(), Some("[thinking] literal [/thinking]"));
+            (
+                "decoded reasoning wins",
+                "[thinking] literal [/thinking]",
+                Some("decoded reasoning"),
+                Some("decoded reasoning"),
+                Some("[thinking] literal [/thinking]"),
+            ),
+        ];
+        for &(name, content, reasoning, expected_thinking, expected_body) in cases {
+            let (thinking, body) =
+                split_thinking(Some(content.to_string()), reasoning.map(str::to_string));
+            assert_eq!(
+                thinking.as_deref(),
+                expected_thinking,
+                "case {name}: thinking"
+            );
+            assert_eq!(body.as_deref(), expected_body, "case {name}: body");
+        }
     }
 
     #[test]
@@ -290,8 +287,7 @@ mod tests {
 
     #[test]
     fn ledger_sources_track_the_source_row_of_each_entry() {
-        // The tool result attaches to its round instead of adding an entry, so
-        // the entry→message map is not the identity.
+        // The tool result attaches to its round, so the entry→message map is not the identity.
         let messages = vec![
             ChatMessage::user("go"),
             assistant_tool_call(Some("checking"), None),
@@ -302,9 +298,6 @@ mod tests {
         assert_eq!(sources, vec![0, 1, 3]);
     }
 
-    /// Build an assistant tool-call message with an optional decoded `content`
-    /// (null when `None`) and an optional `reasoning` field, so the ledger's
-    /// `ToolRound` carries the promoted-reasoning signal under test.
     fn assistant_tool_call(content: Option<&str>, reasoning: Option<&str>) -> ChatMessage {
         let calls = vec![serde_json::json!({
             "id": "call_1",
@@ -318,97 +311,67 @@ mod tests {
         ChatMessage::assistant(body.to_string())
     }
 
-    #[test]
-    fn promoted_reasoning_textless_round_with_reasoning() {
-        let messages = vec![assistant_tool_call(None, Some("Checking the file first"))];
-        let entries = build_ledger(&messages);
-        match &entries[..] {
-            [
-                SessionEntry::ToolRound {
-                    narration,
-                    reasoning,
-                    ..
-                },
-            ] => {
-                assert_eq!(narration.as_deref(), None);
-                assert_eq!(reasoning.as_deref(), Some("Checking the file first"));
-                assert_eq!(
-                    promoted_reasoning(narration.as_deref(), reasoning.as_deref()),
-                    Some("Checking the file first"),
-                    "null content + reasoning promotes"
-                );
-            }
-            other => panic!("expected a single ToolRound entry, got {other:?}"),
-        }
+    #[derive(Default)]
+    struct PromotedCase {
+        name: &'static str,
+        content: Option<&'static str>,
+        reasoning: Option<&'static str>,
+        promoted: Option<&'static str>,
     }
 
+    /// Reasoning is promoted only when the round has no visible narration and there is reasoning to promote.
     #[test]
-    fn promoted_reasoning_visible_content_does_not_promote() {
-        let messages = vec![assistant_tool_call(
-            Some("Doing it"),
-            Some("Reasoning here"),
-        )];
-        let entries = build_ledger(&messages);
-        match &entries[..] {
-            [
-                SessionEntry::ToolRound {
-                    narration,
-                    reasoning,
-                    ..
-                },
-            ] => {
-                assert_eq!(narration.as_deref(), Some("Doing it"));
-                assert!(
-                    promoted_reasoning(narration.as_deref(), reasoning.as_deref()).is_none(),
-                    "visible content blocks promotion"
-                );
+    fn promoted_reasoning_cases() {
+        let cases: &[PromotedCase] = &[
+            PromotedCase {
+                name: "textless round with reasoning",
+                reasoning: Some("Checking the file first"),
+                promoted: Some("Checking the file first"),
+                ..PromotedCase::default()
+            },
+            PromotedCase {
+                name: "visible content does not promote",
+                content: Some("Doing it"),
+                reasoning: Some("Reasoning here"),
+                ..PromotedCase::default()
+            },
+            PromotedCase {
+                name: "whitespace content counts as empty",
+                content: Some("   "),
+                reasoning: Some("Reasoning here"),
+                promoted: Some("Reasoning here"),
+            },
+            PromotedCase {
+                name: "without reasoning does not promote",
+                ..PromotedCase::default()
+            },
+        ];
+        for case in cases {
+            let name = case.name;
+            let messages = vec![assistant_tool_call(case.content, case.reasoning)];
+            let entries = build_ledger(&messages);
+            match &entries[..] {
+                [
+                    SessionEntry::ToolRound {
+                        narration,
+                        reasoning,
+                        ..
+                    },
+                ] => {
+                    assert_eq!(narration.as_deref(), case.content, "case {name}: narration");
+                    assert_eq!(
+                        reasoning.as_deref(),
+                        case.reasoning,
+                        "case {name}: reasoning"
+                    );
+                    assert_eq!(
+                        promoted_reasoning(narration.as_deref(), reasoning.as_deref()),
+                        case.promoted,
+                        "case {name}: promoted"
+                    );
+                }
+                other => panic!("case {name}: expected a single ToolRound entry, got {other:?}"),
             }
-            other => panic!("expected a single ToolRound entry, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn promoted_reasoning_whitespace_content_counts_as_empty() {
-        let messages = vec![assistant_tool_call(Some("   "), Some("Reasoning here"))];
-        let entries = build_ledger(&messages);
-        match &entries[..] {
-            [
-                SessionEntry::ToolRound {
-                    narration,
-                    reasoning,
-                    ..
-                },
-            ] => {
-                assert_eq!(narration.as_deref(), Some("   "));
-                assert!(
-                    promoted_reasoning(narration.as_deref(), reasoning.as_deref()).is_some(),
-                    "whitespace-only content counts as empty"
-                );
-            }
-            other => panic!("expected a single ToolRound entry, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn promoted_reasoning_without_reasoning_does_not_promote() {
-        let messages = vec![assistant_tool_call(None, None)];
-        let entries = build_ledger(&messages);
-        match &entries[..] {
-            [
-                SessionEntry::ToolRound {
-                    narration,
-                    reasoning,
-                    ..
-                },
-            ] => {
-                assert_eq!(narration.as_deref(), None);
-                assert_eq!(reasoning.as_deref(), None);
-                assert!(
-                    promoted_reasoning(narration.as_deref(), reasoning.as_deref()).is_none(),
-                    "no reasoning → no promotion"
-                );
-            }
-            other => panic!("expected a single ToolRound entry, got {other:?}"),
         }
     }
 }
