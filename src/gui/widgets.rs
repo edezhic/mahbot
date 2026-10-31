@@ -1541,10 +1541,17 @@ fn absolute_scroll_to<Message: 'static>(file_tree: &mut FileTree, y: f32) -> Tas
 /// Rows render inside the wrapper's uniform [`SCROLL_H_PAD`] inset, so row
 /// hover/highlight backgrounds sit 8px inside the panel edges rather than
 /// touching them.
+///
+/// `top_inset` is the permanent gap between the panel's top edge and the first
+/// row. It pads the surface container above the scroll viewport, so the
+/// surface still reaches the panel's top while rows never touch the window
+/// edge, even while scrolling. Pass `0.0` for a tree that already sits below
+/// its own chrome (the diff view).
 pub fn build_tree_panel<'a, Message: 'a>(
     file_tree: &'a FileTree,
     tree_rows: Vec<Element<'a, Message>>,
     row_widths: &[f32],
+    top_inset: f32,
     on_scroll: impl Fn(scrollable::Viewport) -> Message + 'a,
 ) -> Element<'a, Message> {
     let panel_width = tree_panel_width(file_tree, row_widths);
@@ -1560,6 +1567,7 @@ pub fn build_tree_panel<'a, Message: 'a>(
     let tree_inner: Element<'_, Message> = container(tree_body)
         .width(Length::Fixed(panel_width))
         .height(Length::Fill)
+        .padding(Padding::default().top(top_inset))
         .style(theme::surface_container_style)
         .into();
 

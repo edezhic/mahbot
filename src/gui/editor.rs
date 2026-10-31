@@ -4797,9 +4797,17 @@ impl EditorState {
                 }
             },
         );
-        let panel = widgets::build_tree_panel(&self.file_tree, elements, &row_widths, |viewport| {
-            EditorMessage::TreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
-        });
+        let panel = widgets::build_tree_panel(
+            &self.file_tree,
+            elements,
+            &row_widths,
+            // The tree meets the top of the content area; keep its first row
+            // off the window edge.
+            theme::PAD_6,
+            |viewport| {
+                EditorMessage::TreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
+            },
+        );
 
         // Wrap the tree panel with a context menu that fires on empty-space
         // right-clicks. When the user right-clicks on a tree node, the inner

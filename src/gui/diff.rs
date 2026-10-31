@@ -998,7 +998,7 @@ impl DiffState {
                 }
             },
         );
-        widgets::build_tree_panel(&self.file_tree, elements, &row_widths, |viewport| {
+        widgets::build_tree_panel(&self.file_tree, elements, &row_widths, 0.0, |viewport| {
             DiffMessage::TreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
         })
     }
