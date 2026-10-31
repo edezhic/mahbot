@@ -14,8 +14,8 @@
 //! absolute path in verbatim form for every filesystem call (and `tokio::fs`
 //! delegates to it), which lifts Windows' classic 260-character path ceiling.
 
-/// The rule in the words the surfaces that propose a name use, so that what
-/// they ask for is what [`folder_name_problem`] accepts.
+/// The rule in the words the account-adding tool's schema uses, so that what it
+/// asks for is what [`folder_name_problem`] accepts.
 pub(crate) const RULE_SUMMARY: &str = "not empty, not only dots, no / \\ : * ? \" < > |, no \
      character below U+0020, nothing ending in a dot or a space, no reserved device name in any \
      letter case (CON, NUL, PRN, AUX, COM1-9, LPT1-9, COM¹-³, LPT¹-³ — also with an extension — \

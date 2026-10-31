@@ -1874,15 +1874,15 @@ impl SettingsState {
                 Task::perform(
                     async move {
                         let store = users::user_store()?;
-                        // The name IS the admin marker, so a guest-creation path
-                        // can never mint the admin's name.
+                        // The dialog already refuses every name it can judge;
+                        // what is left here is the fallback for a race or a
+                        // store error. The Settings bypass has no way to
+                        // complete a leftover unbound row, so a duplicate would
+                        // silently no-op (INSERT OR IGNORE) while reporting
+                        // success. A name that only matches by case or Unicode
+                        // composition passes this and is refused by `add_user`,
+                        // with the same message.
                         crate::users::validate_new_user_name(&sender).map_err(|e| e.to_string())?;
-                        // Reject a duplicate name here too: the Settings bypass has no
-                        // way to complete a leftover unbound row, so a duplicate would
-                        // silently no-op (INSERT OR IGNORE) while reporting success.
-                        // A name that only matches by case or Unicode composition
-                        // passes this and is refused by `add_user`, with the same
-                        // message.
                         if store
                             .user_exists(&sender)
                             .await
@@ -3303,34 +3303,27 @@ impl SettingsState {
         )
     }
 
-    /// Build the add-user modal dialog content. The account name becomes that
-    /// account's personal-workspace folder, so the dialog states the rule and
-    /// refuses a name the product cannot turn into one before the request
-    /// leaves the desktop.
+    /// Build the add-user modal dialog. The account name becomes that account's
+    /// personal-workspace folder, so a name the product cannot use is refused
+    /// right under the field, in one line — the reserved slot it always occupies
+    /// keeps the dialog from jumping as the line comes and goes.
     fn add_user_dialog(&self) -> Element<'_, SettingsMessage> {
         let name = self.add_user_sender.text();
         let problem = if name.is_empty() {
             None
         } else {
-            crate::util::folder_name::folder_name_problem(&name)
+            crate::users::new_account_name_problem(
+                &name,
+                self.users_state
+                    .users
+                    .iter()
+                    .map(|entry| entry.record.name.as_str()),
+            )
         };
-        let mut middle = Column::new().push(
-            text(format!(
-                "The name is also the folder of this account's personal workspace, so it must be \
-                 one every platform can create: {}. {}",
-                crate::util::folder_name::RULE_SUMMARY,
-                crate::users::NAME_COLLISION_RULE
-            ))
-            .size(theme::TEXT_11)
-            .color(theme::TEXT_SECONDARY),
-        );
-        if let Some(problem) = problem {
-            middle = middle.push(
-                text(format!("This name cannot be used because {problem}."))
-                    .size(theme::TEXT_11)
-                    .color(theme::STATUS_ERROR),
-            );
-        }
+        let submit_enabled = !name.is_empty() && problem.is_none();
+        // The slot is always filled: a lone space lays out at exactly the height
+        // of a one-line message, so nothing moves as the red line comes and goes.
+        let line = problem.unwrap_or_else(|| " ".to_string());
         modal_dialog(
             "Add User".to_string(),
             &[DialogField {
@@ -3340,10 +3333,15 @@ impl SettingsState {
                 id: "add_user_sender",
                 on_input: SettingsMessage::AddUserSender,
             }],
-            Some(middle.spacing(theme::SPACE_4).into()),
+            Some(
+                text(line)
+                    .size(theme::TEXT_11)
+                    .color(theme::STATUS_ERROR)
+                    .into(),
+            ),
             "Add",
             self.add_user_adding.then_some(BUSY_ADDING),
-            !name.is_empty() && problem.is_none(),
+            submit_enabled,
             SettingsMessage::ToggleAddUserModal,
             SettingsMessage::SubmitAddUser,
         )

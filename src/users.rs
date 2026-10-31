@@ -295,25 +295,26 @@ impl UserStore {
     }
 
     /// Refuse a name about to become a NEW account when, with case and Unicode
-    /// composition ignored, it is an existing account's or the admin's name:
-    /// macOS resolves such spellings to one and the same personal-workspace
-    /// folder, and Windows — case-insensitive by default — the case difference
-    /// alone, so the new account would read and write the other's files.
+    /// composition ignored ([`collides_with_existing`]), it is an existing
+    /// account's or the admin's name: macOS resolves such spellings to one and
+    /// the same personal-workspace folder, and Windows — case-insensitive by
+    /// default — the case difference alone, so the new account would read and
+    /// write the other's files.
     ///
     /// The comparison covers every stored name plus the reserved admin name,
     /// whose row [`UserStore::ensure_admin_user`] may not have seeded yet. The
     /// rule is the same on every platform — it is about which account is meant,
     /// not about the volume this process happens to run on.
     async fn refuse_colliding_name(&self, name: &str) -> Result<()> {
-        let key = caseless_name_key(name);
+        let names = self.user_names().await?;
         // A stored name byte-identical to this one is the idempotent re-add of
         // an account that already exists — the one thing this rule never judges
-        // — so it is no collision however the two reads interleave. The reserved
-        // admin name is in the set whether or not its row exists.
-        let collides = std::iter::once(ADMIN_USER_NAME)
-            .chain(self.user_names().await?.iter().map(String::as_str))
-            .any(|existing| existing != name && caseless_name_key(existing) == key);
-        if collides {
+        // — so it is no collision however the two reads interleave.
+        let judged = names
+            .iter()
+            .map(String::as_str)
+            .filter(|stored| *stored != name);
+        if collides_with_existing(name, judged) {
             anyhow::bail!("{}", name_taken_message(name));
         }
         Ok(())
@@ -1008,10 +1009,10 @@ pub(crate) fn refuse_admin_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The other half of the account-name rule, in the words the surfaces that
-/// propose a name use (the desktop's add-user dialog and the account-adding
-/// tool): the name of a new account is refused when another account or the
-/// admin already holds it once case and Unicode composition are ignored.
+/// The other half of the account-name rule, in the words the account-adding
+/// tool's schema answers with: the name of a new account is refused when another
+/// account or the admin already holds it once case and Unicode composition are
+/// ignored.
 pub(crate) const NAME_COLLISION_RULE: &str = "A new account's name is also refused when another \
      account or the admin already has it, ignoring case and Unicode composition — on macOS those \
      spellings are one folder, on Windows a case difference alone already is.";
@@ -1024,12 +1025,68 @@ pub(crate) fn name_taken_message(name: &str) -> String {
 
 /// The form two account names collide in: `NFD(toCasefold(NFD(name)))`, the
 /// canonical caseless matching of the Unicode standard — what
-/// [`UserStore::refuse_colliding_name`] judges by. Folding is the *full* one, so
-/// `ß` and `ss` (and a three-character `ﬃ` and `ffi`) are one key; decomposition
-/// is canonical, so composed and decomposed accents are one key.
+/// [`collides_with_existing`] judges by. Folding is the *full* one, so `ß` and
+/// `ss` (and a three-character `ﬃ` and `ffi`) are one key; decomposition is
+/// canonical, so composed and decomposed accents are one key.
 fn caseless_name_key(name: &str) -> String {
     let decomposed: String = name.nfd().collect();
     UniCase::new(decomposed).to_folded_case().nfd().collect()
+}
+
+/// Whether `name` is one an existing account or the admin already holds, once
+/// case and Unicode composition are ignored — the one place the collision rule
+/// lives, judged by both [`UserStore::add_user`] and the desktop's add-user
+/// dialog. `existing` is the caller's reading of the stored names; the reserved
+/// admin name counts whether or not its row is in that reading. A byte-identical
+/// name collides here too: the store's exemption of the idempotent re-add is its
+/// own policy, applied at its call site.
+pub(crate) fn collides_with_existing<'a>(
+    name: &str,
+    existing: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let key = caseless_name_key(name);
+    std::iter::once(ADMIN_USER_NAME)
+        .chain(existing)
+        .any(|existing| caseless_name_key(existing) == key)
+}
+
+/// Characters of a typed name the taken-name line spells out before it is
+/// tapered: the name is the only unbounded part of that line, so this is what
+/// keeps it one line.
+const MAX_NAME_IN_REFUSAL_CHARS: usize = 24;
+
+/// `name` as the taken-name line may spell it: its first
+/// [`MAX_NAME_IN_REFUSAL_CHARS`] characters, then an ellipsis if there were more.
+fn one_line_name(name: &str) -> String {
+    match name.char_indices().nth(MAX_NAME_IN_REFUSAL_CHARS) {
+        Some((end, _)) => format!("{}…", &name[..end]),
+        None => name.to_string(),
+    }
+}
+
+/// Why the desktop's add-user dialog cannot create an account called `name`, as
+/// the single line it shows under its field: the refusals the creation path
+/// applies, in its order — the reserved admin name and the folder rule
+/// ([`validate_new_user_name`]), then the collision
+/// ([`collides_with_existing`]) — so a name the dialog judges unusable never
+/// reaches the store. `existing` is the caller's reading of the stored names.
+/// `None` exactly when the name is one to create a new account with.
+pub(crate) fn new_account_name_problem<'a>(
+    name: &str,
+    existing: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    if is_admin_name(name) {
+        return Some(
+            "This name cannot be used because it is the admin account's name.".to_string(),
+        );
+    }
+    if let Some(problem) = crate::util::folder_name::folder_name_problem(name) {
+        return Some(format!("This name cannot be used because {problem}."));
+    }
+    if collides_with_existing(name, existing) {
+        return Some(name_taken_message(&one_line_name(name)));
+    }
+    None
 }
 
 /// Refuse a name the account's personal-workspace folder cannot be built from.
