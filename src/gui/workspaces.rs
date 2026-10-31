@@ -52,7 +52,7 @@ pub enum WorkspacesMessage {
     /// Async result of re-discovering diagnostics.
     RediscoverDiagnosticsResult(String, Result<(), String>),
 
-    /// Dismiss modals/panels (Escape key or Close button).
+    /// Dismiss modals/panels (Escape key or a popup's corner cross).
     Escape,
 
     /// Request toast notification.
@@ -68,7 +68,7 @@ pub enum WorkspacesMessage {
     SaveRules,
     /// Async result of saving rules: (workspace, result).
     RulesSaved(String, Result<(), String>),
-    /// Close the rules popup, throwing the buffer away — its explicit Discard.
+    /// Close the rules popup, throwing the buffer away — its corner cross.
     RulesDiscard,
     /// Escape or a click outside the popup: close it only when nothing is
     /// unsaved.
@@ -480,7 +480,7 @@ impl WorkspacesState {
                 Task::none()
             }
             // Escape and a click outside are not ways out of unsaved text: only
-            // Save and the explicit Discard are.
+            // Save and the corner cross are.
             WorkspacesMessage::RulesDismiss => self.dismiss_rules(),
             WorkspacesMessage::ContextsClose => {
                 self.context_view = None;

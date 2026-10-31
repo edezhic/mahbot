@@ -8,6 +8,7 @@
 //! coordination (diff modal ↔ branch modal mutual exclusion) is handled
 //! at the Dashboard level.
 
+use super::dialog;
 use super::theme;
 use super::widgets;
 
@@ -741,9 +742,9 @@ impl GitState {
     // ── View ──────────────────────────────────────────────────────
 
     /// Render the branch management dialog content (search, branch list,
-    /// create section). Does **not** wrap in a modal backdrop — the
-    /// Dashboard wraps it in a small centered dialog so the close message
-    /// is consistent with the rest of the overlay stack.
+    /// create section) with the corner close cross. Does **not** wrap in a
+    /// modal backdrop — the Dashboard wraps it in a small centered dialog so
+    /// the close message is consistent with the rest of the overlay stack.
     pub fn view(&self) -> Element<'_, GitMessage> {
         let search_input = super::widgets::single_line_editor(
             &self.branch_search_query.buffer,
@@ -828,7 +829,7 @@ impl GitState {
         });
 
         column![
-            widgets::section_heading("Branches"),
+            dialog::dialog_title_row(widgets::section_heading("Branches"), GitMessage::CloseModal),
             Space::new().height(8),
             search_input,
             Space::new().height(8),

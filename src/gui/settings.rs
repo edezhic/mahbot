@@ -2644,19 +2644,15 @@ impl SettingsState {
 
         dialog::dialog_shell(
             column![
-                dialog::dialog_title(tool.name()),
+                dialog::dialog_title_row(
+                    dialog::dialog_title(tool.name()),
+                    SettingsMessage::CustomToolsMsg(custom_tools::CustomToolsMessage::CloseDetails),
+                ),
                 Space::new().height(16),
                 // Sized to the details and capped, so a long description or
                 // many parameters stay readable by scrolling inside the window.
                 container(widgets::vscroll_sized(body, Length::Fill, Length::Shrink))
                     .max_height(320.0),
-                Space::new().height(16),
-                dialog::dialog_footer_row([button(text("Close").size(theme::TEXT_13))
-                    .style(theme::button_secondary)
-                    .on_press(SettingsMessage::CustomToolsMsg(
-                        custom_tools::CustomToolsMessage::CloseDetails,
-                    ))
-                    .into()]),
             ]
             .spacing(theme::SPACE_8)
             .width(Length::Fill),
@@ -2765,8 +2761,8 @@ impl SettingsState {
         }
 
         // The body gets the room between the fields and the footer, so the list runs
-        // down to the buttons; `Shrink` keeps the dialog at the body's own height
-        // instead of stretching it. The reported size still has the footer in it.
+        // down to the submit button; `Shrink` keeps the dialog at the body's own
+        // height instead of stretching it. The reported size still has the footer in it.
         middle = middle.push(
             responsive(move |size| Self::custom_role_body(editor, size.height))
                 .height(Length::Shrink),
@@ -2830,7 +2826,7 @@ impl SettingsState {
 
     /// The custom-role window's body, no taller than its content and never past
     /// the room `reported` measures: the prompt editor, the branching picker and
-    /// the tool list, sized so the list runs down to the footer buttons and
+    /// the tool list, sized so the list runs down to the footer button and
     /// scrolls inside itself when its rows do not fit.
     fn custom_role_body(
         editor: &custom_roles::RoleEditor,
@@ -3035,9 +3031,10 @@ impl SettingsState {
         None
     }
 
-    /// The workspace rules popup: the editor, its counter, Save and Discard,
-    /// and a failed save reported in place. Its backdrop cannot dismiss it while
-    /// there is unsaved text — see `WorkspacesMessage::RulesDismiss`.
+    /// The workspace rules popup: the editor, its counter and Save, and a
+    /// failed save reported in place. The corner cross discards the buffer; its
+    /// backdrop cannot dismiss it while there is unsaved text — see
+    /// `WorkspacesMessage::RulesDismiss`.
     fn rules_dialog(rules: &workspaces::RulesEditor) -> Element<'_, SettingsMessage> {
         let char_count = rules.buffer.text().chars().count();
         let editor: Element<'_, SettingsMessage> = container(
@@ -3080,19 +3077,16 @@ impl SettingsState {
                     .on_press(SettingsMessage::WorkspaceMsg(
                         workspaces::WorkspacesMessage::SaveRules,
                     )),
-                Space::new().width(theme::SPACE_4),
-                button(text("Discard").size(theme::TEXT_12))
-                    .style(theme::button_secondary)
-                    .on_press(SettingsMessage::WorkspaceMsg(
-                        workspaces::WorkspacesMessage::RulesDiscard,
-                    )),
             ]
             .align_y(Alignment::Center),
         );
 
         dialog::dialog_shell(
             column![
-                dialog::dialog_title(format!("Rules: {}", rules.workspace)),
+                dialog::dialog_title_row(
+                    dialog::dialog_title(format!("Rules: {}", rules.workspace)),
+                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::RulesDiscard),
+                ),
                 Space::new().height(16),
                 body,
             ]
@@ -3158,22 +3152,16 @@ impl SettingsState {
                     );
                 }
 
-                view_col = view_col.push(Space::new().height(12));
-                view_col = view_col.push(dialog::dialog_footer_row([button(
-                    text("Close").size(theme::TEXT_13),
-                )
-                .style(theme::button_secondary)
-                .on_press(SettingsMessage::WorkspaceMsg(
-                    workspaces::WorkspacesMessage::ContextsClose,
-                ))
-                .into()]));
                 view_col.spacing(theme::SPACE_4).into()
             }
         };
 
         dialog::dialog_shell(
             column![
-                dialog::dialog_title(format!("{scope}: {ws_name}")),
+                dialog::dialog_title_row(
+                    dialog::dialog_title(format!("{scope}: {ws_name}")),
+                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::ContextsClose),
+                ),
                 Space::new().height(16),
                 body,
             ]
@@ -3408,7 +3396,7 @@ impl SettingsState {
 
         rows_col = rows_col.push(Space::new().height(8));
 
-        // Action buttons row: [Re-discover] [Save] [Cancel]
+        // Action row: [Re-discover] [Save]
         rows_col = rows_col.push(
             row![
                 button(row![
@@ -3440,12 +3428,6 @@ impl SettingsState {
                         workspaces::WorkspacesMessage::SaveDiagnostics(ws_name.clone()),
                     ))
                 }),
-                Space::new().width(theme::SPACE_8),
-                button(text("Cancel").size(theme::TEXT_12).color(theme::TEXT_MUTED))
-                    .style(theme::button_text)
-                    .on_press(SettingsMessage::WorkspaceMsg(
-                        workspaces::WorkspacesMessage::Escape,
-                    )),
             ]
             .align_y(Alignment::Center),
         );
@@ -3453,7 +3435,10 @@ impl SettingsState {
         let modal_title = format!("Diagnostics: {ws_name}");
         dialog::dialog_shell(
             column![
-                dialog::dialog_title(modal_title),
+                dialog::dialog_title_row(
+                    dialog::dialog_title(modal_title),
+                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Escape),
+                ),
                 Space::new().height(16),
                 rows_col,
             ]
@@ -4723,12 +4708,13 @@ struct DialogField<'a> {
     on_input: fn(EditorAction) -> SettingsMessage,
 }
 
-/// Build a reusable modal dialog: title, optional field rows, optional `middle`
-/// content, and a Cancel / submit footer. `busy` is the label the submit button
-/// shows while the action is in flight (`None` when it is idle); the button is
-/// disabled while `busy` is set or `submit_enabled` is false.
+/// Build a reusable modal dialog: its heading with the corner close cross,
+/// optional field rows, optional `middle` content, and a submit footer. `busy`
+/// is the label the submit button shows while the action is in flight (`None`
+/// when it is idle); the button is disabled while `busy` is set or
+/// `submit_enabled` is false. The cross dismisses the dialog with `on_dismiss`.
 ///
-/// Layout: title, spacer(16), field rows (8 px between), spacer(16),
+/// Layout: heading, spacer(16), field rows (8 px between), spacer(16),
 /// middle (if any), spacer(16), footer.
 #[expect(clippy::too_many_arguments)]
 fn modal_dialog<'a>(
@@ -4738,12 +4724,15 @@ fn modal_dialog<'a>(
     submit_label: &'static str,
     busy: Option<&'static str>,
     submit_enabled: bool,
-    on_cancel: SettingsMessage,
+    on_dismiss: SettingsMessage,
     on_submit: SettingsMessage,
 ) -> Element<'a, SettingsMessage> {
     let mut col = Column::new();
 
-    col = col.push(dialog::dialog_title(title));
+    col = col.push(dialog::dialog_title_row(
+        dialog::dialog_title(title),
+        on_dismiss,
+    ));
 
     if !fields.is_empty() || middle.is_some() {
         col = col.push(Space::new().height(16));
@@ -4776,9 +4765,6 @@ fn modal_dialog<'a>(
         col = col.push(Space::new().height(16));
     }
 
-    let cancel_btn = button(text("Cancel").size(theme::TEXT_13))
-        .style(theme::button_secondary)
-        .on_press(on_cancel);
     let submit_btn = button(text(busy.unwrap_or(submit_label)).size(theme::TEXT_13))
         .style(theme::button_secondary)
         .on_press_maybe(if busy.is_some() || !submit_enabled {
@@ -4786,10 +4772,7 @@ fn modal_dialog<'a>(
         } else {
             Some(on_submit)
         });
-    col = col.push(dialog::dialog_footer_row([
-        cancel_btn.into(),
-        submit_btn.into(),
-    ]));
+    col = col.push(dialog::dialog_footer_row([submit_btn.into()]));
 
     dialog::dialog_shell(col, 620.0, 24.0).into()
 }

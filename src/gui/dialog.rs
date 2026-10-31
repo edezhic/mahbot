@@ -32,6 +32,30 @@ pub fn dialog_title<'a>(
         .font(theme::FONT_BOLD)
 }
 
+/// A dialog's heading with its corner close cross: `title` takes the width the
+/// compact cross in the bubble's top-right corner leaves, wrapping (or breaking
+/// a word that cannot fit) rather than running under it. The row is full width
+/// so the cross sits at the bubble's edge, not after the text.
+#[must_use]
+pub fn dialog_title_row<'a, Message: Clone + 'a>(
+    title: iced::widget::Text<'a, iced::Theme, iced::Renderer>,
+    on_close: Message,
+) -> iced::widget::Row<'a, Message> {
+    row![
+        title
+            .width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        super::widgets::compact_x_button(
+            theme::TEXT_SECONDARY,
+            theme::SPACE_6,
+            Some(on_close),
+            None,
+        ),
+    ]
+    .width(Length::Fill)
+    .align_y(Alignment::Start)
+}
+
 /// Secondary-styled dialog body paragraph(s), separated by 8px gaps.
 #[must_use]
 pub fn dialog_body<'a, Message: 'a>(
