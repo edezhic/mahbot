@@ -217,7 +217,13 @@ async fn tick() {
         .max_by_key(|ladder| ladder.delivered_at);
     let now = Utc::now();
 
-    match step(free, capacity, ladder, assistant_can_run(), now) {
+    match step(
+        free,
+        capacity,
+        ladder,
+        crate::config::assistant_can_run(),
+        now,
+    ) {
         Step::Idle => {}
         Step::Rearm => {
             settle(store, Ladder::recovered(now)).await;
@@ -235,15 +241,6 @@ async fn tick() {
 /// Whether free space is below the notice's share of the volume's capacity.
 fn below_threshold(free: u64, capacity: u64) -> bool {
     free < capacity.saturating_mul(LOW_FREE_PCT) / 100
-}
-
-/// Whether the installation can run an assistant turn at all. A notice that
-/// lands before onboarding finishes or with no provider configured is a
-/// guaranteed failing turn, so the check stays silent and the ladder does not
-/// advance until the product can answer.
-fn assistant_can_run() -> bool {
-    crate::config::provider_configured()
-        && crate::config::CONFIG.onboarding_stage() == crate::config::OnboardingState::Finished
 }
 
 /// Hand the notice to the admin assistant's ordinary queue: its reply reaches

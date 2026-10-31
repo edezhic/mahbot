@@ -793,6 +793,15 @@ pub(crate) fn provider_configured() -> bool {
     is_custom_endpoint(&CONFIG.provider_endpoint()) || CONFIG.provider_key().is_some()
 }
 
+/// Whether the installation can run an assistant turn at all: a model provider
+/// is configured and setup has been finished. A product-authored message that
+/// lands before either is a guaranteed failing turn, so its producer stays
+/// silent instead.
+#[must_use]
+pub(crate) fn assistant_can_run() -> bool {
+    provider_configured() && CONFIG.onboarding_stage() == OnboardingState::Finished
+}
+
 /// Effective chat-completions endpoint for a config snapshot: the persisted
 /// endpoint when set (custom), else the default.
 #[must_use]

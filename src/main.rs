@@ -352,6 +352,15 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         "nightly-check",
         mahbot::workspace::run_nightly_check_loop(),
     );
+    // Nightly memory inventory: measures every account's memory file during the
+    // 3-4 AM local time window and asks the assistants whose file no longer
+    // fits into their context to clean up what they keep, once a night each.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "memory-inventory",
+        mahbot::memory_inventory::run_memory_inventory_loop(),
+    );
 
     // Periodic temp cleaner (Sanitation): reclaims the product's agents'
     // abandoned temp artifacts. Its own loop, decoupled from workspace work,

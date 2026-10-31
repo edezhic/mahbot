@@ -747,6 +747,21 @@ impl UserStore {
         Ok(())
     }
 
+    /// The local day (`YYYY-MM-DD`) on which the nightly memory inventory last
+    /// asked this account's assistant, if it ever has.
+    pub(crate) async fn memory_inventory_day(&self, name: &str) -> Result<Option<String>> {
+        self.user_column("memory_inventory_day", name).await
+    }
+
+    /// Record the day the memory inventory asked this account. Written before
+    /// the message is handed over, so a restart cannot ask twice that day.
+    pub(crate) async fn set_memory_inventory_day(&self, name: &str, day: &str) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        upsert_user_column(&tx, name, "memory_inventory_day", Some(day)).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ── Custom tool grants ────────────────────────────────────
 
     /// The custom tools granted to `user_name`, byte-sorted; empty when the

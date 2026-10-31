@@ -173,6 +173,10 @@ pub mod config;
 // The built-in low-disk notice: the admin assistant is told when free space on
 // the temp volume falls below 5%, on a widening reminder ladder.
 pub mod disk_notice;
+// The nightly memory inventory: every account's assistant whose memory file no
+// longer fits into its context is asked, once a night, to clean up what it
+// keeps.
+pub mod memory_inventory;
 // Asking the OS not to throttle a daemon whose window is never visible.
 pub mod power;
 // Start at login: the product's own registration with the operating system.

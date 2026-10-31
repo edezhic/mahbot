@@ -105,7 +105,11 @@ fn append_file_section(out: &mut String, name: &str, content: &str) {
 
 /// The account's personal memory — a continuity record for its own Assistant
 /// only, never context for another role or another account.
-const MEMORY_FILE: &str = "MEMORY.md";
+pub(crate) const MEMORY_FILE: &str = "MEMORY.md";
+
+/// How much of one workspace file a context render keeps, counted in
+/// characters (Unicode scalar values), not bytes.
+pub(crate) const MAX_WORKSPACE_FILE_CHARS: usize = 10_000;
 
 /// Workspace files rendered, in this order, into the workspace context.
 const WORKSPACE_FILES: &[&str] = &[
@@ -237,11 +241,22 @@ fn format_local_timestamp(iso_str: &str) -> String {
     )
 }
 
-/// Push `text` to `out`, truncating at `MAX_WORKSPACE_FILE_CHARS` if needed.
-fn push_truncated(out: &mut String, text: &str) {
-    const MAX_WORKSPACE_FILE_CHARS: usize = 10_000;
+/// The byte index where a context render cuts `text`, or `None` when the whole
+/// text fits.
+fn truncation_point(text: &str) -> Option<usize> {
+    text.char_indices()
+        .nth(MAX_WORKSPACE_FILE_CHARS)
+        .map(|(idx, _)| idx)
+}
 
-    if let Some((idx, _)) = text.char_indices().nth(MAX_WORKSPACE_FILE_CHARS) {
+/// Whether `text` is longer than a context render keeps of it.
+pub(crate) fn exceeds_workspace_file_limit(text: &str) -> bool {
+    truncation_point(text).is_some()
+}
+
+/// Push `text` to `out`, truncating at [`MAX_WORKSPACE_FILE_CHARS`] if needed.
+fn push_truncated(out: &mut String, text: &str) {
+    if let Some(idx) = truncation_point(text) {
         out.push_str(&text[..idx]);
         let _ = writeln!(
             out,
@@ -520,6 +535,21 @@ mod tests {
             scanned += 1;
         }
         assert!(scanned > 0, "no embedded prompt asset was inspected");
+    }
+
+    /// The context cut is also the nightly inventory's trigger: 10,000
+    /// characters are rendered whole, 10,001 are not, and the count is in
+    /// characters — a multi-byte file is measured the same way.
+    #[test]
+    fn the_file_limit_counts_characters() {
+        let fits = "ё".repeat(MAX_WORKSPACE_FILE_CHARS);
+        assert_eq!(
+            fits.len(),
+            MAX_WORKSPACE_FILE_CHARS * 2,
+            "two bytes per char"
+        );
+        assert!(!exceeds_workspace_file_limit(&fits));
+        assert!(exceeds_workspace_file_limit(&format!("{fits}ё")));
     }
 
     #[test]

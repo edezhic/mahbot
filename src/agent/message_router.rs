@@ -804,7 +804,8 @@ fn assistant_notice_job(content: String, user_name: &str) -> AgentJob {
 /// row is replayed at boot, so a producer that owns its own bookkeeping must
 /// never also persist the envelope. It records nothing itself, so a caller that
 /// wants a repeat rather than a loss settles its own record only after this
-/// returns — the update notice does exactly that.
+/// returns — the update notice does exactly that — while a caller that must
+/// never ask twice settles it before, as the nightly memory inventory does.
 pub(crate) fn post_assistant_notice(agent_id: &str, user_name: &str, content: String) {
     route(agent_id, assistant_notice_job(content, user_name));
 }

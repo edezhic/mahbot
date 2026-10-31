@@ -39,9 +39,6 @@ const SERVICE_AREAS: &[&str] = &[
     ARCHIVE_DIR,
 ];
 
-/// The memory file at the workspace root: corrected, never archived.
-const MEMORY_FILE: &str = "MEMORY.md";
-
 pub(crate) struct ArchiveTool;
 
 #[async_trait]
@@ -105,10 +102,11 @@ impl Tool for ArchiveTool {
                 areas.join(", ")
             );
         }
-        if relative == Path::new(MEMORY_FILE) {
+        if relative == Path::new(crate::prompt::MEMORY_FILE) {
             anyhow::bail!(
                 "cannot archive {path}: the memory is corrected, not archived — edit the stale \
-                 part out of {MEMORY_FILE} instead"
+                 part out of {} instead",
+                crate::prompt::MEMORY_FILE
             );
         }
 

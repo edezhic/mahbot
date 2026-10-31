@@ -141,7 +141,7 @@ fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
         return true;
     }
     if entry.depth() == 1 {
-        if name == "MEMORY.md" {
+        if name == crate::prompt::MEMORY_FILE {
             return true;
         }
         if entry.file_type().is_some_and(|t| t.is_dir()) {
